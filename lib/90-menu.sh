@@ -176,6 +176,31 @@ _check_config() {
     _press_any_key
 }
 
+# 兜底卸载 cloudflared（当 VPS 上的 lib/40-cloudflared.sh 是旧版、缺少 _uninstall_cloudflared 时用）
+_uninstall_cloudflared_fallback() {
+    if [ -x /usr/local/bin/cloudflared ]; then
+        _info "卸载 cloudflared (fallback)..."
+        /usr/local/bin/cloudflared service uninstall 2>/dev/null || true
+        pgrep -x cloudflared 2>/dev/null | xargs -r kill -15 2>/dev/null || true
+        sleep 2
+        pgrep -x cloudflared 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        case "$INIT_SYSTEM" in
+            systemd)
+                systemctl disable cloudflared 2>/dev/null || true
+                rm -f /etc/systemd/system/cloudflared.service
+                systemctl daemon-reload 2>/dev/null || true ;;
+            openrc)
+                rc-update del cloudflared default 2>/dev/null || true
+                rm -f /etc/init.d/cloudflared ;;
+        esac
+        rm -f /usr/local/bin/cloudflared
+        rm -f /opt/xray-deploy/state/cf_*
+        _success "cloudflared 已卸载 (fallback)"
+    else
+        _warn "cloudflared 未安装"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 卸载菜单
 # ---------------------------------------------------------------------------
@@ -191,7 +216,7 @@ _uninstall_menu() {
     case "$choice" in
         1) _reset_config ;;
         2) _uninstall_xray ;;
-        3) _uninstall_xray; _uninstall_cloudflared ;;
+        3) _uninstall_xray; if declare -F _uninstall_cloudflared >/dev/null 2>&1; then _uninstall_cloudflared; else _uninstall_cloudflared_fallback; fi ;;
         0) return ;;
         *) _warn "取消" ;;
     esac
@@ -232,7 +257,7 @@ _reset_config() {
 # 检测脚本更新(问题3)
 # 对比本地 SCRIPT_VERSION 与远程 VERSION 文件; 有新版提示重新跑 install.sh
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION="0.1.2"
+SCRIPT_VERSION="0.1.3"
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
 
 _check_script_update() {
