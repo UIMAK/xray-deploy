@@ -4,11 +4,27 @@
 # 串接所有模块, 渲染菜单, 调度用户选择
 # ============================================================================
 
-# 标题框(纯 ASCII 两行, 不依赖 Unicode 框线, 窄终端/非 UTF-8 都能显)
+# 标题框(Unicode 框线, 中文双宽自适应)
 _print_logo() {
-    echo -e "  ${CYAN}═══════════════════════════════════════════${NC}"
-    echo -e "  ${CYAN}══  Xray 部署管理脚本 (xray-deploy)  ══${NC}"
-    echo -e "  ${CYAN}═══════════════════════════════════════════${NC}"
+    local title="Xray 部署管理脚本 (xray-deploy)"
+    # 计算显示宽度: 用 wc -m(字符数) + wc -c(字节数) 推算 CJK 宽字符数
+    # CJK 字符 = (字节数 - 字符数) / 2, 每个 CJK 占 2 列
+    local char_count byte_count cjk_chars display_w
+    char_count=$(printf '%s' "$title" | wc -m | tr -d '[:space:]')
+    byte_count=$(printf '%s' "$title" | wc -c | tr -d '[:space:]')
+    cjk_chars=$(( (byte_count - char_count) / 2 ))
+    display_w=$(( char_count + cjk_chars ))            # ASCII 1列 + CJK 2列
+    local inner=$(( display_w + 6 ))                   # 左右各3空格边距
+    [ "$inner" -lt 36 ] && inner=36
+    # 边框
+    local border="" i
+    for ((i=0; i<inner; i++)); do border="${border}═"; done
+    local right_pad="" j
+    local pad_len=$(( inner - display_w - 2 ))         # 标题右侧填充空格数
+    for ((j=0; j<pad_len; j++)); do right_pad="${right_pad} "; done
+    echo -e "  ${CYAN}╔${border}╗${NC}"
+    echo -e "  ${CYAN}║${NC} ${title}${right_pad} ${CYAN}║${NC}"
+    echo -e "  ${CYAN}╚${border}╝${NC}"
 }
 
 # ---------------------------------------------------------------------------
