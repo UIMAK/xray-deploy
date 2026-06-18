@@ -198,6 +198,26 @@ _init_config_if_empty() {
     _ensure_dirs
     # 美化多行格式(便于手动编辑) + routing 规则(bt/广告/私网/CN 走 block)
     local base='{
+  "dns": {
+    "enableParallelQuery": true,
+    "queryStrategy": "UseIP",
+    "servers": [
+      {
+        "address": "https://1.1.1.1/dns-query",
+        "tag": "dns_cloudflare"
+      },
+      {
+        "address": "https://9.9.9.11/dns-query",
+        "tag": "dns_quad9"
+      },
+      {
+        "address": "https://8.8.8.8/dns-query",
+        "tag": "dns_google"
+      }
+    ],
+    "tag": "dns_inbound",
+    "useSystemHosts": false
+  },
   "log": {
     "loglevel": "warning",
     "access": "'"$LOG_DIR"'/access.log",
