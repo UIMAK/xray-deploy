@@ -4,35 +4,11 @@
 # 串接所有模块, 渲染菜单, 调度用户选择
 # ============================================================================
 
-# 标题框(按显示宽度居中, 适配中文双宽)
+# 标题框(纯 ASCII 两行, 不依赖 Unicode 框线, 窄终端/非 UTF-8 都能显)
 _print_logo() {
-    local title="Xray 部署管理脚本 (xray-deploy)"
-    # 计算显示宽度: ASCII 1 列, 非 ASCII(中文等)2 列
-    local w=0 i ch
-    for ((i=0; i<${#title}; i++)); do
-        ch="${title:$i:1}"
-        if [[ "$ch" =~ [^[:print:]] || "$ch" == $'\t' ]]; then continue; fi
-        # 简单判定: 字节 >= 0x80 视为宽字符(中文/全角)
-        local byte
-        byte=$(printf '%s' "$ch" | wc -c 2>/dev/null | tr -d ' ')
-        if [ "$byte" -gt 1 ]; then w=$((w+2)); else w=$((w+1)); fi
-    done
-    # 框内宽 = w + 8(留边距); 至少 40
-    local inner=$((w+8))
-    [ "$inner" -lt 40 ] && inner=40
-    local pad=$(( (inner - w) / 2 ))
-    local border=""
-    for ((i=0; i<inner+2; i++)); do border="${border}═"; done
-    # 顶部
-    echo -e "  ${CYAN}╔${border}╗${NC}"
-    # 内容行: 左 pad 空格 + 标题 + 右补齐
-    local left="" rightlen=$(( inner - w - pad ))
-    local right=""
-    for ((i=0; i<pad; i++)); do left="${left} "; done
-    for ((i=0; i<rightlen; i++)); do right="${right} "; done
-    echo -e "  ${CYAN}║${NC} ${left}${title}${right} ${CYAN}║${NC}"
-    # 底部
-    echo -e "  ${CYAN}╚${border}╝${NC}"
+    echo -e "  ${CYAN}═══════════════════════════════════════════${NC}"
+    echo -e "  ${CYAN}══  Xray 部署管理脚本 (xray-deploy)  ══${NC}"
+    echo -e "  ${CYAN}═══════════════════════════════════════════${NC}"
 }
 
 # ---------------------------------------------------------------------------
