@@ -7,7 +7,6 @@
 # 标题框(Unicode 框线, 中文双宽自适应居中)
 _print_logo() {
     local title="Xray 部署管理脚本 (xray-deploy)"
-    # display_w: ASCII=1列, CJK=2列; CJK字数 = (字节数-字符数)/2
     local char_count byte_count cjk_chars display_w
     char_count=$(printf '%s' "$title" | wc -m | tr -d '[:space:]')
     byte_count=$(printf '%s' "$title" | wc -c | tr -d '[:space:]')
@@ -15,15 +14,14 @@ _print_logo() {
     display_w=$(( char_count + cjk_chars ))
     local inner=$(( display_w + 8 ))
     [ "$inner" -lt 40 ] && inner=40
-    local pad=$(( (inner - display_w) / 2 ))               # 左空格
-    local rightlen=$(( inner - display_w - pad ))          # 右空格
+    local pad=$(( (inner - display_w) / 2 ))
+    local rightlen=$(( inner - display_w - pad ))
     local border="" left="" right="" i
     for ((i=0; i<inner+2; i++)); do border="${border}═"; done
     for ((i=0; i<pad; i++)); do left="${left} "; done
     for ((i=0; i<rightlen; i++)); do right="${right} "; done
     echo -e "  ${CYAN}╔${border}╗${NC}"
     echo -e "  ${CYAN}║${NC} ${left}${title}${right} ${CYAN}║${NC}"
-    echo -e "  ${CYAN}╚${border}╝${NC}"
 }
 
 # ---------------------------------------------------------------------------
