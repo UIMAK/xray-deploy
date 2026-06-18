@@ -5,10 +5,8 @@
     "tag": "{{TAG}}",
     "settings": {
         "method": "{{METHOD}}",
-        "password": "{{PASSWORD}}"
-    },
-    "streamSettings": {
-        "network": "tcp"
+        "password": "{{PASSWORD}}",
+        "network": "tcp,udp"
     },
     "sniffing": {
         "enabled": true,
