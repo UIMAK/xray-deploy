@@ -4,7 +4,7 @@
 # 串接所有模块, 渲染菜单, 调度用户选择
 # ============================================================================
 
-# 标题框(Unicode 框线, 中文双宽自适应居中)
+# 标题(居中)
 _print_logo() {
     local title="Xray 部署管理脚本 (xray-deploy)"
     local char_count byte_count cjk_chars display_w
@@ -15,13 +15,9 @@ _print_logo() {
     local inner=$(( display_w + 8 ))
     [ "$inner" -lt 40 ] && inner=40
     local pad=$(( (inner - display_w) / 2 ))
-    local rightlen=$(( inner - display_w - pad ))
-    local border="" left="" right="" i
-    for ((i=0; i<inner+2; i++)); do border="${border}═"; done
+    local left="" i
     for ((i=0; i<pad; i++)); do left="${left} "; done
-    for ((i=0; i<rightlen; i++)); do right="${right} "; done
-    echo -e "  ${CYAN}╔${border}╗${NC}"
-    echo -e "  ${CYAN}║${NC} ${left}${title}${right} ${CYAN}║${NC}"
+    echo -e "  ${CYAN}${left}${title}${NC}"
 }
 
 # ---------------------------------------------------------------------------
