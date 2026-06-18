@@ -243,19 +243,66 @@ _cf_replace_token_in_service() {
 }
 
 # ---------------------------------------------------------------------------
-# 重启 cloudflared service(openrc 先清残留 PID 文件, 再 stop->start)
-_cf_restart() {
-    rm -f /run/cloudflared.pid 2>/dev/null
+# 强力杀干净所有 cloudflared 进程(防止 PID 残留导致的进程泄漏)
+# openrc 的 rc-service stop 经常杀不干净, 必须内核级 kill 兜底
+# ---------------------------------------------------------------------------
+_cf_kill_all() {
+    local pids="" i
+
+    # 1. 按实际 init 系统走正确的 stop，并等待进程真正退出
     case "$INIT_SYSTEM" in
-        systemd) systemctl restart cloudflared 2>/dev/null ;;
+        systemd)
+            systemctl stop cloudflared 2>/dev/null || true
+            # 等 systemd 真正把进程杀掉（最多等 15s，避免无限阻塞）
+            i=0
+            while systemctl is-active --quiet cloudflared 2>/dev/null && [ "$i" -lt 15 ]; do
+                sleep 1; i=$((i+1))
+            done
+            ;;
         openrc)
-            rc-service cloudflared stop 2>/dev/null
-            sleep 1
-            rm -f /run/cloudflared.pid 2>/dev/null
-            rc-service cloudflared start 2>/dev/null
+            rc-service cloudflared stop 2>/dev/null || true
+            sleep 2
             ;;
     esac
-    sleep 2
+
+    # 2. 杀 PID 文件里的残留
+    for pf in /run/cloudflared.pid /var/run/cloudflared.pid; do
+        [ -f "$pf" ] && kill "$(cat "$pf" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$pf" 2>/dev/null
+    done
+
+    # 3. 扫残留进程：先 SIGTERM（给 cloudflared 时间向 CF 边缘发送断开信号），等 3s，再 SIGKILL
+    pids=$(pgrep -x cloudflared 2>/dev/null \
+        || ps -o pid,comm 2>/dev/null | awk '/cloudflared/{print $1}')
+    if [ -n "$pids" ]; then
+        for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
+        sleep 3
+        # 再扫一次，还活着的直接 SIGKILL
+        pids=$(pgrep -x cloudflared 2>/dev/null \
+            || ps -o pid,comm 2>/dev/null | awk '/cloudflared/{print $1}')
+        for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+        sleep 1
+    fi
+
+    # 4. 最终确认
+    pids=$(pgrep -x cloudflared 2>/dev/null \
+        || ps -o pid,comm 2>/dev/null | awk '/cloudflared/{print $1}')
+    if [ -n "$pids" ]; then
+        _warn "cloudflared 仍有残留进程: $pids"
+    else
+        _info "cloudflared 所有进程已清理"
+    fi
+}
+
+# 重启 cloudflared service(先杀干净所有, 等 CF 边缘回收旧 session, 再重新 start)
+_cf_restart() {
+    _cf_kill_all
+    sleep 2   # 等 CF 边缘感知旧 connector 断开
+    case "$INIT_SYSTEM" in
+        systemd) systemctl start cloudflared 2>/dev/null ;;
+        openrc)  rc-service cloudflared start 2>/dev/null ;;
+    esac
+    sleep 3   # 等新进程建立连接后再做后续检测
 }
 
 # 判断 cloudflared 是否在运行(状态栏 + 诊断用)
@@ -323,15 +370,14 @@ _uninstall_cloudflared() {
     [ -x "$CF_BIN" ] || { _warn "cloudflared 未安装"; return 0; }
     _info "卸载 cloudflared..."
     "$CF_BIN" service uninstall 2>/dev/null || true
+    _cf_kill_all   # 确保进程彻底死掉再删文件（替换原来的裸 stop）
     case "$INIT_SYSTEM" in
         systemd)
-            systemctl stop cloudflared 2>/dev/null || true
             systemctl disable cloudflared 2>/dev/null || true
             rm -f "$CF_UNIT_SYSTEMD" "${CF_UNIT_SYSTEMD}.bak"
             systemctl daemon-reload 2>/dev/null || true
             ;;
         openrc)
-            rc-service cloudflared stop 2>/dev/null || true
             rc-update del cloudflared default 2>/dev/null || true
             rm -f "$CF_UNIT_OPENRC" "${CF_UNIT_OPENRC}.bak"
             ;;
@@ -380,12 +426,8 @@ _cf_switch_token() {
         }
     fi
 
-    # 重启; 失败则回滚 .bak(先 stop 再 start, 比 restart 更可靠)
-    case "$INIT_SYSTEM" in
-        systemd) systemctl restart cloudflared 2>/dev/null ;;
-        openrc)  rc-service cloudflared stop 2>/dev/null; sleep 1; rc-service cloudflared start 2>/dev/null ;;
-    esac
-    sleep 2
+    # 重启: 先杀干净所有, 等 CF 边缘回收旧 session, 验证启动
+    _cf_restart
     local restarted_ok="no"
     case "$INIT_SYSTEM" in
         systemd) systemctl is-active --quiet cloudflared 2>/dev/null && restarted_ok="yes" ;;
@@ -396,10 +438,7 @@ _cf_switch_token() {
         cat "${svcfile}.bak" > "$svcfile"
         case "$svcfile" in /etc/init.d/*) chmod +x "$svcfile" 2>/dev/null ;; esac
         [ "$INIT_SYSTEM" = "systemd" ] && systemctl daemon-reload 2>/dev/null
-        case "$INIT_SYSTEM" in
-            systemd) systemctl restart cloudflared 2>/dev/null ;;
-            openrc)  rc-service cloudflared restart 2>/dev/null ;;
-        esac
+        _cf_restart
         _error "令牌替换后服务异常, 已回滚。请检查令牌是否正确, 或手动检查 $svcfile"
         return 1
     fi
@@ -498,13 +537,8 @@ _cf_toggle() {
     case "$svcfile" in /etc/init.d/*) chmod +x "$svcfile" 2>/dev/null ;; esac
     [ "$INIT_SYSTEM" = "systemd" ] && systemctl daemon-reload 2>/dev/null
 
-    # 重启: 先清残留 PID 文件(openrc 已知问题), 再 stop->start
-    rm -f /run/cloudflared.pid 2>/dev/null
-    case "$INIT_SYSTEM" in
-        systemd) systemctl restart cloudflared 2>/dev/null ;;
-        openrc)  rc-service cloudflared stop 2>/dev/null; sleep 1; rm -f /run/cloudflared.pid 2>/dev/null; rc-service cloudflared start 2>/dev/null ;;
-    esac
-    sleep 2
+    # 重启: 先杀干净所有, 等 CF 边缘回收旧 session, 再 start
+    _cf_restart
     _state_set "cf_$key" "$new"
     _success "${key} 已切换为 ${new}(cloudflared 已重启, 隧道短暂中断)"
 }
