@@ -521,11 +521,11 @@ _add_shadowsocks() {
 _tpl_path() {
     local key="$1"
     case "$key" in
-        vless-tcp-reality-vision) echo "templates/vless-tcp-reality-vision.server.jsonc" ;;
-        vless-xhttp-reality)      echo "templates/vless-xhttp-reality.server.jsonc" ;;
-        vless-xhttp-cdn)          echo "templates/vless-xhttp-cdn.server.jsonc" ;;
-        vless-ws-cdn)             echo "templates/vless-ws-cdn.server.jsonc" ;;
-        shadowsocks)              echo "templates/shadowsocks.server.jsonc" ;;
+        vless-tcp-reality-vision) echo "/opt/xray-deploy/templates/vless-tcp-reality-vision.server.jsonc" ;;
+        vless-xhttp-reality)      echo "/opt/xray-deploy/templates/vless-xhttp-reality.server.jsonc" ;;
+        vless-xhttp-cdn)          echo "/opt/xray-deploy/templates/vless-xhttp-cdn.server.jsonc" ;;
+        vless-ws-cdn)             echo "/opt/xray-deploy/templates/vless-ws-cdn.server.jsonc" ;;
+        shadowsocks)              echo "/opt/xray-deploy/templates/shadowsocks.server.jsonc" ;;
     esac
 }
 
