@@ -1,0 +1,28 @@
+{
+    "listen": "{{LISTEN}}",
+    "port": {{PORT}},
+    "protocol": "vless",
+    "tag": "{{TAG}}",
+    "settings": {
+        "clients": [
+            {
+                "id": "{{UUID}}",
+                "flow": ""
+            }
+        ],
+        "decryption": "none"
+    },
+    "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+            "path": "{{PATH}}",
+            "headers": {
+                "Host": "{{HOST}}"
+            }
+        }
+    },
+    "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+    }
+}

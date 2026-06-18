@@ -1,0 +1,34 @@
+{
+    "listen": "{{LISTEN}}",
+    "port": {{PORT}},
+    "protocol": "vless",
+    "tag": "{{TAG}}",
+    "settings": {
+        "clients": [
+            {
+                "id": "{{UUID}}",
+                "flow": "xtls-rprx-vision"
+            }
+        ],
+        "decryption": "none"
+    },
+    "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+            "target": "{{TARGET}}",
+            "serverNames": [
+                "{{SERVER_NAME}}"
+            ],
+            "privateKey": "{{PRIVATE_KEY}}",
+            "shortIds": [
+                "{{SHORT_ID}}"
+            ]{{MLDSA65_SEED_BLOCK}}
+        }
+    },
+    "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+    }
+}

@@ -1,0 +1,17 @@
+{
+    "listen": "{{LISTEN}}",
+    "port": {{PORT}},
+    "protocol": "shadowsocks",
+    "tag": "{{TAG}}",
+    "settings": {
+        "method": "{{METHOD}}",
+        "password": "{{PASSWORD}}"
+    },
+    "streamSettings": {
+        "network": "tcp"
+    },
+    "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+    }
+}
