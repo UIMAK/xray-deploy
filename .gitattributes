@@ -1,0 +1,9 @@
+# Force LF line endings for all text files
+# Prevents CRLF corruption when committing from Windows
+* text=auto
+*.sh text eol=lf
+*.jsonc text eol=lf
+VERSION text eol=lf
+README.md text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
