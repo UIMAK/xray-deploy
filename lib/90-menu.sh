@@ -257,7 +257,7 @@ _reset_config() {
 # 检测脚本更新(问题3)
 # 对比本地 SCRIPT_VERSION 与远程 VERSION 文件; 有新版提示重新跑 install.sh
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION="0.1.4"
+SCRIPT_VERSION="0.1.5"
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
 
 _check_script_update() {
