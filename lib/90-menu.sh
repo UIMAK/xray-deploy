@@ -256,7 +256,7 @@ _reset_config() {
 # 检测脚本更新(问题3)
 # 对比本地 SCRIPT_VERSION 与远程 VERSION 文件; 有新版提示重新跑 install.sh
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.1.2"
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
 
 _check_script_update() {
@@ -278,9 +278,17 @@ _check_script_update() {
         _success "已是最新版本"
     elif [ -n "$remote" ]; then
         _warn "发现新版本: ${remote}"
-        echo -e "  升级方式: 重新运行安装命令"
-        echo -e "  ${CYAN}bash <(curl -sL ${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/install.sh)${NC}"
-        echo -e "  ${YELLOW}(升级只替换脚本, 不影响已装的 Xray/节点/cloudflared)${NC}"
+        read -rp "  是否立即更新? [y/N]: " ans
+        case "$ans" in
+            y|Y)
+                _info "正在更新脚本..."
+                # 直接跑远程 install.sh (只替换脚本, 不影响 Xray/cloudflared/节点)
+                bash <(curl -fsSL "https://raw.githubusercontent.com/UIMAK/xray-deploy/main/install.sh") --no-start
+                _success "脚本已更新到 ${remote}, 下次进菜单生效"
+                exit 0
+                ;;
+            *) _info "已取消更新" ;;
+        esac
     fi
     _press_any_key
 }
