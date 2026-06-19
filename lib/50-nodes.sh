@@ -1171,6 +1171,9 @@ _hy2_toggle_hop() {
                     _error "禁用失败, 已回滚"; _press_any_key; return
                 fi
                 jq 'del(.udp_hop_ports) | del(.udp_hop_interval) | del(.hop_ranges) | del(.hop_start) | del(.hop_end)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+                # 重建分享链接
+                local newlink; newlink=$(_rebuild_hy2_link "$meta")
+                jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
                 _success "端口跳跃已禁用"
                 ;;
             *) _info "已取消" ;;
@@ -1211,6 +1214,9 @@ _hy2_toggle_hop() {
         # 更新元数据
         jq --arg p "$hop_ports" --arg i "$hop_interval" \
            '.udp_hop_ports=$p | .udp_hop_interval=$i' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        # 重建分享链接
+        local newlink; newlink=$(_rebuild_hy2_link "$meta")
+        jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
         _success "端口跳跃已启用: ${hop_ports} (每${hop_interval}s)"
         _tip "客户端需配置相同端口范围以使用端口跳跃"
         _tip "请确保防火墙/安全组已放行该 UDP 端口范围"
