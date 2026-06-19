@@ -434,6 +434,8 @@ _hy2_toggle_brutal() {
         local brutal_up="" brutal_down=""
         read -rp "  上传带宽 (回车不限): " brutal_up
         read -rp "  下载带宽 (回车不限): " brutal_down
+        brutal_up=$(_normalize_bandwidth "$brutal_up")
+        brutal_down=$(_normalize_bandwidth "$brutal_down")
         _backup_config
         local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
         jq --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
@@ -499,6 +501,8 @@ _hy2_adjust_bandwidth() {
     new_up=${new_up:-$cur_up}
     read -rp "  新下载带宽: " new_down
     new_down=${new_down:-$cur_down}
+    new_up=$(_normalize_bandwidth "$new_up")
+    new_down=$(_normalize_bandwidth "$new_down")
 
     _backup_config
     local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
