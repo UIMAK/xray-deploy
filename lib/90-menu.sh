@@ -359,8 +359,8 @@ _check_script_update() {
         case "$ans" in
             y|Y)
                 _info "正在更新脚本..."
-                bash <(curl -fsSL "https://raw.githubusercontent.com/UIMAK/xray-deploy/main/install.sh") --no-start
-                _success "脚本已更新到 ${remote}, 下次进菜单生效"
+                bash <(curl -fsSL "https://raw.githubusercontent.com/UIMAK/xray-deploy/main/install.sh") --update
+                _success "脚本已更新, 下次进菜单生效"
                 exit 0
                 ;;
             *) _info "已取消更新" ;;
