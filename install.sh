@@ -92,6 +92,12 @@ download_all() {
         echo "[错误] 主脚本下载失败"; fail=$((fail+1))
     fi
 
+    if dl "${REMOTE_BASE}/VERSION" "$DEPLOY_DIR/VERSION"; then
+        ok=$((ok+1))
+    else
+        echo "[警告] VERSION 下载失败"; fail=$((fail+1))
+    fi
+
     echo "[信息] 下载 lib 模块..."
     for f in $LIB_MODULES; do
         if dl "${REMOTE_BASE}/lib/${f}.sh" "${INSTALL_LIB_DIR}/${f}.sh"; then
@@ -159,6 +165,7 @@ LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 if [ -f "${LOCAL_DIR}/xray-deploy.sh" ]; then
     echo "[信息] 检测到本地源, 从本地拷贝"
     cp -f "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"
+    cp -f "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" 2>/dev/null
     cp -f "${LOCAL_DIR}"/lib/*.sh "$INSTALL_LIB_DIR/" 2>/dev/null
     cp -f "${LOCAL_DIR}"/templates/*.jsonc "$INSTALL_TPL_DIR/" 2>/dev/null
 else
