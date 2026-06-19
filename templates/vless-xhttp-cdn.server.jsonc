@@ -15,7 +15,7 @@
     "streamSettings": {
         "network": "xhttp",
         "xhttpSettings": {
-            "mode": "stream-one",
+            "mode": "auto",
             "path": "{{PATH}}",
             "host": "{{HOST}}"
         }
