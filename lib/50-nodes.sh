@@ -196,7 +196,11 @@ _read_hop_ranges() {
     hop_s=$(jq -r '.hop_start // empty' "$meta" 2>/dev/null)
     hop_e=$(jq -r '.hop_end // empty' "$meta" 2>/dev/null)
     if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
-        echo "${hop_s}:${hop_e}"
+        if [ "$hop_s" = "$hop_e" ]; then
+            echo "$hop_s"
+        else
+            echo "${hop_s}:${hop_e}"
+        fi
     fi
 }
 
