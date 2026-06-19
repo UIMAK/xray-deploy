@@ -15,6 +15,7 @@ PROTOCOLS=(
     "vless-xhttp-cdn|VLESS+XHTTP(无TLS)|none|cdn|必须套CDN·禁止直连"
     "vless-ws-cdn|VLESS+WS(无TLS)|none|cdn|必须套CDN·禁止直连"
     "shadowsocks|Shadowsocks|none|direct|"
+    "hysteria2|Hysteria2|tls|direct|QUIC·需TLS证书"
 )
 
 # ---------------------------------------------------------------------------
@@ -88,6 +89,8 @@ _render_template() {
     : "${R_LISTEN:=}" "${R_PORT:=}" "${R_TAG:=}" "${R_UUID:=}" "${R_TARGET:=}"
     : "${R_SERVER_NAME:=}" "${R_PRIVATE_KEY:=}" "${R_SHORT_ID:=}" "${R_PATH:=}"
     : "${R_HOST:=}" "${R_METHOD:=}" "${R_PASSWORD:=}" "${R_MLDSA65_SEED:=}"
+    : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
+    : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
 
@@ -105,6 +108,17 @@ _render_template() {
     p="{{HOST}}";         content="${content//$p/$R_HOST}"
     p="{{METHOD}}";       content="${content//$p/$R_METHOD}"
     p="{{PASSWORD}}";     content="${content//$p/$R_PASSWORD}"
+    p="{{AUTH}}";         content="${content//$p/$R_AUTH}"
+    p="{{CERT_FILE}}";    content="${content//$p/$R_CERT_FILE}"
+    p="{{KEY_FILE}}";     content="${content//$p/$R_KEY_FILE}"
+    p="{{CONGESTION}}";   content="${content//$p/$R_CONGESTION}"
+    # Hysteria2 brutal 参数块(可选: brutal 模式注入, 否则置空)
+    p="{{BRUTAL_PARAMS_BLOCK}}"
+    if [ -n "$R_BRUTAL_PARAMS_BLOCK" ]; then
+        content="${content//$p/$R_BRUTAL_PARAMS_BLOCK}"
+    else
+        content="${content//$p/}"
+    fi
     # 后量子 seed 块(可选)
     p="{{MLDSA65_SEED_BLOCK}}"
     if [ -n "$R_MLDSA65_SEED" ]; then
@@ -234,6 +248,7 @@ _add_node() {
         vless-xhttp-cdn)          _add_vless_xhttp_cdn ;;
         vless-ws-cdn)             _add_vless_ws_cdn ;;
         shadowsocks)              _add_shadowsocks ;;
+        hysteria2)                _add_hysteria2 ;;
         *) _warn "未知协议" ;;
     esac
     _press_any_key
@@ -513,6 +528,196 @@ _add_shadowsocks() {
 
     _success "节点 [${name}] 创建成功"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
+}
+
+# ---------------------------------------------------------------------------
+# 协议6: Hysteria2 (QUIC + TLS证书)
+# 模板: templates/hysteria2.server.jsonc
+# 来源: Xray-examples/Hysteria2/server.jsonc + Xray-docs-next hysteria.md / finalmask.md
+# ---------------------------------------------------------------------------
+# 生成 Hysteria2 自签 TLS 证书(EC-256, 10 年)
+# 用法:_gen_hy2_cert <tag>  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
+_gen_hy2_cert() {
+    local tag="$1"
+    local cert_dir="$CERT_DIR/$tag"
+    mkdir -p "$cert_dir"
+    CERT_FILE_PATH="${cert_dir}/cert.pem"
+    KEY_FILE_PATH="${cert_dir}/key.pem"
+    if [ -f "$CERT_FILE_PATH" ] && [ -f "$KEY_FILE_PATH" ]; then
+        _info "已有证书, 复用: $cert_dir"
+        return 0
+    fi
+    _info "生成 TLS 自签证书..."
+    if command -v openssl >/dev/null 2>&1; then
+        openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE_PATH" 2>/dev/null \
+            && openssl req -new -x509 -days 3650 -key "$KEY_FILE_PATH" \
+                -out "$CERT_FILE_PATH" -subj "/CN=hy2.local" 2>/dev/null
+    elif [ -x "$XRAY_BIN" ]; then
+        "$XRAY_BIN" tls cert --domain hy2.local --file "$cert_dir" 2>/dev/null
+        # xray tls cert 输出: cert.pem / key.pem(同名)
+        [ -f "${cert_dir}/cert.pem" ] && mv -f "${cert_dir}/cert.pem" "$CERT_FILE_PATH"
+        [ -f "${cert_dir}/key.pem" ] && mv -f "${cert_dir}/key.pem" "$KEY_FILE_PATH"
+    fi
+    if [ ! -f "$CERT_FILE_PATH" ] || [ ! -f "$KEY_FILE_PATH" ]; then
+        _error "证书生成失败, 需安装 openssl 或使用 xray tls cert"
+        return 1
+    fi
+    _success "TLS 证书已生成: $cert_dir"
+}
+
+_add_hysteria2() {
+    echo -e "\n  ${CYAN}=== Hysteria2 (QUIC · 可直连 · 需 TLS 证书) ===${NC}"
+    local port=$(_input_port)
+
+    # TLS 证书
+    local tag="xd-hy2-${port}"
+    _gen_hy2_cert "$tag" || return 1
+
+    # 认证密码
+    local auth
+    auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
+    read -rp "  认证密码 (回车随机): " custom_auth
+    auth=${custom_auth:-$auth}
+
+    # 拥塞控制
+    echo -e "  拥塞控制:"
+    echo -e "  ${GREEN}[1]${NC} bbr   (推荐, 自适应)"
+    echo -e "  ${GREEN}[2]${NC} brutal (固定带宽, 须知道服务器带宽)"
+    read -rp "  选择 (默认 1): " cc_choice
+    local congestion="bbr"
+    local brutal_up="" brutal_down=""
+    case "${cc_choice:-1}" in
+        2)
+            congestion="brutal"
+            echo -e "  ${YELLOW}brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
+            read -rp "  上传带宽 (服务器→客户端, 回车不限): " brutal_up
+            read -rp "  下载带宽 (客户端→服务器, 回车不限): " brutal_down
+            ;;
+    esac
+
+    local default_name="HY2-${port}"
+    read -rp "  节点名称 (默认 ${default_name}): " name
+    name=${name:-$default_name}
+
+    local listen="::"
+
+    # 构建 inbound JSON(条件字段, 用 jq 组装, 比模板灵活)
+    local cert_dir="$CERT_DIR/$tag"
+    local inbound
+    inbound=$(jq -n \
+        --arg listen "$listen" --argjson port "$port" --arg tag "$tag" \
+        --arg auth "$auth" \
+        --arg cert "$cert_dir/cert.pem" --arg key "$cert_dir/key.pem" \
+        --arg congestion "$congestion" \
+        --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
+        '{
+            listen: $listen, port: $port, protocol: "hysteria", tag: $tag,
+            settings: { version: 2 },
+            streamSettings: {
+                network: "hysteria", security: "tls",
+                tlsSettings: {
+                    alpn: ["h3"],
+                    certificates: [{ usage: "encipherment", certificateFile: $cert, keyFile: $key }]
+                },
+                hysteriaSettings: { version: 2, auth: $auth },
+                finalmask: { quicParams: (
+                    { congestion: $congestion }
+                    + (if $brutalUp != "" then { brutalUp: $brutalUp } else {} end)
+                    + (if $brutalDown != "" then { brutalDown: $brutalDown } else {} end)
+                ) }
+            },
+            sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
+        }') || { _error "inbound JSON 生成失败"; return 1; }
+
+    _commit_inbound "$inbound" || return 1
+
+    local addr
+    addr=$(_ask_link_addr)
+    local link_ip="$addr"
+    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
+
+    # hy2:// 分享链接(标准格式: hy2://password@host:port/?sni=...&congestion=...)
+    local link="hy2://${auth}@${link_ip}:${port}/?sni=hy2.local&congestion=${congestion}"
+    [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
+    [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
+    link="${link}#$(_url_encode "$name")"
+
+    # clash yaml
+    local clash="- {name: \"$name\", type: hysteria2, server: $addr, port: $port, password: \"$auth\", sni: hy2.local, \"congestion-control\": $congestion}"
+    _add_node_to_yaml "$clash"
+
+    # 元数据
+    _save_node_meta "$tag" "$(jq -n \
+        --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
+        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
+        --arg auth "$auth" --arg congestion "$congestion" \
+        --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
+        --arg link "$link" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,share_link:$link}')"
+
+    _success "节点 [${name}] 创建成功"
+    _tip "SNI 使用自签证书域名 hy2.local, 客户端须手动信任证书"
+    echo -e "  ${CYAN}拥塞控制:${NC} ${congestion}"
+    echo -e "  ${CYAN}分享链接:${NC} ${link}"
+}
+
+# ---------------------------------------------------------------------------
+# 分享链接重建(HY2 / Reality 域名切换后更新链接用)
+# ---------------------------------------------------------------------------
+
+# 重建 hy2:// 分享链接(从元数据读参数)
+# 用法:_rebuild_hy2_link <meta_file>
+_rebuild_hy2_link() {
+    local meta="$1"
+    local auth host port sni congestion brutal_up brutal_down name
+    auth=$(jq -r '.auth' "$meta")
+    host=$(jq -r '.link_addr' "$meta")
+    port=$(jq -r '.port' "$meta")
+    sni="hy2.local"
+    congestion=$(jq -r '.congestion' "$meta")
+    brutal_up=$(jq -r '.brutal_up // empty' "$meta")
+    brutal_down=$(jq -r '.brutal_down // empty' "$meta")
+    name=$(jq -r '.name' "$meta")
+    local link_ip="$host"
+    [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
+    local link="hy2://${auth}@${link_ip}:${port}/?sni=${sni}&congestion=${congestion}"
+    [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
+    [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
+    link="${link}#$(_url_encode "$name")"
+    echo "$link"
+}
+
+# 重建 vless:// reality 分享链接(从元数据读参数)
+# 用法:_rebuild_reality_link <meta_file> [new_sni]  不传 new_sni 则用 meta 里的 sni
+_rebuild_reality_link() {
+    local meta="$1" new_sni="${2:-}"
+    local uuid host port proto sni pk sid pqv name path
+    uuid=$(jq -r '.uuid' "$meta")
+    host=$(jq -r '.link_addr' "$meta")
+    port=$(jq -r '.port' "$meta")
+    proto=$(jq -r '.protocol' "$meta")
+    sni=$(jq -r '.sni' "$meta")
+    [ -n "$new_sni" ] && sni="$new_sni"
+    pk=$(jq -r '.public_key' "$meta")
+    sid=$(jq -r '.short_id' "$meta")
+    pqv=$(jq -r '.mldsa65_verify // empty' "$meta")
+    name=$(jq -r '.name' "$meta")
+    path=$(jq -r '.path // empty' "$meta")
+    local link_ip="$host"
+    [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
+    local link
+    case "$proto" in
+        vless-tcp-reality-vision)
+            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
+            ;;
+        vless-xhttp-reality)
+            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
+            ;;
+        *) echo ""; return 1 ;;
+    esac
+    [ -n "$pqv" ] && link="${link}&pqv=${pqv}"
+    link="${link}#$(_url_encode "$name")"
+    echo "$link"
 }
 
 # ---------------------------------------------------------------------------

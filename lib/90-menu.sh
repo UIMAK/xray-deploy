@@ -67,6 +67,28 @@ _print_status_bar() {
 }
 
 # ---------------------------------------------------------------------------
+# 节点类型检测(用于条件显示管理菜单)
+# ---------------------------------------------------------------------------
+_has_hy2_nodes() {
+    [ -d "$NODES_DIR" ] || return 1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        [ "$(jq -r '.protocol' "$f" 2>/dev/null)" = "hysteria2" ] && return 0
+    done
+    return 1
+}
+
+_has_reality_nodes() {
+    [ -d "$NODES_DIR" ] || return 1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        case "$proto" in *reality*) return 0 ;; esac
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # 主菜单
 # ---------------------------------------------------------------------------
 _main_menu() {
@@ -82,43 +104,85 @@ _main_menu() {
         echo -e "  ${GREEN}[3]${NC} 删除节点"
         echo -e "  ${GREEN}[4]${NC} 修改端口"
         echo -e "  ${GREEN}[5]${NC} 更新监听"
+        _has_hy2_nodes && echo -e "  ${GREEN}[6]${NC} Hysteria2 管理 (brutal 模式/带宽)"
+        if _has_reality_nodes; then
+            if _has_hy2_nodes; then
+                echo -e "  ${GREEN}[7]${NC} Reality 域名管理"
+            else
+                echo -e "  ${GREEN}[6]${NC} Reality 域名管理"
+            fi
+        fi
         echo
         echo -e "  ${CYAN}【核心与服务】${NC}"
-        echo -e "  ${GREEN}[6]${NC} 安装/更新或切换 Xray 核心(稳定/预览)"
-        echo -e "  ${GREEN}[7]${NC} Geo 数据自动更新"
-        echo -e "  ${GREEN}[8]${NC} cloudflared 管理"
+        local _off=0
+        _has_hy2_nodes && _off=$((_off+1))
+        _has_reality_nodes && _off=$((_off+1))
+        local _core=$((_off+6))
+        local _ops_start=$((_core+3))
+        printf "  ${GREEN}[%d]${NC} 安装/更新或切换 Xray 核心(稳定/预览)\n" "$_core"
+        printf "  ${GREEN}[%d]${NC} Geo 数据自动更新\n" $((_core+1))
+        printf "  ${GREEN}[%d]${NC} cloudflared 管理\n" $((_core+2))
         echo
         echo -e "  ${CYAN}【运维】${NC}"
-        printf "  ${GREEN}[%2d]${NC} 检测脚本更新\n" 9
-        printf "  ${GREEN}[%2d]${NC} 重启 Xray\n" 10
-        printf "  ${GREEN}[%2d]${NC} 停止 Xray\n" 11
-        printf "  ${GREEN}[%2d]${NC} 查看状态\n" 12
-        printf "  ${GREEN}[%2d]${NC} 查看日志\n" 13
-        printf "  ${GREEN}[%2d]${NC} 检查配置(xray -test)\n" 14
-        printf "  ${GREEN}[%2d]${NC} 卸载\n" 15
+        printf "  ${GREEN}[%2d]${NC} 检测脚本更新\n" "$_ops_start"
+        printf "  ${GREEN}[%2d]${NC} 重启 Xray\n" $((_ops_start+1))
+        printf "  ${GREEN}[%2d]${NC} 停止 Xray\n" $((_ops_start+2))
+        printf "  ${GREEN}[%2d]${NC} 查看状态\n" $((_ops_start+3))
+        printf "  ${GREEN}[%2d]${NC} 查看日志\n" $((_ops_start+4))
+        printf "  ${GREEN}[%2d]${NC} 检查配置(xray -test)\n" $((_ops_start+5))
+        printf "  ${GREEN}[%2d]${NC} 卸载\n" $((_ops_start+6))
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
         read -rp "  请选择: " choice
+        # 节点管理(固定编号 1-5)
         case "$choice" in
-            1)  _add_node ;;
-            2)  _view_nodes ;;
-            3)  _delete_node ;;
-            4)  _modify_port ;;
-            5)  _update_listen ;;
-            6)  _xray_core_menu ;;
-            7)  _geo_menu ;;
-            8)  _cloudflared_menu ;;
-            9)  _check_script_update ;;
-            10) _manage_xray restart; _success "已重启"; _press_any_key ;;
-            11) _manage_xray stop; _success "已停止"; _press_any_key ;;
-            12) _view_status ;;
-            13) _view_log ;;
-            14) _check_config ;;
-            15) _uninstall_menu ;;
-            0)  echo -e "${CYAN}再见${NC}"; exit 0 ;;
-            *)  _warn "无效选择"; _press_any_key ;;
+            1) _add_node; continue ;;
+            2) _view_nodes; continue ;;
+            3) _delete_node; continue ;;
+            4) _modify_port; continue ;;
+            5) _update_listen; continue ;;
         esac
+        # 条件管理入口
+        if [ "$choice" = "6" ] && _has_hy2_nodes; then
+            _hy2_manage_menu; continue
+        fi
+        if _has_hy2_nodes && [ "$choice" = "7" ] && _has_reality_nodes; then
+            _reality_domain_menu; continue
+        elif ! _has_hy2_nodes && [ "$choice" = "6" ] && _has_reality_nodes; then
+            _reality_domain_menu; continue
+        fi
+        # 动态编号: 核心与服务 / 运维
+        local _off=0
+        _has_hy2_nodes && _off=$((_off+1))
+        _has_reality_nodes && _off=$((_off+1))
+        local _core=$((_off+6))
+        local _ops_start=$((_core+3))
+        if [ "$choice" = "$_core" ]; then
+            _xray_core_menu
+        elif [ "$choice" = "$((_core+1))" ]; then
+            _geo_menu
+        elif [ "$choice" = "$((_core+2))" ]; then
+            _cloudflared_menu
+        elif [ "$choice" = "$_ops_start" ]; then
+            _check_script_update
+        elif [ "$choice" = "$((_ops_start+1))" ]; then
+            _manage_xray restart; _success "已重启"; _press_any_key
+        elif [ "$choice" = "$((_ops_start+2))" ]; then
+            _manage_xray stop; _success "已停止"; _press_any_key
+        elif [ "$choice" = "$((_ops_start+3))" ]; then
+            _view_status
+        elif [ "$choice" = "$((_ops_start+4))" ]; then
+            _view_log
+        elif [ "$choice" = "$((_ops_start+5))" ]; then
+            _check_config
+        elif [ "$choice" = "$((_ops_start+6))" ]; then
+            _uninstall_menu
+        elif [ "$choice" = "0" ]; then
+            echo -e "${CYAN}再见${NC}"; exit 0
+        else
+            _warn "无效选择"; _press_any_key
+        fi
     done
 }
 
@@ -266,7 +330,7 @@ _reset_config() {
 # 检测脚本更新(问题3)
 # 对比本地 SCRIPT_VERSION 与远程 VERSION 文件; 有新版提示重新跑 install.sh
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION="0.1.5"
+SCRIPT_VERSION="0.1.6"
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
 
 _check_script_update() {
@@ -300,5 +364,221 @@ _check_script_update() {
             *) _info "已取消更新" ;;
         esac
     fi
+    _press_any_key
+}
+
+# ---------------------------------------------------------------------------
+# Hysteria2 管理子菜单
+# ---------------------------------------------------------------------------
+_hy2_manage_menu() {
+    while true; do
+        clear
+        echo
+        echo -e "  ${CYAN}【Hysteria2 管理】${NC}"
+        echo
+        echo -e "  ${GREEN}[1]${NC} 切换 brutal / bbr 模式"
+        echo -e "  ${GREEN}[2]${NC} 调整 brutal 带宽"
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        echo
+        read -rp "  请选择: " choice
+        case "$choice" in
+            1) _hy2_toggle_brutal ;;
+            2) _hy2_adjust_bandwidth ;;
+            0) return ;;
+            *) _warn "无效选择"; _press_any_key ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Hysteria2: 切换 brutal / bbr
+# ---------------------------------------------------------------------------
+_hy2_toggle_brutal() {
+    clear
+    _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    echo; echo -e "  ${CYAN}【切换 brutal / bbr】${NC}"
+    local tags=() i=1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        local tag name cc
+        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); cc=$(jq -r '.congestion' "$f")
+        tags+=("$tag")
+        printf "  ${GREEN}[%d]${NC} %-20s 当前: %s\n" "$i" "$name" "$cc"
+        i=$((i+1))
+    done
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    read -rp "  选择节点: " choice
+    [ "$choice" = "0" ] && return
+    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+
+    local meta="$NODES_DIR/${tag}.json"
+    local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
+    local new_cc
+    if [ "$cur_cc" = "brutal" ]; then
+        new_cc="bbr"
+        _backup_config
+        local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+        jq --arg t "$tag" \
+           '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
+            {congestion: "bbr"}' "$CONFIG_FILE" > "$tmp" 2>/dev/null
+        mv -f "$tmp" "$CONFIG_FILE"
+        if ! _xray_test_config; then
+            _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
+        fi
+        _manage_xray restart 2>/dev/null || true
+        jq --arg cc "$new_cc" '.congestion=$cc | .brutal_up="" | .brutal_down=""' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        local link; link=$(_rebuild_hy2_link "$meta")
+        jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        _success "已切换为 bbr 模式"
+    else
+        new_cc="brutal"
+        echo -e "  ${YELLOW}brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
+        local brutal_up="" brutal_down=""
+        read -rp "  上传带宽 (回车不限): " brutal_up
+        read -rp "  下载带宽 (回车不限): " brutal_down
+        _backup_config
+        local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+        jq --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
+           '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
+            ({congestion: "brutal"}
+             + (if $up != "" then {brutalUp: $up} else {} end)
+             + (if $down != "" then {brutalDown: $down} else {} end))' \
+           "$CONFIG_FILE" > "$tmp" 2>/dev/null
+        mv -f "$tmp" "$CONFIG_FILE"
+        if ! _xray_test_config; then
+            _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
+        fi
+        _manage_xray restart 2>/dev/null || true
+        jq --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" \
+           '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        local link; link=$(_rebuild_hy2_link "$meta")
+        jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        _success "已切换为 brutal 模式"
+        [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
+        [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
+    fi
+    _press_any_key
+}
+
+# ---------------------------------------------------------------------------
+# Hysteria2: 调整 brutal 带宽(仅 brutal 模式)
+# ---------------------------------------------------------------------------
+_hy2_adjust_bandwidth() {
+    clear
+    _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    echo; echo -e "  ${CYAN}【调整 brutal 带宽】${NC}"
+    local tags=() i=1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        local tag name cc up down
+        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
+        cc=$(jq -r '.congestion' "$f"); up=$(jq -r '.brutal_up // empty' "$f"); down=$(jq -r '.brutal_down // empty' "$f")
+        tags+=("$tag")
+        printf "  ${GREEN}[%d]${NC} %-20s cc=%-6s up=%-12s down=%s\n" "$i" "$name" "$cc" "${up:--}" "${down:--}"
+        i=$((i+1))
+    done
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    read -rp "  选择节点: " choice
+    [ "$choice" = "0" ] && return
+    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+
+    local meta="$NODES_DIR/${tag}.json"
+    local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
+    if [ "$cur_cc" != "brutal" ]; then
+        _warn "该节点当前为 ${cur_cc} 模式, 非 brutal 无需设带宽"
+        _press_any_key; return
+    fi
+    local cur_up cur_down
+    cur_up=$(jq -r '.brutal_up // empty' "$meta"); cur_down=$(jq -r '.brutal_down // empty' "$meta")
+    echo -e "  当前: 上传=${CYAN}${cur_up:-不限}${NC}  下载=${CYAN}${cur_down:-不限}${NC}"
+    echo -e "  ${YELLOW}格式: 100 mbps / 10m / 1g  (回车保持不变)${NC}"
+    local new_up new_down
+    read -rp "  新上传带宽: " new_up
+    new_up=${new_up:-$cur_up}
+    read -rp "  新下载带宽: " new_down
+    new_down=${new_down:-$cur_down}
+
+    _backup_config
+    local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    jq --arg t "$tag" --arg up "$new_up" --arg down "$new_down" \
+       '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
+        ({congestion: "brutal"}
+         + (if $up != "" then {brutalUp: $up} else {} end)
+         + (if $down != "" then {brutalDown: $down} else {} end))' \
+       "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    mv -f "$tmp" "$CONFIG_FILE"
+    if ! _xray_test_config; then
+        _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
+    fi
+    _manage_xray restart 2>/dev/null || true
+    jq --arg up "$new_up" --arg down "$new_down" '.brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    local link; link=$(_rebuild_hy2_link "$meta")
+    jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    _success "带宽已更新: 上传=${new_up:-不限}  下载=${new_down:-不限}"
+    _press_any_key
+}
+
+# ---------------------------------------------------------------------------
+# Reality 域名管理(切换 target SNI)
+# ---------------------------------------------------------------------------
+_reality_domain_menu() {
+    clear
+    _has_reality_nodes || { _warn "暂无 Reality 节点"; _press_any_key; return; }
+    echo; echo -e "  ${CYAN}【Reality 域名管理】${NC}"
+    local tags=() i=1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        case "$proto" in *reality*) ;; *) continue ;; esac
+        local tag name sni
+        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); sni=$(jq -r '.sni' "$f")
+        tags+=("$tag")
+        printf "  ${GREEN}[%d]${NC} %-24s 当前域名: %s\n" "$i" "$name" "$sni"
+        i=$((i+1))
+    done
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Reality 节点"; _press_any_key; return; }
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    read -rp "  选择节点: " choice
+    [ "$choice" = "0" ] && return
+    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+
+    local meta="$NODES_DIR/${tag}.json"
+    local cur_sni; cur_sni=$(jq -r '.sni' "$meta")
+    echo -e "  当前域名: ${CYAN}${cur_sni}${NC}"
+    local new_sni
+    read -rp "  新伪装域名 (回车取消): " new_sni
+    [ -z "$new_sni" ] && { _info "已取消"; _press_any_key; return; }
+
+    local new_target="${new_sni}:443"
+
+    _backup_config
+    local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    jq --arg t "$tag" --arg sni "$new_sni" --arg target "$new_target" \
+       '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+        (.target = $target | .serverNames = [$sni])' \
+       "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    mv -f "$tmp" "$CONFIG_FILE"
+    if ! _xray_test_config; then
+        _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
+    fi
+    _manage_xray restart 2>/dev/null || true
+
+    # 更新元数据 + 分享链接
+    jq --arg sni "$new_sni" '.sni=$sni' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    local newlink; newlink=$(_rebuild_reality_link "$meta")
+    jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+
+    _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"
+    _tip "客户端须更新 SNI 为 ${new_sni} (pbk/sid 不变, 更新分享链接即可)"
+    echo -e "  ${CYAN}新分享链接:${NC} ${newlink}"
     _press_any_key
 }
