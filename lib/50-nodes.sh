@@ -349,7 +349,7 @@ _add_vless_tcp_reality_vision() {
     fi
 
     local tag="xd-reality-vision-${port}"
-    local tunnel_tag="xd-tunnel-${tunnel_port}"
+    local tunnel_tag="Tunnel-${sni}-${tunnel_port}-${port}"
     local listen="::"
 
     # 渲染 tunnel inbound
@@ -421,7 +421,7 @@ _add_vless_xhttp_reality() {
     fi
 
     local tag="xd-reality-xhttp-${port}"
-    local tunnel_tag="xd-tunnel-${tunnel_port}"
+    local tunnel_tag="Tunnel-${sni}-${tunnel_port}-${port}"
     local listen="::"
 
     R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
