@@ -104,18 +104,13 @@ _main_menu() {
         echo -e "  ${GREEN}[3]${NC} 删除节点"
         echo -e "  ${GREEN}[4]${NC} 修改端口"
         echo -e "  ${GREEN}[5]${NC} 更新监听"
-        _has_hy2_nodes && echo -e "  ${GREEN}[6]${NC} Hysteria2 管理 (brutal 模式/带宽)"
+        echo -e "  ${GREEN}[6]${NC} Hysteria2 管理"
         if _has_reality_nodes; then
-            if _has_hy2_nodes; then
-                echo -e "  ${GREEN}[7]${NC} Reality 域名管理"
-            else
-                echo -e "  ${GREEN}[6]${NC} Reality 域名管理"
-            fi
+            echo -e "  ${GREEN}[7]${NC} Reality 域名管理"
         fi
         echo
         echo -e "  ${CYAN}【核心与服务】${NC}"
-        local _off=0
-        _has_hy2_nodes && _off=$((_off+1))
+        local _off=1
         _has_reality_nodes && _off=$((_off+1))
         local _core=$((_off+6))
         local _ops_start=$((_core+3))
@@ -144,17 +139,15 @@ _main_menu() {
             5) _update_listen; continue ;;
         esac
         # 条件管理入口
-        if [ "$choice" = "6" ] && _has_hy2_nodes; then
+        if [ "$choice" = "6" ]; then
             _hy2_manage_menu; continue
         fi
-        if _has_hy2_nodes && [ "$choice" = "7" ] && _has_reality_nodes; then
-            _reality_domain_menu; continue
-        elif ! _has_hy2_nodes && [ "$choice" = "6" ] && _has_reality_nodes; then
+        if [ "$choice" = "7" ] && _has_reality_nodes; then
             _reality_domain_menu; continue
         fi
         # 动态编号: 核心与服务 / 运维
-        local _off=0
-        _has_hy2_nodes && _off=$((_off+1))
+        local _off=1
+        _has_reality_nodes && _off=$((_off+1))
         _has_reality_nodes && _off=$((_off+1))
         local _core=$((_off+6))
         local _ops_start=$((_core+3))

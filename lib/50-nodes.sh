@@ -15,7 +15,7 @@ PROTOCOLS=(
     "vless-xhttp-cdn|VLESS+XHTTP(无TLS)|none|cdn|必须套CDN·禁止直连"
     "vless-ws-cdn|VLESS+WS(无TLS)|none|cdn|必须套CDN·禁止直连"
     "shadowsocks|Shadowsocks|none|direct|"
-    "hysteria2|Hysteria2|tls|direct|QUIC·需TLS证书"
+    "hysteria2|Hysteria2               |tls|direct|必须套TLS证书·QUIC"
 )
 
 # ---------------------------------------------------------------------------
@@ -569,9 +569,23 @@ _add_hysteria2() {
     echo -e "\n  ${CYAN}=== Hysteria2 (QUIC · 可直连 · 需 TLS 证书) ===${NC}"
     local port=$(_input_port)
 
-    # TLS 证书
+    # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
-    _gen_hy2_cert "$tag" || return 1
+    local cert_file="" key_file=""
+    echo -e "  TLS 证书:"
+    echo -e "  回车使用自签证书, 或输入证书文件路径"
+    read -rp "  cert 路径 (回车自签): " custom_cert
+    if [ -n "$custom_cert" ]; then
+        read -rp "  key 路径: " custom_key
+        if [ ! -f "$custom_cert" ] || [ ! -f "$custom_key" ]; then
+            _error "证书文件不存在"; return 1
+        fi
+        cert_file="$custom_cert"; key_file="$custom_key"
+        _info "使用自定义证书: $cert_file"
+    else
+        _gen_hy2_cert "$tag" || return 1
+        cert_file="$CERT_FILE_PATH"; key_file="$KEY_FILE_PATH"
+    fi
 
     # 认证密码
     local auth
@@ -602,12 +616,11 @@ _add_hysteria2() {
     local listen="::"
 
     # 构建 inbound JSON(条件字段, 用 jq 组装, 比模板灵活)
-    local cert_dir="$CERT_DIR/$tag"
     local inbound
     inbound=$(jq -n \
         --arg listen "$listen" --argjson port "$port" --arg tag "$tag" \
         --arg auth "$auth" \
-        --arg cert "$cert_dir/cert.pem" --arg key "$cert_dir/key.pem" \
+        --arg cert "$cert_file" --arg key "$key_file" \
         --arg congestion "$congestion" \
         --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
         '{
