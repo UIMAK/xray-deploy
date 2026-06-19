@@ -16,7 +16,7 @@
         "network": "raw",
         "security": "reality",
         "realitySettings": {
-            "dest": "127.0.0.1:{{TUNNEL_PORT}}",
+            "target": "127.0.0.1:{{TUNNEL_PORT}}",
             "serverNames": [
                 "{{SERVER_NAME}}"
             ],

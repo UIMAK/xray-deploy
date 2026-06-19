@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# lib/50-nodes.sh — 节点管理(5 协议)
+# lib/50-nodes.sh — 节点管理(6 协议)
 # 需求 R6(协议集) + R7(按节点改监听) + R8(Reality 后量子)
 # 配置以官方为准(design.md 配置依据表), 模板在 templates/ 下, 占位符 {{...}} 渲染.
 # 节点元数据: $NODES_DIR/<tag>.json (按节点独立文件, 便于 R7 单节点改监听)
@@ -212,16 +212,6 @@ _commit_reality_inbound() {
             {inboundTag: [$tg], outboundTag: "block"}]' || return 1
 }
 
-# 删除 Tunnel inbound + 对应路由规则
-_remove_reality_tunnel() {
-    local tg="$1"
-    [ -z "$tg" ] && return 0
-    [ -f "$CONFIG_FILE" ] || return 0
-    _mutate_config --arg tg "$tg" \
-       '.inbounds |= map(select(.tag != $tg))
-        | .routing.rules |= map(select(.inboundTag == null or (.inboundTag | index($tg)) == null))' || return 1
-}
-
 # ---------------------------------------------------------------------------
 # 保存节点元数据(每节点独立文件)
 # 用法:_save_node_meta <tag> <json_object>
@@ -253,17 +243,6 @@ _ask_link_addr() {
             _warn "不能为空"
         done
     fi
-}
-
-# ---------------------------------------------------------------------------
-# 读取所有节点 tag 列表
-# ---------------------------------------------------------------------------
-_list_node_tags() {
-    [ -d "$NODES_DIR" ] || return 0
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        basename "$f" .json
-    done
 }
 
 _node_count() {
@@ -366,7 +345,7 @@ _add_vless_tcp_reality_vision() {
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -799,7 +778,7 @@ _rebuild_reality_link() {
     local link
     case "$proto" in
         vless-tcp-reality-vision)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
             ;;
         vless-xhttp-reality)
             link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"

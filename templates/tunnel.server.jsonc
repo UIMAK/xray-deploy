@@ -4,9 +4,9 @@
     "protocol": "tunnel",
     "tag": "{{TAG}}",
     "settings": {
-        "address": "{{TARGET}}",
-        "port": 443,
-        "network": "tcp"
+        "allowedNetwork": "tcp",
+        "rewriteAddress": "{{TARGET}}",
+        "rewritePort": 443
     },
     "sniffing": {
         "enabled": true,

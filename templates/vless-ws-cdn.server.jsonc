@@ -13,12 +13,10 @@
         "decryption": "none"
     },
     "streamSettings": {
-        "network": "ws",
+        "network": "websocket",
         "wsSettings": {
             "path": "{{PATH}}",
-            "headers": {
-                "Host": "{{HOST}}"
-            }
+            "host": "{{HOST}}"
         }
     },
     "sniffing": {

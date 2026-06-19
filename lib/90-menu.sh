@@ -515,10 +515,9 @@ _hy2_adjust_bandwidth() {
     _backup_config
     local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
     jq --arg t "$tag" --arg up "$new_up" --arg down "$new_down" \
-       '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
-        ({congestion: "brutal"}
-         + (if $up != "" then {brutalUp: $up} else {} end)
-         + (if $down != "" then {brutalDown: $down} else {} end))' \
+       '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) |=
+        (. + (if $up != "" then {brutalUp: $up} else {} end)
+             + (if $down != "" then {brutalDown: $down} else {} end))' \
        "$CONFIG_FILE" > "$tmp" 2>/dev/null
     mv -f "$tmp" "$CONFIG_FILE"
     if ! _xray_test_config; then
@@ -583,7 +582,7 @@ _reality_domain_menu() {
            '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
             (.serverNames = [$sni] | .mldsa65Seed = $seed)
             | if $tg != "" then
-                (.inbounds[] | select(.tag == $tg) | .settings.address) = $dom
+                (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
                 | .routing.rules |= map(
                     if .inboundTag != null and (.inboundTag | index($tg)) != null
                     then if .domain != null then .domain = [$dom] else . end
@@ -596,7 +595,7 @@ _reality_domain_menu() {
            '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
             (.serverNames = [$sni] | del(.mldsa65Seed))
             | if $tg != "" then
-                (.inbounds[] | select(.tag == $tg) | .settings.address) = $dom
+                (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
                 | .routing.rules |= map(
                     if .inboundTag != null and (.inboundTag | index($tg)) != null
                     then if .domain != null then .domain = [$dom] else . end
