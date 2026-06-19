@@ -71,9 +71,12 @@ _ensure_iptables() {
 _parse_hop_ranges() {
     local input="$1"
     local result=""
-    local IFS=','
+    local entries
+    # 用 subshell + IFS 拆分逗号分隔的条目, 避免 IFS 污染整个函数
+    IFS=',' read -ra entries <<< "$input"
     local all_starts=() all_ends=()
-    for entry in $input; do
+    local entry
+    for entry in "${entries[@]}"; do
         entry=$(echo "$entry" | tr -d ' ')
         [ -z "$entry" ] && continue
         local start end
