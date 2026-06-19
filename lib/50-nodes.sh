@@ -714,7 +714,7 @@ _add_hysteria2() {
 
     # hy2:// 分享链接(标准格式: hy2://password@host:port/?sni=...&insecure=...&congestion=...)
     local link="hy2://${auth}@${link_ip}:${port}/?sni=${sni}"
-    [ "$self_signed" = "true" ] && link="${link}&insecure=1"
+    [ "$self_signed" = "true" ] && link="${link}&insecure=1&allowInsecure=1"
     link="${link}&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
@@ -766,7 +766,7 @@ _rebuild_hy2_link() {
     local link_ip="$host"
     [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
     local link="hy2://${auth}@${link_ip}:${port}/?sni=${sni}"
-    [ "$self_signed" = "true" ] && link="${link}&insecure=1"
+    [ "$self_signed" = "true" ] && link="${link}&insecure=1&allowInsecure=1"
     link="${link}&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
