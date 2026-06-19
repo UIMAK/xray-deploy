@@ -558,12 +558,28 @@ _reality_domain_menu() {
 
     local new_target="${new_sni}:443"
 
+    # 后量子检测(新域名可能支持或不支持)
+    local pq_seed="" pq_verify=""
+    if _detect_reality_pq "$new_target"; then
+        pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
+        _info "新域名支持后量子签名"
+    fi
+
     _backup_config
     local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    jq --arg t "$tag" --arg sni "$new_sni" --arg target "$new_target" \
-       '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-        (.target = $target | .serverNames = [$sni])' \
-       "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    if [ -n "$pq_seed" ]; then
+        # 启用后量子: 更新 target/serverNames + 添加 mldsa65Seed
+        jq --arg t "$tag" --arg sni "$new_sni" --arg target "$new_target" --arg seed "$pq_seed" \
+           '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+            (.target = $target | .serverNames = [$sni] | .mldsa65Seed = $seed)' \
+           "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    else
+        # 不支持后量子: 更新 target/serverNames + 移除 mldsa65Seed
+        jq --arg t "$tag" --arg sni "$new_sni" --arg target "$new_target" \
+           '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+            (.target = $target | .serverNames = [$sni] | del(.mldsa65Seed))' \
+           "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    fi
     mv -f "$tmp" "$CONFIG_FILE"
     if ! _xray_test_config; then
         _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
@@ -571,12 +587,14 @@ _reality_domain_menu() {
     _manage_xray restart 2>/dev/null || true
 
     # 更新元数据 + 分享链接
-    jq --arg sni "$new_sni" '.sni=$sni' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    jq --arg sni "$new_sni" --arg pqv "$pq_verify" '.sni=$sni | .mldsa65_verify=$pqv' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
     local newlink; newlink=$(_rebuild_reality_link "$meta")
     jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
 
     _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"
-    _tip "客户端须更新 SNI 为 ${new_sni} (pbk/sid 不变, 更新分享链接即可)"
+    _tip "客户端须更新 SNI 为 ${new_sni} (pbk/sid 不变)"
+    [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"
+    [ -z "$pq_verify" ] && _warn "新域名不支持后量子, 已移除 pqv 参数"
     echo -e "  ${CYAN}新分享链接:${NC} ${newlink}"
     _press_any_key
 }
