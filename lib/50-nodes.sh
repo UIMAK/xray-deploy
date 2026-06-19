@@ -33,231 +33,15 @@ _normalize_bandwidth() {
 }
 
 # ---------------------------------------------------------------------------
-# iptables / 端口跳跃辅助(Hysteria2 端口跳跃用)
-# 原理: iptables nat PREROUTING DNAT 把 UDP 端口范围转发到 hy2 监听端口
-# 支持格式: "3010-3020" / "3050" / "3010-3020,3050,3100-3110" (逗号分隔混合)
+# 通用端口输入(带冲突检测)
 # ---------------------------------------------------------------------------
 
-# 确保 iptables 已安装(Debian 同时装 iptables-persistent 做开机恢复)
-_ensure_iptables() {
-    if command -v iptables >/dev/null 2>&1; then
-        return 0
-    fi
-    _info "iptables 未安装, 正在安装..."
-    local fam
-    fam=$(_detect_os_family)
-    case "$fam" in
-        debian)
-            _pkg_install iptables || return 1
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq >/dev/null 2>&1
-            apt-get install -y -qq --no-install-recommends iptables-persistent >/dev/null 2>&1 || true
-            ;;
-        *)
-            _pkg_install iptables || return 1
-            ;;
-    esac
-    if ! command -v iptables >/dev/null 2>&1; then
-        _error "iptables 安装失败, 请手动安装"
-        return 1
-    fi
-    _success "iptables 已安装"
-}
+# ---------------------------------------------------------------------------
+# 通用端口输入(带冲突检测)
+# ---------------------------------------------------------------------------
 
-# 解析端口范围字符串 → "start:end start:end ..."
-# 输入: "3010-3020,3050,3100-3110"
-# 输出: "3010:3020 3050 3100:3110"  (单端口省略冒号, 避免 iptables -D 匹配问题)
-# 验证: 端口合法性 + 范围间无重叠
-_parse_hop_ranges() {
-    local input="$1"
-    local result=""
-    local entries
-    # 用 subshell + IFS 拆分逗号分隔的条目, 避免 IFS 污染整个函数
-    IFS=',' read -ra entries <<< "$input"
-    local all_starts=() all_ends=()
-    local entry
-    for entry in "${entries[@]}"; do
-        entry=$(echo "$entry" | tr -d ' ')
-        [ -z "$entry" ] && continue
-        local start end
-        if echo "$entry" | grep -q '-'; then
-            start=$(echo "$entry" | cut -d'-' -f1)
-            end=$(echo "$entry" | cut -d'-' -f2)
-        else
-            start="$entry"
-            end="$entry"
-        fi
-        if ! _validate_port "$start" || ! _validate_port "$end"; then
-            _error "无效端口: $entry"
-            return 1
-        fi
-        if [ "$start" -gt "$end" ]; then
-            _error "起始端口大于结束端口: $entry"
-            return 1
-        fi
-        # 检查与已有范围的重叠
-        local i
-        for ((i=0; i<${#all_starts[@]}; i++)); do
-            if [ "$start" -le "${all_ends[$i]}" ] && [ "$end" -ge "${all_starts[$i]}" ]; then
-                _error "范围重叠: $entry 与 ${all_starts[$i]}-${all_ends[$i]}"
-                return 1
-            fi
-        done
-        all_starts+=("$start")
-        all_ends+=("$end")
-        # 单端口用裸端口号, 范围用 start:end(iptables -D 匹配一致性)
-        if [ "$start" = "$end" ]; then
-            result="${result:+$result }${start}"
-        else
-            result="${result:+$result }${start}:${end}"
-        fi
-    done
-    [ -z "$result" ] && { _error "无有效端口范围"; return 1; }
-    echo "$result"
-}
-
-# 为多个范围添加 DNAT 规则
-# 用法: _hy2_add_hop_rules <hy2_port> <range1> [range2 ...]
-#   range 格式: "start:end" (单端口也用 start:start)
-_hy2_add_hop_rules() {
-    local hy2_port="$1"; shift
-    local range
-    for range in "$@"; do
-        iptables -t nat -A PREROUTING -p udp --dport "${range}" \
-            -m comment --comment "xray-deploy-hy2-hop" \
-            -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || return 1
-        if command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -t nat -A PREROUTING -p udp --dport "${range}" \
-                -m comment --comment "xray-deploy-hy2-hop" \
-                -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || true
-        fi
-    done
-}
-
-# 删除多个范围的 DNAT 规则
-# 用法: _hy2_remove_hop_rules <hy2_port> <range1> [range2 ...]
-_hy2_remove_hop_rules() {
-    local hy2_port="$1"; shift
-    local range
-    for range in "$@"; do
-        iptables -t nat -D PREROUTING -p udp --dport "${range}" \
-            -m comment --comment "xray-deploy-hy2-hop" \
-            -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || true
-        if command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -t nat -D PREROUTING -p udp --dport "${range}" \
-                -m comment --comment "xray-deploy-hy2-hop" \
-                -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || true
-        fi
-    done
-}
-
-# 持久化 iptables 规则
-_hy2_persist_iptables() {
-    if command -v iptables-save >/dev/null 2>&1; then
-        local fam
-        fam=$(_detect_os_family)
-        case "$fam" in
-            debian)
-                mkdir -p /etc/iptables
-                iptables-save > /etc/iptables/rules.v4 2>/dev/null
-                if command -v ip6tables-save >/dev/null 2>&1; then
-                    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-                fi
-                ;;
-            alpine)
-                if [ -x /etc/init.d/iptables ]; then
-                    /etc/init.d/iptables save >/dev/null 2>&1 || true
-                else
-                    mkdir -p /etc/iptables
-                    iptables-save > /etc/iptables/rules-save 2>/dev/null
-                fi
-                ;;
-            *)
-                mkdir -p /etc/iptables
-                iptables-save > /etc/iptables/rules.v4 2>/dev/null
-                ;;
-        esac
-    fi
-}
-
-# 从元数据读取端口跳跃范围(兼容旧格式 hop_start/hop_end)
-# 输出: "start:end start:end ..." 空格分隔, 无则输出空
-_read_hop_ranges() {
-    local meta="$1"
-    local ranges
-    ranges=$(jq -r '.hop_ranges // empty' "$meta" 2>/dev/null)
-    if [ -n "$ranges" ]; then
-        # 新格式: 逗号分隔 → 空格分隔, - 替换为 :
-        echo "$ranges" | tr ',' ' ' | tr '-' ':'
-        return
-    fi
-    # 旧格式兼容: hop_start + hop_end
-    local hop_s hop_e
-    hop_s=$(jq -r '.hop_start // empty' "$meta" 2>/dev/null)
-    hop_e=$(jq -r '.hop_end // empty' "$meta" 2>/dev/null)
-    if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
-        if [ "$hop_s" = "$hop_e" ]; then
-            echo "$hop_s"
-        else
-            echo "${hop_s}:${hop_e}"
-        fi
-    fi
-}
-
-# 从元数据读取端口跳跃范围(人类可读格式)
-# 输出: "3010-3020,3050" 或空
-_read_hop_ranges_display() {
-    local meta="$1"
-    local ranges
-    ranges=$(jq -r '.hop_ranges // empty' "$meta" 2>/dev/null)
-    if [ -n "$ranges" ]; then
-        echo "$ranges"
-        return
-    fi
-    local hop_s hop_e
-    hop_s=$(jq -r '.hop_start // empty' "$meta" 2>/dev/null)
-    hop_e=$(jq -r '.hop_end // empty' "$meta" 2>/dev/null)
-    if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
-        if [ "$hop_s" = "$hop_e" ]; then
-            echo "$hop_s"
-        else
-            echo "${hop_s}-${hop_e}"
-        fi
-    fi
-}
-
-# 检查是否已有 xray-deploy 的端口跳跃规则(简单存在性检查)
-_hy2_has_any_hop_rules() {
-    command -v iptables >/dev/null 2>&1 || return 1
-    iptables -t nat -S PREROUTING 2>/dev/null | grep -q "xray-deploy-hy2-hop"
-}
-
-# 列出所有 xray-deploy 端口跳跃规则
-_hy2_list_all_hop_rules() {
-    command -v iptables >/dev/null 2>&1 || return
-    iptables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop" || true
-}
-
-# 清理所有节点的端口跳跃 iptables 规则(供 _reset_config / _uninstall_xray 调用)
-_hy2_cleanup_all_hops() {
-    command -v iptables >/dev/null 2>&1 || return 0
-    [ -d "$NODES_DIR" ] || return 0
-    local found=0
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        [ "$proto" = "hysteria2" ] || continue
-        local port ranges
-        port=$(jq -r '.port' "$f" 2>/dev/null)
-        ranges=$(_read_hop_ranges "$f")
-        if [ -n "$ranges" ] && [ -n "$port" ]; then
-            # shellcheck disable=SC2086
-            _hy2_remove_hop_rules "$port" $ranges
-            found=1
-        fi
-    done
-    [ "$found" -eq 1 ] && _hy2_persist_iptables
-}
+# ---------------------------------------------------------------------------
+# 通用端口输入(带冲突检测)
 
 # ---------------------------------------------------------------------------
 # 通用端口输入(带冲突检测)
@@ -331,7 +115,7 @@ _render_template() {
     : "${R_SERVER_NAME:=}" "${R_PRIVATE_KEY:=}" "${R_SHORT_ID:=}" "${R_PATH:=}"
     : "${R_HOST:=}" "${R_METHOD:=}" "${R_PASSWORD:=}" "${R_MLDSA65_SEED:=}"
     : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
-    : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}"
+    : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}" "${R_UDPHOP_BLOCK:=}"
     : "${R_TUNNEL_PORT:=}" "${R_TUNNEL_TAG:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
@@ -360,6 +144,13 @@ _render_template() {
     p="{{BRUTAL_PARAMS_BLOCK}}"
     if [ -n "$R_BRUTAL_PARAMS_BLOCK" ]; then
         content="${content//$p/$R_BRUTAL_PARAMS_BLOCK}"
+    else
+        content="${content//$p/}"
+    fi
+    # Hysteria2 udpHop 端口跳跃块(可选)
+    p="{{UDPHOP_BLOCK}}"
+    if [ -n "$R_UDPHOP_BLOCK" ]; then
+        content="${content//$p/$R_UDPHOP_BLOCK}"
     else
         content="${content//$p/}"
     fi
@@ -1123,22 +914,6 @@ _delete_node() {
         mv -f "$tmp" "$CONFIG_FILE"
         if _xray_test_config; then
             _manage_xray restart 2>/dev/null || true
-            # 清理所有端口跳跃 iptables 规则
-            if command -v iptables >/dev/null 2>&1; then
-                for tag in "${tags[@]}"; do
-                    local proto; proto=$(jq -r '.protocol' "$NODES_DIR/${tag}.json" 2>/dev/null)
-                    if [ "$proto" = "hysteria2" ]; then
-                        local hop_port ranges
-                        hop_port=$(jq -r '.port' "$NODES_DIR/${tag}.json" 2>/dev/null)
-                        ranges=$(_read_hop_ranges "$NODES_DIR/${tag}.json")
-                        if [ -n "$ranges" ]; then
-                            # shellcheck disable=SC2086
-                            _hy2_remove_hop_rules "$hop_port" $ranges
-                        fi
-                    fi
-                done
-                _hy2_persist_iptables
-            fi
             for tag in "${tags[@]}"; do
                 rm -f "$NODES_DIR/${tag}.json"
                 _remove_node_from_yaml_by_tag "$tag"
@@ -1164,19 +939,6 @@ _delete_node() {
             | .inbounds |= map(select(.tag != \$tg))"
     fi
     if _mutate_config --arg t "$tag" --arg tg "$tunnel_tag" "$jq_filter"; then
-        # 清理端口跳跃 iptables 规则
-        local proto; proto=$(jq -r '.protocol' "$NODES_DIR/${tag}.json" 2>/dev/null)
-        if [ "$proto" = "hysteria2" ] && command -v iptables >/dev/null 2>&1; then
-            local hop_port ranges
-            hop_port=$(jq -r '.port' "$NODES_DIR/${tag}.json" 2>/dev/null)
-            ranges=$(_read_hop_ranges "$NODES_DIR/${tag}.json")
-            if [ -n "$ranges" ]; then
-                # shellcheck disable=SC2086
-                _hy2_remove_hop_rules "$hop_port" $ranges
-                _hy2_persist_iptables
-                _tip "已清理端口跳跃规则"
-            fi
-        fi
         rm -f "$NODES_DIR/${tag}.json"
         _remove_node_from_yaml_by_tag "$tag"
         _success "节点已删除"
@@ -1230,22 +992,6 @@ _modify_port() {
            '.port=$p | .share_link=$l | .name=$n' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
     else
         jq --argjson p "$newport" --arg l "$newlink" '.port=$p | .share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-    fi
-    # 如果是 hy2 节点且有端口跳跃, 更新 DNAT 规则
-    local proto; proto=$(jq -r '.protocol' "$meta" 2>/dev/null)
-    if [ "$proto" = "hysteria2" ] && command -v iptables >/dev/null 2>&1; then
-        local ranges display_ranges
-        ranges=$(_read_hop_ranges "$meta")
-        display_ranges=$(_read_hop_ranges_display "$meta")
-        if [ -n "$ranges" ]; then
-            _info "检测到端口跳跃规则, 正在更新..."
-            # shellcheck disable=SC2086
-            _hy2_remove_hop_rules "$oldport" $ranges
-            # shellcheck disable=SC2086
-            _hy2_add_hop_rules "$newport" $ranges
-            _hy2_persist_iptables
-            _tip "端口跳跃规则已更新: ${display_ranges} → ${newport}"
-        fi
     fi
     _success "端口已改为 ${newport}"
     _press_any_key
@@ -1360,30 +1106,44 @@ _remove_node_from_yaml_by_tag() {
 }
 
 # ---------------------------------------------------------------------------
-# Hysteria2 端口跳跃管理
+# Hysteria2 端口跳跃管理 (Xray 原生 udpHop)
 # ---------------------------------------------------------------------------
+
+# 从 config.json 读取 udpHop 配置
+# 用法: _read_udphop <tag>  输出: "ports|interval" 或空
+_read_udphop() {
+    local tag="$1"
+    [ -f "$CONFIG_FILE" ] || return
+    local ports interval
+    ports=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.udpHop.ports // empty' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$ports" ] && return
+    interval=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.udpHop.interval // "30"' "$CONFIG_FILE" 2>/dev/null)
+    echo "${ports}|${interval}"
+}
 
 # 启用/禁用端口跳跃
 _hy2_toggle_hop() {
     clear
     _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
-    _ensure_iptables || { _press_any_key; return; }
 
     echo; echo -e "  ${CYAN}【端口跳跃 — 启用/禁用】${NC}"
-    echo -e "  ${YELLOW}通过 iptables DNAT 将 UDP 端口范围转发到 Hysteria2 监听端口${NC}"
-    echo -e "  ${YELLOW}客户端可连接范围内任意端口, 提高抗封锁能力${NC}"
+    echo -e "  ${YELLOW}Xray 原生 udpHop: QUIC 层面端口跳变, 无需 iptables${NC}"
+    echo -e "  ${YELLOW}客户端自动在端口范围内切换, 提高抗封锁能力${NC}"
     echo
     local tags=() i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
         [ "$proto" = "hysteria2" ] || continue
-        local tag name port ranges_display
+        local tag name port udphop
         tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        ranges_display=$(_read_hop_ranges_display "$f")
+        udphop=$(_read_udphop "$tag")
         tags+=("$tag")
-        if [ -n "$ranges_display" ]; then
-            printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${GREEN}%s${NC}\n" "$i" "$name" "$port" "$ranges_display"
+        if [ -n "$udphop" ]; then
+            local hop_ports hop_interval
+            hop_ports=$(echo "$udphop" | cut -d'|' -f1)
+            hop_interval=$(echo "$udphop" | cut -d'|' -f2)
+            printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${GREEN}%s${NC} (每%ss)\n" "$i" "$name" "$port" "$hop_ports" "$hop_interval"
         else
             printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${RED}未启用${NC}\n" "$i" "$name" "$port"
         fi
@@ -1398,67 +1158,55 @@ _hy2_toggle_hop() {
 
     local meta="$NODES_DIR/${tag}.json"
     local port; port=$(jq -r '.port' "$meta")
-    local cur_ranges
-    cur_ranges=$(_read_hop_ranges "$meta")
-    local cur_display
-    cur_display=$(_read_hop_ranges_display "$meta")
+    local cur_udphop
+    cur_udphop=$(_read_udphop "$tag")
 
-    if [ -n "$cur_ranges" ]; then
+    if [ -n "$cur_udphop" ]; then
         # 已启用 → 禁用
-        echo -e "  当前端口跳跃: ${GREEN}${cur_display}${NC} → ${port}"
+        local cur_ports cur_interval
+        cur_ports=$(echo "$cur_udphop" | cut -d'|' -f1)
+        cur_interval=$(echo "$cur_udphop" | cut -d'|' -f2)
+        echo -e "  当前端口跳跃: ${GREEN}${cur_ports}${NC} (每${cur_interval}s) → ${port}"
         read -rp "  确认禁用端口跳跃? [y/N]: " ans
         case "$ans" in
             y|Y)
-                # shellcheck disable=SC2086
-                _hy2_remove_hop_rules "$port" $cur_ranges
-                _hy2_persist_iptables
-                jq 'del(.hop_ranges) | del(.hop_start) | del(.hop_end)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+                if ! _mutate_config --arg t "$tag" \
+                     '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) |= del(.udpHop)'; then
+                    _error "禁用失败, 已回滚"; _press_any_key; return
+                fi
+                jq 'del(.udp_hop_ports) | del(.udp_hop_interval) | del(.hop_ranges) | del(.hop_start) | del(.hop_end)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
                 _success "端口跳跃已禁用"
                 ;;
             *) _info "已取消" ;;
         esac
     else
-        # 未启用 → 设置端口范围
+        # 未启用 → 设置 udpHop
         echo -e "  当前 Hysteria2 端口: ${CYAN}${port}${NC}"
-        echo -e "  ${YELLOW}端口范围格式:${NC}"
+        echo -e "  ${YELLOW}端口范围格式 (与 udpHop 一致):${NC}"
         echo -e "    单个端口:     ${CYAN}3050${NC}"
-        echo -e "    连续范围:     ${CYAN}3010-3020${NC}"
-        echo -e "    混合(逗号分隔): ${CYAN}3010-3020,3050,3100-3110${NC}"
+        echo -e "    连续范围:     ${CYAN}20000-50000${NC}"
+        echo -e "    混合(逗号分隔): ${CYAN}11,13,15-17${NC}"
         echo
-        local hop_input
-        read -rp "  端口范围: " hop_input
-        [ -z "$hop_input" ] && { _info "已取消"; _press_any_key; return; }
-        # 解析并验证
-        local parsed
-        parsed=$(_parse_hop_ranges "$hop_input") || { _press_any_key; return; }
-        # 规范化输入(用于存储和显示)
-        local normalized=""
-        local range
-        for range in $parsed; do
-            local rs re
-            rs=$(echo "$range" | cut -d: -f1)
-            re=$(echo "$range" | cut -d: -f2)
-            if [ "$rs" = "$re" ]; then
-                normalized="${normalized:+$normalized,}$rs"
-            else
-                normalized="${normalized:+$normalized,}$rs-$re"
-            fi
-        done
-        # 检查是否已有跳跃规则(提示用户)
-        if _hy2_has_any_hop_rules; then
-            _warn "已有其他跳跃规则, 请确保端口范围不冲突"
+        local hop_ports
+        read -rp "  端口范围: " hop_ports
+        [ -z "$hop_ports" ] && { _info "已取消"; _press_any_key; return; }
+        local hop_interval
+        read -rp "  跳跃间隔 (秒, 最少5, 默认30): " hop_interval
+        hop_interval=${hop_interval:-30}
+        if [ "$hop_interval" -lt 5 ] 2>/dev/null; then
+            _warn "间隔不能小于 5 秒"; _press_any_key; return
         fi
-        # 添加规则
-        # shellcheck disable=SC2086
-        if _hy2_add_hop_rules "$port" $parsed; then
-            _hy2_persist_iptables
-            jq --arg r "$normalized" '.hop_ranges=$r | del(.hop_start) | del(.hop_end)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-            _success "端口跳跃已启用: ${normalized} → ${port}"
-            _tip "客户端可连接上述端口范围内的任意端口"
-            _tip "请确保防火墙/安全组已放行该 UDP 端口范围"
-        else
-            _error "iptables 规则添加失败, 请检查内核是否支持 nat 模块"
+        # 注入 udpHop 到 config.json
+        if ! _mutate_config --arg t "$tag" --arg ports "$hop_ports" --argjson interval "$hop_interval" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.udpHop) = {ports: $ports, interval: $interval}'; then
+            _error "启用失败, 已回滚"; _press_any_key; return
         fi
+        # 更新元数据
+        jq --arg p "$hop_ports" --argjson i "$hop_interval" \
+           '.udp_hop_ports=$p | .udp_hop_interval=$i' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        _success "端口跳跃已启用: ${hop_ports} (每${hop_interval}s)"
+        _tip "客户端需配置相同端口范围以使用端口跳跃"
+        _tip "请确保防火墙/安全组已放行该 UDP 端口范围"
     fi
     _press_any_key
 }
@@ -1467,33 +1215,26 @@ _hy2_toggle_hop() {
 _hy2_view_hop() {
     clear
     echo; echo -e "  ${CYAN}【端口跳跃状态】${NC}"
+    echo -e "  ${YELLOW}Xray 原生 udpHop (config.json 内配置)${NC}"
     echo
     local found=0
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
         [ "$proto" = "hysteria2" ] || continue
-        local name port ranges_display
-        name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        ranges_display=$(_read_hop_ranges_display "$f")
-        if [ -n "$ranges_display" ]; then
-            echo -e "  ${GREEN}●${NC} ${name}: ${CYAN}${ranges_display}${NC} → ${port} (UDP)"
+        local tag name port udphop
+        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
+        udphop=$(_read_udphop "$tag")
+        if [ -n "$udphop" ]; then
+            local hop_ports hop_interval
+            hop_ports=$(echo "$udphop" | cut -d'|' -f1)
+            hop_interval=$(echo "$udphop" | cut -d'|' -f2)
+            echo -e "  ${GREEN}●${NC} ${name}: ${CYAN}${hop_ports}${NC} (每${hop_interval}s) → ${port}"
             found=1
         fi
     done
     if [ "$found" -eq 0 ]; then
         echo -e "  ${YELLOW}暂无启用端口跳跃的节点${NC}"
-    fi
-    echo
-    if command -v iptables >/dev/null 2>&1; then
-        local rules
-        rules=$(_hy2_list_all_hop_rules)
-        if [ -n "$rules" ]; then
-            echo -e "  ${CYAN}iptables nat 规则:${NC}"
-            echo "$rules" | while read -r line; do
-                echo -e "  ${GREEN}▸${NC} $line"
-            done
-        fi
     fi
     _press_any_key
 }

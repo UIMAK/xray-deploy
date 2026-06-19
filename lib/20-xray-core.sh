@@ -388,10 +388,6 @@ _uninstall_xray() {
     # 删快捷命令与主脚本副本
     rm -f /usr/local/bin/"$CMD_NAME"
     rm -f /usr/local/bin/xd
-    # 清理端口跳跃 iptables 规则(必须在删除部署目录之前)
-    if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        _hy2_cleanup_all_hops
-    fi
     # 删部署目录(含 config/nodes/assets/logs/state/lib/templates)
     rm -rf "$DEPLOY_DIR"
     _success "Xray 已卸载干净(/opt/xray-deploy、xd 命令、geo crontab 已清除)"
