@@ -238,6 +238,27 @@ _hy2_list_all_hop_rules() {
     iptables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop" || true
 }
 
+# 清理所有节点的端口跳跃 iptables 规则(供 _reset_config / _uninstall_xray 调用)
+_hy2_cleanup_all_hops() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    [ -d "$NODES_DIR" ] || return 0
+    local found=0
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        local port ranges
+        port=$(jq -r '.port' "$f" 2>/dev/null)
+        ranges=$(_read_hop_ranges "$f")
+        if [ -n "$ranges" ] && [ -n "$port" ]; then
+            # shellcheck disable=SC2086
+            _hy2_remove_hop_rules "$port" $ranges
+            found=1
+        fi
+    done
+    [ "$found" -eq 1 ] && _hy2_persist_iptables
+}
+
 # ---------------------------------------------------------------------------
 # 通用端口输入(带冲突检测)
 # ---------------------------------------------------------------------------

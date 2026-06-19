@@ -306,6 +306,10 @@ _reset_config() {
     # 删掉 config 让 _init_config_if_empty 重建
     rm -f "$CONFIG_FILE"
     _init_config_if_empty
+    # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前)
+    if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
+        _hy2_cleanup_all_hops
+    fi
     # 清空节点元数据 + clash.yaml
     if [ -d "$NODES_DIR" ]; then
         rm -f "$NODES_DIR"/*.json 2>/dev/null
