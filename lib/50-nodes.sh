@@ -773,7 +773,7 @@ _rebuild_hy2_link() {
     # 端口跳跃端口(如果已配置)
     local hop_ports
     hop_ports=$(jq -r '.udp_hop_ports // empty' "$meta" 2>/dev/null)
-    [ -n "$hop_ports" ] && link="${link}&hop=$(_url_encode "$hop_ports")"
+    [ -n "$hop_ports" ] && link="${link}&mport=$(_url_encode "$hop_ports")"
     link="${link}#$(_url_encode "$name")"
     echo "$link"
 }
