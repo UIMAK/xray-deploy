@@ -327,17 +327,20 @@ _reset_config() {
 }
 
 # ---------------------------------------------------------------------------
-# 检测脚本更新(问题3)
-# 对比本地 SCRIPT_VERSION 与远程 VERSION 文件; 有新版提示重新跑 install.sh
+# 检测脚本更新
+# 本地版本从 $DEPLOY_DIR/VERSION 文件读取, 远程从 GitHub raw 拉取
+# 以后只需改 VERSION 文件, 不用动代码
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION="0.1.6"
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
 
 _check_script_update() {
     clear
     echo
     echo -e "  ${CYAN}【检测脚本更新】${NC}"
-    echo -e "  当前版本: ${CYAN}${SCRIPT_VERSION}${NC}"
+    local local_ver
+    local_ver=$(cat "$DEPLOY_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$local_ver" ] && local_ver="(未知)"
+    echo -e "  当前版本: ${CYAN}${local_ver}${NC}"
     _info "正在检查远程版本..."
     local remote
     remote=$(curl -fsSL --max-time 10 "$SCRIPT_VERSION_URL" 2>/dev/null) || \
@@ -348,7 +351,7 @@ _check_script_update() {
     fi
     remote=$(echo "$remote" | tr -d '[:space:]')
     echo -e "  远程版本: ${CYAN}${remote}${NC}"
-    if [ "$remote" = "$SCRIPT_VERSION" ]; then
+    if [ "$remote" = "$local_ver" ]; then
         _success "已是最新版本"
     elif [ -n "$remote" ]; then
         _warn "发现新版本: ${remote}"
@@ -356,7 +359,6 @@ _check_script_update() {
         case "$ans" in
             y|Y)
                 _info "正在更新脚本..."
-                # 直接跑远程 install.sh (只替换脚本, 不影响 Xray/cloudflared/节点)
                 bash <(curl -fsSL "https://raw.githubusercontent.com/UIMAK/xray-deploy/main/install.sh") --no-start
                 _success "脚本已更新到 ${remote}, 下次进菜单生效"
                 exit 0
