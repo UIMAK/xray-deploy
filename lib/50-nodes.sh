@@ -66,7 +66,7 @@ _ensure_iptables() {
 
 # 解析端口范围字符串 → "start:end start:end ..."
 # 输入: "3010-3020,3050,3100-3110"
-# 输出: "3010:3020 3050:3050 3100:3110"
+# 输出: "3010:3020 3050 3100:3110"  (单端口省略冒号, 避免 iptables -D 匹配问题)
 # 验证: 端口合法性 + 范围间无重叠
 _parse_hop_ranges() {
     local input="$1"
@@ -105,7 +105,12 @@ _parse_hop_ranges() {
         done
         all_starts+=("$start")
         all_ends+=("$end")
-        result="${result:+$result }${start}:${end}"
+        # 单端口用裸端口号, 范围用 start:end(iptables -D 匹配一致性)
+        if [ "$start" = "$end" ]; then
+            result="${result:+$result }${start}"
+        else
+            result="${result:+$result }${start}:${end}"
+        fi
     done
     [ -z "$result" ] && { _error "无有效端口范围"; return 1; }
     echo "$result"
