@@ -15,7 +15,7 @@ PROTOCOLS=(
     "vless-xhttp-cdn|VLESS+XHTTP(无TLS)               |none|cdn|必须套CDN·禁止直连"
     "vless-ws-cdn|VLESS+WS(无TLS)                    |none|cdn|必须套CDN·禁止直连"
     "shadowsocks|Shadowsocks                          |none|direct|"
-    "hysteria2|Hysteria2                               |tls|direct|必须套TLS证书·QUIC"
+    "hysteria2|Hysteria2                              |tls|direct|必须套TLS证书·QUIC"
 )
 
 # ---------------------------------------------------------------------------
