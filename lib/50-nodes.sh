@@ -630,7 +630,7 @@ _add_hysteria2() {
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
-    local cert_file="" key_file="" self_signed="false"
+    local cert_file="" key_file="" self_signed="false" sni="build.nvidia.com"
     echo -e "  TLS 证书:"
     echo -e "  回车使用自签证书, 或输入证书文件路径"
     read -rp "  cert 路径 (回车自签): " custom_cert
@@ -641,6 +641,18 @@ _add_hysteria2() {
         fi
         cert_file="$custom_cert"; key_file="$custom_key"
         _info "使用自定义证书: $cert_file"
+        # 从证书提取 CN 作为 SNI 建议
+        local cert_cn=""
+        if command -v openssl >/dev/null 2>&1; then
+            cert_cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's/\/.*//')
+        fi
+        if [ -n "$cert_cn" ]; then
+            read -rp "  SNI (默认 ${cert_cn}): " custom_sni
+            sni=${custom_sni:-$cert_cn}
+        else
+            read -rp "  SNI (证书域名): " custom_sni
+            sni=${custom_sni:-build.nvidia.com}
+        fi
     else
         _gen_hy2_cert "$tag" || return 1
         cert_file="$CERT_FILE_PATH"; key_file="$KEY_FILE_PATH"
@@ -657,13 +669,14 @@ _add_hysteria2() {
     echo -e "  拥塞控制:"
     echo -e "  ${GREEN}[1]${NC} bbr"
     echo -e "  ${GREEN}[2]${NC} brutal"
+    echo -e "  ${GREEN}[3]${NC} force-brutal"
     read -rp "  选择 (默认 1): " cc_choice
     local congestion="bbr"
     local brutal_up="" brutal_down=""
     case "${cc_choice:-1}" in
-        2)
-            congestion="brutal"
-            echo -e "  ${YELLOW}brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
+        2|3)
+            [ "${cc_choice}" = "3" ] && congestion="force-brutal" || congestion="brutal"
+            echo -e "  ${YELLOW}${congestion} 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
             read -rp "  上传带宽 (服务器→客户端, 回车不限): " brutal_up
             read -rp "  下载带宽 (客户端→服务器, 回车不限): " brutal_down
             brutal_up=$(_normalize_bandwidth "$brutal_up")
@@ -677,9 +690,9 @@ _add_hysteria2() {
 
     local listen="::"
 
-    # 构建 brutal 参数块(仅 brutal 模式有值)
+    # 构建 brutal 参数块(brutal / force-brutal 模式有值)
     local brutal_block=""
-    if [ "$congestion" = "brutal" ]; then
+    if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
         brutal_block=""
         [ -n "$brutal_up" ] && brutal_block="${brutal_block}, \"brutalUp\": \"${brutal_up}\""
         [ -n "$brutal_down" ] && brutal_block="${brutal_block}, \"brutalDown\": \"${brutal_down}\""
@@ -700,7 +713,7 @@ _add_hysteria2() {
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
     # hy2:// 分享链接(标准格式: hy2://password@host:port/?sni=...&insecure=...&congestion=...)
-    local link="hy2://${auth}@${link_ip}:${port}/?sni=build.nvidia.com"
+    local link="hy2://${auth}@${link_ip}:${port}/?sni=${sni}"
     [ "$self_signed" = "true" ] && link="${link}&insecure=1"
     link="${link}&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
@@ -710,20 +723,24 @@ _add_hysteria2() {
     # clash yaml
     local clash_insecure=""
     [ "$self_signed" = "true" ] && clash_insecure=", skip-cert-verify: true"
-    local clash="- {name: \"$name\", type: hysteria2, server: $addr, port: $port, password: \"$auth\", sni: build.nvidia.com, \"congestion-control\": $congestion${clash_insecure}}"
+    local clash="- {name: \"$name\", type: hysteria2, server: $addr, port: $port, password: \"$auth\", sni: ${sni}, \"congestion-control\": $congestion${clash_insecure}}"
     _add_node_to_yaml "$clash"
 
     # 元数据
     _save_node_meta "$tag" "$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
-        --arg auth "$auth" --arg congestion "$congestion" \
+        --arg auth "$auth" --arg sni "$sni" --arg congestion "$congestion" \
         --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
         --arg link "$link" --argjson ss "$self_signed" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,self_signed:$ss,share_link:$link}')"
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,self_signed:$ss,share_link:$link}')"
 
     _success "节点 [${name}] 创建成功"
-    _tip "SNI 使用自签证书域名 build.nvidia.com, 客户端须手动信任证书"
+    if [ "$self_signed" = "true" ]; then
+        _tip "自签证书, 客户端须手动信任证书 (insecure=1)"
+    else
+        _tip "使用自定义证书, SNI: ${sni}"
+    fi
     echo -e "  ${CYAN}拥塞控制:${NC} ${congestion}"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
@@ -740,7 +757,7 @@ _rebuild_hy2_link() {
     auth=$(jq -r '.auth' "$meta")
     host=$(jq -r '.link_addr' "$meta")
     port=$(jq -r '.port' "$meta")
-    sni="build.nvidia.com"
+    sni=$(jq -r '.sni // "build.nvidia.com"' "$meta")
     congestion=$(jq -r '.congestion' "$meta")
     brutal_up=$(jq -r '.brutal_up // empty' "$meta")
     brutal_down=$(jq -r '.brutal_down // empty' "$meta")
