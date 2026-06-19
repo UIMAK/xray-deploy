@@ -4,7 +4,10 @@
     "protocol": "hysteria",
     "tag": "{{TAG}}",
     "settings": {
-        "version": 2
+        "version": 2,
+        "users": [{
+            "auth": "{{AUTH}}"
+        }]
     },
     "streamSettings": {
         "network": "hysteria",
@@ -16,10 +19,6 @@
                 "certificateFile": "{{CERT_FILE}}",
                 "keyFile": "{{KEY_FILE}}"
             }]
-        },
-        "hysteriaSettings": {
-            "version": 2,
-            "auth": "{{AUTH}}"
         },
         "finalmask": {
             "quicParams": {

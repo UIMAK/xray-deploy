@@ -370,7 +370,7 @@ _hy2_manage_menu() {
         echo
         echo -e "  ${CYAN}【Hysteria2 管理】${NC}"
         echo
-        echo -e "  ${GREEN}[1]${NC} 切换 brutal / bbr 模式"
+        echo -e "  ${GREEN}[1]${NC} 切换拥塞控制 (bbr/brutal/force-brutal)"
         echo -e "  ${GREEN}[2]${NC} 调整 brutal 带宽"
         echo -e "  ${GREEN}[3]${NC} 端口跳跃 (udpHop)"
         echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
@@ -416,39 +416,55 @@ _hy2_toggle_brutal() {
     local meta="$NODES_DIR/${tag}.json"
     local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
     local new_cc
-    if [ "$cur_cc" = "brutal" ]; then
-        new_cc="bbr"
-        if ! _mutate_config --arg t "$tag" \
-             '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = {congestion: "bbr"}'; then
-            _error "切换失败, 已回滚"; _press_any_key; return
-        fi
-        jq --arg cc "$new_cc" '.congestion=$cc | .brutal_up="" | .brutal_down=""' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-        local link; link=$(_rebuild_hy2_link "$meta")
-        jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-        _success "已切换为 bbr 模式"
-    else
-        new_cc="brutal"
-        echo -e "  ${YELLOW}brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
-        local brutal_up="" brutal_down=""
-        read -rp "  上传带宽 (回车不限): " brutal_up
-        read -rp "  下载带宽 (回车不限): " brutal_down
-        brutal_up=$(_normalize_bandwidth "$brutal_up")
-        brutal_down=$(_normalize_bandwidth "$brutal_down")
-        if ! _mutate_config --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
-             '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
-              ({congestion: "brutal"}
-               + (if $up != "" then {brutalUp: $up} else {} end)
-               + (if $down != "" then {brutalDown: $down} else {} end))'; then
-            _error "切换失败, 已回滚"; _press_any_key; return
-        fi
-        jq --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" \
-           '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-        local link; link=$(_rebuild_hy2_link "$meta")
-        jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-        _success "已切换为 brutal 模式"
-        [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
-        [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
-    fi
+    # 循环切换: bbr → brutal → force-brutal → bbr
+    case "$cur_cc" in
+        bbr)
+            # bbr → brutal (需要带宽)
+            new_cc="brutal"
+            echo -e "  ${YELLOW}brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
+            local brutal_up="" brutal_down=""
+            read -rp "  上传带宽 (回车不限): " brutal_up
+            read -rp "  下载带宽 (回车不限): " brutal_down
+            brutal_up=$(_normalize_bandwidth "$brutal_up")
+            brutal_down=$(_normalize_bandwidth "$brutal_down")
+            if ! _mutate_config --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
+                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
+                  ({congestion: "brutal"}
+                   + (if $up != "" then {brutalUp: $up} else {} end)
+                   + (if $down != "" then {brutalDown: $down} else {} end))'; then
+                _error "切换失败, 已回滚"; _press_any_key; return
+            fi
+            jq --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" \
+               '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            _success "已切换为 brutal 模式"
+            [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
+            [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
+            ;;
+        brutal)
+            # brutal → force-brutal (保留带宽)
+            new_cc="force-brutal"
+            if ! _mutate_config --arg t "$tag" \
+                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.congestion) = "force-brutal"'; then
+                _error "切换失败, 已回滚"; _press_any_key; return
+            fi
+            jq --arg cc "$new_cc" '.congestion=$cc' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            _success "已切换为 force-brutal 模式"
+            _tip "force-brutal: 强制使用 brutalUp 固定发包速率, 无视对端协商"
+            ;;
+        force-brutal|*)
+            # force-brutal → bbr
+            new_cc="bbr"
+            if ! _mutate_config --arg t "$tag" \
+                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = {congestion: "bbr"}'; then
+                _error "切换失败, 已回滚"; _press_any_key; return
+            fi
+            jq --arg cc "$new_cc" '.congestion=$cc | .brutal_up="" | .brutal_down=""' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            _success "已切换为 bbr 模式"
+            ;;
+    esac
+    # 重建分享链接
+    local link; link=$(_rebuild_hy2_link "$meta")
+    jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
     _press_any_key
 }
 
@@ -480,8 +496,8 @@ _hy2_adjust_bandwidth() {
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
-    if [ "$cur_cc" != "brutal" ]; then
-        _warn "该节点当前为 ${cur_cc} 模式, 非 brutal 无需设带宽"
+    if [ "$cur_cc" != "brutal" ] && [ "$cur_cc" != "force-brutal" ]; then
+        _warn "该节点当前为 ${cur_cc} 模式, 非 brutal/force-brutal 无需设带宽"
         _press_any_key; return
     fi
     local cur_up cur_down
