@@ -80,10 +80,12 @@ else
     if ! dl "${REMOTE_BASE}/xray-deploy.sh" "${INSTALL_BIN}.src"; then
         echo "[错误] 下载主脚本失败"; exit 1
     fi
+    # lib 模块(固定列表, 加新模块需同步)
     for f in 00-common 10-system 20-xray-core 30-geo 40-cloudflared 50-nodes 51-reality-pq 90-menu; do
         dl "${REMOTE_BASE}/lib/${f}.sh" "${INSTALL_LIB_DIR}/${f}.sh" || echo "[警告] lib/${f}.sh 下载失败"
     done
-    for t in vless-tcp-reality-vision vless-xhttp-reality vless-xhttp-cdn vless-ws-cdn shadowsocks; do
+    # templates: 下载已知列表(新模板同步到此)
+    for t in vless-tcp-reality-vision vless-xhttp-reality vless-xhttp-cdn vless-ws-cdn shadowsocks hysteria2; do
         dl "${REMOTE_BASE}/templates/${t}.server.jsonc" "${INSTALL_TPL_DIR}/${t}.server.jsonc" || echo "[警告] templates/${t} 下载失败"
     done
 fi
