@@ -372,12 +372,16 @@ _hy2_manage_menu() {
         echo
         echo -e "  ${GREEN}[1]${NC} 切换 brutal / bbr 模式"
         echo -e "  ${GREEN}[2]${NC} 调整 brutal 带宽"
+        echo -e "  ${GREEN}[3]${NC} 端口跳跃 (iptables)"
+        echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice
         case "$choice" in
             1) _hy2_toggle_brutal ;;
             2) _hy2_adjust_bandwidth ;;
+            3) _hy2_toggle_hop ;;
+            4) _hy2_view_hop ;;
             0) return ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
@@ -414,16 +418,10 @@ _hy2_toggle_brutal() {
     local new_cc
     if [ "$cur_cc" = "brutal" ]; then
         new_cc="bbr"
-        _backup_config
-        local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-        jq --arg t "$tag" \
-           '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
-            {congestion: "bbr"}' "$CONFIG_FILE" > "$tmp" 2>/dev/null
-        mv -f "$tmp" "$CONFIG_FILE"
-        if ! _xray_test_config; then
-            _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
+        if ! _mutate_config --arg t "$tag" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = {congestion: "bbr"}'; then
+            _error "切换失败, 已回滚"; _press_any_key; return
         fi
-        _manage_xray restart 2>/dev/null || true
         jq --arg cc "$new_cc" '.congestion=$cc | .brutal_up="" | .brutal_down=""' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
         local link; link=$(_rebuild_hy2_link "$meta")
         jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
@@ -436,19 +434,13 @@ _hy2_toggle_brutal() {
         read -rp "  下载带宽 (回车不限): " brutal_down
         brutal_up=$(_normalize_bandwidth "$brutal_up")
         brutal_down=$(_normalize_bandwidth "$brutal_down")
-        _backup_config
-        local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-        jq --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
-           '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
-            ({congestion: "brutal"}
-             + (if $up != "" then {brutalUp: $up} else {} end)
-             + (if $down != "" then {brutalDown: $down} else {} end))' \
-           "$CONFIG_FILE" > "$tmp" 2>/dev/null
-        mv -f "$tmp" "$CONFIG_FILE"
-        if ! _xray_test_config; then
-            _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
+        if ! _mutate_config --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
+              ({congestion: "brutal"}
+               + (if $up != "" then {brutalUp: $up} else {} end)
+               + (if $down != "" then {brutalDown: $down} else {} end))'; then
+            _error "切换失败, 已回滚"; _press_any_key; return
         fi
-        _manage_xray restart 2>/dev/null || true
         jq --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" \
            '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
         local link; link=$(_rebuild_hy2_link "$meta")

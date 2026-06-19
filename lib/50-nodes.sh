@@ -33,6 +33,129 @@ _normalize_bandwidth() {
 }
 
 # ---------------------------------------------------------------------------
+# iptables / 端口跳跃辅助(Hysteria2 端口跳跃用)
+# 原理: iptables nat PREROUTING DNAT 把一段 UDP 端口范围转发到 hy2 监听端口
+# ---------------------------------------------------------------------------
+
+# 确保 iptables 已安装(Debian 同时装 iptables-persistent 做开机恢复)
+_ensure_iptables() {
+    if command -v iptables >/dev/null 2>&1; then
+        return 0
+    fi
+    _info "iptables 未安装, 正在安装..."
+    local fam
+    fam=$(_detect_os_family)
+    case "$fam" in
+        debian)
+            # 先装 iptables, 再装 iptables-persistent(开机自动恢复规则)
+            _pkg_install iptables || return 1
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y -qq --no-install-recommends iptables-persistent >/dev/null 2>&1 || true
+            ;;
+        *)
+            _pkg_install iptables || return 1
+            ;;
+    esac
+    if ! command -v iptables >/dev/null 2>&1; then
+        _error "iptables 安装失败, 请手动安装"
+        return 1
+    fi
+    _success "iptables 已安装"
+}
+
+# 添加端口跳跃 iptables DNAT 规则
+# 用法: _hy2_add_hop_rules <hy2_port> <start> <end>
+_hy2_add_hop_rules() {
+    local hy2_port="$1" start="$2" end="$3"
+    iptables -t nat -A PREROUTING -p udp --dport "${start}:${end}" \
+        -m comment --comment "xray-deploy-hy2-hop" \
+        -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || return 1
+    # IPv6(ip6tables 可选, 失败不阻塞)
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -A PREROUTING -p udp --dport "${start}:${end}" \
+            -m comment --comment "xray-deploy-hy2-hop" \
+            -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || true
+    fi
+}
+
+# 删除指定端口范围的跳跃规则
+# 用法: _hy2_remove_hop_rules <start> <end> <hy2_port>
+_hy2_remove_hop_rules() {
+    local hy2_port="$1" start="$2" end="$3"
+    iptables -t nat -D PREROUTING -p udp --dport "${start}:${end}" \
+        -m comment --comment "xray-deploy-hy2-hop" \
+        -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || true
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -D PREROUTING -p udp --dport "${start}:${end}" \
+            -m comment --comment "xray-deploy-hy2-hop" \
+            -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || true
+    fi
+}
+
+# 持久化 iptables 规则
+_hy2_persist_iptables() {
+    if command -v iptables-save >/dev/null 2>&1; then
+        local fam
+        fam=$(_detect_os_family)
+        case "$fam" in
+            debian)
+                mkdir -p /etc/iptables
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null
+                if command -v ip6tables-save >/dev/null 2>&1; then
+                    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+                fi
+                ;;
+            alpine)
+                # Alpine: /etc/init.d/iptables save 写到 /etc/iptables/rules-save
+                if [ -x /etc/init.d/iptables ]; then
+                    /etc/init.d/iptables save >/dev/null 2>&1 || true
+                else
+                    mkdir -p /etc/iptables
+                    iptables-save > /etc/iptables/rules-save 2>/dev/null
+                fi
+                ;;
+            *)
+                # 兜底: 直接写文件
+                mkdir -p /etc/iptables
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null
+                ;;
+        esac
+    fi
+}
+
+# 检查端口范围是否与现有规则冲突
+# 返回 0 = 有冲突, 1 = 无冲突
+_hy2_check_hop_conflict() {
+    local start="$1" end="$2"
+    local rules
+    rules=$(iptables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop") || return 1
+    [ -z "$rules" ] && return 1
+    # 用 here-string 避免 pipe-while 子 shell 中 return 不生效
+    while read -r line; do
+        local dport_part rule_start rule_end
+        dport_part=$(echo "$line" | sed 's/.*--dport \([^ ]*\).*/\1/')
+        if echo "$dport_part" | grep -q ':'; then
+            rule_start=$(echo "$dport_part" | cut -d: -f1)
+            rule_end=$(echo "$dport_part" | cut -d: -f2)
+        else
+            rule_start="$dport_part"
+            rule_end="$dport_part"
+        fi
+        if [ "$start" -le "$rule_end" ] 2>/dev/null && [ "$end" -ge "$rule_start" ] 2>/dev/null; then
+            return 0
+        fi
+    done <<< "$rules"
+    return 1
+}
+
+# 列出所有 xray-deploy 端口跳跃规则
+_hy2_list_all_hop_rules() {
+    command -v iptables >/dev/null 2>&1 || return
+    iptables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop" || true
+}
+
+# ---------------------------------------------------------------------------
 # 通用端口输入(带冲突检测)
 # ---------------------------------------------------------------------------
 # 生成随机端口(20000-65000)
@@ -348,7 +471,7 @@ _add_vless_tcp_reality_vision() {
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -474,7 +597,7 @@ _add_vless_xhttp_cdn() {
     _commit_inbound "$inbound" || return 1
 
     # 链接服务器地址 = CDN 域名(必须)
-    local link="vless://${uuid}@${host}:${port}?encryption=none&type=xhttp&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    local link="vless://${uuid}@${host}:${port}?encryption=none&security=none&type=xhttp&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
     local clash="- {name: \"$name\", type: vless, server: $host, port: $port, uuid: $uuid, network: xhttp, \"xhttp-opts\": {path: \"$path\", host: $host}}"
     _add_node_to_yaml "$clash"
 
@@ -516,7 +639,7 @@ _add_vless_ws_cdn() {
     inbound=$(_render_template "$(_tpl_path vless-ws-cdn)") || return 1
     _commit_inbound "$inbound" || return 1
 
-    local link="vless://${uuid}@${host}:${port}?encryption=none&type=ws&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    local link="vless://${uuid}@${host}:${port}?encryption=none&security=none&type=ws&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
     local clash="- {name: \"$name\", type: vless, server: $host, port: $port, uuid: $uuid, network: ws, \"ws-opts\": {path: \"$path\", headers: {Host: $host}}}"
     _add_node_to_yaml "$clash"
 
@@ -633,7 +756,7 @@ _add_hysteria2() {
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
-    local cert_file="" key_file=""
+    local cert_file="" key_file="" self_signed="false"
     echo -e "  TLS 证书:"
     echo -e "  回车使用自签证书, 或输入证书文件路径"
     read -rp "  cert 路径 (回车自签): " custom_cert
@@ -647,6 +770,7 @@ _add_hysteria2() {
     else
         _gen_hy2_cert "$tag" || return 1
         cert_file="$CERT_FILE_PATH"; key_file="$KEY_FILE_PATH"
+        self_signed="true"
     fi
 
     # 认证密码
@@ -713,14 +837,18 @@ _add_hysteria2() {
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
-    # hy2:// 分享链接(标准格式: hy2://password@host:port/?sni=...&congestion=...)
-    local link="hy2://${auth}@${link_ip}:${port}/?sni=build.nvidia.com&congestion=${congestion}"
+    # hy2:// 分享链接(标准格式: hy2://password@host:port/?sni=...&insecure=...&congestion=...)
+    local link="hy2://${auth}@${link_ip}:${port}/?sni=build.nvidia.com"
+    [ "$self_signed" = "true" ] && link="${link}&insecure=1"
+    link="${link}&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
     link="${link}#$(_url_encode "$name")"
 
     # clash yaml
-    local clash="- {name: \"$name\", type: hysteria2, server: $addr, port: $port, password: \"$auth\", sni: build.nvidia.com, \"congestion-control\": $congestion}"
+    local clash_insecure=""
+    [ "$self_signed" = "true" ] && clash_insecure=", skip-cert-verify: true"
+    local clash="- {name: \"$name\", type: hysteria2, server: $addr, port: $port, password: \"$auth\", sni: build.nvidia.com, \"congestion-control\": $congestion${clash_insecure}}"
     _add_node_to_yaml "$clash"
 
     # 元数据
@@ -729,8 +857,8 @@ _add_hysteria2() {
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg auth "$auth" --arg congestion "$congestion" \
         --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
-        --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,share_link:$link}')"
+        --arg link "$link" --argjson ss "$self_signed" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,self_signed:$ss,share_link:$link}')"
 
     _success "节点 [${name}] 创建成功"
     _tip "SNI 使用自签证书域名 build.nvidia.com, 客户端须手动信任证书"
@@ -746,7 +874,7 @@ _add_hysteria2() {
 # 用法:_rebuild_hy2_link <meta_file>
 _rebuild_hy2_link() {
     local meta="$1"
-    local auth host port sni congestion brutal_up brutal_down name
+    local auth host port sni congestion brutal_up brutal_down name self_signed
     auth=$(jq -r '.auth' "$meta")
     host=$(jq -r '.link_addr' "$meta")
     port=$(jq -r '.port' "$meta")
@@ -754,10 +882,13 @@ _rebuild_hy2_link() {
     congestion=$(jq -r '.congestion' "$meta")
     brutal_up=$(jq -r '.brutal_up // empty' "$meta")
     brutal_down=$(jq -r '.brutal_down // empty' "$meta")
+    self_signed=$(jq -r '.self_signed // "false"' "$meta")
     name=$(jq -r '.name' "$meta")
     local link_ip="$host"
     [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
-    local link="hy2://${auth}@${link_ip}:${port}/?sni=${sni}&congestion=${congestion}"
+    local link="hy2://${auth}@${link_ip}:${port}/?sni=${sni}"
+    [ "$self_signed" = "true" ] && link="${link}&insecure=1"
+    link="${link}&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
     link="${link}#$(_url_encode "$name")"
@@ -785,7 +916,7 @@ _rebuild_reality_link() {
     local link
     case "$proto" in
         vless-tcp-reality-vision)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
             ;;
         vless-xhttp-reality)
             link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
@@ -898,6 +1029,22 @@ _delete_node() {
         mv -f "$tmp" "$CONFIG_FILE"
         if _xray_test_config; then
             _manage_xray restart 2>/dev/null || true
+            # 清理所有端口跳跃 iptables 规则
+            if command -v iptables >/dev/null 2>&1; then
+                for tag in "${tags[@]}"; do
+                    local proto; proto=$(jq -r '.protocol' "$NODES_DIR/${tag}.json" 2>/dev/null)
+                    if [ "$proto" = "hysteria2" ]; then
+                        local hop_s hop_e hop_port
+                        hop_s=$(jq -r '.hop_start // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+                        hop_e=$(jq -r '.hop_end // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+                        hop_port=$(jq -r '.port' "$NODES_DIR/${tag}.json" 2>/dev/null)
+                        if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
+                            _hy2_remove_hop_rules "$hop_port" "$hop_s" "$hop_e"
+                        fi
+                    fi
+                done
+                _hy2_persist_iptables
+            fi
             for tag in "${tags[@]}"; do
                 rm -f "$NODES_DIR/${tag}.json"
                 _remove_node_from_yaml_by_tag "$tag"
@@ -923,6 +1070,19 @@ _delete_node() {
             | .inbounds |= map(select(.tag != \$tg))"
     fi
     if _mutate_config --arg t "$tag" --arg tg "$tunnel_tag" "$jq_filter"; then
+        # 清理端口跳跃 iptables 规则
+        local proto; proto=$(jq -r '.protocol' "$NODES_DIR/${tag}.json" 2>/dev/null)
+        if [ "$proto" = "hysteria2" ] && command -v iptables >/dev/null 2>&1; then
+            local hop_s hop_e hop_port
+            hop_s=$(jq -r '.hop_start // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+            hop_e=$(jq -r '.hop_end // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+            hop_port=$(jq -r '.port' "$NODES_DIR/${tag}.json" 2>/dev/null)
+            if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
+                _hy2_remove_hop_rules "$hop_port" "$hop_s" "$hop_e"
+                _hy2_persist_iptables
+                _tip "已清理端口跳跃规则"
+            fi
+        fi
         rm -f "$NODES_DIR/${tag}.json"
         _remove_node_from_yaml_by_tag "$tag"
         _success "节点已删除"
@@ -968,6 +1128,20 @@ _modify_port() {
     local oldport; oldport=$(jq -r '.port' "$meta")
     newlink="${oldlink/:${oldport}/:${newport}}"
     jq --argjson p "$newport" --arg l "$newlink" '.port=$p | .share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    # 如果是 hy2 节点且有端口跳跃, 更新 DNAT 规则
+    local proto; proto=$(jq -r '.protocol' "$meta" 2>/dev/null)
+    if [ "$proto" = "hysteria2" ] && command -v iptables >/dev/null 2>&1; then
+        local hop_s hop_e
+        hop_s=$(jq -r '.hop_start // empty' "$meta" 2>/dev/null)
+        hop_e=$(jq -r '.hop_end // empty' "$meta" 2>/dev/null)
+        if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
+            _info "检测到端口跳跃规则, 正在更新..."
+            _hy2_remove_hop_rules "$oldport" "$hop_s" "$hop_e"
+            _hy2_add_hop_rules "$newport" "$hop_s" "$hop_e"
+            _hy2_persist_iptables
+            _tip "端口跳跃规则已更新: ${hop_s}-${hop_e} → ${newport}"
+        fi
+    fi
     _success "端口已改为 ${newport}"
     _press_any_key
 }
@@ -1078,4 +1252,148 @@ _remove_node_from_yaml_by_tag() {
     name=$(jq -r '.name' "$NODES_DIR/${tag}.json" 2>/dev/null)
     [ -z "$name" ] && return
     _remove_node_from_yaml_by_name "$name"
+}
+
+# ---------------------------------------------------------------------------
+# Hysteria2 端口跳跃管理
+# ---------------------------------------------------------------------------
+
+# 启用/禁用端口跳跃
+_hy2_toggle_hop() {
+    clear
+    _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    _ensure_iptables || { _press_any_key; return; }
+
+    echo; echo -e "  ${CYAN}【端口跳跃 — 启用/禁用】${NC}"
+    echo -e "  ${YELLOW}通过 iptables DNAT 将一段 UDP 端口范围转发到 Hysteria2 监听端口${NC}"
+    echo -e "  ${YELLOW}客户端可连接范围内任意端口, 提高抗封锁能力${NC}"
+    echo
+    local tags=() i=1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        local tag name port hop_s hop_e
+        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
+        hop_s=$(jq -r '.hop_start // empty' "$f")
+        hop_e=$(jq -r '.hop_end // empty' "$f")
+        tags+=("$tag")
+        if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
+            printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${GREEN}%s-%s${NC}\n" "$i" "$name" "$port" "$hop_s" "$hop_e"
+        else
+            printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${RED}未启用${NC}\n" "$i" "$name" "$port"
+        fi
+        i=$((i+1))
+    done
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    read -rp "  选择节点: " choice
+    [ "$choice" = "0" ] && return
+    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+
+    local meta="$NODES_DIR/${tag}.json"
+    local port; port=$(jq -r '.port' "$meta")
+    local cur_hop_s cur_hop_e
+    cur_hop_s=$(jq -r '.hop_start // empty' "$meta")
+    cur_hop_e=$(jq -r '.hop_end // empty' "$meta")
+
+    if [ -n "$cur_hop_s" ] && [ -n "$cur_hop_e" ]; then
+        # 已启用 → 禁用
+        echo -e "  当前端口跳跃: ${GREEN}${cur_hop_s}-${cur_hop_e} → ${port}${NC}"
+        read -rp "  确认禁用端口跳跃? [y/N]: " ans
+        case "$ans" in
+            y|Y)
+                _hy2_remove_hop_rules "$port" "$cur_hop_s" "$cur_hop_e"
+                _hy2_persist_iptables
+                jq 'del(.hop_start) | del(.hop_end)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+                _success "端口跳跃已禁用"
+                ;;
+            *) _info "已取消" ;;
+        esac
+    else
+        # 未启用 → 设置端口范围
+        echo -e "  当前 Hysteria2 端口: ${CYAN}${port}${NC}"
+        echo -e "  ${YELLOW}设置端口跳跃范围 (建议范围不超过 1000 个端口)${NC}"
+        local hop_start hop_end
+        read -rp "  起始端口: " hop_start
+        read -rp "  结束端口: " hop_end
+        if ! _validate_port "$hop_start" || ! _validate_port "$hop_end"; then
+            _warn "端口无效 (1-65535)"; _press_any_key; return
+        fi
+        if [ "$hop_start" -ge "$hop_end" ]; then
+            _warn "起始端口须小于结束端口"; _press_any_key; return
+        fi
+        local range=$((hop_end - hop_start + 1))
+        if [ "$range" -gt 1000 ]; then
+            _warn "端口范围过大 (${range} 个端口), 建议不超过 1000"
+            read -rp "  继续? [y/N]: " ans
+            case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; return ;; esac
+        fi
+        # 检查冲突
+        if _hy2_check_hop_conflict "$hop_start" "$hop_end"; then
+            _warn "端口范围与已有跳跃规则冲突"; _press_any_key; return
+        fi
+        # 检查范围内是否有被占用的端口
+        local conflict_port=""
+        local check_port
+        for check_port in "$hop_start" "$hop_end" $((hop_start + range / 2)); do
+            if _check_port_occupied "$check_port" "udp" || _check_port_in_config "$check_port"; then
+                conflict_port="$check_port"
+                break
+            fi
+        done
+        if [ -n "$conflict_port" ]; then
+            _warn "端口 ${conflict_port} 已被占用或在配置中"; _press_any_key; return
+        fi
+        # 添加规则
+        if _hy2_add_hop_rules "$port" "$hop_start" "$hop_end"; then
+            _hy2_persist_iptables
+            jq --argjson s "$hop_start" --argjson e "$hop_end" \
+               '.hop_start=$s | .hop_end=$e' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            _success "端口跳跃已启用: ${hop_start}-${hop_end} → ${port}"
+            _tip "客户端可连接 ${hop_start}-${hop_end} 范围内的任意端口"
+            _tip "请确保防火墙/安全组已放行该 UDP 端口范围"
+        else
+            _error "iptables 规则添加失败, 请检查内核是否支持 nat 模块"
+        fi
+    fi
+    _press_any_key
+}
+
+# 查看端口跳跃状态
+_hy2_view_hop() {
+    clear
+    echo; echo -e "  ${CYAN}【端口跳跃状态】${NC}"
+    echo
+    local found=0
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        local name port hop_s hop_e
+        name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
+        hop_s=$(jq -r '.hop_start // empty' "$f")
+        hop_e=$(jq -r '.hop_end // empty' "$f")
+        if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
+            echo -e "  ${GREEN}●${NC} ${name}: ${CYAN}${hop_s}-${hop_e}${NC} → ${port} (UDP)"
+            found=1
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        echo -e "  ${YELLOW}暂无启用端口跳跃的节点${NC}"
+    fi
+    echo
+    # 显示 iptables 规则(如果有)
+    if command -v iptables >/dev/null 2>&1; then
+        local rules
+        rules=$(_hy2_list_all_hop_rules)
+        if [ -n "$rules" ]; then
+            echo -e "  ${CYAN}iptables nat 规则:${NC}"
+            echo "$rules" | while read -r line; do
+                echo -e "  ${GREEN}▸${NC} $line"
+            done
+        fi
+    fi
+    _press_any_key
 }
