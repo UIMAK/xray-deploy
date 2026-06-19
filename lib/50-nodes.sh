@@ -10,12 +10,12 @@
 # 协议清单(R6)
 # ---------------------------------------------------------------------------
 PROTOCOLS=(
-    "vless-tcp-reality-vision|VLESS+TCP+Reality+Vision|reality|direct|"
-    "vless-xhttp-reality|VLESS+XHTTP+Reality|reality|direct|"
-    "vless-xhttp-cdn|VLESS+XHTTP(无TLS)|none|cdn|必须套CDN·禁止直连"
-    "vless-ws-cdn|VLESS+WS(无TLS)|none|cdn|必须套CDN·禁止直连"
-    "shadowsocks|Shadowsocks|none|direct|"
-    "hysteria2|Hysteria2               |tls|direct|必须套TLS证书·QUIC"
+    "vless-tcp-reality-vision|VLESS+TCP+Reality+Vision |reality|direct|"
+    "vless-xhttp-reality|VLESS+XHTTP+Reality          |reality|direct|"
+    "vless-xhttp-cdn|VLESS+XHTTP(无TLS)     |none|cdn|必须套CDN·禁止直连"
+    "vless-ws-cdn|VLESS+WS(无TLS)           |none|cdn|必须套CDN·禁止直连"
+    "shadowsocks|Shadowsocks                |none|direct|"
+    "hysteria2|Hysteria2                    |tls|direct|必须套TLS证书·QUIC"
 )
 
 # ---------------------------------------------------------------------------
@@ -226,23 +226,8 @@ _node_count() {
 
 # ---------------------------------------------------------------------------
 # 添加节点:协议分发
+# PROTOCOLS 的 name 字段已含对齐空格, 直接打印
 # ---------------------------------------------------------------------------
-# 格式化协议菜单行(对齐 CJK 和 ASCII 宽度差异)
-# 目标: 描述从第 34 列开始( [N] 4列 + name 30列 )
-_format_proto_line() {
-    local idx="$1" name="$2" desc="$3"
-    local nbyte nchar cjk dw pad i sp=""
-    nbyte=${#name}; nchar=$(printf '%s' "$name" | wc -m | tr -d ' ')
-    cjk=$(( (nbyte - nchar) / 2 )); dw=$(( nchar + cjk ))
-    pad=$(( 30 - dw )); [ "$pad" -lt 1 ] && pad=1
-    for ((i=0; i<pad; i++)); do sp="${sp} "; done
-    if [ -n "$desc" ]; then
-        printf "  ${GREEN}[%d]${NC} %s%s%s\n" "$idx" "$name" "$sp" "$desc"
-    else
-        printf "  ${GREEN}[%d]${NC} %s\n" "$idx" "$name"
-    fi
-}
-
 _add_node() {
     clear
     [ -x "$XRAY_BIN" ] || { _error "Xray 未安装,请先在 [6] 安装/切换 Xray 核心"; _press_any_key; return 1; }
@@ -255,8 +240,11 @@ _add_node() {
     for p in "${PROTOCOLS[@]}"; do
         local key name desc
         IFS='|' read -r key name _ _ desc <<< "$p"
-        name=$(echo "$name" | xargs)  # trim padding spaces
-        _format_proto_line "$i" "$name" "$desc"
+        if [ -n "$desc" ]; then
+            printf "  ${GREEN}[%d]${NC} %s %s\n" "$i" "$name" "$desc"
+        else
+            printf "  ${GREEN}[%d]${NC} %s\n" "$i" "$name"
+        fi
         i=$((i+1))
     done
     echo -e "  ${GREEN}[0]${NC} 返回"
