@@ -323,7 +323,7 @@ _add_node() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议1: VLESS+TCP+Reality+Vision (Tunnel 模式, 不偷证书)
+# 协议1: VLESS+TCP+Reality+Vision (Tunnel 模式, 防偷跑)
 # ---------------------------------------------------------------------------
 _add_vless_tcp_reality_vision() {
     echo -e "\n  ${CYAN}=== VLESS+TCP+Reality+Vision (Tunnel 模式) ===${NC}"
@@ -391,7 +391,7 @@ _add_vless_tcp_reality_vision() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议2: VLESS+XHTTP+Reality (Tunnel 模式, 不偷证书)
+# 协议2: VLESS+XHTTP+Reality (Tunnel 模式, 防偷跑)
 # ---------------------------------------------------------------------------
 _add_vless_xhttp_reality() {
     echo -e "\n  ${CYAN}=== VLESS+XHTTP+Reality (Tunnel 模式) ===${NC}"
