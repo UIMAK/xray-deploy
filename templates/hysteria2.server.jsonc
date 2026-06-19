@@ -22,7 +22,7 @@
         },
         "finalmask": {
             "quicParams": {
-                "congestion": "{{CONGESTION}}"{{BRUTAL_PARAMS_BLOCK}}{{UDPHOP_BLOCK}}
+                "congestion": "{{CONGESTION}}"{{BRUTAL_PARAMS_BLOCK}}
             }
         }
     },

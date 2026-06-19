@@ -324,7 +324,7 @@ _render_template() {
     : "${R_SERVER_NAME:=}" "${R_PRIVATE_KEY:=}" "${R_SHORT_ID:=}" "${R_PATH:=}"
     : "${R_HOST:=}" "${R_METHOD:=}" "${R_PASSWORD:=}" "${R_MLDSA65_SEED:=}"
     : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
-    : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}" "${R_UDPHOP_BLOCK:=}"
+    : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}"
     : "${R_TUNNEL_PORT:=}" "${R_TUNNEL_TAG:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
@@ -353,13 +353,6 @@ _render_template() {
     p="{{BRUTAL_PARAMS_BLOCK}}"
     if [ -n "$R_BRUTAL_PARAMS_BLOCK" ]; then
         content="${content//$p/$R_BRUTAL_PARAMS_BLOCK}"
-    else
-        content="${content//$p/}"
-    fi
-    # Hysteria2 udpHop 端口跳跃块(可选)
-    p="{{UDPHOP_BLOCK}}"
-    if [ -n "$R_UDPHOP_BLOCK" ]; then
-        content="${content//$p/$R_UDPHOP_BLOCK}"
     else
         content="${content//$p/}"
     fi
@@ -1360,17 +1353,17 @@ _remove_node_from_yaml_by_tag() {
 }
 
 # ---------------------------------------------------------------------------
-# Hysteria2 端口跳跃管理 (iptables DNAT + udpHop 配置)
+# Hysteria2 端口跳跃管理 (iptables DNAT)
 # ---------------------------------------------------------------------------
 
-# 启用/禁用端口跳跃 (iptables DNAT + udpHop 配置 + 分享链接 mport)
+# 启用/禁用端口跳跃 (iptables DNAT + 分享链接 mport)
 _hy2_toggle_hop() {
     clear
     _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
     _ensure_iptables || { _press_any_key; return; }
 
     echo; echo -e "  ${CYAN}【端口跳跃 — 启用/禁用】${NC}"
-    echo -e "  ${YELLOW}iptables DNAT 转发 + Xray udpHop 配置, 双管齐下${NC}"
+    echo -e "  ${YELLOW}iptables DNAT 将 UDP 端口范围转发到 Hysteria2 监听端口${NC}"
     echo -e "  ${YELLOW}客户端可连接范围内任意端口, 提高抗封锁能力${NC}"
     echo
     local tags=() i=1
@@ -1413,11 +1406,8 @@ _hy2_toggle_hop() {
                 # shellcheck disable=SC2086
                 _hy2_remove_hop_rules "$port" $cur_ranges
                 _hy2_persist_iptables
-                # 删除 udpHop 配置
-                _mutate_config --arg t "$tag" \
-                    '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) |= del(.udpHop)' 2>/dev/null || true
                 # 清理元数据
-                jq 'del(.hop_ranges) | del(.hop_start) | del(.hop_end) | del(.udp_hop_ports) | del(.udp_hop_interval)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+                jq 'del(.hop_ranges) | del(.hop_start) | del(.hop_end) | del(.udp_hop_ports)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
                 # 重建分享链接
                 local newlink; newlink=$(_rebuild_hy2_link "$meta")
                 jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
@@ -1452,22 +1442,6 @@ _hy2_toggle_hop() {
                 normalized="${normalized:+$normalized,}$rs-$re"
             fi
         done
-        # 跳跃间隔
-        local hop_interval
-        read -rp "  跳跃间隔 (固定秒数或范围如5-10, 最少5, 默认5-10): " hop_interval
-        hop_interval=${hop_interval:-5-10}
-        if echo "$hop_interval" | grep -q '-'; then
-            local i_min i_max
-            i_min=$(echo "$hop_interval" | cut -d'-' -f1)
-            i_max=$(echo "$hop_interval" | cut -d'-' -f2)
-            if [ "$i_min" -lt 5 ] 2>/dev/null || [ "$i_max" -lt "$i_min" ] 2>/dev/null; then
-                _warn "间隔最小值不能小于 5 秒"; _press_any_key; return
-            fi
-        else
-            if [ "$hop_interval" -lt 5 ] 2>/dev/null; then
-                _warn "间隔不能小于 5 秒"; _press_any_key; return
-            fi
-        fi
         # 1. 添加 iptables DNAT 规则 (服务端端口转发)
         # shellcheck disable=SC2086
         if ! _hy2_add_hop_rules "$port" $parsed; then
@@ -1475,17 +1449,13 @@ _hy2_toggle_hop() {
             _press_any_key; return
         fi
         _hy2_persist_iptables
-        # 2. 注入 udpHop 到 config.json (客户端信息)
-        _mutate_config --arg t "$tag" --arg ports "$normalized" --arg interval "$hop_interval" \
-            '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.udpHop) =
-             {ports: $ports, interval: ($interval | if test("^[0-9]+$") then tonumber else . end)}' 2>/dev/null || true
-        # 3. 更新元数据
-        jq --arg r "$normalized" --arg i "$hop_interval" \
-           '.hop_ranges=$r | .udp_hop_ports=$r | .udp_hop_interval=$i | del(.hop_start) | del(.hop_end)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-        # 4. 重建分享链接 (含 &mport=)
+        # 2. 更新元数据
+        jq --arg r "$normalized" \
+           '.hop_ranges=$r | .udp_hop_ports=$r | del(.hop_start) | del(.hop_end)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        # 3. 重建分享链接 (含 &mport=)
         local newlink; newlink=$(_rebuild_hy2_link "$meta")
         jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-        _success "端口跳跃已启用: ${normalized} → ${port} (每${hop_interval}s)"
+        _success "端口跳跃已启用: ${normalized} → ${port}"
         _tip "iptables DNAT 已生效, 客户端可连接范围内任意端口"
         _tip "请确保防火墙/安全组已放行该 UDP 端口范围"
     fi

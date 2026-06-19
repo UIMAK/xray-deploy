@@ -376,7 +376,7 @@ _hy2_manage_menu() {
         echo
         echo -e "  ${GREEN}[1]${NC} 切换拥塞控制 (bbr/brutal/force-brutal)"
         echo -e "  ${GREEN}[2]${NC} 调整 brutal 带宽"
-        echo -e "  ${GREEN}[3]${NC} 端口跳跃 (iptables+udpHop)"
+        echo -e "  ${GREEN}[3]${NC} 端口跳跃 (iptables)"
         echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
