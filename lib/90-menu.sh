@@ -148,7 +148,6 @@ _main_menu() {
         # 动态编号: 核心与服务 / 运维
         local _off=1
         _has_reality_nodes && _off=$((_off+1))
-        _has_reality_nodes && _off=$((_off+1))
         local _core=$((_off+6))
         local _ops_start=$((_core+3))
         if [ "$choice" = "$_core" ]; then
