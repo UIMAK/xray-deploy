@@ -1187,18 +1187,29 @@ _hy2_toggle_hop() {
         read -rp "  端口范围: " hop_ports
         [ -z "$hop_ports" ] && { _info "已取消"; _press_any_key; return; }
         local hop_interval
-        read -rp "  跳跃间隔 (秒, 最少5, 默认30): " hop_interval
-        hop_interval=${hop_interval:-30}
-        if [ "$hop_interval" -lt 5 ] 2>/dev/null; then
-            _warn "间隔不能小于 5 秒"; _press_any_key; return
+        read -rp "  跳跃间隔 (固定秒数或范围如5-10, 最少5, 默认5-10): " hop_interval
+        hop_interval=${hop_interval:-5-10}
+        # 验证: 数字或范围格式
+        if echo "$hop_interval" | grep -q '-'; then
+            local i_min i_max
+            i_min=$(echo "$hop_interval" | cut -d'-' -f1)
+            i_max=$(echo "$hop_interval" | cut -d'-' -f2)
+            if [ "$i_min" -lt 5 ] 2>/dev/null || [ "$i_max" -lt "$i_min" ] 2>/dev/null; then
+                _warn "间隔最小值不能小于 5 秒"; _press_any_key; return
+            fi
+        else
+            if [ "$hop_interval" -lt 5 ] 2>/dev/null; then
+                _warn "间隔不能小于 5 秒"; _press_any_key; return
+            fi
         fi
-        # 注入 udpHop 到 config.json
-        if ! _mutate_config --arg t "$tag" --arg ports "$hop_ports" --argjson interval "$hop_interval" \
-             '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.udpHop) = {ports: $ports, interval: $interval}'; then
+        # 注入 udpHop 到 config.json (interval 可以是数字或 "5-10" 范围字符串)
+        if ! _mutate_config --arg t "$tag" --arg ports "$hop_ports" --arg interval "$hop_interval" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.udpHop) =
+              {ports: $ports, interval: ($interval | if test("^[0-9]+$") then tonumber else . end)}'; then
             _error "启用失败, 已回滚"; _press_any_key; return
         fi
         # 更新元数据
-        jq --arg p "$hop_ports" --argjson i "$hop_interval" \
+        jq --arg p "$hop_ports" --arg i "$hop_interval" \
            '.udp_hop_ports=$p | .udp_hop_interval=$i' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
         _success "端口跳跃已启用: ${hop_ports} (每${hop_interval}s)"
         _tip "客户端需配置相同端口范围以使用端口跳跃"
