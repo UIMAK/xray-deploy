@@ -907,32 +907,20 @@ _add_hysteria2() {
 
     local listen="::"
 
-    # 构建 inbound JSON(条件字段, 用 jq 组装, 比模板灵活)
+    # 构建 brutal 参数块(仅 brutal 模式有值)
+    local brutal_block=""
+    if [ "$congestion" = "brutal" ]; then
+        brutal_block=""
+        [ -n "$brutal_up" ] && brutal_block="${brutal_block}, \"brutalUp\": \"${brutal_up}\""
+        [ -n "$brutal_down" ] && brutal_block="${brutal_block}, \"brutalDown\": \"${brutal_down}\""
+    fi
+
+    # 渲染模板
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag"
+    R_AUTH="$auth" R_CERT_FILE="$cert_file" R_KEY_FILE="$key_file"
+    R_CONGESTION="$congestion" R_BRUTAL_PARAMS_BLOCK="$brutal_block"
     local inbound
-    inbound=$(jq -n \
-        --arg listen "$listen" --argjson port "$port" --arg tag "$tag" \
-        --arg auth "$auth" \
-        --arg cert "$cert_file" --arg key "$key_file" \
-        --arg congestion "$congestion" \
-        --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
-        '{
-            listen: $listen, port: $port, protocol: "hysteria", tag: $tag,
-            settings: { version: 2 },
-            streamSettings: {
-                network: "hysteria", security: "tls",
-                tlsSettings: {
-                    alpn: ["h3"],
-                    certificates: [{ usage: "encipherment", certificateFile: $cert, keyFile: $key }]
-                },
-                hysteriaSettings: { version: 2, auth: $auth },
-                finalmask: { quicParams: (
-                    { congestion: $congestion }
-                    + (if $brutalUp != "" then { brutalUp: $brutalUp } else {} end)
-                    + (if $brutalDown != "" then { brutalDown: $brutalDown } else {} end)
-                ) }
-            },
-            sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
-        }') || { _error "inbound JSON 生成失败"; return 1; }
+    inbound=$(_render_template "$(_tpl_path hysteria2)") || return 1
 
     _commit_inbound "$inbound" || return 1
 
@@ -1044,6 +1032,7 @@ _tpl_path() {
         vless-xhttp-cdn)          echo "/opt/xray-deploy/templates/vless-xhttp-cdn.server.jsonc" ;;
         vless-ws-cdn)             echo "/opt/xray-deploy/templates/vless-ws-cdn.server.jsonc" ;;
         shadowsocks)              echo "/opt/xray-deploy/templates/shadowsocks.server.jsonc" ;;
+        hysteria2)                echo "/opt/xray-deploy/templates/hysteria2.server.jsonc" ;;
     esac
 }
 
