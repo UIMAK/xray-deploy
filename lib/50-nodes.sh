@@ -153,23 +153,20 @@ _render_template() {
 }
 
 # ---------------------------------------------------------------------------
-# Reality 专用: 同时加入 tunnel inbound + reality inbound + 2 条路由规则
-# 用法:_commit_reality_inbound <tunnel_json> <reality_json> <tunnel_tag> <domain>
+# 统一的 config.json 修改流程: backup → jq → test → rollback/restart
+# 用法:_mutate_config <jq_filter> [jq_extra_args...]
+# 所有 config 修改应通过此函数, 不再各自实现 backup/test/rollback
 # ---------------------------------------------------------------------------
-_commit_reality_inbound() {
-    local tunnel="$1" reality="$2" tunnel_tag="$3" domain="$4"
+_mutate_config() {
+    local jq_filter="$1"; shift
     _backup_config
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    jq --argjson tb "$tunnel" --argjson rb "$reality" \
-       --arg tg "$tunnel_tag" --arg dom "$domain" \
-       '.inbounds += [$tb, $rb]
-        | .routing.rules += [
-            {inboundTag: [$tg], domain: [$dom], outboundTag: "direct"},
-            {inboundTag: [$tg], outboundTag: "block"}
-          ]' "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    if ! jq $jq_filter "$@" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; _error "jq 处理失败"; return 1
+    fi
     if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"; _error "合并 Reality+Tunnel 配置失败"; return 1
+        rm -f "$tmp"; _error "生成的配置为空"; return 1
     fi
     mv -f "$tmp" "$CONFIG_FILE"
     if ! _xray_test_config; then
@@ -181,48 +178,30 @@ _commit_reality_inbound() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# 删除 Reality 节点时, 同步删除对应 Tunnel inbound + 2 条路由规则
-# 用法:_remove_reality_tunnel <tunnel_tag>
-# ---------------------------------------------------------------------------
+# 把渲染好的 inbound 加入 config.json
+_commit_inbound() {
+    local inbound="$1"
+    _mutate_config --argjson nb "$inbound" '.inbounds += [$nb]' || return 1
+}
+
+# Reality 专用: tunnel + reality inbound + 2 条路由规则
+_commit_reality_inbound() {
+    local tunnel="$1" reality="$2" tunnel_tag="$3" domain="$4"
+    _mutate_config --argjson tb "$tunnel" --argjson rb "$reality" \
+       --arg tg "$tunnel_tag" --arg dom "$domain" \
+       '.inbounds += [$tb, $rb] | .routing.rules += [
+            {inboundTag: [$tg], domain: [$dom], outboundTag: "direct"},
+            {inboundTag: [$tg], outboundTag: "block"}]' || return 1
+}
+
+# 删除 Tunnel inbound + 对应路由规则
 _remove_reality_tunnel() {
     local tg="$1"
     [ -z "$tg" ] && return 0
     [ -f "$CONFIG_FILE" ] || return 0
-    local tmp
-    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    jq --arg tg "$tg" \
+    _mutate_config --arg tg "$tg" \
        '.inbounds |= map(select(.tag != $tg))
-        | .routing.rules |= map(select(.inboundTag == null or (.inboundTag | index($tg)) == null))' \
-       "$CONFIG_FILE" > "$tmp" 2>/dev/null
-    if [ -s "$tmp" ]; then
-        mv -f "$tmp" "$CONFIG_FILE"
-    else
-        rm -f "$tmp"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# 把渲染好的 inbound 加入 config.json, 校验, 重启
-# 用法:_commit_inbound <inbound_json>
-# ---------------------------------------------------------------------------
-_commit_inbound() {
-    local inbound="$1"
-    _backup_config
-    local tmp
-    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    jq --argjson nb "$inbound" '.inbounds += [$nb]' "$CONFIG_FILE" > "$tmp" 2>/dev/null
-    if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"; _error "合并 inbound 失败"; return 1
-    fi
-    mv -f "$tmp" "$CONFIG_FILE"
-    if ! _xray_test_config; then
-        _error "配置校验失败,回滚"
-        _restore_config
-        return 1
-    fi
-    _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null
-    return 0
+        | .routing.rules |= map(select(.inboundTag == null or (.inboundTag | index($tg)) == null))' || return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -634,9 +613,9 @@ _gen_hy2_cert() {
     if command -v openssl >/dev/null 2>&1; then
         openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE_PATH" 2>/dev/null \
             && openssl req -new -x509 -days 3650 -key "$KEY_FILE_PATH" \
-                -out "$CERT_FILE_PATH" -subj "/CN=hy2.local" 2>/dev/null
+                -out "$CERT_FILE_PATH" -subj "/CN=build.nvidia.com" 2>/dev/null
     elif [ -x "$XRAY_BIN" ]; then
-        "$XRAY_BIN" tls cert --domain hy2.local --file "$cert_dir" 2>/dev/null
+        "$XRAY_BIN" tls cert --domain build.nvidia.com --file "$cert_dir" 2>/dev/null
         # xray tls cert 输出: cert.pem / key.pem(同名)
         [ -f "${cert_dir}/cert.pem" ] && mv -f "${cert_dir}/cert.pem" "$CERT_FILE_PATH"
         [ -f "${cert_dir}/key.pem" ] && mv -f "${cert_dir}/key.pem" "$KEY_FILE_PATH"
@@ -735,13 +714,13 @@ _add_hysteria2() {
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
     # hy2:// 分享链接(标准格式: hy2://password@host:port/?sni=...&congestion=...)
-    local link="hy2://${auth}@${link_ip}:${port}/?sni=hy2.local&congestion=${congestion}"
+    local link="hy2://${auth}@${link_ip}:${port}/?sni=build.nvidia.com&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
     link="${link}#$(_url_encode "$name")"
 
     # clash yaml
-    local clash="- {name: \"$name\", type: hysteria2, server: $addr, port: $port, password: \"$auth\", sni: hy2.local, \"congestion-control\": $congestion}"
+    local clash="- {name: \"$name\", type: hysteria2, server: $addr, port: $port, password: \"$auth\", sni: build.nvidia.com, \"congestion-control\": $congestion}"
     _add_node_to_yaml "$clash"
 
     # 元数据
@@ -754,7 +733,7 @@ _add_hysteria2() {
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,share_link:$link}')"
 
     _success "节点 [${name}] 创建成功"
-    _tip "SNI 使用自签证书域名 hy2.local, 客户端须手动信任证书"
+    _tip "SNI 使用自签证书域名 build.nvidia.com, 客户端须手动信任证书"
     echo -e "  ${CYAN}拥塞控制:${NC} ${congestion}"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
@@ -771,7 +750,7 @@ _rebuild_hy2_link() {
     auth=$(jq -r '.auth' "$meta")
     host=$(jq -r '.link_addr' "$meta")
     port=$(jq -r '.port' "$meta")
-    sni="hy2.local"
+    sni="build.nvidia.com"
     congestion=$(jq -r '.congestion' "$meta")
     brutal_up=$(jq -r '.brutal_up // empty' "$meta")
     brutal_down=$(jq -r '.brutal_down // empty' "$meta")
@@ -935,24 +914,21 @@ _delete_node() {
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
 
-    # 先备份, 再删除(tunnel + reality + 路由一起删, 最后统一校验)
-    _backup_config
+    # 读取 tunnel_tag, 一次性删除 tunnel + reality + 路由(原子操作)
     local tunnel_tag
     tunnel_tag=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+    local jq_filter='.inbounds |= map(select(.tag != $t))'
     if [ -n "$tunnel_tag" ]; then
-        _remove_reality_tunnel "$tunnel_tag"
+        jq_filter="$jq_filter | .routing.rules |= map(select(.inboundTag == null or (.inboundTag | index(\$tg)) == null))
+            | .inbounds |= map(select(.tag != \$tg))"
     fi
-
-    local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    jq --arg t "$tag" '.inbounds |= map(select(.tag != $t))' "$CONFIG_FILE" > "$tmp" 2>/dev/null
-    mv -f "$tmp" "$CONFIG_FILE"
-    if ! _xray_test_config; then
-        _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return 1
+    if _mutate_config --arg t "$tag" --arg tg "$tunnel_tag" "$jq_filter"; then
+        rm -f "$NODES_DIR/${tag}.json"
+        _remove_node_from_yaml_by_tag "$tag"
+        _success "节点已删除"
+    else
+        _error "删除失败, 已回滚"
     fi
-    _manage_xray restart 2>/dev/null || true
-    rm -f "$NODES_DIR/${tag}.json"
-    _remove_node_from_yaml_by_tag "$tag"
-    _success "节点已删除"
     _press_any_key
 }
 
@@ -980,11 +956,10 @@ _modify_port() {
     [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
 
     local newport=$(_input_port)
-    _backup_config
-    local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    jq --arg t "$tag" --argjson p "$newport" '(.inbounds[] | select(.tag == $t) | .port) = $p' "$CONFIG_FILE" > "$tmp" 2>/dev/null
-    mv -f "$tmp" "$CONFIG_FILE"
-    _xray_test_config && _manage_xray restart || { _restore_config; return 1; }
+    if ! _mutate_config --arg t "$tag" --argjson p "$newport" \
+         '(.inbounds[] | select(.tag == $t) | .port) = $p'; then
+        _error "端口修改失败, 已回滚"; _press_any_key; return 1
+    fi
 
     # 更新元数据 + 链接(端口出现在链接里)
     local meta="$NODES_DIR/${tag}.json"
@@ -1032,14 +1007,10 @@ _update_listen() {
         _warn "监听地址不合法"; _press_any_key; return
     fi
 
-    _backup_config
-    local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    jq --arg t "$tag" --arg l "$newlisten" '(.inbounds[] | select(.tag == $t) | .listen) = $l' "$CONFIG_FILE" > "$tmp" 2>/dev/null
-    mv -f "$tmp" "$CONFIG_FILE"
-    if ! _xray_test_config; then
-        _restore_config; _press_any_key; return
+    if ! _mutate_config --arg t "$tag" --arg l "$newlisten" \
+         '(.inbounds[] | select(.tag == $t) | .listen) = $l'; then
+        _error "监听修改失败, 已回滚"; _press_any_key; return
     fi
-    _manage_xray restart 2>/dev/null || true
 
     # 联动链接服务器地址(R7 确认 A)
     local proto oldaddr newaddr
