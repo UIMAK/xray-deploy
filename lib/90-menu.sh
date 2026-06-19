@@ -566,18 +566,34 @@ _reality_domain_menu() {
     fi
 
     _backup_config
+    local tunnel_tag
+    tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
     local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
     if [ -n "$pq_seed" ]; then
-        # 启用后量子: 更新 target/serverNames + 添加 mldsa65Seed
-        jq --arg t "$tag" --arg sni "$new_sni" --arg target "$new_target" --arg seed "$pq_seed" \
+        jq --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
+           --arg tg "$tunnel_tag" --arg dom "$new_sni" \
            '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-            (.target = $target | .serverNames = [$sni] | .mldsa65Seed = $seed)' \
+            (.serverNames = [$sni] | .mldsa65Seed = $seed)
+            | if $tg != "" then
+                (.inbounds[] | select(.tag == $tg) | .settings.address) = $dom
+                | .routing.rules |= map(
+                    if .inboundTag != null and (.inboundTag | index($tg)) != null
+                    then if .domain != null then .domain = [$dom] else . end
+                    else . end)
+              else . end' \
            "$CONFIG_FILE" > "$tmp" 2>/dev/null
     else
-        # 不支持后量子: 更新 target/serverNames + 移除 mldsa65Seed
-        jq --arg t "$tag" --arg sni "$new_sni" --arg target "$new_target" \
+        jq --arg t "$tag" --arg sni "$new_sni" \
+           --arg tg "$tunnel_tag" --arg dom "$new_sni" \
            '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-            (.target = $target | .serverNames = [$sni] | del(.mldsa65Seed))' \
+            (.serverNames = [$sni] | del(.mldsa65Seed))
+            | if $tg != "" then
+                (.inbounds[] | select(.tag == $tg) | .settings.address) = $dom
+                | .routing.rules |= map(
+                    if .inboundTag != null and (.inboundTag | index($tg)) != null
+                    then if .domain != null then .domain = [$dom] else . end
+                    else . end)
+              else . end' \
            "$CONFIG_FILE" > "$tmp" 2>/dev/null
     fi
     mv -f "$tmp" "$CONFIG_FILE"

@@ -105,6 +105,7 @@ _render_template() {
     : "${R_HOST:=}" "${R_METHOD:=}" "${R_PASSWORD:=}" "${R_MLDSA65_SEED:=}"
     : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
     : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}"
+    : "${R_TUNNEL_PORT:=}" "${R_TUNNEL_TAG:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
 
@@ -122,6 +123,8 @@ _render_template() {
     p="{{HOST}}";         content="${content//$p/$R_HOST}"
     p="{{METHOD}}";       content="${content//$p/$R_METHOD}"
     p="{{PASSWORD}}";     content="${content//$p/$R_PASSWORD}"
+    p="{{TUNNEL_PORT}}";  content="${content//$p/$R_TUNNEL_PORT}"
+    p="{{TUNNEL_TAG}}";   content="${content//$p/$R_TUNNEL_TAG}"
     p="{{AUTH}}";         content="${content//$p/$R_AUTH}"
     p="{{CERT_FILE}}";    content="${content//$p/$R_CERT_FILE}"
     p="{{KEY_FILE}}";     content="${content//$p/$R_KEY_FILE}"
@@ -147,6 +150,56 @@ _render_template() {
         _error "模板渲染后 JSON 不合法"
         return 1
     }
+}
+
+# ---------------------------------------------------------------------------
+# Reality 专用: 同时加入 tunnel inbound + reality inbound + 2 条路由规则
+# 用法:_commit_reality_inbound <tunnel_json> <reality_json> <tunnel_tag> <domain>
+# ---------------------------------------------------------------------------
+_commit_reality_inbound() {
+    local tunnel="$1" reality="$2" tunnel_tag="$3" domain="$4"
+    _backup_config
+    local tmp
+    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    jq --argjson tb "$tunnel" --argjson rb "$reality" \
+       --arg tg "$tunnel_tag" --arg dom "$domain" \
+       '.inbounds += [$tb, $rb]
+        | .routing.rules += [
+            {inboundTag: [$tg], domain: [$dom], outboundTag: "direct"},
+            {inboundTag: [$tg], outboundTag: "block"}
+          ]' "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; _error "合并 Reality+Tunnel 配置失败"; return 1
+    fi
+    mv -f "$tmp" "$CONFIG_FILE"
+    if ! _xray_test_config; then
+        _error "配置校验失败,回滚"
+        _restore_config
+        return 1
+    fi
+    _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 删除 Reality 节点时, 同步删除对应 Tunnel inbound + 2 条路由规则
+# 用法:_remove_reality_tunnel <tunnel_tag>
+# ---------------------------------------------------------------------------
+_remove_reality_tunnel() {
+    local tg="$1"
+    [ -z "$tg" ] && return 0
+    [ -f "$CONFIG_FILE" ] || return 0
+    local tmp
+    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    jq --arg tg "$tg" \
+       '.inbounds |= map(select(.tag != $tg))
+        | .routing.rules |= map(select(.inboundTag == null or (.inboundTag | index($tg)) == null))' \
+       "$CONFIG_FILE" > "$tmp" 2>/dev/null
+    if [ -s "$tmp" ]; then
+        mv -f "$tmp" "$CONFIG_FILE"
+    else
+        rm -f "$tmp"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -270,85 +323,20 @@ _add_node() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议1: VLESS+TCP+Reality+Vision
+# 协议1: VLESS+TCP+Reality+Vision (Tunnel 模式, 不偷证书)
 # ---------------------------------------------------------------------------
 _add_vless_tcp_reality_vision() {
-    echo -e "\n  ${CYAN}=== VLESS+TCP+Reality+Vision (可直连) ===${NC}"
-    local port=$(_input_port)
+    echo -e "\n  ${CYAN}=== VLESS+TCP+Reality+Vision (Tunnel 模式) ===${NC}"
     local sni
-    read -rp "  伪装域名/Target SNI (默认 www.amd.com): " sni
+    read -rp "  伪装域名 (默认 www.amd.com): " sni
     sni=${sni:-www.amd.com}
-    local target="${sni}:443"
 
-    local default_name="Reality-Vision-${port}"
-    read -rp "  节点名称 (默认 ${default_name}): " name
-    name=${name:-$default_name}
-
-    local uuid
-    uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
-    _generate_reality_keys || return 1
-
-    # 后量子检测(R8 默认自动)
-    local pq_seed="" pq_verify=""
-    if _detect_reality_pq "$target"; then
-        pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
-    fi
-
-    local tag="xd-reality-vision-${port}"
-    local listen="::"   # R7 默认双栈
-
-    # 渲染模板
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
-    R_TARGET="$target" R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
-    R_SHORT_ID="$REALITY_SHORT_ID" R_MLDSA65_SEED="$pq_seed"
-    local inbound
-    inbound=$(_render_template "$(_tpl_path vless-tcp-reality-vision)") || return 1
-
-    _commit_inbound "$inbound" || return 1
-
-    # 客户端连接地址(直连场景: 默认公网 IP)
-    local addr
-    addr=$(_ask_link_addr)
-
-    # 分享链接(mack-a 风格: pbk= + 可选 pqv=)
-    local link_ip="$addr"
-    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
-    [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
-    link="${link}#$(_url_encode "$name")"
-
-    # clash yaml 节点行
-    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": chrome, network: tcp}"
-    _add_node_to_yaml "$clash"
-
-    # 元数据
-    _save_node_meta "$tag" "$(jq -n \
-        --arg tag "$tag" --arg name "$name" --arg proto "vless-tcp-reality-vision" \
-        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
-        --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
-        --arg sid "$REALITY_SHORT_ID" --arg pqv "$pq_verify" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link}')"
-
-    _success "节点 [${name}] 创建成功"
-    [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"
-    echo -e "  ${CYAN}分享链接:${NC} ${link}"
-}
-
-# ---------------------------------------------------------------------------
-# 协议2: VLESS+XHTTP+Reality (flow 空, 不用 Vision)
-# ---------------------------------------------------------------------------
-_add_vless_xhttp_reality() {
-    echo -e "\n  ${CYAN}=== VLESS+XHTTP+Reality (可直连) ===${NC}"
+    echo -e "  ${YELLOW}Tunnel 监听端口 (转发到 ${sni}:443)${NC}"
+    local tunnel_port=$(_input_port)
+    echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
     local port=$(_input_port)
-    local sni
-    read -rp "  伪装域名/Target SNI (默认 www.amd.com): " sni
-    sni=${sni:-www.amd.com}
-    local target="${sni}:443"
-    local path=$(_gen_rand_path)
-    read -rp "  XHTTP path (默认 ${path}): " custom_path
-    path=${custom_path:-$path}
 
-    local default_name="Reality-XHTTP-${port}"
+    local default_name="Tunnel-${sni}-${tunnel_port}-${port}"
     read -rp "  节点名称 (默认 ${default_name}): " name
     name=${name:-$default_name}
 
@@ -356,21 +344,99 @@ _add_vless_xhttp_reality() {
     _generate_reality_keys || return 1
 
     local pq_seed="" pq_verify=""
-    if _detect_reality_pq "$target"; then
+    if _detect_reality_pq "${sni}:443"; then
+        pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
+    fi
+
+    local tag="xd-reality-vision-${port}"
+    local tunnel_tag="xd-tunnel-${tunnel_port}"
+    local listen="::"
+
+    # 渲染 tunnel inbound
+    R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
+    local tunnel_json
+    tunnel_json=$(_render_template "$(_tpl_path tunnel)") || return 1
+
+    # 渲染 reality inbound
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
+    R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+    R_SHORT_ID="$REALITY_SHORT_ID" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
+    local reality_json
+    reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision)") || return 1
+
+    _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
+
+    local addr; addr=$(_ask_link_addr)
+    local link_ip="$addr"
+    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
+    link="${link}#$(_url_encode "$name")"
+
+    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": chrome, network: tcp}"
+    _add_node_to_yaml "$clash"
+
+    _save_node_meta "$tag" "$(jq -n \
+        --arg tag "$tag" --arg name "$name" --arg proto "vless-tcp-reality-vision" \
+        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
+        --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
+        --arg sid "$REALITY_SHORT_ID" --arg pqv "$pq_verify" --arg link "$link" \
+        --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link,tunnel_tag:$ttag,tunnel_port:$tport}')"
+
+    _success "节点 [${name}] 创建成功"
+    _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
+    [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"
+    echo -e "  ${CYAN}分享链接:${NC} ${link}"
+}
+
+# ---------------------------------------------------------------------------
+# 协议2: VLESS+XHTTP+Reality (Tunnel 模式, 不偷证书)
+# ---------------------------------------------------------------------------
+_add_vless_xhttp_reality() {
+    echo -e "\n  ${CYAN}=== VLESS+XHTTP+Reality (Tunnel 模式) ===${NC}"
+    local sni
+    read -rp "  伪装域名 (默认 www.amd.com): " sni
+    sni=${sni:-www.amd.com}
+
+    echo -e "  ${YELLOW}Tunnel 监听端口 (转发到 ${sni}:443)${NC}"
+    local tunnel_port=$(_input_port)
+    echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
+    local port=$(_input_port)
+
+    local path=$(_gen_rand_path)
+    read -rp "  XHTTP path (默认 ${path}): " custom_path
+    path=${custom_path:-$path}
+
+    local default_name="Tunnel-${sni}-${tunnel_port}-${port}"
+    read -rp "  节点名称 (默认 ${default_name}): " name
+    name=${name:-$default_name}
+
+    local uuid; uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
+    _generate_reality_keys || return 1
+
+    local pq_seed="" pq_verify=""
+    if _detect_reality_pq "${sni}:443"; then
         pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
     fi
 
     local tag="xd-reality-xhttp-${port}"
+    local tunnel_tag="xd-tunnel-${tunnel_port}"
     local listen="::"
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
-    R_TARGET="$target" R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
-    R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_MLDSA65_SEED="$pq_seed"
-    local inbound
-    inbound=$(_render_template "$(_tpl_path vless-xhttp-reality)") || return 1
-    _commit_inbound "$inbound" || return 1
 
-    local addr
-    addr=$(_ask_link_addr)
+    R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
+    local tunnel_json
+    tunnel_json=$(_render_template "$(_tpl_path tunnel)") || return 1
+
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
+    R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+    R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
+    local reality_json
+    reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality)") || return 1
+
+    _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
+
+    local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
@@ -385,9 +451,11 @@ _add_vless_xhttp_reality() {
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
         --arg sid "$REALITY_SHORT_ID" --arg path "$path" --arg pqv "$pq_verify" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link}')"
+        --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link,tunnel_tag:$ttag,tunnel_port:$tport}')"
 
     _success "节点 [${name}] 创建成功"
+    _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
     [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
@@ -756,8 +824,9 @@ _rebuild_reality_link() {
 _tpl_path() {
     local key="$1"
     case "$key" in
-        vless-tcp-reality-vision) echo "/opt/xray-deploy/templates/vless-tcp-reality-vision.server.jsonc" ;;
-        vless-xhttp-reality)      echo "/opt/xray-deploy/templates/vless-xhttp-reality.server.jsonc" ;;
+        vless-tcp-reality-vision) echo "/opt/xray-deploy/templates/vless-tcp-reality-vision-tunnel.server.jsonc" ;;
+        vless-xhttp-reality)      echo "/opt/xray-deploy/templates/vless-xhttp-reality-tunnel.server.jsonc" ;;
+        tunnel)                   echo "/opt/xray-deploy/templates/tunnel.server.jsonc" ;;
         vless-xhttp-cdn)          echo "/opt/xray-deploy/templates/vless-xhttp-cdn.server.jsonc" ;;
         vless-ws-cdn)             echo "/opt/xray-deploy/templates/vless-ws-cdn.server.jsonc" ;;
         shadowsocks)              echo "/opt/xray-deploy/templates/shadowsocks.server.jsonc" ;;
@@ -846,7 +915,7 @@ _delete_node() {
         esac
         _backup_config
         local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-        jq '.inbounds = []' "$CONFIG_FILE" > "$tmp" 2>/dev/null
+        jq '.inbounds = [] | .routing.rules = []' "$CONFIG_FILE" > "$tmp" 2>/dev/null
         mv -f "$tmp" "$CONFIG_FILE"
         if _xray_test_config; then
             _manage_xray restart 2>/dev/null || true
@@ -865,6 +934,13 @@ _delete_node() {
 
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+
+    # 若是 Reality 节点, 先删除对应 Tunnel inbound + 路由规则
+    local tunnel_tag
+    tunnel_tag=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+    if [ -n "$tunnel_tag" ]; then
+        _remove_reality_tunnel "$tunnel_tag"
+    fi
 
     _backup_config
     local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")

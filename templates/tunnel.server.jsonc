@@ -1,0 +1,16 @@
+{
+    "listen": "127.0.0.1",
+    "port": {{PORT}},
+    "protocol": "tunnel",
+    "tag": "{{TAG}}",
+    "settings": {
+        "address": "{{TARGET}}",
+        "port": 443,
+        "network": "tcp"
+    },
+    "sniffing": {
+        "enabled": true,
+        "destOverride": ["tls"],
+        "routeOnly": true
+    }
+}
