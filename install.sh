@@ -19,7 +19,7 @@ INSTALL_TPL_DIR="$DEPLOY_DIR/templates"
 
 # 模块与模板完整列表(新增时同步此处)
 LIB_MODULES="00-common 10-system 20-xray-core 30-geo 40-cloudflared 50-nodes 51-reality-pq 90-menu"
-TPL_NAMES="vless-tcp-reality-vision vless-xhttp-reality vless-xhttp-cdn vless-ws-cdn shadowsocks hysteria2 tunnel vless-tcp-reality-vision-tunnel vless-xhttp-reality-tunnel"
+TPL_NAMES="vless-tcp-reality-vision-tunnel vless-xhttp-reality-tunnel tunnel vless-xhttp-cdn vless-ws-cdn shadowsocks hysteria2"
 
 # ---------------------------------------------------------------------------
 # root 检测

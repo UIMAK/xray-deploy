@@ -935,18 +935,21 @@ _delete_node() {
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
 
-    # 若是 Reality 节点, 先删除对应 Tunnel inbound + 路由规则
+    # 先备份, 再删除(tunnel + reality + 路由一起删, 最后统一校验)
+    _backup_config
     local tunnel_tag
     tunnel_tag=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
     if [ -n "$tunnel_tag" ]; then
         _remove_reality_tunnel "$tunnel_tag"
     fi
 
-    _backup_config
     local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
     jq --arg t "$tag" '.inbounds |= map(select(.tag != $t))' "$CONFIG_FILE" > "$tmp" 2>/dev/null
     mv -f "$tmp" "$CONFIG_FILE"
-    _xray_test_config && _manage_xray restart || { _restore_config; return 1; }
+    if ! _xray_test_config; then
+        _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return 1
+    fi
+    _manage_xray restart 2>/dev/null || true
     rm -f "$NODES_DIR/${tag}.json"
     _remove_node_from_yaml_by_tag "$tag"
     _success "节点已删除"
