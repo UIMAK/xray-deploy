@@ -581,8 +581,8 @@ _add_hysteria2() {
 
     # 拥塞控制
     echo -e "  拥塞控制:"
-    echo -e "  ${GREEN}[1]${NC} bbr   (推荐, 自适应)"
-    echo -e "  ${GREEN}[2]${NC} brutal (固定带宽, 须知道服务器带宽)"
+    echo -e "  ${GREEN}[1]${NC} bbr"
+    echo -e "  ${GREEN}[2]${NC} brutal"
     read -rp "  选择 (默认 1): " cc_choice
     local congestion="bbr"
     local brutal_up="" brutal_down=""
