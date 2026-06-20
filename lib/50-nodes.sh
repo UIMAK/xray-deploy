@@ -731,27 +731,27 @@ _add_vless_ws_cdn() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议5: Shadowsocks(3 种加密选择)
+# 协议5: Shadowsocks(3 种加密: aes-256-gcm / 2022-blake3-aes-256-gcm / 2022-blake3-chacha20-poly1305)
 # ---------------------------------------------------------------------------
 _add_shadowsocks() {
     echo -e "\n  ${CYAN}=== Shadowsocks (可直连) ===${NC}"
     local port=$(_input_port)
     echo -e "  加密方式:"
     echo -e "  ${GREEN}[1]${NC} aes-256-gcm"
-    echo -e "  ${GREEN}[2]${NC} chacha20-ietf-poly1305"
-    echo -e "  ${GREEN}[3]${NC} 2022-blake3-aes-256-gcm"
+    echo -e "  ${GREEN}[2]${NC} 2022-blake3-aes-256-gcm"
+    echo -e "  ${GREEN}[3]${NC} 2022-blake3-chacha20-poly1305"
     read -rp "  选择 (默认 1): " mc
     local method
     case "${mc:-1}" in
         1) method="aes-256-gcm" ;;
-        2) method="chacha20-ietf-poly1305" ;;
-        3) method="2022-blake3-aes-256-gcm" ;;
+        2) method="2022-blake3-aes-256-gcm" ;;
+        3) method="2022-blake3-chacha20-poly1305" ;;
         *) _warn "无效,默认 aes-256-gcm"; method="aes-256-gcm" ;;
     esac
-    # 2022 系列密码需 base64 32 字节
+    # 2022 系列密码需标准 base64(32 字节密钥, 带 = 填充, Go base64 解码要求)
     local password
     if [[ "$method" == 2022* ]]; then
-        password=$(head -c 32 /dev/urandom | base64 | tr -d '\n=' | head -c 43)
+        password=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
     else
         password=$(head -c 16 /dev/urandom | base64 | tr -d '\n=' | head -c 22)
     fi
