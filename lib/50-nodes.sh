@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# lib/50-nodes.sh — 节点管理(6 协议)
+# lib/50-nodes.sh — 节点管理(7 协议)
 # 需求 R6(协议集) + R7(按节点改监听) + R8(Reality 后量子)
 # 配置以官方为准(design.md 配置依据表), 模板在 templates/ 下, 占位符 {{...}} 渲染.
 # 节点元数据: $NODES_DIR/<tag>.json (按节点独立文件, 便于 R7 单节点改监听)
@@ -12,6 +12,7 @@
 PROTOCOLS=(
     "vless-tcp-reality-vision|VLESS+TCP+Reality+Vision|reality|direct|Tunnel模式·防偷跑"
     "vless-xhttp-reality|VLESS+XHTTP+Reality|reality|direct|Tunnel模式·防偷跑"
+    "vless-enc|VLESS+ENC|enc|direct|内置加密·类似SS·轻量无TLS"
     "vless-xhttp-cdn|VLESS+XHTTP(无TLS)|none|cdn|必须套CDN·禁止直连"
     "vless-ws-cdn|VLESS+WS(无TLS)|none|cdn|必须套CDN·禁止直连"
     "shadowsocks|Shadowsocks|none|direct|"
@@ -326,6 +327,7 @@ _render_template() {
     : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
     : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}"
     : "${R_TUNNEL_PORT:=}" "${R_TUNNEL_TAG:=}"
+    : "${R_FLOW:=}" "${R_DECRYPTION:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
 
@@ -345,6 +347,8 @@ _render_template() {
     p="{{PASSWORD}}";     content="${content//$p/$R_PASSWORD}"
     p="{{TUNNEL_PORT}}";  content="${content//$p/$R_TUNNEL_PORT}"
     p="{{TUNNEL_TAG}}";   content="${content//$p/$R_TUNNEL_TAG}"
+    p="{{FLOW}}";          content="${content//$p/$R_FLOW}"
+    p="{{DECRYPTION}}";    content="${content//$p/$R_DECRYPTION}"
     p="{{AUTH}}";         content="${content//$p/$R_AUTH}"
     p="{{CERT_FILE}}";    content="${content//$p/$R_CERT_FILE}"
     p="{{KEY_FILE}}";     content="${content//$p/$R_KEY_FILE}"
@@ -491,6 +495,7 @@ _add_node() {
     case "$key" in
         vless-tcp-reality-vision) _add_vless_tcp_reality_vision ;;
         vless-xhttp-reality)      _add_vless_xhttp_reality ;;
+        vless-enc)                _add_vless_enc ;;
         vless-xhttp-cdn)          _add_vless_xhttp_cdn ;;
         vless-ws-cdn)             _add_vless_ws_cdn ;;
         shadowsocks)              _add_shadowsocks ;;
@@ -639,7 +644,97 @@ _add_vless_xhttp_reality() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议3: VLESS+XHTTP(无TLS, 必须套CDN)
+# 协议3: VLESS+ENC (内置加密, 无 TLS, 类似 SS 轻量直连)
+# 通过 xray vlessenc 生成 decryption(服务端)/encryption(客户端) 密钥对
+# 来源: Xray-docs-next vless.md + PR #5067
+# ---------------------------------------------------------------------------
+
+# 生成 VLESS+ENC 密钥对(xray vlessenc)
+# 输出全局: VLESS_ENC_DECRYPTION / VLESS_ENC_ENCRYPTION
+# 注意: xray vlessenc 输出可能不是纯 JSON(有额外文本), jq 优先, grep 兜底
+_generate_vless_enc_keys() {
+    local output
+    output=$("$XRAY_BIN" vlessenc 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$output" ]; then
+        _error "VLESS+ENC 密钥生成失败 (需要较新版本的 Xray 核心)"
+        return 1
+    fi
+    # jq 优先(纯 JSON 场景)
+    VLESS_ENC_DECRYPTION=$(echo "$output" | jq -r '.decryption // empty' 2>/dev/null)
+    VLESS_ENC_ENCRYPTION=$(echo "$output" | jq -r '.encryption // empty' 2>/dev/null)
+    # grep + sed 兜底(输出含额外文本时 jq 会失败)
+    if [ -z "$VLESS_ENC_DECRYPTION" ]; then
+        VLESS_ENC_DECRYPTION=$(echo "$output" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+    if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
+        VLESS_ENC_ENCRYPTION=$(echo "$output" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+    if [ -z "$VLESS_ENC_DECRYPTION" ] || [ -z "$VLESS_ENC_ENCRYPTION" ]; then
+        _error "VLESS+ENC 密钥解析失败 (xray vlessenc 输出格式异常)"
+        return 1
+    fi
+    _info "VLESS+ENC 密钥已生成 (decryption: ${VLESS_ENC_DECRYPTION:0:30}...)"
+}
+
+_add_vless_enc() {
+    echo -e "\n  ${CYAN}=== VLESS+ENC (内置加密 · 无 TLS · 类似 SS 轻量直连) ===${NC}"
+    local port=$(_input_port)
+
+    # flow 选项(xtls-rprx-vision 可启用 splice 优化)
+    echo -e "  流控模式:"
+    echo -e "  ${GREEN}[1]${NC} 无 (默认, 通用兼容)"
+    echo -e "  ${GREEN}[2]${NC} xtls-rprx-vision (splice 优化, 性能更好)"
+    read -rp "  选择 (默认 1): " flow_choice
+    local flow=""
+    [ "${flow_choice:-1}" = "2" ] && flow="xtls-rprx-vision"
+
+    local default_name="ENC-${port}"
+    read -rp "  节点名称 (默认 ${default_name}): " name
+    name=${name:-$default_name}
+
+    local uuid; uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
+    _generate_vless_enc_keys || return 1
+
+    local tag="xd-vless-enc-${port}"
+    local listen="::"
+
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
+    R_FLOW="$flow" R_DECRYPTION="$VLESS_ENC_DECRYPTION"
+    local inbound
+    inbound=$(_render_template "$(_tpl_path vless-enc)") || return 1
+    _commit_inbound "$inbound" || return 1
+
+    local addr; addr=$(_ask_link_addr)
+    local link_ip="$addr"
+    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
+
+    # 分享链接: encryption 参数为客户端密钥(URL 编码, 含点号和特殊字符)
+    local enc_encoded; enc_encoded=$(_url_encode "$VLESS_ENC_ENCRYPTION")
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_encoded}&security=none&type=raw"
+    [ -n "$flow" ] && link="${link}&flow=${flow}"
+    link="${link}#$(_url_encode "$name")"
+
+    # clash yaml (Clash Meta / mihomo 格式)
+    local clash_flow=""
+    [ -n "$flow" ] && clash_flow=", flow: ${flow}"
+    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, network: tcp, tls: false, \"vless-enc-opts\": {encryption: \"$VLESS_ENC_ENCRYPTION\"}${clash_flow}}"
+    _add_node_to_yaml "$clash"
+
+    _save_node_meta "$tag" "$(jq -n \
+        --arg tag "$tag" --arg name "$name" --arg proto "vless-enc" \
+        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
+        --arg uuid "$uuid" --arg flow "$flow" \
+        --arg dec "$VLESS_ENC_DECRYPTION" --arg enc "$VLESS_ENC_ENCRYPTION" \
+        --arg link "$link" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,flow:$flow,decryption:$dec,encryption:$enc,share_link:$link}')"
+
+    _success "节点 [${name}] 创建成功"
+    [ -n "$flow" ] && _tip "已启用 xtls-rprx-vision (splice 优化)"
+    echo -e "  ${CYAN}分享链接:${NC} ${link}"
+}
+
+# ---------------------------------------------------------------------------
+# 协议4: VLESS+XHTTP(无TLS, 必须套CDN)
 # ---------------------------------------------------------------------------
 _add_vless_xhttp_cdn() {
     echo -e "\n  ${CYAN}=== VLESS+XHTTP (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
@@ -689,7 +784,7 @@ _add_vless_xhttp_cdn() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议4: VLESS+WS(无TLS, 必须套CDN)
+# 协议5: VLESS+WS(无TLS, 必须套CDN)
 # ---------------------------------------------------------------------------
 _add_vless_ws_cdn() {
     echo -e "\n  ${CYAN}=== VLESS+WS (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
@@ -731,7 +826,7 @@ _add_vless_ws_cdn() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议5: Shadowsocks(3 种加密: aes-256-gcm / 2022-blake3-aes-256-gcm / 2022-blake3-chacha20-poly1305)
+# 协议6: Shadowsocks(3 种加密: aes-256-gcm / 2022-blake3-aes-256-gcm / 2022-blake3-chacha20-poly1305)
 # ---------------------------------------------------------------------------
 _add_shadowsocks() {
     echo -e "\n  ${CYAN}=== Shadowsocks (可直连) ===${NC}"
@@ -792,7 +887,7 @@ _add_shadowsocks() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议6: Hysteria2 (QUIC + TLS证书)
+# 协议7: Hysteria2 (QUIC + TLS证书)
 # 模板: templates/hysteria2.server.jsonc
 # 来源: Xray-examples/Hysteria2/server.jsonc + Xray-docs-next hysteria.md / finalmask.md
 # ---------------------------------------------------------------------------
@@ -1022,6 +1117,7 @@ _tpl_path() {
         vless-tcp-reality-vision) echo "/opt/xray-deploy/templates/vless-tcp-reality-vision-tunnel.server.jsonc" ;;
         vless-xhttp-reality)      echo "/opt/xray-deploy/templates/vless-xhttp-reality-tunnel.server.jsonc" ;;
         tunnel)                   echo "/opt/xray-deploy/templates/tunnel.server.jsonc" ;;
+        vless-enc)                echo "/opt/xray-deploy/templates/vless-enc.server.jsonc" ;;
         vless-xhttp-cdn)          echo "/opt/xray-deploy/templates/vless-xhttp-cdn.server.jsonc" ;;
         vless-ws-cdn)             echo "/opt/xray-deploy/templates/vless-ws-cdn.server.jsonc" ;;
         shadowsocks)              echo "/opt/xray-deploy/templates/shadowsocks.server.jsonc" ;;
