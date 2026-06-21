@@ -515,7 +515,9 @@ _auto_tag_tagless_inbounds() {
                 n=$((n+1))
             done
             used_tags="${used_tags}"$'\n'"${new_tag}"
-            jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+            local tmp
+            tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+            jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE" > "$tmp" && mv -f "$tmp" "$CONFIG_FILE"
             tagged=$((tagged+1))
         fi
         idx=$((idx+1))
@@ -618,7 +620,16 @@ _detect_inbound_protocol() {
                     *)     echo "vless-tcp-reality-vision" ;;
                 esac ;;
             tls)     echo "vless-tls-$net" ;;
-            *)       echo "vless-$net" ;;
+            *)
+                # 检测 VLESS+ENC: 有 decryption 字段且 network=raw
+                local dec
+                dec=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.decryption // empty' "$CONFIG_FILE" 2>/dev/null)
+                if [ -n "$dec" ] && [ "$net" = "raw" ]; then
+                    echo "vless-enc"
+                else
+                    echo "vless-$net"
+                fi
+                ;;
         esac
     elif [ "$proto" = "shadowsocks" ]; then
         echo "shadowsocks"

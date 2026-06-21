@@ -147,8 +147,7 @@ _main_menu() {
             _reality_domain_menu; continue
         fi
         # 动态编号: 核心与服务 / 运维
-        local _core=8
-        local _ops_start=$((_core+3))
+        _ops_start=$((_core+3))
         if [ "$choice" = "$_core" ]; then
             _xray_core_menu
         elif [ "$choice" = "$((_core+1))" ]; then
