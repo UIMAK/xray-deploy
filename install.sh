@@ -45,8 +45,7 @@ ensure_bash "$@"
 # 基础依赖
 # ---------------------------------------------------------------------------
 need=()
-command -v curl  >/dev/null 2>&1 || need+=(curl)
-command -v wget  >/dev/null 2>&1 || need+=(wget)
+command -v curl  >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || need+=(curl)
 command -v jq    >/dev/null 2>&1 || need+=(jq)
 command -v unzip >/dev/null 2>&1 || need+=(unzip)
 if [ "${#need[@]}" -gt 0 ]; then

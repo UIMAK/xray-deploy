@@ -499,7 +499,7 @@ _auto_tag_tagless_inbounds() {
             elif [ -n "$listen" ]; then
                 # Unix socket: /dev/shm/xrxh.socket,0666 → xrxh-socket
                 local sock_name
-                sock_name=$(basename "${listen%%,*}" | tr '[:upper:]' '[:lower:]' | sed 's/\.socket$/-socket/' | tr -cs 'a-z0-9' '-' | sed 's/^-\|-$//g')
+                sock_name=$(basename "${listen%%,*}" | tr '[:upper:]' '[:lower:]' | sed 's/\.socket$/-socket/' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//')
                 [ -z "$sock_name" ] && sock_name="sock-${idx}"
                 new_tag="manual-${sock_name}"
             else
@@ -609,7 +609,11 @@ _detect_inbound_protocol() {
         security=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.security // "none"' "$CONFIG_FILE" 2>/dev/null)
         net=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.network // "raw"' "$CONFIG_FILE" 2>/dev/null)
         case "$security" in
-            reality) echo "vless-reality" ;;
+            reality)
+                case "$net" in
+                    xhttp) echo "vless-xhttp-reality" ;;
+                    *)     echo "vless-tcp-reality-vision" ;;
+                esac ;;
             tls)     echo "vless-tls-$net" ;;
             *)       echo "vless-$net" ;;
         esac
@@ -1520,7 +1524,7 @@ _delete_node() {
         esac
         _backup_config
         local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-        jq '.inbounds = [] | .routing.rules = []' "$CONFIG_FILE" > "$tmp" 2>/dev/null
+        jq '.inbounds = [] | .routing.rules |= map(select(.inboundTag == null))' "$CONFIG_FILE" > "$tmp" 2>/dev/null
         mv -f "$tmp" "$CONFIG_FILE"
         if _xray_test_config; then
             _manage_xray restart 2>/dev/null || true
@@ -1708,15 +1712,26 @@ _update_listen() {
     fi
     [ -z "$newaddr" ] && newaddr="$oldaddr"
 
-    # 重写链接里的地址
+    # 重写链接里的地址(纯 bash, 不用 sed -E —— busybox 不支持)
     local oldlink newlink
     oldlink=$(jq -r '.share_link' "$meta")
     # 链接形如 proto://uuid@addr:port... 或 ss://b64@addr:port...
-    newlink=$(printf '%s' "$oldlink" | sed -E "s/@[^:/#]+/@${newaddr}/")
-    # IPv6 地址加括号
-    if [[ "$newaddr" == *":"* && "$newaddr" != *"["* ]]; then
-        newlink=$(printf '%s' "$oldlink" | sed -E "s/@[^:/#]+/@[${newaddr}]/")
+    local before_at="${oldlink%%@*}" after_at="${oldlink#*@}"
+    # after_at 可能是 addr:port?... 或 [addr]:port?... 或 addr/path?...
+    local old_host_part
+    if [[ "$after_at" == "["* ]]; then
+        # IPv6: [addr]:port
+        old_host_part="${after_at%%]*}]"
+    else
+        # IPv4/域名: addr:port 或 addr/path
+        old_host_part="${after_at%%[:/?#]*}"
     fi
+    # IPv6 地址加括号
+    local new_host="$newaddr"
+    if [[ "$newaddr" == *":"* && "$newaddr" != *"["* ]]; then
+        new_host="[${newaddr}]"
+    fi
+    newlink="${before_at}@${new_host}${after_at#"$old_host_part"}"
 
     jq --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink" \
        '.listen=$l | .link_addr=$a | .share_link=$link' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
@@ -1737,9 +1752,9 @@ _add_node_to_yaml() {
     if [ ! -f "$CLASH_YAML" ]; then
         printf 'proxies:\n' > "$CLASH_YAML"
     fi
-    # 去重: 同名节点先删再追加
+    # 去重: 同名节点先删再追加(BRE, busybox 兼容)
     local name
-    name=$(printf '%s' "$line" | sed -nE 's/.*name: *"?([^",}]*)"?.*/\1/p')
+    name=$(printf '%s' "$line" | sed -n 's/.*name: *"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p')
     [ -n "$name" ] && _remove_node_from_yaml_by_name "$name" 2>/dev/null
     printf '  %s\n' "$line" >> "$CLASH_YAML"
 }
@@ -1748,8 +1763,10 @@ _remove_node_from_yaml_by_name() {
     local name="$1"
     [ -f "$CLASH_YAML" ] || return
     local tmp; tmp=$(mktemp)
-    # 删除以 name 匹配的节点行(行内含 name: "<name>" 或 name: <name>)
-    grep -vE "name: *\"?$(printf '%s' "$name" | sed 's/[.[\*^$()+?{|]/\\&/g')\"?[,} ]" "$CLASH_YAML" > "$tmp" 2>/dev/null
+    # 删除以 name 匹配的节点行(BRE, busybox 兼容)
+    local escaped_name
+    escaped_name=$(printf '%s' "$name" | sed 's/[.[\*^$()+?{|]/\\&/g')
+    grep -v "name: *\"\{0,1\}${escaped_name}\"\{0,1\}[,} ]" "$CLASH_YAML" > "$tmp" 2>/dev/null
     mv -f "$tmp" "$CLASH_YAML"
 }
 
