@@ -386,7 +386,7 @@ _mutate_config() {
     _backup_config
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    if ! jq $jq_filter "$@" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+    if ! jq "$jq_filter" "$@" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
         rm -f "$tmp"; _error "jq 处理失败"; return 1
     fi
     if [ ! -s "$tmp" ]; then
@@ -482,6 +482,7 @@ _has_orphan_inbounds() {
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
     local tags_json
     tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null) || return 1
+    [ -z "$tags_json" ] && return 1
     [ "$tags_json" = "[]" ] && return 1
     local known_list
     known_list=$(_known_tags)
@@ -512,7 +513,7 @@ _detect_inbound_protocol() {
             *)
                 # security=none: 可能是 VLESS+ENC 或 CDN 协议
                 case "$net" in
-                    xhttp|xhttp)  echo "vless-xhttp-cdn" ;;
+                    xhttp)        echo "vless-xhttp-cdn" ;;
                     websocket|ws) echo "vless-ws-cdn" ;;
                     *)            echo "vless-enc" ;;
                 esac
@@ -591,6 +592,8 @@ _sync_config_check() {
             IFS=',' read -ra nums <<< "$sel"
             for n in "${nums[@]}"; do
                 n=$(echo "$n" | tr -d ' ')
+                # 校验数字(set -u 下非数字算术会触发 unbound variable)
+                [[ "$n" =~ ^[0-9]+$ ]] || continue
                 local idx=$((n-1))
                 [ "$idx" -ge 0 ] && [ "$idx" -lt "${#orphans[@]}" ] && to_remove+=("${orphans[$idx]}")
             done
@@ -620,34 +623,20 @@ _sync_config_check() {
 # ---------------------------------------------------------------------------
 _remove_orphan_inbounds() {
     local tags=("$@")
-    _backup_config
+    [ ${#tags[@]} -eq 0 ] && return 0
 
-    # 构建 jq 过滤: 逐个排除 tag, 同时清理关联路由规则
-    local jq_filter='.inbounds |= map(select(.tag as $t |'
-    local first=true
-    for t in "${tags[@]}"; do
-        if $first; then
-            jq_filter="$jq_filter \$t != \"$t\""
-            first=false
-        else
-            jq_filter="$jq_filter and \$t != \"$t\""
-        fi
-    done
-    jq_filter="$jq_filter))"
-    # 清理引用这些 tag 的路由规则
-    jq_filter="$jq_filter | .routing.rules |= map(select(.inboundTag == null or ("
-    first=true
-    for t in "${tags[@]}"; do
-        if $first; then
-            jq_filter="$jq_filter (.inboundTag | index(\"$t\")) == null"
-            first=false
-        else
-            jq_filter="$jq_filter and (.inboundTag | index(\"$t\")) == null"
-        fi
-    done
-    jq_filter="$jq_filter)))"
+    # 构建 tag 数组, 通过 --argjson 传入(避免字符串拼接注入)
+    local tags_json
+    tags_json=$(printf '%s\n' "${tags[@]}" | jq -R . | jq -c -s .)
 
-    if _mutate_config "$jq_filter"; then
+    # filter 末尾传入(经 "$@" 引用, 不被分词)
+    #   .inbounds: 保留 tag 不在 rm 集合的入站
+    #   .routing.rules: 保留无 inboundTag 或 inboundTag 元素均不在 rm 集合的规则
+    local filter='.inbounds |= map(select(.tag as $t | ($rm | index($t)) | not))
+                 | .routing.rules |= map(select(.inboundTag == null
+                       or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))'
+
+    if _mutate_config --argjson rm "$tags_json" "$filter"; then
         _success "已移除 ${#tags[@]} 个入站"
     else
         _error "移除失败, 已回滚"
@@ -665,8 +654,10 @@ _adopt_orphan_inbounds() {
         proto=$(_detect_inbound_protocol "$tag")
         [ "$proto" = "tunnel" ] && continue  # tunnel 是 Reality 的内部组件, 不单独采纳
 
-        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port' "$CONFIG_FILE" 2>/dev/null)
+        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // 0' "$CONFIG_FILE" 2>/dev/null)
+        [[ "$port" =~ ^[0-9]+$ ]] || port=0
         listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
+        [ -z "$listen" ] && listen="::"
 
         # 从 inbound 提取 UUID(如果有)
         local uuid=""
