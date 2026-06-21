@@ -239,6 +239,29 @@ _gen_rand_path() {
 }
 
 # ---------------------------------------------------------------------------
+# 格式化 config.json: 按官方顺序重排字段 + 统一缩进
+# 幂等操作, 可在启动/检查配置时安全调用
+# ---------------------------------------------------------------------------
+_normalize_config_format() {
+    [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    local tmp
+    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    if jq '. as $c |
+        {log:$c.log, api:$c.api, dns:$c.dns, routing:$c.routing,
+         policy:$c.policy, inbounds:$c.inbounds, outbounds:$c.outbounds,
+         stats:$c.stats, fakedns:$c.fakedns, metrics:$c.metrics,
+         observatory:$c.observatory, burstObservatory:$c.burstObservatory,
+         geodata:$c.geodata, version:$c.version}
+        | with_entries(select(.value != null))' \
+        "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$CONFIG_FILE"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # 任意键继续
 # ---------------------------------------------------------------------------
 _press_any_key() {

@@ -92,9 +92,10 @@ _has_reality_nodes() {
 # 主菜单
 # ---------------------------------------------------------------------------
 _main_menu() {
-    # 启动时: 自动补 tag + 自动采纳孤儿入站
+    # 启动时: 自动补 tag + 自动采纳孤儿入站 + 格式化配置
     _auto_tag_tagless_inbounds
     _auto_adopt_orphans
+    _normalize_config_format
 
     while true; do
         clear
@@ -230,6 +231,7 @@ _check_config() {
     echo
     if [ ! -x "$XRAY_BIN" ]; then _warn "Xray 未安装"; _press_any_key; return; fi
     if [ ! -f "$CONFIG_FILE" ]; then _warn "配置文件不存在"; _press_any_key; return; fi
+    _normalize_config_format
     _info "运行 xray -test..."
     if XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE"; then
         _success "配置校验通过"
