@@ -96,7 +96,8 @@ _has_reality_nodes() {
 # 主菜单
 # ---------------------------------------------------------------------------
 _main_menu() {
-    # 启动时检测孤儿入站
+    # 启动时: 先给无 tag 入站自动补 tag, 再检测孤儿
+    _auto_tag_tagless_inbounds
     if _has_orphan_inbounds; then
         clear
         _print_logo
