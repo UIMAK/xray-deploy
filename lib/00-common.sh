@@ -247,14 +247,21 @@ _normalize_config_format() {
     command -v jq >/dev/null 2>&1 || return 0
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    if jq '. as $c |
-        {log:$c.log, api:$c.api, dns:$c.dns, routing:$c.routing,
-         policy:$c.policy, inbounds:$c.inbounds, outbounds:$c.outbounds,
-         stats:$c.stats, fakedns:$c.fakedns, metrics:$c.metrics,
-         observatory:$c.observatory, burstObservatory:$c.burstObservatory,
-         geodata:$c.geodata, version:$c.version}
-        | with_entries(select(.value != null))' \
-        "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+    # 按官方顺序排已知字段, 未知字段追加到末尾, 去除 null 值
+    if jq '
+        . as $c |
+        (["log","api","dns","routing","policy","inbounds","outbounds",
+          "stats","fakedns","metrics","observatory","burstObservatory",
+          "geodata","version"]) as $known |
+        ({log:$c.log, api:$c.api, dns:$c.dns, routing:$c.routing,
+          policy:$c.policy, inbounds:$c.inbounds, outbounds:$c.outbounds,
+          stats:$c.stats, fakedns:$c.fakedns, metrics:$c.metrics,
+          observatory:$c.observatory, burstObservatory:$c.burstObservatory,
+          geodata:$c.geodata, version:$c.version}
+         | with_entries(select(.value != null))) as $ordered |
+        ($c | to_entries | map(select(.key as $k | $known | index($k) | not)) | from_entries) as $extra |
+        $ordered + $extra
+    ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
         mv -f "$tmp" "$CONFIG_FILE"
     else
         rm -f "$tmp"

@@ -483,46 +483,80 @@ _known_tags() {
 # ---------------------------------------------------------------------------
 _auto_tag_tagless_inbounds() {
     [ -f "$CONFIG_FILE" ] || return 0
-    local count
-    count=$(jq '.inbounds | length' "$CONFIG_FILE" 2>/dev/null) || return 0
-    [ "$count" -eq 0 ] 2>/dev/null && return 0
+    # 一次性读取所有入站的 tag/port/listen, 减少 jq 调用
+    local inbounds_info
+    inbounds_info=$(jq -c '[.inbounds | to_entries[] | {idx: .key, tag: (.value.tag // ""), port: (.value.port // 0), listen: (.value.listen // "")}]' "$CONFIG_FILE" 2>/dev/null) || return 0
+    [ -z "$inbounds_info" ] || [ "$inbounds_info" = "[]" ] && return 0
 
-    local idx=0 tagged=0
     local used_tags
-    used_tags=$(jq -r '.inbounds[].tag // empty' "$CONFIG_FILE" 2>/dev/null)
-    while [ "$idx" -lt "$count" ]; do
-        local tag
-        tag=$(jq -r ".inbounds[$idx].tag // empty" "$CONFIG_FILE" 2>/dev/null)
-        if [ -z "$tag" ]; then
-            local listen port new_tag
-            port=$(jq -r ".inbounds[$idx].port // 0" "$CONFIG_FILE" 2>/dev/null)
-            listen=$(jq -r ".inbounds[$idx].listen // empty" "$CONFIG_FILE" 2>/dev/null)
-            if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -gt 0 ] 2>/dev/null; then
-                new_tag="manual-${port}"
-            elif [ -n "$listen" ]; then
-                # Unix socket: /dev/shm/xrxh.socket,0666 → xrxh-socket
-                local sock_name
-                sock_name=$(basename "${listen%%,*}" | tr '[:upper:]' '[:lower:]' | sed 's/\.socket$/-socket/' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//')
-                [ -z "$sock_name" ] && sock_name="sock-${idx}"
-                new_tag="manual-${sock_name}"
-            else
-                new_tag="manual-${idx}"
-            fi
-            # 去重: 已存在则追加 -2 -3 ...
-            local base="$new_tag" n=2
-            while grep -qxF "$new_tag" <<< "$used_tags"; do
-                new_tag="${base}-${n}"
-                n=$((n+1))
-            done
-            used_tags="${used_tags}"$'\n'"${new_tag}"
-            local tmp
-            tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-            jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE" > "$tmp" && mv -f "$tmp" "$CONFIG_FILE"
-            tagged=$((tagged+1))
+    used_tags=$(jq -r '.[] | select(.tag != "") | .tag' <<< "$inbounds_info" 2>/dev/null)
+
+    local tagged=0
+    local entry idx tag port listen new_tag
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        idx=$(jq -r '.idx' <<< "$entry")
+        tag=$(jq -r '.tag' <<< "$entry")
+        [ -n "$tag" ] && continue  # 已有 tag, 跳过
+
+        port=$(jq -r '.port' <<< "$entry")
+        listen=$(jq -r '.listen' <<< "$entry")
+
+        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -gt 0 ] 2>/dev/null; then
+            new_tag="manual-${port}"
+        elif [ -n "$listen" ]; then
+            local sock_name
+            sock_name=$(basename "${listen%%,*}" | tr '[:upper:]' '[:lower:]' | sed 's/\.socket$/-socket/' | tr -cs 'a-z0-9' '-' | sed 's/^-//; s/-$//')
+            [ -z "$sock_name" ] && sock_name="sock-${idx}"
+            new_tag="manual-${sock_name}"
+        else
+            new_tag="manual-${idx}"
         fi
-        idx=$((idx+1))
-    done
+
+        # 去重: 已存在则追加 -2 -3 ...
+        local base="$new_tag" n=2
+        while grep -qxF "$new_tag" <<< "$used_tags"; do
+            new_tag="${base}-${n}"
+            n=$((n+1))
+        done
+        used_tags="${used_tags}"$'\n'"${new_tag}"
+
+        local tmp
+        tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+        jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE" > "$tmp" && mv -f "$tmp" "$CONFIG_FILE"
+        tagged=$((tagged+1))
+    done <<< "$(jq -c '.[]' <<< "$inbounds_info" 2>/dev/null)"
+
     [ "$tagged" -gt 0 ] && _info "已自动给 ${tagged} 个无 tag 入站分配标识"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 采纳单个入站: 从 config.json 推断元数据, 创建 nodes/*.json
+# 返回 0 = 成功, 1 = 跳过(tunnel)
+# ---------------------------------------------------------------------------
+_adopt_single_inbound() {
+    local tag="$1" suffix="${2:-adopted}"
+    local proto port listen
+    proto=$(_detect_inbound_protocol "$tag")
+    [ "$proto" = "tunnel" ] && return 1
+
+    port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // 0' "$CONFIG_FILE" 2>/dev/null)
+    [[ "$port" =~ ^[0-9]+$ ]] || port=0
+    listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$listen" ] && listen="::"
+
+    local uuid=""
+    uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.clients[0].id // empty' "$CONFIG_FILE" 2>/dev/null)
+    local sni=""
+    sni=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.serverNames[0] // empty' "$CONFIG_FILE" 2>/dev/null)
+
+    local link="#${tag} (${suffix})"
+    _save_node_meta "$tag" "$(jq -n \
+        --arg tag "$tag" --arg proto "$proto" \
+        --argjson port "$port" --arg listen "$listen" \
+        --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
+        '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:"",share_link:$link}')"
     return 0
 }
 
@@ -553,27 +587,9 @@ _auto_adopt_orphans() {
 
     local adopted=0
     for tag in "${orphans[@]}"; do
-        local proto port listen
-        proto=$(_detect_inbound_protocol "$tag")
-        [ "$proto" = "tunnel" ] && continue
-
-        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // 0' "$CONFIG_FILE" 2>/dev/null)
-        [[ "$port" =~ ^[0-9]+$ ]] || port=0
-        listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
-        [ -z "$listen" ] && listen="::"
-
-        local uuid=""
-        uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.clients[0].id // empty' "$CONFIG_FILE" 2>/dev/null)
-        local sni=""
-        sni=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.serverNames[0] // empty' "$CONFIG_FILE" 2>/dev/null)
-
-        local link="#${tag} (auto-adopted)"
-        _save_node_meta "$tag" "$(jq -n \
-            --arg tag "$tag" --arg proto "$proto" \
-            --argjson port "$port" --arg listen "$listen" \
-            --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
-            '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:"",share_link:$link}')"
-        adopted=$((adopted+1))
+        if _adopt_single_inbound "$tag" "auto-adopted"; then
+            adopted=$((adopted+1))
+        fi
     done
     [ "$adopted" -gt 0 ] && _info "已自动采纳 ${adopted} 个手动入站(分享链接需手动重建)"
     return 0
@@ -762,28 +778,10 @@ _adopt_orphan_inbounds() {
     local tags=("$@")
     local adopted=0
     for tag in "${tags[@]}"; do
-        local proto port listen
-        proto=$(_detect_inbound_protocol "$tag")
-        [ "$proto" = "tunnel" ] && continue
-
-        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // 0' "$CONFIG_FILE" 2>/dev/null)
-        [[ "$port" =~ ^[0-9]+$ ]] || port=0
-        listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
-        [ -z "$listen" ] && listen="::"
-
-        local uuid=""
-        uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.clients[0].id // empty' "$CONFIG_FILE" 2>/dev/null)
-        local sni=""
-        sni=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.serverNames[0] // empty' "$CONFIG_FILE" 2>/dev/null)
-
-        local link="#${tag} (adopted)"
-        _save_node_meta "$tag" "$(jq -n \
-            --arg tag "$tag" --arg name "$tag" --arg proto "$proto" \
-            --argjson port "$port" --arg listen "$listen" \
-            --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
-            '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:"",share_link:$link}')"
-        adopted=$((adopted+1))
-        _info "已采纳: $tag ($proto :$port)"
+        if _adopt_single_inbound "$tag" "adopted"; then
+            adopted=$((adopted+1))
+            _info "已采纳: $tag"
+        fi
     done
     _success "已采纳 ${adopted} 个入站(分享链接需手动重建)"
     _tip "采纳的节点缺少完整参数, 建议使用 [查看节点] 确认, 或删后重建"
@@ -1778,9 +1776,11 @@ _remove_node_from_yaml_by_name() {
     [ -f "$CLASH_YAML" ] || return
     local tmp; tmp=$(mktemp)
     # 删除以 name 匹配的节点行(BRE, busybox 兼容)
+    # 两次 grep -v: 第一次匹配 name 后跟 ,}空格, 第二次匹配行尾
     local escaped_name
     escaped_name=$(printf '%s' "$name" | sed 's/[.[\*^$()+?{|]/\\&/g')
-    grep -v "name: *\"\{0,1\}${escaped_name}\"\{0,1\}[,} ]" "$CLASH_YAML" > "$tmp" 2>/dev/null
+    grep -v "name: *\"\{0,1\}${escaped_name}\"\{0,1\}[,} ]" "$CLASH_YAML" 2>/dev/null \
+        | grep -v "name: *\"\{0,1\}${escaped_name}\"\{0,1\} *$" > "$tmp" 2>/dev/null
     mv -f "$tmp" "$CLASH_YAML"
 }
 
