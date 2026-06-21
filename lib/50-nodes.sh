@@ -474,6 +474,54 @@ _known_tags() {
 }
 
 # ---------------------------------------------------------------------------
+# 给 config.json 中无 tag 的入站自动分配 tag
+# 有 port: manual-<port> (如 manual-443)
+# Unix socket: manual-<socket文件名去后缀> (如 manual-xrxh-socket)
+# ---------------------------------------------------------------------------
+_auto_tag_tagless_inbounds() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    local count
+    count=$(jq '.inbounds | length' "$CONFIG_FILE" 2>/dev/null) || return 0
+    [ "$count" -eq 0 ] 2>/dev/null && return 0
+
+    local idx=0 tagged=0
+    local used_tags
+    used_tags=$(jq -r '.inbounds[].tag // empty' "$CONFIG_FILE" 2>/dev/null)
+    while [ "$idx" -lt "$count" ]; do
+        local tag
+        tag=$(jq -r ".inbounds[$idx].tag // empty" "$CONFIG_FILE" 2>/dev/null)
+        if [ -z "$tag" ]; then
+            local listen port new_tag
+            port=$(jq -r ".inbounds[$idx].port // 0" "$CONFIG_FILE" 2>/dev/null)
+            listen=$(jq -r ".inbounds[$idx].listen // empty" "$CONFIG_FILE" 2>/dev/null)
+            if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -gt 0 ] 2>/dev/null; then
+                new_tag="manual-${port}"
+            elif [ -n "$listen" ]; then
+                # Unix socket: /dev/shm/xrxh.socket,0666 → xrxh-socket
+                local sock_name
+                sock_name=$(basename "${listen%%,*}" | tr '[:upper:]' '[:lower:]' | sed 's/\.socket$/-socket/' | tr -cs 'a-z0-9' '-' | sed 's/^-\|-$//g')
+                [ -z "$sock_name" ] && sock_name="sock-${idx}"
+                new_tag="manual-${sock_name}"
+            else
+                new_tag="manual-${idx}"
+            fi
+            # 去重: 已存在则追加 -2 -3 ...
+            local base="$new_tag" n=2
+            while grep -qxF "$new_tag" <<< "$used_tags"; do
+                new_tag="${base}-${n}"
+                n=$((n+1))
+            done
+            used_tags="${used_tags}"$'\n'"${new_tag}"
+            jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+            tagged=$((tagged+1))
+        fi
+        idx=$((idx+1))
+    done
+    [ "$tagged" -gt 0 ] && _info "已自动给 ${tagged} 个无 tag 入站分配标识"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 检测 config.json 中的孤儿入站(手动添加,无元数据)
 # 返回 0 = 有孤儿, 1 = 无
 # ---------------------------------------------------------------------------
@@ -497,11 +545,11 @@ _has_orphan_inbounds() {
 }
 
 # ---------------------------------------------------------------------------
-# 从 config.json 入站推断协议类型
+# 从 config.json 入站推断协议类型(按 tag)
 # ---------------------------------------------------------------------------
 _detect_inbound_protocol() {
     local tag="$1"
-    local proto settings security net
+    local proto security net
     proto=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .protocol' "$CONFIG_FILE" 2>/dev/null)
     [ "$proto" = "tunnel" ] && { echo "tunnel"; return; }
     if [ "$proto" = "vless" ]; then
@@ -511,7 +559,6 @@ _detect_inbound_protocol() {
             reality) echo "vless-reality" ;;
             tls)     echo "vless-tls-$net" ;;
             *)
-                # security=none: 可能是 VLESS+ENC 或 CDN 协议
                 case "$net" in
                     xhttp)        echo "vless-xhttp-cdn" ;;
                     websocket|ws) echo "vless-ws-cdn" ;;
@@ -524,7 +571,7 @@ _detect_inbound_protocol() {
     elif [ "$proto" = "hysteria2" ]; then
         echo "hysteria2"
     else
-        echo "${proto:-unknown}"
+        echo "$proto"
     fi
 }
 
@@ -540,6 +587,9 @@ _sync_config_check() {
 
     [ -f "$CONFIG_FILE" ] || { _warn "config.json 不存在"; _press_any_key; return; }
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
+
+    # 先自动给无 tag 入站分配 tag(幂等, 已分配的不变)
+    _auto_tag_tagless_inbounds
 
     local tags_json
     tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null)
@@ -567,14 +617,16 @@ _sync_config_check() {
 
     echo -e "  ${YELLOW}发现 ${#orphans[@]} 个未跟踪入站:${NC}"
     echo
-    printf "  %-3s %-30s %-16s %-7s\n" "#" "Tag" "协议" "端口"
-    echo "  -----------------------------------------------------------"
+    printf "  %-3s %-30s %-16s %-7s %-8s\n" "#" "Tag" "协议" "端口" "监听"
+    echo "  ---------------------------------------------------------------------------"
     local i=1
     for tag in "${orphans[@]}"; do
-        local proto port
+        local proto port listen
         proto=$(_detect_inbound_protocol "$tag")
-        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port' "$CONFIG_FILE" 2>/dev/null)
-        printf "  %-3s %-30s %-16s %-7s\n" "[$i]" "$tag" "$proto" "$port"
+        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // "-"' "$CONFIG_FILE" 2>/dev/null)
+        listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
+        [ ${#tag} -gt 28 ] && tag="${tag:0:25}..."
+        printf "  %-3s %-30s %-16s %-7s %-8s\n" "[$i]" "$tag" "$proto" "$port" "$listen"
         i=$((i+1))
     done
     echo
@@ -592,7 +644,6 @@ _sync_config_check() {
             IFS=',' read -ra nums <<< "$sel"
             for n in "${nums[@]}"; do
                 n=$(echo "$n" | tr -d ' ')
-                # 校验数字(set -u 下非数字算术会触发 unbound variable)
                 [[ "$n" =~ ^[0-9]+$ ]] || continue
                 local idx=$((n-1))
                 [ "$idx" -ge 0 ] && [ "$idx" -lt "${#orphans[@]}" ] && to_remove+=("${orphans[$idx]}")
@@ -625,13 +676,9 @@ _remove_orphan_inbounds() {
     local tags=("$@")
     [ ${#tags[@]} -eq 0 ] && return 0
 
-    # 构建 tag 数组, 通过 --argjson 传入(避免字符串拼接注入)
     local tags_json
     tags_json=$(printf '%s\n' "${tags[@]}" | jq -R . | jq -c -s .)
 
-    # filter 末尾传入(经 "$@" 引用, 不被分词)
-    #   .inbounds: 保留 tag 不在 rm 集合的入站
-    #   .routing.rules: 保留无 inboundTag 或 inboundTag 元素均不在 rm 集合的规则
     local filter='.inbounds |= map(select(.tag as $t | ($rm | index($t)) | not))
                  | .routing.rules |= map(select(.inboundTag == null
                        or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))'
@@ -652,31 +699,24 @@ _adopt_orphan_inbounds() {
     for tag in "${tags[@]}"; do
         local proto port listen
         proto=$(_detect_inbound_protocol "$tag")
-        [ "$proto" = "tunnel" ] && continue  # tunnel 是 Reality 的内部组件, 不单独采纳
+        [ "$proto" = "tunnel" ] && continue
 
         port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // 0' "$CONFIG_FILE" 2>/dev/null)
         [[ "$port" =~ ^[0-9]+$ ]] || port=0
         listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
         [ -z "$listen" ] && listen="::"
 
-        # 从 inbound 提取 UUID(如果有)
         local uuid=""
         uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.clients[0].id // empty' "$CONFIG_FILE" 2>/dev/null)
-
-        # 从 inbound 提取 SNI(Reality)
         local sni=""
         sni=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.serverNames[0] // empty' "$CONFIG_FILE" 2>/dev/null)
 
-        local name="$tag"
-
-        # 生成占位分享链接
         local link="#${tag} (adopted)"
-
         _save_node_meta "$tag" "$(jq -n \
-            --arg tag "$tag" --arg name "$name" --arg proto "$proto" \
+            --arg tag "$tag" --arg name "$tag" --arg proto "$proto" \
             --argjson port "$port" --arg listen "$listen" \
             --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
-            '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:"",share_link:$link}')"
+            '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:"",share_link:$link}')"
         adopted=$((adopted+1))
         _info "已采纳: $tag ($proto :$port)"
     done
