@@ -197,7 +197,13 @@ _init_config_if_empty() {
     fi
     _ensure_dirs
     # 美化多行格式(便于手动编辑) + routing 规则(bt/广告/私网/CN 走 block)
+    # 按 Xray 官方文档顺序排列(log → dns → routing → inbounds → outbounds)
     local base='{
+  "log": {
+    "loglevel": "warning",
+    "access": "'"$LOG_DIR"'/access.log",
+    "error": "'"$LOG_DIR"'/error.log"
+  },
   "dns": {
     "enableParallelQuery": true,
     "queryStrategy": "UseIP",
@@ -217,11 +223,6 @@ _init_config_if_empty() {
     ],
     "tag": "dns_inbound",
     "useSystemHosts": false
-  },
-  "log": {
-    "loglevel": "warning",
-    "access": "'"$LOG_DIR"'/access.log",
-    "error": "'"$LOG_DIR"'/error.log"
   },
   "routing": {
     "domainStrategy": "IPIfNonMatch",

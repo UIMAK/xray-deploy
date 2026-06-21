@@ -386,7 +386,10 @@ _mutate_config() {
     _backup_config
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    if ! jq "$jq_filter" "$@" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+    # 应用 filter 后, 按 Xray 官方文档顺序重排顶层字段
+    if ! jq "$jq_filter" "$@" \
+         '| . as $c | {log: $c.log, api: $c.api, dns: $c.dns, routing: $c.routing, policy: $c.policy, inbounds: $c.inbounds, outbounds: $c.outbounds, stats: $c.stats, fakedns: $c.fakedns, metrics: $c.metrics, observatory: $c.observatory, burstObservatory: $c.burstObservatory, geodata: $c.geodata, version: $c.version} | with_entries(select(.value != null))' \
+         "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
         rm -f "$tmp"; _error "jq 处理失败"; return 1
     fi
     if [ ! -s "$tmp" ]; then
