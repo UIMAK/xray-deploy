@@ -44,10 +44,6 @@ _print_status_bar() {
 
     # 节点数
     local ncount; ncount=$(_node_count 2>/dev/null); [ -z "$ncount" ] && ncount=0
-    local orphan_hint=""
-    if _has_orphan_inbounds 2>/dev/null; then
-        orphan_hint="  ${YELLOW}⚠ 有未跟踪入站${NC}"
-    fi
 
     # cloudflared
     local cfstatus="${RED}○ 未安装${NC}"
@@ -65,7 +61,7 @@ _print_status_bar() {
     [ "$geostate" = "on" ] && geostr="${GREEN}● 自动${NC}" || geostr="${RED}○ 手动${NC}"
 
     echo -e "  系统: ${CYAN}${os_info}${NC}  |  init: ${CYAN}${INIT_SYSTEM}${NC}"
-    echo -e "  Xray${CYAN}${xver}${NC} [${xchannel}]: ${xstatus}  |  节点: ${CYAN}${ncount}${NC}${orphan_hint}"
+    echo -e "  Xray${CYAN}${xver}${NC} [${xchannel}]: ${xstatus}  |  节点: ${CYAN}${ncount}${NC}"
     echo -e "  cloudflared: ${cfstatus}  |  Geo: ${geostr}"
     echo
 }
@@ -96,20 +92,9 @@ _has_reality_nodes() {
 # 主菜单
 # ---------------------------------------------------------------------------
 _main_menu() {
-    # 启动时: 先给无 tag 入站自动补 tag, 再检测孤儿
+    # 启动时: 自动补 tag + 自动采纳孤儿入站
     _auto_tag_tagless_inbounds
-    if _has_orphan_inbounds; then
-        clear
-        _print_logo
-        echo
-        echo -e "  ${YELLOW}⚠ config.json 中存在未由脚本管理的入站(可能是手动添加)${NC}"
-        echo
-        read -rp "  是否现在处理? [Y/n]: " ans
-        case "$ans" in
-            n|N) ;;
-            *) _sync_config_check ;;
-        esac
-    fi
+    _auto_adopt_orphans
 
     while true; do
         clear
@@ -125,10 +110,9 @@ _main_menu() {
         echo -e "  ${GREEN}[5]${NC} 更新监听"
         echo -e "  ${GREEN}[6]${NC} Hysteria2 管理"
         echo -e "  ${GREEN}[7]${NC} Reality 域名管理"
-        echo -e "  ${GREEN}[8]${NC} 同步配置入站"
         echo
         echo -e "  ${CYAN}【核心与服务】${NC}"
-        local _core=9
+        local _core=8
         local _ops_start=$((_core+3))
         printf "  ${GREEN}[%d]${NC} 安装/更新或切换 Xray 核心(稳定/预览)\n" "$_core"
         printf "  ${GREEN}[%d]${NC} Geo 数据自动更新\n" $((_core+1))
@@ -161,11 +145,8 @@ _main_menu() {
         if [ "$choice" = "7" ]; then
             _reality_domain_menu; continue
         fi
-        if [ "$choice" = "8" ]; then
-            _sync_config_check; continue
-        fi
         # 动态编号: 核心与服务 / 运维
-        local _core=9
+        local _core=8
         local _ops_start=$((_core+3))
         if [ "$choice" = "$_core" ]; then
             _xray_core_menu

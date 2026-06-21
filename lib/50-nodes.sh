@@ -522,6 +522,59 @@ _auto_tag_tagless_inbounds() {
 }
 
 # ---------------------------------------------------------------------------
+# 自动采纳孤儿入站: 为无元数据的入站创建 nodes/*.json
+# 启动时静默运行, 不询问用户
+# ---------------------------------------------------------------------------
+_auto_adopt_orphans() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
+    local known_list
+    known_list=$(_known_tags)
+
+    local tags_json
+    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$tags_json" ] || [ "$tags_json" = "[]" ] && return 0
+
+    local orphans=()
+    local tag
+    while IFS= read -r tag; do
+        [ -z "$tag" ] && continue
+        if ! grep -qxF "$tag" <<< "$known_list"; then
+            orphans+=("$tag")
+        fi
+    done <<< "$(jq -r '.[]' <<< "$tags_json" 2>/dev/null)"
+
+    [ ${#orphans[@]} -eq 0 ] && return 0
+
+    local adopted=0
+    for tag in "${orphans[@]}"; do
+        local proto port listen
+        proto=$(_detect_inbound_protocol "$tag")
+        [ "$proto" = "tunnel" ] && continue
+
+        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // 0' "$CONFIG_FILE" 2>/dev/null)
+        [[ "$port" =~ ^[0-9]+$ ]] || port=0
+        listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
+        [ -z "$listen" ] && listen="::"
+
+        local uuid=""
+        uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.clients[0].id // empty' "$CONFIG_FILE" 2>/dev/null)
+        local sni=""
+        sni=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.serverNames[0] // empty' "$CONFIG_FILE" 2>/dev/null)
+
+        local link="#${tag} (auto-adopted)"
+        _save_node_meta "$tag" "$(jq -n \
+            --arg tag "$tag" --arg proto "$proto" \
+            --argjson port "$port" --arg listen "$listen" \
+            --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
+            '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:"",share_link:$link}')"
+        adopted=$((adopted+1))
+    done
+    [ "$adopted" -gt 0 ] && _info "已自动采纳 ${adopted} 个手动入站(分享链接需手动重建)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 检测 config.json 中的孤儿入站(手动添加,无元数据)
 # 返回 0 = 有孤儿, 1 = 无
 # ---------------------------------------------------------------------------
@@ -1389,11 +1442,6 @@ _tpl_path() {
 # ---------------------------------------------------------------------------
 _view_nodes() {
     clear
-    # 顺便检测孤儿入站
-    if _has_orphan_inbounds 2>/dev/null; then
-        echo -e "  ${YELLOW}⚠ config.json 中有未跟踪入站, 请使用 [8] 同步配置入站${NC}"
-        echo
-    fi
     local count
     count=$(_node_count)
     echo
