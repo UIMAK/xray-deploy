@@ -558,13 +558,7 @@ _detect_inbound_protocol() {
         case "$security" in
             reality) echo "vless-reality" ;;
             tls)     echo "vless-tls-$net" ;;
-            *)
-                case "$net" in
-                    xhttp)        echo "vless-xhttp-cdn" ;;
-                    websocket|ws) echo "vless-ws-cdn" ;;
-                    *)            echo "vless-enc" ;;
-                esac
-                ;;
+            *)       echo "vless-$net" ;;
         esac
     elif [ "$proto" = "shadowsocks" ]; then
         echo "shadowsocks"
