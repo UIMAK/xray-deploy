@@ -1395,6 +1395,11 @@ _tpl_path() {
 # ---------------------------------------------------------------------------
 _view_nodes() {
     clear
+    # 顺便检测孤儿入站
+    if _has_orphan_inbounds 2>/dev/null; then
+        echo -e "  ${YELLOW}⚠ config.json 中有未跟踪入站, 请使用 [8] 同步配置入站${NC}"
+        echo
+    fi
     local count
     count=$(_node_count)
     echo

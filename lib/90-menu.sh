@@ -103,9 +103,12 @@ _main_menu() {
         _print_logo
         echo
         echo -e "  ${YELLOW}⚠ config.json 中存在未由脚本管理的入站(可能是手动添加)${NC}"
-        echo -e "  ${YELLOW}  请使用菜单 [8] 同步配置入站 查看详情${NC}"
         echo
-        _press_any_key
+        read -rp "  是否现在处理? [Y/n]: " ans
+        case "$ans" in
+            n|N) ;;
+            *) _sync_config_check ;;
+        esac
     fi
 
     while true; do
