@@ -460,6 +460,240 @@ _node_count() {
 }
 
 # ---------------------------------------------------------------------------
+# 列出 config.json 中有元数据文件的入站 tag 集合(含 tunnel_tag)
+# 输出: 每行一个 tag
+# ---------------------------------------------------------------------------
+_known_tags() {
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        basename "$f" .json
+        local ttag
+        ttag=$(jq -r '.tunnel_tag // empty' "$f" 2>/dev/null)
+        [ -n "$ttag" ] && echo "$ttag"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# 检测 config.json 中的孤儿入站(手动添加,无元数据)
+# 返回 0 = 有孤儿, 1 = 无
+# ---------------------------------------------------------------------------
+_has_orphan_inbounds() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
+    local tags_json
+    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null) || return 1
+    [ "$tags_json" = "[]" ] && return 1
+    local known_list
+    known_list=$(_known_tags)
+    local tag
+    while IFS= read -r tag; do
+        [ -z "$tag" ] && continue
+        if ! grep -qxF "$tag" <<< "$known_list"; then
+            return 0
+        fi
+    done <<< "$(jq -r '.[]' <<< "$tags_json" 2>/dev/null)"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# 从 config.json 入站推断协议类型
+# ---------------------------------------------------------------------------
+_detect_inbound_protocol() {
+    local tag="$1"
+    local proto settings security net
+    proto=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .protocol' "$CONFIG_FILE" 2>/dev/null)
+    [ "$proto" = "tunnel" ] && { echo "tunnel"; return; }
+    if [ "$proto" = "vless" ]; then
+        security=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.security // "none"' "$CONFIG_FILE" 2>/dev/null)
+        net=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.network // "raw"' "$CONFIG_FILE" 2>/dev/null)
+        case "$security" in
+            reality) echo "vless-reality" ;;
+            tls)     echo "vless-tls-$net" ;;
+            *)
+                # security=none: 可能是 VLESS+ENC 或 CDN 协议
+                case "$net" in
+                    xhttp|xhttp)  echo "vless-xhttp-cdn" ;;
+                    websocket|ws) echo "vless-ws-cdn" ;;
+                    *)            echo "vless-enc" ;;
+                esac
+                ;;
+        esac
+    elif [ "$proto" = "shadowsocks" ]; then
+        echo "shadowsocks"
+    elif [ "$proto" = "hysteria2" ]; then
+        echo "hysteria2"
+    else
+        echo "${proto:-unknown}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 同步配置: 检测孤儿入站, 提供清理/采纳选项
+# ---------------------------------------------------------------------------
+_sync_config_check() {
+    clear
+    echo
+    echo -e "  ${CYAN}【同步配置入站】${NC}"
+    echo -e "  扫描 config.json 中未由脚本管理的入站..."
+    echo
+
+    [ -f "$CONFIG_FILE" ] || { _warn "config.json 不存在"; _press_any_key; return; }
+    [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
+
+    local tags_json
+    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$tags_json" ] || [ "$tags_json" = "[]" ]; then
+        _info "config.json 无任何入站"
+        _press_any_key; return
+    fi
+
+    local known_list
+    known_list=$(_known_tags)
+
+    local orphans=()
+    local tag
+    while IFS= read -r tag; do
+        [ -z "$tag" ] && continue
+        if ! grep -qxF "$tag" <<< "$known_list"; then
+            orphans+=("$tag")
+        fi
+    done <<< "$(jq -r '.[]' <<< "$tags_json" 2>/dev/null)"
+
+    if [ ${#orphans[@]} -eq 0 ]; then
+        _success "所有入站均由脚本管理, 无需同步"
+        _press_any_key; return
+    fi
+
+    echo -e "  ${YELLOW}发现 ${#orphans[@]} 个未跟踪入站:${NC}"
+    echo
+    printf "  %-3s %-30s %-16s %-7s\n" "#" "Tag" "协议" "端口"
+    echo "  -----------------------------------------------------------"
+    local i=1
+    for tag in "${orphans[@]}"; do
+        local proto port
+        proto=$(_detect_inbound_protocol "$tag")
+        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port' "$CONFIG_FILE" 2>/dev/null)
+        printf "  %-3s %-30s %-16s %-7s\n" "[$i]" "$tag" "$proto" "$port"
+        i=$((i+1))
+    done
+    echo
+    echo -e "  ${GREEN}[1]${NC} 从 config.json 移除选中入站"
+    echo -e "  ${GREEN}[2]${NC} 移除全部未跟踪入站"
+    echo -e "  ${GREEN}[3]${NC} 采纳为脚本管理节点(创建元数据)"
+    echo -e "  ${GREEN}[0]${NC} 取消"
+    read -rp "  请选择: " action
+
+    case "$action" in
+        1)
+            echo -e "  输入要移除的编号(逗号分隔, 如 1,3,5):"
+            read -rp "  " sel
+            local to_remove=()
+            IFS=',' read -ra nums <<< "$sel"
+            for n in "${nums[@]}"; do
+                n=$(echo "$n" | tr -d ' ')
+                local idx=$((n-1))
+                [ "$idx" -ge 0 ] && [ "$idx" -lt "${#orphans[@]}" ] && to_remove+=("${orphans[$idx]}")
+            done
+            [ ${#to_remove[@]} -eq 0 ] && { _warn "无有效选择"; _press_any_key; return; }
+            _remove_orphan_inbounds "${to_remove[@]}"
+            ;;
+        2)
+            echo -e "  ${RED}确认移除全部 ${#orphans[@]} 个未跟踪入站?${NC}"
+            read -rp "  继续? [y/N]: " ans
+            case "$ans" in
+                y|Y) _remove_orphan_inbounds "${orphans[@]}" ;;
+                *) _info "已取消" ;;
+            esac
+            ;;
+        3)
+            _adopt_orphan_inbounds "${orphans[@]}"
+            ;;
+        *)
+            _info "已取消"
+            ;;
+    esac
+    _press_any_key
+}
+
+# ---------------------------------------------------------------------------
+# 从 config.json 移除孤儿入站 + 关联路由规则
+# ---------------------------------------------------------------------------
+_remove_orphan_inbounds() {
+    local tags=("$@")
+    _backup_config
+
+    # 构建 jq 过滤: 逐个排除 tag, 同时清理关联路由规则
+    local jq_filter='.inbounds |= map(select(.tag as $t |'
+    local first=true
+    for t in "${tags[@]}"; do
+        if $first; then
+            jq_filter="$jq_filter \$t != \"$t\""
+            first=false
+        else
+            jq_filter="$jq_filter and \$t != \"$t\""
+        fi
+    done
+    jq_filter="$jq_filter))"
+    # 清理引用这些 tag 的路由规则
+    jq_filter="$jq_filter | .routing.rules |= map(select(.inboundTag == null or ("
+    first=true
+    for t in "${tags[@]}"; do
+        if $first; then
+            jq_filter="$jq_filter (.inboundTag | index(\"$t\")) == null"
+            first=false
+        else
+            jq_filter="$jq_filter and (.inboundTag | index(\"$t\")) == null"
+        fi
+    done
+    jq_filter="$jq_filter)))"
+
+    if _mutate_config "$jq_filter"; then
+        _success "已移除 ${#tags[@]} 个入站"
+    else
+        _error "移除失败, 已回滚"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 采纳孤儿入站: 从 config.json 推断元数据, 创建 nodes/*.json
+# ---------------------------------------------------------------------------
+_adopt_orphan_inbounds() {
+    local tags=("$@")
+    local adopted=0
+    for tag in "${tags[@]}"; do
+        local proto port listen
+        proto=$(_detect_inbound_protocol "$tag")
+        [ "$proto" = "tunnel" ] && continue  # tunnel 是 Reality 的内部组件, 不单独采纳
+
+        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port' "$CONFIG_FILE" 2>/dev/null)
+        listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
+
+        # 从 inbound 提取 UUID(如果有)
+        local uuid=""
+        uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.clients[0].id // empty' "$CONFIG_FILE" 2>/dev/null)
+
+        # 从 inbound 提取 SNI(Reality)
+        local sni=""
+        sni=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.serverNames[0] // empty' "$CONFIG_FILE" 2>/dev/null)
+
+        local name="$tag"
+
+        # 生成占位分享链接
+        local link="#${tag} (adopted)"
+
+        _save_node_meta "$tag" "$(jq -n \
+            --arg tag "$tag" --arg name "$name" --arg proto "$proto" \
+            --argjson port "$port" --arg listen "$listen" \
+            --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
+            '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:"",share_link:$link}')"
+        adopted=$((adopted+1))
+        _info "已采纳: $tag ($proto :$port)"
+    done
+    _success "已采纳 ${adopted} 个入站(分享链接需手动重建)"
+    _tip "采纳的节点缺少完整参数, 建议使用 [查看节点] 确认, 或删后重建"
+}
+
+# ---------------------------------------------------------------------------
 # 添加节点:协议分发
 # PROTOCOLS 的 name 字段已含对齐空格, 直接打印
 # ---------------------------------------------------------------------------
