@@ -413,8 +413,9 @@ _hy2_toggle_brutal() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
@@ -494,8 +495,9 @@ _hy2_adjust_bandwidth() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
@@ -556,8 +558,9 @@ _reality_domain_menu() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_sni; cur_sni=$(jq -r '.sni' "$meta")

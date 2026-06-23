@@ -818,6 +818,7 @@ _add_node() {
     echo
     read -rp "  请选择协议: " choice
     [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice-1))
     local sel="${PROTOCOLS[$idx]:-}"
     [ -z "$sel" ] && { _warn "无效选择"; _press_any_key; return; }
@@ -1490,6 +1491,7 @@ _view_nodes() {
     echo -e "  输入编号(0 返回):"
     read -rp "  " choice
     [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice)) n=0
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
@@ -1573,8 +1575,9 @@ _delete_node() {
         _press_any_key; return
     fi
 
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     # 读取 tunnel_tag, 一次性删除 tunnel + reality + 路由(原子操作)
     local tunnel_tag
@@ -1627,8 +1630,9 @@ _modify_port() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择: " choice
     [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local newport=$(_input_port)
     if ! _mutate_config --arg t "$tag" --argjson p "$newport" \
@@ -1694,8 +1698,9 @@ _update_listen() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择: " choice
     [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
     local curlisten; curlisten=$(jq -r '.listen' "$meta")
@@ -1829,8 +1834,9 @@ _hy2_toggle_hop() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效"; _press_any_key; return; }
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
     local port; port=$(jq -r '.port' "$meta")
