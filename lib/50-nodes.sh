@@ -955,7 +955,7 @@ _add_vless_xhttp_reality() {
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -1101,7 +1101,7 @@ _add_vless_xhttp_cdn() {
     _commit_inbound "$inbound" || return 1
 
     # 链接服务器地址 = CDN 域名(必须)
-    local link="vless://${uuid}@${host}:${port}?encryption=none&security=none&type=xhttp&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    local link="vless://${uuid}@${host}:${port}?encryption=none&security=none&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
     local clash="- {name: \"$name\", type: vless, server: $host, port: $port, uuid: $uuid, network: xhttp, \"xhttp-opts\": {path: \"$path\", host: $host}}"
     _add_node_to_yaml "$clash"
 
@@ -1432,7 +1432,7 @@ _rebuild_reality_link() {
             link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
             ;;
         vless-xhttp-reality)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
             ;;
         *) echo ""; return 1 ;;
     esac
