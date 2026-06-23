@@ -378,18 +378,22 @@ _render_template() {
 
 # ---------------------------------------------------------------------------
 # 统一的 config.json 修改流程: backup → jq → test → rollback/restart
-# 用法:_mutate_config <jq_filter> [jq_extra_args...]
+# 用法:_mutate_config [--arg/--argjson ...] <jq_filter>
+# 参数: jq 选项在前, jq filter 在最后(必须)
 # 所有 config 修改应通过此函数, 不再各自实现 backup/test/rollback
 # ---------------------------------------------------------------------------
 _mutate_config() {
-    local jq_filter="$1"; shift
     _backup_config
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    # 应用 filter 后, 按 Xray 官方文档顺序重排顶层字段
-    if ! jq "$jq_filter" "$@" \
-         '| . as $c | {log: $c.log, api: $c.api, dns: $c.dns, routing: $c.routing, policy: $c.policy, inbounds: $c.inbounds, outbounds: $c.outbounds, stats: $c.stats, fakedns: $c.fakedns, metrics: $c.metrics, observatory: $c.observatory, burstObservatory: $c.burstObservatory, geodata: $c.geodata, version: $c.version} | with_entries(select(.value != null))' \
-         "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+    # 获取最后一个参数(用户 filter), 其余是 jq 选项
+    local user_filter="${!#}"
+    # 应用 filter 后, 按 Xray 官方文档顺序重排顶层字段(单 filter, 不依赖 jq 多 filter 拼接)
+    local reorder='| . as $c | {log: $c.log, api: $c.api, dns: $c.dns, routing: $c.routing, policy: $c.policy, inbounds: $c.inbounds, outbounds: $c.outbounds, stats: $c.stats, fakedns: $c.fakedns, metrics: $c.metrics, observatory: $c.observatory, burstObservatory: $c.burstObservatory, geodata: $c.geodata, version: $c.version} | with_entries(select(.value != null))'
+    local combined="${user_filter} ${reorder}"
+    # 构建参数列表: 去掉最后一个(filter), 追加合并后的 filter
+    local args=("${@:1:$#-1}" "${combined}")
+    if ! jq "${args[@]}" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
         rm -f "$tmp"; _error "jq 处理失败"; return 1
     fi
     if [ ! -s "$tmp" ]; then
