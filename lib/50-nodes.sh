@@ -267,6 +267,7 @@ _gen_random_port() {
 }
 
 _input_port() {
+    local proto="${1:-}"  # optional: tcp, udp, or empty (both)
     local port="" def
     def=$(_gen_random_port)
     while true; do
@@ -275,7 +276,7 @@ _input_port() {
         if ! _validate_port "$port"; then
             _warn "无效端口(1-65535)"; continue
         fi
-        if _check_port_occupied "$port"; then
+        if _check_port_occupied "$port" "${proto:-}"; then
             _warn "端口 ${port} 已被占用,换一个"; def=$(_gen_random_port); continue
         fi
         if _check_port_in_config "$port"; then
@@ -850,7 +851,7 @@ _add_vless_tcp_reality_vision() {
     local tunnel_port=$(_gen_random_port)
     _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
     echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
-    local port=$(_input_port)
+    local port=$(_input_port tcp)
 
     local default_name="Reality-Vision-${port}"
     read -rp "  节点名称 (默认 ${default_name}): " name
@@ -918,7 +919,7 @@ _add_vless_xhttp_reality() {
     local tunnel_port=$(_gen_random_port)
     _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
     echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
-    local port=$(_input_port)
+    local port=$(_input_port tcp)
 
     local path=$(_gen_rand_path)
     read -rp "  XHTTP path (默认 ${path}): " custom_path
@@ -1011,7 +1012,7 @@ _generate_vless_enc_keys() {
 
 _add_vless_enc() {
     echo -e "\n  ${CYAN}=== VLESS+ENC (内置加密 · 无 TLS · 类似 SS 轻量直连) ===${NC}"
-    local port=$(_input_port)
+    local port=$(_input_port tcp)
 
     # flow 选项(xtls-rprx-vision 可启用 splice 优化)
     echo -e "  流控模式:"
@@ -1074,7 +1075,7 @@ _add_vless_xhttp_cdn() {
     echo -e "  ${RED}⚠ 该协议不能直连, 客户端须经 CF CDN 回源到本机${NC}"
     local port
     while true; do
-        port=$(_input_port)
+        port=$(_input_port tcp)
         # 走 CDN 建议用 CF 支持的 HTTP 端口
         case "$port" in 80|8080|8880|2052|2082|2086|2095|443|2053|2083|2087|2096|8443) break ;; *)
             _warn "无TLS走CDN建议用 CF 支持的端口(80/8080/2052/2086/2095 等),仍可继续"; break ;;
@@ -1122,7 +1123,7 @@ _add_vless_xhttp_cdn() {
 _add_vless_ws_cdn() {
     echo -e "\n  ${CYAN}=== VLESS+WS (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
     echo -e "  ${RED}⚠ 该协议不能直连, 客户端须经 CF CDN 回源到本机${NC}"
-    local port=$(_input_port)
+    local port=$(_input_port tcp)
 
     local host
     read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
@@ -1256,7 +1257,7 @@ _gen_hy2_cert() {
 
 _add_hysteria2() {
     echo -e "\n  ${CYAN}=== Hysteria2 (QUIC · 可直连 · 需 TLS 证书) ===${NC}"
-    local port=$(_input_port)
+    local port=$(_input_port udp)
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"

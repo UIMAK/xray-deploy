@@ -147,10 +147,16 @@ _validate_port() {
 # ---------------------------------------------------------------------------
 _check_port_occupied() {
     local port="$1" proto="${2:-tcp}"
+    local ss_opts
+    case "$proto" in
+        tcp) ss_opts="-ltn" ;;
+        udp) ss_opts="-lun" ;;
+        *)   ss_opts="-lntu" ;;
+    esac
     if command -v ss >/dev/null 2>&1; then
-        ss -lntu 2>/dev/null | awk '{print $5}' | grep -q ":${port}$" && return 0
+        ss ${ss_opts} 2>/dev/null | awk '{print $5}' | grep -q ":${port}$" && return 0
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -lntu 2>/dev/null | grep -q ":${port} " && return 0
+        netstat ${ss_opts} 2>/dev/null | grep -q ":${port} " && return 0
     fi
     return 1
 }
