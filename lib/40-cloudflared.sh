@@ -448,7 +448,8 @@ _cf_switch_token() {
 }
 
 # ---------------------------------------------------------------------------
-# 切换 3 开关: 在原 service 启动行里增/删对应参数片段(不重组整行, 不破坏原结构)
+# 切换 3 开关: 读取当前状态, 反转目标开关, 用 _cf_build_cmdline 重组整行写回
+# (从头重建保证参数顺序: 全局标志 tunnel 连接标志 run --token)
 # 用法:_cf_toggle <autoupdate|http2|ipv6>
 # ---------------------------------------------------------------------------
 _cf_toggle() {
@@ -467,78 +468,14 @@ _cf_toggle() {
     esac
     local new; [ "$cur" = "on" ] && new="off" || new="on"
 
-    # 在 service 文件里增/删对应参数片段
-    local svcfile add_frag del_frag
-    case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
-    [ -f "$svcfile" ] || { _error "service 文件不存在: $svcfile"; return 1; }
-
+    CF_AUTOUPDATE="${CF_CUR_AUTOUPDATE}"; CF_HTTP2="${CF_CUR_HTTP2}"; CF_IPV6="${CF_CUR_IPV6}"
     case "$key" in
-        autoupdate)
-            # 开:加 --autoupdate-freq 24h0m0s; 关:删 --autoupdate-freq xxx, 加 --no-autoupdate
-            add_frag="--autoupdate-freq 24h0m0s"
-            ;;
-        http2)
-            add_frag="--protocol http2"
-            ;;
-        ipv6)
-            add_frag="--edge-ip-version 6"
-            ;;
+        autoupdate) CF_AUTOUPDATE="$new" ;;
+        http2)      CF_HTTP2="$new" ;;
+        ipv6)       CF_IPV6="$new" ;;
     esac
+    _cf_write_service_line "$(_cf_build_cmdline "$CF_CUR_TOKEN")" || return 1
 
-    # 备份
-    cp -f "$svcfile" "${svcfile}.bak"
-    local tmp; tmp=$(mktemp)
-    while IFS= read -r ln || [ -n "$ln" ]; do
-        # 只处理含 cloudflared 启动参数的行(command_args / command / supervise_daemon_args / ExecStart / start 块内联)
-        case "$ln" in
-            *tunnel*|--token*)
-                local modified="$ln"
-                if [ "$new" = "on" ]; then
-                    # 加片段(若尚未存在)
-                    case "$modified" in
-                        *${add_frag}*) ;;  # 已有, 不加
-                        *)
-                            # 在闭合双引号前插入(若行尾是 "..."); 否则行尾追加
-                            case "$modified" in
-                                *\") modified="${modified%\"} ${add_frag}\"" ;;
-                                *)   modified="${modified} ${add_frag}" ;;
-                            esac
-                            ;;
-                    esac
-                else
-                    # 关: 删除该片段及其可能的取值
-                    case "$key" in
-                        autoupdate)
-                            modified=$(printf '%s' "$modified" | sed 's/ --autoupdate-freq [^ ]*//g; s/--autoupdate-freq [^ ]* //g')
-                            case "$modified" in *--no-autoupdate*) ;; *)
-                                # 在闭合引号前插入 --no-autoupdate
-                                case "$modified" in
-                                    *\") modified="${modified%\"} --no-autoupdate\"" ;;
-                                    *)   modified="${modified} --no-autoupdate" ;;
-                                esac ;;
-                            esac
-                            ;;
-                        http2)
-                            modified=$(printf '%s' "$modified" | sed 's/ --protocol http2//g; s/--protocol http2 //g')
-                            ;;
-                        ipv6)
-                            modified=$(printf '%s' "$modified" | sed 's/ --edge-ip-version 6//g; s/--edge-ip-version 6 //g')
-                            ;;
-                    esac
-                fi
-                printf '%s\n' "$modified" >> "$tmp"
-                ;;
-            *)
-                printf '%s\n' "$ln" >> "$tmp"
-                ;;
-        esac
-    done < "$svcfile"
-    cat "$tmp" > "$svcfile"
-    rm -f "$tmp"
-    case "$svcfile" in /etc/init.d/*) chmod +x "$svcfile" 2>/dev/null ;; esac
-    [ "$INIT_SYSTEM" = "systemd" ] && systemctl daemon-reload 2>/dev/null
-
-    # 重启: 先杀干净所有, 等 CF 边缘回收旧 session, 再 start
     _cf_restart
     _state_set "cf_$key" "$new"
     _success "${key} 已切换为 ${new}(cloudflared 已重启, 隧道短暂中断)"
