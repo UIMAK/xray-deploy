@@ -20,6 +20,16 @@
                 "keyFile": "{{KEY_FILE}}"
             }]
         },
+        "hysteriaSettings": {
+            "version": 2,
+            "masquerade": {
+                "type": "",
+                "dir": "",
+                "url": "",
+                "rewriteHost": false,
+                "content": ""
+            }
+        },
         "finalmask": {
             "quicParams": {
                 "congestion": "{{CONGESTION}}"{{BRUTAL_PARAMS_BLOCK}}
