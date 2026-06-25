@@ -125,7 +125,7 @@ _main_menu() {
         printf "  ${GREEN}[%2d]${NC} 停止 Xray\n" $((_ops_start+2))
         printf "  ${GREEN}[%2d]${NC} 查看状态\n" $((_ops_start+3))
         printf "  ${GREEN}[%2d]${NC} 查看日志\n" $((_ops_start+4))
-        printf "  ${GREEN}[%2d]${NC} 定时重启 Xray\n" $((_ops_start+5))
+        printf "  ${GREEN}[%2d]${NC} 定时重启\n" $((_ops_start+5))
         printf "  ${GREEN}[%2d]${NC} 检查配置\n" $((_ops_start+6))
         printf "  ${GREEN}[%2d]${NC} 卸载\n" $((_ops_start+7))
         echo
@@ -244,11 +244,11 @@ _check_config() {
 }
 
 # ---------------------------------------------------------------------------
-# 定时重启 Xray 菜单
+# 定时重启 菜单
 # ---------------------------------------------------------------------------
 _timed_restart_menu() {
     clear
-    echo; echo -e "  ${CYAN}【定时重启 Xray】${NC}"
+    echo; echo -e "  ${CYAN}【定时重启】${NC}"
     local state; state=$(_state_get timed_restart 2>/dev/null || echo "off")
     if [ "$state" != "off" ] && [ -n "$state" ]; then
         echo -e "  当前状态: ${GREEN}${state}${NC}"
@@ -256,7 +256,7 @@ _timed_restart_menu() {
         echo -e "  当前状态: 未启用"
     fi
     echo
-    echo -e "  ${GREEN}[1]${NC} 每天 4:00 重启"
+    echo -e "  ${GREEN}[1]${NC} 每 3 小时重启"
     echo -e "  ${GREEN}[2]${NC} 每 6 小时重启"
     echo -e "  ${GREEN}[3]${NC} 每 12 小时重启"
     echo -e "  ${GREEN}[4]${NC} 自定义 cron 表达式"
@@ -270,7 +270,7 @@ _timed_restart_menu() {
     local marker="# xray-deploy-timed-restart"
     case "${choice:-0}" in
         0) return ;;
-        1) cron_expr="0 4 * * *" ;;
+        1) cron_expr="0 */3 * * *" ;;
         2) cron_expr="0 */6 * * *" ;;
         3) cron_expr="0 */12 * * *" ;;
         4)
