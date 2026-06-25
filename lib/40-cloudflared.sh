@@ -341,8 +341,8 @@ _install_cloudflared() {
     fi
     [ -z "$token" ] && { _error "Token 不能为空"; return 1; }
 
-    # 默认开关(首次安装: 自动更新 on, HTTP2 on, IPv6 off)
-    CF_AUTOUPDATE="on"; CF_HTTP2="on"; CF_IPV6="off"
+    # 默认开关(脚本安装默认: 自动更新 off, HTTP2 off, IPv6 off)
+    CF_AUTOUPDATE="off"; CF_HTTP2="off"; CF_IPV6="off"
 
     _info "调用 cloudflared service install..."
     if ! "$CF_BIN" service install "$token" 2>&1; then
@@ -360,6 +360,7 @@ _install_cloudflared() {
     _state_set cf_ipv6 "$CF_IPV6"
     _state_set cf_token "$token"
     _success "cloudflared 安装完成(已注册服务并开机自启)"
+    _tip "已默认关闭 cloudflared 自动更新和 HTTP2 连接（可在 cloudflared 管理中修改）"
     _tip "隧道路由请在 Cloudflare Web 端配置, 本脚本不写 config.yml"
 }
 

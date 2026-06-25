@@ -6,7 +6,7 @@
     "settings": {
         "method": "{{METHOD}}",
         "password": "{{PASSWORD}}",
-        "network": "tcp,udp"
+        "network": "{{NETWORK}}"
     },
     "sniffing": {
         "enabled": true,

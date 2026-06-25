@@ -116,7 +116,47 @@ _xray_download_replace() {
         _error "新二进制无法执行,可能架构不匹配"
         return 1
     fi
+    # 创建 xray 命令 symlink（检测已有安装不覆盖）
+    _ensure_xray_symlink
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# 定时重启执行体(cron 调用: xd timed-restart)
+# 逻辑: xray -test → 通过则 restart → 记录日志
+# ---------------------------------------------------------------------------
+_timed_restart_do() {
+    local log_file="$LOG_DIR/timed-restart.log"
+    mkdir -p "$LOG_DIR"
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    if [ ! -x "$XRAY_BIN" ]; then
+        echo "[$ts] 跳过: Xray 未安装" >> "$log_file"
+        exit 0
+    fi
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "[$ts] 跳过: 配置文件不存在" >> "$log_file"
+        exit 0
+    fi
+    if ! XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo "[$ts] 跳过: 配置校验失败" >> "$log_file"
+        exit 0
+    fi
+    _manage_xray restart
+    echo "[$ts] 已重启" >> "$log_file"
+}
+
+# ---------------------------------------------------------------------------
+# 确保 xray 命令可用 (symlink $XRAY_BIN → /usr/local/bin/xray)
+# ---------------------------------------------------------------------------
+_ensure_xray_symlink() {
+    local link="/usr/local/bin/xray"
+    if [ ! -e "$link" ]; then
+        ln -sf "$XRAY_BIN" "$link"
+    elif [ "$(readlink -f "$link" 2>/dev/null)" = "$XRAY_BIN" ]; then
+        :  # 已是我们的 symlink, 跳过
+    else
+        _tip "检测到已有 xray 命令 ($(readlink -f "$link" 2>/dev/null || echo "$link")), 跳过 symlink 创建"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -384,11 +424,12 @@ _uninstall_xray() {
             rm -f /etc/init.d/xray
             ;;
     esac
-    # 清 crontab 的 geo 自动更新任务
-    crontab -l 2>/dev/null | grep -v "$GEO_CRON_MARKER" 2>/dev/null | crontab - 2>/dev/null || true
-    # 删快捷命令与主脚本副本
+    # 清 crontab 的 geo 自动更新任务 + 定时重启任务
+    crontab -l 2>/dev/null | grep -v "$GEO_CRON_MARKER" 2>/dev/null | grep -v "# xray-deploy-timed-restart" 2>/dev/null | crontab - 2>/dev/null || true
+    # 删快捷命令与主脚本副本 + xray symlink
     rm -f /usr/local/bin/"$CMD_NAME"
     rm -f /usr/local/bin/xd
+    [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ] && rm -f /usr/local/bin/xray
     # 清理端口跳跃 iptables 规则(必须在删除部署目录之前)
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
         _hy2_cleanup_all_hops

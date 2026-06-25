@@ -146,7 +146,7 @@ _validate_port() {
 # 端口占用检测(复用 singbox-lite 思路)
 # ---------------------------------------------------------------------------
 _check_port_occupied() {
-    local port="$1" proto="${2:-tcp}"
+    local port="$1" proto="${2:-}"
     local ss_opts
     case "$proto" in
         tcp) ss_opts="-ltn" ;;

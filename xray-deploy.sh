@@ -2,7 +2,7 @@
 # =============================================================================
 # xray-deploy.sh — Xray 部署管理脚本(主入口)
 # 安装后落 /usr/local/bin/xd, 输入 xd 唤出菜单
-# 支持子命令: xd geo-update (供 cron 调用, 需求 R4)
+# 支持子命令: xd geo-update, xd timed-restart (供 cron 调用)
 # =============================================================================
 
 set -u
@@ -56,6 +56,12 @@ main() {
     if [ "${1:-}" = "geo-update" ]; then
         _ensure_dirs
         _geo_update
+        exit $?
+    fi
+    # 子命令: timed-restart(cron 调用)
+    if [ "${1:-}" = "timed-restart" ]; then
+        _ensure_dirs
+        _timed_restart_do
         exit $?
     fi
 

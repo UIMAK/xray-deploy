@@ -10,6 +10,16 @@ GEO_CRON_MARKER="# xray-deploy-geo-update"
 GEO_STATE_FILE="$STATE_DIR/geo_cron"
 
 # ---------------------------------------------------------------------------
+# 确保 cron 服务在运行(启用 + 启动)
+# ---------------------------------------------------------------------------
+_ensure_cron_running() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true ;;
+        openrc)  rc-update add cron default 2>/dev/null; rc-service cron start 2>/dev/null || true ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # 执行一次 Geo 更新(原子替换, 失败保留旧)
 # ---------------------------------------------------------------------------
 _geo_update() {
@@ -70,10 +80,7 @@ _geo_set_auto_update() {
                 _error "写入 crontab 失败"; return 1
             }
             # 确保 cron 服务运行
-            case "$INIT_SYSTEM" in
-                systemd) systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true ;;
-                openrc)  rc-update add cron default 2>/dev/null; rc-service cron start 2>/dev/null || true ;;
-            esac
+            _ensure_cron_running
             _state_set geo_cron "on"
             _success "Geo 自动更新已开启 (每 3 天 03:00 执行)"
             ;;

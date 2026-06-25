@@ -125,8 +125,9 @@ _main_menu() {
         printf "  ${GREEN}[%2d]${NC} 停止 Xray\n" $((_ops_start+2))
         printf "  ${GREEN}[%2d]${NC} 查看状态\n" $((_ops_start+3))
         printf "  ${GREEN}[%2d]${NC} 查看日志\n" $((_ops_start+4))
-        printf "  ${GREEN}[%2d]${NC} 检查配置(xray -test)\n" $((_ops_start+5))
-        printf "  ${GREEN}[%2d]${NC} 卸载\n" $((_ops_start+6))
+        printf "  ${GREEN}[%2d]${NC} 定时重启 Xray\n" $((_ops_start+5))
+        printf "  ${GREEN}[%2d]${NC} 检查配置\n" $((_ops_start+6))
+        printf "  ${GREEN}[%2d]${NC} 卸载\n" $((_ops_start+7))
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
@@ -165,8 +166,10 @@ _main_menu() {
         elif [ "$choice" = "$((_ops_start+4))" ]; then
             _view_log
         elif [ "$choice" = "$((_ops_start+5))" ]; then
-            _check_config
+            _timed_restart_menu
         elif [ "$choice" = "$((_ops_start+6))" ]; then
+            _check_config
+        elif [ "$choice" = "$((_ops_start+7))" ]; then
             _uninstall_menu
         elif [ "$choice" = "0" ]; then
             echo -e "${CYAN}再见${NC}"; exit 0
@@ -238,6 +241,90 @@ _check_config() {
         _error "配置校验失败"
     fi
     _press_any_key
+}
+
+# ---------------------------------------------------------------------------
+# 定时重启 Xray 菜单
+# ---------------------------------------------------------------------------
+_timed_restart_menu() {
+    clear
+    echo; echo -e "  ${CYAN}【定时重启 Xray】${NC}"
+    local state; state=$(_state_get timed_restart 2>/dev/null || echo "off")
+    if [ "$state" != "off" ] && [ -n "$state" ]; then
+        echo -e "  当前状态: ${GREEN}${state}${NC}"
+    else
+        echo -e "  当前状态: 未启用"
+    fi
+    echo
+    echo -e "  ${GREEN}[1]${NC} 每天 4:00 重启"
+    echo -e "  ${GREEN}[2]${NC} 每 6 小时重启"
+    echo -e "  ${GREEN}[3]${NC} 每 12 小时重启"
+    echo -e "  ${GREEN}[4]${NC} 自定义 cron 表达式"
+    echo -e "  ${GREEN}[5]${NC} 禁用定时重启"
+    echo -e "  ${GREEN}[6]${NC} 查看日志"
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    echo
+    read -rp "  请选择: " choice
+    local cron_line="" cron_expr=""
+    local cmd_path; cmd_path=$(command -v "$CMD_NAME" 2>/dev/null || echo "/usr/local/bin/$CMD_NAME")
+    local marker="# xray-deploy-timed-restart"
+    case "${choice:-0}" in
+        0) return ;;
+        1) cron_expr="0 4 * * *" ;;
+        2) cron_expr="0 */6 * * *" ;;
+        3) cron_expr="0 */12 * * *" ;;
+        4)
+            read -rp "  输入 cron 表达式 (如 30 3 * * *): " cron_expr
+            [ -z "$cron_expr" ] && { _warn "表达式为空, 取消"; _press_any_key; return; }
+            ;;
+        5)
+            _timed_restart_disable
+            _press_any_key; return
+            ;;
+        6)
+            _timed_restart_view_log
+            _press_any_key; return
+            ;;
+        *) _warn "无效选择"; _press_any_key; return ;;
+    esac
+    [ -z "$cron_expr" ] && { _press_any_key; return; }
+    cron_line="${cron_expr} ${cmd_path} timed-restart ${marker}"
+    # 删除旧行 + 写入新行
+    (crontab -l 2>/dev/null | grep -v "$marker"; echo "$cron_line") | crontab - 2>/dev/null || { _error "写入 crontab 失败"; _press_any_key; return; }
+    mkdir -p "$STATE_DIR"
+    _state_set timed_restart "$cron_expr"
+    # 确保 cron 服务运行
+    _ensure_cron_running
+    _success "定时重启已设置: ${cron_expr}"
+    _press_any_key
+}
+
+# ---------------------------------------------------------------------------
+# 禁用定时重启
+# ---------------------------------------------------------------------------
+_timed_restart_disable() {
+    local marker="# xray-deploy-timed-restart"
+    if crontab -l 2>/dev/null | grep -q "$marker"; then
+        crontab -l 2>/dev/null | grep -v "$marker" | crontab - 2>/dev/null
+        _success "定时重启已禁用"
+    else
+        _info "定时重启未启用"
+    fi
+    _state_set timed_restart "off"
+}
+
+# ---------------------------------------------------------------------------
+# 查看定时重启日志
+# ---------------------------------------------------------------------------
+_timed_restart_view_log() {
+    clear
+    echo -e "  ${CYAN}【定时重启日志】${NC}"
+    if [ -f "$LOG_DIR/timed-restart.log" ]; then
+        echo
+        tail -20 "$LOG_DIR/timed-restart.log"
+    else
+        _info "暂无日志"
+    fi
 }
 
 # 兜底卸载 cloudflared（当 VPS 上的 lib/40-cloudflared.sh 是旧版、缺少 _uninstall_cloudflared 时用）
@@ -419,12 +506,34 @@ _hy2_toggle_brutal() {
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
+    # 选项模式: 直接选择目标模式
+    echo
+    echo -e "  当前拥塞控制: ${CYAN}${cur_cc}${NC}"
+    echo -e "  ${GREEN}[1]${NC} bbr"
+    echo -e "  ${GREEN}[2]${NC} brutal"
+    echo -e "  ${GREEN}[3]${NC} force-brutal"
+    echo -e "  ${GREEN}[0]${NC} 取消"
+    read -rp "  选择模式: " cc_choice
     local new_cc
-    # 循环切换: bbr → brutal → force-brutal → bbr
-    case "$cur_cc" in
+    case "${cc_choice:-0}" in
+        0) return ;;
+        1) new_cc="bbr" ;;
+        2) new_cc="brutal" ;;
+        3) new_cc="force-brutal" ;;
+        *) _warn "无效选择"; _press_any_key; return ;;
+    esac
+    [ "$new_cc" = "$cur_cc" ] && { _info "已是 ${new_cc} 模式, 无需切换"; _press_any_key; return; }
+
+    case "$new_cc" in
         bbr)
-            # bbr → brutal (需要带宽)
-            new_cc="brutal"
+            if ! _mutate_config --arg t "$tag" \
+                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = {congestion: "bbr"}'; then
+                _error "切换失败, 已回滚"; _press_any_key; return
+            fi
+            jq --arg cc "$new_cc" '.congestion=$cc | .brutal_up="" | .brutal_down=""' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            _success "已切换为 bbr 模式"
+            ;;
+        brutal)
             echo -e "  ${YELLOW}brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
             local brutal_up="" brutal_down=""
             read -rp "  上传带宽 (回车不限): " brutal_up
@@ -444,9 +553,7 @@ _hy2_toggle_brutal() {
             [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
             [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
             ;;
-        brutal)
-            # brutal → force-brutal (保留带宽)
-            new_cc="force-brutal"
+        force-brutal)
             if ! _mutate_config --arg t "$tag" \
                  '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.congestion) = "force-brutal"'; then
                 _error "切换失败, 已回滚"; _press_any_key; return
@@ -454,16 +561,6 @@ _hy2_toggle_brutal() {
             jq --arg cc "$new_cc" '.congestion=$cc' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
             _success "已切换为 force-brutal 模式"
             _tip "force-brutal: 强制使用 brutalUp 固定发包速率, 无视对端协商"
-            ;;
-        force-brutal|*)
-            # force-brutal → bbr
-            new_cc="bbr"
-            if ! _mutate_config --arg t "$tag" \
-                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = {congestion: "bbr"}'; then
-                _error "切换失败, 已回滚"; _press_any_key; return
-            fi
-            jq --arg cc "$new_cc" '.congestion=$cc | .brutal_up="" | .brutal_down=""' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
-            _success "已切换为 bbr 模式"
             ;;
     esac
     # 重建分享链接

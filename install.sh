@@ -144,6 +144,10 @@ if [ "$IS_UPDATE" -eq 1 ]; then
         # 软链
         ln -sf "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN"
         chmod +x "$INSTALL_BIN"
+        # xray 命令 symlink（检测已有安装不覆盖）
+        if [ ! -e /usr/local/bin/xray ] || [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$DEPLOY_DIR/bin/xray" ]; then
+            ln -sf "$DEPLOY_DIR/bin/xray" /usr/local/bin/xray
+        fi
         local_ver=$(cat "$DEPLOY_DIR/VERSION" 2>/dev/null || echo "?")
         echo "[成功] 更新完成 (版本 ${local_ver})"
     else
@@ -176,6 +180,10 @@ fi
 
 ln -sf "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN"
 chmod +x "$INSTALL_BIN"
+# xray 命令 symlink（检测已有安装不覆盖）
+if [ ! -e /usr/local/bin/xray ] || [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$DEPLOY_DIR/bin/xray" ]; then
+    ln -sf "$DEPLOY_DIR/bin/xray" /usr/local/bin/xray
+fi
 
 echo "[成功] xray-deploy 安装完成"
 echo "[信息] 输入 ${CMD_NAME} 唤出主菜单"

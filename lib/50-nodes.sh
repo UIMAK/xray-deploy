@@ -328,7 +328,7 @@ _render_template() {
     : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
     : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}"
     : "${R_TUNNEL_PORT:=}" "${R_TUNNEL_TAG:=}"
-    : "${R_FLOW:=}" "${R_DECRYPTION:=}"
+    : "${R_FLOW:=}" "${R_DECRYPTION:=}" "${R_NETWORK:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
 
@@ -350,6 +350,7 @@ _render_template() {
     p="{{TUNNEL_TAG}}";   content="${content//$p/$R_TUNNEL_TAG}"
     p="{{FLOW}}";          content="${content//$p/$R_FLOW}"
     p="{{DECRYPTION}}";    content="${content//$p/$R_DECRYPTION}"
+    p="{{NETWORK}}";      content="${content//$p/$R_NETWORK}"
     p="{{AUTH}}";         content="${content//$p/$R_AUTH}"
     p="{{CERT_FILE}}";    content="${content//$p/$R_CERT_FILE}"
     p="{{KEY_FILE}}";     content="${content//$p/$R_KEY_FILE}"
@@ -1164,7 +1165,20 @@ _add_vless_ws_cdn() {
 # ---------------------------------------------------------------------------
 _add_shadowsocks() {
     echo -e "\n  ${CYAN}=== Shadowsocks (可直连) ===${NC}"
-    local port=$(_input_port)
+    # TCP/UDP 协议选择
+    echo -e "  监听协议:"
+    echo -e "  ${GREEN}[1]${NC} TCP+UDP (默认)"
+    echo -e "  ${GREEN}[2]${NC} 仅 TCP"
+    echo -e "  ${GREEN}[3]${NC} 仅 UDP"
+    read -rp "  选择 (默认 1): " net_choice
+    local proto_arg network_val
+    case "${net_choice:-1}" in
+        1) proto_arg="";   network_val="tcp,udp" ;;
+        2) proto_arg="tcp"; network_val="tcp" ;;
+        3) proto_arg="udp"; network_val="udp" ;;
+        *) _warn "无效,默认 TCP+UDP"; proto_arg=""; network_val="tcp,udp" ;;
+    esac
+    local port=$(_input_port "$proto_arg")
     echo -e "  加密方式:"
     echo -e "  ${GREEN}[1]${NC} aes-256-gcm"
     echo -e "  ${GREEN}[2]${NC} 2022-blake3-aes-256-gcm"
@@ -1193,7 +1207,7 @@ _add_shadowsocks() {
 
     local tag="xd-ss-${port}"
     local listen="::"
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_METHOD="$method" R_PASSWORD="$password"
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_METHOD="$method" R_PASSWORD="$password" R_NETWORK="$network_val"
     local inbound
     inbound=$(_render_template "$(_tpl_path shadowsocks)") || return 1
     _commit_inbound "$inbound" || return 1
