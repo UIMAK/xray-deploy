@@ -286,6 +286,24 @@ _init_config_if_empty() {
           "geoip:cn"
         ],
         "outboundTag": "block"
+      },
+      {
+        "domain": [
+          "unpkg.com",
+          "pypi.org",
+          "nodejs.org",
+          "kali.download",
+          "www.apple.com",
+          "www.gstatic.com",
+          "cp.cloudflare.com",
+          "fonts.gstatic.com",
+          "cdnjs.cloudflare.com",
+          "registry.npmjs.org",
+          "www.msftconnecttest.com",
+          "regexp:^(mt|khm)\\d?\\.google\\.com$",
+          "regexp:(gstatic|fonts|dl|ajax)\\.google(apis)?\\.com$"
+        ],
+        "outboundTag": "direct"
       }
     ]
   },
