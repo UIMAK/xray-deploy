@@ -249,15 +249,15 @@ _init_config_if_empty() {
     "queryStrategy": "UseIP",
     "servers": [
       {
-        "address": "https://1.1.1.1/dns-query",
+        "address": "https+local://cloudflare-dns.com/dns-query",
         "tag": "dns_cloudflare"
       },
       {
-        "address": "https://9.9.9.11/dns-query",
+        "address": "https+local://dns11.quad9.net/dns-query",
         "tag": "dns_quad9"
       },
       {
-        "address": "https://8.8.8.8/dns-query",
+        "address": "https+local://dns.google/dns-query",
         "tag": "dns_google"
       }
     ],
@@ -267,12 +267,6 @@ _init_config_if_empty() {
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {
-        "inboundTag": [
-          "dns_inbound"
-        ],
-        "outboundTag": "direct"
-      },
       {
         "protocol": [
           "bittorrent"
