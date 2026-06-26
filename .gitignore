@@ -12,6 +12,7 @@ Thumbs.db
 
 # 开发工具
 .claude/
+.opencode/
 .trellis/
 AGENTS.md
 CLAUDE.md
