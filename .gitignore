@@ -14,7 +14,8 @@ Thumbs.db
 .claude/
 .opencode/
 .trellis/
-# AGENTS.md and CLAUDE.md are now tracked
+CLAUDE.md
+# AGENTS.md is now tracked
 
 # 文档
 docs/
