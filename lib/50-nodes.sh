@@ -422,9 +422,9 @@ _commit_reality_inbound() {
     local tunnel="$1" reality="$2" tunnel_tag="$3" domain="$4"
     _mutate_config --argjson tb "$tunnel" --argjson rb "$reality" \
        --arg tg "$tunnel_tag" --arg dom "$domain" \
-       '.inbounds += [$tb, $rb] | .routing.rules += [
+       '.inbounds += [$tb, $rb] | .routing.rules = [
             {inboundTag: [$tg], domain: [$dom], outboundTag: "direct"},
-            {inboundTag: [$tg], outboundTag: "block"}]' || return 1
+            {inboundTag: [$tg], outboundTag: "block"}] + .routing.rules' || return 1
 }
 
 # ---------------------------------------------------------------------------

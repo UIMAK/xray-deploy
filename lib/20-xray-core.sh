@@ -268,6 +268,12 @@ _init_config_if_empty() {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
+        "inboundTag": [
+          "dns_inbound"
+        ],
+        "outboundTag": "direct"
+      },
+      {
         "protocol": [
           "bittorrent"
         ],
