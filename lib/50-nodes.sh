@@ -1503,8 +1503,7 @@ _view_nodes() {
     done
     echo
     echo -e "  ${YELLOW}查看某节点分享链接?${NC}"
-    echo -e "  输入编号(0 返回):"
-    read -rp "  " choice
+    read -rp "  输入编号(0 返回): " choice
     [ "$choice" = "0" ] && return
     [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
     local idx=$((choice)) n=0
