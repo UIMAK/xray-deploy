@@ -725,8 +725,7 @@ _sync_config_check() {
 
     case "$action" in
         1)
-            echo -e "  输入要移除的编号(逗号分隔, 如 1,3,5):"
-            read -rp "  " sel
+            read -rp "  输入要移除的编号(逗号分隔, 如 1,3,5): " sel
             local to_remove=()
             IFS=',' read -ra nums <<< "$sel"
             for n in "${nums[@]}"; do
