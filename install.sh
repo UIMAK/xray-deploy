@@ -81,17 +81,20 @@ dl() {
 # ---------------------------------------------------------------------------
 download_all() {
     local ok=0 fail=0
+    # 下载到临时 staging 目录, 全部成功后再 atomic 复制到目标路径 (S7)
+    local stage; stage=$(mktemp -d)
+    local stage_lib="$stage/lib" stage_tpl="$stage/templates"
+    mkdir -p "$stage_lib" "$stage_tpl"
 
     echo "[信息] 下载主脚本..."
-    if dl "${REMOTE_BASE}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"; then
-        chmod +x "$DEPLOY_DIR/xray-deploy.sh"
+    if dl "${REMOTE_BASE}/xray-deploy.sh" "$stage/xray-deploy.sh"; then
         echo "[成功] 主脚本 ✓"
         ok=$((ok+1))
     else
         echo "[错误] 主脚本下载失败"; fail=$((fail+1))
     fi
 
-    if dl "${REMOTE_BASE}/VERSION" "$DEPLOY_DIR/VERSION"; then
+    if dl "${REMOTE_BASE}/VERSION" "$stage/VERSION"; then
         ok=$((ok+1))
     else
         echo "[警告] VERSION 下载失败"; fail=$((fail+1))
@@ -99,7 +102,7 @@ download_all() {
 
     echo "[信息] 下载 lib 模块..."
     for f in $LIB_MODULES; do
-        if dl "${REMOTE_BASE}/lib/${f}.sh" "${INSTALL_LIB_DIR}/${f}.sh"; then
+        if dl "${REMOTE_BASE}/lib/${f}.sh" "$stage_lib/${f}.sh"; then
             ok=$((ok+1))
         else
             echo "[错误] lib/${f}.sh 下载失败"
@@ -109,7 +112,7 @@ download_all() {
 
     echo "[信息] 下载模板..."
     for t in $TPL_NAMES; do
-        if dl "${REMOTE_BASE}/templates/${t}.server.jsonc" "${INSTALL_TPL_DIR}/${t}.server.jsonc"; then
+        if dl "${REMOTE_BASE}/templates/${t}.server.jsonc" "$stage_tpl/${t}.server.jsonc"; then
             ok=$((ok+1))
         else
             echo "[错误] templates/${t}.server.jsonc 下载失败"
@@ -118,7 +121,20 @@ download_all() {
     done
 
     echo "[信息] 下载完成: 成功 ${ok}, 失败 ${fail}"
-    [ "$fail" -gt 0 ] && return 1
+    if [ "$fail" -gt 0 ]; then
+        rm -rf "$stage"
+        echo "[错误] 部分文件下载失败, 已取消更新(现有文件未变动)"
+        return 1
+    fi
+
+    # 全部成功 → 复制到最终路径
+    mkdir -p "$DEPLOY_DIR" "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR"
+    cp -f "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"
+    chmod +x "$DEPLOY_DIR/xray-deploy.sh"
+    cp -f "$stage/VERSION" "$DEPLOY_DIR/VERSION"
+    cp -f "$stage_lib"/*.sh "$INSTALL_LIB_DIR/"
+    cp -f "$stage_tpl"/*.jsonc "$INSTALL_TPL_DIR/"
+    rm -rf "$stage"
     return 0
 }
 
