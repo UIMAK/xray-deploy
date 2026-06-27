@@ -125,9 +125,10 @@ _main_menu() {
         printf "  ${GREEN}[%2d]${NC} 停止 Xray\n" $((_ops_start+2))
         printf "  ${GREEN}[%2d]${NC} 查看状态\n" $((_ops_start+3))
         printf "  ${GREEN}[%2d]${NC} 查看日志\n" $((_ops_start+4))
-        printf "  ${GREEN}[%2d]${NC} 定时重启\n" $((_ops_start+5))
-        printf "  ${GREEN}[%2d]${NC} 检查配置\n" $((_ops_start+6))
-        printf "  ${GREEN}[%2d]${NC} 卸载\n" $((_ops_start+7))
+        printf "  ${GREEN}[%2d]${NC} 日志轮换\n" $((_ops_start+5))
+        printf "  ${GREEN}[%2d]${NC} 定时重启\n" $((_ops_start+6))
+        printf "  ${GREEN}[%2d]${NC} 检查配置\n" $((_ops_start+7))
+        printf "  ${GREEN}[%2d]${NC} 卸载\n" $((_ops_start+8))
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
@@ -166,10 +167,12 @@ _main_menu() {
         elif [ "$choice" = "$((_ops_start+4))" ]; then
             _view_log
         elif [ "$choice" = "$((_ops_start+5))" ]; then
-            _timed_restart_menu
+            _logrotate_menu
         elif [ "$choice" = "$((_ops_start+6))" ]; then
-            _check_config
+            _timed_restart_menu
         elif [ "$choice" = "$((_ops_start+7))" ]; then
+            _check_config
+        elif [ "$choice" = "$((_ops_start+8))" ]; then
             _uninstall_menu
         elif [ "$choice" = "0" ]; then
             echo -e "${CYAN}再见${NC}"; exit 0

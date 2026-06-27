@@ -26,6 +26,8 @@ LIB_DIR="$SCRIPT_DIR/lib"
 . "$LIB_DIR/30-geo.sh"
 # shellcheck source=lib/40-cloudflared.sh
 . "$LIB_DIR/40-cloudflared.sh"
+# shellcheck source=lib/45-logrotate.sh
+. "$LIB_DIR/45-logrotate.sh"
 # shellcheck source=lib/50-nodes.sh
 . "$LIB_DIR/50-nodes.sh"
 # shellcheck source=lib/51-reality-pq.sh

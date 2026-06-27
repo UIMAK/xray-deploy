@@ -224,6 +224,12 @@ _install_or_switch_xray() {
     newv=$(_xray_current_version)
     _success "Xray-core 已切换到 v${newv} (${channel})"
     _tip "配置与节点保持不变"
+
+    # 首次安装/切换后自动配置 logrotate(幂等)
+    if declare -F _logrotate_setup >/dev/null 2>&1; then
+        _logrotate_setup
+    fi
+
     return 0
 }
 
@@ -451,6 +457,10 @@ _uninstall_xray() {
     # 清理端口跳跃 iptables 规则(必须在删除部署目录之前)
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
         _hy2_cleanup_all_hops
+    fi
+    # 清理 logrotate 配置
+    if declare -F _logrotate_cleanup >/dev/null 2>&1; then
+        _logrotate_cleanup
     fi
     # 删部署目录(含 config/nodes/assets/logs/state/lib/templates)
     rm -rf "$DEPLOY_DIR"
