@@ -48,7 +48,7 @@ _print_status_bar() {
     # cloudflared
     local cfstatus="${RED}○ 未安装${NC}"
     if [ -x "$CF_BIN" ]; then
-        if _cf_is_running; then
+        if declare -F _cf_is_running >/dev/null 2>&1 && _cf_is_running; then
             cfstatus="${GREEN}● 运行中${NC}"
         else
             cfstatus="${YELLOW}○ 已安装(未运行)${NC}"
@@ -292,12 +292,12 @@ _timed_restart_menu() {
     esac
     [ -z "$cron_expr" ] && { _press_any_key; return; }
     cron_line="${cron_expr} ${cmd_path} timed-restart ${marker}"
+    # 先确保 cron 服务运行(M20: 无 cron 的全新 Alpine 上先装 cron 再写 crontab)
+    _ensure_cron_running
     # 删除旧行 + 写入新行
     (crontab -l 2>/dev/null | grep -v "$marker"; echo "$cron_line") | crontab - 2>/dev/null || { _error "写入 crontab 失败"; _press_any_key; return; }
     mkdir -p "$STATE_DIR"
     _state_set timed_restart "$cron_expr"
-    # 确保 cron 服务运行
-    _ensure_cron_running
     _success "定时重启已设置: ${cron_expr}"
     _press_any_key
 }
@@ -392,13 +392,13 @@ _reset_config() {
         esac
         _backup_config
     fi
-    # 删掉 config 让 _init_config_if_empty 重建
-    rm -f "$CONFIG_FILE"
-    _init_config_if_empty
-    # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前)
+    # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
         _hy2_cleanup_all_hops
     fi
+    # 删掉 config 让 _init_config_if_empty 重建
+    rm -f "$CONFIG_FILE"
+    _init_config_if_empty
     # 清空节点元数据 + clash.yaml
     if [ -d "$NODES_DIR" ]; then
         rm -f "$NODES_DIR"/*.json 2>/dev/null
@@ -462,6 +462,10 @@ _hy2_manage_menu() {
         clear
         echo
         echo -e "  ${CYAN}【Hysteria2 管理】${NC}"
+        # 暂无节点守卫 (M18: CLAUDE.md 规约 — 无节点时显示警告)
+        if ! _has_hy2_nodes; then
+            echo -e "  ${YELLOW}暂无 Hysteria2 节点${NC}"
+        fi
         echo
         echo -e "  ${GREEN}[1]${NC} 切换拥塞控制 (bbr/brutal/force-brutal)"
         echo -e "  ${GREEN}[2]${NC} 调整 brutal 带宽"
@@ -682,7 +686,7 @@ _reality_domain_menu() {
               | if $tg != "" then
                   (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
                   | .routing.rules |= map(
-                      if .inboundTag != null and (.inboundTag | index($tg)) != null
+                      if .inboundTag != null and (.inboundTag | type) == "array" and (.inboundTag | index($tg)) != null
                       then if .domain != null then .domain = [$dom] else . end
                       else . end)
                 else . end'; then
@@ -698,7 +702,7 @@ _reality_domain_menu() {
               | if $tg != "" then
                   (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
                   | .routing.rules |= map(
-                      if .inboundTag != null and (.inboundTag | index($tg)) != null
+                      if .inboundTag != null and (.inboundTag | type) == "array" and (.inboundTag | index($tg)) != null
                       then if .domain != null then .domain = [$dom] else . end
                       else . end)
                 else . end'; then

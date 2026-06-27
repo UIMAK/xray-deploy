@@ -36,6 +36,12 @@ _detect_reality_pq() {
     # 两次 ping(mack-a 同款:一次判 X25519MLKEM768,一次取证书长度)
     ping_out=$(XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" tls ping "$target" 2>/dev/null)
 
+    if [ -z "$ping_out" ]; then
+        PQ_REASON="xray tls ping 无输出(目标不可达或 xray 不支持 tls ping)"
+        _warn "$PQ_REASON"
+        return 1
+    fi
+
     if ! echo "$ping_out" | grep -q "X25519MLKEM768"; then
         PQ_REASON="目标域名不支持 X25519MLKEM768,忽略 ML-DSA-65"
         _tip "$PQ_REASON"
@@ -69,9 +75,11 @@ _detect_reality_pq() {
     PQ_VERIFY=$(echo "$mldsa_out" | tail -n 1 | awk '{print $2}')
 
     if [ -z "$PQ_SEED" ] || [ -z "$PQ_VERIFY" ]; then
-        # 兜底:按冒号后取值
-        PQ_SEED=$(echo "$mldsa_out" | head -1 | sed -E 's/.*: *//')
-        PQ_VERIFY=$(echo "$mldsa_out" | tail -n 1 | sed -E 's/.*: *//')
+        # 兜底:按冒号后取值 (M17: 用 bash 参数扩展替代 sed -E, busybox 兼容)
+        local seed_line="${mldsa_out%%$'\n'*}"
+        local verify_line="${mldsa_out##*$'\n'}"
+        PQ_SEED="${seed_line#*: }"
+        PQ_VERIFY="${verify_line#*: }"
     fi
 
     if [ -z "$PQ_SEED" ] || [ -z "$PQ_VERIFY" ]; then
