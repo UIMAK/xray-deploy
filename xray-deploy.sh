@@ -56,12 +56,14 @@ _init_runtime() {
 main() {
     # 子命令: geo-update(cron 调用)
     if [ "${1:-}" = "geo-update" ]; then
+        INIT_SYSTEM=$(_detect_init_system)
         _ensure_dirs
         _geo_update
         exit $?
     fi
     # 子命令: timed-restart(cron 调用)
     if [ "${1:-}" = "timed-restart" ]; then
+        INIT_SYSTEM=$(_detect_init_system)
         _ensure_dirs
         _timed_restart_do
         exit $?
