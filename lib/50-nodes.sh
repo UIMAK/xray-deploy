@@ -166,7 +166,7 @@ _hy2_persist_iptables() {
                     /etc/init.d/iptables save >/dev/null 2>&1 || true
                 else
                     mkdir -p /etc/iptables
-                    iptables-save > /etc/iptables/rules-save 2>/dev/null
+                    iptables-save > /etc/iptables/rules.v4 2>/dev/null
                 fi
                 ;;
             *)
@@ -295,6 +295,8 @@ _input_port() {
 # 检查端口是否已存在于 config.json
 _check_port_in_config() {
     local port="$1"
+    # 入口校验: port 必须为数字 (M15: --argjson 对非数字行为未定义)
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
     [ -f "$CONFIG_FILE" ] || return 1
     jq -e --argjson p "$port" '.inbounds[] | select(.port == $p)' "$CONFIG_FILE" >/dev/null 2>&1
 }
@@ -439,7 +441,11 @@ _commit_reality_inbound() {
 _save_node_meta() {
     local tag="$1" json="$2"
     mkdir -p "$NODES_DIR"
-    printf '%s' "$json" | jq . > "$NODES_DIR/${tag}.json" 2>/dev/null || printf '%s' "$json" > "$NODES_DIR/${tag}.json"
+    printf '%s' "$json" | jq . > "$NODES_DIR/${tag}.json" 2>/dev/null || {
+        # jq 美化失败(可能非 JSON), 回退直写但校验内容可解析 (M14)
+        printf '%s' "$json" > "$NODES_DIR/${tag}.json"
+        jq empty "$NODES_DIR/${tag}.json" 2>/dev/null || _warn "节点元数据可能非有效 JSON: $tag"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1759,16 +1765,26 @@ _update_listen() {
     local proto oldaddr newaddr
     proto=$(jq -r '.protocol' "$meta")
     oldaddr=$(jq -r '.link_addr' "$meta")
-    if _is_listen_loopback "$newlisten"; then
-        echo -e "  ${YELLOW}监听已改为回环, 该节点仅本机可达(适合 cloudflared 回源)${NC}"
+    # CDN 协议强制填域名(M12: CDN 节点填公网 IP 会导致直连失效)
+    case "$proto" in *-cdn)
+        echo -e "  ${YELLOW}该节点为 CDN 协议, 必须使用 CDN 域名${NC}"
         echo -e "  当前链接服务器地址: ${oldaddr}"
-        read -rp "  请输入新的链接服务器地址(CDN 域名): " newaddr
-    else
-        echo -e "  监听已改为全监听(${newlisten}), 该节点对外可达"
-        local pubip; pubip=$(_get_public_ip)
-        read -rp "  请输入链接服务器地址(公网 IP/域名, 默认 ${pubip}): " newaddr
-        newaddr=${newaddr:-$pubip}
-    fi
+        read -rp "  请输入 CDN 域名: " newaddr
+        [[ "$newaddr" == *"."* ]] || { _warn "CDN 节点须填域名, 而非 IP"; _press_any_key; return; }
+        ;;
+    *)
+        if _is_listen_loopback "$newlisten"; then
+            echo -e "  ${YELLOW}监听已改为回环, 该节点仅本机可达(适合 cloudflared 回源)${NC}"
+            echo -e "  当前链接服务器地址: ${oldaddr}"
+            read -rp "  请输入新的链接服务器地址(CDN 域名): " newaddr
+        else
+            echo -e "  监听已改为全监听(${newlisten}), 该节点对外可达"
+            local pubip; pubip=$(_get_public_ip)
+            read -rp "  请输入链接服务器地址(公网 IP/域名, 默认 ${pubip}): " newaddr
+            newaddr=${newaddr:-$pubip}
+        fi
+        ;;
+    esac
     [ -z "$newaddr" ] && newaddr="$oldaddr"
 
     # 重写链接里的地址(纯 bash, 不用 sed -E —— busybox 不支持)
