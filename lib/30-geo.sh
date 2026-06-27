@@ -21,7 +21,7 @@ _ensure_cron_running() {
 }
 
 # ---------------------------------------------------------------------------
-# 执行一次 Geo 更新(原子替换, 失败保留旧)
+# 执行一次 Geo 更新(备份旧 dat → 下载覆盖 → xray -test 校验, 失败回退旧 dat)
 # ---------------------------------------------------------------------------
 _geo_update() {
     _ensure_dirs
@@ -30,6 +30,7 @@ _geo_update() {
     _info "[$ts] 开始更新 Geo 数据..."
 
     local ok=1
+    local backed=()  # 已备份的旧 dat 路径, 用于失败回退 (S9)
     for f in geosite.dat geoip.dat; do
         local url="$GEO_BASE/$f" dest="$ASSET_DIR/$f" t="${tmp}/${f}"
         _info "下载 $f <- $url"
@@ -43,21 +44,39 @@ _geo_update() {
             _warn "$f 体积异常(${sz}B), 保留旧文件"
             ok=0; rm -f "$t"; continue
         fi
-        # 原子替换(成功后旧 dat 不保留 —— 直接覆盖)
+        # 覆盖前备份旧 dat (S9: 运行期 -test 校验失败或下载部分失败时可回退)
+        [ -f "$dest" ] && { cp -f "$dest" "$dest.bak"; backed+=("$dest"); }
+        # 原子替换
         mv -f "$t" "$dest"
         _success "$f 更新成功 (${sz}B)"
     done
 
     rm -rf "$tmp"
 
-    # 日志
+    # 日志 + 校验
     mkdir -p "$LOG_DIR"
     if [ "$ok" -eq 1 ]; then
         echo "[$ts] OK 全部更新成功" >> "$GEO_LOG"
-        # 重启 xray 让其重新加载 geo(若在运行)
+        # 运行期校验: xray -test 确认新 dat 可用, 失败则回退旧 dat (S9)
+        if [ -x "$XRAY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
+            if ! XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
+                _warn "新 dat 导致配置校验失败, 回退旧 dat"
+                for dest in "${backed[@]}"; do
+                    [ -f "${dest}.bak" ] && mv -f "${dest}.bak" "$dest"
+                done
+                echo "[$ts] FAIL 运行期校验失败, 已回退旧 dat" >> "$GEO_LOG"
+                return 1
+            fi
+        fi
+        # 校验通过, 清理备份 + 重启 xray
+        for dest in "${backed[@]}"; do rm -f "${dest}.bak" 2>/dev/null; done
         _manage_xray restart 2>/dev/null || true
         return 0
     else
+        # 部分下载失败: 回退已替换的文件, 保持 dat 对一致性
+        for dest in "${backed[@]}"; do
+            [ -f "${dest}.bak" ] && mv -f "${dest}.bak" "$dest"
+        done
         echo "[$ts] PARTIAL 部分失败, 旧 dat 已保留" >> "$GEO_LOG"
         return 1
     fi
