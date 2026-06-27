@@ -1553,12 +1553,7 @@ _delete_node() {
             y|Y) ;;
             *) _info "已取消"; _press_any_key; return ;;
         esac
-        _backup_config
-        local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-        jq '.inbounds = [] | .routing.rules |= map(select(.inboundTag == null))' "$CONFIG_FILE" > "$tmp" 2>/dev/null
-        mv -f "$tmp" "$CONFIG_FILE"
-        if _xray_test_config; then
-            _manage_xray restart 2>/dev/null || true
+        if _mutate_config '.inbounds = [] | .routing.rules |= map(select(.inboundTag == null))'; then
             # 清理所有端口跳跃 iptables 规则
             if command -v iptables >/dev/null 2>&1; then
                 for tag in "${tags[@]}"; do
@@ -1583,7 +1578,7 @@ _delete_node() {
             [ -f "$CLASH_YAML" ] && printf 'proxies:\n' > "$CLASH_YAML"
             _success "已删除全部 ${#tags[@]} 个节点"
         else
-            _restore_config; _error "配置校验失败,已回滚"
+            _error "删除失败, 已回滚"
         fi
         _press_any_key; return
     fi
