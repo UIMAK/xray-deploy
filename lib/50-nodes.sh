@@ -1650,19 +1650,41 @@ _modify_port() {
 
     # 更新元数据 + 链接(端口出现在链接里)
     local meta="$NODES_DIR/${tag}.json"
-    local oldlink newlink
-    oldlink=$(jq -r '.share_link' "$meta")
     local oldport; oldport=$(jq -r '.port' "$meta")
-    newlink="${oldlink/:${oldport}/:${newport}}"
+    local proto; proto=$(jq -r '.protocol' "$meta" 2>/dev/null)
+
+    # 先更新端口到元数据(rebuild 函数需要读新端口)
+    jq --argjson p "$newport" '.port=$p' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+
+    # 按协议重建分享链接(避免裸字符串替换误伤其他字段, S4)
+    local newlink
+    case "$proto" in
+        hysteria2) newlink=$(_rebuild_hy2_link "$meta") ;;
+        vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$meta") ;;
+        *)
+            # 其他协议: @ 锚定分割确保只替换 host:port 段(不误伤 path/sni/name)
+            local oldlink; oldlink=$(jq -r '.share_link' "$meta")
+            local before_at="${oldlink%%@*}"
+            local after_at="${oldlink#*@}"
+            local host_part
+            if [[ "$after_at" == "["* ]]; then
+                host_part="${after_at%%]*}]"
+            else
+                host_part="${after_at%%[:/?#]*}"
+            fi
+            newlink="${before_at}@${host_part}:${newport}${after_at#${host_part}:${oldport}}"
+            ;;
+    esac
+
     # 同步更新节点名称(名称通常包含端口号)
     local old_name new_name
     old_name=$(jq -r '.name' "$meta")
     new_name="${old_name//${oldport}/${newport}}"
     if [ "$new_name" != "$old_name" ]; then
-        jq --argjson p "$newport" --arg l "$newlink" --arg n "$new_name" \
-           '.port=$p | .share_link=$l | .name=$n' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        jq --arg l "$newlink" --arg n "$new_name" \
+           '.share_link=$l | .name=$n' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
     else
-        jq --argjson p "$newport" --arg l "$newlink" '.port=$p | .share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
     fi
     # 如果是 hy2 节点且有端口跳跃, 更新 iptables DNAT 规则
     local proto; proto=$(jq -r '.protocol' "$meta" 2>/dev/null)
