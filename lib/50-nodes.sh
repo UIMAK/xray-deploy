@@ -164,9 +164,15 @@ _hy2_persist_iptables() {
             alpine)
                 if [ -x /etc/init.d/iptables ]; then
                     /etc/init.d/iptables save >/dev/null 2>&1 || true
+                    if command -v ip6tables-save >/dev/null 2>&1; then
+                        /etc/init.d/ip6tables save >/dev/null 2>&1 || true
+                    fi
                 else
                     mkdir -p /etc/iptables
                     iptables-save > /etc/iptables/rules.v4 2>/dev/null
+                    if command -v ip6tables-save >/dev/null 2>&1; then
+                        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+                    fi
                 fi
                 ;;
             *)
@@ -220,10 +226,14 @@ _read_hop_ranges_display() {
     fi
 }
 
-# 列出所有 xray-deploy 端口跳跃规则
+# 列出所有 xray-deploy 端口跳跃规则(IPv4 + IPv6)
 _hy2_list_all_hop_rules() {
-    command -v iptables >/dev/null 2>&1 || return
-    iptables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop" || true
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop" || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop" || true
+    fi
 }
 
 # 清理所有节点的端口跳跃 iptables 规则
