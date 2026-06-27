@@ -95,7 +95,7 @@ _read_cf_state() {
     local lines="" ln
     while IFS= read -r ln || [ -n "$ln" ]; do
         case "$ln" in
-            command_args=*|command=*|supervise_daemon_args=*|ExecStart=*|start*)
+            command_args=*|command=*|supervise_daemon_args=*|ExecStart=*|start\))
                 lines="$lines
 $ln" ;;
         esac
@@ -178,7 +178,7 @@ _svc_replace_line() {
         esac
     done < "$svcfile"
     # 用 cat 保内容 + 原文件保留(避免 mktemp 无执行位的问题): 先覆盖内容, 再恢复权限
-    cat "$tmp" > "$svcfile"
+    [ -s "$tmp" ] && cat "$tmp" > "$svcfile"
     rm -f "$tmp"
     # openrc init.d 文件需可执行
     case "$svcfile" in /etc/init.d/*) chmod +x "$svcfile" 2>/dev/null ;; esac
@@ -235,7 +235,7 @@ _cf_replace_token_in_service() {
             fi
         fi
     done < "$svcfile"
-    cat "$tmp" > "$svcfile"
+    [ -s "$tmp" ] && cat "$tmp" > "$svcfile"
     rm -f "$tmp"
     case "$svcfile" in /etc/init.d/*) chmod +x "$svcfile" 2>/dev/null ;; esac
     [ "$INIT_SYSTEM" = "systemd" ] && systemctl daemon-reload
@@ -359,7 +359,12 @@ _install_cloudflared() {
     _state_set cf_http2 "$CF_HTTP2"
     _state_set cf_ipv6 "$CF_IPV6"
     _state_set cf_token "$token"
-    _success "cloudflared 安装完成(已注册服务并开机自启)"
+    # 验证 service 真正启动 (M5: token 非法时 service install 仍成功, 但服务无法运行)
+    if _cf_is_running; then
+        _success "cloudflared 安装完成(已注册服务并开机自启)"
+    else
+        _warn "cloudflared 已安装但服务未运行, 请检查 token 是否正确"
+    fi
     _tip "已默认关闭 cloudflared 自动更新、开启 HTTP2 连接（可在 cloudflared 管理中修改）"
     _tip "隧道路由请在 Cloudflare Web 端配置, 本脚本不写 config.yml"
 }
@@ -432,7 +437,7 @@ _cf_switch_token() {
     local restarted_ok="no"
     case "$INIT_SYSTEM" in
         systemd) systemctl is-active --quiet cloudflared 2>/dev/null && restarted_ok="yes" ;;
-        openrc)  rc-service cloudflared status 2>/dev/null | grep -q started && restarted_ok="yes" ;;
+        openrc)  _cf_is_running && restarted_ok="yes" ;;
     esac
     if [ "$restarted_ok" = "no" ] && [ -f "${svcfile}.bak" ]; then
         _warn "重启后服务未运行, 回滚 service 文件..."
@@ -477,6 +482,19 @@ _cf_toggle() {
     _cf_write_service_line "$(_cf_build_cmdline "$CF_CUR_TOKEN")" || return 1
 
     _cf_restart
+    if ! _cf_is_running; then
+        _warn "切换后服务未运行, 回滚..."
+        local svcfile
+        case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
+        if [ -f "${svcfile}.bak" ]; then
+            cat "${svcfile}.bak" > "$svcfile"
+            case "$svcfile" in /etc/init.d/*) chmod +x "$svcfile" 2>/dev/null ;; esac
+            [ "$INIT_SYSTEM" = "systemd" ] && systemctl daemon-reload 2>/dev/null
+            _cf_restart
+        fi
+        _error "${key} 切换失败, 已回滚到原状态"
+        return 1
+    fi
     _state_set "cf_$key" "$new"
     _success "${key} 已切换为 ${new}(cloudflared 已重启, 隧道短暂中断)"
 }
@@ -525,7 +543,7 @@ _cloudflared_menu() {
             2) _cf_toggle autoupdate ;;
             3) _cf_toggle http2 ;;
             4) _cf_toggle ipv6 ;;
-            5) _cf_restart; _success "已重启" ;;
+            5) _cf_restart; if _cf_is_running; then _success "已重启"; else _warn "重启后服务未运行, 请检查状态"; fi ;;
             6) _cf_diagnose ;;
             9) _uninstall_cloudflared ;;
             0) return ;;
