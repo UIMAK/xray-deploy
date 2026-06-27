@@ -28,6 +28,11 @@ _normalize_bandwidth() {
     # 纯数字 → 补 mbps
     if [[ "$v" =~ ^[0-9]+$ ]]; then
         echo "${v} mbps"
+    # 短后缀展开: 1g→1 gbps, 10m→10 mbps (较新 Xray 可能拒绝裸短后缀, M10)
+    elif [[ "$v" =~ ^[0-9]+g$ ]]; then
+        echo "${v%g} gbps"
+    elif [[ "$v" =~ ^[0-9]+m$ ]]; then
+        echo "${v%m} mbps"
     else
         echo "$v"
     fi
@@ -649,7 +654,11 @@ _detect_inbound_protocol() {
                 if [ -n "$dec" ] && [ "$net" = "raw" ]; then
                     echo "vless-enc"
                 else
-                    echo "vless-$net"
+                    case "$net" in
+                        xhttp)     echo "vless-xhttp-cdn" ;;
+                        websocket) echo "vless-ws-cdn" ;;
+                        *)         echo "vless-$net" ;;
+                    esac
                 fi
                 ;;
         esac
@@ -806,8 +815,8 @@ _add_node() {
     echo
     local i=1
     for p in "${PROTOCOLS[@]}"; do
-        local key name desc
-        IFS='|' read -r key name _ _ desc <<< "$p"
+        local key name tls route desc
+        IFS='|' read -r key name tls route desc <<< "$p"
         if [ -n "$desc" ]; then
             printf "  ${GREEN}[%d]${NC} %s   %s\n" "$i" "$name" "$desc"
         else
@@ -824,8 +833,8 @@ _add_node() {
     local sel="${PROTOCOLS[$idx]:-}"
     [ -z "$sel" ] && { _warn "无效选择"; _press_any_key; return; }
 
-    local key
-    IFS='|' read -r key _ _ _ _ <<< "$sel"
+    local key tls route desc
+    IFS='|' read -r key name tls route desc <<< "$sel"
     case "$key" in
         vless-tcp-reality-vision) _add_vless_tcp_reality_vision ;;
         vless-xhttp-reality)      _add_vless_xhttp_reality ;;
@@ -1074,13 +1083,12 @@ _add_vless_xhttp_cdn() {
     echo -e "\n  ${CYAN}=== VLESS+XHTTP (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
     echo -e "  ${RED}⚠ 该协议不能直连, 客户端须经 CF CDN 回源到本机${NC}"
     local port
-    while true; do
-        port=$(_input_port tcp)
-        # 走 CDN 建议用 CF 支持的 HTTP 端口
-        case "$port" in 80|8080|8880|2052|2082|2086|2095|443|2053|2083|2087|2096|8443) break ;; *)
-            _warn "无TLS走CDN建议用 CF 支持的端口(80/8080/2052/2086/2095 等),仍可继续"; break ;;
-        esac
-    done
+    port=$(_input_port tcp)
+    # 走 CDN 建议用 CF 支持的 HTTP 端口(仅警告, 不强制)
+    case "$port" in 80|8080|8880|2052|2082|2086|2095|443|2053|2083|2087|2096|8443) ;; *)
+        _warn "非 CF 推荐端口, 建议使用 80/8080/2052/2086/2095 等, 仍可继续"
+        ;;
+    esac
 
     local host
     read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
@@ -1414,9 +1422,9 @@ _rebuild_hy2_link() {
     link="${link}&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
-    # 端口跳跃端口(如果已配置)
+    # 端口跳跃端口(如果已配置, 统一通过 _read_hop_ranges_display 读取, M9)
     local hop_ports
-    hop_ports=$(jq -r '.udp_hop_ports // empty' "$meta" 2>/dev/null)
+    hop_ports=$(_read_hop_ranges_display "$meta" 2>/dev/null)
     [ -n "$hop_ports" ] && link="${link}&mport=$(_url_encode "$hop_ports")"
     link="${link}#$(_url_encode "$name")"
     echo "$link"
