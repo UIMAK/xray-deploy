@@ -617,18 +617,12 @@ _hy2_adjust_bandwidth() {
     new_up=$(_normalize_bandwidth "$new_up")
     new_down=$(_normalize_bandwidth "$new_down")
 
-    _backup_config
-    local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    jq --arg t "$tag" --arg up "$new_up" --arg down "$new_down" \
-       '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) |=
-        (. + (if $up != "" then {brutalUp: $up} else {} end)
-             + (if $down != "" then {brutalDown: $down} else {} end))' \
-       "$CONFIG_FILE" > "$tmp" 2>/dev/null
-    mv -f "$tmp" "$CONFIG_FILE"
-    if ! _xray_test_config; then
-        _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
+    if ! _mutate_config --arg t "$tag" --arg up "$new_up" --arg down "$new_down" \
+         '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) |=
+          (. + (if $up != "" then {brutalUp: $up} else {} end)
+               + (if $down != "" then {brutalDown: $down} else {} end))'; then
+        _error "带宽调整失败, 已回滚"; _press_any_key; return
     fi
-    _manage_xray restart 2>/dev/null || true
     jq --arg up "$new_up" --arg down "$new_down" '.brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
     local link; link=$(_rebuild_hy2_link "$meta")
     jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
@@ -678,42 +672,41 @@ _reality_domain_menu() {
         _info "新域名支持后量子签名"
     fi
 
-    _backup_config
     local tunnel_tag
     tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
-    local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
     if [ -n "$pq_seed" ]; then
-        jq --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
-           --arg tg "$tunnel_tag" --arg dom "$new_sni" \
-           '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-            (.serverNames = [$sni] | .mldsa65Seed = $seed)
-            | if $tg != "" then
-                (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
-                | .routing.rules |= map(
-                    if .inboundTag != null and (.inboundTag | index($tg)) != null
-                    then if .domain != null then .domain = [$dom] else . end
-                    else . end)
-              else . end' \
-           "$CONFIG_FILE" > "$tmp" 2>/dev/null
+        if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
+             --arg tg "$tunnel_tag" --arg dom "$new_sni" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+              (.serverNames = [$sni] | .mldsa65Seed = $seed)
+              | if $tg != "" then
+                  (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
+                  | .routing.rules |= map(
+                      if .inboundTag != null and (.inboundTag | index($tg)) != null
+                      then if .domain != null then .domain = [$dom] else . end
+                      else . end)
+                else . end'; then
+            :
+        else
+            _error "域名切换失败, 已回滚"; _press_any_key; return
+        fi
     else
-        jq --arg t "$tag" --arg sni "$new_sni" \
-           --arg tg "$tunnel_tag" --arg dom "$new_sni" \
-           '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-            (.serverNames = [$sni] | del(.mldsa65Seed))
-            | if $tg != "" then
-                (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
-                | .routing.rules |= map(
-                    if .inboundTag != null and (.inboundTag | index($tg)) != null
-                    then if .domain != null then .domain = [$dom] else . end
-                    else . end)
-              else . end' \
-           "$CONFIG_FILE" > "$tmp" 2>/dev/null
+        if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" \
+             --arg tg "$tunnel_tag" --arg dom "$new_sni" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+              (.serverNames = [$sni] | del(.mldsa65Seed))
+              | if $tg != "" then
+                  (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
+                  | .routing.rules |= map(
+                      if .inboundTag != null and (.inboundTag | index($tg)) != null
+                      then if .domain != null then .domain = [$dom] else . end
+                      else . end)
+                else . end'; then
+            :
+        else
+            _error "域名切换失败, 已回滚"; _press_any_key; return
+        fi
     fi
-    mv -f "$tmp" "$CONFIG_FILE"
-    if ! _xray_test_config; then
-        _restore_config; _error "配置校验失败, 已回滚"; _press_any_key; return
-    fi
-    _manage_xray restart 2>/dev/null || true
 
     # 更新元数据 + 分享链接
     jq --arg sni "$new_sni" --arg pqv "$pq_verify" '.sni=$sni | .mldsa65_verify=$pqv' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
