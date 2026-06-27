@@ -76,7 +76,7 @@ _get_public_ip() {
         ip=$(curl -s4 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
     done
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ipv4.icanhazip.com"; do
-        ip=$(wget -q4O- --timeout=6 "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
+        ip=$(wget -q -O- --timeout=6 "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
     done
     # IPv6 兜底
     for url in "https://api64.ipify.org" "https://6.ipw.cn" "https://ipv6.icanhazip.com"; do
@@ -156,7 +156,7 @@ _check_port_occupied() {
     if command -v ss >/dev/null 2>&1; then
         ss ${ss_opts} 2>/dev/null | awk '{print $5}' | grep -q ":${port}$" && return 0
     elif command -v netstat >/dev/null 2>&1; then
-        netstat ${ss_opts} 2>/dev/null | grep -q ":${port} " && return 0
+        netstat ${ss_opts} 2>/dev/null | awk '{print $4}' | grep -q ":${port}$" && return 0
     fi
     return 1
 }

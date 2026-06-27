@@ -25,6 +25,10 @@ _ensure_cron_running() {
 # ---------------------------------------------------------------------------
 _geo_update() {
     _ensure_dirs
+    # M26: cron 环境下 _info/_warn 输出到 stdout 会产生噪音邮件, 重定向到日志
+    if [ ! -t 0 ]; then
+        exec >> "$GEO_LOG" 2>&1
+    fi
     local tmp; tmp=$(mktemp -d)
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
     _info "[$ts] 开始更新 Geo 数据..."
@@ -90,6 +94,7 @@ _geo_set_auto_update() {
     local action="$1"
     # cron 调用本脚本的 geo-update 子命令: xd geo-update
     # */3 在 day-of-month 字段: 每月 1/4/7/.../31 号 03:00 (跨月不连续, 非严格 "每 3 天")
+    # M25: cron 环境 PATH 受限时 command -v 可能失败, 硬编码 /usr/local/bin 兜底已足够
     local cmd="$(command -v "$CMD_NAME" 2>/dev/null || echo "/usr/local/bin/$CMD_NAME") geo-update"
     local cron_line="0 3 */3 * * $cmd ${GEO_CRON_MARKER}"
 
