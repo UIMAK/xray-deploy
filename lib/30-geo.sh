@@ -1,9 +1,10 @@
 #!/bin/bash
 # =============================================================================
 # lib/30-geo.sh — geosite/geoip 自动更新
-# 需求 R4: 用户可开/关, 默认关; 每 3 天; crontab; 失败保留旧 dat; 不要精简版; 成功旧 dat 不保留
+# 需求 R4: 用户可开/关, 默认关; cron 每月 1/4/7/.../31 号 03:00 执行; 失败保留旧 dat; 不要精简版; 成功旧 dat 不保留
 # 数据源: Loyalsoldier/v2ray-rules-dat releases/latest/download/{geosite,geoip}.dat
 # 落点: $ASSET_DIR (/opt/xray-deploy/assets, 即 XRAY_LOCATION_ASSET)
+# 注意: cron 表达式 */3 在 day-of-month 字段表示每月 1/4/7/.../31 号, 并非严格的"每 3 天"(跨月不连续)
 # ============================================================================
 
 GEO_CRON_MARKER="# xray-deploy-geo-update"
@@ -69,6 +70,7 @@ _geo_update() {
 _geo_set_auto_update() {
     local action="$1"
     # cron 调用本脚本的 geo-update 子命令: xd geo-update
+    # */3 在 day-of-month 字段: 每月 1/4/7/.../31 号 03:00 (跨月不连续, 非严格 "每 3 天")
     local cmd="$(command -v "$CMD_NAME" 2>/dev/null || echo "/usr/local/bin/$CMD_NAME") geo-update"
     local cron_line="0 3 */3 * * $cmd ${GEO_CRON_MARKER}"
 
@@ -82,7 +84,7 @@ _geo_set_auto_update() {
             # 确保 cron 服务运行
             _ensure_cron_running
             _state_set geo_cron "on"
-            _success "Geo 自动更新已开启 (每 3 天 03:00 执行)"
+            _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
             ;;
         off)
             _geo_remove_cron_line
@@ -106,8 +108,8 @@ _geo_next_run_hint() {
         echo "未开启"
         return
     fi
-    # 形如 0 3 */3 * * —— 每月 3 号、6 号... 的 03:00(粗略提示)
-    echo "每 3 天 03:00 (cron: $(echo "$line" | awk '{print $1" "$2" "$3" "$4" "$5}'))"
+    # 形如 0 3 */3 * * —— 每月 1/4/7/.../31 号 03:00 (非严格 "每 3 天", 跨月间隔不固定)
+    echo "每月 1/4/7/.../31 号 03:00 (cron: $(echo "$line" | awk '{print $1" "$2" "$3" "$4" "$5}'))"
 }
 
 # ---------------------------------------------------------------------------
@@ -132,7 +134,7 @@ _geo_menu() {
     if [ "$state" = "on" ]; then
         echo -e "  ${GREEN}[2]${NC} 关闭自动更新"
     else
-        echo -e "  ${GREEN}[2]${NC} 开启自动更新(每 3 天)"
+        echo -e "  ${GREEN}[2]${NC} 开启自动更新(定期)"
     fi
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  请选择: " choice
