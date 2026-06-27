@@ -99,9 +99,11 @@ _xray_download_replace() {
         return 1
     fi
 
-    # 停服务 -> 替换二进制 -> 校验可执行
+    # 停服务 -> 备份旧二进制 -> 替换二进制 -> 校验可执行
     _manage_xray stop >/dev/null 2>&1 || true
     mkdir -p "$BIN_DIR"
+    # 覆盖前备份旧二进制(校验失败可回滚, S6)
+    [ -f "$XRAY_BIN" ] && cp -f "$XRAY_BIN" "$XRAY_BIN.bak"
     mv -f "${tmp_dir}/xray" "$XRAY_BIN"
     chmod +x "$XRAY_BIN"
 
@@ -114,8 +116,16 @@ _xray_download_replace() {
     # 可执行性校验
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
         _error "新二进制无法执行,可能架构不匹配"
+        # 恢复旧二进制
+        if [ -f "$XRAY_BIN.bak" ]; then
+            mv -f "$XRAY_BIN.bak" "$XRAY_BIN"
+            chmod +x "$XRAY_BIN"
+            _info "已回滚到旧二进制"
+        fi
         return 1
     fi
+    # 校验通过, 清理备份
+    rm -f "$XRAY_BIN.bak"
     # 创建 xray 命令 symlink（检测已有安装不覆盖）
     _ensure_xray_symlink
     return 0
