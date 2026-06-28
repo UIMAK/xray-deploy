@@ -261,23 +261,13 @@ _hy2_cleanup_all_hops() {
 # 通用端口输入(带冲突检测)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# 通用端口输入(带冲突检测)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# 通用端口输入(带冲突检测)
-
-# ---------------------------------------------------------------------------
-# 通用端口输入(带冲突检测)
-# ---------------------------------------------------------------------------
 # 生成随机端口(20000-65000)
 _gen_random_port() {
     local lo hi range r
     lo=20000; hi=65000; range=$((hi-lo+1))
     # /dev/urandom 取 2 字节做随机数(无 Math.random 限制)
     r=$(od -An -tu2 -N2 /dev/urandom 2>/dev/null | tr -d ' ')
-    [ -z "$r" ] && r=${RANDOM:-12345}
+    [ -z "$r" ] && r=${RANDOM:-$(( $$ % 45000 + 20000 ))}
     echo $(( lo + (r % range) ))
 }
 
@@ -318,8 +308,8 @@ _check_port_in_config() {
 _generate_reality_keys() {
     local keypair
     keypair=$("$XRAY_BIN" x25519 2>/dev/null)
-    REALITY_PRIVATE_KEY=$(echo "$keypair" | awk 'NR==1 {print $NF}')
-    REALITY_PUBLIC_KEY=$(echo "$keypair" | awk 'NR==2 {print $NF}')
+    REALITY_PRIVATE_KEY=$(echo "$keypair" | awk -F': ' '/^Private/ {print $2}')
+    REALITY_PUBLIC_KEY=$(echo "$keypair" | awk -F': ' '/^Public/ {print $2}')
     REALITY_SHORT_ID=$(_gen_short_id)
     if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
         _error "Reality 密钥生成失败"
@@ -583,7 +573,7 @@ _adopt_single_inbound() {
         --arg tag "$tag" --arg proto "$proto" \
         --argjson port "$port" --arg listen "$listen" \
         --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
-        '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:"",share_link:$link}')"
+        '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:$listen,share_link:$link}')"
     return 0
 }
 
@@ -1539,7 +1529,7 @@ _view_nodes() {
             echo
             echo -e "  ${CYAN}【${name}】${NC}"
             echo -e "  ${GREEN}${link}${NC}"
-            local proto=$(jq -r '.protocol' "$f")
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
             case "$proto" in *cdn*) _warn "此为 CDN 协议, 禁止直连, 须经 Cloudflare 回源" ;; esac
             break
         fi
@@ -1696,7 +1686,12 @@ _modify_port() {
             else
                 host_part="${after_at%%[:/?#]*}"
             fi
-            newlink="${before_at}@${host_part}:${newport}${after_at#${host_part}:${oldport}}"
+            if [[ "$host_part" == "["* ]]; then
+                local tail_offset=$((${#host_part} + ${#oldport} + 1))
+                newlink="${before_at}@${host_part}:${newport}${after_at:$tail_offset}"
+            else
+                newlink="${before_at}@${host_part}:${newport}${after_at#${host_part}:${oldport}}"
+            fi
             ;;
     esac
 
@@ -1848,12 +1843,7 @@ _remove_node_from_yaml_by_name() {
     local name="$1"
     [ -f "$CLASH_YAML" ] || return
     local tmp; tmp=$(mktemp)
-    # 删除以 name 匹配的节点行(BRE, busybox 兼容)
-    # 两次 grep -v: 第一次匹配 name 后跟 ,}空格, 第二次匹配行尾
-    local escaped_name
-    escaped_name=$(printf '%s' "$name" | sed 's/[.[\*^$()+?{|]/\\&/g')
-    grep -v "name: *\"\{0,1\}${escaped_name}\"\{0,1\}[,} ]" "$CLASH_YAML" 2>/dev/null \
-        | grep -v "name: *\"\{0,1\}${escaped_name}\"\{0,1\} *$" > "$tmp" 2>/dev/null
+    grep -vF "$name" "$CLASH_YAML" > "$tmp" 2>/dev/null
     mv -f "$tmp" "$CLASH_YAML"
 }
 

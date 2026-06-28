@@ -503,6 +503,7 @@ _cf_toggle() {
 # cloudflared 子菜单
 # ---------------------------------------------------------------------------
 _cloudflared_menu() {
+    local choice
     while true; do
         clear
         echo
