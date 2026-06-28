@@ -35,6 +35,9 @@ export XRAY_REPO_API="https://api.github.com/repos/XTLS/Xray-core/releases"
 export GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
 
+# Xray config.json 官方顶层字段顺序(DRY: _normalize_config_format 与 _mutate_config 共用)
+readonly XRAY_TOP_FIELDS_JSON='["log","api","dns","routing","policy","inbounds","outbounds","stats","fakedns","metrics","observatory","burstObservatory","geodata","version"]'
+
 # ---------------------------------------------------------------------------
 # 颜色定义(借鉴 singbox-lite,统一配色)
 # ---------------------------------------------------------------------------
@@ -42,8 +45,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
-SKYBLUE='\033[0;34m'
-ORANGE='\033[0;33m'
+SKYBLUE='\033[0;94m'
 NC='\033[0m'
 
 # ---------------------------------------------------------------------------
@@ -52,7 +54,6 @@ NC='\033[0m'
 _info()    { echo -e "${CYAN}[信息]${NC} $1" >&2; }
 _success() { echo -e "${GREEN}[成功]${NC} $1" >&2; }
 _warn()    { echo -e "${YELLOW}[注意]${NC} $1" >&2; }
-_warning() { _warn "$1"; }                      # 别名兼容
 _error()   { echo -e "${RED}[错误]${NC} $1" >&2; }
 _tip()     { echo -e "${SKYBLUE}[提示]${NC} $1" >&2; }
 
@@ -257,9 +258,7 @@ _normalize_config_format() {
     # 按官方顺序排已知字段, 未知字段追加到末尾, 去除 null 值
     if jq '
         . as $c |
-        (["log","api","dns","routing","policy","inbounds","outbounds",
-          "stats","fakedns","metrics","observatory","burstObservatory",
-          "geodata","version"]) as $known |
+        ('"${XRAY_TOP_FIELDS_JSON}"') as $known |
         ({log:$c.log, api:$c.api, dns:$c.dns, routing:$c.routing,
           policy:$c.policy, inbounds:$c.inbounds, outbounds:$c.outbounds,
           stats:$c.stats, fakedns:$c.fakedns, metrics:$c.metrics,

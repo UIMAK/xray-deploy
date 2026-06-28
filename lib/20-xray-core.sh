@@ -384,6 +384,9 @@ command_args="run -c ${CONFIG_FILE}"
 pidfile="/run/xray.pid"
 command_background=true
 supervisor=supervise-daemon
+# 日志输出
+output_log="${LOG_DIR}/xray.log"
+error_log="${LOG_DIR}/xray.log"
 # 注入 XRAY_LOCATION_ASSET(openrc 通过 supervise_daemon_args 传 env)
 supervise_daemon_args="--env XRAY_LOCATION_ASSET=${ASSET_DIR}"
 EOF
@@ -460,9 +463,8 @@ _uninstall_xray() {
     esac
     # 清 crontab 的 geo 自动更新任务 + 定时重启任务
     crontab -l 2>/dev/null | grep -v "$GEO_CRON_MARKER" 2>/dev/null | grep -v "# xray-deploy-timed-restart" 2>/dev/null | crontab - 2>/dev/null || true
-    # 删快捷命令与主脚本副本 + xray symlink
+    # 删快捷命令(xd) + xray symlink
     rm -f /usr/local/bin/"$CMD_NAME"
-    rm -f /usr/local/bin/xd
     [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ] && rm -f /usr/local/bin/xray
     # 清理端口跳跃 iptables 规则(必须在删除部署目录之前)
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then

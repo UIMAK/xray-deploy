@@ -397,8 +397,8 @@ _mutate_config() {
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
     # 获取最后一个参数(用户 filter), 其余是 jq 选项
     local user_filter="${!#}"
-    # 应用 filter 后, 按 Xray 官方文档顺序重排顶层字段(单 filter, 不依赖 jq 多 filter 拼接)
-    local reorder='| . as $c | {log: $c.log, api: $c.api, dns: $c.dns, routing: $c.routing, policy: $c.policy, inbounds: $c.inbounds, outbounds: $c.outbounds, stats: $c.stats, fakedns: $c.fakedns, metrics: $c.metrics, observatory: $c.observatory, burstObservatory: $c.burstObservatory, geodata: $c.geodata, version: $c.version} | with_entries(select(.value != null))'
+    # 应用 filter 后, 按官方字段顺序重排顶层字段(字段列表定义在 00-common XRAY_TOP_FIELDS_JSON)
+    local reorder="| . as \$c | {log: \$c.log, api: \$c.api, dns: \$c.dns, routing: \$c.routing, policy: \$c.policy, inbounds: \$c.inbounds, outbounds: \$c.outbounds, stats: \$c.stats, fakedns: \$c.fakedns, metrics: \$c.metrics, observatory: \$c.observatory, burstObservatory: \$c.burstObservatory, geodata: \$c.geodata, version: \$c.version} | with_entries(select(.value != null))"
     local combined="${user_filter} ${reorder}"
     # 构建参数列表: 去掉最后一个(filter), 追加合并后的 filter
     local args=("${@:1:$#-1}" "${combined}")

@@ -11,11 +11,11 @@
 #   - cloudflared 是唯一例外, 落官方默认点, 不收口 /opt/xray-deploy
 # ============================================================================
 
-# cloudflared 启动行各片段开关(存 state 便于回显与重组)
+# cloudflared 开关状态文件(持久化供手动查看, 运行时从 service 文件解析)
 CF_STATE_AUTOUPDATE="$STATE_DIR/cf_autoupdate"     # on|off
 CF_STATE_HTTP2="$STATE_DIR/cf_http2"               # on|off
 CF_STATE_IPV6="$STATE_DIR/cf_ipv6"                 # on|off
-CF_STATE_TOKEN="$STATE_DIR/cf_token"
+CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 安装时的 token
 
 # ---------------------------------------------------------------------------
 # 架构 -> cloudflared 下载资产名

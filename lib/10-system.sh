@@ -51,41 +51,6 @@ _detect_arch() {
 }
 
 # ---------------------------------------------------------------------------
-# 确保 bash 可用(Alpine 默认 ash,需 apk add bash)
-# 脚本入口调用一次;若当前不是 bash 且需安装,安装后 exec 重启自身
-# ---------------------------------------------------------------------------
-_ensure_bash() {
-    # 已经在 bash 下
-    if [ -n "$BASH_VERSION" ]; then
-        return 0
-    fi
-    if command -v bash >/dev/null 2>&1; then
-        # 有 bash 但当前 shell 不是 bash,重启自身
-        exec bash "$0" "$@"
-    fi
-    # 没有 bash,安装
-    local fam
-    fam=$(_detect_os_family)
-    _info "当前非 bash,正在安装 bash..."
-    case "$fam" in
-        alpine)
-            if command -v apk >/dev/null 2>&1; then
-                apk add --no-cache bash >/dev/null 2>&1 && exec bash "$0" "$@"
-            fi
-            ;;
-        debian)
-            if command -v apt-get >/dev/null 2>&1; then
-                export DEBIAN_FRONTEND=noninteractive
-                apt-get update -qq >/dev/null 2>&1
-                apt-get install -y -qq --no-install-recommends bash >/dev/null 2>&1 && exec bash "$0" "$@"
-            fi
-            ;;
-    esac
-    _error "无法安装 bash,请手动安装后重试"
-    exit 1
-}
-
-# ---------------------------------------------------------------------------
 # 包安装(统一 apt/apk 分支)
 # 用法:_pkg_install <pkg1> [pkg2 ...]
 # ---------------------------------------------------------------------------

@@ -422,6 +422,7 @@ _reset_config() {
 # 检测脚本更新
 # 本地版本从 $DEPLOY_DIR/VERSION 文件读取, 远程从 GitHub raw 拉取
 # 以后只需改 VERSION 文件, 不用动代码
+# 可通过环境变量 XRAY_DEPLOY_RAW 覆盖上游 raw URL（如自建镜像/私有 fork）
 # ---------------------------------------------------------------------------
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
 

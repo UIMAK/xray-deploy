@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # lib/30-geo.sh — geosite/geoip 自动更新
-# 需求 R4: 用户可开/关, 默认关; cron 每月 1/4/7/.../31 号 03:00 执行; 失败保留旧 dat; 不要精简版; 成功旧 dat 不保留
+# 需求 R4: 用户可开/关, 默认关; cron 每月 1/4/7/.../31 号 03:00 执行; 下载失败保留旧 dat; 运行期校验失败回退旧 dat; 不要精简版
 # 数据源: Loyalsoldier/v2ray-rules-dat releases/latest/download/{geosite,geoip}.dat
 # 落点: $ASSET_DIR (/opt/xray-deploy/assets, 即 XRAY_LOCATION_ASSET)
 # 注意: cron 表达式 */3 在 day-of-month 字段表示每月 1/4/7/.../31 号, 并非严格的"每 3 天"(跨月不连续)
