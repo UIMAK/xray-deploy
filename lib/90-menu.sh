@@ -96,6 +96,7 @@ _main_menu() {
     _auto_tag_tagless_inbounds
     _auto_adopt_orphans
     _normalize_config_format
+    local choice
 
     while true; do
         clear
@@ -250,6 +251,7 @@ _check_config() {
 # 定时重启 菜单
 # ---------------------------------------------------------------------------
 _timed_restart_menu() {
+    local choice
     clear
     echo; echo -e "  ${CYAN}【定时重启】${NC}"
     local state; state=$(_state_get timed_restart 2>/dev/null || echo "off")
@@ -335,9 +337,9 @@ _uninstall_cloudflared_fallback() {
     if [ -x /usr/local/bin/cloudflared ]; then
         _info "卸载 cloudflared (fallback)..."
         /usr/local/bin/cloudflared service uninstall 2>/dev/null || true
-        pgrep -x cloudflared 2>/dev/null | xargs -r kill -15 2>/dev/null || true
+        pgrep -x cloudflared 2>/dev/null | while read -r pid; do kill -15 "$pid" 2>/dev/null; done || true
         sleep 2
-        pgrep -x cloudflared 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        pgrep -x cloudflared 2>/dev/null | while read -r pid; do kill -9 "$pid" 2>/dev/null; done || true
         case "$INIT_SYSTEM" in
             systemd)
                 systemctl disable cloudflared 2>/dev/null || true
@@ -348,7 +350,7 @@ _uninstall_cloudflared_fallback() {
                 rm -f /etc/init.d/cloudflared ;;
         esac
         rm -f /usr/local/bin/cloudflared
-        rm -f /opt/xray-deploy/state/cf_*
+        rm -f "$STATE_DIR"/cf_*
         _success "cloudflared 已卸载 (fallback)"
     else
         _warn "cloudflared 未安装"
@@ -359,6 +361,7 @@ _uninstall_cloudflared_fallback() {
 # 卸载菜单
 # ---------------------------------------------------------------------------
 _uninstall_menu() {
+    local choice
     clear
     echo
     echo -e "  ${RED}【卸载 / 重置】${NC}"
@@ -406,7 +409,11 @@ _reset_config() {
     [ -f "$CLASH_YAML" ] && printf 'proxies:\n' > "$CLASH_YAML" 2>/dev/null
     # 重启 xray(若在跑)
     if [ -x "$XRAY_BIN" ]; then
-        _xray_test_config 2>/dev/null && _manage_xray restart 2>/dev/null
+        if _xray_test_config 2>/dev/null && _manage_xray restart 2>/dev/null; then
+            _tip "xray 已使用新配置重启"
+        else
+            _warn "配置重置后 xray 重启失败, 请检查状态"
+        fi
     fi
     _success "config.json 已重置(含 routing 规则), 节点已清空"
 }
@@ -458,6 +465,7 @@ _check_script_update() {
 # Hysteria2 管理子菜单
 # ---------------------------------------------------------------------------
 _hy2_manage_menu() {
+    local choice
     while true; do
         clear
         echo
@@ -580,6 +588,7 @@ _hy2_toggle_brutal() {
 # Hysteria2: 调整 brutal 带宽(仅 brutal 模式)
 # ---------------------------------------------------------------------------
 _hy2_adjust_bandwidth() {
+    local choice
     clear
     _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【调整 brutal 带宽】${NC}"
@@ -638,9 +647,11 @@ _hy2_adjust_bandwidth() {
 # Reality 域名管理(切换 target SNI)
 # ---------------------------------------------------------------------------
 _reality_domain_menu() {
-    clear
+    local choice
     _has_reality_nodes || { _warn "暂无 Reality 节点"; _press_any_key; return; }
-    echo; echo -e "  ${CYAN}【Reality 域名管理】${NC}"
+    while true; do
+        clear
+        echo; echo -e "  ${CYAN}【Reality 域名管理】${NC}"
     local tags=() i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
@@ -656,16 +667,16 @@ _reality_domain_menu() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; continue; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; continue; }
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_sni; cur_sni=$(jq -r '.sni' "$meta")
     echo -e "  当前域名: ${CYAN}${cur_sni}${NC}"
     local new_sni
     read -rp "  新伪装域名 (回车取消): " new_sni
-    [ -z "$new_sni" ] && { _info "已取消"; _press_any_key; return; }
+    [ -z "$new_sni" ] && { _info "已取消"; _press_any_key; continue; }
 
     local new_target="${new_sni}:443"
 
@@ -692,7 +703,7 @@ _reality_domain_menu() {
                 else . end'; then
             :
         else
-            _error "域名切换失败, 已回滚"; _press_any_key; return
+            _error "域名切换失败, 已回滚"; _press_any_key; continue
         fi
     else
         if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" \
@@ -708,7 +719,7 @@ _reality_domain_menu() {
                 else . end'; then
             :
         else
-            _error "域名切换失败, 已回滚"; _press_any_key; return
+            _error "域名切换失败, 已回滚"; _press_any_key; continue
         fi
     fi
 
@@ -723,4 +734,5 @@ _reality_domain_menu() {
     [ -z "$pq_verify" ] && _warn "新域名不支持后量子, 已移除 pqv 参数"
     echo -e "  ${CYAN}新分享链接:${NC} ${newlink}"
     _press_any_key
+    done
 }
