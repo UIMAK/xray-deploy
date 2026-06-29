@@ -34,7 +34,8 @@ _detect_reality_pq() {
     _info "检测 Reality 后量子兼容性: $target"
     local ping_out
     # 两次 ping(mack-a 同款:一次判 X25519MLKEM768,一次取证书长度)
-    ping_out=$(XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" tls ping "$target" 2>/dev/null)
+    # timeout 防止某些目标静默丢包导致永久挂起
+    ping_out=$(timeout 10 XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" tls ping "$target" 2>/dev/null)
 
     if [ -z "$ping_out" ]; then
         PQ_REASON="xray tls ping 无输出(目标不可达或 xray 不支持 tls ping)"
