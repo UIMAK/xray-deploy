@@ -307,7 +307,7 @@ _check_port_in_config() {
 # ---------------------------------------------------------------------------
 _generate_reality_keys() {
     local keypair
-    keypair=$("$XRAY_BIN" x25519 2>/dev/null)
+    keypair=$(XRAY_LOCATION_ASSET= "$XRAY_BIN" x25519 2>/dev/null)
     REALITY_PRIVATE_KEY=$(echo "$keypair" | awk -F': ' '/^Private/ {print $2}')
     REALITY_PUBLIC_KEY=$(echo "$keypair" | awk -F': ' '/PublicKey/ {print $2}')
     REALITY_SHORT_ID=$(_gen_short_id)
@@ -1003,7 +1003,7 @@ _add_vless_xhttp_reality() {
 # 注意: xray vlessenc 输出可能不是纯 JSON(有额外文本), jq 优先, grep 兜底
 _generate_vless_enc_keys() {
     local output
-    output=$("$XRAY_BIN" vlessenc 2>/dev/null)
+    output=$(XRAY_LOCATION_ASSET= "$XRAY_BIN" vlessenc 2>/dev/null)
     if [ $? -ne 0 ] || [ -z "$output" ]; then
         _error "VLESS+ENC 密钥生成失败 (需要较新版本的 Xray 核心)"
         return 1
@@ -1270,7 +1270,7 @@ _gen_hy2_cert() {
             && openssl req -new -x509 -days 3650 -key "$KEY_FILE_PATH" \
                 -out "$CERT_FILE_PATH" -subj "/CN=build.nvidia.com" 2>/dev/null
     elif [ -x "$XRAY_BIN" ]; then
-        "$XRAY_BIN" tls cert --domain build.nvidia.com --file "$cert_dir" 2>/dev/null
+        XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain build.nvidia.com --file "$cert_dir" 2>/dev/null
         # xray tls cert 输出: cert.pem / key.pem(同名)
         [ -f "${cert_dir}/cert.pem" ] && mv -f "${cert_dir}/cert.pem" "$CERT_FILE_PATH"
         [ -f "${cert_dir}/key.pem" ] && mv -f "${cert_dir}/key.pem" "$KEY_FILE_PATH"
