@@ -309,7 +309,7 @@ _generate_reality_keys() {
     local keypair
     keypair=$("$XRAY_BIN" x25519 2>/dev/null)
     REALITY_PRIVATE_KEY=$(echo "$keypair" | awk -F': ' '/^Private/ {print $2}')
-    REALITY_PUBLIC_KEY=$(echo "$keypair" | awk -F': ' '/^Public/ {print $2}')
+    REALITY_PUBLIC_KEY=$(echo "$keypair" | awk -F': ' '/PublicKey/ {print $2}')
     REALITY_SHORT_ID=$(_gen_short_id)
     if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
         _error "Reality 密钥生成失败"
