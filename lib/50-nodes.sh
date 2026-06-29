@@ -1554,7 +1554,7 @@ _delete_node() {
         printf "  ${GREEN}[%d]${NC} %s\n" "$i" "$name"
         i=$((i+1))
     done
-    echo -e "  ${RED}[a]${NC} ${RED}全部删除${NC}"
+    echo -e "  ${RED}[a]${NC} ${RED}全部删除${NC} | 多选: 逗号分隔(如1,3)"
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择: " choice
     [ "$choice" = "0" ] && return
@@ -1591,6 +1591,69 @@ _delete_node() {
             # 清空 clash.yaml proxies
             [ -f "$CLASH_YAML" ] && printf 'proxies:\n' > "$CLASH_YAML"
             _success "已删除全部 ${#tags[@]} 个节点"
+        else
+            _error "删除失败, 已回滚"
+        fi
+        _press_any_key; return
+    fi
+
+    # 多选删除:逗号分隔(如 1,3,5)
+    if [[ "$choice" == *","* ]]; then
+        IFS=',' read -ra nums <<< "$choice"
+        local del_tags=() del_ttags=()
+        for n in "${nums[@]}"; do
+            n="${n#"${n%%[![:space:]]*}"}"; n="${n%"${n##*[![:space:]]}"}"
+            [[ "$n" =~ ^[0-9]+$ ]] || continue
+            local di=$((n-1)); local dt="${tags[$di]:-}"
+            [ -z "$dt" ] && continue
+            # 去重
+            local dup=0
+            for existing in "${del_tags[@]}"; do [ "$existing" = "$dt" ] && { dup=1; break; }; done
+            [ "$dup" -eq 1 ] && continue
+            del_tags+=("$dt")
+            local dtt; dtt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${dt}.json" 2>/dev/null)
+            [ -n "$dtt" ] && del_ttags+=("$dtt")
+        done
+        [ ${#del_tags[@]} -eq 0 ] && { _warn "无效选择"; _press_any_key; return; }
+
+        echo -e "  ${RED}确认删除以下 ${#del_tags[@]} 个节点?${NC}"
+        for dt in "${del_tags[@]}"; do
+            local dn; dn=$(jq -r '.name' "$NODES_DIR/${dt}.json" 2>/dev/null)
+            echo "    - $dn"
+        done
+        read -rp "  继续? [y/N]: " ans
+        case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; return ;; esac
+
+        local tun_json='[]'
+        [ ${#del_ttags[@]} -gt 0 ] && tun_json=$(printf '%s\n' "${del_ttags[@]}" | jq -R . | jq -s .)
+        local all_json; all_json=$(printf '%s\n' "${del_tags[@]}" "${del_ttags[@]}" | jq -R . | jq -s .)
+
+        local jq_multi='.inbounds |= map(select(.tag as $t | $all_tags | index($t) | not))'
+        if [ ${#del_ttags[@]} -gt 0 ]; then
+            jq_multi="$jq_multi | .routing.rules |= map(select(.inboundTag == null or (.inboundTag as $it | $tun_tags | index($it) | not)))"
+        fi
+
+        if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
+            if command -v iptables >/dev/null 2>&1; then
+                for dt in "${del_tags[@]}"; do
+                    local proto; proto=$(jq -r '.protocol' "$NODES_DIR/${dt}.json" 2>/dev/null)
+                    if [ "$proto" = "hysteria2" ]; then
+                        local hop_port ranges
+                        hop_port=$(jq -r '.port' "$NODES_DIR/${dt}.json" 2>/dev/null)
+                        ranges=$(_read_hop_ranges "$NODES_DIR/${dt}.json")
+                        if [ -n "$ranges" ]; then
+                            # shellcheck disable=SC2086
+                            _hy2_remove_hop_rules "$hop_port" $ranges
+                        fi
+                    fi
+                done
+                _hy2_persist_iptables
+            fi
+            for dt in "${del_tags[@]}"; do
+                rm -f "$NODES_DIR/${dt}.json"
+                _remove_node_from_yaml_by_tag "$dt"
+            done
+            _success "已删除 ${#del_tags[@]} 个节点"
         else
             _error "删除失败, 已回滚"
         fi
