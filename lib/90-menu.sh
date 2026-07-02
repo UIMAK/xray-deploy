@@ -570,13 +570,25 @@ _hy2_toggle_brutal() {
             [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
             ;;
         force-brutal)
-            if ! _mutate_config --arg t "$tag" \
-                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.congestion) = "force-brutal"'; then
+            echo -e "  ${YELLOW}force-brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
+            local brutal_up="" brutal_down=""
+            read -rp "  上传带宽 (回车不限): " brutal_up
+            read -rp "  下载带宽 (回车不限): " brutal_down
+            brutal_up=$(_normalize_bandwidth "$brutal_up")
+            brutal_down=$(_normalize_bandwidth "$brutal_down")
+            if ! _mutate_config --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
+                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
+                  ({congestion: "force-brutal"}
+                   + (if $up != "" then {brutalUp: $up} else {} end)
+                   + (if $down != "" then {brutalDown: $down} else {} end))'; then
                 _error "切换失败, 已回滚"; _press_any_key; return
             fi
-            jq --arg cc "$new_cc" '.congestion=$cc' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            jq --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" \
+               '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
             _success "已切换为 force-brutal 模式"
             _tip "force-brutal: 强制使用 brutalUp 固定发包速率, 无视对端协商"
+            [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
+            [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
             ;;
     esac
     # 重建分享链接
