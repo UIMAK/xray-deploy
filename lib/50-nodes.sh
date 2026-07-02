@@ -1284,7 +1284,7 @@ _gen_hy2_cert() {
 
 _add_hysteria2() {
     echo -e "\n  ${CYAN}=== Hysteria2 (QUIC · 可直连 · 需 TLS 证书) ===${NC}"
-    local port=$(_input_port)
+    local port=$(_input_port udp)
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
