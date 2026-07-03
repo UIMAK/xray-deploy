@@ -700,40 +700,56 @@ _reality_domain_menu() {
         _info "新域名支持后量子签名"
     fi
 
-    local tunnel_tag
+    local tunnel_tag tunnel_port node_port new_tunnel_tag
     tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
+    tunnel_port=$(jq -r '.tunnel_port' "$meta")
+    node_port=$(jq -r '.port' "$meta")
+    new_tunnel_tag="Tunnel-${new_sni}-${tunnel_port}-${node_port}"
     if [ -n "$pq_seed" ]; then
         if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
-             --arg tg "$tunnel_tag" --arg dom "$new_sni" \
+             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
              '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
               (.serverNames = [$sni] | .mldsa65Seed = $seed)
               | if $tg != "" then
-                  (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
+                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
+                  | (.inbounds[] | select(.tag == $new_tg) | .settings.rewriteAddress) = $dom
                   | .routing.rules |= map(
-                      if .inboundTag != null and (.inboundTag | type) == "array" and (.inboundTag | index($tg)) != null
-                      then if .domain != null then .domain = [$dom] else . end
-                      else . end)
+                      (if .inboundTag != null and (.inboundTag | type) == "array"
+                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                       else . end)
+                      | if .inboundTag != null and (.inboundTag | type) == "array"
+                           and (.inboundTag | index($new_tg)) != null
+                           and .domain != null
+                        then .domain = [$dom]
+                        else . end)
                 else . end'; then
             _error "域名切换失败, 已回滚"; _press_any_key; continue
         fi
     else
         if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" \
-             --arg tg "$tunnel_tag" --arg dom "$new_sni" \
+             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
              '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
               (.serverNames = [$sni] | del(.mldsa65Seed))
               | if $tg != "" then
-                  (.inbounds[] | select(.tag == $tg) | .settings.rewriteAddress) = $dom
+                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
+                  | (.inbounds[] | select(.tag == $new_tg) | .settings.rewriteAddress) = $dom
                   | .routing.rules |= map(
-                      if .inboundTag != null and (.inboundTag | type) == "array" and (.inboundTag | index($tg)) != null
-                      then if .domain != null then .domain = [$dom] else . end
-                      else . end)
+                      (if .inboundTag != null and (.inboundTag | type) == "array"
+                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                       else . end)
+                      | if .inboundTag != null and (.inboundTag | type) == "array"
+                           and (.inboundTag | index($new_tg)) != null
+                           and .domain != null
+                        then .domain = [$dom]
+                        else . end)
                 else . end'; then
             _error "域名切换失败, 已回滚"; _press_any_key; continue
         fi
     fi
 
     # 更新元数据 + 分享链接
-    jq --arg sni "$new_sni" --arg pqv "$pq_verify" '.sni=$sni | .mldsa65_verify=$pqv' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    jq --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" \
+      '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
     local newlink; newlink=$(_rebuild_reality_link "$meta")
     jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
 
