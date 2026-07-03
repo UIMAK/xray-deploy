@@ -714,8 +714,6 @@ _reality_domain_menu() {
                       then if .domain != null then .domain = [$dom] else . end
                       else . end)
                 else . end'; then
-            :
-        else
             _error "域名切换失败, 已回滚"; _press_any_key; continue
         fi
     else
@@ -730,8 +728,6 @@ _reality_domain_menu() {
                       then if .domain != null then .domain = [$dom] else . end
                       else . end)
                 else . end'; then
-            :
-        else
             _error "域名切换失败, 已回滚"; _press_any_key; continue
         fi
     fi
