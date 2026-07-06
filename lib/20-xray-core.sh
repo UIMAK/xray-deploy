@@ -405,7 +405,7 @@ pidfile="/run/\${RC_SVCNAME}.pid"
 rc_ulimit="-n 1024000 -u 1024000"
 capabilities="^cap_net_bind_service,^cap_net_admin,^cap_net_raw"
 extra_commands="checkconfig"
-env="XRAY_LOCATION_ASSET=${ASSET_DIR}"
+supervise_daemon_args="--env XRAY_LOCATION_ASSET=${ASSET_DIR}"
 
 command="${XRAY_BIN}"
 command_user="nobody:nobody"
