@@ -417,7 +417,6 @@ respawn_delay=5
 pidfile="/run/\${RC_SVCNAME}.pid"
 rc_ulimit="-n 1024000 -u 1024000"
 capabilities="^cap_net_bind_service,^cap_net_admin,^cap_net_raw"
-extra_commands="checkconfig"
 supervise_daemon_args="--env XRAY_LOCATION_ASSET=${ASSET_DIR}"
 
 command="${XRAY_BIN}"
@@ -428,17 +427,6 @@ depend() {
     need net
     want dns ntp-client
     after firewall
-}
-
-checkconfig() {
-    ebegin "Checking Xray configuration"
-    export XRAY_LOCATION_ASSET="${ASSET_DIR}"
-    "${XRAY_BIN}" run -c "${CONFIG_FILE}" -test
-    eend \$?
-}
-
-start_pre() {
-    checkconfig || return 1
 }
 EOF
     chmod +x /etc/init.d/xray
