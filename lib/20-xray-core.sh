@@ -93,6 +93,8 @@ _xray_download_replace() {
         rm -rf "$tmp_dir"
         return 1
     fi
+    # 立即删除 zip 文件(低内存 VPS 上 tmpfs 中的 20MB zip 是压垮骆驼的最后一根稻草)
+    rm -f "$tmp_zip"
     if [ ! -f "${tmp_dir}/xray" ]; then
         _error "压缩包内未找到 xray 二进制"
         rm -rf "$tmp_dir"
@@ -112,6 +114,10 @@ _xray_download_replace() {
     [ -f "${tmp_dir}/geosite.dat" ] && cp -f "${tmp_dir}/geosite.dat" "$ASSET_DIR/" 2>/dev/null || true
 
     rm -rf "$tmp_dir"
+
+    # 低内存机器: 下载/解压/cp 产生大量页缓存, xray version 前释放以避 OOM
+    sync 2>/dev/null || true
+    { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
 
     # 可执行性校验
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
