@@ -21,7 +21,7 @@ _ensure_cron_running() {
 }
 
 # ---------------------------------------------------------------------------
-# 执行一次 Geo 更新(备份旧 dat → 下载覆盖 → xray -test 校验, 失败回退旧 dat)
+# 执行一次 Geo 更新(备份旧 dat → 下载覆盖 → 重启 xray)
 # ---------------------------------------------------------------------------
 _geo_update() {
     _ensure_dirs
@@ -61,19 +61,7 @@ _geo_update() {
     mkdir -p "$LOG_DIR"
     if [ "$ok" -eq 1 ]; then
         echo "[$ts] OK 全部更新成功" >> "$GEO_LOG"
-    # 运行期校验: xray -test 确认新 dat 可用, 失败则回退旧 dat (S9)
-    if [ -x "$XRAY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
-        _maybe_drop_caches
-        if ! XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
-            _warn "新 dat 导致配置校验失败, 回退旧 dat"
-                for dest in "${backed[@]}"; do
-                    [ -f "${dest}.bak" ] && mv -f "${dest}.bak" "$dest"
-                done
-                echo "[$ts] FAIL 运行期校验失败, 已回退旧 dat" >> "$GEO_LOG"
-                return 1
-            fi
-        fi
-        # 校验通过, 清理备份 + 重启 xray
+        # 清理备份 + 重启 xray
         for dest in "${backed[@]}"; do rm -f "${dest}.bak" 2>/dev/null; done
         _manage_xray restart 2>/dev/null || true
         return 0
