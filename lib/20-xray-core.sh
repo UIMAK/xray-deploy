@@ -413,8 +413,6 @@ description="A unified platform for anti-censorship (xray-deploy)"
 
 supervisor=supervise-daemon
 respawn_delay=5
-respawn_max=2
-respawn_period=600
 
 pidfile="/run/\${RC_SVCNAME}.pid"
 rc_ulimit="-n 1024000 -u 1024000"
@@ -423,7 +421,6 @@ extra_commands="checkconfig"
 supervise_daemon_args="--env XRAY_LOCATION_ASSET=${ASSET_DIR}"
 
 command="${XRAY_BIN}"
-command_user="nobody:nobody"
 command_args="run -c ${CONFIG_FILE}"
 required_files="${CONFIG_FILE}"
 
