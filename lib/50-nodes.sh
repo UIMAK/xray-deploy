@@ -999,25 +999,74 @@ _add_vless_xhttp_reality() {
 # ---------------------------------------------------------------------------
 
 # 生成 VLESS+ENC 密钥对(xray vlessenc)
+# 参数 $1: 认证类型 (x25519 | mlkem768), 默认 x25519
 # 输出全局: VLESS_ENC_DECRYPTION / VLESS_ENC_ENCRYPTION
-# 注意: xray vlessenc 输出可能不是纯 JSON(有额外文本), jq 优先, grep 兜底
+# 新版 xray vlessenc 输出双模式(Authentication: section), awk 按 section 定位
+# 旧版输出(无 Authentication: 行): jq 优先, grep+sed 兜底
 _generate_vless_enc_keys() {
+    local auth_type="${1:-x25519}"
     local output
     output=$(XRAY_LOCATION_ASSET= "$XRAY_BIN" vlessenc 2>/dev/null)
     if [ $? -ne 0 ] || [ -z "$output" ]; then
         _error "VLESS+ENC 密钥生成失败 (需要较新版本的 Xray 核心)"
         return 1
     fi
-    # jq 优先(纯 JSON 场景)
-    VLESS_ENC_DECRYPTION=$(echo "$output" | jq -r '.decryption // empty' 2>/dev/null)
-    VLESS_ENC_ENCRYPTION=$(echo "$output" | jq -r '.encryption // empty' 2>/dev/null)
-    # grep + sed 兜底(输出含额外文本时 jq 会失败)
-    if [ -z "$VLESS_ENC_DECRYPTION" ]; then
-        VLESS_ENC_DECRYPTION=$(echo "$output" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+
+    VLESS_ENC_DECRYPTION=""
+    VLESS_ENC_ENCRYPTION=""
+
+    # 检测新版格式: 包含 "Authentication:" section header
+    if echo "$output" | grep -q "^Authentication:"; then
+        _info "检测到新版 vlessenc 输出, 选择认证: ${auth_type}"
+        VLESS_ENC_DECRYPTION=$(echo "$output" | awk -v target="$auth_type" '
+            /^Authentication:/ {
+                line = tolower($0); gsub(/-/, "", line)
+                in_section = (index(line, target) > 0); next
+            }
+            in_section && /^"decryption":/ {
+                sub(/.*"decryption"[[:space:]]*:[[:space:]]*"/, "")
+                sub(/".*/, "")
+                print
+            }
+        ' | head -1)
+        VLESS_ENC_ENCRYPTION=$(echo "$output" | awk -v target="$auth_type" '
+            /^Authentication:/ {
+                line = tolower($0); gsub(/-/, "", line)
+                in_section = (index(line, target) > 0); next
+            }
+            in_section && /^"encryption":/ {
+                sub(/.*"encryption"[[:space:]]*:[[:space:]]*"/, "")
+                sub(/".*/, "")
+                print
+            }
+        ' | head -1)
+        # section-aware grep+sed 兜底: awk 窄化到目标 section, 再 grep+sed 提取值
+        if [ -z "$VLESS_ENC_DECRYPTION" ] || [ -z "$VLESS_ENC_ENCRYPTION" ]; then
+            local section
+            section=$(echo "$output" | awk -v target="$auth_type" '
+                /^Authentication:/ { line = tolower($0); gsub(/-/, "", line); in_section = (index(line, target) > 0); next }
+                in_section { print }
+            ')
+            if [ -z "$VLESS_ENC_DECRYPTION" ]; then
+                VLESS_ENC_DECRYPTION=$(echo "$section" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            fi
+            if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
+                VLESS_ENC_ENCRYPTION=$(echo "$section" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            fi
+        fi
+    else
+        # 旧版格式回退: jq 优先(纯 JSON 场景)
+        VLESS_ENC_DECRYPTION=$(echo "$output" | jq -r '.decryption // empty' 2>/dev/null)
+        VLESS_ENC_ENCRYPTION=$(echo "$output" | jq -r '.encryption // empty' 2>/dev/null)
+        # grep + sed 兜底(输出含额外文本时 jq 会失败)
+        if [ -z "$VLESS_ENC_DECRYPTION" ]; then
+            VLESS_ENC_DECRYPTION=$(echo "$output" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
+        if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
+            VLESS_ENC_ENCRYPTION=$(echo "$output" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
     fi
-    if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
-        VLESS_ENC_ENCRYPTION=$(echo "$output" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-    fi
+
     if [ -z "$VLESS_ENC_DECRYPTION" ] || [ -z "$VLESS_ENC_ENCRYPTION" ]; then
         _error "VLESS+ENC 密钥解析失败 (xray vlessenc 输出格式异常)"
         return 1
@@ -1028,6 +1077,14 @@ _generate_vless_enc_keys() {
 _add_vless_enc() {
     echo -e "\n  ${CYAN}=== VLESS+ENC (内置加密 · 无 TLS · 类似 SS 轻量直连) ===${NC}"
     local port=$(_input_port tcp)
+
+    # 认证算法选择
+    echo -e "  认证算法:"
+    echo -e "  ${GREEN}[1]${NC} X25519 (默认, 兼容性好)"
+    echo -e "  ${GREEN}[2]${NC} ML-KEM-768 (Post-Quantum, 抗量子攻击)"
+    read -rp "  选择 (默认 1): " auth_choice
+    local AUTH_TYPE="x25519"
+    [ "${auth_choice:-1}" = "2" ] && AUTH_TYPE="mlkem768"
 
     # flow 选项(xtls-rprx-vision 可启用 splice 优化)
     echo -e "  流控模式:"
@@ -1042,7 +1099,7 @@ _add_vless_enc() {
     name=${name:-$default_name}
 
     local uuid; uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
-    _generate_vless_enc_keys || return 1
+    _generate_vless_enc_keys "$AUTH_TYPE" || return 1
 
     local tag="xd-vless-enc-${port}"
     local listen="::"
@@ -1072,13 +1129,15 @@ _add_vless_enc() {
     _save_node_meta "$tag" "$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-enc" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
-        --arg uuid "$uuid" --arg flow "$flow" \
+        --arg uuid "$uuid" --arg flow "$flow" --arg auth "$AUTH_TYPE" \
         --arg dec "$VLESS_ENC_DECRYPTION" --arg enc "$VLESS_ENC_ENCRYPTION" \
         --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,flow:$flow,decryption:$dec,encryption:$enc,share_link:$link}')"
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,flow:$flow,auth:$auth,decryption:$dec,encryption:$enc,share_link:$link}')"
 
     _success "节点 [${name}] 创建成功"
     [ -n "$flow" ] && _tip "已启用 xtls-rprx-vision (splice 优化)"
+    _tip "认证算法: ${AUTH_TYPE}"
+    [ "$AUTH_TYPE" = "mlkem768" ] && _tip "ML-KEM-768 需客户端支持 Post-Quantum 加密"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
 
@@ -1500,18 +1559,19 @@ _view_nodes() {
         _press_any_key; return
     fi
     echo
-    printf "  %-3s %-20s %-26s %-7s %-16s %-18s\n" "#" "名称" "协议" "端口" "监听" "链接地址"
-    echo "  ---------------------------------------------------------------------------------------"
+    printf "  %-3s %-20s %-26s %-7s %-10s %-16s %-18s\n" "#" "名称" "协议" "端口" "认证" "监听" "链接地址"
+    echo "  --------------------------------------------------------------------------------------------------"
     local i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
-        local name proto port listen addr
+        local name proto port auth listen addr
         name=$(jq -r '.name' "$f" 2>/dev/null)
         proto=$(jq -r '.protocol' "$f" 2>/dev/null)
         port=$(jq -r '.port' "$f" 2>/dev/null)
+        auth=$(jq -r '.auth // "—"' "$f" 2>/dev/null)
         listen=$(jq -r '.listen' "$f" 2>/dev/null)
         addr=$(jq -r '.link_addr' "$f" 2>/dev/null)
-        printf "  %-3s %-20s %-26s %-7s %-16s %-18s\n" "[$i]" "${name}" "${proto}" "${port}" "${listen}" "${addr}"
+        printf "  %-3s %-20s %-26s %-7s %-10s %-16s %-18s\n" "[$i]" "${name}" "${proto}" "${port}" "${auth}" "${listen}" "${addr}"
         i=$((i+1))
     done
     echo
@@ -1524,10 +1584,12 @@ _view_nodes() {
         [ -f "$f" ] || continue
         n=$((n+1))
         if [ "$n" -eq "$idx" ]; then
-            local name link
+            local name link auth
             name=$(jq -r '.name' "$f"); link=$(jq -r '.share_link' "$f")
+            auth=$(jq -r '.auth // "—"' "$f" 2>/dev/null)
             echo
             echo -e "  ${CYAN}【${name}】${NC}"
+            [ "$auth" != "—" ] && echo -e "  认证算法: ${auth}"
             echo -e "  ${GREEN}${link}${NC}"
             local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
             case "$proto" in *cdn*) _warn "此为 CDN 协议, 禁止直连, 须经 Cloudflare 回源" ;; esac
