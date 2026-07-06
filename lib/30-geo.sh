@@ -61,10 +61,11 @@ _geo_update() {
     mkdir -p "$LOG_DIR"
     if [ "$ok" -eq 1 ]; then
         echo "[$ts] OK 全部更新成功" >> "$GEO_LOG"
-        # 运行期校验: xray -test 确认新 dat 可用, 失败则回退旧 dat (S9)
-        if [ -x "$XRAY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
-            if ! XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
-                _warn "新 dat 导致配置校验失败, 回退旧 dat"
+    # 运行期校验: xray -test 确认新 dat 可用, 失败则回退旧 dat (S9)
+    if [ -x "$XRAY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
+        _maybe_drop_caches
+        if ! XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
+            _warn "新 dat 导致配置校验失败, 回退旧 dat"
                 for dest in "${backed[@]}"; do
                     [ -f "${dest}.bak" ] && mv -f "${dest}.bak" "$dest"
                 done
