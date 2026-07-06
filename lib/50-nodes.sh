@@ -1040,21 +1040,31 @@ _generate_vless_enc_keys() {
                 print
             }
         ' | head -1)
-    fi
-
-    # 旧版格式回退: jq 优先(纯 JSON 场景)
-    if [ -z "$VLESS_ENC_DECRYPTION" ]; then
+        # section-aware grep+sed 兜底: awk 窄化到目标 section, 再 grep+sed 提取值
+        if [ -z "$VLESS_ENC_DECRYPTION" ] || [ -z "$VLESS_ENC_ENCRYPTION" ]; then
+            local section
+            section=$(echo "$output" | awk -v target="$auth_type" '
+                /^Authentication:/ { line = tolower($0); gsub(/-/, "", line); in_section = (index(line, target) > 0); next }
+                in_section { print }
+            ')
+            if [ -z "$VLESS_ENC_DECRYPTION" ]; then
+                VLESS_ENC_DECRYPTION=$(echo "$section" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            fi
+            if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
+                VLESS_ENC_ENCRYPTION=$(echo "$section" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            fi
+        fi
+    else
+        # 旧版格式回退: jq 优先(纯 JSON 场景)
         VLESS_ENC_DECRYPTION=$(echo "$output" | jq -r '.decryption // empty' 2>/dev/null)
-    fi
-    if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
         VLESS_ENC_ENCRYPTION=$(echo "$output" | jq -r '.encryption // empty' 2>/dev/null)
-    fi
-    # grep + sed 兜底(输出含额外文本时 jq 会失败)
-    if [ -z "$VLESS_ENC_DECRYPTION" ]; then
-        VLESS_ENC_DECRYPTION=$(echo "$output" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-    fi
-    if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
-        VLESS_ENC_ENCRYPTION=$(echo "$output" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        # grep + sed 兜底(输出含额外文本时 jq 会失败)
+        if [ -z "$VLESS_ENC_DECRYPTION" ]; then
+            VLESS_ENC_DECRYPTION=$(echo "$output" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
+        if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
+            VLESS_ENC_ENCRYPTION=$(echo "$output" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
     fi
 
     if [ -z "$VLESS_ENC_DECRYPTION" ] || [ -z "$VLESS_ENC_ENCRYPTION" ]; then
