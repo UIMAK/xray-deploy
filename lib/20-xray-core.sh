@@ -368,7 +368,11 @@ _init_config_if_empty() {
 # ---------------------------------------------------------------------------
 _xray_test_config() {
     [ -x "$XRAY_BIN" ] || return 1
-    XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1
+    # 低内存机器: xray -test 加载完整二进制+geo,预先释放页缓存
+    sync 2>/dev/null || true
+    { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
+    # 子shell 抑制 bash 的 "Killed" 信号噪音(OOM 场景)
+    ( XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" ) >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
