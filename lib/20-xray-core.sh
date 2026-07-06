@@ -392,17 +392,42 @@ EOF
 _create_xray_openrc_service() {
     cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
-description="Xray Service (xray-deploy)"
-command="${XRAY_BIN}"
-command_args="run -c ${CONFIG_FILE}"
-pidfile="/run/xray.pid"
-command_background=true
+
+name="Xray Daemon"
+description="A unified platform for anti-censorship (xray-deploy)"
+
 supervisor=supervise-daemon
-# 日志输出
-output_log="${LOG_DIR}/xray.log"
-error_log="${LOG_DIR}/xray.log"
-# 注入 XRAY_LOCATION_ASSET(openrc 通过 supervise_daemon_args 传 env)
+respawn_delay=5
+respawn_max=2
+respawn_period=600
+
+pidfile="/run/\${RC_SVCNAME}.pid"
+rc_ulimit="-n 1024000 -u 1024000"
+capabilities="^cap_net_bind_service,^cap_net_admin,^cap_net_raw"
+extra_commands="checkconfig"
 supervise_daemon_args="--env XRAY_LOCATION_ASSET=${ASSET_DIR}"
+
+command="${XRAY_BIN}"
+command_user="nobody:nobody"
+command_args="run -c ${CONFIG_FILE}"
+required_files="${CONFIG_FILE}"
+
+depend() {
+    need net
+    want dns ntp-client
+    after firewall
+}
+
+checkconfig() {
+    ebegin "Checking Xray configuration"
+    export XRAY_LOCATION_ASSET="${ASSET_DIR}"
+    "${XRAY_BIN}" run -c "${CONFIG_FILE}" -test
+    eend \$?
+}
+
+start_pre() {
+    checkconfig || return 1
+}
 EOF
     chmod +x /etc/init.d/xray
     rc-update add xray default 2>/dev/null
