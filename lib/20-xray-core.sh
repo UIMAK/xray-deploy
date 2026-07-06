@@ -419,8 +419,9 @@ depend() {
 }
 
 checkconfig() {
-    export XRAY_LOCATION_ASSET=${ASSET_DIR}
-    ${XRAY_BIN} run -c ${CONFIG_FILE} -test
+    ebegin "Checking Xray configuration"
+    export XRAY_LOCATION_ASSET="${ASSET_DIR}"
+    "${XRAY_BIN}" run -c "${CONFIG_FILE}" -test
     eend \$?
 }
 
