@@ -72,7 +72,7 @@ _xray_current_version() {
 _maybe_drop_caches() {
     local avail_kb
     avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
-    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 393216 ]; then
+    if [ -n "$avail_kb" ] && [[ "$avail_kb" =~ ^[0-9]+$ ]] && [ "$avail_kb" -lt 393216 ]; then
         sync 2>/dev/null || true
         { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
     fi
