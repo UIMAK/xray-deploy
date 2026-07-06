@@ -67,6 +67,18 @@ _xray_current_version() {
 # 下载并替换 Xray 二进制(不缓存旧版,直接覆盖)
 # 用法:_xray_download_replace <tag>
 # ---------------------------------------------------------------------------
+
+# 低内存机器(可用内存<128MB)释放页缓存; 内存充足的机器跳过以避免性能损失
+_maybe_drop_caches() {
+    local avail_kb
+    avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 131072 ]; then
+        sync 2>/dev/null || true
+        { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
+    fi
+    return 0
+}
+
 _xray_download_replace() {
     local tag="$1"
     local asset tmp_dir tmp_zip
@@ -116,8 +128,7 @@ _xray_download_replace() {
     rm -rf "$tmp_dir"
 
     # 低内存机器: 下载/解压/cp 产生大量页缓存, xray version 前释放以避 OOM
-    sync 2>/dev/null || true
-    { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
+    _maybe_drop_caches
 
     # 可执行性校验
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
@@ -369,8 +380,7 @@ _init_config_if_empty() {
 _xray_test_config() {
     [ -x "$XRAY_BIN" ] || return 1
     # 低内存机器: xray -test 加载完整二进制+geo,预先释放页缓存
-    sync 2>/dev/null || true
-    { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
+    _maybe_drop_caches
     # 子shell 抑制 bash 的 "Killed" 信号噪音(OOM 场景)
     ( XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" ) >/dev/null 2>&1
 }
