@@ -489,6 +489,12 @@ _manage_xray() {
                     else
                         XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG_FILE" >/dev/null 2>&1 &
                         echo $! > /run/xray.pid
+                        sleep 1
+                        if ! kill -0 "$(cat /run/xray.pid 2>/dev/null)" 2>/dev/null; then
+                            _warn "Xray 启动失败,进程已退出"
+                            rm -f /run/xray.pid
+                            return 1
+                        fi
                     fi
                     ;;
                 stop)    [ -f /run/xray.pid ] && kill "$(cat /run/xray.pid)" 2>/dev/null; rm -f /run/xray.pid ;;
