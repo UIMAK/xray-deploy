@@ -32,7 +32,9 @@ _print_status_bar() {
     # Xray
     local xver="" xstatus="${RED}○ 未安装${NC}" xchannel=""
     if [ -x "$XRAY_BIN" ]; then
-        xver=" v$("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')"
+        local ver=""
+        ver=$(_xray_cached_version 2>/dev/null)
+        [ -n "$ver" ] && xver=" v${ver}"
         xchannel=$(_state_get channel 2>/dev/null); [ -z "$xchannel" ] && xchannel="?"
         local st; st=$(_manage_xray status 2>/dev/null)
         if [ "$st" = "running" ]; then
@@ -193,7 +195,10 @@ _view_status() {
     local st; st=$(_manage_xray status 2>/dev/null)
     echo -e "  Xray: $([ "$st" = "running" ] && echo "${GREEN}运行中${NC}" || echo "${RED}已停止${NC}")"
     if [ -x "$XRAY_BIN" ]; then
-        echo -e "  版本: v$("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')  通道: $(_state_get channel 2>/dev/null)"
+        local ver=""
+        ver=$(_xray_cached_version 2>/dev/null)
+        [ -z "$ver" ] && ver="未知"
+        echo -e "  版本: $([ "$ver" = "未知" ] && echo "$ver" || echo "v${ver}")  通道: $(_state_get channel 2>/dev/null)"
     fi
     echo -e "  节点数: $(_node_count)"
     case "$INIT_SYSTEM" in
@@ -239,7 +244,7 @@ _check_config() {
     if [ ! -f "$CONFIG_FILE" ]; then _warn "配置文件不存在"; _press_any_key; return; fi
     _normalize_config_format
     _info "运行 xray -test..."
-    if XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE"; then
+    if _xray_test_config; then
         _success "配置校验通过"
     else
         _error "配置校验失败"

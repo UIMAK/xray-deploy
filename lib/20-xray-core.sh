@@ -63,6 +63,16 @@ _xray_current_version() {
     "$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}'
 }
 
+_xray_cached_version() {
+    local ver=""
+    ver=$(_state_get version 2>/dev/null)
+    if [ -z "$ver" ]; then
+        ver=$(_xray_current_version 2>/dev/null)
+        [ -n "$ver" ] && _state_set version "$ver" 2>/dev/null || true
+    fi
+    [ -n "$ver" ] && echo "$ver"
+}
+
 # ---------------------------------------------------------------------------
 # 下载并替换 Xray 二进制(不缓存旧版,直接覆盖)
 # 用法:_xray_download_replace <tag>
@@ -150,7 +160,8 @@ _xray_download_replace() {
 
 # ---------------------------------------------------------------------------
 # 定时重启执行体(cron 调用: xd timed-restart)
-# 逻辑: xray -test → 通过则 restart → 记录日志
+# 逻辑: 基础文件检查 → restart → 记录日志
+# 注意: 低内存机器上 cron 维护路径不预跑 xray -test, 避免额外加载二进制+geo
 # ---------------------------------------------------------------------------
 _timed_restart_do() {
     local log_file="$LOG_DIR/timed-restart.log"
@@ -162,10 +173,6 @@ _timed_restart_do() {
     fi
     if [ ! -f "$CONFIG_FILE" ]; then
         echo "[$ts] 跳过: 配置文件不存在" >> "$log_file"
-        exit 0
-    fi
-    if ! XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo "[$ts] 跳过: 配置校验失败" >> "$log_file"
         exit 0
     fi
     _manage_xray restart
@@ -522,13 +529,13 @@ _uninstall_xray() {
 _xray_core_menu() {
     clear
     local cur="" cur_channel=""
-    cur=$(_xray_current_version 2>/dev/null)
+    cur=$(_xray_cached_version 2>/dev/null)
     cur_channel=$(_state_get channel 2>/dev/null)
     [ -z "$cur_channel" ] && cur_channel="未设置"
 
     echo
     echo -e "  ${CYAN}【Xray 核心管理】${NC}"
-    if [ -n "$cur" ]; then
+    if [ -x "$XRAY_BIN" ] && [ -n "$cur" ]; then
         echo -e "  当前版本: ${GREEN}v${cur}${NC}  通道: ${CYAN}${cur_channel}${NC}"
         echo -e "  ${YELLOW}已安装 → 选择通道将切换到该通道最新版(配置与节点不变)${NC}"
     else
