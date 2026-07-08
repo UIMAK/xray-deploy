@@ -535,7 +535,7 @@ _xray_core_menu() {
 
     echo
     echo -e "  ${CYAN}【Xray 核心管理】${NC}"
-    if [ -n "$cur" ]; then
+    if [ -x "$XRAY_BIN" ] && [ -n "$cur" ]; then
         echo -e "  当前版本: ${GREEN}v${cur}${NC}  通道: ${CYAN}${cur_channel}${NC}"
         echo -e "  ${YELLOW}已安装 → 选择通道将切换到该通道最新版(配置与节点不变)${NC}"
     else
