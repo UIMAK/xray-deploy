@@ -54,6 +54,8 @@ _init_runtime() {
 # 主调度
 # ---------------------------------------------------------------------------
 main() {
+    # cron 环境 PATH 可能受限(Alpine 尤其), 确保 jq/systemctl 等可找到
+    export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH"
     # 子命令: geo-update(cron 调用)
     if [ "${1:-}" = "geo-update" ]; then
         INIT_SYSTEM=$(_detect_init_system)

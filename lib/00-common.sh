@@ -74,10 +74,10 @@ _get_public_ip() {
     local ip url
     # IPv4 多源兜底(curl 优先, wget 兜底)
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ip.sb" "https://4.ipw.cn" "https://ipv4.icanhazip.com"; do
-        ip=$(curl -s4 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
+        ip=$(curl -s4 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" && return 0
     done
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ipv4.icanhazip.com"; do
-        ip=$(wget -q -O- --timeout=6 "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
+        ip=$(wget -q -O- --timeout=6 "$url" 2>/dev/null) && [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" && return 0
     done
     # IPv6 兜底
     for url in "https://api64.ipify.org" "https://6.ipw.cn" "https://ipv6.icanhazip.com"; do
@@ -197,7 +197,7 @@ _ensure_dirs() {
 # ---------------------------------------------------------------------------
 _state_get() {
     local key="$1"
-    [ -f "$STATE_DIR/$key" ] && cat "$STATE_DIR/$key" 2>/dev/null
+    [ -f "$STATE_DIR/$key" ] && cat "$STATE_DIR/$key" 2>/dev/null | tr -d '\n'
 }
 
 _state_set() {
@@ -212,7 +212,7 @@ _state_set() {
 _backup_config() {
     [ -f "$CONFIG_FILE" ] || return 0
     mkdir -p "$BACKUP_DIR"
-    cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.$(cat "$STATE_DIR/version" 2>/dev/null || echo prev).bak" 2>/dev/null
+    cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.$(date +%s).bak" 2>/dev/null
     cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null
 }
 

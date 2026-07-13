@@ -551,7 +551,7 @@ _hy2_toggle_brutal() {
                  '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = {congestion: "bbr"}'; then
                 _error "切换失败, 已回滚"; _press_any_key; return
             fi
-            jq --arg cc "$new_cc" '.congestion=$cc | .brutal_up="" | .brutal_down=""' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            jq --arg cc "$new_cc" '.congestion=$cc | del(.brutal_up) | del(.brutal_down)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
             _success "已切换为 bbr 模式"
             ;;
         brutal)
@@ -707,6 +707,12 @@ _reality_domain_menu() {
 
     local tunnel_tag tunnel_port node_port new_tunnel_tag
     tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
+    if [ -z "$tunnel_tag" ]; then
+        _warn "该节点缺少 tunnel_tag 元数据(可能为旧版本创建或手动添加)"
+        _warn "域名切换将仅更新 Reality inbound, 不会更新 tunnel inbound 和路由规则"
+        read -rp "  继续? [y/N]: " ans
+        case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; continue ;; esac
+    fi
     tunnel_port=$(jq -r '.tunnel_port' "$meta")
     node_port=$(jq -r '.port' "$meta")
     new_tunnel_tag="Tunnel-${new_sni}-${tunnel_port}-${node_port}"
