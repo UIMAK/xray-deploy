@@ -74,10 +74,16 @@ _get_public_ip() {
     local ip url
     # IPv4 多源兜底(curl 优先, wget 兜底)
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ip.sb" "https://4.ipw.cn" "https://ipv4.icanhazip.com"; do
-        ip=$(curl -s4 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" && return 0
+        ip=$(curl -s4 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && \
+        [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] && \
+        (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && \
+        echo "$ip" && return 0
     done
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ipv4.icanhazip.com"; do
-        ip=$(wget -q -O- --timeout=6 "$url" 2>/dev/null) && [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" && return 0
+        ip=$(wget -q -O- --timeout=6 "$url" 2>/dev/null) && [ -n "$ip" ] && \
+        [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] && \
+        (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && \
+        echo "$ip" && return 0
     done
     # IPv6 兜底
     for url in "https://api64.ipify.org" "https://6.ipw.cn" "https://ipv6.icanhazip.com"; do
@@ -212,7 +218,7 @@ _state_set() {
 _backup_config() {
     [ -f "$CONFIG_FILE" ] || return 0
     mkdir -p "$BACKUP_DIR"
-    cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.$(date +%s).bak" 2>/dev/null
+    local tmp; tmp=$(mktemp "${BACKUP_DIR}/config.json.XXXXXX.bak") && cp -f "$CONFIG_FILE" "$tmp" 2>/dev/null
     cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null
 }
 
@@ -259,12 +265,7 @@ _normalize_config_format() {
     if jq '
         . as $c |
         ('"${XRAY_TOP_FIELDS_JSON}"') as $known |
-        ({log:$c.log, api:$c.api, dns:$c.dns, routing:$c.routing,
-          policy:$c.policy, inbounds:$c.inbounds, outbounds:$c.outbounds,
-          stats:$c.stats, fakedns:$c.fakedns, metrics:$c.metrics,
-          observatory:$c.observatory, burstObservatory:$c.burstObservatory,
-          geodata:$c.geodata, version:$c.version}
-         | with_entries(select(.value != null))) as $ordered |
+        (reduce $known[] as $k ({}; .[$k] = $c[$k]) | with_entries(select(.value != null))) as $ordered |
         ($c | to_entries | map(select(.key as $k | $known | index($k) | not)) | from_entries) as $extra |
         $ordered + $extra
     ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then

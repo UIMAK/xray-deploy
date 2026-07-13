@@ -402,7 +402,7 @@ _mutate_config() {
     # 获取最后一个参数(用户 filter), 其余是 jq 选项
     local user_filter="${!#}"
     # 应用 filter 后, 按官方字段顺序重排顶层字段(字段列表定义在 00-common XRAY_TOP_FIELDS_JSON)
-    local reorder="| . as \$c | (${XRAY_TOP_FIELDS_JSON}) as \$known | ({log: \$c.log, api: \$c.api, dns: \$c.dns, routing: \$c.routing, policy: \$c.policy, inbounds: \$c.inbounds, outbounds: \$c.outbounds, stats: \$c.stats, fakedns: \$c.fakedns, metrics: \$c.metrics, observatory: \$c.observatory, burstObservatory: \$c.burstObservatory, geodata: \$c.geodata, version: \$c.version} | with_entries(select(.value != null))) as \$ordered | (\$c | to_entries | map(select(.key as \$k | \$known | index(\$k) | not)) | from_entries) as \$extra | \$ordered + \$extra"
+    local reorder="| . as \$c | (${XRAY_TOP_FIELDS_JSON}) as \$known | (reduce \$known[] as \$k ({}; .[\$k] = \$c[\$k]) | with_entries(select(.value != null))) as \$ordered | (\$c | to_entries | map(select(.key as \$k | \$known | index(\$k) | not)) | from_entries) as \$extra | \$ordered + \$extra"
     local combined="${user_filter} ${reorder}"
     # 构建参数列表: 去掉最后一个(filter), 追加合并后的 filter
     local args=("${@:1:$#-1}" "${combined}")
@@ -423,6 +423,11 @@ _mutate_config() {
     else
         _error "xray 启动失败,回滚配置"
         _restore_config
+        if _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null; then
+            _warn "已回滚到旧配置并重启"
+        else
+            _error "回滚后 xray 仍启动失败,请手动检查"
+        fi
         return 1
     fi
 }
@@ -1977,8 +1982,8 @@ _remove_node_from_yaml_by_name() {
     local name="$1"
     [ -f "$CLASH_YAML" ] || return
     local tmp; tmp=$(mktemp)
-    # 精确匹配 name 字段: name: "name" 或 name: name (避免子串误删)
-    grep -v "name:.*\"${name}\"" "$CLASH_YAML" > "$tmp" 2>/dev/null
+    # 固定字符串匹配 name: "name" 含闭合引号(避免子串误删/正则转义)
+    grep -vF "name: \"${name}\"" "$CLASH_YAML" > "$tmp" 2>/dev/null
     mv -f "$tmp" "$CLASH_YAML"
 }
 

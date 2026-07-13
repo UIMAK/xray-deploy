@@ -712,10 +712,12 @@ _reality_domain_menu() {
         _warn "域名切换将仅更新 Reality inbound, 不会更新 tunnel inbound 和路由规则"
         read -rp "  继续? [y/N]: " ans
         case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; continue ;; esac
+        new_tunnel_tag=""
+    else
+        tunnel_port=$(jq -r '.tunnel_port' "$meta")
+        node_port=$(jq -r '.port' "$meta")
+        new_tunnel_tag="Tunnel-${new_sni}-${tunnel_port}-${node_port}"
     fi
-    tunnel_port=$(jq -r '.tunnel_port' "$meta")
-    node_port=$(jq -r '.port' "$meta")
-    new_tunnel_tag="Tunnel-${new_sni}-${tunnel_port}-${node_port}"
     if [ -n "$pq_seed" ]; then
         if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
              --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
@@ -759,8 +761,13 @@ _reality_domain_menu() {
     fi
 
     # 更新元数据 + 分享链接
-    jq --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" \
-      '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    if [ -n "$new_tunnel_tag" ]; then
+        jq --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" \
+          '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    else
+        jq --arg sni "$new_sni" --arg pqv "$pq_verify" \
+          '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    fi
     local newlink; newlink=$(_rebuild_reality_link "$meta")
     jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
 
