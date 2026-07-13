@@ -217,9 +217,11 @@ _state_set() {
 # ---------------------------------------------------------------------------
 _backup_config() {
     [ -f "$CONFIG_FILE" ] || return 0
-    mkdir -p "$BACKUP_DIR"
-    local tmp; tmp=$(mktemp "${BACKUP_DIR}/config.json.XXXXXX.bak") && cp -f "$CONFIG_FILE" "$tmp" 2>/dev/null
-    cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null
+    mkdir -p "$BACKUP_DIR" || return 1
+    local tmp
+    tmp=$(mktemp "${BACKUP_DIR}/config.json.XXXXXX.bak") || return 1
+    cp -f "$CONFIG_FILE" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null || return 1
 }
 
 _restore_config() {

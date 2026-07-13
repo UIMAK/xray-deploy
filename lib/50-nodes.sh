@@ -396,7 +396,10 @@ _render_template() {
 # 所有 config 修改应通过此函数, 不再各自实现 backup/test/rollback
 # ---------------------------------------------------------------------------
 _mutate_config() {
-    _backup_config
+    if ! _backup_config; then
+        _error "配置备份失败,中止操作"
+        return 1
+    fi
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
     # 获取最后一个参数(用户 filter), 其余是 jq 选项
@@ -415,14 +418,21 @@ _mutate_config() {
     mv -f "$tmp" "$CONFIG_FILE"
     if ! _xray_test_config; then
         _error "配置校验失败,回滚"
-        _restore_config
+        if _restore_config; then
+            _warn "已回滚到旧配置"
+        else
+            _error "回滚失败(config.json.lastbak 不存在或恢复出错)"
+        fi
         return 1
     fi
     if _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null; then
         return 0
     else
         _error "xray 启动失败,回滚配置"
-        _restore_config
+        if ! _restore_config; then
+            _error "回滚失败(config.json.lastbak 不存在或恢复出错),未尝试重启"
+            return 1
+        fi
         if _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null; then
             _warn "已回滚到旧配置并重启"
         else
