@@ -194,7 +194,8 @@ _cf_write_service_line() {
     esac
     [ -f "$svcfile" ] || { _error "service 文件不存在: $svcfile"; return 1; }
     if [ "$INIT_SYSTEM" = "openrc" ]; then
-        _svc_replace_line "$svcfile" "command_args=" "command_args=\"$cmd\""
+        local args="${cmd#$CF_BIN }"
+        _svc_replace_line "$svcfile" "command_args=" "command_args=\"$args\""
     else
         _svc_replace_line "$svcfile" "ExecStart=" "ExecStart=$cmd"
         systemctl daemon-reload
