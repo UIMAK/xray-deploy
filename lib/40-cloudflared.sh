@@ -556,7 +556,7 @@ _cloudflared_menu() {
         echo -e "  ${GREEN}[0]${NC} 返回"
         read -rp "  请选择: " choice
         case "$choice" in
-            1) [ "$installed" = "yes" ] && _cf_switch_token || _install_cloudflared ;;
+            1) if [ "$installed" = "yes" ]; then _cf_switch_token; else _install_cloudflared; fi ;;
             2) _cf_toggle autoupdate ;;
             3) _cf_toggle http2 ;;
             4) _cf_toggle ipv6 ;;

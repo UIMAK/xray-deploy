@@ -29,7 +29,7 @@ _xray_fetch_tag() {
     local channel="$1" body tag
     case "$channel" in
         stable)
-            body=$(curl -sL --max-time 20 "$XRAY_REPO_API/latest" 2>/dev/null) \
+            body=$(curl -fsSL --max-time 20 "$XRAY_REPO_API/latest" 2>/dev/null) \
                 || body=$(wget -qO- --timeout=20 "$XRAY_REPO_API/latest" 2>/dev/null)
             [ -z "$body" ] && return 1
             # 优先 jq; 兜底 BRE grep(busybox 稳)
@@ -237,7 +237,7 @@ _install_or_switch_xray() {
     _init_config_if_empty
     _create_xray_service
 
-    # 直接启动, init.d 的 checkconfig()+start_pre() 会在服务启动时校验配置
+    # 直接启动 — OpenRC init.d 已移除 checkconfig()+start_pre()(避免低内存 OOM)
     # 不在此处做 xray -test(低内存机器 OOM, 且各 commit_inbound 已有校验)
     if [ -n "$cur" ]; then
         _manage_xray restart

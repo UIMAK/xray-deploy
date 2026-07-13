@@ -132,18 +132,22 @@ _hy2_add_hop_rules() {
     done
 }
 
-# 删除多个范围的 DNAT 规则
+# 删除多个范围的 DNAT 规则(先查 iptables -S 找实际 rule spec 再 -D, 确保精准删除)
 _hy2_remove_hop_rules() {
     local hy2_port="$1"; shift
     local range
     for range in "$@"; do
-        iptables -t nat -D PREROUTING -p udp --dport "${range}" \
-            -m comment --comment "xray-deploy-hy2-hop" \
-            -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || true
+        local specs
+        specs=$(iptables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop" | grep "dport $range" | sed 's/^-A/-D/')
+        local line
+        while IFS= read -r line; do
+            [ -n "$line" ] && iptables -t nat $line 2>/dev/null || true
+        done <<< "$specs"
         if command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -t nat -D PREROUTING -p udp --dport "${range}" \
-                -m comment --comment "xray-deploy-hy2-hop" \
-                -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || true
+            specs=$(ip6tables -t nat -S PREROUTING 2>/dev/null | grep "xray-deploy-hy2-hop" | grep "dport $range" | sed 's/^-A/-D/')
+            while IFS= read -r line; do
+                [ -n "$line" ] && ip6tables -t nat $line 2>/dev/null || true
+            done <<< "$specs"
         fi
     done
 }
@@ -392,13 +396,16 @@ _render_template() {
 # 所有 config 修改应通过此函数, 不再各自实现 backup/test/rollback
 # ---------------------------------------------------------------------------
 _mutate_config() {
-    _backup_config
+    if ! _backup_config; then
+        _error "配置备份失败,中止操作"
+        return 1
+    fi
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
     # 获取最后一个参数(用户 filter), 其余是 jq 选项
     local user_filter="${!#}"
     # 应用 filter 后, 按官方字段顺序重排顶层字段(字段列表定义在 00-common XRAY_TOP_FIELDS_JSON)
-    local reorder="| . as \$c | {log: \$c.log, api: \$c.api, dns: \$c.dns, routing: \$c.routing, policy: \$c.policy, inbounds: \$c.inbounds, outbounds: \$c.outbounds, stats: \$c.stats, fakedns: \$c.fakedns, metrics: \$c.metrics, observatory: \$c.observatory, burstObservatory: \$c.burstObservatory, geodata: \$c.geodata, version: \$c.version} | with_entries(select(.value != null))"
+    local reorder="| . as \$c | (${XRAY_TOP_FIELDS_JSON}) as \$known | (reduce \$known[] as \$k ({}; .[\$k] = \$c[\$k]) | with_entries(select(.value != null))) as \$ordered | (\$c | to_entries | map(select(.key as \$k | \$known | index(\$k) | not)) | from_entries) as \$extra | \$ordered + \$extra"
     local combined="${user_filter} ${reorder}"
     # 构建参数列表: 去掉最后一个(filter), 追加合并后的 filter
     local args=("${@:1:$#-1}" "${combined}")
@@ -411,11 +418,28 @@ _mutate_config() {
     mv -f "$tmp" "$CONFIG_FILE"
     if ! _xray_test_config; then
         _error "配置校验失败,回滚"
-        _restore_config
+        if _restore_config; then
+            _warn "已回滚到旧配置"
+        else
+            _error "回滚失败(config.json.lastbak 不存在或恢复出错)"
+        fi
         return 1
     fi
-    _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null
-    return 0
+    if _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null; then
+        return 0
+    else
+        _error "xray 启动失败,回滚配置"
+        if ! _restore_config; then
+            _error "回滚失败(config.json.lastbak 不存在或恢复出错),未尝试重启"
+            return 1
+        fi
+        if _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null; then
+            _warn "已回滚到旧配置并重启"
+        else
+            _error "回滚后 xray 仍启动失败,请手动检查"
+        fi
+        return 1
+    fi
 }
 
 # 把渲染好的 inbound 加入 config.json
@@ -670,7 +694,7 @@ _detect_inbound_protocol() {
         esac
     elif [ "$proto" = "shadowsocks" ]; then
         echo "shadowsocks"
-    elif [ "$proto" = "hysteria2" ]; then
+    elif [ "$proto" = "hysteria" ]; then
         echo "hysteria2"
     else
         echo "$proto"
@@ -1629,7 +1653,7 @@ _delete_node() {
             y|Y) ;;
             *) _info "已取消"; _press_any_key; return ;;
         esac
-        if _mutate_config '.inbounds = [] | .routing.rules |= map(select(.inboundTag == null))'; then
+        if _mutate_config '.inbounds = [] | .routing.rules |= map(select(.inboundTag == null or (.inboundTag | type) == "array" and (.inboundTag | length) == 0))'; then
             # 清理所有端口跳跃 iptables 规则
             if command -v iptables >/dev/null 2>&1; then
                 for tag in "${tags[@]}"; do
@@ -1968,7 +1992,8 @@ _remove_node_from_yaml_by_name() {
     local name="$1"
     [ -f "$CLASH_YAML" ] || return
     local tmp; tmp=$(mktemp)
-    grep -vF "$name" "$CLASH_YAML" > "$tmp" 2>/dev/null
+    # 固定字符串匹配 name: "name" 含闭合引号(避免子串误删/正则转义)
+    grep -vF "name: \"${name}\"" "$CLASH_YAML" > "$tmp" 2>/dev/null
     mv -f "$tmp" "$CLASH_YAML"
 }
 
