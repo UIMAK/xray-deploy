@@ -91,10 +91,11 @@ _read_cf_state() {
         *)       svcfile="$CF_UNIT_SYSTEMD" ;;
     esac
     [ -f "$svcfile" ] || return 1
-    # 收集所有可能的启动行(command_args/command/supervise_daemon_args/ExecStart/cmd/SysV start块)
+    # 收集所有可能的启动行(先去行首空白, 兼容缩进)
     local lines="" ln
     while IFS= read -r ln || [ -n "$ln" ]; do
-        case "$ln" in
+        local t="${ln#"${ln%%[![:space:]]*}"}"
+        case "$t" in
             command_args=*|command=*|supervise_daemon_args=*|ExecStart=*|start\)|cmd=*)
                 lines="$lines
 $ln" ;;
@@ -166,17 +167,23 @@ _cf_build_cmdline() {
 #       _cf_replace_token_in_service <oldtoken> <newtoken>  (只换 token, 保留原参数)
 # ---------------------------------------------------------------------------
 # 通用: 逐行读 service 文件, 替换匹配行, 写回(保留原文件权限)
+# 兼容缩进: 匹配前先去除行首空白; 未匹配到任何行时返回 1
 _svc_replace_line() {
-    local svcfile="$1" pattern="$2" newline="$3" tmp
+    local svcfile="$1" pattern="$2" newline="$3" tmp found=0
     [ -f "$svcfile" ] || return 1
     cp -f "$svcfile" "${svcfile}.bak"
     tmp=$(mktemp)
     while IFS= read -r ln || [ -n "$ln" ]; do
-        case "$ln" in
-            "$pattern"*) printf '%s\n' "$newline" >> "$tmp" ;;
+        local t="${ln#"${ln%%[![:space:]]*}"}"
+        case "$t" in
+            "$pattern"*) printf '%s\n' "$newline" >> "$tmp"; found=1 ;;
             *) printf '%s\n' "$ln" >> "$tmp" ;;
         esac
     done < "$svcfile"
+    if [ "$found" -eq 0 ]; then
+        rm -f "$tmp"
+        return 1
+    fi
     # 用 cat 保内容 + 原文件保留(避免 mktemp 无执行位的问题): 先覆盖内容, 再恢复权限
     [ -s "$tmp" ] && cat "$tmp" > "$svcfile"
     rm -f "$tmp"
@@ -195,16 +202,17 @@ _cf_write_service_line() {
     [ -f "$svcfile" ] || { _error "service 文件不存在: $svcfile"; return 1; }
     if [ "$INIT_SYSTEM" = "openrc" ]; then
         if grep -q '^[[:space:]]*command_args=' "$svcfile" 2>/dev/null; then
-            local args="${cmd#$CF_BIN }"
-            _svc_replace_line "$svcfile" "command_args=" "command_args=\"$args\""
+            local prefix="$CF_BIN "
+            local args="${cmd#$prefix}"
+            _svc_replace_line "$svcfile" "command_args=" "command_args=\"$args\"" || return 1
         elif grep -q '^[[:space:]]*cmd=' "$svcfile" 2>/dev/null; then
-            _svc_replace_line "$svcfile" "cmd=" "cmd=\"$cmd\""
+            _svc_replace_line "$svcfile" "cmd=" "cmd=\"$cmd\"" || return 1
         else
             _error "无法在 $svcfile 中找到 command_args= 或 cmd= 行"
             return 1
         fi
     else
-        _svc_replace_line "$svcfile" "ExecStart=" "ExecStart=$cmd"
+        _svc_replace_line "$svcfile" "ExecStart=" "ExecStart=$cmd" || return 1
         systemctl daemon-reload
     fi
     return 0
