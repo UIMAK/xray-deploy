@@ -91,11 +91,11 @@ _read_cf_state() {
         *)       svcfile="$CF_UNIT_SYSTEMD" ;;
     esac
     [ -f "$svcfile" ] || return 1
-    # 收集所有可能的启动行(command_args / command / supervise_daemon_args / ExecStart)
+    # 收集所有可能的启动行(command_args/command/supervise_daemon_args/ExecStart/cmd/SysV start块)
     local lines="" ln
     while IFS= read -r ln || [ -n "$ln" ]; do
         case "$ln" in
-            command_args=*|command=*|supervise_daemon_args=*|ExecStart=*|start\))
+            command_args=*|command=*|supervise_daemon_args=*|ExecStart=*|start\)|cmd=*)
                 lines="$lines
 $ln" ;;
         esac
@@ -194,8 +194,15 @@ _cf_write_service_line() {
     esac
     [ -f "$svcfile" ] || { _error "service 文件不存在: $svcfile"; return 1; }
     if [ "$INIT_SYSTEM" = "openrc" ]; then
-        local args="${cmd#$CF_BIN }"
-        _svc_replace_line "$svcfile" "command_args=" "command_args=\"$args\""
+        if grep -q '^[[:space:]]*command_args=' "$svcfile" 2>/dev/null; then
+            local args="${cmd#$CF_BIN }"
+            _svc_replace_line "$svcfile" "command_args=" "command_args=\"$args\""
+        elif grep -q '^[[:space:]]*cmd=' "$svcfile" 2>/dev/null; then
+            _svc_replace_line "$svcfile" "cmd=" "cmd=\"$cmd\""
+        else
+            _error "无法在 $svcfile 中找到 command_args= 或 cmd= 行"
+            return 1
+        fi
     else
         _svc_replace_line "$svcfile" "ExecStart=" "ExecStart=$cmd"
         systemctl daemon-reload
