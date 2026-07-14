@@ -1370,7 +1370,7 @@ _add_vless_ws_cdn() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=firefox&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560#$(_url_encode "$name")"
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=firefox&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
@@ -1754,7 +1754,7 @@ _rebuild_cdn_link() {
             link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${sni}&fp=${fp}&alpn=${alpn}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")"
             ;;
         vless-ws-cdn)
-            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${sni}&fp=${fp}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560"
+            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${sni}&fp=${fp}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=ws&host=${host}&path=$(_url_encode "${path}?ed=2560")"
             ;;
         *) echo ""; return 1 ;;
     esac
