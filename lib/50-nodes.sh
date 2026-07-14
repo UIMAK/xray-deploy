@@ -339,7 +339,7 @@ _render_template() {
     : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
     : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}"
     : "${R_TUNNEL_PORT:=}" "${R_TUNNEL_TAG:=}"
-    : "${R_FLOW:=}" "${R_DECRYPTION:=}" "${R_NETWORK:=}"
+    : "${R_FLOW:=}" "${R_DECRYPTION:=none}" "${R_NETWORK:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
 
@@ -681,7 +681,7 @@ _detect_inbound_protocol() {
                 # 检测 VLESS+ENC: 有 decryption 字段且 network=raw
                 local dec
                 dec=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.decryption // empty' "$CONFIG_FILE" 2>/dev/null)
-                if [ -n "$dec" ] && [ "$net" = "raw" ]; then
+                if [ -n "$dec" ] && [ "$dec" != "none" ] && [ "$net" = "raw" ]; then
                     echo "vless-enc"
                 else
                     case "$net" in
@@ -904,6 +904,10 @@ _add_vless_tcp_reality_vision() {
         pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
     fi
 
+    # 加密选项
+    if ! _prompt_encryption; then return 1; fi
+    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+
     local tag="xd-reality-vision-${port}"
     local tunnel_tag="Tunnel-${sni}-${tunnel_port}-${port}"
     local listen="::"
@@ -925,20 +929,37 @@ _add_vless_tcp_reality_vision() {
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=firefox&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    local enc_param
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        enc_param=$(_url_encode "$ENC_ENCRYPTION")
+    else
+        enc_param="none"
+    fi
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=firefox&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
-    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, network: tcp}"
+    local enc_clash=""
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        enc_clash=", \"vless-enc-opts\": {encryption: \"$ENC_ENCRYPTION\"}"
+    fi
+    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, network: tcp}"
     _add_node_to_yaml "$clash"
 
-    _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-tcp-reality-vision" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
         --arg sid "$REALITY_SHORT_ID" --arg pqv "$pq_verify" --arg link "$link" \
         --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link,tunnel_tag:$ttag,tunnel_port:$tport}')"
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link,tunnel_tag:$ttag,tunnel_port:$tport}')
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        meta_json=$(echo "$meta_json" | jq \
+            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
+            '. + {auth:$auth,decryption:$dec,encryption:$enc}')
+    fi
+    _save_node_meta "$tag" "$meta_json"
 
     _success "节点 [${name}] 创建成功"
     _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
@@ -976,6 +997,10 @@ _add_vless_xhttp_reality() {
         pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
     fi
 
+    # 加密选项
+    if ! _prompt_encryption; then return 1; fi
+    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+
     local tag="xd-reality-xhttp-${port}"
     local tunnel_tag="Tunnel-${sni}-${tunnel_port}-${port}"
     local listen="::"
@@ -995,20 +1020,37 @@ _add_vless_xhttp_reality() {
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=firefox&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+    local enc_param
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        enc_param=$(_url_encode "$ENC_ENCRYPTION")
+    else
+        enc_param="none"
+    fi
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=firefox&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
-    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, network: xhttp, tls: true, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, \"xhttp-opts\": {path: \"$path\"}}"
+    local enc_clash=""
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        enc_clash=", \"vless-enc-opts\": {encryption: \"$ENC_ENCRYPTION\"}"
+    fi
+    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, \"xhttp-opts\": {path: \"$path\"}}"
     _add_node_to_yaml "$clash"
 
-    _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-xhttp-reality" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
         --arg sid "$REALITY_SHORT_ID" --arg path "$path" --arg pqv "$pq_verify" --arg link "$link" \
         --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link,tunnel_tag:$ttag,tunnel_port:$tport}')"
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link,tunnel_tag:$ttag,tunnel_port:$tport}')
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        meta_json=$(echo "$meta_json" | jq \
+            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
+            '. + {auth:$auth,decryption:$dec,encryption:$enc}')
+    fi
+    _save_node_meta "$tag" "$meta_json"
 
     _success "节点 [${name}] 创建成功"
     _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
@@ -1096,6 +1138,34 @@ _generate_vless_enc_keys() {
         return 1
     fi
     _info "VLESS+ENC 密钥已生成 (decryption: ${VLESS_ENC_DECRYPTION:0:30}...)"
+}
+
+# VLESS 内置加密选项提示(供各 VLESS 变体复用)
+# 设置全局变量: ENC_ENABLED, ENC_AUTH, ENC_DECRYPTION, ENC_ENCRYPTION
+_prompt_encryption() {
+    local choice
+    echo ""
+    _info "VLESS 内置加密 (encryption):"
+    echo "  0) 不启用 (默认)"
+    echo "  1) X25519 (经典 ECDH, 兼容性最好)"
+    echo "  2) ML-KEM-768 (后量子, 需客户端 PQC 支持)"
+    read -rp "  请选择(0-2, 默认 0): " choice
+    ENC_ENABLED=0
+    case "${choice:-0}" in
+        1)
+            if ! _generate_vless_enc_keys x25519; then return 1; fi
+            ENC_ENABLED=1; ENC_AUTH="x25519"
+            ENC_DECRYPTION="$VLESS_ENC_DECRYPTION"
+            ENC_ENCRYPTION="$VLESS_ENC_ENCRYPTION"
+            ;;
+        2)
+            if ! _generate_vless_enc_keys mlkem768; then return 1; fi
+            ENC_ENABLED=1; ENC_AUTH="mlkem768"
+            ENC_DECRYPTION="$VLESS_ENC_DECRYPTION"
+            ENC_ENCRYPTION="$VLESS_ENC_ENCRYPTION"
+            ;;
+    esac
+    return 0
 }
 
 _add_vless_enc() {
@@ -1201,6 +1271,11 @@ _add_vless_xhttp_cdn() {
     name=${name:-$default_name}
 
     local uuid; uuid=$(_gen_uuid) || return 1
+
+    # 加密选项
+    if ! _prompt_encryption; then return 1; fi
+    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+
     local tag="xd-xhttp-cdn-${port}"
     local listen="::"
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_HOST="$host"
@@ -1210,18 +1285,35 @@ _add_vless_xhttp_cdn() {
 
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=none&security=tls&sni=${host}&fp=firefox&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
-    local clash="- {name: \"$name\", type: vless, server: $preferred_addr, port: $preferred_port, uuid: $uuid, tls: true, servername: $host, \"client-fingerprint\": firefox, network: xhttp, \"xhttp-opts\": {path: \"$path\", host: $host}}"
+    local enc_param
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        enc_param=$(_url_encode "$ENC_ENCRYPTION")
+    else
+        enc_param="none"
+    fi
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=firefox&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    local enc_clash=""
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        enc_clash=", \"vless-enc-opts\": {encryption: \"$ENC_ENCRYPTION\"}"
+    fi
+    local clash="- {name: \"$name\", type: vless, server: $preferred_addr, port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: $host, \"client-fingerprint\": firefox, network: xhttp, \"xhttp-opts\": {path: \"$path\", host: $host}}"
     _add_node_to_yaml "$clash"
 
-    _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-xhttp-cdn" \
         --argjson port "$port" --arg listen "$listen" \
         --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
         --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
         --arg sni "$host" --arg fp "firefox" --arg alpn "h2" \
         --arg insecure "0" --arg allowInsecure "0" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')"
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        meta_json=$(echo "$meta_json" | jq \
+            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
+            '. + {auth:$auth,decryption:$dec,encryption:$enc}')
+    fi
+    _save_node_meta "$tag" "$meta_json"
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -1258,6 +1350,11 @@ _add_vless_ws_cdn() {
     name=${name:-$default_name}
 
     local uuid; uuid=$(_gen_uuid) || return 1
+
+    # 加密选项
+    if ! _prompt_encryption; then return 1; fi
+    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+
     local tag="xd-ws-cdn-${port}"
     local listen="::"
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_HOST="$host"
@@ -1267,18 +1364,35 @@ _add_vless_ws_cdn() {
 
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=none&security=tls&sni=${host}&fp=firefox&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560#$(_url_encode "$name")"
-    local clash="- {name: \"$name\", type: vless, server: $preferred_addr, port: $preferred_port, uuid: $uuid, tls: true, servername: $host, \"client-fingerprint\": firefox, network: ws, \"ws-opts\": {path: \"$path\", headers: {Host: $host}}}"
+    local enc_param
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        enc_param=$(_url_encode "$ENC_ENCRYPTION")
+    else
+        enc_param="none"
+    fi
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=firefox&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560#$(_url_encode "$name")"
+    local enc_clash=""
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        enc_clash=", \"vless-enc-opts\": {encryption: \"$ENC_ENCRYPTION\"}"
+    fi
+    local clash="- {name: \"$name\", type: vless, server: $preferred_addr, port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: $host, \"client-fingerprint\": firefox, network: ws, \"ws-opts\": {path: \"$path\", headers: {Host: $host}}}"
     _add_node_to_yaml "$clash"
 
-    _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-ws-cdn" \
         --argjson port "$port" --arg listen "$listen" \
         --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
         --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
         --arg sni "$host" --arg fp "firefox" \
         --arg insecure "0" --arg allowInsecure "0" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')"
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        meta_json=$(echo "$meta_json" | jq \
+            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
+            '. + {auth:$auth,decryption:$dec,encryption:$enc}')
+    fi
+    _save_node_meta "$tag" "$meta_json"
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -1564,19 +1678,46 @@ _rebuild_reality_link() {
     pqv=$(jq -r '.mldsa65_verify // empty' "$meta")
     name=$(jq -r '.name' "$meta")
     path=$(jq -r '.path // empty' "$meta")
+    local enc; enc=$(jq -r '.encryption // "none"' "$meta")
+    local enc_param
+    if [ "$enc" != "none" ] && [ -n "$enc" ]; then
+        enc_param=$(_url_encode "$enc")
+    else
+        enc_param="none"
+    fi
     local link_ip="$host"
     [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
     local link
     case "$proto" in
         vless-tcp-reality-vision)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=firefox&pbk=$(_url_encode "$pk")&sid=${sid}"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=firefox&pbk=$(_url_encode "$pk")&sid=${sid}"
             ;;
         vless-xhttp-reality)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=firefox&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=firefox&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
             ;;
         *) echo ""; return 1 ;;
     esac
     [ -n "$pqv" ] && link="${link}&pqv=${pqv}"
+    link="${link}#$(_url_encode "$name")"
+    echo "$link"
+}
+
+# 重建 vless-enc:// 分享链接(从元数据读参数)
+# 用法:_rebuild_vless_enc_link <meta_file>
+_rebuild_vless_enc_link() {
+    local meta="$1"
+    local uuid host port flow enc name
+    uuid=$(jq -r '.uuid' "$meta")
+    host=$(jq -r '.link_addr' "$meta")
+    port=$(jq -r '.port' "$meta")
+    flow=$(jq -r '.flow // empty' "$meta")
+    enc=$(jq -r '.encryption // empty' "$meta")
+    name=$(jq -r '.name' "$meta")
+    local link_ip="$host"
+    [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
+    local enc_encoded; enc_encoded=$(_url_encode "$enc")
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_encoded}&security=none&type=raw"
+    [ -n "$flow" ] && link="${link}&flow=${flow}"
     link="${link}#$(_url_encode "$name")"
     echo "$link"
 }
@@ -1598,15 +1739,22 @@ _rebuild_cdn_link() {
     alpn=$(jq -r '.alpn // "h2"' "$meta")
     insecure=$(jq -r '.insecure // "0"' "$meta")
     allowInsecure=$(jq -r '.allowInsecure // "0"' "$meta")
+    local enc; enc=$(jq -r '.encryption // "none"' "$meta")
+    local enc_param
+    if [ "$enc" != "none" ] && [ -n "$enc" ]; then
+        enc_param=$(_url_encode "$enc")
+    else
+        enc_param="none"
+    fi
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
     local link
     case "$proto" in
         vless-xhttp-cdn)
-            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=none&security=tls&sni=${sni}&fp=${fp}&alpn=${alpn}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")"
+            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${sni}&fp=${fp}&alpn=${alpn}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")"
             ;;
         vless-ws-cdn)
-            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=none&security=tls&sni=${sni}&fp=${fp}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560"
+            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${sni}&fp=${fp}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560"
             ;;
         *) echo ""; return 1 ;;
     esac
@@ -1886,6 +2034,7 @@ _modify_port() {
     case "$proto" in
         hysteria2) newlink=$(_rebuild_hy2_link "$meta") ;;
         vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$meta") ;;
+        vless-enc) newlink=$(_rebuild_vless_enc_link "$meta") ;;
         vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$meta") ;;
         *)
             # 其他协议: @ 锚定分割确保只替换 host:port 段(不误伤 path/sni/name)
