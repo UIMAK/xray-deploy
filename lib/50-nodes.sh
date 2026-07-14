@@ -1190,7 +1190,7 @@ _add_vless_xhttp_cdn() {
     local preferred_port
     read -rp "  优选端口(默认 443): " preferred_port
     preferred_port=${preferred_port:-443}
-    [[ "$preferred_port" =~ ^[0-9]+$ ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
+    [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
 
     local path=$(_gen_rand_path)
     read -rp "  XHTTP path (默认 ${path}): " custom_path
@@ -1247,7 +1247,7 @@ _add_vless_ws_cdn() {
     local preferred_port
     read -rp "  优选端口(默认 443): " preferred_port
     preferred_port=${preferred_port:-443}
-    [[ "$preferred_port" =~ ^[0-9]+$ ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
+    [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
 
     local path=$(_gen_rand_path)
     read -rp "  WS path (默认 ${path}): " custom_path
@@ -1595,7 +1595,7 @@ _rebuild_cdn_link() {
     preferred_port=$(jq -r '.preferred_port // "443"' "$meta")
     sni=$(jq -r '.sni // .host' "$meta")
     fp=$(jq -r '.fp // "firefox"' "$meta")
-    alpn=$(jq -r '.alpn // empty' "$meta")
+    alpn=$(jq -r '.alpn // "h2"' "$meta")
     insecure=$(jq -r '.insecure // "0"' "$meta")
     allowInsecure=$(jq -r '.allowInsecure // "0"' "$meta")
     local link_ip="$preferred_addr"
