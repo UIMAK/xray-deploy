@@ -9,7 +9,7 @@
                 "id": "{{UUID}}"
             }
         ],
-        "decryption": "none"
+        "decryption": "{{DECRYPTION}}"
     },
     "streamSettings": {
         "network": "xhttp",
