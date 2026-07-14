@@ -925,11 +925,11 @@ _add_vless_tcp_reality_vision() {
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=firefox&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
-    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": chrome, network: tcp}"
+    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, network: tcp}"
     _add_node_to_yaml "$clash"
 
     _save_node_meta "$tag" "$(jq -n \
@@ -995,11 +995,11 @@ _add_vless_xhttp_reality() {
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=firefox&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
-    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, network: xhttp, tls: true, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$path\"}}"
+    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, network: xhttp, tls: true, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, \"xhttp-opts\": {path: \"$path\"}}"
     _add_node_to_yaml "$clash"
 
     _save_node_meta "$tag" "$(jq -n \
@@ -1182,6 +1182,16 @@ _add_vless_xhttp_cdn() {
     local host
     read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
     [ -z "$host" ] && { _warn "CDN 协议必须填域名"; return 1; }
+
+    local preferred_addr
+    read -rp "  优选域名/IP(分享链接使用, 默认 ${host}): " preferred_addr
+    preferred_addr=${preferred_addr:-$host}
+
+    local preferred_port
+    read -rp "  优选端口(默认 443): " preferred_port
+    preferred_port=${preferred_port:-443}
+    [[ "$preferred_port" =~ ^[0-9]+$ ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
+
     local path=$(_gen_rand_path)
     read -rp "  XHTTP path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
@@ -1198,16 +1208,20 @@ _add_vless_xhttp_cdn() {
     inbound=$(_render_template "$(_tpl_path vless-xhttp-cdn)") || return 1
     _commit_inbound "$inbound" || return 1
 
-    # 链接服务器地址 = CDN 域名(必须)
-    local link="vless://${uuid}@${host}:${port}?encryption=none&security=none&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
-    local clash="- {name: \"$name\", type: vless, server: $host, port: $port, uuid: $uuid, network: xhttp, \"xhttp-opts\": {path: \"$path\", host: $host}}"
+    local link_ip="$preferred_addr"
+    [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=none&security=tls&sni=${host}&fp=firefox&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    local clash="- {name: \"$name\", type: vless, server: $preferred_addr, port: $preferred_port, uuid: $uuid, tls: true, servername: $host, \"client-fingerprint\": firefox, network: xhttp, \"xhttp-opts\": {path: \"$path\", host: $host}}"
     _add_node_to_yaml "$clash"
 
     _save_node_meta "$tag" "$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-xhttp-cdn" \
-        --argjson port "$port" --arg listen "$listen" --arg host "$host" \
-        --arg uuid "$uuid" --arg path "$path" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$host,uuid:$uuid,host:$host,path:$path,share_link:$link}')"
+        --argjson port "$port" --arg listen "$listen" \
+        --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
+        --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
+        --arg sni "$host" --arg fp "firefox" --arg alpn "h2" \
+        --arg insecure "0" --arg allowInsecure "0" --arg link "$link" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')"
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -1225,6 +1239,16 @@ _add_vless_ws_cdn() {
     local host
     read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
     [ -z "$host" ] && { _warn "CDN 协议必须填域名"; return 1; }
+
+    local preferred_addr
+    read -rp "  优选域名/IP(分享链接使用, 默认 ${host}): " preferred_addr
+    preferred_addr=${preferred_addr:-$host}
+
+    local preferred_port
+    read -rp "  优选端口(默认 443): " preferred_port
+    preferred_port=${preferred_port:-443}
+    [[ "$preferred_port" =~ ^[0-9]+$ ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
+
     local path=$(_gen_rand_path)
     read -rp "  WS path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
@@ -1241,15 +1265,20 @@ _add_vless_ws_cdn() {
     inbound=$(_render_template "$(_tpl_path vless-ws-cdn)") || return 1
     _commit_inbound "$inbound" || return 1
 
-    local link="vless://${uuid}@${host}:${port}?encryption=none&security=none&type=ws&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
-    local clash="- {name: \"$name\", type: vless, server: $host, port: $port, uuid: $uuid, network: ws, \"ws-opts\": {path: \"$path\", headers: {Host: $host}}}"
+    local link_ip="$preferred_addr"
+    [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=none&security=tls&sni=${host}&fp=firefox&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560#$(_url_encode "$name")"
+    local clash="- {name: \"$name\", type: vless, server: $preferred_addr, port: $preferred_port, uuid: $uuid, tls: true, servername: $host, \"client-fingerprint\": firefox, network: ws, \"ws-opts\": {path: \"$path\", headers: {Host: $host}}}"
     _add_node_to_yaml "$clash"
 
     _save_node_meta "$tag" "$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-ws-cdn" \
-        --argjson port "$port" --arg listen "$listen" --arg host "$host" \
-        --arg uuid "$uuid" --arg path "$path" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$host,uuid:$uuid,host:$host,path:$path,share_link:$link}')"
+        --argjson port "$port" --arg listen "$listen" \
+        --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
+        --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
+        --arg sni "$host" --arg fp "firefox" \
+        --arg insecure "0" --arg allowInsecure "0" --arg link "$link" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')"
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -1540,14 +1569,47 @@ _rebuild_reality_link() {
     local link
     case "$proto" in
         vless-tcp-reality-vision)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=firefox&pbk=$(_url_encode "$pk")&sid=${sid}"
             ;;
         vless-xhttp-reality)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=firefox&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
             ;;
         *) echo ""; return 1 ;;
     esac
     [ -n "$pqv" ] && link="${link}&pqv=${pqv}"
+    link="${link}#$(_url_encode "$name")"
+    echo "$link"
+}
+
+# 重建 CDN 节点分享链接(从元数据读参数)
+# 用法:_rebuild_cdn_link <meta_file>
+_rebuild_cdn_link() {
+    local meta="$1"
+    local uuid host path name proto preferred_addr preferred_port sni fp alpn insecure allowInsecure
+    uuid=$(jq -r '.uuid' "$meta")
+    host=$(jq -r '.host' "$meta")
+    path=$(jq -r '.path // empty' "$meta")
+    name=$(jq -r '.name' "$meta")
+    proto=$(jq -r '.protocol' "$meta")
+    preferred_addr=$(jq -r '.preferred_addr // .host' "$meta")
+    preferred_port=$(jq -r '.preferred_port // "443"' "$meta")
+    sni=$(jq -r '.sni // .host' "$meta")
+    fp=$(jq -r '.fp // "firefox"' "$meta")
+    alpn=$(jq -r '.alpn // empty' "$meta")
+    insecure=$(jq -r '.insecure // "0"' "$meta")
+    allowInsecure=$(jq -r '.allowInsecure // "0"' "$meta")
+    local link_ip="$preferred_addr"
+    [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
+    local link
+    case "$proto" in
+        vless-xhttp-cdn)
+            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=none&security=tls&sni=${sni}&fp=${fp}&alpn=${alpn}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")"
+            ;;
+        vless-ws-cdn)
+            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=none&security=tls&sni=${sni}&fp=${fp}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560"
+            ;;
+        *) echo ""; return 1 ;;
+    esac
     link="${link}#$(_url_encode "$name")"
     echo "$link"
 }
@@ -1824,6 +1886,7 @@ _modify_port() {
     case "$proto" in
         hysteria2) newlink=$(_rebuild_hy2_link "$meta") ;;
         vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$meta") ;;
+        vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$meta") ;;
         *)
             # 其他协议: @ 锚定分割确保只替换 host:port 段(不误伤 path/sni/name)
             local oldlink; oldlink=$(jq -r '.share_link' "$meta")
