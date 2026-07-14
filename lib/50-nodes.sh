@@ -1150,7 +1150,7 @@ _prompt_encryption() {
     echo "  1) X25519 (经典 ECDH, 兼容性最好)"
     echo "  2) ML-KEM-768 (后量子, 需客户端 PQC 支持)"
     read -rp "  请选择(0-2, 默认 0): " choice
-    ENC_ENABLED=0
+    ENC_ENABLED=0; ENC_AUTH=""; ENC_DECRYPTION=""; ENC_ENCRYPTION=""
     case "${choice:-0}" in
         1)
             if ! _generate_vless_enc_keys x25519; then return 1; fi
