@@ -941,7 +941,7 @@ _add_vless_tcp_reality_vision() {
 
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_clash=", \"vless-enc-opts\": {encryption: \"$ENC_ENCRYPTION\"}"
+        enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
     local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, network: tcp}"
     _add_node_to_yaml "$clash"
@@ -1032,7 +1032,7 @@ _add_vless_xhttp_reality() {
 
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_clash=", \"vless-enc-opts\": {encryption: \"$ENC_ENCRYPTION\"}"
+        enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
     local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: $sni, \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, \"xhttp-opts\": {path: \"$path\"}}"
     _add_node_to_yaml "$clash"
@@ -1217,7 +1217,7 @@ _add_vless_enc() {
     # clash yaml (Clash Meta / mihomo 格式)
     local clash_flow=""
     [ -n "$flow" ] && clash_flow=", flow: ${flow}"
-    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, network: tcp, tls: false, \"vless-enc-opts\": {encryption: \"$VLESS_ENC_ENCRYPTION\"}${clash_flow}}"
+    local clash="- {name: \"$name\", type: vless, server: $addr, port: $port, uuid: $uuid, encryption: \"$VLESS_ENC_ENCRYPTION\", network: tcp, tls: false${clash_flow}}"
     _add_node_to_yaml "$clash"
 
     _save_node_meta "$tag" "$(jq -n \
@@ -1294,7 +1294,7 @@ _add_vless_xhttp_cdn() {
     local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=firefox&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_clash=", \"vless-enc-opts\": {encryption: \"$ENC_ENCRYPTION\"}"
+        enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
     local clash="- {name: \"$name\", type: vless, server: $preferred_addr, port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: $host, \"client-fingerprint\": firefox, network: xhttp, \"xhttp-opts\": {path: \"$path\", host: $host}}"
     _add_node_to_yaml "$clash"
@@ -1373,7 +1373,7 @@ _add_vless_ws_cdn() {
     local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=firefox&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "$path")?ed=2560#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_clash=", \"vless-enc-opts\": {encryption: \"$ENC_ENCRYPTION\"}"
+        enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
     local clash="- {name: \"$name\", type: vless, server: $preferred_addr, port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: $host, \"client-fingerprint\": firefox, network: ws, \"ws-opts\": {path: \"$path\", headers: {Host: $host}}}"
     _add_node_to_yaml "$clash"
@@ -1711,7 +1711,7 @@ _rebuild_vless_enc_link() {
     host=$(jq -r '.link_addr' "$meta")
     port=$(jq -r '.port' "$meta")
     flow=$(jq -r '.flow // empty' "$meta")
-    enc=$(jq -r '.encryption // empty' "$meta")
+    enc=$(jq -r '.encryption // "none"' "$meta")
     name=$(jq -r '.name' "$meta")
     local link_ip="$host"
     [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
