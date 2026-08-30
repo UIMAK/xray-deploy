@@ -85,7 +85,7 @@ _pkg_install() {
 
 # ---------------------------------------------------------------------------
 # 检查并安装基础依赖(jq curl wget unzip)
-# 首次进菜单时调用
+# 每次启动轻量探测(command -v), 仅缺依赖时安装; 安装后复核, 返回真实成败
 # ---------------------------------------------------------------------------
 _ensure_base_deps() {
     local missing=()
@@ -96,12 +96,20 @@ _ensure_base_deps() {
     # tar/cron 通常自带,不强制
     if [ "${#missing[@]}" -gt 0 ]; then
         _pkg_install "${missing[@]}" || return 1
+        local still=()
+        for c in "${missing[@]}"; do
+            command -v "$c" >/dev/null 2>&1 || still+=("$c")
+        done
+        if [ "${#still[@]}" -gt 0 ]; then
+            _error "依赖安装后仍缺失: ${still[*]}"
+            return 1
+        fi
     fi
-    # cron 守护(Alpine 的 busybox crond 通常已有;Debian 有 cron)
+    # cron 守护(Alpine 的 busybox crond 通常已有;Debian 有 cron) — best-effort, 失败不阻断
     if ! command -v crontab >/dev/null 2>&1; then
         case "$(_detect_os_family)" in
-            alpine) _pkg_install busybox-suid >/dev/null 2>&1 ;;
-            debian) _pkg_install cron >/dev/null 2>&1
+            alpine) _pkg_install busybox-suid >/dev/null 2>&1 || _warn "crontab 安装失败, 定时任务不可用" ;;
+            debian) _pkg_install cron >/dev/null 2>&1 || _warn "crontab 安装失败, 定时任务不可用"
                     # 确保 cron 服务运行
                     systemctl enable --now cron 2>/dev/null || true
                     ;;
