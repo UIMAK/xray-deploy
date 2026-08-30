@@ -36,18 +36,15 @@ LIB_DIR="$SCRIPT_DIR/lib"
 . "$LIB_DIR/90-menu.sh"
 
 # ---------------------------------------------------------------------------
-# 初始化(每次启动做轻量探测, 不重复装依赖)
+# 初始化(每次启动轻量探测, 仅缺依赖时安装)
 # ---------------------------------------------------------------------------
 _init_runtime() {
     _check_root
     INIT_SYSTEM=$(_detect_init_system)
-    # 首次安装后标记存在才装依赖, 避免每次进菜单都检测
-    if [ ! -f "$STATE_DIR/initialized" ]; then
-        _ensure_base_deps 2>/dev/null || true
-        _ensure_dirs
-        _state_set initialized "1"
-    fi
     _ensure_dirs
+    if ! _ensure_base_deps; then
+        _warn "基础依赖安装失败, 部分功能可能不可用, 请检查网络或包管理"
+    fi
 }
 
 # ---------------------------------------------------------------------------
