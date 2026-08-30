@@ -2,9 +2,9 @@
 # =============================================================================
 # install.sh — xray-deploy 一键安装/更新入口
 # 用法:
-#   首次安装: bash <(curl -sL <raw_url>/install.sh)
-#   更新脚本: bash <(curl -sL <raw_url>/install.sh) --update
-#   更新(不启动菜单): bash <(curl -sL <raw_url>/install.sh) --no-start
+#   首次安装: bash <(curl -fsSL <raw_url>/install.sh || wget -qO- <raw_url>/install.sh)
+#   更新脚本: bash <(curl -fsSL <raw_url>/install.sh || wget -qO- <raw_url>/install.sh) --update
+#   更新(不启动菜单): bash <(curl -fsSL <raw_url>/install.sh || wget -qO- <raw_url>/install.sh) --no-start
 # =============================================================================
 
 set -u
