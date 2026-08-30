@@ -219,7 +219,8 @@ _backup_config() {
     [ -f "$CONFIG_FILE" ] || return 0
     mkdir -p "$BACKUP_DIR" || return 1
     local tmp
-    tmp=$(mktemp "${BACKUP_DIR}/config.json.XXXXXX.bak") || return 1
+    # 注意: busybox/musl 的 mktemp 要求模板以 XXXXXX 结尾, 后缀必须放在 X 之前(否则 EINVAL)
+    tmp=$(mktemp "${BACKUP_DIR}/config.json.bak.XXXXXX") || return 1
     cp -f "$CONFIG_FILE" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null || return 1
 }
