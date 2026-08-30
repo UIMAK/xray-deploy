@@ -490,6 +490,23 @@ _manage_xray() {
 }
 
 # ---------------------------------------------------------------------------
+# 重启 xray 并确认稳定运行(取代 _mutate_config 的预跑 xray -test)。
+# 低内存 VPS 上 xray -test 会与运行中的实例同时加载两份二进制+geo, 触发 OOM;
+# 改为重启后轮询 status(最多 5s), 坏配置/被 OOM 都进不了 running 态 → 返回 1 触发回滚。
+# ---------------------------------------------------------------------------
+_restart_xray_verified() {
+    _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null
+    local i
+    for i in 1 2 3 4 5; do
+        if [ "$(_manage_xray status 2>/dev/null)" = "running" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # 卸载 Xray(停服务 + 删 service + 删部署目录 + 清快捷命令 + 清 crontab)
 # ---------------------------------------------------------------------------
 _uninstall_xray() {

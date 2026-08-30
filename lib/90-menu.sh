@@ -414,7 +414,7 @@ _reset_config() {
     [ -f "$CLASH_YAML" ] && printf 'proxies:\n' > "$CLASH_YAML" 2>/dev/null
     # 重启 xray(若在跑)
     if [ -x "$XRAY_BIN" ]; then
-        if _xray_test_config 2>/dev/null && _manage_xray restart 2>/dev/null; then
+        if _restart_xray_verified; then
             _tip "xray 已使用新配置重启"
         else
             _warn "配置重置后 xray 重启失败, 请检查状态"

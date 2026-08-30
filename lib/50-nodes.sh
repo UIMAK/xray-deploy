@@ -416,30 +416,22 @@ _mutate_config() {
         rm -f "$tmp"; _error "生成的配置为空"; return 1
     fi
     mv -f "$tmp" "$CONFIG_FILE"
-    if ! _xray_test_config; then
-        _error "配置校验失败,回滚"
-        if _restore_config; then
-            _warn "已回滚到旧配置"
-        else
-            _error "回滚失败(config.json.lastbak 不存在或恢复出错)"
-        fi
-        return 1
-    fi
-    if _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null; then
-        return 0
-    else
+    # 低内存 VPS: 不再预跑 xray -test —— 它会与运行中的实例同时加载两份二进制+geo, 触发 OOM。
+    # 改为重启后校验服务是否稳定在运行态; 坏配置/被 OOM 都会导致启动失败并回滚旧配置。
+    if ! _restart_xray_verified; then
         _error "xray 启动失败,回滚配置"
         if ! _restore_config; then
             _error "回滚失败(config.json.lastbak 不存在或恢复出错),未尝试重启"
             return 1
         fi
-        if _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null; then
+        if _restart_xray_verified; then
             _warn "已回滚到旧配置并重启"
         else
             _error "回滚后 xray 仍启动失败,请手动检查"
         fi
         return 1
     fi
+    return 0
 }
 
 # 把渲染好的 inbound 加入 config.json
