@@ -5,16 +5,16 @@
 #   - 安装(架构自适应下载) / 卸载(彻底清) / 切换令牌
 #   - 安装走官方 `cloudflared service install <token>`, 不写 config.yml(路由在 CF Web 配)
 #   - 改参数/令牌 = 直接改 /etc/systemd/system/cloudflared.service 或 /etc/init.d/cloudflared 启动行
-#   - 3 开关: 自动更新(--autoupdate-freq 24h0m0s / --no-autoupdate)
-#             HTTP/2  (--protocol http2 / 不写)
-#             IPv6栈  (--edge-ip-version 6 / 不写)
+#   - 3 项设置: 自动更新 (--autoupdate-freq 24h0m0s / --no-autoupdate)
+#               HTTP/2   (--protocol http2 / 不写)
+#               协议栈   (--edge-ip-version 4|6|auto / 不写)
 #   - cloudflared 是唯一例外, 落官方默认点, 不收口 /opt/xray-deploy
 # ============================================================================
 
 # cloudflared 开关状态文件(持久化供手动查看, 运行时从 service 文件解析)
 CF_STATE_AUTOUPDATE="$STATE_DIR/cf_autoupdate"     # on|off
 CF_STATE_HTTP2="$STATE_DIR/cf_http2"               # on|off
-CF_STATE_IPV6="$STATE_DIR/cf_ipv6"                 # on|off
+CF_STATE_EDGE_IP="$STATE_DIR/cf_edge_ip"           # off|4|6|auto
 CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 安装时的 token
 
 # ---------------------------------------------------------------------------
@@ -80,10 +80,10 @@ _extract_token() {
 
 # ---------------------------------------------------------------------------
 # 读取当前 service 文件启动行, 解析出 token 与 3 开关状态
-# 输出全局: CF_CUR_TOKEN / CF_CUR_AUTOUPDATE / CF_CUR_HTTP2 / CF_CUR_IPV6
+# 输出全局: CF_CUR_TOKEN / CF_CUR_AUTOUPDATE / CF_CUR_HTTP2 / CF_CUR_EDGE_IP
 # ---------------------------------------------------------------------------
 _read_cf_state() {
-    CF_CUR_TOKEN=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_IPV6="off"; CF_CUR_RAWLINE=""
+    CF_CUR_TOKEN=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_RAWLINE=""
     local svcfile
     case "$INIT_SYSTEM" in
         systemd) svcfile="$CF_UNIT_SYSTEMD" ;;
@@ -138,13 +138,17 @@ $full"
     echo "$oneline" | grep -q -- '--no-autoupdate'      && CF_CUR_AUTOUPDATE="off"
     echo "$oneline" | grep -q -- '--autoupdate-freq'   && CF_CUR_AUTOUPDATE="on"
     echo "$oneline" | grep -q -- '--protocol http2'    && CF_CUR_HTTP2="on"
-    echo "$oneline" | grep -q -- '--edge-ip-version 6' && CF_CUR_IPV6="on"
+    # 协议栈: --edge-ip-version <4|6|auto>; 未写则 off
+    if   echo "$oneline" | grep -q -- '--edge-ip-version 4';    then CF_CUR_EDGE_IP="4";
+    elif echo "$oneline" | grep -q -- '--edge-ip-version 6';    then CF_CUR_EDGE_IP="6";
+    elif echo "$oneline" | grep -q -- '--edge-ip-version auto'; then CF_CUR_EDGE_IP="auto";
+    fi
 }
 
 # ---------------------------------------------------------------------------
 # 重组 cloudflared 启动命令行(按 3 开关 + token)
 # 用法:_cf_build_cmdline <token>
-# 读取全局 CF_AUTOUPDATE/CF_HTTP2/CF_IPV6
+# 读取全局 CF_AUTOUPDATE/CF_HTTP2/CF_EDGE_IP
 # ---------------------------------------------------------------------------
 _cf_build_cmdline() {
     local token="$1"
@@ -156,7 +160,11 @@ _cf_build_cmdline() {
     fi
     cmd="$cmd tunnel"
     [ "$CF_HTTP2" = "on" ] && cmd="$cmd --protocol http2"
-    [ "$CF_IPV6" = "on" ]  && cmd="$cmd --edge-ip-version 6"
+    case "$CF_EDGE_IP" in
+        4)    cmd="$cmd --edge-ip-version 4" ;;
+        6)    cmd="$cmd --edge-ip-version 6" ;;
+        auto) cmd="$cmd --edge-ip-version auto" ;;
+    esac
     cmd="$cmd run --token $token"
     echo "$cmd"
 }
@@ -357,8 +365,8 @@ _install_cloudflared() {
     fi
     [ -z "$token" ] && { _error "Token 不能为空"; return 1; }
 
-    # 默认开关(脚本安装默认: 自动更新 off, HTTP2 on, IPv6 off)
-    CF_AUTOUPDATE="off"; CF_HTTP2="on"; CF_IPV6="off"
+    # 默认设置(脚本安装默认: 自动更新 off, HTTP2 on, 协议栈 off)
+    CF_AUTOUPDATE="off"; CF_HTTP2="on"; CF_EDGE_IP="off"
 
     _info "调用 cloudflared service install..."
     if ! "$CF_BIN" service install "$token" 2>&1; then
@@ -373,7 +381,7 @@ _install_cloudflared() {
     mkdir -p "$STATE_DIR"
     _state_set cf_autoupdate "$CF_AUTOUPDATE"
     _state_set cf_http2 "$CF_HTTP2"
-    _state_set cf_ipv6 "$CF_IPV6"
+    _state_set cf_edge_ip "$CF_EDGE_IP"
     _state_set cf_token "$token"
     # 验证 service 真正启动 (M5: token 非法时 service install 仍成功, 但服务无法运行)
     if _cf_is_running; then
@@ -405,7 +413,7 @@ _uninstall_cloudflared() {
             ;;
     esac
     rm -f "$CF_BIN"
-    rm -f "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_IPV6" "$CF_STATE_TOKEN"
+    rm -f "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6"
     _success "cloudflared 已卸载(二进制/服务/状态已清除)"
 }
 
@@ -469,9 +477,9 @@ _cf_switch_token() {
 }
 
 # ---------------------------------------------------------------------------
-# 切换 3 开关: 读取当前状态, 反转目标开关, 用 _cf_build_cmdline 重组整行写回
+# 切换 2 开关(autoupdate|http2): 读取当前状态, 反转目标开关, 用 _cf_build_cmdline 重组整行写回
 # (从头重建保证参数顺序: 全局标志 tunnel 连接标志 run --token)
-# 用法:_cf_toggle <autoupdate|http2|ipv6>
+# 协议栈为四选一, 走 _cf_set_edge_ip(见下)
 # ---------------------------------------------------------------------------
 _cf_toggle() {
     local key="$1"
@@ -485,15 +493,13 @@ _cf_toggle() {
     case "$key" in
         autoupdate) cur="${CF_CUR_AUTOUPDATE:-on}" ;;
         http2)      cur="${CF_CUR_HTTP2:-on}" ;;
-        ipv6)       cur="${CF_CUR_IPV6:-off}" ;;
     esac
     local new; [ "$cur" = "on" ] && new="off" || new="on"
 
-    CF_AUTOUPDATE="${CF_CUR_AUTOUPDATE}"; CF_HTTP2="${CF_CUR_HTTP2}"; CF_IPV6="${CF_CUR_IPV6}"
+    CF_AUTOUPDATE="${CF_CUR_AUTOUPDATE}"; CF_HTTP2="${CF_CUR_HTTP2}"; CF_EDGE_IP="${CF_CUR_EDGE_IP}"
     case "$key" in
         autoupdate) CF_AUTOUPDATE="$new" ;;
         http2)      CF_HTTP2="$new" ;;
-        ipv6)       CF_IPV6="$new" ;;
     esac
     _cf_write_service_line "$(_cf_build_cmdline "$CF_CUR_TOKEN")" || return 1
 
@@ -516,6 +522,64 @@ _cf_toggle() {
 }
 
 # ---------------------------------------------------------------------------
+# 设置协议栈 (--edge-ip-version 4|6|auto|关)
+# 四选一: IPv4 / IPv6 / Auto / 关(不写参数, 交 cloudflared 默认)
+# ---------------------------------------------------------------------------
+_cf_set_edge_ip() {
+    [ -x "$CF_BIN" ] || { _warn "cloudflared 未安装, 请先安装"; return 1; }
+    _read_cf_state
+    if [ -z "$CF_CUR_TOKEN" ]; then
+        _warn "未能读取令牌(可能是手动安装), 请先 [1] 补录令牌后再切换协议栈"
+        return 1
+    fi
+    local cur="${CF_CUR_EDGE_IP:-off}"
+    echo
+    echo -e "  ${CYAN}【切换协议栈】${NC}"
+    echo -e "  当前: $(_cf_edge_ip_disp "$cur")"
+    echo
+    echo -e "  ${GREEN}[1]${NC} IPv4 (--edge-ip-version 4)"
+    echo -e "  ${GREEN}[2]${NC} IPv6 (--edge-ip-version 6)"
+    echo -e "  ${GREEN}[3]${NC} Auto (--edge-ip-version auto)"
+    echo -e "  ${GREEN}[4]${NC} 关   (不写参数, 使用 cloudflared 默认)"
+    echo -e "  ${GREEN}[0]${NC} 取消"
+    local choice
+    read -rp "  请选择: " choice
+    local val
+    case "$choice" in
+        1) val="4" ;;
+        2) val="6" ;;
+        3) val="auto" ;;
+        4) val="off" ;;
+        0) return 0 ;;
+        *) _warn "无效"; return 1 ;;
+    esac
+    if [ "$val" = "$cur" ]; then
+        _info "协议栈已是 $(_cf_edge_ip_label "$val")，无需切换"
+        return 0
+    fi
+
+    CF_AUTOUPDATE="${CF_CUR_AUTOUPDATE}"; CF_HTTP2="${CF_CUR_HTTP2}"; CF_EDGE_IP="$val"
+    _cf_write_service_line "$(_cf_build_cmdline "$CF_CUR_TOKEN")" || return 1
+
+    _cf_restart
+    if ! _cf_is_running; then
+        _warn "切换后服务未运行, 回滚..."
+        local svcfile
+        case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
+        if [ -f "${svcfile}.bak" ]; then
+            cat "${svcfile}.bak" > "$svcfile"
+            case "$svcfile" in /etc/init.d/*) chmod +x "$svcfile" 2>/dev/null ;; esac
+            [ "$INIT_SYSTEM" = "systemd" ] && systemctl daemon-reload 2>/dev/null
+            _cf_restart
+        fi
+        _error "协议栈切换失败, 已回滚到原状态"
+        return 1
+    fi
+    _state_set cf_edge_ip "$val"
+    _success "协议栈已切换为 $(_cf_edge_ip_label "$val")(cloudflared 已重启, 隧道短暂中断)"
+}
+
+# ---------------------------------------------------------------------------
 # cloudflared 子菜单
 # ---------------------------------------------------------------------------
 _cloudflared_menu() {
@@ -535,7 +599,7 @@ _cloudflared_menu() {
                 tok_disp="${YELLOW}未读取(需补录)${NC}"
             fi
             echo -e "  状态: ${GREEN}已安装${NC}  令牌: ${tok_disp}"
-            echo -e "  自动更新: $(_cf_onoff "${CF_CUR_AUTOUPDATE:-on}")  HTTP/2: $(_cf_onoff "${CF_CUR_HTTP2:-on}")  IPv6栈: $(_cf_onoff "${CF_CUR_IPV6:-off}")"
+            echo -e "  自动更新: $(_cf_onoff "${CF_CUR_AUTOUPDATE:-on}")  HTTP/2: $(_cf_onoff "${CF_CUR_HTTP2:-on}")  协议栈: $(_cf_edge_ip_disp "${CF_CUR_EDGE_IP:-off}")"
             echo
             if [ -n "$CF_CUR_TOKEN" ]; then
                 echo -e "  ${GREEN}[1]${NC} 切换令牌"
@@ -544,7 +608,7 @@ _cloudflared_menu() {
             fi
             echo -e "  ${GREEN}[2]${NC} 切换 自动更新 (当前 $(_cf_onoff "${CF_CUR_AUTOUPDATE:-on}"))"
             echo -e "  ${GREEN}[3]${NC} 切换 HTTP/2      (当前 $(_cf_onoff "${CF_CUR_HTTP2:-on}"))"
-            echo -e "  ${GREEN}[4]${NC} 切换 IPv6栈      (当前 $(_cf_onoff "${CF_CUR_IPV6:-off}"))"
+            echo -e "  ${GREEN}[4]${NC} 切换 协议栈      (当前 $(_cf_edge_ip_disp "${CF_CUR_EDGE_IP:-off}"))"
             echo -e "  ${GREEN}[5]${NC} 重启 cloudflared"
             echo -e "  ${GREEN}[6]${NC} 诊断(查看 service 文件内容)"
             echo -e "  ${GREEN}[9]${NC} 卸载"
@@ -559,7 +623,7 @@ _cloudflared_menu() {
             1) if [ "$installed" = "yes" ]; then _cf_switch_token; else _install_cloudflared; fi ;;
             2) _cf_toggle autoupdate ;;
             3) _cf_toggle http2 ;;
-            4) _cf_toggle ipv6 ;;
+            4) _cf_set_edge_ip ;;
             5) _cf_restart; if _cf_is_running; then _success "已重启"; else _warn "重启后服务未运行, 请检查状态"; fi ;;
             6) _cf_diagnose ;;
             9) _uninstall_cloudflared ;;
@@ -584,7 +648,7 @@ _cf_diagnose() {
     if [ -f "$svcfile" ]; then
         echo -e "  权限: $(ls -la "$svcfile" | awk '{print $1}')"
         echo -e "  解析到的 token: ${CF_CUR_TOKEN:-(空)}"
-        echo -e "  解析到的开关: auto=${CF_CUR_AUTOUPDATE} http2=${CF_CUR_HTTP2} ipv6=${CF_CUR_IPV6}"
+        echo -e "  解析到的开关: auto=${CF_CUR_AUTOUPDATE} http2=${CF_CUR_HTTP2} 协议栈=${CF_CUR_EDGE_IP}"
         echo
         echo -e "  ${CYAN}--- 文件内容 ---${NC}"
         cat "$svcfile"
@@ -598,4 +662,24 @@ _cf_diagnose() {
 
 _cf_onoff() {
     [ "$1" = "on" ] && echo "${GREEN}● 开${NC}" || echo "${RED}○ 关${NC}"
+}
+
+# 协议栈显示: 带颜色 (菜单/状态栏)
+_cf_edge_ip_disp() {
+    case "$1" in
+        4)    echo "${GREEN}● IPv4${NC}" ;;
+        6)    echo "${GREEN}● IPv6${NC}" ;;
+        auto) echo "${GREEN}● Auto${NC}" ;;
+        *)    echo "${RED}○ 关${NC}" ;;
+    esac
+}
+
+# 协议栈纯文本标签(日志/提示用, 不带颜色)
+_cf_edge_ip_label() {
+    case "$1" in
+        4) echo "IPv4" ;;
+        6) echo "IPv6" ;;
+        auto) echo "Auto" ;;
+        *) echo "关" ;;
+    esac
 }
