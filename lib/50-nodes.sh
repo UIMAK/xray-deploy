@@ -837,7 +837,7 @@ _adopt_orphan_inbounds() {
 # ---------------------------------------------------------------------------
 _add_node() {
     clear
-    [ -x "$XRAY_BIN" ] || { _error "Xray 未安装,请先在 [6] 安装/切换 Xray 核心"; _press_any_key; return 1; }
+    [ -x "$XRAY_BIN" ] || { _error "Xray 未安装,请先在 [8] 安装/更新或切换 Xray 核心(稳定/预览)"; _press_any_key; return 1; }
     _ensure_dirs
     echo
     echo -e "  ${CYAN}【添加节点 — 选择协议】${NC}"
