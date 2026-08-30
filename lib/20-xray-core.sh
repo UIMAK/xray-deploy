@@ -462,7 +462,17 @@ _manage_xray() {
                 start)   rc-service xray start 2>/dev/null ;;
                 stop)    rc-service xray stop 2>/dev/null ;;
                 restart) rc-service xray restart 2>/dev/null ;;
-                status)  rc-service xray status 2>/dev/null | grep -q started && echo "running" || echo "stopped" ;;
+                status)
+                    # supervise-daemon 的 rc-service status 可能把 crash/respawn 也报成 started;
+                    # 直查 xray 进程才可靠: pidof(优先, busybox/sysvinit 均内置) → pidfile 兜底。
+                    if pidof xray >/dev/null 2>&1; then
+                        echo "running"
+                    elif [ -f /run/xray.pid ] && kill -0 "$(cat /run/xray.pid 2>/dev/null)" 2>/dev/null; then
+                        echo "running"
+                    else
+                        echo "stopped"
+                    fi
+                    ;;
             esac
             ;;
         direct)
@@ -492,18 +502,21 @@ _manage_xray() {
 # ---------------------------------------------------------------------------
 # 重启 xray 并确认稳定运行(取代 _mutate_config 的预跑 xray -test)。
 # 低内存 VPS 上 xray -test 会与运行中的实例同时加载两份二进制+geo, 触发 OOM;
-# 改为重启后轮询 status(最多 5s), 坏配置/被 OOM 都进不了 running 态 → 返回 1 触发回滚。
+# 改为重启后做存活确认: 先 sleep 1s 再查, 之后完整观察 8s, 期间任何一次
+# 不为 running 都立即判失败。8s > openrc respawn_delay=5, 至少覆盖一个崩溃-重生周期,
+# 避免坏配置在启动后短暂 running、随后崩溃却被误判成功。
+# 坏配置/被 OOM 进不了持续 running 态 → 返回 1 触发上层回滚。
 # ---------------------------------------------------------------------------
 _restart_xray_verified() {
     _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null
     local i
-    for i in 1 2 3 4 5; do
-        if [ "$(_manage_xray status 2>/dev/null)" = "running" ]; then
-            return 0
-        fi
+    for i in 1 2 3 4 5 6 7 8; do
         sleep 1
+        if [ "$(_manage_xray status 2>/dev/null)" != "running" ]; then
+            return 1
+        fi
     done
-    return 1
+    return 0
 }
 
 # ---------------------------------------------------------------------------
