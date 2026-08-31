@@ -105,7 +105,8 @@ _xray_download_replace() {
     tmp_zip="${tmp_dir}/xray.zip"
 
     _info "下载 Xray-core ${tag} (${asset})"
-    if ! wget -q --show-progress -O "$tmp_zip" "$dl_url" 2>&1; then
+    # curl 优先 + 可移植 wget 兜底(原 wget --show-progress 在 busybox 上直接失败)
+    if ! _http_download "$dl_url" "$tmp_zip" 120; then
         _error "下载失败: $dl_url"
         rm -rf "$tmp_dir"
         return 1
@@ -126,10 +127,33 @@ _xray_download_replace() {
     # 停服务 -> 备份旧二进制 -> 替换二进制 -> 校验可执行
     _manage_xray stop >/dev/null 2>&1 || true
     mkdir -p "$BIN_DIR"
-    # 覆盖前备份旧二进制(校验失败可回滚, S6)
-    [ -f "$XRAY_BIN" ] && cp -f "$XRAY_BIN" "$XRAY_BIN.bak"
-    mv -f "${tmp_dir}/xray" "$XRAY_BIN"
-    chmod +x "$XRAY_BIN"
+    # 覆盖前备份旧二进制(校验失败/运行期不稳定可回滚)。备份必须真正成功才允许替换:
+    # 磁盘满/IO 错误导致 cp 失败时, 若继续 mv 会让旧二进制无 .bak 可回滚(与 Geo 备份同一事务原则)。
+    if [ -f "$XRAY_BIN" ]; then
+        if ! cp -f "$XRAY_BIN" "$XRAY_BIN.bak"; then
+            _error "旧二进制备份失败(磁盘空间/IO?), 取消替换, 保留旧版本"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+    fi
+    # 替换必须真正成功: mv 失败(磁盘满/IO/只读)时旧二进制仍在原位, 若放行则后续 "$XRAY_BIN"
+    # version 校验通过的是"旧版本", 会被误当成升级成功、甚至删除 .bak。故失败立即中止。
+    if ! mv -f "${tmp_dir}/xray" "$XRAY_BIN"; then
+        _error "新二进制替换失败(磁盘空间/IO/只读?), 保留旧版本"
+        rm -f "$XRAY_BIN.bak" 2>/dev/null   # 旧二进制仍在原位, 无需保留多余备份
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    # 执行位必须真正设置成功, 否则新二进制不可执行, 后续 version 校验/启动都会失败
+    if ! chmod +x "$XRAY_BIN" 2>/dev/null; then
+        _error "新二进制设置执行权限失败, 回滚旧版本"
+        if [ -f "$XRAY_BIN.bak" ]; then
+            mv -f "$XRAY_BIN.bak" "$XRAY_BIN" 2>/dev/null
+            chmod +x "$XRAY_BIN" 2>/dev/null
+        fi
+        rm -rf "$tmp_dir"
+        return 1
+    fi
 
     # 顺带把 release 自带的 geoip/geosite 放进 assets(若无则跳过;R4 的自动更新会覆盖)
     [ -f "${tmp_dir}/geoip.dat" ]   && cp -f "${tmp_dir}/geoip.dat"   "$ASSET_DIR/" 2>/dev/null || true
@@ -140,19 +164,22 @@ _xray_download_replace() {
     # 低内存机器: 下载/解压/cp 产生大量页缓存, xray version 前释放以避 OOM
     _maybe_drop_caches
 
-    # 可执行性校验
+    # 可执行性校验(仅证明二进制能跑, 不代表能稳定承载当前配置)
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
         _error "新二进制无法执行,可能架构不匹配"
-        # 恢复旧二进制
+        # 恢复旧二进制(mv 失败时旧二进制仍原位, 显式提示而非静默)
         if [ -f "$XRAY_BIN.bak" ]; then
-            mv -f "$XRAY_BIN.bak" "$XRAY_BIN"
-            chmod +x "$XRAY_BIN"
-            _info "已回滚到旧二进制"
+            if mv -f "$XRAY_BIN.bak" "$XRAY_BIN"; then
+                chmod +x "$XRAY_BIN"
+                _info "已回滚到旧二进制"
+            else
+                _warn "旧二进制回滚失败, 请手动检查 $XRAY_BIN"
+            fi
         fi
         return 1
     fi
-    # 校验通过, 清理备份
-    rm -f "$XRAY_BIN.bak"
+    # 注意: 此处先不删 $XRAY_BIN.bak —— 二进制 version 成功但可能与当前配置不兼容,
+    # 交由调用方 _install_or_switch_xray 在 verified-restart 成功后才删除、失败则回滚。
     # 创建 xray 命令 symlink（检测已有安装不覆盖）
     _ensure_xray_symlink
     return 0
@@ -175,8 +202,13 @@ _timed_restart_do() {
         echo "[$ts] 跳过: 配置文件不存在" >> "$log_file"
         exit 0
     fi
-    _manage_xray restart
-    echo "[$ts] 已重启" >> "$log_file"
+    # 重启后做稳定存活确认(不跑 xray -test, 避免低内存双份加载 OOM), 如实记录成败
+    if _restart_xray_verified; then
+        echo "[$ts] 已重启并稳定运行" >> "$log_file"
+    else
+        echo "[$ts] 重启失败: xray 未稳定运行, 请检查配置/日志" >> "$log_file"
+        exit 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -206,7 +238,7 @@ _install_or_switch_xray() {
         *) _error "未知通道: $channel"; return 1 ;;
     esac
 
-    _ensure_dirs
+    _ensure_dirs || return 1
     local tag
     tag=$(_xray_fetch_tag "$channel") || {
         _error "无法获取 ${channel} 通道最新版本(网络?)"
@@ -221,8 +253,11 @@ _install_or_switch_xray() {
         _info "当前已是该版本 (v${cur}),仍重新下载替换以确保最新"
     fi
 
-    # 备份配置(切换不动配置,但写前留快照以防万一)
-    _backup_config
+    # 备份配置(切换不动配置,但写前留快照以防万一)。备份失败则中止, 保持"备份→替换→验证→回滚"事务链闭合。
+    if ! _backup_config; then
+        _error "配置备份失败, 取消核心切换"
+        return 1
+    fi
 
     if ! _xray_download_replace "$tag"; then
         # 下载失败:若有旧二进制,尝试恢复服务
@@ -237,20 +272,37 @@ _install_or_switch_xray() {
     _init_config_if_empty
     _create_xray_service
 
-    # 直接启动 — OpenRC init.d 已移除 checkconfig()+start_pre()(避免低内存 OOM)
-    # 不在此处做 xray -test(低内存机器 OOM, 且各 commit_inbound 已有校验)
-    if [ -n "$cur" ]; then
-        _manage_xray restart
-    else
-        _manage_xray start
-    fi || _warn "Xray 启动失败,请检查配置后重试"
+    # 重启并确认"稳定运行"而非仅命令返回 0(systemd Type=simple 在进程崩溃前即返回 0)。
+    # 不在此处跑 xray -test(低内存 OOM); verified-restart 会完整观察 8s。
+    local started_ok=1
+    _restart_xray_verified || started_ok=0
 
-    # 记录状态
-    _state_set channel "$channel"
-    _state_set version "$(_xray_current_version)"
-
+    # 记录状态。注意 cur 是"替换前"探测(用于上面的版本提示/回滚文案), 这里 newv 是
+    # "替换后"只探测一次(旧代码替换后还连探两次: _state_set 内一次 + newv 一次, 已合并)。
     local newv
-    newv=$(_xray_current_version)
+    newv=$(_xray_current_version 2>/dev/null)
+    _state_set channel "$channel" || _warn "状态持久化失败(channel)"
+    if [ -n "$newv" ]; then
+        _state_set version "$newv" || _warn "状态持久化失败(version)"
+    fi
+
+    if [ "$started_ok" -ne 1 ]; then
+        # 新二进制可执行但无法稳定运行(如当前配置与新版本不兼容): 回滚到替换前的旧二进制并重新拉起,
+        # 与 config/geo 的失败回滚保持同一事务级别。首次安装无 .bak 时只报错。
+        if [ -f "$XRAY_BIN.bak" ]; then
+            if mv -f "$XRAY_BIN.bak" "$XRAY_BIN"; then
+                chmod +x "$XRAY_BIN"
+                _manage_xray restart >/dev/null 2>&1 || _manage_xray start >/dev/null 2>&1 || true
+                _warn "新核心 v${newv:-?} 未能稳定运行, 已回滚到旧二进制 v${cur:-?}"
+            else
+                _error "旧二进制回滚失败, 请手动处理 $XRAY_BIN"
+            fi
+        fi
+        _error "Xray 二进制已替换, 但服务未能稳定运行, 请检查配置"
+        return 1
+    fi
+    # verified 稳定运行后才丢弃旧二进制备份
+    rm -f "$XRAY_BIN.bak"
     _success "Xray-core 已切换到 v${newv} (${channel})"
     _tip "配置与节点保持不变"
 
@@ -270,7 +322,7 @@ _init_config_if_empty() {
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
         return 0
     fi
-    _ensure_dirs
+    _ensure_dirs || return 1
     # 美化多行格式(便于手动编辑) + routing 规则(bt/广告/私网/CN 走 block)
     # 按 Xray 官方文档顺序排列(log → dns → routing → inbounds → outbounds)
     local base='{
@@ -361,10 +413,8 @@ _init_config_if_empty() {
   ]
 }'
     _atomic_write_json "$CONFIG_FILE" "$base" || return 1
-    # 再用 jq 美化一遍(确保格式规范)
-    if command -v jq >/dev/null 2>&1; then
-        jq . "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null && mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-    fi
+    # $base 本身即 2 空格人工排版且 _atomic_write_json 已做 jq 校验, 不再做第二遍 jq 写回
+    # (旧的 "jq . > tmp && mv" 路径无错误处理, 失败会静默继续且可能残留 .tmp, R13)
     _info "已初始化空配置: $CONFIG_FILE"
 }
 
@@ -380,13 +430,44 @@ _xray_test_config() {
 }
 
 # ---------------------------------------------------------------------------
+# 计算可安全抬升的 nofile。目标 65535; 但在受限容器里若当前 hard 上限更低, 把限制
+# 抬到上限之上会 EPERM, 导致 systemd/openrc 在 exec 前中止(H2 同类)。此时输出空串,
+# 表示"不要设置、继承容器默认", 宁可低一点也不能让服务起不来。
+# ---------------------------------------------------------------------------
+_safe_nofile() {
+    local target=65535 hard="" f
+    local IFS=$' \t\n'   # 防止上层遗留的自定义 IFS 影响 read 分词
+    # 直接读 /proc/self/limits(无 fork): 低配饱和 VPS 上 $(ulimit -Hn) 命令替换可能因
+    # fork 失败返回空。行形如 "Max open files  <soft>  <hard>  files"。
+    if [ -r /proc/self/limits ]; then
+        while read -ra f; do
+            if [ "${f[0]} ${f[1]} ${f[2]}" = "Max open files" ]; then hard="${f[4]}"; fi
+        done < /proc/self/limits
+    else
+        hard=$(ulimit -Hn 2>/dev/null)
+    fi
+    if [ "$hard" = "unlimited" ]; then echo "$target"; return; fi
+    if [[ "$hard" =~ ^[0-9]+$ ]] && [ "$hard" -ge "$target" ]; then echo "$target"; fi
+    # 数字但 < target, 或读不到/异常: 输出空(不设置, 继承默认, 绝不抬到上限之上触发 EPERM)
+}
+
+# ---------------------------------------------------------------------------
 # 生成 service 文件(R2:注入 XRAY_LOCATION_ASSET=/opt/xray-deploy/assets)
 # ---------------------------------------------------------------------------
 _create_xray_systemd_service() {
+    local nofile_line=""
+    local _nf; _nf=$(_safe_nofile)
+    [ -n "$_nf" ] && nofile_line="LimitNOFILE=$_nf"
     cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service (xray-deploy)
-After=network.target nss-lookup.target
+Wants=network-online.target
+After=network-online.target nss-lookup.target
+# 宽松但有限的崩溃熔断: 10 分钟内允许 20 次重启(足够吸收低配机偶发 OOM, 不会像默认
+# 10s/5 次那样几次 OOM 就永久停服), 但坏配置导致的紧密崩溃循环到上限后仍会停下,
+# 避免无限重启空耗 CPU/日志(与 OpenRC supervise-daemon 有限 respawn 的策略对齐)。
+StartLimitIntervalSec=600
+StartLimitBurst=20
 
 [Service]
 Type=simple
@@ -394,7 +475,7 @@ Environment=XRAY_LOCATION_ASSET=${ASSET_DIR}
 ExecStart=${XRAY_BIN} run -c ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=3
-LimitNOFILE=65535
+${nofile_line}
 
 [Install]
 WantedBy=multi-user.target
@@ -404,6 +485,10 @@ EOF
 }
 
 _create_xray_openrc_service() {
+    local rc_ulimit_line=""
+    local _nf; _nf=$(_safe_nofile)
+    # 仅当 hard 上限足够时才抬 nofile; 受限容器留空(继承默认), 避免 EPERM 中止 exec
+    [ -n "$_nf" ] && rc_ulimit_line="rc_ulimit=\"-n $_nf\""
     cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
 
@@ -414,8 +499,12 @@ supervisor=supervise-daemon
 respawn_delay=5
 
 pidfile="/run/\${RC_SVCNAME}.pid"
-rc_ulimit="-n 1024000 -u 1024000"
-capabilities="^cap_net_bind_service,^cap_net_admin,^cap_net_raw"
+# nofile 仅在当前 hard 上限 >= 65535 时才抬升(见 _safe_nofile); 受限容器此行为空。
+# 不要写 -u(nproc), 也不要写超过容器上限的值: 抬升超限会 EPERM, OpenRC 在 exec 前
+# 即中止, xray 子进程根本不会启动。
+${rc_ulimit_line}
+# 不静态设置 capabilities: supervise-daemon 裁剪 bounding set 的 prctl 在受限容器内会
+# EPERM 并中止启动; 且 iptables 由管理脚本以 root 执行, xray 进程运行期不需要 NET_ADMIN/RAW。
 supervise_daemon_args="--env XRAY_LOCATION_ASSET=${ASSET_DIR}"
 
 command="${XRAY_BIN}"
@@ -444,6 +533,24 @@ _create_xray_service() {
 }
 
 # ---------------------------------------------------------------------------
+# 真实判断 xray 业务进程是否存活(跨 systemd/openrc/direct 与容器环境)
+# 坑1: openrc supervise-daemon 的 pidfile 记录的是 supervisor 自身 PID, 子进程崩溃循环/
+#       放弃重生时 supervisor 仍存活 -> kill -0 pidfile 会假阳性"running"。
+# 坑2: 部分 LXC/Podman 容器内 busybox 的 pidof / pgrep -x 按名精确匹配会假阴性
+#       (实测连运行中的 sshd 都匹配不到), 只有直接读 /proc/<pid>/comm 可靠。
+# 策略: pidof 快路径(常规 glibc/alpine) + 扫描 /proc comm 精确匹配兜底(容器)。
+# ---------------------------------------------------------------------------
+_xray_is_running() {
+    if pidof xray >/dev/null 2>&1; then return 0; fi
+    local p c
+    for p in /proc/[0-9]*; do
+        read -r c 2>/dev/null < "$p/comm" || continue
+        [ "$c" = "xray" ] && return 0
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # 服务管理:start/stop/restart/status
 # ---------------------------------------------------------------------------
 _manage_xray() {
@@ -459,41 +566,62 @@ _manage_xray() {
             ;;
         openrc)
             case "$action" in
-                start)   rc-service xray start 2>/dev/null ;;
+                # supervise-daemon 崩溃次数耗尽(respawn-max)后进入 crashed 态, 直接 start/restart
+                # 会被拒; 仅在"确无真实 xray 业务进程"时 zap 复位状态机(健康运行时绝不 zap,
+                # 否则 OpenRC 误判 stopped 会再起一个实例造成端口冲突)。
+                start)
+                    _xray_is_running || rc-service xray zap >/dev/null 2>&1
+                    rc-service xray start 2>/dev/null ;;
                 stop)    rc-service xray stop 2>/dev/null ;;
-                restart) rc-service xray restart 2>/dev/null ;;
+                restart)
+                    _xray_is_running || rc-service xray zap >/dev/null 2>&1
+                    rc-service xray restart 2>/dev/null ;;
                 status)
-                    # supervise-daemon 的 rc-service status 可能把 crash/respawn 也报成 started;
-                    # 直查 xray 进程才可靠: pidof(优先, busybox/sysvinit 均内置) → pidfile 兜底。
-                    if pidof xray >/dev/null 2>&1; then
-                        echo "running"
-                    elif [ -f /run/xray.pid ] && kill -0 "$(cat /run/xray.pid 2>/dev/null)" 2>/dev/null; then
-                        echo "running"
-                    else
-                        echo "stopped"
-                    fi
+                    # 只认真实 xray 业务进程, 不认 supervise-daemon 父进程(否则崩溃循环被误报 running)
+                    if _xray_is_running; then echo "running"; else echo "stopped"; fi
                     ;;
             esac
             ;;
         direct)
             case "$action" in
                 start)
-                    if [ -f /run/xray.pid ] && kill -0 "$(cat /run/xray.pid 2>/dev/null)" 2>/dev/null; then
+                    local dpid0=""
+                    [ -f /run/xray.pid ] && dpid0=$(cat /run/xray.pid 2>/dev/null)
+                    # PID reuse 防护: pidfile 的 PID 必须 comm 仍是 xray 才算已在运行;
+                    # 旧 xray 退出后 PID 若被其他程序复用, 陈旧 pidfile 应清掉再正常启动
+                    if [ -n "$dpid0" ] && [ "$(cat /proc/$dpid0/comm 2>/dev/null)" = "xray" ]; then
                         echo "running"
                     else
+                        rm -f /run/xray.pid
                         XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG_FILE" >/dev/null 2>&1 &
                         echo $! > /run/xray.pid
                         sleep 1
-                        if ! kill -0 "$(cat /run/xray.pid 2>/dev/null)" 2>/dev/null; then
+                        if [ "$(cat /proc/$(cat /run/xray.pid 2>/dev/null)/comm 2>/dev/null)" != "xray" ]; then
                             _warn "Xray 启动失败,进程已退出"
                             rm -f /run/xray.pid
                             return 1
                         fi
                     fi
                     ;;
-                stop)    [ -f /run/xray.pid ] && kill "$(cat /run/xray.pid)" 2>/dev/null; rm -f /run/xray.pid ;;
-                restart) _manage_xray stop; sleep 1; _manage_xray start ;;
-                status)  [ -f /run/xray.pid ] && kill -0 "$(cat /run/xray.pid 2>/dev/null)" 2>/dev/null && echo "running" || echo "stopped" ;;
+                stop)
+                    if [ -f /run/xray.pid ]; then
+                        local dpid; dpid=$(cat /run/xray.pid 2>/dev/null)
+                        # PID reuse 防护: 只对 comm 确为 xray 的 pidfile 进程发信号, 绝不误杀复用该 PID 的其他程序
+                        if [ -n "$dpid" ] && [ "$(cat /proc/$dpid/comm 2>/dev/null)" = "xray" ]; then
+                            kill "$dpid" 2>/dev/null
+                            # 优雅等待最多 5s, 仍不退出再 SIGKILL, 避免端口未释放
+                            local k
+                            for k in 1 2 3 4 5; do
+                                kill -0 "$dpid" 2>/dev/null || break
+                                sleep 1
+                            done
+                            kill -0 "$dpid" 2>/dev/null && kill -9 "$dpid" 2>/dev/null
+                        fi
+                    fi
+                    rm -f /run/xray.pid
+                    ;;
+                restart) _manage_xray stop; sleep 2; _manage_xray start ;;
+                status)  _xray_is_running && echo "running" || echo "stopped" ;;
             esac
             ;;
     esac
@@ -508,13 +636,16 @@ _manage_xray() {
 # 坏配置/被 OOM 进不了持续 running 态 → 返回 1 触发上层回滚。
 # ---------------------------------------------------------------------------
 _restart_xray_verified() {
-    _manage_xray restart 2>/dev/null || _manage_xray start 2>/dev/null
+    # 服务操作本身必须成功: restart 失败再退而尝试 start; 两者都返回失败则立即判失败,
+    # 避免"操作没生效、但恰好旧进程还活着 → 后续 8s 全 running → 假成功"。
+    # (restart 偶发非 0 但服务其实已起来时, 后续 start 对 active 单元是幂等成功, 不影响。)
+    if ! _manage_xray restart 2>/dev/null; then
+        _manage_xray start 2>/dev/null || return 1
+    fi
     local i
     for i in 1 2 3 4 5 6 7 8; do
         sleep 1
-        if [ "$(_manage_xray status 2>/dev/null)" != "running" ]; then
-            return 1
-        fi
+        [ "$(_manage_xray status 2>/dev/null)" = "running" ] || return 1
     done
     return 0
 }

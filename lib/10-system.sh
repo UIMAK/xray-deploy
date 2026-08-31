@@ -25,11 +25,18 @@ _detect_init_system() {
 # ---------------------------------------------------------------------------
 _detect_os_family() {
     if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
         . /etc/os-release 2>/dev/null
         case "$ID" in
             debian|ubuntu) echo "debian" ;;
             alpine)        echo "alpine" ;;
-            *)             echo "${ID:-unknown}" ;;
+            *)
+                # 衍生版(Mint/Kali/Raspbian/Devuan/Pop!_OS 等)通过 ID_LIKE 归类
+                case " ${ID_LIKE:-} " in
+                    *" debian "*|*" ubuntu "*) echo "debian" ;;
+                    *) echo "${ID:-unknown}" ;;
+                esac
+                ;;
         esac
     else
         echo "unknown"
