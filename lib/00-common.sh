@@ -93,6 +93,30 @@ _get_public_ip() {
 }
 
 # ---------------------------------------------------------------------------
+# 通用 HTTP 下载: curl 优先, wget 兜底
+# 关键: wget 只用 busybox/GNU 都支持的 -q -T -O(禁用 --show-progress/-4 等 GNU 专有选项,
+# busybox wget 遇到会直接 unrecognized option 中止)。成功且文件非空才返回 0。
+# 用法: _http_download <url> <dest> [timeout_sec]
+# ---------------------------------------------------------------------------
+_http_download() {
+    local url="$1" dest="$2" timeout_s="${3:-60}"
+    local dir; dir=$(dirname "$dest")
+    [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --retry 2 --max-time "$timeout_s" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
+            return 0
+        fi
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q -T "$timeout_s" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
+            return 0
+        fi
+    fi
+    rm -f "$dest" 2>/dev/null
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # URL 编解码(节点链接生成用)
 # ---------------------------------------------------------------------------
 _url_encode() {
@@ -106,11 +130,6 @@ _url_encode() {
         esac
     done
     echo "$out"
-}
-
-_url_decode() {
-    local s="$1"
-    printf '%b' "${s//%/\\x}"
 }
 
 # ---------------------------------------------------------------------------
@@ -175,8 +194,13 @@ _check_port_occupied() {
 # ---------------------------------------------------------------------------
 _atomic_write_json() {
     local target="$1" content="$2" tmp
-    tmp=$(mktemp "${target}.XXXXXX")
-    printf '%s' "$content" > "$tmp"
+    # tmp 构造必须完整成功(磁盘满/IO/配额时可能写一半), 否则 mv 会把损坏 JSON 当成正式文件提交
+    tmp=$(mktemp "${target}.XXXXXX") || { _error "无法创建临时 JSON 文件: $target"; return 1; }
+    if ! printf '%s' "$content" > "$tmp"; then
+        rm -f "$tmp"
+        _error "写入临时 JSON 文件失败: $target"
+        return 1
+    fi
     # 语法校验(jq 可用时)
     if command -v jq >/dev/null 2>&1; then
         if ! jq empty "$tmp" 2>/dev/null; then
@@ -185,16 +209,46 @@ _atomic_write_json() {
             return 1
         fi
     fi
-    mv -f "$tmp" "$target"
+    if ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp"
+        _error "替换 JSON 文件失败: $target"
+        return 1
+    fi
+    return 0
+}
+
+# 原子更新 JSON 文件(R15): 先 jq 变换到内存(未落地), 成功后用 _atomic_write_json 提交。
+# 目标文件在失败时保持原样, 无 .tmp 残留。替代所有裸 "jq ... > tmp && mv" 写法。
+# 用法: _meta_update <目标文件> <jq-filter> [jq 参数...]  (jq 参数置于 filter 前, 如 --arg l "$link")
+# 返回: 0 成功; 1 jq 变换或原子写失败
+_meta_update() {
+    local target="$1" filter="$2"; shift 2
+    local content
+    content=$(jq "$@" "$filter" "$target") || { _error "元数据变换失败: $target"; return 1; }
+    _atomic_write_json "$target" "$content"
 }
 
 # ---------------------------------------------------------------------------
 # 确保部署目录结构存在
 # ---------------------------------------------------------------------------
 _ensure_dirs() {
+    local ok=1
     for d in "$BIN_DIR" "$ASSET_DIR" "$NODES_DIR" "$CERT_DIR" "$LOG_DIR" "$STATE_DIR" "$BACKUP_DIR"; do
-        mkdir -p "$d"
+        mkdir -p "$d" || ok=0
+        chmod 700 "$d" 2>/dev/null || ok=0
     done
+    # 存量敏感文件收紧为仅 root 可读(私钥/密码/token; umask 只对新建文件生效, 这里回填旧文件)
+    [ -f "$CONFIG_FILE" ] && { chmod 600 "$CONFIG_FILE" 2>/dev/null || ok=0; }
+    local f
+    for f in "$NODES_DIR"/*.json "$STATE_DIR"/cf_token "$DEPLOY_DIR"/clash.yaml; do
+        [ -f "$f" ] && { chmod 600 "$f" 2>/dev/null || ok=0; }
+    done
+    # 安全加固是启动前提: 目录/敏感文件权限设置失败必须让初始化失败, 不能静默当作成功
+    if [ "$ok" -ne 1 ]; then
+        _error "目录/敏感文件权限设置失败(只读文件系统/权限异常?), 请检查后重试"
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -207,9 +261,20 @@ _state_get() {
 }
 
 _state_set() {
-    local key="$1" val="$2"
-    mkdir -p "$STATE_DIR"
-    printf '%s' "$val" > "$STATE_DIR/${key}.tmp" && mv -f "$STATE_DIR/${key}.tmp" "$STATE_DIR/$key"
+    local key="$1" val="$2" tmp
+    # 严格半事务(R14): mkdir/printf/mv 任一步失败都返回 1 并清理 tmp,
+    # 避免"业务成功但 state 写失败被调用方忽略"导致 service/config 与 state 状态分裂
+    mkdir -p "$STATE_DIR" || return 1
+    tmp="$STATE_DIR/${key}.tmp"
+    if ! printf '%s' "$val" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$STATE_DIR/$key"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -222,13 +287,37 @@ _backup_config() {
     # 注意: busybox/musl 的 mktemp 要求模板以 XXXXXX 结尾, 后缀必须放在 X 之前(否则 EINVAL)
     tmp=$(mktemp "${BACKUP_DIR}/config.json.bak.XXXXXX") || return 1
     cp -f "$CONFIG_FILE" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    cp -f "$CONFIG_FILE" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null || return 1
+    # 备份含密码/UUID/私钥等敏感信息: chmod 600 失败视为备份失败(R13), 不能留下 0644 备份
+    chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    # R23: lastbak 原子更新 — 先写临时文件并 chmod, 再 mv; 旧 lastbak 保持到新备份完整成功。
+    # 直接 cp 覆盖在 I/O 失败时会截断 lastbak, 损坏整个 rollback 基础。
+    local last_tmp
+    last_tmp=$(mktemp "${BACKUP_DIR}/config.json.lastbak.XXXXXX") || { rm -f "$tmp"; return 1; }
+    cp -f "$CONFIG_FILE" "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
+    chmod 600 "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
+    mv -f "$last_tmp" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
+    # 轮转历史快照: 仅保留最新 10 份随机备份(回滚只用 lastbak, 其余仅作人工追溯)
+    local old i=0
+    # ls -1t 按修改时间新→旧(busybox/coreutils 均支持), 跳过 lastbak
+    for old in $(ls -1t "$BACKUP_DIR" 2>/dev/null | grep '^config.json.bak.'); do
+        i=$((i+1))
+        [ "$i" -gt 10 ] && rm -f "$BACKUP_DIR/$old"
+    done
+    return 0
 }
 
 _restore_config() {
     [ -f "$BACKUP_DIR/config.json.lastbak" ] || return 1
-    cp -f "$BACKUP_DIR/config.json.lastbak" "$CONFIG_FILE"
+    # R23: 原子回滚 — 直接 cp 覆盖在 I/O 失败时可能把 config 截断成半截(比回滚失败更糟);
+    # 复用 _atomic_write_json(tmp 构造→校验→mv), 失败时旧 config 保持原样
+    local content
+    content=$(cat "$BACKUP_DIR/config.json.lastbak" 2>/dev/null) || { _error "读取备份失败($BACKUP_DIR/config.json.lastbak)"; return 1; }
+    if ! _atomic_write_json "$CONFIG_FILE" "$content"; then
+        _error "配置回滚失败($CONFIG_FILE)"
+        return 1
+    fi
     _warn "已回滚到上次配置"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -258,24 +347,22 @@ _gen_rand_path() {
 # ---------------------------------------------------------------------------
 # 格式化 config.json: 按官方顺序重排字段 + 统一缩进
 # 幂等操作, 可在启动/检查配置时安全调用
+# R35(P2): 复用 _atomic_write_json 单一严格写入器(内存变换 -> 原子写), 不再维护第二套
+# tmp/mv 逻辑; 失败时原文件保持原样, 调用方(启动/检查)均不检查返回值, 不阻塞。
 # ---------------------------------------------------------------------------
 _normalize_config_format() {
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
-    local tmp
-    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
-    # 按官方顺序排已知字段, 未知字段追加到末尾, 去除 null 值
-    if jq '
+    local content
+    # 按官方顺序排已知字段, 未知字段追加到末尾, 去除 null 值; jq 失败保持原文件不动
+    content=$(jq '
         . as $c |
         ('"${XRAY_TOP_FIELDS_JSON}"') as $known |
         (reduce $known[] as $k ({}; .[$k] = $c[$k]) | with_entries(select(.value != null))) as $ordered |
         ($c | to_entries | map(select(.key as $k | $known | index($k) | not)) | from_entries) as $extra |
         $ordered + $extra
-    ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
-        mv -f "$tmp" "$CONFIG_FILE"
-    else
-        rm -f "$tmp"
-    fi
+    ' "$CONFIG_FILE" 2>/dev/null) || return 0
+    _atomic_write_json "$CONFIG_FILE" "$content"
 }
 
 # ---------------------------------------------------------------------------

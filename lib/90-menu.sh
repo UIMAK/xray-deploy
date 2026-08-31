@@ -162,7 +162,8 @@ _main_menu() {
         elif [ "$choice" = "$_ops_start" ]; then
             _check_script_update
         elif [ "$choice" = "$((_ops_start+1))" ]; then
-            _manage_xray restart; _success "已重启"; _press_any_key
+            if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
+            _press_any_key
         elif [ "$choice" = "$((_ops_start+2))" ]; then
             _manage_xray stop; _success "已停止"; _press_any_key
         elif [ "$choice" = "$((_ops_start+3))" ]; then
@@ -457,9 +458,22 @@ _check_script_update() {
         case "$ans" in
             y|Y)
                 _info "正在更新脚本..."
-                bash <(curl -fsSL "${SCRIPT_VERSION_URL%/VERSION}/install.sh") --update
-                _success "脚本已更新, 下次进菜单生效"
-                exit 0
+                # 先下载到临时文件并校验非空再执行, 避免网络失败时空脚本 bash 退出 0 谎报成功
+                local updater
+                updater=$(mktemp) || { _error "临时文件创建失败"; _press_any_key; return; }
+                if ! _http_download "${SCRIPT_VERSION_URL%/VERSION}/install.sh" "$updater" 30 || [ ! -s "$updater" ]; then
+                    rm -f "$updater"
+                    _error "更新脚本下载失败(网络受限?), 当前版本未变动"
+                    _press_any_key; return
+                fi
+                if bash "$updater" --update; then
+                    rm -f "$updater"
+                    _success "脚本已更新, 下次进菜单生效"
+                    exit 0
+                else
+                    rm -f "$updater"
+                    _error "更新失败, 当前版本未变动"
+                fi
                 ;;
             *) _info "已取消更新" ;;
         esac
@@ -551,7 +565,7 @@ _hy2_toggle_brutal() {
                  '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = {congestion: "bbr"}'; then
                 _error "切换失败, 已回滚"; _press_any_key; return
             fi
-            jq --arg cc "$new_cc" '.congestion=$cc | del(.brutal_up) | del(.brutal_down)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            _meta_update "$meta" '.congestion=$cc | del(.brutal_up) | del(.brutal_down)' --arg cc "$new_cc" || { _error "元数据写入失败"; _press_any_key; return; }
             _success "已切换为 bbr 模式"
             ;;
         brutal)
@@ -568,8 +582,7 @@ _hy2_toggle_brutal() {
                    + (if $down != "" then {brutalDown: $down} else {} end))'; then
                 _error "切换失败, 已回滚"; _press_any_key; return
             fi
-            jq --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" \
-               '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            _meta_update "$meta" '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" || { _error "元数据写入失败"; _press_any_key; return; }
             _success "已切换为 brutal 模式"
             [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
             [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
@@ -588,8 +601,7 @@ _hy2_toggle_brutal() {
                    + (if $down != "" then {brutalDown: $down} else {} end))'; then
                 _error "切换失败, 已回滚"; _press_any_key; return
             fi
-            jq --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" \
-               '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+            _meta_update "$meta" '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" || { _error "元数据写入失败"; _press_any_key; return; }
             _success "已切换为 force-brutal 模式"
             _tip "force-brutal: 强制使用 brutalUp 固定发包速率, 无视对端协商"
             [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
@@ -598,7 +610,7 @@ _hy2_toggle_brutal() {
     esac
     # 重建分享链接
     local link; link=$(_rebuild_hy2_link "$meta")
-    jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
     _press_any_key
 }
 
@@ -654,9 +666,9 @@ _hy2_adjust_bandwidth() {
                + (if $down != "" then {brutalDown: $down} else {} end))'; then
         _error "带宽调整失败, 已回滚"; _press_any_key; return
     fi
-    jq --arg up "$new_up" --arg down "$new_down" '.brutal_up=$up | .brutal_down=$down' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    _meta_update "$meta" '.brutal_up=$up | .brutal_down=$down' --arg up "$new_up" --arg down "$new_down" || { _error "带宽元数据写入失败"; _press_any_key; return; }
     local link; link=$(_rebuild_hy2_link "$meta")
-    jq --arg l "$link" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
     _success "带宽已更新: 上传=${new_up:-不限}  下载=${new_down:-不限}"
     _press_any_key
 }
@@ -762,14 +774,14 @@ _reality_domain_menu() {
 
     # 更新元数据 + 分享链接
     if [ -n "$new_tunnel_tag" ]; then
-        jq --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" \
-          '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" || { _error "元数据写入失败"; _press_any_key; continue; }
     else
-        jq --arg sni "$new_sni" --arg pqv "$pq_verify" \
-          '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag)' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag)' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" || { _error "元数据写入失败"; _press_any_key; continue; }
     fi
     local newlink; newlink=$(_rebuild_reality_link "$meta")
-    jq --arg l "$newlink" '.share_link=$l' "$meta" > "$meta.tmp" && mv -f "$meta.tmp" "$meta"
+    _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || { _error "分享链接写入失败"; _press_any_key; continue; }
 
     _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"
     _tip "客户端须更新 SNI 为 ${new_sni} (pbk/sid 不变)"

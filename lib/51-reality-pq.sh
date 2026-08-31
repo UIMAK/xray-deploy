@@ -52,7 +52,7 @@ _detect_reality_pq() {
     length=$(echo "$ping_out" | grep "Certificate chain's total length:" | awk '{print $5}' | head -1)
     # 容错:不同版本输出列数可能不同,取最后一个数字
     if [ -z "$length" ] || ! [[ "$length" =~ ^[0-9]+$ ]]; then
-        length=$(echo "$ping_out" | grep "Certificate chain's total length:" | grep -oE '[0-9]+' | tail -1)
+        length=$(echo "$ping_out" | grep "Certificate chain's total length:" | grep -o '[0-9][0-9]*' | tail -1)
     fi
 
     if [ -z "$length" ] || ! [[ "$length" =~ ^[0-9]+$ ]] || [ "$length" -le 3500 ]; then
