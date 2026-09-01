@@ -26,6 +26,9 @@ TPL_NAMES="vless-tcp-reality-vision-tunnel vless-xhttp-reality-tunnel tunnel vle
 # ---------------------------------------------------------------------------
 [ "$(id -u)" -ne 0 ] && { echo "[错误] 请以 root 运行"; exit 1; }
 
+# 部署目录含私钥/密码/token, 默认 077 使运行期生成的敏感文件仅 root 可读
+umask 077
+
 # ---------------------------------------------------------------------------
 # 确保 bash(Alpine 默认 ash)
 # ---------------------------------------------------------------------------
@@ -69,9 +72,9 @@ dl() {
             [ -s "$dest" ] && return 0
         fi
     fi
-    # wget 兜底
+    # wget 兜底(只用 busybox/GNU 都支持的 -q -T -O; --tries/--timeout 等 GNU 长选项在老版本 busybox 上不保证)
     if command -v wget >/dev/null 2>&1; then
-        if wget -q --tries=2 --timeout=30 -O "$dest" "$url" 2>/dev/null; then
+        if wget -q -T 30 -O "$dest" "$url" 2>/dev/null; then
             [ -s "$dest" ] && return 0
         fi
     fi
@@ -130,14 +133,20 @@ download_all() {
         return 1
     fi
 
-    # 全部成功 → 复制到最终路径
+    # 全部成功 → 复制到最终路径。逐份检查 cp 返回值: 磁盘满/IO 错误时不得只落地一半文件却报成功。
+    # (下载已在独立 staging 完成; 此处不做目录级 rename 原子切换, 因运行期 manager 就在目标目录内。)
     mkdir -p "$DEPLOY_DIR" "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR"
-    cp -f "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"
-    chmod +x "$DEPLOY_DIR/xray-deploy.sh"
-    cp -f "$stage/VERSION" "$DEPLOY_DIR/VERSION"
-    cp -f "$stage_lib"/*.sh "$INSTALL_LIB_DIR/"
-    cp -f "$stage_tpl"/*.jsonc "$INSTALL_TPL_DIR/"
+    local copy_ok=1
+    cp -f "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || copy_ok=0
+    chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || copy_ok=0
+    cp -f "$stage/VERSION" "$DEPLOY_DIR/VERSION" || copy_ok=0
+    cp -f "$stage_lib"/*.sh "$INSTALL_LIB_DIR/" || copy_ok=0
+    cp -f "$stage_tpl"/*.jsonc "$INSTALL_TPL_DIR/" || copy_ok=0
     rm -rf "$stage"
+    if [ "$copy_ok" -ne 1 ]; then
+        echo "[错误] 文件落地失败(磁盘空间/权限/IO?), 目标可能不完整, 请清理后重试"
+        return 1
+    fi
     return 0
 }
 
