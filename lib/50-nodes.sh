@@ -123,29 +123,51 @@ _hy2_match_target() {
     grep -e "--to-destination :${port} " -e "--to-destination :${port}\$"
 }
 
-# R38(P1): 本机是否"确定不存在任何 xray-deploy 端口跳跃规则"。
-# 用于给 _node_protocol_safe 的 fail-closed 提供一个可证伪的逃生口: 只有能证明
-# 无 hop 规则时才放行损坏 metadata 的删除。无法证明一律返回 1。
-# 证据来源:
-#   a) iptables 可用 → 直接查 runtime(最权威);
-#   b) iptables 不可用 → 查持久化文件(/etc/iptables/rules.v4|v6)。本项目启用 hop 时
-#      会 _ensure_iptables 安装 iptables, 所以"iptables 不存在"通常意味着从未启用过 hop;
-#      但用户可能装过又卸载, 此时持久化规则仍会在开机时被重新加载, 故必须一并检查。
-#      文件不存在 = 无持久化规则 = 无证据表明有 hop。
-# 返回: 0 = 确定无 hop 规则(安全); 1 = 有规则或无法确认(不安全)
+# R38(P1)/R39(P1): 本机是否"**有证据表明**不存在任何 xray-deploy 端口跳跃规则"。
+# 用于给 _node_protocol_safe 的 fail-closed 提供一个可证伪的逃生口。
+# R39 收紧: 必须真的**看过** runtime, 才能说"没有规则"。
+#   "iptables 不可用 + 持久化文件不存在" 只是"我没有观察能力", 不等于"内核里没有规则":
+#   曾启用过 hop、规则已进内核、没装 iptables-persistent(无 rules.v4)、之后 iptables
+#   二进制被卸载 —— 此时规则仍在内核中转发流量, 而旧实现会返回 0(=已证明无规则),
+#   于是删除节点后留下无法追溯 dport 的孤儿 DNAT(metadata 也已被删)。
+# 证据来源(必须至少有一个可用的观察通道):
+#   a) iptables -S 成功 -> 最权威, 直接看 runtime;
+#   b) iptables 不可用但内核 x_tables 从未装载过 nat 表 -> /proc/net/ip_tables_names
+#      不含 "nat"(文件不存在同样说明 x_tables 未被使用) => 内核里不可能有 nat 规则;
+#   c) 上面能确认无 runtime 规则后, 再看持久化文件(它们会在重启时被重新加载)。
+# 任一通道都无法确认 => 返回 1(UNKNOWN, 按不安全处理), 由调用方拒绝并给出人工路径。
+# 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
 _hy2_no_hop_rules_at_all() {
-    local q f
+    local q f runtime_clean=0
     if command -v iptables >/dev/null 2>&1; then
         q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
         printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
-        # IPv6 侧为 best-effort: 命令存在但查询失败时无法确认, 保守判"不安全"
+        # IPv6 侧为 best-effort: 命令存在但查询失败时无法确认, 保守判 UNKNOWN
         if command -v ip6tables >/dev/null 2>&1; then
             q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
             printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
         fi
-        return 0
+        runtime_clean=1
+    else
+        # 无 iptables: 唯一可靠的替代证据是"内核 nat 表从未被使用过"。
+        # /proc/net/ip_tables_names 列出当前已注册的 iptables 表; 不含 nat(或文件不存在,
+        # 即 x_tables 未装载)时, 内核里不可能存在 nat PREROUTING 规则。
+        # 注意 nftables 后端(nft) 不体现在该文件里, 因此若 nft 存在而 iptables 不存在,
+        # 一律判 UNKNOWN —— 本项目只用 iptables 写规则, 但用户环境可能已迁移到 nft。
+        if command -v nft >/dev/null 2>&1; then
+            _warn "iptables 不可用但检测到 nft, 无法确认是否存在跳跃规则"
+            return 1
+        fi
+        if [ -e /proc/net/ip_tables_names ]; then
+            if ! q=$(cat /proc/net/ip_tables_names 2>/dev/null); then
+                return 1   # 存在但读不到(权限/容器限制): UNKNOWN
+            fi
+            printf '%s\n' "$q" | grep -qx "nat" && return 1   # nat 表在用, 但无从查询内容
+        fi
+        runtime_clean=1
     fi
-    # iptables 不可用: 以持久化文件为证据(不存在即视为无规则)
+    [ "$runtime_clean" -eq 1 ] || return 1
+    # runtime 已确认无规则; 持久化文件会在重启时重新加载, 同样必须干净
     for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
         [ -f "$f" ] || continue
         grep -q "xray-deploy-hy2-hop" "$f" 2>/dev/null && return 1
@@ -1061,8 +1083,13 @@ _save_node_meta() {
 # R38(P1): 不可读的 metadata 不再整体 fail —— 原写法让"任意一个损坏文件"永久阻断
 # 所有新建节点(即使新名字与任何现存节点都不冲突), 这是拒绝服务而非安全。
 # 现改为: 损坏文件跳过并告警(它的 name 未知, 无法参与比较), 只有"确实读到同名"才拒绝。
-# 残余风险(已在提示中告知用户): 损坏文件里可能恰好存着同名节点, 需人工核对该文件。
-# 返回: 0 唯一; 1 已存在(调用方应中止创建)
+# R39(P2) 语义声明 —— **唯一性在存在损坏 metadata 时降级为 best-effort**:
+#   损坏文件里可能恰好存着同名节点, 本函数无从得知, 因此不能声称"name 全局唯一"。
+#   影响面: clash.yaml 按 name 删除时可能同时删掉两条同名条目(clash.yaml 属可再生的
+#   派生导出, 权威身份始终是 tag/nodes/<tag>.json), 不会影响 config.json 与节点本体。
+#   取舍理由: "一个坏文件让所有新建失败" 的代价远大于 "极小概率的派生缓存重名"。
+#   调用方若需要严格唯一, 必须先修复/移除损坏的 metadata(本函数已把数量告知用户)。
+# 返回: 0 唯一(或无法确认); 1 确实已存在(调用方应中止创建)
 _ensure_unique_name() {
     local name="$1" f n rc bad=0
     for f in "$NODES_DIR"/*.json; do
@@ -1078,7 +1105,10 @@ _ensure_unique_name() {
             return 1
         }
     done
-    [ "$bad" -eq 0 ] || _warn "有 ${bad} 个节点元数据损坏/为空, 已跳过名称查重(请人工核对 ${NODES_DIR})"
+    [ "$bad" -eq 0 ] || {
+        _warn "有 ${bad} 个节点元数据损坏/为空, 已跳过名称查重(唯一性降级为 best-effort)"
+        _tip "请人工核对 ${NODES_DIR} 并修复/删除这些文件, 否则可能出现同名节点"
+    }
     return 0
 }
 
@@ -1756,7 +1786,8 @@ _add_vless_tcp_reality_vision() {
     R_DECRYPTION="${ENC_DECRYPTION:-none}"
 
     local tag="xd-reality-vision-${port}"
-    local tunnel_tag="Tunnel-${sni}-${tunnel_port}-${port}"
+    # R39(P2): tag 长度封顶(见 _gen_tunnel_tag), 避免最长合法 SNI 拼出 270+ 字符的 tag
+    local tunnel_tag; tunnel_tag=$(_gen_tunnel_tag "$sni" "$tunnel_port" "$port")
     local listen="::"
 
     # 渲染 tunnel inbound
@@ -1860,7 +1891,8 @@ _add_vless_xhttp_reality() {
     R_DECRYPTION="${ENC_DECRYPTION:-none}"
 
     local tag="xd-reality-xhttp-${port}"
-    local tunnel_tag="Tunnel-${sni}-${tunnel_port}-${port}"
+    # R39(P2): tag 长度封顶(见 _gen_tunnel_tag)
+    local tunnel_tag; tunnel_tag=$(_gen_tunnel_tag "$sni" "$tunnel_port" "$port")
     local listen="::"
 
     R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"

@@ -109,25 +109,26 @@ _read_cf_state() {
         *)       svcfile="$CF_UNIT_SYSTEMD" ;;
     esac
     [ -f "$svcfile" ] || return 1
-    # 收集所有可能的启动行(先去行首空白, 兼容缩进)
+    # R39(P1): 只从"真正的启动命令行"收集(见 _cf_is_cmd_line: 排除注释与空行, 认
+    # ExecStart=/command_args=/cmd=/command= 前缀或内联了 $CF_BIN 的 SysV start) 块)。
+    # 原实现把**整个文件**作为兜底搜索范围, 于是形如
+    #     # previous example token: eyAAAA...
+    # 的注释会被当成当前 token: 显示给用户是错的, 更糟的是 _cf_toggle 会把它经
+    # _cf_build_cmdline 写进 ExecStart —— 用一个注释里的过期 token 覆盖真 token, 隧道直接挂。
+    # SysV 内联命令的场景由 _cf_is_cmd_line 的 $CF_BIN 分支覆盖, 不再需要全文件兜底。
     local lines="" ln
     while IFS= read -r ln || [ -n "$ln" ]; do
-        local t="${ln#"${ln%%[![:space:]]*}"}"
-        case "$t" in
-            command_args=*|command=*|supervise_daemon_args=*|ExecStart=*|start\)|cmd=*)
-                lines="$lines
-$ln" ;;
-        esac
+        if _cf_is_cmd_line "$ln"; then
+            lines="$lines
+$ln"
+        fi
     done < "$svcfile"
-    # 也把整个文件作为兜底搜索范围(token 可能在 SysV 脚本的 start 块内联命令里)
-    local full; full=$(cat "$svcfile" 2>/dev/null)
-    CF_CUR_RAWLINE="$full"
-    # token: 优先在启动行里找 --token 后字段; 兜底全文件 ey 开头串
+    # 诊断输出仍需要完整原文(仅用于 _cf_diagnose 展示, 不参与解析)
+    CF_CUR_RAWLINE=$(cat "$svcfile" 2>/dev/null)
+    # token: 优先在启动行里找 --token 后字段; 兜底同一批行里的裸 ey 开头串
     # 把多行合成单行(换行换空格), 再 read -ra 按空白分词(read -ra 只读单行)
-    local search oneline
-    search="$lines
-$full"
-    oneline=$(printf '%s' "$search" | tr '\n' ' ')
+    local oneline
+    oneline=$(printf '%s' "$lines" | tr '\n' ' ')
     local arr=() i grab=0
     read -ra arr <<< "$oneline"
     for ((i=0; i<${#arr[@]}; i++)); do
@@ -146,6 +147,7 @@ $full"
         done
     fi
     # 去掉 token 首尾可能粘连的引号(command_args="..." 闭合引号)
+    # 注意只剥引号: cloudflared token 是 base64, 末尾 '=' 是合法 padding
     case "$CF_CUR_TOKEN" in
         *\") CF_CUR_TOKEN="${CF_CUR_TOKEN%\"}" ;;
     esac
@@ -308,14 +310,68 @@ _cf_write_service_line() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# R39(P1): 判定一行是否为"真正的启动命令行"。只有这些行里的 token 才允许替换。
+# 为什么: R38 只加了 `replaced` 标志, 但判据是"整行包含 oldtok"。而 _read_cf_state 的
+# token 兜底会在**整个文件**里搜 ey... 串, 所以 oldtok 可能来自一行注释:
+#     # previous example token: eyAAAA...
+#     ExecStart=... --token eyBBBB...
+# 于是替换命中注释行 -> replaced=1 -> 报"令牌已更新", 而 ExecStart 仍是旧 token,
+# 重启当然成功, state 却写入新 token => service 与 state 分裂。假成功只是从
+# "0 次替换"变成了"1 次替换但改的是注释", 标志本身并不足够。
+# 判据: 注释行一律不动; 只认 unit/init 的命令字段前缀, 或内联了 cloudflared 二进制
+# 路径的行(SysV 的 start) 块)。
+# ---------------------------------------------------------------------------
+_cf_is_cmd_line() {
+    local t="${1#"${1%%[![:space:]]*}"}"
+    case "$t" in
+        '#'*|'') return 1 ;;   # 注释与空行绝不修改
+    esac
+    case "$t" in
+        ExecStart=*|command_args=*|cmd=*|command=*) return 0 ;;
+    esac
+    # SysV/OpenRC 的 start) 块可能内联完整命令行, 用二进制路径识别
+    case "$t" in
+        *"$CF_BIN"*) return 0 ;;
+    esac
+    return 1
+}
+
+# R39(P1): 从一行启动命令里提取现存 token。优先 `--token <v>` / `--token=<v>`,
+# 兜底裸 ey... 词; 去掉粘连的闭合引号(command_args="... --token XXX")。
+# 输出为空表示该行没有 token(如 openrc 的 command="/usr/local/bin/cloudflared")。
+_cf_extract_line_token() {
+    local ln="$1" arr=() i w grab=0 tok=""
+    read -ra arr <<< "$ln"
+    for ((i=0; i<${#arr[@]}; i++)); do
+        w="${arr[$i]}"
+        if [ "$grab" -eq 1 ]; then tok="$w"; break; fi
+        case "$w" in
+            --token)   grab=1 ;;
+            --token=*) tok="${w#--token=}"; break ;;
+        esac
+    done
+    if [ -z "$tok" ]; then
+        for w in "${arr[@]}"; do
+            case "$w" in ey????????????????????*) tok="$w"; break ;; esac
+        done
+    fi
+    # 只剥一层首尾引号: cloudflared token 是 base64, 末尾的 '=' 是合法 padding, 不能动
+    tok="${tok%\"}"; tok="${tok%\'}"
+    tok="${tok#\"}"; tok="${tok#\'}"
+    printf '%s' "$tok"
+}
+
 # 只替换 service 启动行里的 token, 保留用户原有的其他参数(不破坏手动装的好配置)
 # 用纯 bash 字符串替换(不依赖 sed -E 正则)
-# R38(P1): 必须跟踪"是否真的替换了至少一处"(replaced)。原实现只看写 tmp 是否成功, 于是
-#   (a) oldtok 非空但与文件实际字节不符(手动安装用 Environment=TUNNEL_TOKEN= / --token-file /
-#       token 被引号或换行包裹), 或 (b) oldtok 为空且行内没有裸 ey... 词,
-#   都会"零替换"却返回 0 —— 调用方随后用**旧 token** 重启, _cf_is_running 自然为真,
-#   于是写入新 token 到 state 并报「令牌已更新」。隧道仍挂旧账号, state 与 service 分裂。
-#   这正是本 PR 要消除的假成功, 与 _svc_replace_line 的 found 检查保持同一标准。
+# R38(P1): 必须跟踪"是否真的替换了至少一处"——原实现只看写 tmp 是否成功, 零替换也返回 0,
+#   调用方随后用**旧 token** 重启成功, 于是写入新 token 到 state 并报「令牌已更新」。
+# R39(P1): 判据由"整行包含 oldtok"收紧为"在真正的启动命令行上替换掉解析出来的 token"
+#   (见 _cf_is_cmd_line / _cf_extract_line_token)。同时替换方式改为只替换 token 子串
+#   `${ln//$found/$newtok}` —— 原来的 `read -ra` + 逐词重组会吃掉 openrc
+#   `command_args="... --token XXX="` 的闭合引号并把连续空格压成一个, 写出的 init 脚本
+#   引号不闭合, source 时报错、服务彻底起不来。
+# 参数 oldtok 现在只是提示(命令行上解析到的 token 才是权威), 保留以兼容调用方签名。
 _cf_replace_token_in_service() {
     local oldtok="$1" newtok="$2" svcfile
     case "$INIT_SYSTEM" in
@@ -326,32 +382,18 @@ _cf_replace_token_in_service() {
     [ -f "$svcfile" ] || return 1
     # 备份必须真正成功才允许改 service(失败可恢复)
     cp -f "$svcfile" "${svcfile}.bak" 2>/dev/null || { _error "service 备份失败: $svcfile"; return 1; }
-    local tmp write_ok=1 replaced=0
+    local tmp write_ok=1 replaced=0 ln found
     tmp=$(mktemp) || { _error "无法创建临时 service 文件: $svcfile"; return 1; }
     while IFS= read -r ln || [ -n "$ln" ]; do
-        if [ -n "$oldtok" ]; then
-            case "$ln" in
-                *"$oldtok"*) replaced=1 ;;
-            esac
-            printf '%s\n' "${ln//"$oldtok"/$newtok}" >> "$tmp" || write_ok=0
-        else
-            # oldtok 为空: 在该行里找 ey 开头的 token 字段替换
-            local out="" arr=() rep=0
-            read -ra arr <<< "$ln"
-            local w
-            for w in "${arr[@]}"; do
-                case "$w" in
-                    ey????????????????????*) out="$out $newtok"; rep=1 ;;
-                    *) out="$out $w" ;;
-                esac
-            done
-            if [ "$rep" -eq 1 ]; then
-                replaced=1
-                printf '%s\n' "${out# }" >> "$tmp" || write_ok=0
-            else
-                printf '%s\n' "$ln" >> "$tmp" || write_ok=0
+        if _cf_is_cmd_line "$ln"; then
+            found=$(_cf_extract_line_token "$ln")
+            if [ -n "$found" ]; then
+                printf '%s\n' "${ln//"$found"/$newtok}" >> "$tmp" || write_ok=0
+                replaced=$((replaced+1))
+                continue
             fi
         fi
+        printf '%s\n' "$ln" >> "$tmp" || write_ok=0
     done < "$svcfile"
     # tmp 构造必须完整成功(磁盘满/IO/配额时 printf 可能写一半), 否则半截文件会被提交
     if [ "$write_ok" -ne 1 ]; then
@@ -359,13 +401,17 @@ _cf_replace_token_in_service() {
         rm -f "$tmp"
         return 1
     fi
-    # R38(P1): 零替换必须失败——否则调用方会拿旧 token 重启并宣称"令牌已更新"
-    if [ "$replaced" -ne 1 ]; then
+    # R38/R39(P1): 未在任何启动命令行上替换到 token => 必须失败, 否则调用方拿旧 token
+    # 重启并宣称"令牌已更新"
+    if [ "$replaced" -lt 1 ]; then
         rm -f "$tmp" "${svcfile}.bak"
-        _error "未在 $svcfile 中找到可替换的令牌, 令牌未更新"
-        _tip "该 service 可能由 cloudflared 官方命令以其他形式写入(如 --token-file / Environment=), 请手动编辑 $svcfile 后重启"
+        _error "未在 $svcfile 的启动命令行中找到可替换的令牌, 令牌未更新"
+        _tip "该 service 可能以其他形式提供 token(--token-file / Environment=TUNNEL_TOKEN=),"
+        _tip "本脚本不会改写这类形态; 请手动编辑 $svcfile 后重启 cloudflared"
         return 1
     fi
+    [ -n "$oldtok" ] && [ "$replaced" -gt 1 ] && \
+        _warn "在 $replaced 行启动命令中替换了令牌, 请确认该 service 是否本就有多条启动行"
     _svc_commit "$svcfile" "$tmp" || return 1
     if [ "$INIT_SYSTEM" = "systemd" ]; then
         if ! systemctl daemon-reload 2>/dev/null; then
@@ -885,14 +931,41 @@ _cf_diagnose() {
     echo -e "  service 文件: ${svcfile}"
     if [ -f "$svcfile" ]; then
         echo -e "  权限: $(ls -la "$svcfile" | awk '{print $1}')"
-        echo -e "  解析到的 token: ${CF_CUR_TOKEN:-(空)}"
+        # R39(P2): token 打屏必须掩码 —— 诊断输出常被用户直接粘贴到 issue/群里,
+        # 明文 token 等同于隧道凭据泄漏。与菜单里的展示口径一致(首 12 + 末 4)。
+        if [ -n "$CF_CUR_TOKEN" ]; then
+            echo -e "  解析到的 token: ${CF_CUR_TOKEN:0:12}...${CF_CUR_TOKEN: -4} (长度 ${#CF_CUR_TOKEN})"
+        else
+            echo -e "  解析到的 token: (空)"
+        fi
         echo -e "  解析到的开关: auto=${CF_CUR_AUTOUPDATE} http2=${CF_CUR_HTTP2} 协议栈=${CF_CUR_EDGE_IP}"
         echo
-        echo -e "  ${CYAN}--- 文件内容 ---${NC}"
-        cat "$svcfile"
+        echo -e "  ${CYAN}--- 文件内容(token 已掩码) ---${NC}"
+        # 把 ey... 串替换成 ey***: 不依赖 sed -E, 用 bash 逐词处理以兼容 busybox
+        local dl dw dout
+        while IFS= read -r dl || [ -n "$dl" ]; do
+            case "$dl" in
+                *ey????????????????????*)
+                    dout=""
+                    for dw in $dl; do
+                        case "$dw" in
+                            ey????????????????????*) dout="$dout ey***MASKED***" ;;
+                            *"ey"*)
+                                # token 可能与前缀粘连(--token=ey... / "ey...")
+                                case "$dw" in
+                                    *=ey????????????????????*) dout="$dout ${dw%%=ey*}=ey***MASKED***" ;;
+                                    *) dout="$dout $dw" ;;
+                                esac ;;
+                            *) dout="$dout $dw" ;;
+                        esac
+                    done
+                    printf '%s\n' "${dout# }" ;;
+                *) printf '%s\n' "$dl" ;;
+            esac
+        done < "$svcfile"
         echo -e "  ${CYAN}--- end ---${NC}"
         echo
-        _tip "若 token 解析为空但文件里有 ey... 串, 请把以上内容(token 用 xxx 替代)反馈给开发者"
+        _tip "以上 token 已掩码, 可直接反馈给开发者"
     else
         _warn "service 文件不存在"
     fi
