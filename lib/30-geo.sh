@@ -24,12 +24,16 @@ _ensure_cron_running() {
 # 执行一次 Geo 更新(备份旧 dat → 下载覆盖 → 重启 xray)
 # ---------------------------------------------------------------------------
 _geo_update() {
-    _ensure_dirs
+    _ensure_dirs || return 1
     # M26: cron 环境下 _info/_warn 输出到 stdout 会产生噪音邮件, 重定向到日志
     if [ ! -t 0 ]; then
         exec >> "$GEO_LOG" 2>&1
     fi
-    local tmp; tmp=$(mktemp -d)
+    # R38(M5): mktemp -d 失败必须中止 —— 否则 tmp="" 会让 t="/geosite.dat", 两个 20MB+
+    # 的 dat 被下载到根目录, 且末尾 rm -rf "$tmp" 变成 rm -rf "" 空操作, 文件永久残留。
+    # /tmp 写满/只读/inode 耗尽正是本 PR 关注的低配 VPS 场景。
+    local tmp
+    tmp=$(mktemp -d) || { _error "无法创建临时目录(/tmp 写满或只读?), Geo 更新中止"; return 1; }
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
     _info "[$ts] 开始更新 Geo 数据..."
 
@@ -38,7 +42,7 @@ _geo_update() {
     for f in geosite.dat geoip.dat; do
         local url="$GEO_BASE/$f" dest="$ASSET_DIR/$f" t="${tmp}/${f}"
         _info "下载 $f <- $url"
-        if ! wget -q --timeout=60 -O "$t" "$url" 2>/dev/null; then
+        if ! _http_download "$url" "$t" 60; then
             _warn "$f 下载失败, 保留旧文件"
             ok=0; continue
         fi
@@ -48,10 +52,22 @@ _geo_update() {
             _warn "$f 体积异常(${sz}B), 保留旧文件"
             ok=0; rm -f "$t"; continue
         fi
-        # 覆盖前备份旧 dat (S9: 运行期 -test 校验失败或下载部分失败时可回退)
-        [ -f "$dest" ] && { cp -f "$dest" "$dest.bak"; backed+=("$dest"); }
-        # 原子替换
-        mv -f "$t" "$dest"
+        # 覆盖前备份旧 dat (S9: 运行期校验失败或部分下载失败时可回退)。
+        # 备份必须真正成功才允许覆盖: 磁盘满/IO 错误导致 cp 失败时, 若继续 mv 会让旧 dat
+        # 无备份可回滚 → 数据集不一致。备份失败则保留旧文件、本次不替换。
+        if [ -f "$dest" ]; then
+            if ! cp -f "$dest" "$dest.bak"; then
+                _warn "$f 旧文件备份失败(磁盘空间/IO?), 保留旧文件, 跳过本次替换"
+                ok=0; rm -f "$t"; continue
+            fi
+            backed+=("$dest")
+        fi
+        # 原子替换。mv 失败(磁盘满/IO/只读)时旧 dat 仍在原位, 不能报"更新成功"并随后删除 .bak;
+        # 置 ok=0 走"部分失败"分支, 由 backed[] 里的 .bak 把旧 dat 还原回来。
+        if ! mv -f "$t" "$dest"; then
+            _warn "$f 替换失败(磁盘空间/IO/只读?), 保留旧文件, 跳过本次更新"
+            ok=0; rm -f "$t"; continue
+        fi
         _success "$f 更新成功 (${sz}B)"
     done
 
@@ -60,17 +76,70 @@ _geo_update() {
     # 日志 + 校验
     mkdir -p "$LOG_DIR"
     if [ "$ok" -eq 1 ]; then
-        echo "[$ts] OK 全部更新成功" >> "$GEO_LOG"
-        # 清理备份 + 重启 xray
-        for dest in "${backed[@]}"; do rm -f "${dest}.bak" 2>/dev/null; done
-        _manage_xray restart 2>/dev/null || true
+        # 低内存机器不跑 xray -test(双份加载 OOM); 改为重启后做稳定存活确认。
+        # 仅当 xray 已安装且原本在运行/存在配置时才重启验证
+        local need_verify=0
+        if [ -x "$XRAY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
+            case "$(_manage_xray status 2>/dev/null)" in running) need_verify=1;; esac
+        fi
+        if [ "$need_verify" -eq 1 ]; then
+            if _restart_xray_verified; then
+                for dest in "${backed[@]}"; do rm -f "${dest}.bak" 2>/dev/null; done
+                echo "[$ts] OK 全部更新成功, xray 重启稳定" >> "$GEO_LOG"
+            else
+                # 新 dat 导致 xray 无法稳定运行: 回退旧 dat 并重新拉起
+                # R38(M4): 必须统计"实际回退了几个"——backed[] 只在旧文件存在时才追加, 首次
+                # 部署/assets 被清过的机器上它是空数组, 循环一次都不跑, 坏 dat 原样留在盘上,
+                # 而日志却写"已回退旧 dat"。cron 每月一次, 这行日志是用户唯一的诊断依据。
+                _warn "新 Geo 数据导致 xray 运行异常, 回退旧 dat"
+                local rolled=0
+                for dest in "${backed[@]}"; do
+                    if [ -f "${dest}.bak" ]; then
+                        if mv -f "${dest}.bak" "$dest"; then
+                            rolled=$((rolled+1))
+                        else
+                            _warn "回滚 ${dest} 失败, 请手动检查"
+                        fi
+                    fi
+                done
+                # R38(M4): 回退后是否救回来了, 是值班时最需要知道的一件事; 不能用
+                # `2>/dev/null || true` 把结果一并吞掉
+                local recovered="xray 仍未稳定运行, 需人工介入"
+                if _restart_xray_verified; then
+                    recovered="xray 已恢复运行"
+                fi
+                if [ "$rolled" -eq 0 ]; then
+                    _warn "无旧 dat 可回退(首次安装/assets 曾被清空), 新 dat 仍在 ${ASSET_DIR}"
+                    echo "[$ts] FAIL 新 dat 运行期校验失败, 无旧 dat 可回退, ${recovered}" >> "$GEO_LOG"
+                else
+                    echo "[$ts] FAIL 新 dat 运行期校验失败, 已回退 ${rolled} 个旧 dat, ${recovered}" >> "$GEO_LOG"
+                fi
+                return 1
+            fi
+        else
+            # xray 未安装/未运行: 无需重启, 清理备份
+            for dest in "${backed[@]}"; do rm -f "${dest}.bak" 2>/dev/null; done
+            echo "[$ts] OK 全部更新成功(xray 未运行, 已跳过重启)" >> "$GEO_LOG"
+        fi
         return 0
     else
         # 部分下载失败: 回退已替换的文件, 保持 dat 对一致性
+        # R38(M4): 同样统计实际回退数量, 并区分"有旧文件可回退"与"某份是首次下载"
+        local rolled=0
         for dest in "${backed[@]}"; do
-            [ -f "${dest}.bak" ] && mv -f "${dest}.bak" "$dest"
+            if [ -f "${dest}.bak" ]; then
+                if mv -f "${dest}.bak" "$dest"; then
+                    rolled=$((rolled+1))
+                else
+                    _warn "回滚 ${dest} 失败, 请手动检查"
+                fi
+            fi
         done
-        echo "[$ts] PARTIAL 部分失败, 旧 dat 已保留" >> "$GEO_LOG"
+        if [ "$rolled" -eq 0 ]; then
+            echo "[$ts] PARTIAL 部分失败, 无已替换文件需回退" >> "$GEO_LOG"
+        else
+            echo "[$ts] PARTIAL 部分失败, 已回退 ${rolled} 个旧 dat" >> "$GEO_LOG"
+        fi
         return 1
     fi
 }

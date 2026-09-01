@@ -25,12 +25,31 @@ _detect_init_system() {
 # ---------------------------------------------------------------------------
 _detect_os_family() {
     if [ -f /etc/os-release ]; then
-        . /etc/os-release 2>/dev/null
-        case "$ID" in
-            debian|ubuntu) echo "debian" ;;
-            alpine)        echo "alpine" ;;
-            *)             echo "${ID:-unknown}" ;;
-        esac
+        # shellcheck disable=SC1091
+        # R38(M2): 用子 shell 隔离 —— `. /etc/os-release` 会把 ID/NAME/VERSION/PRETTY_NAME
+        # 等 20+ 个大写变量注入调用者作用域。当前 4 个调用点都是命令替换(污染限于子 shell),
+        # 但函数本身没有任何防护, 一次裸调用就会静默覆盖同名变量。
+        (
+            . /etc/os-release 2>/dev/null
+            # R38(M2): 必须用 ${ID:-} —— 入口有 set -u, 而部分裁剪镜像/自制 rootfs 的
+            # os-release 只写 NAME/PRETTY_NAME 而没有 ID=; 裸 "$ID" 会让子 shell 以
+            # "ID: unbound variable" 直接退出, 下面 ${ID:-unknown} 的兜底永远到不了,
+            # 调用方拿到空串并报"不支持的系统"。
+            case "${ID:-}" in
+                debian|ubuntu) echo "debian" ;;
+                alpine)        echo "alpine" ;;
+                *)
+                    # 衍生版(Mint/Kali/Raspbian/Devuan/Pop!_OS 等)通过 ID_LIKE 归类
+                    # R38(M2): 同时覆盖 alpine 系衍生版(postmarketOS 等), 否则它们会落到
+                    # echo "$ID" 而被 _pkg_install 判为"不支持的系统"
+                    case " ${ID_LIKE:-} " in
+                        *" debian "*|*" ubuntu "*) echo "debian" ;;
+                        *" alpine "*)              echo "alpine" ;;
+                        *) echo "${ID:-unknown}" ;;
+                    esac
+                    ;;
+            esac
+        )
     else
         echo "unknown"
     fi

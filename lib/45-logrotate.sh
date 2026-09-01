@@ -72,6 +72,9 @@ $LOG_DIR/access.log $LOG_DIR/error.log {
     notifempty
 }
 EOF
+    # R38(M14): umask 077 会让配置生成为 0600; logrotate 读它时不受影响(root 运行),
+    # 但系统集成文件按惯例给 644, 避免与其他工具/审计脚本产生困惑。
+    chmod 644 "$LOGROTATE_CONF" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
