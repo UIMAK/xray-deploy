@@ -29,7 +29,11 @@ _geo_update() {
     if [ ! -t 0 ]; then
         exec >> "$GEO_LOG" 2>&1
     fi
-    local tmp; tmp=$(mktemp -d)
+    # R38(M5): mktemp -d 失败必须中止 —— 否则 tmp="" 会让 t="/geosite.dat", 两个 20MB+
+    # 的 dat 被下载到根目录, 且末尾 rm -rf "$tmp" 变成 rm -rf "" 空操作, 文件永久残留。
+    # /tmp 写满/只读/inode 耗尽正是本 PR 关注的低配 VPS 场景。
+    local tmp
+    tmp=$(mktemp -d) || { _error "无法创建临时目录(/tmp 写满或只读?), Geo 更新中止"; return 1; }
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
     _info "[$ts] 开始更新 Geo 数据..."
 
@@ -84,14 +88,32 @@ _geo_update() {
                 echo "[$ts] OK 全部更新成功, xray 重启稳定" >> "$GEO_LOG"
             else
                 # 新 dat 导致 xray 无法稳定运行: 回退旧 dat 并重新拉起
+                # R38(M4): 必须统计"实际回退了几个"——backed[] 只在旧文件存在时才追加, 首次
+                # 部署/assets 被清过的机器上它是空数组, 循环一次都不跑, 坏 dat 原样留在盘上,
+                # 而日志却写"已回退旧 dat"。cron 每月一次, 这行日志是用户唯一的诊断依据。
                 _warn "新 Geo 数据导致 xray 运行异常, 回退旧 dat"
+                local rolled=0
                 for dest in "${backed[@]}"; do
-                    if [ -f "${dest}.bak" ] && ! mv -f "${dest}.bak" "$dest"; then
-                        _warn "回滚 ${dest} 失败, 请手动检查"
+                    if [ -f "${dest}.bak" ]; then
+                        if mv -f "${dest}.bak" "$dest"; then
+                            rolled=$((rolled+1))
+                        else
+                            _warn "回滚 ${dest} 失败, 请手动检查"
+                        fi
                     fi
                 done
-                _restart_xray_verified 2>/dev/null || true
-                echo "[$ts] FAIL 新 dat 运行期校验失败, 已回退旧 dat" >> "$GEO_LOG"
+                # R38(M4): 回退后是否救回来了, 是值班时最需要知道的一件事; 不能用
+                # `2>/dev/null || true` 把结果一并吞掉
+                local recovered="xray 仍未稳定运行, 需人工介入"
+                if _restart_xray_verified; then
+                    recovered="xray 已恢复运行"
+                fi
+                if [ "$rolled" -eq 0 ]; then
+                    _warn "无旧 dat 可回退(首次安装/assets 曾被清空), 新 dat 仍在 ${ASSET_DIR}"
+                    echo "[$ts] FAIL 新 dat 运行期校验失败, 无旧 dat 可回退, ${recovered}" >> "$GEO_LOG"
+                else
+                    echo "[$ts] FAIL 新 dat 运行期校验失败, 已回退 ${rolled} 个旧 dat, ${recovered}" >> "$GEO_LOG"
+                fi
                 return 1
             fi
         else
@@ -102,12 +124,22 @@ _geo_update() {
         return 0
     else
         # 部分下载失败: 回退已替换的文件, 保持 dat 对一致性
+        # R38(M4): 同样统计实际回退数量, 并区分"有旧文件可回退"与"某份是首次下载"
+        local rolled=0
         for dest in "${backed[@]}"; do
-            if [ -f "${dest}.bak" ] && ! mv -f "${dest}.bak" "$dest"; then
-                _warn "回滚 ${dest} 失败, 请手动检查"
+            if [ -f "${dest}.bak" ]; then
+                if mv -f "${dest}.bak" "$dest"; then
+                    rolled=$((rolled+1))
+                else
+                    _warn "回滚 ${dest} 失败, 请手动检查"
+                fi
             fi
         done
-        echo "[$ts] PARTIAL 部分失败, 旧 dat 已保留" >> "$GEO_LOG"
+        if [ "$rolled" -eq 0 ]; then
+            echo "[$ts] PARTIAL 部分失败, 无已替换文件需回退" >> "$GEO_LOG"
+        else
+            echo "[$ts] PARTIAL 部分失败, 已回退 ${rolled} 个旧 dat" >> "$GEO_LOG"
+        fi
         return 1
     fi
 }

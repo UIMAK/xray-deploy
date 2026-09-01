@@ -466,6 +466,15 @@ _check_script_update() {
                     _error "更新脚本下载失败(网络受限?), 当前版本未变动"
                     _press_any_key; return
                 fi
+                # R38(M13): 只判非空挡不住"截断但非空"的下载(chunked 传输、劫持插入的 HTML
+                # 片段、CDN 部分内容)。install.sh 头部就有 root 检查/依赖安装/mkdir 等副作用,
+                # 半截脚本执行到 download_all 定义前断掉会留下不可预期的中间状态。
+                # bash -n 只做语法解析、不执行任何命令, 能拦掉绝大多数截断。
+                if ! bash -n "$updater" 2>/dev/null; then
+                    rm -f "$updater"
+                    _error "更新脚本不完整或语法异常(下载被截断?), 当前版本未变动"
+                    _press_any_key; return
+                fi
                 if bash "$updater" --update; then
                     rm -f "$updater"
                     _success "脚本已更新, 下次进菜单生效"
@@ -609,7 +618,12 @@ _hy2_toggle_brutal() {
             ;;
     esac
     # 重建分享链接
-    local link; link=$(_rebuild_hy2_link "$meta")
+    # R38(M10): 消费 rebuild 返回码 —— 元数据缺必填字段时不能把空/含 null 的链接写回去
+    local link
+    if ! link=$(_rebuild_hy2_link "$meta") || [ -z "$link" ]; then
+        _warn "拥塞控制已切换, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
+        _press_any_key; return
+    fi
     _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
     _press_any_key
 }
@@ -667,7 +681,12 @@ _hy2_adjust_bandwidth() {
         _error "带宽调整失败, 已回滚"; _press_any_key; return
     fi
     _meta_update "$meta" '.brutal_up=$up | .brutal_down=$down' --arg up "$new_up" --arg down "$new_down" || { _error "带宽元数据写入失败"; _press_any_key; return; }
-    local link; link=$(_rebuild_hy2_link "$meta")
+    # R38(M10): 消费 rebuild 返回码
+    local link
+    if ! link=$(_rebuild_hy2_link "$meta") || [ -z "$link" ]; then
+        _warn "带宽已更新, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
+        _press_any_key; return
+    fi
     _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
     _success "带宽已更新: 上传=${new_up:-不限}  下载=${new_down:-不限}"
     _press_any_key
@@ -707,6 +726,11 @@ _reality_domain_menu() {
     local new_sni
     read -rp "  新伪装域名 (回车取消): " new_sni
     [ -z "$new_sni" ] && { _info "已取消"; _press_any_key; continue; }
+    # R38(P1): 新 SNI 会被拼进新 tunnel tag, 含空格/引号会破坏按 tag 的关联匹配
+    if ! _validate_domain "$new_sni"; then
+        _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $new_sni"
+        _press_any_key; continue
+    fi
 
     local new_target="${new_sni}:443"
 
@@ -780,7 +804,13 @@ _reality_domain_menu() {
         _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag)' \
             --arg sni "$new_sni" --arg pqv "$pq_verify" || { _error "元数据写入失败"; _press_any_key; continue; }
     fi
-    local newlink; newlink=$(_rebuild_reality_link "$meta")
+    # R38(M10): 消费 rebuild 返回码 —— SNI 已改, 但链接重建失败时不能写入空/坏链接
+    local newlink
+    if ! newlink=$(_rebuild_reality_link "$meta") || [ -z "$newlink" ]; then
+        _warn "域名已切换为 ${new_sni}, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
+        _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
+        _press_any_key; continue
+    fi
     _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || { _error "分享链接写入失败"; _press_any_key; continue; }
 
     _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"

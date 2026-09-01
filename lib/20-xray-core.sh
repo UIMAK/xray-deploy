@@ -282,24 +282,34 @@ _install_or_switch_xray() {
     local newv
     newv=$(_xray_current_version 2>/dev/null)
     _state_set channel "$channel" || _warn "状态持久化失败(channel)"
-    if [ -n "$newv" ]; then
-        _state_set version "$newv" || _warn "状态持久化失败(version)"
-    fi
 
     if [ "$started_ok" -ne 1 ]; then
         # 新二进制可执行但无法稳定运行(如当前配置与新版本不兼容): 回滚到替换前的旧二进制并重新拉起,
         # 与 config/geo 的失败回滚保持同一事务级别。首次安装无 .bak 时只报错。
+        # R38(M1): version 状态必须反映"磁盘上实际的那个二进制"。原实现在这段之前就无条件
+        # _state_set version "$newv", 回滚到旧二进制后 state 里仍是新版本, 而菜单
+        # (_xray_cached_version)优先读 state, 于是版本显示与现实长期不一致。
+        local rolled_back=0
         if [ -f "$XRAY_BIN.bak" ]; then
             if mv -f "$XRAY_BIN.bak" "$XRAY_BIN"; then
                 chmod +x "$XRAY_BIN"
                 _manage_xray restart >/dev/null 2>&1 || _manage_xray start >/dev/null 2>&1 || true
+                rolled_back=1
                 _warn "新核心 v${newv:-?} 未能稳定运行, 已回滚到旧二进制 v${cur:-?}"
             else
                 _error "旧二进制回滚失败, 请手动处理 $XRAY_BIN"
             fi
         fi
+        # 回滚成功 → state 记旧版本; 回滚失败/首次安装 → 磁盘上是新二进制, 记新版本
+        local recv
+        recv=$(_xray_current_version 2>/dev/null)
+        [ -n "$recv" ] || { [ "$rolled_back" -eq 1 ] && recv="$cur" || recv="$newv"; }
+        [ -n "$recv" ] && { _state_set version "$recv" || _warn "状态持久化失败(version)"; }
         _error "Xray 二进制已替换, 但服务未能稳定运行, 请检查配置"
         return 1
+    fi
+    if [ -n "$newv" ]; then
+        _state_set version "$newv" || _warn "状态持久化失败(version)"
     fi
     # verified 稳定运行后才丢弃旧二进制备份
     rm -f "$XRAY_BIN.bak"
@@ -431,8 +441,15 @@ _xray_test_config() {
 
 # ---------------------------------------------------------------------------
 # 计算可安全抬升的 nofile。目标 65535; 但在受限容器里若当前 hard 上限更低, 把限制
-# 抬到上限之上会 EPERM, 导致 systemd/openrc 在 exec 前中止(H2 同类)。此时输出空串,
-# 表示"不要设置、继承容器默认", 宁可低一点也不能让服务起不来。
+# 抬到上限之上会 EPERM, 导致 systemd/openrc 在 exec 前中止(H2 同类)。
+# R38(M2): hard < 65535 时不能输出空串 —— 那样 systemd unit 里就不写 LimitNOFILE,
+# 服务会落到 systemd 的 DefaultLimitNOFILE(soft 1024), 比改动前的 65535 低两个数量级,
+# 代理进程很容易 "too many open files"。改为"能抬到 65535 就抬, 否则抬到探测到的
+# hard 上限", 既不触发 EPERM, 也不会静默降到 1024。
+# 已知局限: 这里读的是**管理脚本自己**的 /proc/self/limits; systemd 给服务设的限制来自
+# DefaultLimitNOFILE, 且 PID1 通常有 CAP_SYS_RESOURCE 能抬到系统 hard 之上, 因此这个
+# 探测对 systemd 只是保守下界。openrc 侧(rc_ulimit 由与本脚本同环境的 supervise-daemon
+# 执行)判据是准确的。
 # ---------------------------------------------------------------------------
 _safe_nofile() {
     local target=65535 hard="" f
@@ -447,8 +464,16 @@ _safe_nofile() {
         hard=$(ulimit -Hn 2>/dev/null)
     fi
     if [ "$hard" = "unlimited" ]; then echo "$target"; return; fi
-    if [[ "$hard" =~ ^[0-9]+$ ]] && [ "$hard" -ge "$target" ]; then echo "$target"; fi
-    # 数字但 < target, 或读不到/异常: 输出空(不设置, 继承默认, 绝不抬到上限之上触发 EPERM)
+    if [[ "$hard" =~ ^[0-9]+$ ]]; then
+        if [ "$hard" -ge "$target" ]; then
+            echo "$target"
+        else
+            # 数字但 < target: 抬到 hard 上限本身(等于当前上限, 不会 EPERM), 绝不留空
+            echo "$hard"
+        fi
+        return
+    fi
+    # 读不到/异常: 输出空(不设置, 继承默认), 这是唯一无法判断的情况
 }
 
 # ---------------------------------------------------------------------------
@@ -480,6 +505,10 @@ ${nofile_line}
 [Install]
 WantedBy=multi-user.target
 EOF
+    # R38(M14): umask 077 会让 unit 文件生成为 0600, systemd 会记 "marked
+    # world-inaccessible" 告警。unit 不含机密(token 在 cloudflared 侧, 且那本就是既有形态),
+    # 显式给 644 以符合系统集成惯例。
+    chmod 644 /etc/systemd/system/xray.service 2>/dev/null || true
     systemctl daemon-reload
     systemctl enable xray 2>/dev/null
 }
@@ -487,7 +516,7 @@ EOF
 _create_xray_openrc_service() {
     local rc_ulimit_line=""
     local _nf; _nf=$(_safe_nofile)
-    # 仅当 hard 上限足够时才抬 nofile; 受限容器留空(继承默认), 避免 EPERM 中止 exec
+    # 抬到"目标 65535 或当前 hard 上限"(见 _safe_nofile); 只有完全探测不到时才留空
     [ -n "$_nf" ] && rc_ulimit_line="rc_ulimit=\"-n $_nf\""
     cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
@@ -499,7 +528,7 @@ supervisor=supervise-daemon
 respawn_delay=5
 
 pidfile="/run/\${RC_SVCNAME}.pid"
-# nofile 仅在当前 hard 上限 >= 65535 时才抬升(见 _safe_nofile); 受限容器此行为空。
+# nofile 抬到 65535, 若当前 hard 上限更低则抬到该上限(见 _safe_nofile); 完全探测不到时此行为空。
 # 不要写 -u(nproc), 也不要写超过容器上限的值: 抬升超限会 EPERM, OpenRC 在 exec 前
 # 即中止, xray 子进程根本不会启动。
 ${rc_ulimit_line}
@@ -538,16 +567,35 @@ _create_xray_service() {
 #       放弃重生时 supervisor 仍存活 -> kill -0 pidfile 会假阳性"running"。
 # 坑2: 部分 LXC/Podman 容器内 busybox 的 pidof / pgrep -x 按名精确匹配会假阴性
 #       (实测连运行中的 sshd 都匹配不到), 只有直接读 /proc/<pid>/comm 可靠。
-# 策略: pidof 快路径(常规 glibc/alpine) + 扫描 /proc comm 精确匹配兜底(容器)。
+# R38(M3): 只按 comm 全机扫描还有第三个坑 —— 会把**别的** xray 安装(x-ui/3x-ui 迁移残留、
+#       用户手动跑的实例)也算成"我们的服务在跑", 于是本脚本的 unit 起不来也判 running,
+#       _restart_xray_verified 恒成功。故判活优先绑定到本 service 的进程树:
+#         systemd: MainPID(权威, unit 自己的主进程)
+#         openrc : pidfile(supervisor pid) → 回溯 ppid 链找 comm==xray 的子进程
+#         direct : 我们自己 nohup 的 pidfile
+#       三者都拿不到 anchor 时才回退到全机扫描(已知局限: 无法区分他人实例, 见 _proc_any_named)。
 # ---------------------------------------------------------------------------
 _xray_is_running() {
-    if pidof xray >/dev/null 2>&1; then return 0; fi
-    local p c
-    for p in /proc/[0-9]*; do
-        read -r c 2>/dev/null < "$p/comm" || continue
-        [ "$c" = "xray" ] && return 0
-    done
-    return 1
+    local anchor=""
+    case "$INIT_SYSTEM" in
+        systemd)
+            anchor=$(systemctl show -p MainPID --value xray 2>/dev/null)
+            if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ]; then
+                _proc_named_under "$anchor" xray && return 0
+                return 1
+            fi
+            ;;
+        openrc|direct)
+            anchor=$(cat /run/xray.pid 2>/dev/null)
+            if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] && [ -d "/proc/$anchor" ]; then
+                _proc_named_under "$anchor" xray && return 0
+                return 1
+            fi
+            ;;
+    esac
+    # 拿不到 service anchor(未安装 unit / pidfile 缺失 / 容器内 systemctl 不可用):
+    # 回退到全机 comm 扫描。这是 best-effort, 无法排除宿主上其他 xray 实例。
+    _proc_any_named xray
 }
 
 # ---------------------------------------------------------------------------
