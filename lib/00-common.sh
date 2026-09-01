@@ -182,6 +182,30 @@ _validate_domain() {
 }
 
 # ---------------------------------------------------------------------------
+# 生成 Reality 的 tunnel inbound tag(R39)
+# 形态: Tunnel-<sni>-<tunnel_port>-<reality_port>
+# 为什么要单独封装并限长: tag 是内部标识, 不该无界地携带 display 信息。合法 SNI 最长
+# 253 字符, 拼出来的 tag 可达 270+; 虽然本项目从不用 tunnel_tag 作文件名(metadata 文件名
+# 是 xd-<proto>-<port>), config.json 也能容纳, 但超长 tag 会污染菜单显示、日志与人工排查,
+# 且一旦将来有人拿 tag 拼路径就会撞上 NAME_MAX(255)。这里把 SNI 段截断, 使整个 tag
+# <= 200 字符 —— 关联推导不受影响: 主键是 realitySettings.target 的端口, legacy 兜底按
+# "-<reality_port>" 后缀匹配, 两者都不依赖 SNI 段的完整性。
+# 用法: tag=$(_gen_tunnel_tag <sni> <tunnel_port> <reality_port>)
+# ---------------------------------------------------------------------------
+_gen_tunnel_tag() {
+    local sni="$1" tport="$2" nport="$3"
+    local suffix="-${tport}-${nport}"
+    local max=200
+    # 预算 = 200 - len("Tunnel-") - len(suffix)
+    local budget=$(( max - 7 - ${#suffix} ))
+    [ "$budget" -lt 8 ] && budget=8
+    if [ "${#sni}" -gt "$budget" ]; then
+        sni="${sni:0:$budget}"
+    fi
+    printf 'Tunnel-%s%s' "$sni" "$suffix"
+}
+
+# ---------------------------------------------------------------------------
 # YAML 双引号标量最小转义(R38)
 # clash.yaml 的 proxy 条目是单行 flow 映射, 用户可控字段(节点名/密码/SNI/地址)直接
 # 插进 "..." 里。实测(pyyaml)双引号标量内只有三类字符会破坏或改变语义:

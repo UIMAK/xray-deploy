@@ -752,7 +752,8 @@ _reality_domain_menu() {
     else
         tunnel_port=$(jq -r '.tunnel_port' "$meta")
         node_port=$(jq -r '.port' "$meta")
-        new_tunnel_tag="Tunnel-${new_sni}-${tunnel_port}-${node_port}"
+        # R39(P2): 与创建路径统一走 _gen_tunnel_tag(tag 长度封顶)
+        new_tunnel_tag=$(_gen_tunnel_tag "$new_sni" "$tunnel_port" "$node_port")
     fi
     if [ -n "$pq_seed" ]; then
         if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
