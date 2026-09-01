@@ -170,6 +170,38 @@ _validate_port() {
 }
 
 # ---------------------------------------------------------------------------
+# 域名合法性校验(R38): 伪装域名会被拼进 inbound tag(Tunnel-<sni>-<tport>-<port>),
+# tag 含空格/引号会破坏后续按 tag 的关联匹配与 Clash 条目; 从输入侧就禁止。
+# 只接受 LDH 形式(字母/数字/连字符, 点分段), 单段 1-63 字符, 总长 <=253。
+# ---------------------------------------------------------------------------
+_validate_domain() {
+    local d="$1"
+    [ -n "$d" ] || return 1
+    [ "${#d}" -le 253 ] || return 1
+    [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# YAML 双引号标量最小转义(R38)
+# clash.yaml 的 proxy 条目是单行 flow 映射, 用户可控字段(节点名/密码/SNI/地址)直接
+# 插进 "..." 里。实测(pyyaml)双引号标量内只有三类字符会破坏或改变语义:
+#   "  -> 提前闭合标量, 整份 YAML 不可解析(不只该节点, 导致整个订阅报错)
+#   \  -> 被当作转义引导符, 值被静默改写
+#   CR/LF -> 条目被截成两行, flow 映射结构损坏
+# 其余(  {} , # : ' 空格 Tab 中文 )在双引号内均安全, 无需处理。
+# 用法: v=$(_yaml_dq "$raw"); 输出的是"可直接放进双引号内"的内容, 不含外层引号。
+# ---------------------------------------------------------------------------
+_yaml_dq() {
+    local s="$1"
+    s="${s//\\/\\\\}"   # 反斜杠先转义(必须最先, 否则会二次转义下面新加的反斜杠)
+    s="${s//\"/\\\"}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# ---------------------------------------------------------------------------
 # 端口占用检测(复用 singbox-lite 思路)
 # ---------------------------------------------------------------------------
 _check_port_occupied() {
@@ -201,9 +233,19 @@ _atomic_write_json() {
         _error "写入临时 JSON 文件失败: $target"
         return 1
     fi
-    # 语法校验(jq 可用时)
+    # R38(P1): 空内容必须拦在这里。上游普遍写成 _atomic_write_json "$f" "$(jq ...)",
+    # jq 失败时命令替换为空串; 而 `jq empty` 对 0 字节/纯空白文件返回 0(不报错),
+    # 于是会把空文件当合法 JSON 提交 —— 表现为"节点元数据变 0 字节却报创建成功"、
+    # "config.json 被截断成 0 字节"、"回滚到空配置却报回滚成功"。
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        _error "生成的 JSON 内容为空,已放弃写入: $target"
+        return 1
+    fi
+    # 语法校验(jq 可用时)。用 `jq -e .` 而非 `jq empty`: -e 让 null/false 也判失败,
+    # 空白输入返回 4, 从而拒绝"语法上没报错但没有内容"的情况。
     if command -v jq >/dev/null 2>&1; then
-        if ! jq empty "$tmp" 2>/dev/null; then
+        if ! jq -e . "$tmp" >/dev/null 2>&1; then
             rm -f "$tmp"
             _error "生成的 JSON 语法不合法,已放弃写入"
             return 1
@@ -225,6 +267,8 @@ _meta_update() {
     local target="$1" filter="$2"; shift 2
     local content
     content=$(jq "$@" "$filter" "$target") || { _error "元数据变换失败: $target"; return 1; }
+    # R38(P1): jq 对 0 字节输入返回 0 且输出空; 空内容不得提交(会把 metadata 清成 0 字节)
+    [ -n "$content" ] || { _error "元数据变换结果为空(源文件损坏?): $target"; return 1; }
     _atomic_write_json "$target" "$content"
 }
 
@@ -287,6 +331,9 @@ _backup_config() {
     # 注意: busybox/musl 的 mktemp 要求模板以 XXXXXX 结尾, 后缀必须放在 X 之前(否则 EINVAL)
     tmp=$(mktemp "${BACKUP_DIR}/config.json.bak.XXXXXX") || return 1
     cp -f "$CONFIG_FILE" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    # R38(P1): 备份必须非空——磁盘满时 cp 可能返回 0 却只落地 0 字节, 之后 _restore_config
+    # 就会以"空配置"回滚。空备份视为备份失败, 由调用方中止事务。
+    [ -s "$tmp" ] || { rm -f "$tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
     # 备份含密码/UUID/私钥等敏感信息: chmod 600 失败视为备份失败(R13), 不能留下 0644 备份
     chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     # R23: lastbak 原子更新 — 先写临时文件并 chmod, 再 mv; 旧 lastbak 保持到新备份完整成功。
@@ -294,6 +341,8 @@ _backup_config() {
     local last_tmp
     last_tmp=$(mktemp "${BACKUP_DIR}/config.json.lastbak.XXXXXX") || { rm -f "$tmp"; return 1; }
     cp -f "$CONFIG_FILE" "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
+    # R38(P1): 同上——lastbak 是回滚基础, 0 字节比"没有备份"更危险
+    [ -s "$last_tmp" ] || { rm -f "$tmp" "$last_tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
     chmod 600 "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     mv -f "$last_tmp" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     # 轮转历史快照: 仅保留最新 10 份随机备份(回滚只用 lastbak, 其余仅作人工追溯)
@@ -310,6 +359,13 @@ _restore_config() {
     [ -f "$BACKUP_DIR/config.json.lastbak" ] || return 1
     # R23: 原子回滚 — 直接 cp 覆盖在 I/O 失败时可能把 config 截断成半截(比回滚失败更糟);
     # 复用 _atomic_write_json(tmp 构造→校验→mv), 失败时旧 config 保持原样
+    # R38(P1): 备份本身可能是 0 字节(上一次备份时磁盘满等), 必须先判非空——否则
+    # "回滚"会把 config.json 变成空文件却报成功(_atomic_write_json 已补空内容拦截, 这里
+    # 再前置判断以给出准确原因)。
+    [ -s "$BACKUP_DIR/config.json.lastbak" ] || {
+        _error "备份文件为空, 无法回滚($BACKUP_DIR/config.json.lastbak)"
+        return 1
+    }
     local content
     content=$(cat "$BACKUP_DIR/config.json.lastbak" 2>/dev/null) || { _error "读取备份失败($BACKUP_DIR/config.json.lastbak)"; return 1; }
     if ! _atomic_write_json "$CONFIG_FILE" "$content"; then
@@ -349,6 +405,8 @@ _gen_rand_path() {
 # 幂等操作, 可在启动/检查配置时安全调用
 # R35(P2): 复用 _atomic_write_json 单一严格写入器(内存变换 -> 原子写), 不再维护第二套
 # tmp/mv 逻辑; 失败时原文件保持原样, 调用方(启动/检查)均不检查返回值, 不阻塞。
+# R38(P1): jq 对"只含空白的文件"不报错但输出空, 旧写法会把 config.json 截断成 0 字节。
+# 现由 _atomic_write_json 的空内容拦截兜住, 这里再显式判一次以避免无谓的错误输出。
 # ---------------------------------------------------------------------------
 _normalize_config_format() {
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
@@ -362,7 +420,70 @@ _normalize_config_format() {
         ($c | to_entries | map(select(.key as $k | $known | index($k) | not)) | from_entries) as $extra |
         $ordered + $extra
     ' "$CONFIG_FILE" 2>/dev/null) || return 0
+    # 变换结果为空(输入是空白/非对象): 保持原文件不动, 交由 xray 自己报配置错误
+    [ -n "$content" ] || return 0
     _atomic_write_json "$CONFIG_FILE" "$content"
+}
+
+# ---------------------------------------------------------------------------
+# 进程归属判定辅助(R38, M3)
+# 背景: 只按 comm 全机扫描"有没有叫 xray 的进程"会把**别的**安装(从 x-ui/3x-ui 迁移的
+# 残留、用户自己跑的 xray)也算成"我们的服务在跑" —— 于是本脚本的 unit 起不来也会被判
+# running, _restart_xray_verified 恒成功, 直接击穿本 PR 的核心保证。
+# 这两个 helper 用于把判活绑定到具体的 service 进程树上。
+# ---------------------------------------------------------------------------
+
+# 读取指定 pid 的父 pid。/proc/<pid>/stat 的 comm 字段可能含空格与括号,
+# 因此从最后一个 ') ' 之后开始取字段: $1=state $2=ppid。
+_proc_ppid() {
+    local pid="$1" line
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    line="${line##*') '}"
+    # shellcheck disable=SC2086
+    set -- $line
+    [ -n "${2:-}" ] || return 1
+    printf '%s' "$2"
+}
+
+# 判断"以 anchor_pid 为祖先(含自身)的进程里, 是否存在 comm == name 的进程"。
+# 用法: _proc_named_under <anchor_pid> <comm> [max_depth]
+# openrc 的 supervise-daemon 把自身 pid 写进 pidfile, 真正的业务进程是它的子进程,
+# 因此需要向上回溯 ppid 链来确认归属(默认回溯 4 层, 足够覆盖 supervisor→业务进程)。
+_proc_named_under() {
+    local anchor="$1" name="$2" depth="${3:-4}"
+    [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
+    [ "$anchor" != "0" ] || return 1
+    # anchor 自身就是目标进程
+    [ "$(cat "/proc/$anchor/comm" 2>/dev/null)" = "$name" ] && return 0
+    local p c cur i
+    for p in /proc/[0-9]*; do
+        read -r c 2>/dev/null < "$p/comm" || continue
+        [ "$c" = "$name" ] || continue
+        cur="${p#/proc/}"
+        i=0
+        while [ "$i" -lt "$depth" ]; do
+            cur=$(_proc_ppid "$cur") || break
+            [ "$cur" = "$anchor" ] && return 0
+            # 到达 init/内核态即停止回溯(写成显式 if, 不依赖 `A || B && C` 的结合律)
+            if [ "$cur" = "1" ] || [ "$cur" = "0" ]; then
+                break
+            fi
+            i=$((i+1))
+        done
+    done
+    return 1
+}
+
+# 全机按 comm 扫描(仅作最后回退; 已知局限: 无法区分本脚本管理的实例与宿主上其他同名进程)
+_proc_any_named() {
+    local name="$1" p c
+    if pidof "$name" >/dev/null 2>&1; then return 0; fi
+    for p in /proc/[0-9]*; do
+        read -r c 2>/dev/null < "$p/comm" || continue
+        [ "$c" = "$name" ] && return 0
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------------------

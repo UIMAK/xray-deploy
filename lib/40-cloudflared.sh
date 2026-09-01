@@ -41,14 +41,28 @@ _install_cloudflared_bin() {
     local url="$CF_DL_BASE/cloudflared-linux-${tag}"
     _info "下载 cloudflared <- $url"
     # 先下到同目录临时文件再原子替换, 避免半截文件留在最终路径(L7); curl 优先(H1)
-    local cf_tmp; cf_tmp=$(mktemp "${CF_BIN}.tmp.XXXXXX") || return 1
+    # R38(P1): chmod/mv 必须检查——mv 失败(分区满/只读/同名目录)时 $CF_BIN 根本不存在,
+    # 原实现却因末句 _success 返回 0 而报"安装成功", 且把 cloudflared.tmp.XXXXXX 留在
+    # 最终目录旁(正是本 PR 要消除的"半截文件留在最终路径")。与 20-xray-core.sh 的
+    # cp/mv/chmod 三步全查保持同一标准。
+    local cf_tmp; cf_tmp=$(mktemp "${CF_BIN}.tmp.XXXXXX") || {
+        _error "无法创建临时文件: ${CF_BIN}.tmp.XXXXXX(目录不可写/磁盘空间?)"
+        return 1
+    }
     if ! _http_download "$url" "$cf_tmp" 120; then
         rm -f "$cf_tmp"
         _error "cloudflared 下载失败"; return 1
     fi
-    chmod +x "$cf_tmp"
-    mv -f "$cf_tmp" "$CF_BIN"
+    if ! chmod +x "$cf_tmp"; then
+        rm -f "$cf_tmp"
+        _error "cloudflared 设置执行权限失败"; return 1
+    fi
+    if ! mv -f "$cf_tmp" "$CF_BIN"; then
+        rm -f "$cf_tmp"
+        _error "cloudflared 落地失败(磁盘空间/只读/权限?), 未安装"; return 1
+    fi
     _success "cloudflared 安装成功"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -296,6 +310,12 @@ _cf_write_service_line() {
 
 # 只替换 service 启动行里的 token, 保留用户原有的其他参数(不破坏手动装的好配置)
 # 用纯 bash 字符串替换(不依赖 sed -E 正则)
+# R38(P1): 必须跟踪"是否真的替换了至少一处"(replaced)。原实现只看写 tmp 是否成功, 于是
+#   (a) oldtok 非空但与文件实际字节不符(手动安装用 Environment=TUNNEL_TOKEN= / --token-file /
+#       token 被引号或换行包裹), 或 (b) oldtok 为空且行内没有裸 ey... 词,
+#   都会"零替换"却返回 0 —— 调用方随后用**旧 token** 重启, _cf_is_running 自然为真,
+#   于是写入新 token 到 state 并报「令牌已更新」。隧道仍挂旧账号, state 与 service 分裂。
+#   这正是本 PR 要消除的假成功, 与 _svc_replace_line 的 found 检查保持同一标准。
 _cf_replace_token_in_service() {
     local oldtok="$1" newtok="$2" svcfile
     case "$INIT_SYSTEM" in
@@ -306,10 +326,13 @@ _cf_replace_token_in_service() {
     [ -f "$svcfile" ] || return 1
     # 备份必须真正成功才允许改 service(失败可恢复)
     cp -f "$svcfile" "${svcfile}.bak" 2>/dev/null || { _error "service 备份失败: $svcfile"; return 1; }
-    local tmp write_ok=1
+    local tmp write_ok=1 replaced=0
     tmp=$(mktemp) || { _error "无法创建临时 service 文件: $svcfile"; return 1; }
     while IFS= read -r ln || [ -n "$ln" ]; do
         if [ -n "$oldtok" ]; then
+            case "$ln" in
+                *"$oldtok"*) replaced=1 ;;
+            esac
             printf '%s\n' "${ln//"$oldtok"/$newtok}" >> "$tmp" || write_ok=0
         else
             # oldtok 为空: 在该行里找 ey 开头的 token 字段替换
@@ -323,6 +346,7 @@ _cf_replace_token_in_service() {
                 esac
             done
             if [ "$rep" -eq 1 ]; then
+                replaced=1
                 printf '%s\n' "${out# }" >> "$tmp" || write_ok=0
             else
                 printf '%s\n' "$ln" >> "$tmp" || write_ok=0
@@ -333,6 +357,13 @@ _cf_replace_token_in_service() {
     if [ "$write_ok" -ne 1 ]; then
         _error "临时 service 文件写入失败(磁盘空间/IO?), 保留原文件"
         rm -f "$tmp"
+        return 1
+    fi
+    # R38(P1): 零替换必须失败——否则调用方会拿旧 token 重启并宣称"令牌已更新"
+    if [ "$replaced" -ne 1 ]; then
+        rm -f "$tmp" "${svcfile}.bak"
+        _error "未在 $svcfile 中找到可替换的令牌, 令牌未更新"
+        _tip "该 service 可能由 cloudflared 官方命令以其他形式写入(如 --token-file / Environment=), 请手动编辑 $svcfile 后重启"
         return 1
     fi
     _svc_commit "$svcfile" "$tmp" || return 1
@@ -350,11 +381,31 @@ _cf_replace_token_in_service() {
 }
 
 # ---------------------------------------------------------------------------
+# R38(P2): 统一的 cloudflared 进程发现。与 _cf_is_running 用同一套判据, 避免
+# "判活用 /proc 扫描、杀进程用 pgrep" 两套逻辑不一致: 容器内 busybox pgrep 假阴性时
+# _cf_kill_all 会报"已清理"而实际仍有残留, 随后 start 出第二个实例。
+# 另: procps 的 ps 无 -e 时只列当前 tty 的进程, cron 下几乎列不出东西, 必须带 -e。
+# 输出: 每行一个 PID(可能为空)
+# ---------------------------------------------------------------------------
+_cf_pids() {
+    local pids p c
+    pids=$(pidof cloudflared 2>/dev/null | tr ' ' '\n' | grep -e '^[0-9][0-9]*$')
+    if [ -n "$pids" ]; then
+        printf '%s\n' "$pids"
+        return 0
+    fi
+    for p in /proc/[0-9]*; do
+        read -r c 2>/dev/null < "$p/comm" || continue
+        [ "$c" = "cloudflared" ] && printf '%s\n' "${p#/proc/}"
+    done
+}
+
+# ---------------------------------------------------------------------------
 # 强力杀干净所有 cloudflared 进程(防止 PID 残留导致的进程泄漏)
 # openrc 的 rc-service stop 经常杀不干净, 必须内核级 kill 兜底
 # ---------------------------------------------------------------------------
 _cf_kill_all() {
-    local pids="" i
+    local pids="" pid i
 
     # 1. 按实际 init 系统走正确的 stop，并等待进程真正退出
     case "$INIT_SYSTEM" in
@@ -383,24 +434,29 @@ _cf_kill_all() {
     done
 
     # 3. 扫残留进程：先 SIGTERM（给 cloudflared 时间向 CF 边缘发送断开信号），等 3s，再 SIGKILL
-    pids=$(pgrep -x cloudflared 2>/dev/null \
-        || ps -o pid,comm 2>/dev/null | awk '$2=="cloudflared"{print $1}')
+    # R38(P2): 统一走 _cf_pids(与 _cf_is_running 同判据), 不再用 pgrep/ps 两套逻辑
+    pids=$(_cf_pids)
     if [ -n "$pids" ]; then
         for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
         sleep 3
         # 再扫一次，还活着的直接 SIGKILL
-        pids=$(pgrep -x cloudflared 2>/dev/null \
-            || ps -o pid,comm 2>/dev/null | awk '$2=="cloudflared"{print $1}')
+        pids=$(_cf_pids)
         for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
         sleep 1
     fi
 
     # 4. 最终确认
-    pids=$(pgrep -x cloudflared 2>/dev/null \
-        || ps -o pid,comm 2>/dev/null | awk '$2=="cloudflared"{print $1}')
+    pids=$(_cf_pids)
     if [ -n "$pids" ]; then
-        _warn "cloudflared 仍有残留进程: $pids"
-        return 1   # 没杀干净 -> 调用方应中止, 避免再 start 产生双实例
+        # R38(P2): 仍然返回 1 把"有残留"这个事实报给调用方, 但调用方语义变了 ——
+        # _cf_restart 不再据此跳过 start(见那里的注释)。原先"残留即中止"会让 _cf_restart
+        # 在已 stop+TERM+KILL **之后**直接返回而不 start, 一次普通的开关切换就把隧道彻底
+        # 打停; 调用方随后 _cf_rollback_service 内部又走 _cf_restart, 同一残留进程导致再次
+        # 不 start, 于是永久下线。残留可能来自不可中断 IO 的进程, 也可能是宿主上与本脚本
+        # 无关的另一个 cloudflared(_cf_pids 是全机范围)。
+        _warn "cloudflared 仍有残留进程: $pids (可能是宿主上另一个 cloudflared 实例)"
+        _tip "若隧道行为异常, 请手动确认这些进程是否应当存在"
+        return 1
     fi
     _info "cloudflared 所有进程已清理"
     return 0
@@ -409,7 +465,10 @@ _cf_kill_all() {
 # 重启 cloudflared service(先杀干净所有, 等 CF 边缘回收旧 session, 再重新 start)
 # 返回 start 命令的真实结果; 调用方仍应再做真实 liveness(_cf_is_running)确认
 _cf_restart() {
-    _cf_kill_all || return 1   # 残留进程未清干净时不 start, 防止双实例
+    # R38(P2): 残留进程只告警、不再中止 start —— 见 _cf_kill_all 内的注释:
+    # "残留即中止"会让一次普通的开关切换确定性地把隧道打停且无法自动恢复。
+    # 双实例风险改由 start 后的 _cf_is_running 与显式告警交给用户判断。
+    _cf_kill_all || _warn "cloudflared 停止流程未完全成功(有残留进程), 仍尝试启动"
     sleep 2   # 等 CF 边缘感知旧 connector 断开
     local rc=1
     case "$INIT_SYSTEM" in
@@ -448,20 +507,32 @@ _cf_rollback_service() {
 
 # 判断 cloudflared 是否在运行(状态栏 + 诊断用)
 _cf_is_running() {
+    local anchor=""
     case "$INIT_SYSTEM" in
-        systemd) systemctl is-active --quiet cloudflared 2>/dev/null ;;
+        systemd)
+            # R38(M3): 用 MainPID 把判活绑定到本 unit 的主进程, 而不是"机器上有没有叫
+            # cloudflared 的进程"。同时避免 is-active 在崩溃循环的 activating 窗口报成功。
+            anchor=$(systemctl show -p MainPID --value cloudflared 2>/dev/null)
+            if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ]; then
+                _proc_named_under "$anchor" cloudflared && return 0
+                return 1
+            fi
+            systemctl is-active --quiet cloudflared 2>/dev/null && _proc_any_named cloudflared
+            return $?
+            ;;
         *)
             # openrc/sysv/direct: 只认真实 cloudflared 进程, 不信 rc-service 的 started 文本
-            # (supervise-daemon 崩溃循环时仍报 started)。pidof 快路径 + /proc comm 精确扫描:
-            # 用 comm(可执行名)而非 pgrep -f 的整行命令行, 避免"某进程参数里恰好含 cloudflared"
-            # 的子串误匹配; /proc 直读也绕开容器内 busybox pidof/pgrep 假阴性。
-            if pidof cloudflared >/dev/null 2>&1; then return 0; fi
-            local p c
-            for p in /proc/[0-9]*; do
-                read -r c 2>/dev/null < "$p/comm" || continue
-                [ "$c" = "cloudflared" ] && return 0
+            # (supervise-daemon 崩溃循环时仍报 started)。优先按 pidfile 回溯进程树确认归属,
+            # 拿不到 pidfile 时回退全机 comm 扫描(best-effort, 无法排除他人实例)。
+            local pf
+            for pf in /run/cloudflared.pid /var/run/cloudflared.pid; do
+                anchor=$(cat "$pf" 2>/dev/null) || continue
+                if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] && [ -d "/proc/$anchor" ]; then
+                    _proc_named_under "$anchor" cloudflared && return 0
+                    return 1
+                fi
             done
-            return 1
+            _proc_any_named cloudflared
             ;;
     esac
 }
@@ -598,19 +669,26 @@ _cf_switch_token() {
     # restart 命令失败即中止(与 _install_cloudflared 同一语义), 避免"重启失败却宣称令牌已更新"。
     if ! _cf_restart; then
         _warn "重启 cloudflared 失败, 回滚 service 文件..."
-        _cf_rollback_service "$svcfile" || _warn "回滚失败, 请手动检查 $svcfile"
-        _error "令牌替换后服务异常, 请检查令牌是否正确, 或手动检查 $svcfile"
+        if _cf_rollback_service "$svcfile"; then
+            _error "令牌替换后重启失败, 已回滚到原令牌。请检查新令牌是否正确"
+        else
+            _error "令牌替换后重启失败, 且回滚未完成: cloudflared 当前可能未运行, 请手动检查 $svcfile"
+        fi
         return 1
     fi
     local restarted_ok="no"
-    case "$INIT_SYSTEM" in
-        systemd) systemctl is-active --quiet cloudflared 2>/dev/null && restarted_ok="yes" ;;
-        openrc)  _cf_is_running && restarted_ok="yes" ;;
-    esac
+    # R38(M3): 统一走 _cf_is_running —— 它现在把判活绑定到 unit MainPID / pidfile 进程树,
+    # 比裸 is-active 更严(is-active 在崩溃循环的 activating 窗口也会返回 0)
+    _cf_is_running && restarted_ok="yes"
     if [ "$restarted_ok" = "no" ]; then
         _warn "重启后服务未运行, 回滚 service 文件..."
-        _cf_rollback_service "$svcfile" || _warn "回滚失败, 请手动检查 $svcfile"
-        _error "令牌替换后服务异常, 已回滚。请检查令牌是否正确, 或手动检查 $svcfile"
+        # R38(P1): 回滚结果必须如实反映——原写法在 _cf_rollback_service 返回 1 时仍无条件
+        # 打印"已回滚", 与紧邻的"回滚失败"自相矛盾, 而此时 .bak 已被 _svc_restore 消费删除。
+        if _cf_rollback_service "$svcfile"; then
+            _error "令牌替换后服务异常, 已回滚到原令牌。请检查新令牌是否正确"
+        else
+            _error "令牌替换后服务异常, 且回滚未完成: cloudflared 当前可能未运行, 请手动检查 $svcfile"
+        fi
         return 1
     fi
     rm -f "${svcfile}.bak"   # 事务成功, 清理预修改快照
@@ -648,16 +726,23 @@ _cf_toggle() {
     _cf_write_service_line "$(_cf_build_cmdline "$CF_CUR_TOKEN")" || return 1
 
     # restart 与 liveness 共同构成成功(与 _cf_switch_token 同一语义), 失败即回滚
+    # R38(P1): 回滚消息按真实结果分支, 不再在回滚失败时也宣称"已回滚到原状态"
     if ! _cf_restart; then
         _warn "重启 cloudflared 失败, 回滚..."
-        _cf_rollback_service "$svcfile" || _warn "回滚失败, 请手动检查 $svcfile"
-        _error "${key} 切换失败, 已回滚到原状态"
+        if _cf_rollback_service "$svcfile"; then
+            _error "${key} 切换失败, 已回滚到原状态"
+        else
+            _error "${key} 切换失败, 且回滚未完成: cloudflared 当前可能未运行, 请手动检查 $svcfile"
+        fi
         return 1
     fi
     if ! _cf_is_running; then
         _warn "切换后服务未运行, 回滚..."
-        _cf_rollback_service "$svcfile" || _warn "回滚失败, 请手动检查 $svcfile"
-        _error "${key} 切换失败, 已回滚到原状态"
+        if _cf_rollback_service "$svcfile"; then
+            _error "${key} 切换失败, 已回滚到原状态"
+        else
+            _error "${key} 切换失败, 且回滚未完成: cloudflared 当前可能未运行, 请手动检查 $svcfile"
+        fi
         return 1
     fi
     rm -f "${svcfile}.bak"   # 事务成功, 清理预修改快照(.bak 是"最近一次修改前"的瞬态)
@@ -708,16 +793,23 @@ _cf_set_edge_ip() {
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
     # restart 与 liveness 共同构成成功(与 _cf_switch_token 同一语义), 失败即回滚
+    # R38(P1): 回滚消息按真实结果分支
     if ! _cf_restart; then
         _warn "重启 cloudflared 失败, 回滚..."
-        _cf_rollback_service "$svcfile" || _warn "回滚失败, 请手动检查 $svcfile"
-        _error "协议栈切换失败, 已回滚到原状态"
+        if _cf_rollback_service "$svcfile"; then
+            _error "协议栈切换失败, 已回滚到原状态"
+        else
+            _error "协议栈切换失败, 且回滚未完成: cloudflared 当前可能未运行, 请手动检查 $svcfile"
+        fi
         return 1
     fi
     if ! _cf_is_running; then
         _warn "切换后服务未运行, 回滚..."
-        _cf_rollback_service "$svcfile" || _warn "回滚失败, 请手动检查 $svcfile"
-        _error "协议栈切换失败, 已回滚到原状态"
+        if _cf_rollback_service "$svcfile"; then
+            _error "协议栈切换失败, 已回滚到原状态"
+        else
+            _error "协议栈切换失败, 且回滚未完成: cloudflared 当前可能未运行, 请手动检查 $svcfile"
+        fi
         return 1
     fi
     rm -f "${svcfile}.bak"   # 事务成功, 清理预修改快照
