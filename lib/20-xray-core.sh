@@ -573,29 +573,62 @@ _create_xray_service() {
 #         systemd: MainPID(权威, unit 自己的主进程)
 #         openrc : pidfile(supervisor pid) → 回溯 ppid 链找 comm==xray 的子进程
 #         direct : 我们自己 nohup 的 pidfile
-#       三者都拿不到 anchor 时才回退到全机扫描(已知局限: 无法区分他人实例, 见 _proc_any_named)。
+#       三者都拿不到 anchor 时才回退到全机扫描(见下方 R40 的收紧)。
+# R40: 上面的 anchor 判定原本只被 openrc/direct 的 status 使用, systemd 的 status 走的是
+#       裸 `systemctl is-active`, 于是"统一真实判活"实际只统一了 2/3 分支。is-active 只回答
+#       "unit 处于 active 状态", 不回答"主进程还活着": Type=simple 下 systemd 把 fork 成功
+#       即视为 active, 主进程被 OOM/崩溃杀掉后到 systemd 收割 SIGCHLD、把 unit 迁出 active
+#       之间存在窗口, 该窗口内 is-active=active 而 MainPID 已是死 pid ——
+#       _restart_xray_verified 的 8 次采样正好可能全落在窗口里判成功, 坏配置被当成写入成功。
+#       现在三个分支一律走 _xray_is_running。
+# R40: 同时收紧两侧的误判方向, 因为"更严"和"更宽"在这里是两种不同的事故:
+#   1) systemd 分支不再落到"任何同名进程都算"的全机扫描。unit 已知(LoadState 可读)时
+#      MainPID 就是权威, MainPID=0 即 stopped; LoadState=not-found 直接判 stopped
+#      (systemd 分支从不自己 nohup 起进程, unit 不存在就不可能有我们的服务在跑);
+#      只有 LoadState 读不到(容器内 systemctl 不可用 / systemd <230 无 --value)时才退化为
+#      "is-active 且确有本脚本二进制在跑"的双条件。若这里裸回退全机扫描, 宿主上别人的
+#      xray(x-ui/3x-ui 残留、手跑实例)会把"我们的 unit 起不来"说成 running —— 比原来更糟。
+#   2) openrc/direct 分支在 anchor 判定失败后, 追加一次"限定为本脚本二进制"的扫描再定论。
+#      anchor 路径依赖 supervise-daemon→xray 的 ppid 拓扑, 一旦拓扑不符合预期(中间多一层
+#      包装、supervisor 重新挂载子进程), 健康服务会被判 stopped, 而 _manage_xray
+#      start/restart 正是以 `_xray_is_running 为假` 作为 `rc-service zap` 的前提 ——
+#      对活着的服务 zap 会让 OpenRC 记为 stopped 却不杀进程, 随后再起一个实例 → 端口冲突。
+#      假阴性在这条路上比假阳性危险, 故补一层按 exe 归属的兜底(见 _proc_exe_is)。
 # ---------------------------------------------------------------------------
 _xray_is_running() {
-    local anchor=""
+    local anchor="" load=""
     case "$INIT_SYSTEM" in
         systemd)
-            anchor=$(systemctl show -p MainPID --value xray 2>/dev/null)
-            if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ]; then
-                _proc_named_under "$anchor" xray && return 0
-                return 1
-            fi
+            load=$(systemctl show -p LoadState --value xray 2>/dev/null)
+            case "$load" in
+                not-found)
+                    # unit 不存在 => 本脚本管理的服务不可能在跑(systemd 分支从不 nohup 起进程)
+                    return 1 ;;
+                "")
+                    # systemctl 不可用, 或 systemd < 230 不支持 --value: 退化为
+                    # "unit active 且确有我们自己的二进制在跑" 双条件, 比任一单条件都严。
+                    systemctl is-active --quiet xray 2>/dev/null || return 1
+                    ;;
+                *)
+                    # unit 已知: MainPID 权威, 不回退全机扫描
+                    anchor=$(systemctl show -p MainPID --value xray 2>/dev/null)
+                    [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
+                    [ "$anchor" != "0" ] || return 1
+                    _proc_named_under "$anchor" xray && return 0
+                    return 1 ;;
+            esac
             ;;
         openrc|direct)
             anchor=$(cat /run/xray.pid 2>/dev/null)
             if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] && [ -d "/proc/$anchor" ]; then
                 _proc_named_under "$anchor" xray && return 0
-                return 1
+                # 不直接判死: 见上方 R40(2), 继续按 exe 归属兜底
             fi
             ;;
     esac
-    # 拿不到 service anchor(未安装 unit / pidfile 缺失 / 容器内 systemctl 不可用):
-    # 回退到全机 comm 扫描。这是 best-effort, 无法排除宿主上其他 xray 实例。
-    _proc_any_named xray
+    # 兜底: 全机扫描 comm==xray, 但只承认 exe 指向本脚本自己的二进制的进程,
+    # 从而仍能排除宿主上别人的 xray 实例(exe 读不到时放行, 见 _proc_exe_is)。
+    _proc_any_named xray "$XRAY_BIN"
 }
 
 # ---------------------------------------------------------------------------
@@ -609,7 +642,10 @@ _manage_xray() {
                 start)   systemctl start xray 2>/dev/null ;;
                 stop)    systemctl stop xray 2>/dev/null ;;
                 restart) systemctl restart xray 2>/dev/null ;;
-                status)  [ "$(systemctl is-active xray 2>/dev/null)" = "active" ] && echo "running" || echo "stopped" ;;
+                # R40: 与 openrc/direct 一致地走 _xray_is_running(绑定到 unit MainPID 的
+                # 真实主进程), 不再用裸 is-active —— 后者在主进程已死、systemd 尚未把 unit
+                # 迁出 active 的窗口内会报 running(详见 _xray_is_running 注释)。
+                status)  if _xray_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
         openrc)
@@ -669,7 +705,7 @@ _manage_xray() {
                     rm -f /run/xray.pid
                     ;;
                 restart) _manage_xray stop; sleep 2; _manage_xray start ;;
-                status)  _xray_is_running && echo "running" || echo "stopped" ;;
+                status)  if _xray_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
     esac
