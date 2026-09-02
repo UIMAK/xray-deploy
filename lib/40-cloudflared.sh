@@ -587,7 +587,12 @@ _cf_is_running() {
                 anchor=$(cat "$pf" 2>/dev/null) || continue
                 if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] && [ -d "/proc/$anchor" ]; then
                     _proc_named_under "$anchor" cloudflared && return 0
-                    return 1
+                    # 不直接判死: 与 xray 侧 R40 同一条推理 —— pidfile 里的 PID 可能是陈旧
+                    # 残留后被其他进程复用(见 _cf_kill_all 的 PID reuse 防护), 也可能因
+                    # supervise-daemon→cloudflared 的 ppid 拓扑与预期不符而判不出归属。
+                    # 此处假阴性会让 _cf_toggle/令牌切换把"重启后 _cf_is_running 为真"的
+                    # 事务成功条件判假, 回滚本已生效的改动。anchor 判不出归属时继续按
+                    # 全机 comm 扫描兜底(不限定 exe, 理由见上方 R40 说明)。
                 fi
             done
             _proc_any_named cloudflared
