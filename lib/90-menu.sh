@@ -721,7 +721,10 @@ _reality_domain_menu() {
         local tag name sni
         tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); sni=$(jq -r '.sni' "$f")
         tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %-24s 当前域名: %s\n" "$i" "$name" "$sni"
+        # R42: 显示拓扑 —— 直连节点切域名要同时改 target, tunnel 节点要改 tunnel/路由
+        local mlabel="隧道"
+        [ "$(_reality_node_mode "$tag")" = "direct" ] && mlabel="直连"
+        printf "  ${GREEN}[%d]${NC} %-24s [%s] 当前域名: %s\n" "$i" "$name" "$mlabel" "$sni"
         i=$((i+1))
     done
     [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Reality 节点"; _press_any_key; return; }
@@ -753,25 +756,35 @@ _reality_domain_menu() {
         _info "新域名支持后量子签名"
     fi
 
-    local tunnel_tag tunnel_port node_port new_tunnel_tag
-    tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
-    if [ -z "$tunnel_tag" ]; then
-        _warn "该节点缺少 tunnel_tag 元数据(可能为旧版本创建或手动添加)"
-        _warn "域名切换将仅更新 Reality inbound, 不会更新 tunnel inbound 和路由规则"
-        read -rp "  继续? [y/N]: " ans
-        case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; continue ;; esac
-        new_tunnel_tag=""
+    # R42: 模式决定要改哪些字段 —— 直连节点的 target 就是伪装站, 换域名必须连 target 一起改
+    # (否则 serverNames 是新域名而 target 仍连旧站, 客户端 SNI 与真实握手对象不一致);
+    # tunnel 节点的 target 恒指向本地 tunnel 入站, 只改 tunnel 的 rewriteAddress 与路由 domain。
+    local rmode; rmode=$(_reality_node_mode "$tag")
+    local tunnel_tag="" tunnel_port node_port new_tunnel_tag="" reality_target=""
+    if [ "$rmode" = "direct" ]; then
+        reality_target="$new_target"
     else
-        tunnel_port=$(jq -r '.tunnel_port' "$meta")
-        node_port=$(jq -r '.port' "$meta")
-        # R39(P2): 与创建路径统一走 _gen_tunnel_tag(tag 长度封顶)
-        new_tunnel_tag=$(_gen_tunnel_tag "$new_sni" "$tunnel_port" "$node_port")
+        tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
+        if [ -z "$tunnel_tag" ]; then
+            _warn "该节点缺少 tunnel_tag 元数据(可能为旧版本创建或手动添加)"
+            _warn "域名切换将仅更新 Reality inbound, 不会更新 tunnel inbound 和路由规则"
+            read -rp "  继续? [y/N]: " ans
+            case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; continue ;; esac
+            new_tunnel_tag=""
+        else
+            tunnel_port=$(jq -r '.tunnel_port' "$meta")
+            node_port=$(jq -r '.port' "$meta")
+            # R39(P2): 与创建路径统一走 _gen_tunnel_tag(tag 长度封顶)
+            new_tunnel_tag=$(_gen_tunnel_tag "$new_sni" "$tunnel_port" "$node_port")
+        fi
     fi
     if [ -n "$pq_seed" ]; then
         if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
              --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
+             --arg newtgt "$reality_target" \
              '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-              (.serverNames = [$sni] | .mldsa65Seed = $seed)
+              (.serverNames = [$sni] | .mldsa65Seed = $seed
+               | if $newtgt != "" then .target = $newtgt else . end)
               | if $tg != "" then
                   (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
                   | (.inbounds[] | select(.tag == $new_tg) | .settings.rewriteAddress) = $dom
@@ -790,8 +803,10 @@ _reality_domain_menu() {
     else
         if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" \
              --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
+             --arg newtgt "$reality_target" \
              '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-              (.serverNames = [$sni] | del(.mldsa65Seed))
+              (.serverNames = [$sni] | del(.mldsa65Seed)
+               | if $newtgt != "" then .target = $newtgt else . end)
               | if $tg != "" then
                   (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
                   | (.inbounds[] | select(.tag == $new_tg) | .settings.rewriteAddress) = $dom
@@ -809,13 +824,16 @@ _reality_domain_menu() {
         fi
     fi
 
-    # 更新元数据 + 分享链接
+    # 更新元数据 + 分享链接(R42: 同时回填 reality_mode, 使旧节点元数据自描述)
     if [ -n "$new_tunnel_tag" ]; then
-        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" || { _error "元数据写入失败"; _press_any_key; continue; }
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
+    elif [ "$rmode" = "direct" ]; then
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | del(.tunnel_port) | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
     else
-        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag)' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" || { _error "元数据写入失败"; _press_any_key; continue; }
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
     fi
     # R38(M10): 消费 rebuild 返回码 —— SNI 已改, 但链接重建失败时不能写入空/坏链接
     local newlink
@@ -827,6 +845,9 @@ _reality_domain_menu() {
     _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || { _error "分享链接写入失败"; _press_any_key; continue; }
 
     _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"
+    if [ "$rmode" = "direct" ]; then
+        _tip "直连模式: realitySettings.target 已同步为 ${new_target}"
+    fi
     _tip "客户端须更新 SNI 为 ${new_sni} (pbk/sid 不变)"
     [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"
     [ -z "$pq_verify" ] && _warn "新域名不支持后量子, 已移除 pqv 参数"

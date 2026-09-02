@@ -10,8 +10,8 @@
 # 协议清单(R6)
 # ---------------------------------------------------------------------------
 PROTOCOLS=(
-    "vless-tcp-reality-vision|VLESS+TCP+Reality+Vision|reality|direct|Tunnel模式·防偷跑"
-    "vless-xhttp-reality|VLESS+XHTTP+Reality|reality|direct|Tunnel模式·防偷跑"
+    "vless-tcp-reality-vision|VLESS+TCP+Reality+Vision|reality|direct|可选直连/Tunnel(防偷跑)"
+    "vless-xhttp-reality|VLESS+XHTTP+Reality|reality|direct|可选直连/Tunnel(防偷跑)"
     "vless-enc|VLESS+ENC|enc|direct|内置加密·类似SS·轻量无TLS"
     "vless-xhttp-cdn|VLESS+XHTTP(无TLS)|none|cdn|必须套CDN·禁止直连"
     "vless-ws-cdn|VLESS+WS(无TLS)|none|cdn|必须套CDN·禁止直连"
@@ -1060,6 +1060,102 @@ _commit_reality_inbound() {
 }
 
 # ---------------------------------------------------------------------------
+# Reality 部署模式(R42)
+# 两种拓扑, 协议键相同(vless-tcp-reality-vision / vless-xhttp-reality):
+#   direct — 单个 Reality 入站, realitySettings.target = "<sni>:443" 直指真实伪装站,
+#            无 tunnel 入站、无路由规则(官方 Xray-examples 标准形态)。
+#   tunnel — 额外一个 protocol:"tunnel" 入站(127.0.0.1:<随机端口> → <sni>:443),
+#            Reality target 指向该 tunnel + 2 条路由规则(域名命中 direct, 否则 block),
+#            用于防止 target 是 CDN 站时服务器被当作端口转发偷跑流量。
+# ---------------------------------------------------------------------------
+
+# 创建时的模式选择(交互)。输出全局 REALITY_MODE; 返回 0=已选定, 1=用户取消。
+# 默认(回车)为 direct —— 因此每次进入 direct 都必须回显偷跑风险(默认姿态比 tunnel 松)。
+# 注意: 绝不对用户输入做算术(set -u 下 $((abc-1)) 会因引用不存在的变量名而崩溃)。
+_prompt_reality_mode() {
+    local choice
+    REALITY_MODE=""
+    while true; do
+        echo
+        echo -e "  ${CYAN}【Reality 部署模式】${NC}"
+        echo -e "  ${GREEN}[1]${NC} 直连模式 (默认) — target 直指伪装站, 仅 1 个入站, 无额外路由"
+        echo -e "  ${GREEN}[2]${NC} Tunnel 模式 — 多一个本地 tunnel 入站 + 2 条路由规则, 防偷跑"
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  请选择 (回车=直连): " choice
+        case "${choice:-1}" in
+            1)
+                REALITY_MODE="direct"
+                _warn "直连模式: 鉴权失败的流量会被 Reality 直接转发到伪装站"
+                _tip "伪装域名若在 CDN 后(如 Cloudflare 站), 可能被扫描后偷跑流量; 建议选非 CDN 的国外站"
+                _tip "如需防偷跑请改选 [2] Tunnel 模式"
+                return 0
+                ;;
+            2)
+                REALITY_MODE="tunnel"
+                _tip "Tunnel 模式会额外占用一个本机随机端口(仅监听 127.0.0.1)"
+                return 0
+                ;;
+            0)
+                _info "已取消"
+                return 1
+                ;;
+            *)
+                _warn "无效选择"
+                ;;
+        esac
+    done
+}
+
+# 判定已存在 Reality 节点的部署模式 —— 全项目唯一入口, 下游(改端口/域名切换/采纳)
+# 只允许通过本函数判模式, 不得各自散写推断。
+# 用法: mode=$(_reality_node_mode <tag>)   stdout 恒为 "tunnel" 或 "direct", 返回 0。
+# 判定优先级(前一级命中即返回):
+#   1. metadata reality_mode 字段(新节点显式写入)
+#   2. metadata tunnel_tag 非空 ⇒ tunnel
+#   3. config 的 realitySettings.target: 主机回环 ⇒ tunnel; 其它主机 ⇒ direct
+#   4. 读不到 / target 缺失 / target 不是 <host>:<数字端口> ⇒ tunnel
+# 为什么第 4 类(含畸形 target)一律算 tunnel: direct 是"放行"分支(跳过改端口的 fail-closed),
+# tunnel 是"保守"分支。target 缺失是旧版/手工配置, _find_reality_tunnel_tag 对它有
+# "按 tag 后缀 -<port> 匹配"的 legacy 兜底, 这条既有路径必须保持可达; 畸形 target 同理
+# 不能当成"确定是直连"而放行。
+_reality_node_mode() {
+    local tag="$1" meta mode ttag target host port
+    meta="$NODES_DIR/${tag}.json"
+    if [ -f "$meta" ]; then
+        mode=$(jq -r '.reality_mode // empty' "$meta" 2>/dev/null) || mode=""
+        case "$mode" in
+            direct|tunnel) printf '%s' "$mode"; return 0 ;;
+        esac
+        ttag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null) || ttag=""
+        [ -n "$ttag" ] && { printf 'tunnel'; return 0; }
+    fi
+    target=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' "$CONFIG_FILE" 2>/dev/null) || target=""
+    case "$target" in
+        *:*) ;;
+        *) printf 'tunnel'; return 0 ;;
+    esac
+    port="${target##*:}"
+    [[ "$port" =~ ^[0-9]+$ ]] || { printf 'tunnel'; return 0; }
+    host="${target%:*}"
+    host="${host#[}"
+    host="${host%]}"
+    if _is_reality_loopback_host "$host"; then
+        printf 'tunnel'
+    else
+        printf 'direct'
+    fi
+    return 0
+}
+
+# target 主机是否为回环(tunnel 模式的 target 恒为 127.0.0.1:<tunnel_port>)
+_is_reality_loopback_host() {
+    case "$1" in
+        "127.0.0.1"|"::1"|"localhost") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # 保存节点元数据(每节点独立文件)
 # 用法:_save_node_meta <tag> <json_object>
 # ---------------------------------------------------------------------------
@@ -1252,6 +1348,16 @@ _find_reality_tunnel_tag() {
     local target tport n ttag=""
     target=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' "$CONFIG_FILE" 2>/dev/null)
     if [ -n "$target" ]; then
+        # R42: 先判 target 主机是否回环 —— 非回环即 direct 模式(target = <sni>:443), 本就无
+        # tunnel 可关联, 必须 return 1(无关联)。若继续往下用 tport=443 去数 tunnel 入站,
+        # 本机恰有一个监听 443 的 tunnel 入站时会被错误关联: orphan 清理会连带删掉别人的
+        # tunnel, 改端口会去改错的 tag。这是严格收紧: 本项目写出的 tunnel 模板 target 恒为
+        # 127.0.0.1:<tport>, _reality_domain_menu 的 tunnel 分支也从不改 target, 因此任何
+        # 真实 tunnel 节点都不受影响。
+        local thost="${target%:*}"
+        thost="${thost#[}"
+        thost="${thost%]}"
+        _is_reality_loopback_host "$thost" || return 1
         # 主键: realitySettings.target = "127.0.0.1:<tunnel_port>" 与 tunnel .port 一一对应。
         # R28(P1): target 有效时命中数 != 1 一律禁止 legacy fallback——
         # 歧义(>1)返回 2 由调用方拒绝, 无匹配(=0)视为无关联返回 1, 均不再用 tag 后缀重绑。
@@ -1373,22 +1479,39 @@ _adopt_single_inbound() {
     # R23: Reality 多 inbound — 重建 tunnel_tag(唯一关联键, 见 _find_reality_tunnel_tag)。
     # R28(P1): 关联歧义(rc2)必须拒绝采纳——否则 tunnel_tag="" 会把坏配置"合法化",
     # 后续删除泄漏 tunnel; 无关联(rc1)可正常采纳(tunnel 保持孤儿), 唯一(rc0)写入 tunnel_tag。
-    local ttag="" trc=1
+    # R42: 先经唯一入口判模式 —— direct 节点(target 直指伪装站)本就无 tunnel, 不做关联推导,
+    # 也不写 tunnel_tag(写空串会误导下游把它当"关联损坏的 tunnel 节点")。
+    local ttag="" trc=1 rmode=""
     if [ "$proto" = "vless-tcp-reality-vision" ] || [ "$proto" = "vless-xhttp-reality" ]; then
-        ttag=$(_find_reality_tunnel_tag "$tag"); trc=$?
-        if [ "$trc" = "2" ]; then
-            _error "Reality tunnel 关联存在歧义(多个 tunnel 命中同端口), 拒绝采纳: $tag"
-            return 1
+        rmode=$(_reality_node_mode "$tag")
+        if [ "$rmode" = "tunnel" ]; then
+            ttag=$(_find_reality_tunnel_tag "$tag"); trc=$?
+            if [ "$trc" = "2" ]; then
+                _error "Reality tunnel 关联存在歧义(多个 tunnel 命中同端口), 拒绝采纳: $tag"
+                return 1
+            fi
         fi
     fi
 
     local link="#${tag} (${suffix})"
-    if ! _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg proto "$proto" \
         --argjson port "$port" --arg listen "$listen" \
         --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
         --arg ttag "$ttag" \
-        '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,tunnel_tag:$ttag,link_addr:$listen,share_link:$link}')"; then
+        '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,tunnel_tag:$ttag,link_addr:$listen,share_link:$link}') || {
+        _warn "采纳失败: 元数据生成失败($tag)"
+        return 1
+    }
+    # R42: 仅 Reality 协议带 reality_mode 字段(其它协议无此概念)
+    if [ -n "$rmode" ]; then
+        meta_json=$(echo "$meta_json" | jq --arg m "$rmode" '. + {reality_mode:$m}') || {
+            _warn "采纳失败: 元数据生成失败($tag)"
+            return 1
+        }
+    fi
+    if ! _save_node_meta "$tag" "$meta_json"; then
         _warn "采纳失败: 元数据写入失败($tag)"
         return 1
     fi
@@ -1753,18 +1876,25 @@ _add_node() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议1: VLESS+TCP+Reality+Vision (Tunnel 模式, 防偷跑)
+# 协议1: VLESS+TCP+Reality+Vision (可选 直连 / Tunnel 模式, 见 _prompt_reality_mode)
 # ---------------------------------------------------------------------------
 _add_vless_tcp_reality_vision() {
-    echo -e "\n  ${CYAN}=== VLESS+TCP+Reality+Vision (Tunnel 模式) ===${NC}"
+    _prompt_reality_mode || return 1
+    local mode="$REALITY_MODE" mode_label="直连模式"
+    [ "$mode" = "tunnel" ] && mode_label="Tunnel 模式·防偷跑"
+    echo -e "\n  ${CYAN}=== VLESS+TCP+Reality+Vision (${mode_label}) ===${NC}"
     local sni
     read -rp "  伪装域名 (默认 www.amd.com): " sni
     sni=${sni:-www.amd.com}
     # R38(P1): SNI 会被拼进 tunnel inbound tag, 含空格/引号会破坏按 tag 的关联匹配
     _validate_domain "$sni" || { _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $sni"; return 1; }
 
-    local tunnel_port=$(_gen_random_port)
-    _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
+    # R42: 直连模式无 tunnel 入站, 不申请 tunnel 端口
+    local tunnel_port=""
+    if [ "$mode" = "tunnel" ]; then
+        tunnel_port=$(_gen_random_port)
+        _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
+    fi
     echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
     local port=$(_input_port tcp)
 
@@ -1786,23 +1916,35 @@ _add_vless_tcp_reality_vision() {
     R_DECRYPTION="${ENC_DECRYPTION:-none}"
 
     local tag="xd-reality-vision-${port}"
-    # R39(P2): tag 长度封顶(见 _gen_tunnel_tag), 避免最长合法 SNI 拼出 270+ 字符的 tag
-    local tunnel_tag; tunnel_tag=$(_gen_tunnel_tag "$sni" "$tunnel_port" "$port")
+    local tunnel_tag=""
     local listen="::"
-
-    # 渲染 tunnel inbound
-    R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
-    local tunnel_json
-    tunnel_json=$(_render_template "$(_tpl_path tunnel)") || return 1
-
-    # 渲染 reality inbound
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
-    R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
-    R_SHORT_ID="$REALITY_SHORT_ID" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
     local reality_json
-    reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision)") || return 1
 
-    _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
+    if [ "$mode" = "tunnel" ]; then
+        # R39(P2): tag 长度封顶(见 _gen_tunnel_tag), 避免最长合法 SNI 拼出 270+ 字符的 tag
+        tunnel_tag=$(_gen_tunnel_tag "$sni" "$tunnel_port" "$port")
+        # 渲染 tunnel inbound
+        R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
+        local tunnel_json
+        tunnel_json=$(_render_template "$(_tpl_path tunnel)") || return 1
+
+        # 渲染 reality inbound (target → 127.0.0.1:<tunnel_port>)
+        R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
+        R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+        R_SHORT_ID="$REALITY_SHORT_ID" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
+        reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision-tunnel)") || return 1
+
+        _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
+    else
+        # R42 直连: target = <sni>:443, 只提交 1 个入站, 不写任何路由规则
+        # (_commit_reality_inbound 固定插 2 条 tunnel 路由规则, 故此处走 _commit_inbound)
+        R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
+        R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+        R_SHORT_ID="$REALITY_SHORT_ID" R_MLDSA65_SEED="$pq_seed"
+        reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision-direct)") || return 1
+
+        _commit_inbound "$reality_json" || return 1
+    fi
 
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
@@ -1825,14 +1967,20 @@ _add_vless_tcp_reality_vision() {
     # 让整份 clash.yaml 不可解析(不只该节点), 且该脏行事后无法从界面清除
     local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, network: tcp}"
 
+    # R42: reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json
     meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-tcp-reality-vision" \
+        --arg mode "$mode" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
         --arg sid "$REALITY_SHORT_ID" --arg pqv "$pq_verify" --arg link "$link" \
-        --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link,tunnel_tag:$ttag,tunnel_port:$tport}')
+        '{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link}')
+    if [ "$mode" = "tunnel" ]; then
+        meta_json=$(echo "$meta_json" | jq \
+            --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
+            '. + {tunnel_tag:$ttag,tunnel_port:$tport}')
+    fi
     if [ "$ENC_ENABLED" -eq 1 ]; then
         meta_json=$(echo "$meta_json" | jq \
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
@@ -1848,24 +1996,35 @@ _add_vless_tcp_reality_vision() {
     _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
 
     _success "节点 [${name}] 创建成功"
-    _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
+    if [ "$mode" = "tunnel" ]; then
+        _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
+    else
+        _tip "直连: Reality ${port} → target ${sni}:443 (无 tunnel 入站/路由规则)"
+    fi
     [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
 
 # ---------------------------------------------------------------------------
-# 协议2: VLESS+XHTTP+Reality (Tunnel 模式, 防偷跑)
+# 协议2: VLESS+XHTTP+Reality (可选 直连 / Tunnel 模式, 见 _prompt_reality_mode)
 # ---------------------------------------------------------------------------
 _add_vless_xhttp_reality() {
-    echo -e "\n  ${CYAN}=== VLESS+XHTTP+Reality (Tunnel 模式) ===${NC}"
+    _prompt_reality_mode || return 1
+    local mode="$REALITY_MODE" mode_label="直连模式"
+    [ "$mode" = "tunnel" ] && mode_label="Tunnel 模式·防偷跑"
+    echo -e "\n  ${CYAN}=== VLESS+XHTTP+Reality (${mode_label}) ===${NC}"
     local sni
     read -rp "  伪装域名 (默认 www.amd.com): " sni
     sni=${sni:-www.amd.com}
     # R38(P1): SNI 会被拼进 tunnel inbound tag, 含空格/引号会破坏按 tag 的关联匹配
     _validate_domain "$sni" || { _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $sni"; return 1; }
 
-    local tunnel_port=$(_gen_random_port)
-    _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
+    # R42: 直连模式无 tunnel 入站, 不申请 tunnel 端口
+    local tunnel_port=""
+    if [ "$mode" = "tunnel" ]; then
+        tunnel_port=$(_gen_random_port)
+        _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
+    fi
     echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
     local port=$(_input_port tcp)
 
@@ -1891,21 +2050,33 @@ _add_vless_xhttp_reality() {
     R_DECRYPTION="${ENC_DECRYPTION:-none}"
 
     local tag="xd-reality-xhttp-${port}"
-    # R39(P2): tag 长度封顶(见 _gen_tunnel_tag)
-    local tunnel_tag; tunnel_tag=$(_gen_tunnel_tag "$sni" "$tunnel_port" "$port")
+    local tunnel_tag=""
     local listen="::"
-
-    R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
-    local tunnel_json
-    tunnel_json=$(_render_template "$(_tpl_path tunnel)") || return 1
-
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
-    R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
-    R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
     local reality_json
-    reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality)") || return 1
 
-    _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
+    if [ "$mode" = "tunnel" ]; then
+        # R39(P2): tag 长度封顶(见 _gen_tunnel_tag)
+        tunnel_tag=$(_gen_tunnel_tag "$sni" "$tunnel_port" "$port")
+
+        R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
+        local tunnel_json
+        tunnel_json=$(_render_template "$(_tpl_path tunnel)") || return 1
+
+        R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
+        R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+        R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
+        reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality-tunnel)") || return 1
+
+        _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
+    else
+        # R42 直连: target = <sni>:443, 单入站提交, 无路由规则
+        R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
+        R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
+        R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_MLDSA65_SEED="$pq_seed"
+        reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality-direct)") || return 1
+
+        _commit_inbound "$reality_json" || return 1
+    fi
 
     local addr; addr=$(_ask_link_addr)
     local link_ip="$addr"
@@ -1926,14 +2097,20 @@ _add_vless_xhttp_reality() {
     fi
     local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
 
+    # R42: reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json
     meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-xhttp-reality" \
+        --arg mode "$mode" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
         --arg sid "$REALITY_SHORT_ID" --arg path "$path" --arg pqv "$pq_verify" --arg link "$link" \
-        --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link,tunnel_tag:$ttag,tunnel_port:$tport}')
+        '{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link}')
+    if [ "$mode" = "tunnel" ]; then
+        meta_json=$(echo "$meta_json" | jq \
+            --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
+            '. + {tunnel_tag:$ttag,tunnel_port:$tport}')
+    fi
     if [ "$ENC_ENABLED" -eq 1 ]; then
         meta_json=$(echo "$meta_json" | jq \
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
@@ -1947,7 +2124,11 @@ _add_vless_xhttp_reality() {
     _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
 
     _success "节点 [${name}] 创建成功"
-    _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
+    if [ "$mode" = "tunnel" ]; then
+        _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
+    else
+        _tip "直连: Reality ${port} → target ${sni}:443 (无 tunnel 入站/路由规则)"
+    fi
     [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
@@ -2712,8 +2893,13 @@ _rebuild_cdn_link() {
 _tpl_path() {
     local key="$1"
     case "$key" in
-        vless-tcp-reality-vision) echo "/opt/xray-deploy/templates/vless-tcp-reality-vision-tunnel.server.jsonc" ;;
-        vless-xhttp-reality)      echo "/opt/xray-deploy/templates/vless-xhttp-reality-tunnel.server.jsonc" ;;
+        # R42: Reality 有两套模板 —— tunnel 版 target 指向本地 tunnel 入站, direct 版 target
+        # 直指伪装站。键名与文件名一一对应, 不保留"裸协议键"别名: 别名会让漏改的调用点
+        # 静默拿到 tunnel 模板(直连节点被渲染成 tunnel 形态), 这类错误在配置提交后才暴露。
+        vless-tcp-reality-vision-tunnel) echo "/opt/xray-deploy/templates/vless-tcp-reality-vision-tunnel.server.jsonc" ;;
+        vless-tcp-reality-vision-direct) echo "/opt/xray-deploy/templates/vless-tcp-reality-vision-direct.server.jsonc" ;;
+        vless-xhttp-reality-tunnel)      echo "/opt/xray-deploy/templates/vless-xhttp-reality-tunnel.server.jsonc" ;;
+        vless-xhttp-reality-direct)      echo "/opt/xray-deploy/templates/vless-xhttp-reality-direct.server.jsonc" ;;
         tunnel)                   echo "/opt/xray-deploy/templates/tunnel.server.jsonc" ;;
         vless-enc)                echo "/opt/xray-deploy/templates/vless-enc.server.jsonc" ;;
         vless-xhttp-cdn)          echo "/opt/xray-deploy/templates/vless-xhttp-cdn.server.jsonc" ;;
@@ -2737,19 +2923,35 @@ _view_nodes() {
         _press_any_key; return
     fi
     echo
-    printf "  %-3s %-20s %-26s %-7s %-10s %-16s %-18s\n" "#" "名称" "协议" "端口" "认证" "监听" "链接地址"
-    echo "  --------------------------------------------------------------------------------------------------"
+    printf "  %-3s %-20s %-26s %-8s %-7s %-10s %-16s %-18s\n" "#" "名称" "协议" "模式" "端口" "认证" "监听" "链接地址"
+    echo "  ----------------------------------------------------------------------------------------------------------"
     local i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
-        local name proto port auth listen addr
+        local name proto port auth listen addr tag rmode
+        tag=$(basename "$f" .json)
         name=$(jq -r '.name' "$f" 2>/dev/null)
         proto=$(jq -r '.protocol' "$f" 2>/dev/null)
         port=$(jq -r '.port' "$f" 2>/dev/null)
         auth=$(jq -r '.auth // "—"' "$f" 2>/dev/null)
         listen=$(jq -r '.listen' "$f" 2>/dev/null)
         addr=$(jq -r '.link_addr' "$f" 2>/dev/null)
-        printf "  %-3s %-20s %-26s %-7s %-10s %-16s %-18s\n" "[$i]" "${name}" "${proto}" "${port}" "${auth}" "${listen}" "${addr}"
+        # R42: Reality 两种拓扑共用同一协议键, 列表必须能区分, 否则用户无从判断该节点
+        # 是否带 tunnel(直接影响 target 指向与是否存在路由规则)。独立成列而不是拼在
+        # 协议名后: printf 的 %-Ns 按字节而非显示宽度补齐, 拼接会让最长协议键
+        # (vless-tcp-reality-vision) 正好吃满字段宽度而挤掉后续列。三种取值
+        # (直连/隧道/——)字节数一致, 该列对齐不受多字节影响。
+        rmode="——"
+        case "$proto" in
+            vless-tcp-reality-vision|vless-xhttp-reality)
+                if [ "$(_reality_node_mode "$tag")" = "direct" ]; then
+                    rmode="直连"
+                else
+                    rmode="隧道"
+                fi
+                ;;
+        esac
+        printf "  %-3s %-20s %-26s %-8s %-7s %-10s %-16s %-18s\n" "[$i]" "${name}" "${proto}" "${rmode}" "${port}" "${auth}" "${listen}" "${addr}"
         i=$((i+1))
     done
     echo
@@ -3104,32 +3306,38 @@ _modify_port() {
     # 自带回滚), 保证 config/metadata 全部回到旧端口或全部新端口。
     # ----------------------------------------------------------------------
     if [ "$proto" = "vless-tcp-reality-vision" ] || [ "$proto" = "vless-xhttp-reality" ]; then
-        # 旧版/手动创建节点可能缺 tunnel_tag —— 从 config 关联推导(R26/R28)。
-        # R41(P1): fail-closed —— 推导失败(rc=1)或歧义(rc=2)一律拒绝改端口, 否则
-        # 只改主 tag 而 tunnel/路由未改, 重新制造 R41 要消灭的不一致。
-        local tunnel_tag tunnel_port sni trc
-        tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
-        tunnel_port=$(jq -r '.tunnel_port // empty' "$meta" 2>/dev/null)
-        sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
-        if [ -z "$tunnel_tag" ]; then
-            tunnel_tag=$(_find_reality_tunnel_tag "$tag"); trc=$?
-            if [ "$trc" != "0" ]; then
-                _error "无法唯一关联 Reality tunnel (rc=${trc}), 无法安全修改端口: $tag"
-                _tip "请检查 config.json 的 realitySettings.target 与 tunnel 入站, 或删除后重建节点"
-                _press_any_key; return 1
-            fi
-        else
-            # R41: metadata 有 tunnel_tag 也不能盲目信任 —— 外部修改/损坏 metadata 后
-            # 可能与 config 不一致。此处验证该 tag 在 config 中真实存在且为 tunnel 入站,
-            # 否则 fail-closed(避免 tunnel/路由漏改)。无 tunnel_tag 的节点走上面的
-            # _find_reality_tunnel_tag 推导, 推导失败/歧义同样 fail-closed, 绝不进入
-            # "仅改端口"的通用路径(R41 的全部 Reality 分支都是 fail-closed)。
-            if ! jq -e --arg tg "$tunnel_tag" \
-                '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
-                "$CONFIG_FILE" >/dev/null 2>&1; then
-                _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
-                _tip "请检查 config.json 或使用 [采纳孤儿入站] 修复元数据"
-                _press_any_key; return 1
+        # R42: 先经唯一入口判模式。direct 模式无 tunnel/路由需要同步, tunnel_tag 保持空,
+        # 下面的事务天然退化为"只处理主入站"(new_tunnel_tag 与 jq 的 tunnel 段都受 -n 保护);
+        # 绝不能让 direct 节点走 tunnel 分支的 fail-closed —— 那会把它永久锁成不能改端口。
+        local tunnel_tag="" tunnel_port sni trc rmode
+        rmode=$(_reality_node_mode "$tag")
+        if [ "$rmode" = "tunnel" ]; then
+            # 旧版/手动创建节点可能缺 tunnel_tag —— 从 config 关联推导(R26/R28)。
+            # R41(P1): fail-closed —— 推导失败(rc=1)或歧义(rc=2)一律拒绝改端口, 否则
+            # 只改主 tag 而 tunnel/路由未改, 重新制造 R41 要消灭的不一致。
+            tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
+            tunnel_port=$(jq -r '.tunnel_port // empty' "$meta" 2>/dev/null)
+            sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
+            if [ -z "$tunnel_tag" ]; then
+                tunnel_tag=$(_find_reality_tunnel_tag "$tag"); trc=$?
+                if [ "$trc" != "0" ]; then
+                    _error "无法唯一关联 Reality tunnel (rc=${trc}), 无法安全修改端口: $tag"
+                    _tip "请检查 config.json 的 realitySettings.target 与 tunnel 入站, 或删除后重建节点"
+                    _press_any_key; return 1
+                fi
+            else
+                # R41: metadata 有 tunnel_tag 也不能盲目信任 —— 外部修改/损坏 metadata 后
+                # 可能与 config 不一致。此处验证该 tag 在 config 中真实存在且为 tunnel 入站,
+                # 否则 fail-closed(避免 tunnel/路由漏改)。无 tunnel_tag 的节点走上面的
+                # _find_reality_tunnel_tag 推导, 推导失败/歧义同样 fail-closed, 绝不进入
+                # "仅改端口"的通用路径(R41 的全部 tunnel 模式分支都是 fail-closed)。
+                if ! jq -e --arg tg "$tunnel_tag" \
+                    '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
+                    "$CONFIG_FILE" >/dev/null 2>&1; then
+                    _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
+                    _tip "请检查 config.json 或使用 [采纳孤儿入站] 修复元数据"
+                    _press_any_key; return 1
+                fi
             fi
         fi
 
@@ -3149,16 +3357,17 @@ _modify_port() {
             _press_any_key; return 1
         fi
 
-        # 在内存生成完整新 metadata(port/tag/tunnel_tag/name/share_link), 未落地任何文件。
+        # 在内存生成完整新 metadata(port/tag/tunnel_tag/reality_mode/name/share_link), 未落地任何文件。
         # _rebuild_reality_link 从文件读, 故用临时文件承载"新 port + 新 name"再重建,
         # 使链接 #fragment 也同步为新名(与 _hy2_gen_port_newmeta 同思路)。
         local tmpm newmeta newlink old_name new_name
         tmpm=$(mktemp "${meta}.port.XXXXXX") || { _error "创建临时文件失败"; _press_any_key; return 1; }
         old_name=$(jq -r '.name' "$meta")
         new_name="${old_name//${oldport}/${newport}}"
+        # R42: 顺带回填 reality_mode —— 旧节点(无该字段)改端口后元数据自描述, 不再依赖推导
         if ! jq --argjson p "$newport" --arg nt "$new_tag" --arg ntg "$new_tunnel_tag" \
-            --arg nn "$new_name" \
-            '.port=$p | .tag=$nt | (if $ntg != "" then .tunnel_tag=$ntg else . end) | .name=$nn' \
+            --arg nn "$new_name" --arg rm "$rmode" \
+            '.port=$p | .tag=$nt | (if $ntg != "" then .tunnel_tag=$ntg else . end) | .name=$nn | .reality_mode=$rm' \
             "$meta" > "$tmpm"; then
             rm -f "$tmpm"; _error "生成元数据失败"; _press_any_key; return 1
         fi
@@ -3214,7 +3423,11 @@ _modify_port() {
             _press_any_key; return 1
         fi
 
-        _success "端口已改为 ${newport}(标签与 tunnel 标签已同步更新)"
+        if [ "$rmode" = "tunnel" ]; then
+            _success "端口已改为 ${newport}(标签与 tunnel 标签已同步更新)"
+        else
+            _success "端口已改为 ${newport}(直连模式, 标签已同步更新)"
+        fi
         _press_any_key
         return
     fi
