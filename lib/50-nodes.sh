@@ -3118,6 +3118,18 @@ _modify_port() {
                 _tip "请检查 config.json 的 realitySettings.target 与 tunnel 入站, 或删除后重建节点"
                 _press_any_key; return 1
             fi
+        else
+            # R41: metadata 中的 tunnel_tag 来自之前创建/域名切换, 正常情况下与 config 一致;
+            # 但外部修改/损坏 metadata 后可能不一致, 此处验证其真实存在, 否则 fail-closed。
+            # 不阻止故意无 tunnel 的旧版/手工节点后续可正常改端口(走 _find_reality_tunnel_tag
+            # 推导失败后进入通用端口修改路径 —— 仅改端口, 不改 tunnel/路由)。
+            if ! jq -e --arg tg "$tunnel_tag" \
+                '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
+                "$CONFIG_FILE" >/dev/null 2>&1; then
+                _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
+                _tip "请检查 config.json 或使用 [采纳孤儿入站] 修复元数据"
+                _press_any_key; return 1
+            fi
         fi
 
         # 主 tag 前缀(xd-reality-vision / xd-reality-xhttp) + 新端口
