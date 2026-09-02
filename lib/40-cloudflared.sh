@@ -327,6 +327,13 @@ _cf_is_cmd_line() {
     case "$t" in
         '#'*|'') return 1 ;;   # 注释与空行绝不修改
     esac
+    # R40: systemd 的其他 Exec* 指令一定不是启动命令行, 必须在下面的 $CF_BIN 兜底之前排除。
+    # 否则 `ExecStop=/usr/local/bin/cloudflared tunnel cleanup --token <旧>` 这类形态会被
+    # 兜底规则当成启动行改写(replaced 计数还会 +1, 掩盖"真启动行没改到"的失败)。
+    # 这是严格收窄: 只排除可证明不是 start 的指令, 不会让真正的 ExecStart 漏判。
+    case "$t" in
+        ExecStartPre=*|ExecStartPost=*|ExecStop=*|ExecStopPost=*|ExecReload=*|ExecCondition=*) return 1 ;;
+    esac
     case "$t" in
         ExecStart=*|command_args=*|cmd=*|command=*) return 0 ;;
     esac
@@ -570,6 +577,11 @@ _cf_is_running() {
             # openrc/sysv/direct: 只认真实 cloudflared 进程, 不信 rc-service 的 started 文本
             # (supervise-daemon 崩溃循环时仍报 started)。优先按 pidfile 回溯进程树确认归属,
             # 拿不到 pidfile 时回退全机 comm 扫描(best-effort, 无法排除他人实例)。
+            # R40 说明: 这里**故意**不像 xray 侧那样把兜底扫描限定到 exe==$CF_BIN。cloudflared
+            # 二进制不由本脚本独占(用户可能先用发行版包/自己装过, 本脚本只接管 service 文件),
+            # 一旦限定路径, 运行中的是 /usr/bin/cloudflared 时判活会恒假 —— 而 _cf_toggle /
+            # 令牌切换都以"重启后 _cf_is_running 为真"作为事务成功条件, 假阴性会把本已生效的
+            # 改动整体回滚。此处的假阳性(把别人的隧道算成我们的)只影响状态显示, 危害更小。
             local pf
             for pf in /run/cloudflared.pid /var/run/cloudflared.pid; do
                 anchor=$(cat "$pf" 2>/dev/null) || continue
