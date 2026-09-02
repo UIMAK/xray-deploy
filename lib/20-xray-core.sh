@@ -350,12 +350,12 @@ _init_config_if_empty() {
         "tag": "dns_cloudflare"
       },
       {
-        "address": "https+local://dns11.quad9.net/dns-query",
+        "address": "https+local://dns.quad9.net/dns-query",
         "tag": "dns_quad9"
       },
       {
-        "address": "https+local://dns.google/dns-query",
-        "tag": "dns_google"
+        "address": "https+local://freedns.controld.com/p0",
+        "tag": "dns_controld"
       }
     ],
     "tag": "dns_inbound",
