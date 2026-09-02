@@ -30,21 +30,16 @@ _ensure_cron_running() {
             return 1
             ;;
         # direct(无 init 系统): 尽力找到并启动 cron 守护(crond=busybox/Vixie, cron=ISC)
+        # 判活用 _proc_any_named(/proc comm 扫描, 容器内可靠), 不用 pgrep ——
+        # 容器内 busybox pgrep -x 会假阴性(H3), 误把已运行的 crond 判为"未运行"
+        # 再二次启动, 反而返回失败。
         direct)
             if command -v crond >/dev/null 2>&1; then
-                # 避免二次启动已运行的 crond(返回非零)
-                if command -v pgrep >/dev/null 2>&1; then
-                    pgrep -x crond >/dev/null 2>&1 && return 0
-                elif [ -f /var/run/crond.pid ]; then
-                    local _p; _p=$(cat /var/run/crond.pid 2>/dev/null)
-                    [ -n "$_p" ] && [ -d "/proc/$_p" ] && return 0
-                fi
+                _proc_any_named crond && return 0
                 crond 2>/dev/null || return 1
                 return 0
             elif command -v cron >/dev/null 2>&1; then
-                if command -v pgrep >/dev/null 2>&1; then
-                    pgrep -x cron >/dev/null 2>&1 && return 0
-                fi
+                _proc_any_named cron && return 0
                 cron 2>/dev/null || return 1
                 return 0
             fi
