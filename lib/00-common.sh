@@ -80,7 +80,8 @@ _get_public_ip() {
         echo "$ip" && return 0
     done
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ipv4.icanhazip.com"; do
-        ip=$(wget -q -O- --timeout=6 "$url" 2>/dev/null) && [ -n "$ip" ] && \
+        # 与 _http_download 同一口径: --timeout 是 GNU 长选项, busybox wget 可能 unrecognized option (H1), 用 -T
+        ip=$(wget -q -T 6 -O- "$url" 2>/dev/null) && [ -n "$ip" ] && \
         [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] && \
         (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && \
         echo "$ip" && return 0
