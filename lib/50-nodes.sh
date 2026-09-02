@@ -3059,6 +3059,9 @@ _modify_port() {
     local oldport; oldport=$(jq -r '.port' "$meta")
     local proto; proto=$(jq -r '.protocol' "$meta" 2>/dev/null)
 
+    # R41: 端口未变化时直接返回, 避免无意义重启; 也防止 Reality 分支对同名元数据文件 mv(同文件错误)
+    [ "$newport" = "$oldport" ] && { _info "端口未变化"; _press_any_key; return; }
+
     # hy2 + 端口跳跃: 走统一端口事务(_hy2_port_txn), 避免 config/metadata 先提交、iptables 后失败
     # 造成 config/metadata/iptables 三方分叉(R16); 任一步失败回滚到旧端口
     # R38(P1): 原写法 `[ "$proto" = hysteria2 ] && command -v iptables` 为假就整块跳过 →
@@ -3089,6 +3092,97 @@ _modify_port() {
             _press_any_key
             return
         fi
+    fi
+
+    # ----------------------------------------------------------------------
+    # Reality 节点分支(R41): 端口变更必须同步更新主 tag(含端口)、tunnel tag、
+    # 路由规则 inboundTag 引用与元数据。主 tag 即元数据文件名, 一并重命名,
+    # 否则 tag/config/metadata 三方不一致(删除/域名切换等按 tag 定位的操作全错)。
+    # 更新模型与 _reality_domain_menu 一致: jq 重命名 tag + 重写路由规则。
+    # ----------------------------------------------------------------------
+    if [ "$proto" = "vless-tcp-reality-vision" ] || [ "$proto" = "vless-xhttp-reality" ]; then
+        # 旧版/手动创建节点可能缺 tunnel_tag —— 从 config 关联推导(R26/R28)
+        local tunnel_tag tunnel_port sni trc
+        tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
+        tunnel_port=$(jq -r '.tunnel_port // empty' "$meta" 2>/dev/null)
+        sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
+        if [ -z "$tunnel_tag" ]; then
+            tunnel_tag=$(_find_reality_tunnel_tag "$tag"); trc=$?
+            if [ "$trc" = "2" ]; then
+                _error "Reality tunnel 关联存在歧义, 无法安全修改端口: $tag"
+                _press_any_key; return 1
+            fi
+        fi
+
+        # 主 tag 前缀(xd-reality-vision / xd-reality-xhttp) + 新端口
+        local new_tag="${tag%-*}-${newport}"
+        # 新 tunnel tag: 仅替换末段 reality 端口(Tunnel-<sni>-<tport>-<port>);
+        # 保持 SNI 段原样(含旧版无长度封顶产生的超长 SNI 段, 不做二次截断)
+        local new_tunnel_tag=""
+        if [ -n "$tunnel_tag" ]; then
+            new_tunnel_tag="${tunnel_tag%-*}-${newport}"
+        fi
+
+        # 合并 jq filter: 改端口 + 重命名主 tag + (tunnel tag + 路由规则引用)
+        local jq_filter
+        jq_filter='(.inbounds[] | select(.tag == $t) | .tag) = $new_t
+| (.inbounds[] | select(.tag == $new_t) | .port) = $p'
+        if [ -n "$tunnel_tag" ]; then
+            jq_filter="$jq_filter
+| (.inbounds[] | select(.tag == \$tg) | .tag) = \$new_tg
+| .routing.rules |= map(
+    if .inboundTag != null and (.inboundTag | type) == \"array\"
+    then .inboundTag |= map(if . == \$tg then \$new_tg else . end)
+    else . end)"
+        fi
+
+        if ! _mutate_config --arg t "$tag" --arg new_t "$new_tag" --argjson p "$newport" \
+             --arg tg "$tunnel_tag" --arg new_tg "$new_tunnel_tag" "$jq_filter"; then
+            _error "端口修改失败, 已回滚"; _press_any_key; return 1
+        fi
+
+        # 主 tag 即元数据文件名 —— 同步重命名
+        if ! mv "$NODES_DIR/${tag}.json" "$NODES_DIR/${new_tag}.json"; then
+            _error "节点元数据文件重命名失败(${tag}.json → ${new_tag}.json)"
+            _press_any_key; return 1
+        fi
+        meta="$NODES_DIR/${new_tag}.json"
+
+        # 先更新端口/tag/tunnel_tag 到元数据(rebuild 需要读新端口); 原子写(R15)
+        local meta_a
+        meta_a=$(jq --argjson p "$newport" --arg nt "$new_tag" --arg ntg "$new_tunnel_tag" \
+            '.port=$p | .tag=$nt | if $ntg != "" then .tunnel_tag=$ntg else . end' "$meta") \
+            || { _error "生成元数据失败"; _press_any_key; return 1; }
+        if ! _atomic_write_json "$meta" "$meta_a"; then
+            _error "端口元数据写入失败"; _press_any_key; return 1
+        fi
+
+        # 重建分享链接(R38/M10: 失败只提示, 不覆盖原 share_link)
+        local newlink
+        if ! newlink=$(_rebuild_reality_link "$meta") || [ -z "$newlink" ]; then
+            _warn "端口已改为 ${newport}, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
+            _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
+            _press_any_key; return 1
+        fi
+
+        # 同步更新节点名称(名称通常包含端口号) + 分享链接; 原子写(R15)
+        local old_name new_name meta_b
+        old_name=$(jq -r '.name' "$meta")
+        new_name="${old_name//${oldport}/${newport}}"
+        if [ "$new_name" != "$old_name" ]; then
+            meta_b=$(jq --arg l "$newlink" --arg n "$new_name" '.share_link=$l | .name=$n' "$meta") \
+                || { _error "生成元数据失败"; _press_any_key; return 1; }
+        else
+            meta_b=$(jq --arg l "$newlink" '.share_link=$l' "$meta") \
+                || { _error "生成元数据失败"; _press_any_key; return 1; }
+        fi
+        if ! _atomic_write_json "$meta" "$meta_b"; then
+            _error "分享链接元数据写入失败"; _press_any_key; return 1
+        fi
+
+        _success "端口已改为 ${newport}(标签与 tunnel 标签已同步更新)"
+        _press_any_key
+        return
     fi
 
     # 非 hop 路径: 原流程(config -> metadata)
