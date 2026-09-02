@@ -17,6 +17,9 @@ _ensure_cron_running() {
     case "$INIT_SYSTEM" in
         systemd) systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true ;;
         openrc)  rc-update add cron default 2>/dev/null; rc-service cron start 2>/dev/null || true ;;
+        # direct(无 init 系统): 尽力找到并启动 cron 守护(crond=busybox/Vixie, cron=ISC)
+        direct)  if command -v crond >/dev/null 2>&1; then crond 2>/dev/null || true
+                 elif command -v cron >/dev/null 2>&1; then cron 2>/dev/null || true; fi ;;
     esac
 }
 

@@ -443,7 +443,7 @@ _check_script_update() {
     _info "正在检查远程版本..."
     local remote
     remote=$(curl -fsSL --max-time 10 "$SCRIPT_VERSION_URL" 2>/dev/null) || \
-    remote=$(wget -qO- --timeout=10 "$SCRIPT_VERSION_URL" 2>/dev/null) || remote=""
+    remote=$(wget -q -T 10 -O- "$SCRIPT_VERSION_URL" 2>/dev/null) || remote=""
     if [ -z "$remote" ]; then
         _warn "无法获取远程版本(网络受限或仓库未发布),请手动检查"
         _press_any_key; return

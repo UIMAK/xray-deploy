@@ -30,7 +30,7 @@ _xray_fetch_tag() {
     case "$channel" in
         stable)
             body=$(curl -fsSL --max-time 20 "$XRAY_REPO_API/latest" 2>/dev/null) \
-                || body=$(wget -qO- --timeout=20 "$XRAY_REPO_API/latest" 2>/dev/null)
+                || body=$(wget -q -T 20 -O- "$XRAY_REPO_API/latest" 2>/dev/null)
             [ -z "$body" ] && return 1
             # 优先 jq; 兜底 BRE grep(busybox 稳)
             tag=$(echo "$body" | jq -r '.tag_name // empty' 2>/dev/null)
@@ -40,7 +40,7 @@ _xray_fetch_tag() {
             ;;
         preview)
             body=$(curl -sL --max-time 20 "$XRAY_REPO_API?per_page=30" 2>/dev/null) \
-                || body=$(wget -qO- --timeout=20 "$XRAY_REPO_API?per_page=30" 2>/dev/null)
+                || body=$(wget -q -T 20 -O- "$XRAY_REPO_API?per_page=30" 2>/dev/null)
             [ -z "$body" ] && return 1
             # 优先 jq: 第一个 prerelease==true 的 tag_name
             tag=$(echo "$body" | jq -r '[.[] | select(.prerelease == true)] | .[0].tag_name // empty' 2>/dev/null)
