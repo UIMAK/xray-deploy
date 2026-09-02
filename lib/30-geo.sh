@@ -15,11 +15,12 @@ GEO_STATE_FILE="$STATE_DIR/geo_cron"
 # ---------------------------------------------------------------------------
 _ensure_cron_running() {
     case "$INIT_SYSTEM" in
-        systemd) systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true ;;
-        openrc)  rc-update add cron default 2>/dev/null; rc-service cron start 2>/dev/null || true ;;
+        systemd) systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || return 1 ;;
+        openrc)  rc-update add cron default 2>/dev/null; rc-service cron start 2>/dev/null || return 1 ;;
         # direct(无 init 系统): 尽力找到并启动 cron 守护(crond=busybox/Vixie, cron=ISC)
-        direct)  if command -v crond >/dev/null 2>&1; then crond 2>/dev/null || true
-                 elif command -v cron >/dev/null 2>&1; then cron 2>/dev/null || true; fi ;;
+        direct)  if command -v crond >/dev/null 2>&1; then crond 2>/dev/null || return 1
+                 elif command -v cron >/dev/null 2>&1; then cron 2>/dev/null || return 1
+                 else return 1; fi ;;
     esac
 }
 
@@ -166,10 +167,15 @@ _geo_set_auto_update() {
             ( crontab -l 2>/dev/null; echo "$cron_line" ) | crontab - 2>/dev/null || {
                 _error "写入 crontab 失败"; return 1
             }
-            # 确保 cron 服务运行
-            _ensure_cron_running
-            _state_set geo_cron "on"
-            _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
+            # 确保 cron 服务运行; 即使失败 crontab 也已写入(cron daemon 后续启动后生效)
+            if _ensure_cron_running; then
+                _state_set geo_cron "on"
+                _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
+            else
+                _warn "cron 守护进程未能启动, 自动更新已写入 crontab 但当前不会执行"
+                _tip "请确保系统中有 cron 守护进程在运行, 或手动启动 crond/cron"
+                _state_set geo_cron "off"
+            fi
             ;;
         off)
             _geo_remove_cron_line
