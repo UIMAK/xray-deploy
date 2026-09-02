@@ -3119,10 +3119,11 @@ _modify_port() {
                 _press_any_key; return 1
             fi
         else
-            # R41: metadata 中的 tunnel_tag 来自之前创建/域名切换, 正常情况下与 config 一致;
-            # 但外部修改/损坏 metadata 后可能不一致, 此处验证其真实存在, 否则 fail-closed。
-            # 不阻止故意无 tunnel 的旧版/手工节点后续可正常改端口(走 _find_reality_tunnel_tag
-            # 推导失败后进入通用端口修改路径 —— 仅改端口, 不改 tunnel/路由)。
+            # R41: metadata 有 tunnel_tag 也不能盲目信任 —— 外部修改/损坏 metadata 后
+            # 可能与 config 不一致。此处验证该 tag 在 config 中真实存在且为 tunnel 入站,
+            # 否则 fail-closed(避免 tunnel/路由漏改)。无 tunnel_tag 的节点走上面的
+            # _find_reality_tunnel_tag 推导, 推导失败/歧义同样 fail-closed, 绝不进入
+            # "仅改端口"的通用路径(R41 的全部 Reality 分支都是 fail-closed)。
             if ! jq -e --arg tg "$tunnel_tag" \
                 '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
                 "$CONFIG_FILE" >/dev/null 2>&1; then
