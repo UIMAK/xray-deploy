@@ -16,11 +16,40 @@ GEO_STATE_FILE="$STATE_DIR/geo_cron"
 _ensure_cron_running() {
     case "$INIT_SYSTEM" in
         systemd) systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || return 1 ;;
-        openrc)  rc-update add cron default 2>/dev/null; rc-service cron start 2>/dev/null || return 1 ;;
+        # OpenRC: Alpine 默认 BusyBox cron 为 crond, 也支持 cronie/dcron。
+        # 通过 /etc/init.d/ 存在性探测, 不硬编码服务名。
+        openrc)
+            local cron_svc=""
+            for cron_svc in crond cronie dcron; do
+                if [ -x "/etc/init.d/$cron_svc" ]; then
+                    rc-update add "$cron_svc" default 2>/dev/null || true
+                    rc-service "$cron_svc" start 2>/dev/null || return 1
+                    return 0
+                fi
+            done
+            return 1
+            ;;
         # direct(无 init 系统): 尽力找到并启动 cron 守护(crond=busybox/Vixie, cron=ISC)
-        direct)  if command -v crond >/dev/null 2>&1; then crond 2>/dev/null || return 1
-                 elif command -v cron >/dev/null 2>&1; then cron 2>/dev/null || return 1
-                 else return 1; fi ;;
+        direct)
+            if command -v crond >/dev/null 2>&1; then
+                # 避免二次启动已运行的 crond(返回非零)
+                if command -v pgrep >/dev/null 2>&1; then
+                    pgrep -x crond >/dev/null 2>&1 && return 0
+                elif [ -f /var/run/crond.pid ]; then
+                    local _p; _p=$(cat /var/run/crond.pid 2>/dev/null)
+                    [ -n "$_p" ] && [ -d "/proc/$_p" ] && return 0
+                fi
+                crond 2>/dev/null || return 1
+                return 0
+            elif command -v cron >/dev/null 2>&1; then
+                if command -v pgrep >/dev/null 2>&1; then
+                    pgrep -x cron >/dev/null 2>&1 && return 0
+                fi
+                cron 2>/dev/null || return 1
+                return 0
+            fi
+            return 1
+            ;;
     esac
 }
 
