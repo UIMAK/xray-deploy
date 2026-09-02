@@ -1109,26 +1109,29 @@ _prompt_reality_mode() {
 # 判定已存在 Reality 节点的部署模式 —— 全项目唯一入口, 下游(改端口/域名切换/采纳)
 # 只允许通过本函数判模式, 不得各自散写推断。
 # 用法: mode=$(_reality_node_mode <tag>)   stdout 恒为 "tunnel" 或 "direct", 返回 0。
-# 判定优先级(前一级命中即返回):
-#   1. metadata reality_mode 字段(新节点显式写入)
-#   2. metadata tunnel_tag 非空 ⇒ tunnel
-#   3. config 的 realitySettings.target: 主机回环 ⇒ tunnel; 其它主机 ⇒ direct
-#   4. 读不到 / target 缺失 / target 不是 <host>:<数字端口> ⇒ tunnel
-# 为什么第 4 类(含畸形 target)一律算 tunnel: direct 是"放行"分支(跳过改端口的 fail-closed),
-# tunnel 是"保守"分支。target 缺失是旧版/手工配置, _find_reality_tunnel_tag 对它有
-# "按 tag 后缀 -<port> 匹配"的 legacy 兜底, 这条既有路径必须保持可达; 畸形 target 同理
-# 不能当成"确定是直连"而放行。
+#
+# 判定原则: config 的 realitySettings.target 是实际运行状态, metadata 是声明的身份。
+# metadata 只是"提示", 必须与 config 交叉校验; 任何不一致一律回退到保守侧 tunnel
+# (tunnel 分支保留 R41 的 fail-closed, direct 分支会跳过 tunnel/路由一致性检查,
+# 所以"无法确定"绝不能判成 direct —— 否则 metadata 被外部改坏时改端口会漏改 tunnel)。
+#
+# 优先级:
+#   1. 先读 config realitySettings.target, 归为三类:
+#        target 缺失 / 无端口段 / 端口非数字   => unknown(旧版/手工配置, 保守)
+#        主机回环                              => tunnel
+#        其它主机                              => direct
+#   2. metadata 存在 reality_mode 时, 与 config 交叉校验:
+#        direct + config=direct              => direct(一致)
+#        direct + config≠direct              => _warn 冲突, 回退 tunnel(fail-closed)
+#        tunnel + config∈{tunnel,unknown}    => tunnel(一致/保守)
+#        tunnel + config=direct              => _warn 冲突, 回退 tunnel(fail-closed)
+#   3. metadata 无 reality_mode: tunnel_tag 非空 ⇒ tunnel; 否则按第 1 步的 config 归类。
+#   4. 都读不到 ⇒ tunnel(保守)。
 _reality_node_mode() {
-    local tag="$1" meta mode ttag target host port
+    local tag="$1" meta mode ttag target host port cfg_mode
     meta="$NODES_DIR/${tag}.json"
-    if [ -f "$meta" ]; then
-        mode=$(jq -r '.reality_mode // empty' "$meta" 2>/dev/null) || mode=""
-        case "$mode" in
-            direct|tunnel) printf '%s' "$mode"; return 0 ;;
-        esac
-        ttag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null) || ttag=""
-        [ -n "$ttag" ] && { printf 'tunnel'; return 0; }
-    fi
+
+    # 第 1 步: config 归类(实际状态)
     target=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' "$CONFIG_FILE" 2>/dev/null) || target=""
     case "$target" in
         *:*) ;;
@@ -1140,19 +1143,51 @@ _reality_node_mode() {
     host="${host#[}"
     host="${host%]}"
     if _is_reality_loopback_host "$host"; then
-        printf 'tunnel'
+        cfg_mode="tunnel"
     else
-        printf 'direct'
+        cfg_mode="direct"
     fi
+
+    if [ -f "$meta" ]; then
+        mode=$(jq -r '.reality_mode // empty' "$meta" 2>/dev/null) || mode=""
+        if [ -n "$mode" ]; then
+            # 第 2 步: 交叉校验 —— metadata 是声明, config 是事实; 不一致回退保守侧
+            if [ "$mode" = "direct" ] && [ "$cfg_mode" != "direct" ]; then
+                _warn "Reality 节点 $tag: metadata 声明 direct, 但 config target=${target} 非直连, 判定为 tunnel(防绕过)"
+                printf 'tunnel'; return 0
+            fi
+            if [ "$mode" = "tunnel" ] && [ "$cfg_mode" = "direct" ]; then
+                _warn "Reality 节点 $tag: metadata 声明 tunnel, 但 config target=${target} 非回环, 判定为 tunnel(fail-closed)"
+                printf 'tunnel'; return 0
+            fi
+            printf '%s' "$mode"
+            return 0
+        fi
+        # 第 3 步: metadata 无 reality_mode(旧节点) —— tunnel_tag 非空即 tunnel
+        ttag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null) || ttag=""
+        [ -n "$ttag" ] && { printf 'tunnel'; return 0; }
+    fi
+
+    printf '%s' "$cfg_mode"
     return 0
 }
 
-# target 主机是否为回环(tunnel 模式的 target 恒为 127.0.0.1:<tunnel_port>)
+# target 主机是否为回环(tunnel 模式的 target 恒为 127.0.0.0/8:<tunnel_port>)
+# R42 复审(P2): 只认 127.0.0.1 会把 127.0.0.2/127.10.x.x 等合法 IPv4 回环误判成 direct,
+# 从而绕过 tunnel 分支的 fail-closed。这里把整个 127.0.0.0/8 纳入(带 0-255 段校验),
+# 另保留 ::1 / localhost。
 _is_reality_loopback_host() {
     case "$1" in
         "127.0.0.1"|"::1"|"localhost") return 0 ;;
-        *) return 1 ;;
     esac
+    # 127.0.0.0/8: 127.<a>.<b>.<c>, 每段 0-255。10#$ 强制十进制, 避免 08/09 被当八进制
+    if [[ "$1" =~ ^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}"
+        if (( 10#$a <= 255 && 10#$b <= 255 && 10#$c <= 255 )); then
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1495,15 +1530,23 @@ _adopt_single_inbound() {
 
     local link="#${tag} (${suffix})"
     local meta_json
+    # R42(P2 复审): 与创建路径一致 —— tunnel_tag 只属于 tunnel 拓扑, direct 节点不得
+    # 写 tunnel_tag:"" (空字段会误导下游把它当"关联损坏的 tunnel 节点")。基础对象先不含
+    # tunnel_tag, 仅在 tunnel 模式下追加(含 orphan 无关联时为空串的既有语义)。
     meta_json=$(jq -n \
         --arg tag "$tag" --arg proto "$proto" \
         --argjson port "$port" --arg listen "$listen" \
         --arg uuid "$uuid" --arg sni "$sni" --arg link "$link" \
-        --arg ttag "$ttag" \
-        '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,tunnel_tag:$ttag,link_addr:$listen,share_link:$link}') || {
+        '{tag:$tag,name:$tag,protocol:$proto,port:$port,listen:$listen,uuid:$uuid,sni:$sni,link_addr:$listen,share_link:$link}') || {
         _warn "采纳失败: 元数据生成失败($tag)"
         return 1
     }
+    if [ "$rmode" = "tunnel" ]; then
+        meta_json=$(echo "$meta_json" | jq --arg ttag "$ttag" '. + {tunnel_tag:$ttag}') || {
+            _warn "采纳失败: 元数据生成失败($tag)"
+            return 1
+        }
+    fi
     # R42: 仅 Reality 协议带 reality_mode 字段(其它协议无此概念)
     if [ -n "$rmode" ]; then
         meta_json=$(echo "$meta_json" | jq --arg m "$rmode" '. + {reality_mode:$m}') || {
