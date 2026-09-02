@@ -301,12 +301,19 @@ _timed_restart_menu() {
     [ -z "$cron_expr" ] && { _press_any_key; return; }
     cron_line="${cron_expr} ${cmd_path} timed-restart ${marker}"
     # 先确保 cron 服务运行(M20: 无 cron 的全新 Alpine 上先装 cron 再写 crontab)
-    _ensure_cron_running
+    local cron_ok=0
+    _ensure_cron_running && cron_ok=1
     # 删除旧行 + 写入新行
     (crontab -l 2>/dev/null | grep -v "$marker"; echo "$cron_line") | crontab - 2>/dev/null || { _error "写入 crontab 失败"; _press_any_key; return; }
     mkdir -p "$STATE_DIR"
-    _state_set timed_restart "$cron_expr"
-    _success "定时重启已设置: ${cron_expr}"
+    if [ "$cron_ok" -eq 1 ]; then
+        _state_set timed_restart "$cron_expr"
+        _success "定时重启已设置: ${cron_expr}"
+    else
+        _warn "cron 守护进程未能启动, 定时重启已写入 crontab 但当前不会执行"
+        _tip "请确保系统中有 cron 守护进程在运行, 或手动启动 crond/cron"
+        _state_set timed_restart "off"
+    fi
     _press_any_key
 }
 
