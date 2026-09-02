@@ -11,12 +11,44 @@ GEO_CRON_MARKER="# xray-deploy-geo-update"
 GEO_STATE_FILE="$STATE_DIR/geo_cron"
 
 # ---------------------------------------------------------------------------
-# 确保 cron 服务在运行(启用 + 启动)
+# 确保 cron 服务在运行并开机自启(语义对齐 systemctl enable --now)。
+# 返回 0 仅当"当前启动 + 持久化启用"都成功; 任一失败返回 1, 由调用方决定状态标记。
 # ---------------------------------------------------------------------------
 _ensure_cron_running() {
     case "$INIT_SYSTEM" in
-        systemd) systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true ;;
-        openrc)  rc-update add cron default 2>/dev/null; rc-service cron start 2>/dev/null || true ;;
+        systemd) systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || return 1 ;;
+        # OpenRC: Alpine 默认 BusyBox cron 为 crond, 也支持 cronie/dcron。
+        # 通过 /etc/init.d/ 存在性探测, 不硬编码服务名。
+        # 先 start 再 rc-update add: start 失败直接返回(不把 enable 当成功), 
+        # enable(add 到 default runlevel)失败同样返回 1 —— 不能只"当前在跑"就当完整成功,
+        # 否则重启后 cron 不自启, 项目状态却显示 on(service/config/state 分裂)。
+        openrc)
+            local cron_svc=""
+            for cron_svc in crond cronie dcron; do
+                if [ -x "/etc/init.d/$cron_svc" ]; then
+                    rc-service "$cron_svc" start 2>/dev/null || return 1
+                    rc-update add "$cron_svc" default 2>/dev/null || return 1
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        # direct(无 init 系统): 尽力找到并启动 cron 守护(crond=busybox/Vixie, cron=ISC)
+        # 判活用 _proc_any_named(pidof 优先 + /proc comm 扫描兜底, 容器内可靠), 不用 pgrep ——
+        # 容器内 busybox pgrep -x 会假阴性(H3), 误把已运行的 crond 判为"未运行"
+        # 再二次启动, 反而返回失败。
+        direct)
+            if command -v crond >/dev/null 2>&1; then
+                _proc_any_named crond && return 0
+                crond 2>/dev/null || return 1
+                return 0
+            elif command -v cron >/dev/null 2>&1; then
+                _proc_any_named cron && return 0
+                cron 2>/dev/null || return 1
+                return 0
+            fi
+            return 1
+            ;;
     esac
 }
 
@@ -163,10 +195,20 @@ _geo_set_auto_update() {
             ( crontab -l 2>/dev/null; echo "$cron_line" ) | crontab - 2>/dev/null || {
                 _error "写入 crontab 失败"; return 1
             }
-            # 确保 cron 服务运行
-            _ensure_cron_running
-            _state_set geo_cron "on"
-            _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
+            # 确保 cron 服务运行; 失败时回滚刚写入的 crontab 行, 保证
+            # state=off ⇔ 项目 cron entry 不存在, 避免 daemon 恢复后无状态执行。
+            if _ensure_cron_running; then
+                _state_set geo_cron "on"
+                _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
+            else
+                # 回滚刚写入的 crontab 行; 回滚失败要暴露, 不能静默
+                if ! _geo_remove_cron_line >/dev/null 2>&1; then
+                    _warn "crontab 回滚失败, 请手动检查项目定时任务 (${GEO_CRON_MARKER})"
+                fi
+                _warn "cron 守护进程未能启动, 自动更新已取消"
+                _tip "请确保系统中有 cron 守护进程, 安装后重试"
+                _state_set geo_cron "off"
+            fi
             ;;
         off)
             _geo_remove_cron_line

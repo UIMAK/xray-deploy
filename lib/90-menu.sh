@@ -301,12 +301,24 @@ _timed_restart_menu() {
     [ -z "$cron_expr" ] && { _press_any_key; return; }
     cron_line="${cron_expr} ${cmd_path} timed-restart ${marker}"
     # 先确保 cron 服务运行(M20: 无 cron 的全新 Alpine 上先装 cron 再写 crontab)
-    _ensure_cron_running
+    local cron_ok=0
+    _ensure_cron_running && cron_ok=1
     # 删除旧行 + 写入新行
     (crontab -l 2>/dev/null | grep -v "$marker"; echo "$cron_line") | crontab - 2>/dev/null || { _error "写入 crontab 失败"; _press_any_key; return; }
     mkdir -p "$STATE_DIR"
-    _state_set timed_restart "$cron_expr"
-    _success "定时重启已设置: ${cron_expr}"
+    if [ "$cron_ok" -eq 1 ]; then
+        _state_set timed_restart "$cron_expr"
+        _success "定时重启已设置: ${cron_expr}"
+    else
+        # 回滚刚写入的 crontab 行, 保证 state=off ⇔ 项目 cron entry 不存在;
+        # 回滚失败要暴露, 不能静默。
+        if ! (crontab -l 2>/dev/null | grep -v "$marker") | crontab - 2>/dev/null; then
+            _warn "crontab 回滚失败, 请手动检查项目定时任务 (${marker})"
+        fi
+        _warn "cron 守护进程未能启动, 定时重启已取消"
+        _tip "请确保系统中有 cron 守护进程, 安装后重试"
+        _state_set timed_restart "off"
+    fi
     _press_any_key
 }
 
@@ -443,7 +455,7 @@ _check_script_update() {
     _info "正在检查远程版本..."
     local remote
     remote=$(curl -fsSL --max-time 10 "$SCRIPT_VERSION_URL" 2>/dev/null) || \
-    remote=$(wget -qO- --timeout=10 "$SCRIPT_VERSION_URL" 2>/dev/null) || remote=""
+    remote=$(wget -q -T 10 -O- "$SCRIPT_VERSION_URL" 2>/dev/null) || remote=""
     if [ -z "$remote" ]; then
         _warn "无法获取远程版本(网络受限或仓库未发布),请手动检查"
         _press_any_key; return
