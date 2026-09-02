@@ -499,13 +499,49 @@ _proc_named_under() {
     return 1
 }
 
-# 全机按 comm 扫描(仅作最后回退; 已知局限: 无法区分本脚本管理的实例与宿主上其他同名进程)
+# R40: 校验 pid 的可执行文件是否就是期望的那个二进制。全机 comm 扫描的已知局限是
+# "无法区分本脚本管理的实例与宿主上别人的同名进程"(x-ui/3x-ui 迁移残留、用户手跑的
+# xray), 而 /proc/<pid>/exe 正好能把这个区分做出来 —— 本脚本的 unit/init 脚本里
+# ExecStart / command 永远是自己生成的 $XRAY_BIN, 别人的实例不可能指向同一路径。
+# fail-open 的边界要分清, 两种"读不到"不是一回事:
+#   - exe 读不到(权限/内核/进程刚退出) => 放行。这是判活的最后兜底路径, 假阴性会让上层
+#     认为"没在跑"而再起一个实例 → 端口冲突/双实例, 比"把别人的进程算成自己的"更糟。
+#   - exe 读到了但与期望路径不同 => 拒绝, 即使期望路径本身解析不出来。此时"不同"已经是
+#     确定结论, 再放行等于把这层过滤整个作废(exe=别人的路径 + 我们的二进制被删 => 误判 running)。
+_proc_exe_is() {
+    local pid="${1:-}" want="${2:-}" got rw
+    [ -n "$want" ] || return 0                  # 未指定期望路径 => 不做这层过滤
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    got=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 0   # 读不到 => 放行
+    [ -n "$got" ] || return 0
+    # 就地替换二进制(升级)后, 运行中进程的 exe 链会带 " (deleted)" 后缀
+    got="${got% (deleted)}"
+    [ "$got" = "$want" ] && return 0
+    # 路径可能经由 symlink 呈现不同前缀(如 /opt 本身是软链, exe 记录的是解析后的真实路径),
+    # 把期望路径也解析一次再比。解析失败(路径不存在/断链)时以上面的字面比较为结论 => 拒绝。
+    rw=$(readlink -f "$want" 2>/dev/null) || return 1
+    [ -n "$rw" ] || return 1
+    [ "$got" = "$rw" ] && return 0
+    return 1
+}
+
+# 全机按 comm 扫描(仅作最后回退)。可选第 2 参数 = 期望的二进制路径, 传了就只认
+# exe 指向该路径的进程(见 _proc_exe_is); 不传则维持"任何同名进程都算"的旧语义。
 _proc_any_named() {
-    local name="$1" p c
-    if pidof "$name" >/dev/null 2>&1; then return 0; fi
+    local name="$1" want="${2:-}" p c pid pids
+    pids=$(pidof "$name" 2>/dev/null | tr ' ' '\n' | grep -e '^[0-9][0-9]*$')
+    if [ -n "$pids" ]; then
+        while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            _proc_exe_is "$pid" "$want" && return 0
+        done <<< "$pids"
+        # pidof 报了同名进程但没有一个是期望的二进制: 不能就此判"没有" ——
+        # busybox pidof 在部分容器里会漏报(见 _xray_is_running 坑2), 继续 /proc 扫描兜底
+    fi
     for p in /proc/[0-9]*; do
         read -r c 2>/dev/null < "$p/comm" || continue
-        [ "$c" = "$name" ] && return 0
+        [ "$c" = "$name" ] || continue
+        _proc_exe_is "${p#/proc/}" "$want" && return 0
     done
     return 1
 }
