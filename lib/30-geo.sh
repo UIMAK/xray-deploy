@@ -201,7 +201,10 @@ _geo_set_auto_update() {
                 _state_set geo_cron "on"
                 _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
             else
-                _geo_remove_cron_line >/dev/null 2>&1
+                # 回滚刚写入的 crontab 行; 回滚失败要暴露, 不能静默
+                if ! _geo_remove_cron_line >/dev/null 2>&1; then
+                    _warn "crontab 回滚失败, 请手动检查项目定时任务 (${GEO_CRON_MARKER})"
+                fi
                 _warn "cron 守护进程未能启动, 自动更新已取消"
                 _tip "请确保系统中有 cron 守护进程, 安装后重试"
                 _state_set geo_cron "off"

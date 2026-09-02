@@ -310,8 +310,11 @@ _timed_restart_menu() {
         _state_set timed_restart "$cron_expr"
         _success "定时重启已设置: ${cron_expr}"
     else
-        # 回滚刚写入的 crontab 行, 保证 state=off ⇔ 项目 cron entry 不存在
-        (crontab -l 2>/dev/null | grep -v "$marker") | crontab - 2>/dev/null || true
+        # 回滚刚写入的 crontab 行, 保证 state=off ⇔ 项目 cron entry 不存在;
+        # 回滚失败要暴露, 不能静默。
+        if ! (crontab -l 2>/dev/null | grep -v "$marker") | crontab - 2>/dev/null; then
+            _warn "crontab 回滚失败, 请手动检查项目定时任务 (${marker})"
+        fi
         _warn "cron 守护进程未能启动, 定时重启已取消"
         _tip "请确保系统中有 cron 守护进程, 安装后重试"
         _state_set timed_restart "off"
