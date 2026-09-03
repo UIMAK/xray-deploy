@@ -768,7 +768,14 @@ _reality_domain_menu() {
 
     # R42: 模式决定要改哪些字段 —— 直连节点的 target 就是伪装站, 换域名必须连 target 一起改
     # (否则 serverNames 是新域名而 target 仍连旧站, 客户端 SNI 与真实握手对象不一致);
-    # tunnel 节点的 target 恒指向本地 tunnel 入站, 只改 tunnel 的 rewriteAddress 与路由 domain。
+    # tunnel 节点的 target 恒指向本地 tunnel 入站, 只改 tunnel 的转发地址与路由 domain。
+    #
+    # R44: tunnel 的转发地址**必须同时写两套字段名**(与 templates/tunnel.server.jsonc 同源)。
+    # 已发布核心(v24.12.31 → v26.3.27)的 json tag 是 address/port/network, main 分支与
+    # Xray-docs-next 改成了 rewriteAddress/rewritePort/allowedNetwork。只写一套会在另一类核心上
+    # 被静默忽略 —— 未识别字段不报错, 但 dest.Address 变 nil、dest.Port 变 0, dokodemo 回落到
+    # LocalHostIP + 监听端口本身 ⇒ tunnel 自环。这里只改**已存在**的键(`if has(...)`), 避免给
+    # 老节点凭空添加它本来没有的字段。
     local rmode; rmode=$(_reality_node_mode "$tag")
     local tunnel_tag="" tunnel_port node_port new_tunnel_tag="" reality_target=""
     if [ "$rmode" = "direct" ]; then
@@ -797,7 +804,9 @@ _reality_domain_menu() {
                | if $newtgt != "" then .target = $newtgt else . end)
               | if $tg != "" then
                   (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
-                  | (.inbounds[] | select(.tag == $new_tg) | .settings.rewriteAddress) = $dom
+                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
+                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
+                       | (if has("address") then .address = $dom else . end))
                   | .routing.rules |= map(
                       (if .inboundTag != null and (.inboundTag | type) == "array"
                        then .inboundTag |= map(if . == $tg then $new_tg else . end)
@@ -819,7 +828,9 @@ _reality_domain_menu() {
                | if $newtgt != "" then .target = $newtgt else . end)
               | if $tg != "" then
                   (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
-                  | (.inbounds[] | select(.tag == $new_tg) | .settings.rewriteAddress) = $dom
+                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
+                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
+                       | (if has("address") then .address = $dom else . end))
                   | .routing.rules |= map(
                       (if .inboundTag != null and (.inboundTag | type) == "array"
                        then .inboundTag |= map(if . == $tg then $new_tg else . end)
