@@ -178,6 +178,19 @@ _logrotate_remove_config() {
 # 启用 / 禁用 logrotate —— 三条路径(手动开关 / loglevel=none 自动禁用 /
 # 切出 none 自动恢复)统一走这两个函数, 不再各自拼 _state_set + rm + cat。
 #
+# **返回码是三态, 因为"哪一步失败"决定调用方该做什么(复审 3 的 P2):**
+#   0 = 文件动作成功 + state 记账成功
+#   1 = **文件动作失败** —— 真实世界未改变(禁用时轮换仍在跑 / 启用时轮换未生效)
+#   2 = **文件动作成功, 仅 state 记账失败** —— 真实世界已改变, 只是记录没写上
+# 旧式 `if ! _logrotate_disable` 的调用点不受影响(任何非零仍算失败), 但需要区分
+# 因果的调用点必须捕获具体 rc。
+#
+# 为什么不用调用方 `[ -e "$LOGROTATE_CONF" ]` 反推(复审建议的最小改法):
+#   那是让每个调用点各自重新观察一次文件系统去猜"上一步为什么失败"。本函数有 2 个
+#   调用点, 都得写同一份推断; 将来若多一个步骤, 推断会静默失效。这正是上一轮刚修掉的
+#   "同一条件在各调用点各自解释"反模式(见 _logrotate_enabled_state 的注释)。
+#   让函数**报告**原因, 而不是让调用方**猜**原因。代价只是多一个返回码常量。
+#
 # 顺序规则: **先做真实世界的动作, 再记账**(与 _geo_set_auto_update 一致:
 # 先写 crontab 行, 最后才 _state_set)。理由是两种失败残局的代价不对称 ——
 #   启用时若先置 state 再写文件, 写失败会留下"state=on 但没有配置文件":
@@ -197,7 +210,7 @@ _logrotate_enable() {
     if ! _state_set logrotate_enabled "on"; then
         _warn "logrotate 配置已写入并生效, 但状态持久化失败(状态显示可能不准)"
         _tip "请重试本操作, 或检查 $STATE_DIR 是否可写"
-        return 1
+        return 2
     fi
     return 0
 }
@@ -207,7 +220,7 @@ _logrotate_disable() {
     if ! _state_set logrotate_enabled "off"; then
         _warn "logrotate 配置已移除(轮换已停), 但状态持久化失败(状态显示可能不准)"
         _tip "请重试本操作, 或检查 $STATE_DIR 是否可写"
-        return 1
+        return 2
     fi
     return 0
 }
@@ -397,9 +410,14 @@ _loglevel_menu() {
     _success "日志级别已切换: ${cur} → ${new_lv}"
 
     # ---- 第 2 步: logrotate 联动(不可回滚, 故必须在 config 成功之后) ----
-    # 严格失败语义: _logrotate_disable/_enable 只在"配置文件动作确实成功"时返回 0。
-    # 失败时不清标记、不谎报成功 —— 否则会留下 state 说已关/已开而实际相反的分裂状态
-    # (PR #27 复审 P1)。日志级别本身已提交成功, 故这里的失败只降级为告警 + 补救指引。
+    # 严格失败语义: _logrotate_disable/_enable 返回三态(0 全成功 / 1 文件动作失败 /
+    # 2 文件动作成功但 state 记账失败)。必须按 rc 分流 —— 两种失败对"联动标记该不该留"
+    # 的答案是相反的(复审 3 的 P2):
+    #   rc=1(轮换配置仍在, logrotate 实际还在跑) ⇒ 撤标记。留着会让下次切出 none 时
+    #     去"恢复"一个从未真正关闭的 logrotate, 一个空操作被报成修复。
+    #   rc=2(配置已删, logrotate 实际已停, 只是 state 没记上) ⇒ **保留标记**。它是
+    #     "还欠一次恢复"的唯一记录; 若跟 rc=1 一样撤掉, 用户切回 error/warning 时就
+    #     不会自动恢复 logrotate, 而 state 可能仍是 on ⇒ 又一种 state/实际分裂。
     if [ "$new_lv" = "none" ]; then
         if [ "$enabled" = "on" ]; then
             # 先置标记再动 logrotate: 标记是"这次禁用是我们做的"的唯一记录, 写不进去就
@@ -409,15 +427,22 @@ _loglevel_menu() {
                 _tip "如需关闭请在本菜单 [1] 手动禁用"
                 _press_any_key; return
             fi
-            if _logrotate_disable; then
-                _success "logrotate 已同步禁用"
-            else
-                # 配置文件仍在 => logrotate 可能继续轮换。此时标记必须撤掉:
-                # 留着它会让下次切出 none 时"恢复"一个从未真正关闭的 logrotate。
-                _logrotate_auto_off_clear
-                _warn "logrotate 未能停用(轮换配置仍在), 日志级别已切为 none 但轮换可能继续"
-                _tip "请在本菜单 [1] 手动禁用, 或检查 ${LOGROTATE_CONF} 是否可删"
-            fi
+            local drc=0
+            _logrotate_disable || drc=$?
+            case "$drc" in
+                0) _success "logrotate 已同步禁用" ;;
+                2)
+                    # 轮换确实停了, 仅 state 未写上。标记必须留 —— 否则切回其它级别时
+                    # 不会自动恢复, 而 state 可能仍是 on(实际已停), 形成反向分裂。
+                    _warn "logrotate 已实际停用, 但状态持久化失败(自动恢复标记已保留)"
+                    _tip "请检查 ${STATE_DIR} 是否可写; 切回其它日志级别时会再尝试恢复"
+                    ;;
+                *)
+                    _logrotate_auto_off_clear
+                    _warn "logrotate 未能停用(轮换配置仍在), 日志级别已切为 none 但轮换可能继续"
+                    _tip "请在本菜单 [1] 手动禁用, 或检查 ${LOGROTATE_CONF} 是否可删"
+                    ;;
+            esac
         else
             if [ "$enabled" = "off" ]; then
                 _info "logrotate 当前已是禁用状态, 无需联动"
@@ -428,14 +453,25 @@ _loglevel_menu() {
         fi
     elif [ "$auto_off" = "on" ]; then
         # 只恢复"我们自己关掉的那次"; 用户手动禁用时 auto_off 为空, 不会走到这里
-        if _logrotate_enable; then
-            # 仅在真正恢复成功后才清因果标记 —— 提前清掉会让失败后无从重试
-            _logrotate_auto_off_clear
-            _success "logrotate 已自动恢复启用(此前因日志级别 none 被自动禁用)"
-        else
-            _warn "logrotate 未能自动恢复(标记已保留, 下次切换级别会再试)"
-            _tip "也可在本菜单 [1] 手动启用"
-        fi
+        local erc=0
+        _logrotate_enable || erc=$?
+        case "$erc" in
+            0)
+                # 仅在完全成功后才清因果标记 —— 提前清掉会让失败后无从重试
+                _logrotate_auto_off_clear
+                _success "logrotate 已自动恢复启用(此前因日志级别 none 被自动禁用)"
+                ;;
+            2)
+                # 轮换已恢复(配置已写), 只是 state 没记上。标记保留: 下次切换级别会
+                # 再跑一遍 enable 把 state 补正, 那时才清标记。
+                _warn "logrotate 轮换已恢复, 但状态持久化失败(标记已保留, 下次切换级别会补正)"
+                _tip "请检查 ${STATE_DIR} 是否可写"
+                ;;
+            *)
+                _warn "logrotate 未能自动恢复(标记已保留, 下次切换级别会再试)"
+                _tip "也可在本菜单 [1] 手动启用"
+                ;;
+        esac
     fi
     _press_any_key
 }
@@ -481,18 +517,23 @@ _logrotate_menu() {
                 # 开关 toggle —— 与联动路径共用 _logrotate_enable/_disable,
                 # 因此"文件动作失败"在这里同样不会被谎报成功(PR #27 复审 P2)。
                 # unset 视同 off(即执行启用): 菜单是用户主动操作, enable 会把 state 补正。
+                # 同样按三态 rc 分流: rc=2 表示轮换已按用户意图改变、只是 state 没记上,
+                # 报"已生效但状态未记录"比笼统报失败准确(后者会让用户误以为动作没做成)。
+                local trc=0
                 if [ "$enabled" = "on" ]; then
-                    if _logrotate_disable; then
-                        _success "logrotate 已禁用"
-                    else
-                        _error "logrotate 禁用失败, 轮换配置仍在生效"
-                    fi
+                    _logrotate_disable || trc=$?
+                    case "$trc" in
+                        0) _success "logrotate 已禁用" ;;
+                        2) _warn "logrotate 轮换已停, 但状态记录写入失败(状态显示可能不准)" ;;
+                        *) _error "logrotate 禁用失败, 轮换配置仍在生效" ;;
+                    esac
                 else
-                    if _logrotate_enable; then
-                        _success "logrotate 已启用"
-                    else
-                        _error "logrotate 启用失败, 日志轮换未生效"
-                    fi
+                    _logrotate_enable || trc=$?
+                    case "$trc" in
+                        0) _success "logrotate 已启用" ;;
+                        2) _warn "logrotate 轮换已生效, 但状态记录写入失败(状态显示可能不准)" ;;
+                        *) _error "logrotate 启用失败, 日志轮换未生效" ;;
+                    esac
                 fi
                 # 手动开关即"用户接管了这个状态": 清掉联动标记, 使日后从 none 切回其它级别
                 # 时不再自动改动它(标记的含义是"logrotate_enabled 的上一次变更是我们做的")。
