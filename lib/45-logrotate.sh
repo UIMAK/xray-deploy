@@ -48,18 +48,40 @@ _logrotate_ensure_package() {
 
 # ---------------------------------------------------------------------------
 # 初始化 state(仅在 state 不存在时写默认值)
+# 4 个键要么全写成、要么视为未初始化: 只写成一半会让后续 _logrotate_write_config
+# 取到"部分默认 + 部分缺失", 而缺失键各自回落到函数内的硬编码默认 —— 表现为
+# 状态页显示的参数与实际配置文件不一致。故任一失败即清掉已写的键, 下次启动重试。
+# **logrotate_enabled 必须最后写**: 它是本函数的哨兵键(上面的 -f 判断读它)。
+# 若先写它而后续键失败, 哨兵已存在, 初始化就永远不会重试。不要调换顺序。
 # ---------------------------------------------------------------------------
 _logrotate_init_state() {
     if [ ! -f "$STATE_DIR/logrotate_enabled" ]; then
-        _state_set logrotate_enabled "on"
-        _state_set logrotate_frequency "daily"
-        _state_set logrotate_retention "7"
-        _state_set logrotate_compress "on"
+        if _state_set logrotate_frequency "daily" \
+           && _state_set logrotate_retention "7" \
+           && _state_set logrotate_compress "on" \
+           && _state_set logrotate_enabled "on"; then
+            return 0
+        fi
+        _warn "logrotate 默认状态写入失败, 已回退(下次启动会重试)"
+        rm -f "$STATE_DIR"/logrotate_enabled "$STATE_DIR"/logrotate_frequency \
+              "$STATE_DIR"/logrotate_retention "$STATE_DIR"/logrotate_compress 2>/dev/null
+        return 1
     fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # 从 state 生成并写入 /etc/logrotate.d/xray-deploy
+# 返回 0 仅当配置文件确实写成; 任一步失败返回 1 并清掉半截文件。
+#
+# 为什么不用 _atomic_write_json 那样的 "tmp -> mv" 原子替换:
+#   tmp 必须与目标同目录才能保证 rename 原子, 而 /etc/logrotate.d 是 logrotate 的
+#   include 目录 —— 遗留的 xray-deploy.XXXXXX 会被一并解析, 与正式文件形成
+#   "duplicate log entry for .../access.log" 错误, 导致我们的日志**永久**不再轮换
+#   (临时文件后缀不在 logrotate 的 tabooext 白名单里)。跨目录 mv 又不是原子操作。
+#   而这里非原子的真实代价极小: logrotate 每天跑一次, 撞上毫秒级半写窗口时只是本次
+#   跳过并报错, 下次即恢复; 与 config.json 半截会让 xray 起不来完全不是一个量级。
+#   故取"直写 + 失败即删半截文件 + 严格传播失败", 不引入 include 目录里的临时文件。
 # ---------------------------------------------------------------------------
 _logrotate_write_config() {
     local enabled freq ret comp
@@ -83,8 +105,14 @@ _logrotate_write_config() {
     local compress_line="compress"
     [ "$comp" = "off" ] && compress_line="nocompress"
 
-    mkdir -p /etc/logrotate.d
-    cat > "$LOGROTATE_CONF" <<EOF
+    if ! mkdir -p /etc/logrotate.d; then
+        _error "无法创建 /etc/logrotate.d, logrotate 配置未写入"
+        return 1
+    fi
+    # cat 的重定向失败(只读 fs / 磁盘满 / 目录缺失)必须显式判定 —— 裸 `cat > f <<EOF`
+    # 之后若紧跟 `chmod ... || true`, 函数返回码会被洗成 0, 调用方据此把 state 置为
+    # "已启用"却没有配置文件, 形成 state/实际分裂(2026-09-03 PR #27 复审 P1)。
+    if ! cat > "$LOGROTATE_CONF" <<EOF
 # xray-deploy logrotate — managed by xd menu, do not edit manually
 $LOG_DIR/access.log $LOG_DIR/error.log {
     $freq
@@ -95,20 +123,83 @@ $LOG_DIR/access.log $LOG_DIR/error.log {
     notifempty
 }
 EOF
+    then
+        _error "写入 logrotate 配置失败(只读文件系统/磁盘空间?): $LOGROTATE_CONF"
+        rm -f "$LOGROTATE_CONF" 2>/dev/null
+        return 1
+    fi
+    # 磁盘满时 cat 可能返回 0 却只落地 0 字节; 空配置对 logrotate 无意义, 视为失败
+    if [ ! -s "$LOGROTATE_CONF" ]; then
+        _error "logrotate 配置内容为空(磁盘空间?), 已删除: $LOGROTATE_CONF"
+        rm -f "$LOGROTATE_CONF" 2>/dev/null
+        return 1
+    fi
     # R38(M14): umask 077 会让配置生成为 0600; logrotate 读它时不受影响(root 运行),
     # 但系统集成文件按惯例给 644, 避免与其他工具/审计脚本产生困惑。
-    chmod 644 "$LOGROTATE_CONF" 2>/dev/null || true
+    # 权限不对不影响 logrotate 工作(它以 root 读), 故只告警不判失败 —— 文件已经写成,
+    # 因权限而回滚会把"轮换已生效"这个用户真正要的结果丢掉。
+    chmod 644 "$LOGROTATE_CONF" 2>/dev/null || \
+        _warn "logrotate 配置权限设置失败(不影响轮换): $LOGROTATE_CONF"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # 删除 logrotate 配置文件
+# 返回 0 仅当文件确实不存在了。rm -f 对"本来就没有"返回 0(幂等), 但只读 /etc、
+# chattr +i、fs 错误时会真失败 —— 那时必须让调用方知道, 否则 state 会被置为
+# "已禁用"而 logrotate 仍在轮换。
 # ---------------------------------------------------------------------------
 _logrotate_remove_config() {
-    rm -f "$LOGROTATE_CONF"
+    rm -f "$LOGROTATE_CONF" 2>/dev/null
+    if [ -e "$LOGROTATE_CONF" ]; then
+        _error "无法删除 logrotate 配置(只读文件系统/文件被锁定?): $LOGROTATE_CONF"
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 启用 / 禁用 logrotate —— 三条路径(手动开关 / loglevel=none 自动禁用 /
+# 切出 none 自动恢复)统一走这两个函数, 不再各自拼 _state_set + rm + cat。
+#
+# 顺序规则: **先做真实世界的动作, 再记账**(与 _geo_set_auto_update 一致:
+# 先写 crontab 行, 最后才 _state_set)。理由是两种失败残局的代价不对称 ——
+#   启用时若先置 state 再写文件, 写失败会留下"state=on 但没有配置文件":
+#     用户以为日志在轮换, 实际磁盘会被撑满(这正是本功能要防的事)。
+#   禁用时若先置 state 再删文件, 删失败会留下"state=off 但文件仍在":
+#     logrotate 继续轮换而 UI 说已停 —— PR #27 复审 P1 指出的分裂。
+# 反过来(动作先、记账后)失败时只是"显示滞后但实际行为符合用户意图", 且必定伴随告警。
+#
+# 与 _geo_set_auto_update 的差异: 那里 state 写失败会回滚 crontab 行, 因为遗留的
+# cron entry 会**无人值守地执行本脚本**(重启服务等副作用)。这里遗留的只是一份
+# logrotate 配置, 行为恰是用户刚刚要求的、也是安装时默认就会写的, 危害等级低得多;
+# 为了 state 文件整洁而删掉用户要的轮换是坏交易。故不回滚, 只显式告警。
+# ---------------------------------------------------------------------------
+_logrotate_enable() {
+    _logrotate_ensure_package || return 1
+    _logrotate_write_config || return 1
+    if ! _state_set logrotate_enabled "on"; then
+        _warn "logrotate 配置已写入并生效, 但状态持久化失败(状态显示可能不准)"
+        _tip "请重试本操作, 或检查 $STATE_DIR 是否可写"
+        return 1
+    fi
+    return 0
+}
+
+_logrotate_disable() {
+    _logrotate_remove_config || return 1
+    if ! _state_set logrotate_enabled "off"; then
+        _warn "logrotate 配置已移除(轮换已停), 但状态持久化失败(状态显示可能不准)"
+        _tip "请重试本操作, 或检查 $STATE_DIR 是否可写"
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # 首次安装/切换后自动配置(幂等)
+# 返回 0 是"安装流程不因日志轮换而中断"的刻意设计(缺包/写失败只告警);
+# 但写失败必须留下痕迹, 不能静默 —— 否则用户以为轮换已就绪而磁盘被慢慢撑满。
 # ---------------------------------------------------------------------------
 _logrotate_setup() {
     _logrotate_ensure_package || return 0
@@ -116,7 +207,7 @@ _logrotate_setup() {
     local enabled
     enabled=$(_state_get logrotate_enabled 2>/dev/null || echo "on")
     if [ "$enabled" = "on" ]; then
-        _logrotate_write_config
+        _logrotate_write_config || _warn "logrotate 配置写入失败, 日志轮换未生效(可在菜单 [日志轮换] 重试)"
     fi
     return 0
 }
@@ -125,7 +216,7 @@ _logrotate_setup() {
 # 卸载时清理
 # ---------------------------------------------------------------------------
 _logrotate_cleanup() {
-    _logrotate_remove_config
+    _logrotate_remove_config || _warn "卸载时未能删除 logrotate 配置, 请手动检查 $LOGROTATE_CONF"
     rm -f "$STATE_DIR"/logrotate_enabled
     rm -f "$STATE_DIR"/logrotate_frequency
     rm -f "$STATE_DIR"/logrotate_retention
@@ -266,36 +357,39 @@ _loglevel_menu() {
     _success "日志级别已切换: ${cur} → ${new_lv}"
 
     # ---- 第 2 步: logrotate 联动(不可回滚, 故必须在 config 成功之后) ----
+    # 严格失败语义: _logrotate_disable/_enable 只在"配置文件动作确实成功"时返回 0。
+    # 失败时不清标记、不谎报成功 —— 否则会留下 state 说已关/已开而实际相反的分裂状态
+    # (PR #27 复审 P1)。日志级别本身已提交成功, 故这里的失败只降级为告警 + 补救指引。
     if [ "$new_lv" = "none" ]; then
         if [ "$enabled" = "on" ]; then
-            # 先置标记再改状态: 标记写失败时不改 logrotate, 避免"关掉了却不知道是谁关的"
+            # 先置标记再动 logrotate: 标记是"这次禁用是我们做的"的唯一记录, 写不进去就
+            # 不该动 logrotate —— 否则关掉了却无从得知该由谁恢复。
             if ! _state_set "$LOGROTATE_AUTO_OFF_KEY" "on"; then
                 _warn "联动标记写入失败, 为避免状态不可追溯, 保持 logrotate 启用"
                 _tip "如需关闭请在本菜单 [1] 手动禁用"
                 _press_any_key; return
             fi
-            if _state_set logrotate_enabled "off"; then
-                _logrotate_remove_config
+            if _logrotate_disable; then
                 _success "logrotate 已同步禁用"
             else
-                _warn "logrotate 状态写入失败, 轮换配置未移除, 请在本菜单 [1] 手动禁用"
+                # 配置文件仍在 => logrotate 可能继续轮换。此时标记必须撤掉:
+                # 留着它会让下次切出 none 时"恢复"一个从未真正关闭的 logrotate。
                 _logrotate_auto_off_clear
+                _warn "logrotate 未能停用(轮换配置仍在), 日志级别已切为 none 但轮换可能继续"
+                _tip "请在本菜单 [1] 手动禁用, 或检查 ${LOGROTATE_CONF} 是否可删"
             fi
         else
             _info "logrotate 当前已是禁用状态, 无需联动"
         fi
     elif [ "$auto_off" = "on" ]; then
         # 只恢复"我们自己关掉的那次"; 用户手动禁用时 auto_off 为空, 不会走到这里
-        if _logrotate_ensure_package; then
-            if _state_set logrotate_enabled "on"; then
-                _logrotate_write_config
-                _logrotate_auto_off_clear
-                _success "logrotate 已自动恢复启用(此前因日志级别 none 被自动禁用)"
-            else
-                _warn "logrotate 状态写入失败, 请在本菜单 [1] 手动启用"
-            fi
+        if _logrotate_enable; then
+            # 仅在真正恢复成功后才清因果标记 —— 提前清掉会让失败后无从重试
+            _logrotate_auto_off_clear
+            _success "logrotate 已自动恢复启用(此前因日志级别 none 被自动禁用)"
         else
-            _warn "logrotate 包不可用, 未能自动恢复; 请安装后在本菜单 [1] 手动启用"
+            _warn "logrotate 未能自动恢复(标记已保留, 下次切换级别会再试)"
+            _tip "也可在本菜单 [1] 手动启用"
         fi
     fi
     _press_any_key
@@ -331,19 +425,24 @@ _logrotate_menu() {
         case "${choice:-0}" in
             0) return ;;
             1)
-                # 开关 toggle
+                # 开关 toggle —— 与联动路径共用 _logrotate_enable/_disable,
+                # 因此"文件动作失败"在这里同样不会被谎报成功(PR #27 复审 P2)
                 if [ "$enabled" = "on" ]; then
-                    _state_set logrotate_enabled "off"
-                    _logrotate_remove_config
-                    _success "logrotate 已禁用"
+                    if _logrotate_disable; then
+                        _success "logrotate 已禁用"
+                    else
+                        _error "logrotate 禁用失败, 轮换配置仍在生效"
+                    fi
                 else
-                    _logrotate_ensure_package || { _press_any_key; continue; }
-                    _state_set logrotate_enabled "on"
-                    _logrotate_write_config
-                    _success "logrotate 已启用"
+                    if _logrotate_enable; then
+                        _success "logrotate 已启用"
+                    else
+                        _error "logrotate 启用失败, 日志轮换未生效"
+                    fi
                 fi
                 # 手动开关即"用户接管了这个状态": 清掉联动标记, 使日后从 none 切回其它级别
-                # 时不再自动改动它(标记的含义是"logrotate_enabled 的上一次变更是我们做的")
+                # 时不再自动改动它(标记的含义是"logrotate_enabled 的上一次变更是我们做的")。
+                # 无论上面成功与否都清: 用户已经明确表达过意图, 自动化不该再覆盖它。
                 if [ "$(_logrotate_auto_off_get)" = "on" ]; then
                     _logrotate_auto_off_clear
                 fi
@@ -370,11 +469,23 @@ _logrotate_menu() {
                     *) _warn "无效选择"; _press_any_key; continue ;;
                 esac
                 [ "$new_freq" = "$cur_freq" ] && { _info "已是 ${new_freq}"; _press_any_key; continue; }
-                _state_set logrotate_frequency "$new_freq"
-                if [ "$enabled" = "on" ]; then
-                    _logrotate_write_config
+                # 参数类变更只能"先记账后落地": _logrotate_write_config 是从 state 读值的,
+                # 顺序反过来就写不出新值。因此这里的失败残局是"state 新、文件旧",
+                # 必须如实报告 —— 报"已更新"会让用户以为新频率已生效(复审 P2 同类)。
+                if ! _state_set logrotate_frequency "$new_freq"; then
+                    _error "轮换频率写入状态失败, 未做任何变更"
+                    _press_any_key; continue
                 fi
-                _success "轮换频率已更新: ${new_freq}"
+                if [ "$enabled" = "on" ]; then
+                    if _logrotate_write_config; then
+                        _success "轮换频率已更新: ${new_freq}"
+                    else
+                        _error "轮换频率已记录为 ${new_freq}, 但配置文件更新失败, 轮换仍按旧参数执行"
+                        _tip "请重试, 或检查 ${LOGROTATE_CONF} 是否可写"
+                    fi
+                else
+                    _success "轮换频率已更新: ${new_freq} (logrotate 当前禁用, 启用后生效)"
+                fi
                 _press_any_key
                 ;;
             3)
@@ -390,11 +501,20 @@ _logrotate_menu() {
                 [ "$new_ret" -lt 1 ] && { _warn "最少保留 1 份"; _press_any_key; continue; }
                 [ "$new_ret" -gt 30 ] && { _warn "最多保留 30 份"; _press_any_key; continue; }
                 [ "$new_ret" = "$cur_ret" ] && { _info "已是 ${new_ret} 份"; _press_any_key; continue; }
-                _state_set logrotate_retention "$new_ret"
-                if [ "$enabled" = "on" ]; then
-                    _logrotate_write_config
+                if ! _state_set logrotate_retention "$new_ret"; then
+                    _error "保留份数写入状态失败, 未做任何变更"
+                    _press_any_key; continue
                 fi
-                _success "保留份数已更新: ${new_ret}"
+                if [ "$enabled" = "on" ]; then
+                    if _logrotate_write_config; then
+                        _success "保留份数已更新: ${new_ret}"
+                    else
+                        _error "保留份数已记录为 ${new_ret}, 但配置文件更新失败, 轮换仍按旧参数执行"
+                        _tip "请重试, 或检查 ${LOGROTATE_CONF} 是否可写"
+                    fi
+                else
+                    _success "保留份数已更新: ${new_ret} (logrotate 当前禁用, 启用后生效)"
+                fi
                 _press_any_key
                 ;;
             4)
@@ -407,13 +527,22 @@ _logrotate_menu() {
                 else
                     new_comp="on"
                 fi
-                _state_set logrotate_compress "$new_comp"
-                if [ "$enabled" = "on" ]; then
-                    _logrotate_write_config
+                if ! _state_set logrotate_compress "$new_comp"; then
+                    _error "压缩开关写入状态失败, 未做任何变更"
+                    _press_any_key; continue
                 fi
                 local comp_label="是"
                 [ "$new_comp" = "off" ] && comp_label="否"
-                _success "压缩已${comp_label}开启"
+                if [ "$enabled" = "on" ]; then
+                    if _logrotate_write_config; then
+                        _success "压缩已${comp_label}开启"
+                    else
+                        _error "压缩已记录为「${comp_label}」, 但配置文件更新失败, 轮换仍按旧参数执行"
+                        _tip "请重试, 或检查 ${LOGROTATE_CONF} 是否可写"
+                    fi
+                else
+                    _success "压缩已${comp_label}开启 (logrotate 当前禁用, 启用后生效)"
+                fi
                 _press_any_key
                 ;;
             5)
