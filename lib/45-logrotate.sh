@@ -99,8 +99,14 @@ _logrotate_enabled_state() {
 #   而这里非原子的真实代价极小: logrotate 每天跑一次, 撞上毫秒级半写窗口时只是本次
 #   跳过并报错, 下次即恢复; 与 config.json 半截会让 xray 起不来完全不是一个量级。
 #   故取"直写 + 失败即删半截文件 + 严格传播失败", 不引入 include 目录里的临时文件。
+#
+# 渲染与写入分离(复审 4): 配置内容由 _logrotate_render_config 产出, 写入与
+# "是否已同步"判定复用同一份渲染 —— 否则比对逻辑会与生成逻辑各自演化
+# (同一项目里 GEO_RULE_REF_JQ 用同一判据供统计与过滤复用, 同一个道理)。
 # ---------------------------------------------------------------------------
-_logrotate_write_config() {
+
+# 渲染应有的配置内容到 stdout(参数校验与生成的唯一来源)
+_logrotate_render_config() {
     local freq ret comp
     freq=$(_state_get logrotate_frequency 2>/dev/null || echo "daily")
     ret=$(_state_get logrotate_retention 2>/dev/null || echo "7")
@@ -121,14 +127,7 @@ _logrotate_write_config() {
     local compress_line="compress"
     [ "$comp" = "off" ] && compress_line="nocompress"
 
-    if ! mkdir -p /etc/logrotate.d; then
-        _error "无法创建 /etc/logrotate.d, logrotate 配置未写入"
-        return 1
-    fi
-    # cat 的重定向失败(只读 fs / 磁盘满 / 目录缺失)必须显式判定 —— 裸 `cat > f <<EOF`
-    # 之后若紧跟 `chmod ... || true`, 函数返回码会被洗成 0, 调用方据此把 state 置为
-    # "已启用"却没有配置文件, 形成 state/实际分裂(2026-09-03 PR #27 复审 P1)。
-    if ! cat > "$LOGROTATE_CONF" <<EOF
+    cat <<EOF
 # xray-deploy logrotate — managed by xd menu, do not edit manually
 $LOG_DIR/access.log $LOG_DIR/error.log {
     $freq
@@ -139,12 +138,47 @@ $LOG_DIR/access.log $LOG_DIR/error.log {
     notifempty
 }
 EOF
-    then
+}
+
+# ---------------------------------------------------------------------------
+# 磁盘上的配置是否与 state 期望一致。
+# 返回 0 = 已同步; 1 = 未同步(文件缺失 / 内容不同 / 读不出来)。
+#
+# 为什么需要它(复审 4 的 P2): 参数类变更(频率/份数/压缩)只能"先记账后落地"
+# (_logrotate_render_config 从 state 读值), 故文件写失败会留下"state 新、文件旧"。
+# 若菜单的"同值即跳过"只比 state, 用户拿到"配置文件更新失败"后**再选同一个值**会被
+# 直接跳过, 永远不再重写 —— 除非绕道改成别的值再改回来。那就不是"可恢复的暂时分裂",
+# 而是正常 UI 路径无法恢复。**同值跳过必须以"文件也已同步"为前提。**
+#
+# 注意: state 是"期望", 文件是"事实"。任何"无需操作"的判断都必须同时看这两侧。
+# ---------------------------------------------------------------------------
+_logrotate_config_in_sync() {
+    [ -f "$LOGROTATE_CONF" ] || return 1
+    local want got
+    want=$(_logrotate_render_config) || return 1
+    got=$(cat "$LOGROTATE_CONF" 2>/dev/null) || return 1
+    [ "$want" = "$got" ]
+}
+
+_logrotate_write_config() {
+    local content
+    content=$(_logrotate_render_config) || {
+        _error "生成 logrotate 配置内容失败"
+        return 1
+    }
+    if ! mkdir -p /etc/logrotate.d; then
+        _error "无法创建 /etc/logrotate.d, logrotate 配置未写入"
+        return 1
+    fi
+    # 重定向失败(只读 fs / 磁盘满 / 目录缺失)必须显式判定 —— 裸 `cat > f` 之后若紧跟
+    # `chmod ... || true`, 函数返回码会被洗成 0, 调用方据此把 state 置为"已启用"却没有
+    # 配置文件, 形成 state/实际分裂(2026-09-03 PR #27 复审 P1)。
+    if ! printf '%s\n' "$content" > "$LOGROTATE_CONF"; then
         _error "写入 logrotate 配置失败(只读文件系统/磁盘空间?): $LOGROTATE_CONF"
         rm -f "$LOGROTATE_CONF" 2>/dev/null
         return 1
     fi
-    # 磁盘满时 cat 可能返回 0 却只落地 0 字节; 空配置对 logrotate 无意义, 视为失败
+    # 磁盘满时写入可能返回 0 却只落地 0 字节; 空配置对 logrotate 无意义, 视为失败
     if [ ! -s "$LOGROTATE_CONF" ]; then
         _error "logrotate 配置内容为空(磁盘空间?), 已删除: $LOGROTATE_CONF"
         rm -f "$LOGROTATE_CONF" 2>/dev/null
@@ -313,6 +347,14 @@ _logrotate_status() {
     local comp_label="是"
     [ "$comp" = "off" ] && comp_label="否"
     echo -e "  压缩: ${CYAN}${comp_label}${NC}"
+
+    # 状态页必须区分"期望"与"事实": state 是期望, /etc/logrotate.d 里的文件才是
+    # logrotate 实际执行的参数。参数写失败会留下"state 新、文件旧", 若这里只回显 state,
+    # 用户看到的是自己想要的值而非真实生效的值(复审 4)。
+    if [ "$enabled" = "on" ] && [ -f "$LOGROTATE_CONF" ] && ! _logrotate_config_in_sync; then
+        echo -e "  ${YELLOW}⚠ 上面的参数尚未同步到 ${LOGROTATE_CONF}, logrotate 仍按旧参数执行${NC}"
+        echo -e "  ${SKYBLUE}(在 [2]/[3]/[4] 里再选一次同样的值即可重试写入)${NC}"
+    fi
 
     if [ "$enabled" = "on" ] && [ -f "$LOGROTATE_CONF" ]; then
         local log_sz1 log_sz2
@@ -563,8 +605,17 @@ _logrotate_menu() {
                     3) new_freq="monthly" ;;
                     *) _warn "无效选择"; _press_any_key; continue ;;
                 esac
-                [ "$new_freq" = "$cur_freq" ] && { _info "已是 ${new_freq}"; _press_any_key; continue; }
-                # 参数类变更只能"先记账后落地": _logrotate_write_config 是从 state 读值的,
+                # 同值跳过必须以"文件也已同步"为前提(复审 4 的 P2)。只比 state 会让
+                # 上一次写失败后的重试路径被锁死: 用户拿到"配置文件更新失败", 再选同一个
+                # 值却被"已是 X"直接跳过, 只能绕道改成别的值再改回来才能重写。
+                if [ "$new_freq" = "$cur_freq" ]; then
+                    if [ "$enabled" = "on" ] && ! _logrotate_config_in_sync; then
+                        _warn "状态已是 ${new_freq}, 但 logrotate 配置尚未同步, 将重试写入"
+                    else
+                        _info "已是 ${new_freq}"; _press_any_key; continue
+                    fi
+                fi
+                # 参数类变更只能"先记账后落地": _logrotate_render_config 是从 state 读值的,
                 # 顺序反过来就写不出新值。因此这里的失败残局是"state 新、文件旧",
                 # 必须如实报告 —— 报"已更新"会让用户以为新频率已生效(复审 P2 同类)。
                 if ! _state_set logrotate_frequency "$new_freq"; then
@@ -595,7 +646,14 @@ _logrotate_menu() {
                 [[ "$new_ret" =~ ^[0-9]+$ ]] || { _warn "请输入有效数字"; _press_any_key; continue; }
                 [ "$new_ret" -lt 1 ] && { _warn "最少保留 1 份"; _press_any_key; continue; }
                 [ "$new_ret" -gt 30 ] && { _warn "最多保留 30 份"; _press_any_key; continue; }
-                [ "$new_ret" = "$cur_ret" ] && { _info "已是 ${new_ret} 份"; _press_any_key; continue; }
+                # 同上: 同值跳过必须以"文件也已同步"为前提, 否则写失败后无法直接重试
+                if [ "$new_ret" = "$cur_ret" ]; then
+                    if [ "$enabled" = "on" ] && ! _logrotate_config_in_sync; then
+                        _warn "状态已是 ${new_ret} 份, 但 logrotate 配置尚未同步, 将重试写入"
+                    else
+                        _info "已是 ${new_ret} 份"; _press_any_key; continue
+                    fi
+                fi
                 if ! _state_set logrotate_retention "$new_ret"; then
                     _error "保留份数写入状态失败, 未做任何变更"
                     _press_any_key; continue
