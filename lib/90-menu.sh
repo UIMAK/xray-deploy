@@ -221,6 +221,16 @@ _view_status() {
 _view_log() {
     clear
     echo
+    # loglevel=none 时核心同时关闭 access 与 error 两个日志(infra/conf/log.go),
+    # 文件不会有新内容 —— 不提示的话用户会以为是脚本坏了。历史内容仍照常展示。
+    # declare -F 探测: 混装版本(20-xray-core 是旧版)时静默跳过提示, 不影响看日志本身。
+    if declare -F _xray_loglevel_get >/dev/null 2>&1 && [ "$(_xray_loglevel_get 2>/dev/null)" = "none" ]; then
+        _warn "当前日志级别为 none: access.log 与 error.log 均已停止写入, 以下仅为历史内容"
+        # 按名字而不是编号指路: 运维段编号由 _main_menu 的 _core/_ops_start 动态算出,
+        # 写死 [16] 会在编号变动后变成错误提示(50-nodes.sh 的 "[6] 安装 Xray" 就这么过期过)。
+        _tip "如需恢复记录, 请到运维菜单的 [日志轮换] → [日志级别] 选择 error/warning 等级别"
+        echo
+    fi
     local logf="$LOG_DIR/error.log"
     [ -f "$logf" ] || logf="$LOG_DIR/access.log"
     if [ -f "$logf" ]; then
