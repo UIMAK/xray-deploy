@@ -335,6 +335,8 @@ _init_config_if_empty() {
     _ensure_dirs || return 1
     # 美化多行格式(便于手动编辑) + routing 规则(bt/广告/私网/CN 走 block)
     # 按 Xray 官方文档顺序排列(log → dns → routing → inbounds → outbounds)
+    # routing.rules 先留空占位, 下面由 XRAY_DEFAULT_ROUTING_RULES_JSON 注入 ——
+    # 默认规则集是唯一真相(00-common), [9] 路由规则的"恢复默认"复用同一常量, 不允许两处硬编码。
     local base='{
   "log": {
     "loglevel": "warning",
@@ -363,52 +365,7 @@ _init_config_if_empty() {
   },
   "routing": {
     "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {
-        "protocol": [
-          "bittorrent"
-        ],
-        "outboundTag": "block"
-      },
-      {
-        "domain": [
-          "geosite:category-ads-all",
-          "geosite:private"
-        ],
-        "outboundTag": "block"
-      },
-      {
-        "ip": [
-          "geoip:private",
-          "geoip:cn"
-        ],
-        "outboundTag": "block"
-      },
-      {
-        "domain": [
-          "pypi.org",
-          "unpkg.com",
-          "debian.org",
-          "github.com",
-          "nodejs.org",
-          "ubuntu.com",
-          "kali.download",
-          "pypi.python.org",
-          "ssl.gstatic.com",
-          "www.gstatic.com",
-          "cp.cloudflare.com",
-          "dockerstatic.com",
-          "fonts.gstatic.com",
-          "registry.npmjs.org",
-          "cdnjs.cloudflare.com",
-          "githubusercontent.com",
-          "www.msftconnecttest.com",
-          "regexp:^(mt|khm)\\d?\\.google\\.com$",
-          "regexp:(gstatic|fonts|dl|ajax)\\.google(apis)?\\.com$"
-        ],
-        "outboundTag": "direct"
-      }
-    ]
+    "rules": []
   },
   "inbounds": [],
   "outbounds": [
@@ -422,10 +379,48 @@ _init_config_if_empty() {
     }
   ]
 }'
-    _atomic_write_json "$CONFIG_FILE" "$base" || return 1
-    # $base 本身即 2 空格人工排版且 _atomic_write_json 已做 jq 校验, 不再做第二遍 jq 写回
+    # 注入默认规则。jq 不可用/失败时不能落地"没有 routing 规则"的半份配置 —— 那会让
+    # 首次安装的机器悄悄失去 BT/广告/私网拦截, 故显式失败由调用方处理。
+    local content
+    content=$(jq --argjson r "$XRAY_DEFAULT_ROUTING_RULES_JSON" '.routing.rules = $r' <<< "$base") || {
+        _error "生成默认配置失败(jq 不可用?), 未写入 $CONFIG_FILE"
+        return 1
+    }
+    [ -n "$content" ] || { _error "生成默认配置为空, 未写入 $CONFIG_FILE"; return 1; }
+    _atomic_write_json "$CONFIG_FILE" "$content" || return 1
+    # jq 输出即 2 空格缩进且 _atomic_write_json 已做 jq 校验, 不再做第二遍 jq 写回
     # (旧的 "jq . > tmp && mv" 路径无错误处理, 失败会静默继续且可能残留 .tmp, R13)
     _info "已初始化空配置: $CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# 读取当前日志级别(log.loglevel)
+# 真相源只有 config.json —— 不另存 state 键(项目有 service/config/state 分裂的历史教训)。
+# 读不到时输出 "warning": 与核心行为一致(infra/conf/log.go 的 default 分支对未识别/缺失
+# 值一律按 warning 处理), 且下游 case 分支不会因空串落到"非法值"。
+# ---------------------------------------------------------------------------
+_xray_loglevel_get() {
+    local lv=""
+    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        lv=$(jq -r '.log.loglevel // empty' "$CONFIG_FILE" 2>/dev/null) || lv=""
+    fi
+    # 配置里存着非法值(手工编辑)时也回显 warning —— 核心就是这么解释它的
+    _xray_loglevel_valid "$lv" || lv="warning"
+    printf '%s' "$lv"
+}
+
+# 日志级别是否合法(XRAY_LOG_LEVELS 白名单, 定义在 00-common)
+# `${XRAY_LOG_LEVELS:-}` 的 `:-` 不可省: 本函数被 _xray_loglevel_get 调用, 而后者又被
+# _logrotate_status / _view_log 这类**只读展示**路径调用。VPS 上存在"主脚本已更新但
+# 00-common 仍是旧版"的混装状态(CLAUDE.md 记录过多次), 裸引用会让 set -u 在打开菜单
+# 时就崩掉 —— 给只读路径引入了新的崩溃点。白名单为空时一律判非法, 回显退化为 warning。
+_xray_loglevel_valid() {
+    local want="${1:-}" lv
+    [ -n "$want" ] || return 1
+    for lv in ${XRAY_LOG_LEVELS:-}; do
+        [ "$want" = "$lv" ] && return 0
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------------------

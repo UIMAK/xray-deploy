@@ -39,6 +39,105 @@ export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/dow
 readonly XRAY_TOP_FIELDS_JSON='["log","api","dns","routing","policy","inbounds","outbounds","stats","fakedns","metrics","observatory","burstObservatory","geodata","version"]'
 
 # ---------------------------------------------------------------------------
+# 默认 routing 规则集(唯一真相)
+# 共用者: _init_config_if_empty(首次写配置, 20-xray-core) 与 _route_restore_default_rules
+# (恢复默认规则, 30-geo)。**绝不允许在任一侧另写一份** —— 两处硬编码必然随时间漂移。
+# 4 条规则中只有第 2、3 条会让 Xray 加载 geosite.dat / geoip.dat(各 ~20MB+),
+# 这正是 [9] → 路由规则精简 要摘掉的两条(见 XRAY_PRIVATE_BLOCK_RULE_JSON)。
+# 注意: regexp 内的 \\d / \\. 是 JSON 转义后的单个反斜杠, 单引号包裹以避免 bash 再吃一层。
+# ---------------------------------------------------------------------------
+readonly XRAY_DEFAULT_ROUTING_RULES_JSON='[
+  {
+    "protocol": [
+      "bittorrent"
+    ],
+    "outboundTag": "block"
+  },
+  {
+    "domain": [
+      "geosite:category-ads-all",
+      "geosite:private"
+    ],
+    "outboundTag": "block"
+  },
+  {
+    "ip": [
+      "geoip:private",
+      "geoip:cn"
+    ],
+    "outboundTag": "block"
+  },
+  {
+    "domain": [
+      "pypi.org",
+      "unpkg.com",
+      "debian.org",
+      "github.com",
+      "nodejs.org",
+      "ubuntu.com",
+      "kali.download",
+      "pypi.python.org",
+      "ssl.gstatic.com",
+      "www.gstatic.com",
+      "cp.cloudflare.com",
+      "dockerstatic.com",
+      "fonts.gstatic.com",
+      "registry.npmjs.org",
+      "cdnjs.cloudflare.com",
+      "githubusercontent.com",
+      "www.msftconnecttest.com",
+      "regexp:^(mt|khm)\\d?\\.google\\.com$",
+      "regexp:(gstatic|fonts|dl|ajax)\\.google(apis)?\\.com$"
+    ],
+    "outboundTag": "direct"
+  }
+]'
+
+# ---------------------------------------------------------------------------
+# 私网/保留地址 block 规则 —— 用字面量 CIDR 等价替换 "geoip:private"
+# 为什么需要它: 精简掉引用 geo 数据的规则后, 原 `ip:["geoip:private","geoip:cn"]` 一并消失,
+# 客户端就能借节点访问本机私网与云元数据端点(169.254.169.254)。routing.md 的 ip 字段
+# 接受字面量 CIDR, 因此把 private 段写死即可保住这层防护且**不加载 geoip.dat**。
+# CIDR 清单取自 v2fly/geoip 的 private 列表原文(plugin/special/private.go), 与
+# geoip:private 等价。
+# ruleTag 是本项目的所有权标记: 精简是幂等操作(重复执行先按该 tag 剔除旧的再重插),
+# 恢复默认规则时也靠它精确移除。Xray 支持 ruleTag(routing.md), 老核心忽略未知字段。
+# ---------------------------------------------------------------------------
+readonly XRAY_PRIVATE_BLOCK_RULE_TAG="xd-block-private"
+readonly XRAY_PRIVATE_BLOCK_RULE_JSON='{
+  "ruleTag": "xd-block-private",
+  "ip": [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.88.99.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "255.255.255.255/32",
+    "::/128",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8"
+  ],
+  "outboundTag": "block"
+}'
+
+# Xray log.loglevel 合法取值(docs/config/log.md)。核心对未识别值静默回落 warning
+# (infra/conf/log.go 的 default 分支), 不会报配置错误 —— 所以校验必须由脚本自己做。
+# 注意 "none" 在核心里同时把 ErrorLogType 与 AccessLogType 置为 None, 即两个日志都停写。
+readonly XRAY_LOG_LEVELS="debug info warning error none"
+
+# ---------------------------------------------------------------------------
 # 颜色定义(借鉴 singbox-lite,统一配色)
 # ---------------------------------------------------------------------------
 RED='\033[0;31m'
@@ -545,6 +644,29 @@ _proc_any_named() {
         _proc_exe_is "${p#/proc/}" "$want" && return 0
     done
     return 1
+}
+
+# ---------------------------------------------------------------------------
+# 就地修改 config.json 前的共同前置校验(路由规则精简/恢复、日志级别切换共用)
+# 缺任一条件即拒绝: 在不存在/空的配置上跑 jq 会产出空或半截配置(_atomic_write_json
+# 已有空内容拦截, 这里前置判断以给出准确原因)。
+# 用法: _config_edit_preflight [操作名]   —— 操作名仅用于错误文案
+# ---------------------------------------------------------------------------
+_config_edit_preflight() {
+    local what="${1:-修改配置}"
+    if [ ! -x "$XRAY_BIN" ]; then
+        _error "Xray 未安装, 无法${what}"
+        return 1
+    fi
+    if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
+        _error "配置文件不存在或为空, 无法${what}: $CONFIG_FILE"
+        return 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        _error "jq 不可用, 无法${what}"
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
