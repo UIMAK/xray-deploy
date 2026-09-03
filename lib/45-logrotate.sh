@@ -71,6 +71,23 @@ _logrotate_init_state() {
 }
 
 # ---------------------------------------------------------------------------
+# 读取 logrotate 启用状态。**所有调用点必须走这里, 不要各自写 `|| echo <某默认>`。**
+# 复审 P2 的根因就是同一个 key 在不同位置有三种兜底解释(`on` / `off` / `未配置`),
+# 于是"state 缺失"这一种情形被同一份代码读成互相矛盾的结论。
+#
+# 缺失一律解释为 "unset"(而非 on/off): 未初始化与用户显式关闭是两件事,
+# 前者应触发初始化/告警, 后者应被尊重。调用方按需自行判断这三种取值。
+# ---------------------------------------------------------------------------
+_logrotate_enabled_state() {
+    local v
+    v=$(_state_get logrotate_enabled 2>/dev/null) || v=""
+    case "$v" in
+        on|off) printf '%s' "$v" ;;
+        *)      printf 'unset' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # 从 state 生成并写入 /etc/logrotate.d/xray-deploy
 # 返回 0 仅当配置文件确实写成; 任一步失败返回 1 并清掉半截文件。
 #
@@ -84,8 +101,7 @@ _logrotate_init_state() {
 #   故取"直写 + 失败即删半截文件 + 严格传播失败", 不引入 include 目录里的临时文件。
 # ---------------------------------------------------------------------------
 _logrotate_write_config() {
-    local enabled freq ret comp
-    enabled=$(_state_get logrotate_enabled 2>/dev/null || echo "on")
+    local freq ret comp
     freq=$(_state_get logrotate_frequency 2>/dev/null || echo "daily")
     ret=$(_state_get logrotate_retention 2>/dev/null || echo "7")
     comp=$(_state_get logrotate_compress 2>/dev/null || echo "on")
@@ -200,13 +216,21 @@ _logrotate_disable() {
 # 首次安装/切换后自动配置(幂等)
 # 返回 0 是"安装流程不因日志轮换而中断"的刻意设计(缺包/写失败只告警);
 # 但写失败必须留下痕迹, 不能静默 —— 否则用户以为轮换已就绪而磁盘被慢慢撑满。
+#
+# **必须消费 _logrotate_init_state 的返回值(复审 P2)。** 否则:
+#   init_state 半写失败 → 回退删掉全部 4 个键(含 enabled) → 这里读不到 enabled
+#   → 旧代码 `|| echo "on"` 兜底成 on → 照样写出配置文件
+#   ⇒ 残局是"logrotate 实际在轮换, 但 state 里没有 enabled 键", 而菜单侧把缺失
+#     读成 off, 于是 UI 显示「启用 logrotate」而它其实已在工作。
+# state 初始化失败时绝不能靠兜底默认继续写配置: 那等于用一个猜出来的值去做持久化动作。
 # ---------------------------------------------------------------------------
 _logrotate_setup() {
     _logrotate_ensure_package || return 0
-    _logrotate_init_state
-    local enabled
-    enabled=$(_state_get logrotate_enabled 2>/dev/null || echo "on")
-    if [ "$enabled" = "on" ]; then
+    if ! _logrotate_init_state; then
+        _warn "logrotate 状态初始化失败, 本次跳过配置写入(下次启动会重试)"
+        return 0
+    fi
+    if [ "$(_logrotate_enabled_state)" = "on" ]; then
         _logrotate_write_config || _warn "logrotate 配置写入失败, 日志轮换未生效(可在菜单 [日志轮换] 重试)"
     fi
     return 0
@@ -230,7 +254,7 @@ _logrotate_cleanup() {
 # ---------------------------------------------------------------------------
 _logrotate_status() {
     local enabled freq ret comp
-    enabled=$(_state_get logrotate_enabled 2>/dev/null || echo "未配置")
+    enabled=$(_logrotate_enabled_state)
     freq=$(_state_get logrotate_frequency 2>/dev/null || echo "daily")
     ret=$(_state_get logrotate_retention 2>/dev/null || echo "7")
     comp=$(_state_get logrotate_compress 2>/dev/null || echo "on")
@@ -243,7 +267,20 @@ _logrotate_status() {
         *)       freq_label="$freq" ;;
     esac
 
-    echo -e "  状态: ${GREEN}${enabled}${NC}"
+    # 状态行要能区分三种情形。尤其 "unset + 文件存在" 必须显式点出来:
+    # 那正是复审 P2 的残局(实际在轮换但 state 里没有记录), 静默显示"未配置"
+    # 会让用户以为轮换没开而不去处理。
+    case "$enabled" in
+        on)  echo -e "  状态: ${GREEN}on${NC}" ;;
+        off) echo -e "  状态: ${RED}off${NC}" ;;
+        *)
+            if [ -f "$LOGROTATE_CONF" ]; then
+                echo -e "  状态: ${YELLOW}未记录(但轮换配置已存在, 实际生效中)${NC}"
+            else
+                echo -e "  状态: ${YELLOW}未配置${NC}"
+            fi
+            ;;
+    esac
     # 日志级别真相源是 config.json 的 log.loglevel(不另存 state, 避免第二份真相)。
     # declare -F 探测: 混装版本(20-xray-core 是旧版)时不显示该行, 而不是显示错误值。
     if declare -F _xray_loglevel_get >/dev/null 2>&1; then
@@ -333,7 +370,10 @@ _loglevel_menu() {
         _press_any_key; return
     fi
 
-    local enabled; enabled=$(_state_get logrotate_enabled 2>/dev/null || echo "off")
+    # 三态读法(on/off/unset)。unset 走 else 分支 = 不做联动:
+    # state 没有记录时我们无从判断"是不是我们该关的那个", 猜一个默认再去动 logrotate
+    # 正是复审 P2 的问题形态。真要处理请走菜单 [1] 手动开关(它会一并接管标记)。
+    local enabled; enabled=$(_logrotate_enabled_state)
     local auto_off; auto_off=$(_logrotate_auto_off_get)
 
     if [ "$new_lv" = "none" ]; then
@@ -379,7 +419,12 @@ _loglevel_menu() {
                 _tip "请在本菜单 [1] 手动禁用, 或检查 ${LOGROTATE_CONF} 是否可删"
             fi
         else
-            _info "logrotate 当前已是禁用状态, 无需联动"
+            if [ "$enabled" = "off" ]; then
+                _info "logrotate 当前已是禁用状态, 无需联动"
+            else
+                _warn "logrotate 状态未记录, 跳过联动禁用(不猜默认值去改系统状态)"
+                _tip "如需关闭请在本菜单 [1] 手动禁用"
+            fi
         fi
     elif [ "$auto_off" = "on" ]; then
         # 只恢复"我们自己关掉的那次"; 用户手动禁用时 auto_off 为空, 不会走到这里
@@ -407,9 +452,17 @@ _logrotate_menu() {
         _logrotate_status
         echo
         local enabled
-        enabled=$(_state_get logrotate_enabled 2>/dev/null || echo "off")
+        enabled=$(_logrotate_enabled_state)
+        # unset 与 off 在这里可以合并成同一个动作("启用"), 因为菜单是用户主动操作:
+        # 无论此前是没记录还是显式关闭, 用户点了启用就该启用, 且 _logrotate_enable
+        # 会把 state 一并写正。这与自动联动路径不同 —— 那里必须拒绝对 unset 动手。
         if [ "$enabled" = "on" ]; then
             echo -e "  ${GREEN}[1]${NC} 禁用 logrotate"
+        elif [ "$enabled" = "off" ]; then
+            echo -e "  ${GREEN}[1]${NC} 启用 logrotate"
+        elif [ -f "$LOGROTATE_CONF" ]; then
+            # 状态未记录但配置文件在: 提供"修正"入口, 走 enable 把 state 补写成 on
+            echo -e "  ${GREEN}[1]${NC} 修正状态记录为「已启用」(轮换配置已存在)"
         else
             echo -e "  ${GREEN}[1]${NC} 启用 logrotate"
         fi
@@ -426,7 +479,8 @@ _logrotate_menu() {
             0) return ;;
             1)
                 # 开关 toggle —— 与联动路径共用 _logrotate_enable/_disable,
-                # 因此"文件动作失败"在这里同样不会被谎报成功(PR #27 复审 P2)
+                # 因此"文件动作失败"在这里同样不会被谎报成功(PR #27 复审 P2)。
+                # unset 视同 off(即执行启用): 菜单是用户主动操作, enable 会把 state 补正。
                 if [ "$enabled" = "on" ]; then
                     if _logrotate_disable; then
                         _success "logrotate 已禁用"
