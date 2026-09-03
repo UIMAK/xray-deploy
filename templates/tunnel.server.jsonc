@@ -4,6 +4,9 @@
     "protocol": "tunnel",
     "tag": "{{TAG}}",
     "settings": {
+        "network": "tcp",
+        "address": "{{TARGET}}",
+        "port": 443,
         "allowedNetwork": "tcp",
         "rewriteAddress": "{{TARGET}}",
         "rewritePort": 443
