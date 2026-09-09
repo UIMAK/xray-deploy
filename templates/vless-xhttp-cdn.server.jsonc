@@ -15,8 +15,7 @@
         "network": "xhttp",
         "xhttpSettings": {
             "mode": "auto",
-            "path": "{{PATH}}",
-            "host": "{{HOST}}"
+            "path": "{{PATH}}"
         }
     },
     "sniffing": {
