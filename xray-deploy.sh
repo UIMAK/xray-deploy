@@ -3,6 +3,7 @@
 # xray-deploy.sh — Xray 部署管理脚本(主入口)
 # 安装后落 /usr/local/bin/xd, 输入 xd 唤出菜单
 # 支持子命令: xd geo-update, xd timed-restart (供 cron 调用)
+#   geo-update 仅旧核心(< v26.4.25)的系统 cron 方案使用; 新核心走 config 的 geodata 内置定时
 # =============================================================================
 
 set -u
