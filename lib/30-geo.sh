@@ -31,22 +31,12 @@ _geo_geodata_json() {
 }
 
 # ---------------------------------------------------------------------------
-# 自动更新状态(唯一读取入口, 供状态栏/菜单/提示共用)
+# 自动更新状态与机制(R45, 审查修订: 单一 jq 查询源)
 # 真相源: config.json 的 .geodata.cron 非空 = 内置更新开启(Xray 定时, 无需系统 cron)。
 # 兼容旧机制: config 无 geodata 时回退读 state geo_cron(=on 表示旧 cron 方案仍在跑)。
-# 输出恒为 on|off。
+# _geo_auto_mechanism 输出恒为 builtin|cron|off, 是唯一查询点; _geo_auto_state 复用它,
+# 输出恒为 on|off —— 避免两份相同 jq 查询漂移。
 # ---------------------------------------------------------------------------
-_geo_auto_state() {
-    local c=""
-    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
-        c=$(jq -r '.geodata.cron // empty' "$CONFIG_FILE" 2>/dev/null)
-    fi
-    [ -n "$c" ] && { echo "on"; return 0; }
-    [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] && { echo "on"; return 0; }
-    echo "off"
-}
-
-# 当前生效的更新机制(文案用): "builtin"=Xray 内置 geodata / "cron"=系统 cron / "off"
 _geo_auto_mechanism() {
     local c=""
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
@@ -55,6 +45,12 @@ _geo_auto_mechanism() {
     [ -n "$c" ] && { echo "builtin"; return 0; }
     [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] && { echo "cron"; return 0; }
     echo "off"
+}
+
+_geo_auto_state() {
+    local m
+    m=$(_geo_auto_mechanism)
+    [ "$m" = "off" ] && echo "off" || echo "on"
 }
 
 # ---------------------------------------------------------------------------
