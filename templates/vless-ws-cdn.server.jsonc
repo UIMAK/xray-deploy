@@ -14,8 +14,7 @@
     "streamSettings": {
         "network": "websocket",
         "wsSettings": {
-            "path": "{{PATH}}",
-            "host": "{{HOST}}"
+            "path": "{{PATH}}"
         }
     },
     "sniffing": {
