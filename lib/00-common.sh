@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 export DEPLOY_DIR="/opt/xray-deploy"
 export BIN_DIR="$DEPLOY_DIR/bin"
-export ASSET_DIR="$DEPLOY_DIR/assets"          # XRAY_LOCATION_ASSET 指向此处
+export ASSET_DIR="$DEPLOY_DIR/assets"          # 资源目录(geoip.dat/geosite.dat)
 export CONFIG_FILE="$DEPLOY_DIR/config.json"
 export NODES_DIR="$DEPLOY_DIR/nodes"           # 每节点元数据
 export CERT_DIR="$DEPLOY_DIR/certs"
@@ -19,7 +19,10 @@ export STATE_DIR="$DEPLOY_DIR/state"
 export BACKUP_DIR="$STATE_DIR/backup"
 
 export XRAY_BIN="$BIN_DIR/xray"
-export XRAY_LOCATION_ASSET="$ASSET_DIR"        # 官方 docs/config/features/env.md
+# XRAY_LOCATION_ASSET 优先经 config.json 的 env 段设置(官方 docs/config/env.md, 核心 ≥
+# v26.7.11 在构建模块前应用该段); 旧核心由 service 文件注入(见 20-xray-core _create_xray_service)。
+# 这里仅保留脚本自身调用(xray -test / direct 模式启动)时的进程级回退, 不再写入 service 文件。
+export XRAY_LOCATION_ASSET="$ASSET_DIR"
 export GEO_LOG="$LOG_DIR/geo.log"
 
 # cloudflared 是唯一例外,落官方默认点(不收口 /opt/xray-deploy)
@@ -36,7 +39,10 @@ export GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest
 export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
 
 # Xray config.json 官方顶层字段顺序(DRY: _normalize_config_format 与 _mutate_config 共用)
-readonly XRAY_TOP_FIELDS_JSON='["log","api","dns","routing","policy","inbounds","outbounds","stats","fakedns","metrics","observatory","burstObservatory","geodata","version"]'
+# 官方顺序(docs/config/index.md): env → log → api → dns → routing → policy → inbounds →
+# outbounds → stats → fakedns → metrics → observatory → burstObservatory → geodata → version。
+# env 是 2026-07 新增(核心 ≥ v26.7.11), 旧核心会静默忽略该字段, 顺序本身对旧核心无影响。
+readonly XRAY_TOP_FIELDS_JSON='["env","log","api","dns","routing","policy","inbounds","outbounds","stats","fakedns","metrics","observatory","burstObservatory","geodata","version"]'
 
 # ---------------------------------------------------------------------------
 # 默认 routing 规则集(唯一真相)
