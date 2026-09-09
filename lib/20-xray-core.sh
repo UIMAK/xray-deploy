@@ -63,6 +63,30 @@ _xray_current_version() {
     "$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}'
 }
 
+# ---------------------------------------------------------------------------
+# 版本门控: 当前已安装核心是否 >= 最低要求。用法: _xray_version_ge "26.7.11"
+# 背景(R44): docs 描述 main 分支, 领先于已发布核心 —— config 新字段(env/geodata 等)在旧
+# 核心上被 Go JSON 静默忽略, 按 docs 无脑写入会让功能"静默失效"。故新特性落地前必须对照
+# 目标发布版本, 这里用纯数字三段比较(version 输出形如 26.9.9), 不用 sort -V(busybox 兼容性)。
+# 未安装/版本读不到 → 返回 1(不满足), 调用方回退到保守行为。
+# ---------------------------------------------------------------------------
+_xray_version_ge() {
+    local min="$1" cur i x y
+    cur=$(_xray_current_version 2>/dev/null)
+    [ -n "$cur" ] || return 1
+    local -a a b
+    IFS='.' read -ra a <<< "$cur"
+    IFS='.' read -ra b <<< "$min"
+    for i in 0 1 2; do
+        x="${a[$i]:-0}"; y="${b[$i]:-0}"
+        [[ "$x" =~ ^[0-9]+$ ]] || x=0
+        [[ "$y" =~ ^[0-9]+$ ]] || y=0
+        [ "$x" -gt "$y" ] && return 0
+        [ "$x" -lt "$y" ] && return 1
+    done
+    return 0
+}
+
 _xray_cached_version() {
     local ver=""
     ver=$(_state_get version 2>/dev/null)
@@ -334,10 +358,15 @@ _init_config_if_empty() {
     fi
     _ensure_dirs || return 1
     # 美化多行格式(便于手动编辑) + routing 规则(bt/广告/私网/CN 走 block)
-    # 按 Xray 官方文档顺序排列(log → dns → routing → inbounds → outbounds)
+    # 按 Xray 官方文档顺序排列(env → log → dns → routing → inbounds → outbounds)
+    # env 段设置 XRAY_LOCATION_ASSET(docs/config/env.md): 核心 ≥ v26.7.11 在构建模块前
+    # 应用该段, geo 文件按此路径加载; 旧核心忽略该字段, 由 service 文件注入同名变量兜底。
     # routing.rules 先留空占位, 下面由 XRAY_DEFAULT_ROUTING_RULES_JSON 注入 ——
     # 默认规则集是唯一真相(00-common), [9] 路由规则的"恢复默认"复用同一常量, 不允许两处硬编码。
     local base='{
+  "env": {
+    "XRAY_LOCATION_ASSET": "'"$ASSET_DIR"'"
+  },
   "log": {
     "loglevel": "warning",
     "access": "'"$LOG_DIR"'/access.log",
@@ -391,6 +420,32 @@ _init_config_if_empty() {
     # jq 输出即 2 空格缩进且 _atomic_write_json 已做 jq 校验, 不再做第二遍 jq 写回
     # (旧的 "jq . > tmp && mv" 路径无错误处理, 失败会静默继续且可能残留 .tmp, R13)
     _info "已初始化空配置: $CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# 启动自动操作(R45): 确保 config.json 带 env.XRAY_LOCATION_ASSET
+# 背景: 新部署的默认配置已含 env 段(见 _init_config_if_empty), 但存量部署的 config 没有。
+# 新核心(≥ v26.7.11)靠该段定位 geo 文件, 若缺失且 service 文件也不再注入, geo 会静默失效;
+# 旧核心忽略该字段(service 注入兜底仍在), 提前补上无副作用, 未来切到新核心即可无缝生效。
+# 幂等: 仅当 env.XRAY_LOCATION_ASSET 缺失时注入; 用户手改的值不被覆盖。不重启服务
+# (与 _normalize_config_format 同级), 只保证磁盘上的 config 自描述, 下次重启生效。
+# 失败静默(启动路径不阻塞), 由下次启动重试。
+# ---------------------------------------------------------------------------
+_auto_ensure_config_env() {
+    [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    local need
+    # .env 非对象时 `.env.XRAY_LOCATION_ASSET` 会让 jq 报类型错误而整行失败 -> 前置判断
+    # 必须先按类型分支(与注入处同一口径), 否则非对象 .env 会在这里提前 return 而无法自愈。
+    need=$(jq -r 'if (.env | type) == "object" and ((.env.XRAY_LOCATION_ASSET // "") != "") then 0 else 1 end' "$CONFIG_FILE" 2>/dev/null) || return 0
+    [ "$need" = "1" ] || return 0
+    local content
+    # 审查修订: .env 可能被手改成非对象(字符串/数组), 裸 `(.env // {}) + {...}` 会触发
+    # jq 类型错误而静默跳过, 该次启动不自愈。这里显式按类型处理: 非对象一律视为 {} 重建。
+    content=$(jq --arg a "$ASSET_DIR" '.env = ((if (.env | type) == "object" then .env else {} end) + {XRAY_LOCATION_ASSET: $a})' "$CONFIG_FILE" 2>/dev/null) || return 0
+    [ -n "$content" ] || return 0
+    _atomic_write_json "$CONFIG_FILE" "$content" 2>/dev/null || return 0
+    _info "已注入 config env: XRAY_LOCATION_ASSET=$ASSET_DIR"
 }
 
 # ---------------------------------------------------------------------------
@@ -472,12 +527,19 @@ _safe_nofile() {
 }
 
 # ---------------------------------------------------------------------------
-# 生成 service 文件(R2:注入 XRAY_LOCATION_ASSET=/opt/xray-deploy/assets)
+# 生成 service 文件
+# R45: XRAY_LOCATION_ASSET 优先走 config.json 的 env 段(docs/config/env.md, 核心 ≥
+# v26.7.11 在构建模块前应用该段并替换同名进程变量)。仅当已安装核心 < v26.7.11(不识别
+# env 段)时才在 service 文件注入同名环境变量兜底 —— 版本读不到时保守保留注入(旧行为)。
+# 注意: _install_or_switch_xray 先替换二进制再调本函数, 这里读到的是"新"核心版本。
 # ---------------------------------------------------------------------------
 _create_xray_systemd_service() {
-    local nofile_line=""
+    local nofile_line="" env_line=""
     local _nf; _nf=$(_safe_nofile)
     [ -n "$_nf" ] && nofile_line="LimitNOFILE=$_nf"
+    if ! _xray_version_ge "26.7.11"; then
+        env_line="Environment=XRAY_LOCATION_ASSET=${ASSET_DIR}"
+    fi
     cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service (xray-deploy)
@@ -491,7 +553,7 @@ StartLimitBurst=20
 
 [Service]
 Type=simple
-Environment=XRAY_LOCATION_ASSET=${ASSET_DIR}
+${env_line}
 ExecStart=${XRAY_BIN} run -c ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=3
@@ -509,10 +571,14 @@ EOF
 }
 
 _create_xray_openrc_service() {
-    local rc_ulimit_line=""
+    local rc_ulimit_line="" sd_env_line=""
     local _nf; _nf=$(_safe_nofile)
     # 抬到"目标 65535 或当前 hard 上限"(见 _safe_nofile); 只有完全探测不到时才留空
     [ -n "$_nf" ] && rc_ulimit_line="rc_ulimit=\"-n $_nf\""
+    # R45: 核心 ≥ v26.7.11 用 config env 段, 不再经 supervise-daemon 注入; 旧核心保留注入兜底
+    if ! _xray_version_ge "26.7.11"; then
+        sd_env_line="supervise_daemon_args=\"--env XRAY_LOCATION_ASSET=${ASSET_DIR}\""
+    fi
     cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
 
@@ -529,7 +595,7 @@ pidfile="/run/\${RC_SVCNAME}.pid"
 ${rc_ulimit_line}
 # 不静态设置 capabilities: supervise-daemon 裁剪 bounding set 的 prctl 在受限容器内会
 # EPERM 并中止启动; 且 iptables 由管理脚本以 root 执行, xray 进程运行期不需要 NET_ADMIN/RAW。
-supervise_daemon_args="--env XRAY_LOCATION_ASSET=${ASSET_DIR}"
+${sd_env_line}
 
 command="${XRAY_BIN}"
 command_args="run -c ${CONFIG_FILE}"
@@ -760,7 +826,7 @@ _uninstall_xray() {
     fi
     # 删部署目录(含 config/nodes/assets/logs/state/lib/templates)
     rm -rf "$DEPLOY_DIR"
-    _success "Xray 已卸载干净(/opt/xray-deploy、xd 命令、geo crontab 已清除)"
+    _success "Xray 已卸载干净(/opt/xray-deploy、xd 命令、系统 cron 已清除)"
 }
 
 # ---------------------------------------------------------------------------

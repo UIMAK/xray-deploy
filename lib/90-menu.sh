@@ -57,8 +57,8 @@ _print_status_bar() {
         fi
     fi
 
-    # Geo
-    local geostate; geostate=$(_state_get geo_cron 2>/dev/null); [ -z "$geostate" ] && geostate="off"
+    # Geo(真相源: config.json 的 geodata.cron, 兼容旧 state)
+    local geostate; geostate=$(_geo_auto_state 2>/dev/null); [ -z "$geostate" ] && geostate="off"
     local geostr
     [ "$geostate" = "on" ] && geostr="${GREEN}● 自动${NC}" || geostr="${RED}○ 手动${NC}"
 
@@ -94,9 +94,12 @@ _has_reality_nodes() {
 # 主菜单
 # ---------------------------------------------------------------------------
 _main_menu() {
-    # 启动时: 自动补 tag + 自动采纳孤儿入站 + 格式化配置
+    # 启动时: 自动补 tag + 自动采纳孤儿入站 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
+    # 后两个用 declare -F 守卫: 混装版本(90-menu 已更新而 20/30-geo 未更新)时静默跳过
     _auto_tag_tagless_inbounds
     _auto_adopt_orphans
+    if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
+    if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
     _normalize_config_format
     local choice
 

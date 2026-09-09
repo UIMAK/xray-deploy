@@ -1,14 +1,57 @@
 #!/bin/bash
 # =============================================================================
 # lib/30-geo.sh — geosite/geoip 自动更新
-# 需求 R4: 用户可开/关, 默认关; cron 每月 1/4/7/.../31 号 03:00 执行; 下载失败保留旧 dat; 运行期校验失败回退旧 dat; 不要精简版
-# 数据源: Loyalsoldier/v2ray-rules-dat releases/latest/download/{geosite,geoip}.dat
-# 落点: $ASSET_DIR (/opt/xray-deploy/assets, 即 XRAY_LOCATION_ASSET)
-# 注意: cron 表达式 */3 在 day-of-month 字段表示每月 1/4/7/.../31 号, 并非严格的"每 3 天"(跨月不连续)
+# 需求 R4: 用户可开/关, 默认关; 数据源 Loyalsoldier/v2ray-rules-dat; 下载失败保留旧 dat。
+# R45 更新(2026-09): 自动更新优先走 Xray 内置 geodata 配置(docs/config/geodata.md,
+# 核心 ≥ v26.4.25): config.json 的 geodata.cron 定时 + assets 下载, 热重载 + 失败回滚,
+# **不再需要系统 cron**。旧核心(< v26.4.25)自动回退到系统 cron 方案(每月 1/4/7/.../31 号
+# 03:00 调用 xd geo-update), 兼容存量部署。
+# 落点: $ASSET_DIR (/opt/xray-deploy/assets, 经 config env 的 XRAY_LOCATION_ASSET 指向)
+# 注意: geodata 的 assets.file 在配置构建时要求文件已存在(infra/conf/geodata.go StatAsset),
+# 所以启用内置更新前必须确保 dat 文件已在 assets/ 下(核心安装自带 / [1] 立即更新一次)。
 # ============================================================================
 
 GEO_CRON_MARKER="# xray-deploy-geo-update"
 GEO_STATE_FILE="$STATE_DIR/geo_cron"
+# 内置 geodata 的定时表达式(与旧 cron 同一语义: day-of-month 的 */3 = 每月 1/4/7/.../31 号)
+GEO_CRON_EXPR="0 3 */3 * *"
+
+# ---------------------------------------------------------------------------
+# 生成 config.json 的 geodata 段(R45)
+# 结构依据 docs/config/geodata.md: cron(5 字段标准表达式) + assets[](url 必须 HTTPS,
+# file 为资源目录内的文件名)。outbound 省略 → 下载走路由模块(默认规则 github 直连)。
+# 注意: 不用 jq -n --arg 也行, 但必须保证输出是合法 JSON(供 --argjson 传参)。
+# ---------------------------------------------------------------------------
+_geo_geodata_json() {
+    jq -n \
+        --arg cron "$GEO_CRON_EXPR" \
+        --arg u1 "$GEO_BASE/geosite.dat" \
+        --arg u2 "$GEO_BASE/geoip.dat" \
+        '{cron: $cron, assets: [ {url: $u1, file: "geosite.dat"}, {url: $u2, file: "geoip.dat"} ]}'
+}
+
+# ---------------------------------------------------------------------------
+# 自动更新状态与机制(R45, 审查修订: 单一 jq 查询源)
+# 真相源: config.json 的 .geodata.cron 非空 = 内置更新开启(Xray 定时, 无需系统 cron)。
+# 兼容旧机制: config 无 geodata 时回退读 state geo_cron(=on 表示旧 cron 方案仍在跑)。
+# _geo_auto_mechanism 输出恒为 builtin|cron|off, 是唯一查询点; _geo_auto_state 复用它,
+# 输出恒为 on|off —— 避免两份相同 jq 查询漂移。
+# ---------------------------------------------------------------------------
+_geo_auto_mechanism() {
+    local c=""
+    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        c=$(jq -r '.geodata.cron // empty' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    [ -n "$c" ] && { echo "builtin"; return 0; }
+    [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] && { echo "cron"; return 0; }
+    echo "off"
+}
+
+_geo_auto_state() {
+    local m
+    m=$(_geo_auto_mechanism)
+    [ "$m" = "off" ] && echo "off" || echo "on"
+}
 
 # ---------------------------------------------------------------------------
 # "该 routing 规则是否引用 geo 数据"的唯一判据(统计与过滤复用同一份, 避免两处漂移)
@@ -194,10 +237,63 @@ _geo_update() {
 }
 
 # ---------------------------------------------------------------------------
-# 开/关自动更新(crontab 每 3 天)
+# 开/关自动更新(R45 双路径)
+#   新核心(≥ v26.4.25): 写 config.json 的 geodata 段, Xray 内置定时下载+热重载, 无系统 cron。
+#   旧核心(< v26.4.25): 回退系统 cron 方案(调用 xd geo-update), 兼容存量部署。
 # 用法:_geo_set_auto_update on|off
 # ---------------------------------------------------------------------------
 _geo_set_auto_update() {
+    local action="$1"
+    case "$action" in
+        on)
+            if [ -x "$XRAY_BIN" ] && _xray_version_ge "26.4.25"; then
+                # geodata 配置构建时要求 dat 文件已存在(infra/conf/geodata.go StatAsset),
+                # 缺失时 xray 会启动失败 —— 必须前置校验, 让用户先 [1] 立即更新一次。
+                if [ ! -f "$ASSET_DIR/geosite.dat" ] || [ ! -f "$ASSET_DIR/geoip.dat" ]; then
+                    _warn "assets/ 下缺少 geosite.dat 或 geoip.dat, 无法启用 Xray 内置更新"
+                    _tip "请先在上层菜单选择 [1] 立即更新一次(或安装核心时会自动放入), 再开启自动更新"
+                    return 1
+                fi
+                local gd
+                gd=$(_geo_geodata_json) || { _error "生成 geodata 配置失败"; return 1; }
+                if _mutate_config --argjson gd "$gd" '.geodata = $gd'; then
+                    # 清理旧 cron 机制(幂等), 旧 state 一并清掉 —— 新机制以 config 为真相
+                    _geo_remove_cron_line >/dev/null 2>&1
+                    _state_set geo_cron "off" 2>/dev/null || true
+                    _success "Geo 自动更新已开启 (Xray 内置: $GEO_CRON_EXPR, 热重载, 无需系统 cron)"
+                    return 0
+                fi
+                _error "写入 geodata 配置失败(配置已回滚)"
+                return 1
+            fi
+            # 旧核心: 沿用系统 cron 方案
+            _geo_set_auto_update_cron on
+            ;;
+        off)
+            # 先移除 config geodata(若有), 再清旧 cron 行与旧 state —— 两条路径都关干净
+            local has_gd=0
+            if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+                has_gd=$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null || echo 0)
+            fi
+            if [ "$has_gd" = "1" ]; then
+                if ! _mutate_config 'del(.geodata)'; then
+                    _error "移除 geodata 配置失败(配置已回滚)"
+                    return 1
+                fi
+            fi
+            _geo_remove_cron_line >/dev/null 2>&1
+            _state_set geo_cron "off" 2>/dev/null || true
+            _success "Geo 自动更新已关闭"
+            ;;
+        *) _warn "未知动作: $action"; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 旧方案: 系统 cron 定时更新(仅旧核心 < v26.4.25 使用)
+# 用法:_geo_set_auto_update_cron on|off
+# ---------------------------------------------------------------------------
+_geo_set_auto_update_cron() {
     local action="$1"
     # cron 调用本脚本的 geo-update 子命令: xd geo-update
     # */3 在 day-of-month 字段: 每月 1/4/7/.../31 号 03:00 (跨月不连续, 非严格 "每 3 天")
@@ -216,6 +312,8 @@ _geo_set_auto_update() {
             # state=off ⇔ 项目 cron entry 不存在, 避免 daemon 恢复后无状态执行。
             if _ensure_cron_running; then
                 _state_set geo_cron "on"
+                _warn "已开启 (系统 cron 方案: 当前核心 < v26.4.25, 不支持 Xray 内置 geodata)"
+                _tip "更新到 ≥ v26.4.25 后会自动切换到 Xray 内置定时, 无需系统 cron"
                 _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
             else
                 # 回滚刚写入的 crontab 行; 回滚失败要暴露, 不能静默
@@ -235,22 +333,64 @@ _geo_set_auto_update() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# 启动自动操作(R45): 存量 geo_cron=on 部署迁移到 Xray 内置 geodata
+# 场景: 旧脚本用系统 cron + state geo_cron=on 开启自动更新; 升级脚本后:
+#   - 新核心(≥ v26.4.25)且 dat 齐备 → 写入 config geodata 段(不重启, 下次重启生效),
+#     移除系统 cron 行与旧 state, 机制切换完成。
+#   - 旧核心 → 保持系统 cron 机制不动(旧方案继续工作), 不迁移。
+#   - config 已有 geodata.cron(已迁移过) → 仅清理残留 cron 行与旧 state。
+# 幂等, 失败静默(启动路径不阻塞), 至多一条 _info。
+# ---------------------------------------------------------------------------
+_auto_migrate_geo_autoupdate() {
+    [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
+    local has_gd=0
+    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        has_gd=$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    fi
+    if [ "$has_gd" = "1" ]; then
+        _geo_remove_cron_line >/dev/null 2>&1
+        _state_set geo_cron "off" 2>/dev/null || true
+        return 0
+    fi
+    if [ -x "$XRAY_BIN" ] && _xray_version_ge "26.4.25" \
+       && [ -f "$ASSET_DIR/geosite.dat" ] && [ -f "$ASSET_DIR/geoip.dat" ]; then
+        local gd content
+        gd=$(_geo_geodata_json) || return 0
+        content=$(jq --argjson gd "$gd" '.geodata = $gd' "$CONFIG_FILE" 2>/dev/null) || return 0
+        [ -n "$content" ] || return 0
+        if _atomic_write_json "$CONFIG_FILE" "$content" 2>/dev/null; then
+            _geo_remove_cron_line >/dev/null 2>&1
+            _state_set geo_cron "off" 2>/dev/null || true
+            _info "已迁移 Geo 自动更新到 Xray 内置定时($GEO_CRON_EXPR), 移除系统 cron, 下次重启生效"
+        fi
+    fi
+}
+
 _geo_remove_cron_line() {
     crontab -l 2>/dev/null | grep -v "$GEO_CRON_MARKER" | crontab - 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
-# 解析下次预计执行时间(从 crontab 行粗略推算, 用于回显)
+# 解析下次预计执行时间(回显用)
+# 新机制: 读 config geodata.cron 原样显示; 旧机制: 从 crontab 行粗略推算
 # ---------------------------------------------------------------------------
 _geo_next_run_hint() {
+    local c=""
+    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        c=$(jq -r '.geodata.cron // empty' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    if [ -n "$c" ]; then
+        echo "Xray 内置定时: ${c} (每月 1/4/7/.../31 号 03:00, 热重载)"
+        return
+    fi
     local line
     line=$(crontab -l 2>/dev/null | grep "$GEO_CRON_MARKER" | head -1)
     if [ -z "$line" ]; then
         echo "未开启"
         return
     fi
-    # 形如 0 3 */3 * * —— 每月 1/4/7/.../31 号 03:00 (非严格 "每 3 天", 跨月间隔不固定)
-    echo "每月 1/4/7/.../31 号 03:00 (cron: $(echo "$line" | awk '{print $1" "$2" "$3" "$4" "$5}'))"
+    echo "每月 1/4/7/.../31 号 03:00 (系统 cron)"
 }
 
 # ---------------------------------------------------------------------------
@@ -433,7 +573,7 @@ _route_rules_menu() {
                 if _route_slim_geo_rules; then
                     _success "路由规则已精简, xray 已用新配置重启"
                     _tip "geosite.dat / geoip.dat 不再被加载, 内存占用应明显下降"
-                    local gstate; gstate=$(_state_get geo_cron 2>/dev/null)
+                    local gstate; gstate=$(_geo_auto_state 2>/dev/null)
                     if [ "$gstate" = "on" ]; then
                         _tip "当前 Geo 自动更新仍为开启; 已无 geo 规则时它没有实际意义, 可在上一级 [2] 关闭"
                     fi
@@ -475,16 +615,21 @@ _geo_menu() {
     clear
     echo
     echo -e "  ${CYAN}【Geo 数据自动更新】${NC}"
-    local state; state=$(_state_get geo_cron 2>/dev/null)
-    [ -z "$state" ] && state="off"
+    local state; state=$(_geo_auto_state)
+    local mech; mech=$(_geo_auto_mechanism)
     if [ "$state" = "on" ]; then
         echo -e "  当前状态: ${GREEN}● 已开启${NC}"
         echo -e "  下次执行: $(_geo_next_run_hint)"
+        if [ "$mech" = "cron" ]; then
+            echo -e "  更新机制: ${YELLOW}系统 cron(当前核心 < v26.4.25, 不支持 Xray 内置)${NC}"
+        else
+            echo -e "  更新机制: ${GREEN}Xray 内置定时(热重载, 无需系统 cron)${NC}"
+        fi
     else
         echo -e "  当前状态: ${RED}○ 已关闭${NC}"
     fi
     echo -e "  数据源: Loyalsoldier/v2ray-rules-dat (完整版)"
-    echo -e "  落点: $ASSET_DIR (XRAY_LOCATION_ASSET)"
+    echo -e "  落点: $ASSET_DIR (config env 的 XRAY_LOCATION_ASSET)"
     echo
     echo -e "  ${GREEN}[1]${NC} 立即更新一次"
     if [ "$state" = "on" ]; then
