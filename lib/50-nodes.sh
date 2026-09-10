@@ -2006,7 +2006,7 @@ _add_vless_tcp_reality_vision() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=firefox&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -2016,7 +2016,7 @@ _add_vless_tcp_reality_vision() {
     fi
     # R38(P1): 用户可控字段(节点名/地址)必须过 _yaml_dq 并放进双引号——裸插入时一个 " 就
     # 让整份 clash.yaml 不可解析(不只该节点), 且该脏行事后无法从界面清除
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, network: tcp}"
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": chrome, network: tcp}"
 
     # R42: reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json
@@ -2138,7 +2138,7 @@ _add_vless_xhttp_reality() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=firefox&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -2146,7 +2146,7 @@ _add_vless_xhttp_reality() {
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": firefox, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
 
     # R42: reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json
@@ -2425,12 +2425,12 @@ _add_vless_xhttp_cdn() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=firefox&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": firefox, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
 
     local meta_json
     meta_json=$(jq -n \
@@ -2438,7 +2438,7 @@ _add_vless_xhttp_cdn() {
         --argjson port "$port" --arg listen "$listen" \
         --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
         --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
-        --arg sni "$host" --arg fp "firefox" --arg alpn "h2" \
+        --arg sni "$host" --arg fp "chrome" --arg alpn "h2" \
         --arg insecure "0" --arg allowInsecure "0" --arg link "$link" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')
     if [ "$ENC_ENABLED" -eq 1 ]; then
@@ -2511,12 +2511,12 @@ _add_vless_ws_cdn() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=firefox&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": firefox, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
 
     local meta_json
     meta_json=$(jq -n \
@@ -2524,7 +2524,7 @@ _add_vless_ws_cdn() {
         --argjson port "$port" --arg listen "$listen" \
         --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
         --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
-        --arg sni "$host" --arg fp "firefox" \
+        --arg sni "$host" --arg fp "chrome" \
         --arg insecure "0" --arg allowInsecure "0" --arg link "$link" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')
     if [ "$ENC_ENABLED" -eq 1 ]; then
@@ -2866,10 +2866,10 @@ _rebuild_reality_link() {
     local link
     case "$proto" in
         vless-tcp-reality-vision)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=firefox&pbk=$(_url_encode "$pk")&sid=${sid}"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
             ;;
         vless-xhttp-reality)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=firefox&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
             ;;
         *) echo ""; return 1 ;;
     esac
@@ -2911,7 +2911,7 @@ _rebuild_cdn_link() {
     preferred_addr=$(jq -r '.preferred_addr // .host' "$meta")
     preferred_port=$(jq -r '.preferred_port // "443"' "$meta")
     sni=$(jq -r '.sni // .host' "$meta")
-    fp=$(jq -r '.fp // "firefox"' "$meta")
+    fp=$(jq -r '.fp // "chrome"' "$meta")
     alpn=$(jq -r '.alpn // "h2"' "$meta")
     insecure=$(jq -r '.insecure // "0"' "$meta")
     allowInsecure=$(jq -r '.allowInsecure // "0"' "$meta")
