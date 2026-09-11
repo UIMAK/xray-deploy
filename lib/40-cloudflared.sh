@@ -99,9 +99,14 @@ _extract_token() {
 # ---------------------------------------------------------------------------
 # 读取当前 service 文件启动行, 解析出 token 与 3 开关状态
 # 输出全局: CF_CUR_TOKEN / CF_CUR_AUTOUPDATE / CF_CUR_HTTP2 / CF_CUR_EDGE_IP
+#           CF_CUR_AUTOUPDATE_FLAG(启动行是否**显式**写了 autoupdate 标志)
 # ---------------------------------------------------------------------------
 _read_cf_state() {
     CF_CUR_TOKEN=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_RAWLINE=""
+    # F6: "启动行没有 autoupdate 标志" ≠ "自动更新关闭" —— cloudflared 缺省 autoupdate=on
+    # (24h)。flag=no 时菜单按"默认开"显示, 且重建行不再无条件写 --no-autoupdate,
+    # 避免对手动安装的 cloudflared 造成用户未要求的静默行为变更。
+    CF_CUR_AUTOUPDATE_FLAG="no"
     local svcfile
     case "$INIT_SYSTEM" in
         systemd) svcfile="$CF_UNIT_SYSTEMD" ;;
@@ -155,8 +160,8 @@ $ln"
         \"*) CF_CUR_TOKEN="${CF_CUR_TOKEN#\"}" ;;
     esac
     # 开关(固定字符串匹配)
-    echo "$oneline" | grep -q -- '--no-autoupdate'      && CF_CUR_AUTOUPDATE="off"
-    echo "$oneline" | grep -q -- '--autoupdate-freq'   && CF_CUR_AUTOUPDATE="on"
+    echo "$oneline" | grep -q -- '--no-autoupdate'      && CF_CUR_AUTOUPDATE="off" && CF_CUR_AUTOUPDATE_FLAG="yes"
+    echo "$oneline" | grep -q -- '--autoupdate-freq'   && CF_CUR_AUTOUPDATE="on"  && CF_CUR_AUTOUPDATE_FLAG="yes"
     echo "$oneline" | grep -q -- '--protocol http2'    && CF_CUR_HTTP2="on"
     # 协议栈: --edge-ip-version <4|6|auto>; 未写则 off
     if   echo "$oneline" | grep -q -- '--edge-ip-version 4';    then CF_CUR_EDGE_IP="4";
@@ -175,7 +180,9 @@ _cf_build_cmdline() {
     local cmd="$CF_BIN"
     if [ "$CF_AUTOUPDATE" = "on" ]; then
         cmd="$cmd --autoupdate-freq 24h0m0s"
-    else
+    elif [ "${CF_AUTOUPDATE_FLAG:-yes}" = "yes" ]; then
+        # F6: 仅当原启动行确实显式管理该开关(或本脚本首次安装, FLAG 默认 yes)才写
+        # --no-autoupdate; 手动安装的无标志行重建后保持 cloudflared 缺省行为不变
         cmd="$cmd --no-autoupdate"
     fi
     cmd="$cmd tunnel"
@@ -240,15 +247,22 @@ _svc_commit() {
         return 1
     fi
     rm -f "$tmp"
-    # openrc init.d 文件需可执行。chmod 失败时文件已被 cat 改写成新内容, 必须 restore 才能算"提交失败
-    # 但内容已回退"(否则调用方收到失败、service 却是新内容, 事务泄漏)。
+    # F4: service 行内含明文隧道 token, 写回时收紧权限 —— systemd unit 600(init.d 700
+    # 含可执行位)。cloudflared service install 生成的是 644/755(任何本地用户可读 token);
+    # xray unit 无密钥可选 644(R38 M14), 这里有密钥必须收口。systemd 会记
+    # "marked world-inaccessible" 提示, 属可接受代价。chmod 失败 warn-only:
+    # 内容已落地, 因权限回滚会丢掉用户要的结果(与 logrotate chmod 同一取舍)。
     case "$svcfile" in
         /etc/init.d/*)
-            if ! chmod +x "$svcfile" 2>/dev/null; then
+            if ! chmod 700 "$svcfile" 2>/dev/null; then
                 _error "service 执行权限设置失败: $svcfile, 回滚 service 文件"
                 _svc_restore "$svcfile" || _error "回滚失败, 请手动检查 $svcfile"
                 return 1
             fi
+            ;;
+        *)
+            chmod 600 "$svcfile" 2>/dev/null || \
+                _warn "service 文件权限收紧失败(token 可能被其他用户读取): $svcfile"
             ;;
     esac
     return 0
@@ -265,10 +279,14 @@ _svc_restore() {
     fi
     case "$svcfile" in
         /etc/init.d/*)
-            if ! chmod +x "$svcfile" 2>/dev/null; then
+            if ! chmod 700 "$svcfile" 2>/dev/null; then
                 _error "service 回滚后执行权限设置失败: $svcfile"
                 return 1
             fi
+            ;;
+        *)
+            chmod 600 "$svcfile" 2>/dev/null || \
+                _warn "service 文件权限收紧失败(token 可能被其他用户读取): $svcfile"
             ;;
     esac
     # 恢复成功: .bak 已消费, 立即删除(否则直调 _svc_restore 的路径——_svc_commit chmod 失败、
@@ -616,14 +634,21 @@ _install_cloudflared() {
     fi
     [ -z "$token" ] && { _error "Token 不能为空"; return 1; }
 
-    # 默认设置(脚本安装默认: 自动更新 off, HTTP2 on, 协议栈 off)
-    CF_AUTOUPDATE="off"; CF_HTTP2="on"; CF_EDGE_IP="off"
+    # 默认设置(脚本安装默认: 自动更新 off, HTTP2 on, 协议栈 off)。
+    # FLAG=yes: 本脚本管理的启动行显式携带全部管理标志(_cf_build_cmdline 依赖)
+    CF_AUTOUPDATE="off"; CF_HTTP2="on"; CF_EDGE_IP="off"; CF_AUTOUPDATE_FLAG="yes"
 
     _info "调用 cloudflared service install..."
     if ! "$CF_BIN" service install "$token" 2>&1; then
         _error "cloudflared service install 失败"
         return 1
     fi
+    # 官方命令生成的 unit 是 644/755, token 任何本地用户可读 —— 落地即收紧(F4);
+    # 随后 _cf_write_service_line 的 _svc_commit 会再收一次, 这里覆盖"写入失败中止"的分支。
+    case "$INIT_SYSTEM" in
+        systemd) chmod 600 "$CF_UNIT_SYSTEMD" 2>/dev/null ;;
+        openrc)  chmod 700 "$CF_UNIT_OPENRC" 2>/dev/null ;;
+    esac
     # 官方命令生成的 service 行可能不含我们要的参数, 重组覆盖。写入失败必须中止(不写 state,
     # 否则 state 记录的参数与 service 实际内容不一致)。
     if ! _cf_write_service_line "$(_cf_build_cmdline "$token")"; then
@@ -639,12 +664,13 @@ _install_cloudflared() {
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
     rm -f "${svcfile}.bak"
-    # 全部成功后持久化状态
+    # 全部成功后持久化状态。F3: cf_token 不再落盘(docs/security-audit.md 修复计划 #4)——
+    # 该 state 键全项目无读者(权威来源是 service 启动行, _read_cf_state 随时能解析),
+    # 多存一份明文只是纯泄漏面; 卸载清理保留, 以覆盖历史版本遗留的文件。
     mkdir -p "$STATE_DIR"
     _state_set cf_autoupdate "$CF_AUTOUPDATE" || _warn "状态持久化失败(cf_autoupdate)"
     _state_set cf_http2 "$CF_HTTP2" || _warn "状态持久化失败(cf_http2)"
     _state_set cf_edge_ip "$CF_EDGE_IP" || _warn "状态持久化失败(cf_edge_ip)"
-    _state_set cf_token "$token" || _warn "状态持久化失败(cf_token)"
     # 验证 service 真正启动 (M5: token 非法时 service install 仍成功, 但服务无法运行;
     # 此时配置/state 已一致, 仅提示用户检查 token, 不把"未运行"误报为安装失败)
     if _cf_is_running; then
@@ -677,6 +703,13 @@ _uninstall_cloudflared() {
     esac
     rm -f "$CF_BIN"
     rm -f "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6"
+    # RT-3(2026-09-12 实测): cloudflared service install 会在 /etc/cloudflared 写入 token
+    # 凭据文件; 新版 service uninstall 会自删它, 但可能留下空目录, 旧版可能两者都不清。
+    # 只删 token 文件 + 仅在目录已空时 rmdir —— 手工配置的 config.yml 永不被触碰。
+    if [ -f /etc/cloudflared/token ]; then
+        rm -f /etc/cloudflared/token
+    fi
+    rmdir /etc/cloudflared 2>/dev/null || true
     _success "cloudflared 已卸载(二进制/服务/状态已清除)"
 }
 
@@ -755,7 +788,7 @@ _cf_switch_token() {
         return 1
     fi
     rm -f "${svcfile}.bak"   # 事务成功, 清理预修改快照
-    _state_set cf_token "$token" || _warn "状态持久化失败(cf_token)"
+    # F3: 不再把新令牌写进 state/cf_token(见 _install_cloudflared 同处注释)
     _success "令牌已更新, cloudflared 已重启(隧道短暂中断)"
 }
 
@@ -780,8 +813,13 @@ _cf_toggle() {
     local new; [ "$cur" = "on" ] && new="off" || new="on"
 
     CF_AUTOUPDATE="${CF_CUR_AUTOUPDATE}"; CF_HTTP2="${CF_CUR_HTTP2}"; CF_EDGE_IP="${CF_CUR_EDGE_IP}"
+    CF_AUTOUPDATE_FLAG="${CF_CUR_AUTOUPDATE_FLAG:-yes}"
     case "$key" in
-        autoupdate) CF_AUTOUPDATE="$new" ;;
+        autoupdate)
+            CF_AUTOUPDATE="$new"
+            # 用户显式切换 autoupdate 本身 => 目标状态必须落成标志(含从"无标志"切到关)
+            CF_AUTOUPDATE_FLAG="yes"
+            ;;
         http2)      CF_HTTP2="$new" ;;
     esac
     local svcfile
@@ -851,6 +889,7 @@ _cf_set_edge_ip() {
     fi
 
     CF_AUTOUPDATE="${CF_CUR_AUTOUPDATE}"; CF_HTTP2="${CF_CUR_HTTP2}"; CF_EDGE_IP="$val"
+    CF_AUTOUPDATE_FLAG="${CF_CUR_AUTOUPDATE_FLAG:-yes}"   # F6: 保留原行对 autoupdate 的管理方式
     _cf_write_service_line "$(_cf_build_cmdline "$CF_CUR_TOKEN")" || return 1
 
     local svcfile
@@ -899,15 +938,23 @@ _cloudflared_menu() {
             else
                 tok_disp="${YELLOW}未读取(需补录)${NC}"
             fi
+            # F6: 启动行未显式写 autoupdate 标志时, cloudflared 缺省是开启(24h),
+            # 状态显示必须反映真实行为而不是"没有标志=关"
+            local auto_disp="${CF_CUR_AUTOUPDATE:-off}"
+            local auto_suffix=""
+            if [ "${CF_CUR_AUTOUPDATE_FLAG:-yes}" = "no" ]; then
+                auto_disp="on"
+                auto_suffix="(启动行无标志, 默认开)"
+            fi
             echo -e "  状态: ${GREEN}已安装${NC}  令牌: ${tok_disp}"
-            echo -e "  自动更新: $(_cf_onoff "${CF_CUR_AUTOUPDATE:-on}")  HTTP/2: $(_cf_onoff "${CF_CUR_HTTP2:-on}")  协议栈: $(_cf_edge_ip_disp "${CF_CUR_EDGE_IP:-off}")"
+            echo -e "  自动更新: $(_cf_onoff "$auto_disp")${auto_suffix}  HTTP/2: $(_cf_onoff "${CF_CUR_HTTP2:-on}")  协议栈: $(_cf_edge_ip_disp "${CF_CUR_EDGE_IP:-off}")"
             echo
             if [ -n "$CF_CUR_TOKEN" ]; then
                 echo -e "  ${GREEN}[1]${NC} 切换令牌"
             else
                 echo -e "  ${GREEN}[1]${NC} 补录令牌(手动安装的 cloudflared)"
             fi
-            echo -e "  ${GREEN}[2]${NC} 切换 自动更新 (当前 $(_cf_onoff "${CF_CUR_AUTOUPDATE:-on}"))"
+            echo -e "  ${GREEN}[2]${NC} 切换 自动更新 (当前 $(_cf_onoff "$auto_disp"))"
             echo -e "  ${GREEN}[3]${NC} 切换 HTTP/2      (当前 $(_cf_onoff "${CF_CUR_HTTP2:-on}"))"
             echo -e "  ${GREEN}[4]${NC} 切换 协议栈      (当前 $(_cf_edge_ip_disp "${CF_CUR_EDGE_IP:-off}"))"
             echo -e "  ${GREEN}[5]${NC} 重启 cloudflared"
@@ -919,7 +966,7 @@ _cloudflared_menu() {
             echo -e "  ${GREEN}[1]${NC} 安装 cloudflared"
         fi
         echo -e "  ${GREEN}[0]${NC} 返回"
-        read -rp "  请选择: " choice
+        read -rp "  请选择: " choice || return 0
         case "$choice" in
             1) if [ "$installed" = "yes" ]; then _cf_switch_token; else _install_cloudflared; fi ;;
             2) _cf_toggle autoupdate ;;

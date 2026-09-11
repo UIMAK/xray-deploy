@@ -138,7 +138,7 @@ _main_menu() {
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
-        read -rp "  请选择: " choice
+        read -rp "  请选择: " choice || exit 0
         # 节点管理(固定编号 1-5)
         case "$choice" in
             1) _add_node; continue ;;
@@ -401,10 +401,24 @@ _uninstall_menu() {
     echo -e "  ${GREEN}[3]${NC} 卸载 Xray + cloudflared"
     echo -e "  ${GREEN}[0]${NC} 取消"
     read -rp "  选择: " choice
+    # RT-4(2026-09-12 实测): [2]/[3] 是不可逆的整站卸载, 此前无任何确认 —— 单键误触
+    # 即全毁, 与本脚本其他破坏性操作(删节点/重置配置)的 y/N 确认惯例不一致。补上。
     case "$choice" in
         1) _reset_config ;;
-        2) _uninstall_xray ;;
-        3) _uninstall_xray; if declare -F _uninstall_cloudflared >/dev/null 2>&1; then _uninstall_cloudflared; else _uninstall_cloudflared_fallback; fi ;;
+        2)
+            read -rp "  确认卸载 Xray(删除配置/节点/证书/全部数据, 不可恢复)? [y/N]: " ans
+            case "$ans" in y|Y) _uninstall_xray ;; *) _info "已取消" ;; esac
+            ;;
+        3)
+            read -rp "  确认卸载 Xray + cloudflared(删除全部数据与隧道, 不可恢复)? [y/N]: " ans
+            case "$ans" in
+                y|Y)
+                    _uninstall_xray
+                    if declare -F _uninstall_cloudflared >/dev/null 2>&1; then _uninstall_cloudflared; else _uninstall_cloudflared_fallback; fi
+                    ;;
+                *) _info "已取消" ;;
+            esac
+            ;;
         0) return ;;
         *) _warn "取消" ;;
     esac
@@ -416,6 +430,13 @@ _uninstall_menu() {
 # ---------------------------------------------------------------------------
 _reset_config() {
     echo
+    # F10: 重建默认配置依赖 jq —— 先删后建, jq 缺失会留下"无 config + xray 起不来"的残局,
+    # 必须在删除前确认重建能力
+    if ! command -v jq >/dev/null 2>&1; then
+        _error "jq 不可用, 无法重建默认配置, 已取消重置"
+        _tip "请先安装 jq(主菜单启动时也会自动尝试安装), 再执行重置"
+        return
+    fi
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
         local ncount; ncount=$(_node_count 2>/dev/null)
         echo -e "  ${YELLOW}当前有 ${ncount} 个节点, 重置将清空所有节点配置${NC}"
@@ -535,7 +556,7 @@ _hy2_manage_menu() {
         echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
-        read -rp "  请选择: " choice
+        read -rp "  请选择: " choice || return 0
         case "$choice" in
             1) _hy2_toggle_brutal ;;
             2) _hy2_adjust_bandwidth ;;
@@ -756,7 +777,7 @@ _reality_domain_menu() {
     done
     [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Reality 节点"; _press_any_key; return; }
     echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice
+    read -rp "  选择节点: " choice || return 0
     [ "$choice" = "0" ] && return
     [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; continue; }
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
@@ -881,6 +902,8 @@ _reality_domain_menu() {
         _press_any_key; continue
     fi
     _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || { _error "分享链接写入失败"; _press_any_key; continue; }
+    # F1: servername(域名)变化需同步 clash 派生缓存, 否则订阅仍指向旧伪装域名
+    _sync_node_clash "$meta"
 
     _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"
     if [ "$rmode" = "direct" ]; then

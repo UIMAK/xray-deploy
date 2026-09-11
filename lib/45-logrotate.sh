@@ -551,7 +551,7 @@ _logrotate_menu() {
         echo -e "  ${GREEN}[6]${NC} 日志级别 (loglevel, 小内存优化)"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
-        read -rp "  请选择: " choice
+        read -rp "  请选择: " choice || return 0
 
         case "${choice:-0}" in
             0) return ;;
