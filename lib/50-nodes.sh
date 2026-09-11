@@ -2006,7 +2006,9 @@ _add_vless_tcp_reality_vision() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    # 分享链接标准(XTLS VMess/VLESS 提案): type 必须是 tcp(不是 raw)、REALITY 时 fp 不可省略
+    # 且默认 chrome、sni 等 URL 字段 Value 一律 encodeURIComponent。
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=tcp&flow=xtls-rprx-vision&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -2016,7 +2018,11 @@ _add_vless_tcp_reality_vision() {
     fi
     # R38(P1): 用户可控字段(节点名/地址)必须过 _yaml_dq 并放进双引号——裸插入时一个 " 就
     # 让整份 clash.yaml 不可解析(不只该节点), 且该脏行事后无法从界面清除
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": chrome, network: tcp}"
+    # clash yaml (mihomo 格式): support-x25519mlkem768 必须显式开启 —— mihomo 默认会在
+    # ClientHello 里移除 X25519MLKEM768 组(reality.go BuildRemovedX25519MLKEM768HandshakeState),
+    # 新 Xray Reality 服务器按指纹拒绝不含该组的握手(XTLS/Xray-core#6477/#6714);
+    # client-fingerprint 用 chrome(新 Reality 服务器要求 chrome 指纹才能协商 MLKEM768)。
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, network: tcp}"
 
     # R42: reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json
@@ -2138,7 +2144,7 @@ _add_vless_xhttp_reality() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -2146,7 +2152,9 @@ _add_vless_xhttp_reality() {
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
+    # clash yaml (mihomo 格式): 见 _add_vless_tcp_reality_vision 同处注释 ——
+    # support-x25519mlkem768 必须显式开启, client-fingerprint 用 chrome。
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
 
     # R42: reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json
@@ -2335,16 +2343,16 @@ _add_vless_enc() {
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
-    # 分享链接: encryption 参数为客户端密钥(URL 编码, 含点号和特殊字符)
+    # 分享链接: encryption 参数为客户端密钥(URL 编码, 含点号和特殊字符); type=tcp 符合分享链接标准
     local enc_encoded; enc_encoded=$(_url_encode "$VLESS_ENC_ENCRYPTION")
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_encoded}&security=none&type=raw"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_encoded}&security=none&type=tcp"
     [ -n "$flow" ] && link="${link}&flow=${flow}"
     link="${link}#$(_url_encode "$name")"
 
     # clash yaml (Clash Meta / mihomo 格式)
     local clash_flow=""
     [ -n "$flow" ] && clash_flow=", flow: ${flow}"
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, uuid: $uuid, encryption: \"$(_yaml_dq "$VLESS_ENC_ENCRYPTION")\", network: tcp, tls: false${clash_flow}}"
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, encryption: \"$(_yaml_dq "$VLESS_ENC_ENCRYPTION")\", network: tcp, tls: false${clash_flow}}"
 
     if ! _save_node_meta "$tag" "$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-enc" \
@@ -2425,12 +2433,14 @@ _add_vless_xhttp_cdn() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=chrome&alpn=h2&insecure=0&allowInsecure=0&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    # 分享链接标准: fp 默认 chrome; 标准无 insecure/allowInsecure 字段(Xray 已移除该配置项),
+    # 且本节点经 CF 边缘合法证书, 无需跳过校验; sni/host 必须 encodeURIComponent
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&alpn=h2&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
 
     local meta_json
     meta_json=$(jq -n \
@@ -2439,8 +2449,8 @@ _add_vless_xhttp_cdn() {
         --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
         --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
         --arg sni "$host" --arg fp "chrome" --arg alpn "h2" \
-        --arg insecure "0" --arg allowInsecure "0" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')
+        --arg link "$link" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,share_link:$link}')
     if [ "$ENC_ENABLED" -eq 1 ]; then
         meta_json=$(echo "$meta_json" | jq \
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
@@ -2511,12 +2521,12 @@ _add_vless_ws_cdn() {
     else
         enc_param="none"
     fi
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${host}&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=${host}&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
+    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
 
     local meta_json
     meta_json=$(jq -n \
@@ -2525,8 +2535,8 @@ _add_vless_ws_cdn() {
         --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
         --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
         --arg sni "$host" --arg fp "chrome" \
-        --arg insecure "0" --arg allowInsecure "0" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,insecure:$insecure,allowInsecure:$allowInsecure,share_link:$link}')
+        --arg link "$link" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,share_link:$link}')
     if [ "$ENC_ENABLED" -eq 1 ]; then
         meta_json=$(echo "$meta_json" | jq \
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
@@ -2601,12 +2611,18 @@ _add_shadowsocks() {
     addr=$(_ask_link_addr)
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
-    # ss 链接: ss://base64(method:password)@host:port#name
+    # ss 链接(SIP002): userinfo 必须 base64url 无填充 —— 标准 base64 可能含 + / =,
+    # 其中 / 会破坏 URL userinfo 段的解析(Go url.Parse 等); 2022-blake3 密码本身含 = + /,
+    # 被整体 base64url 编码后 URL 安全, 客户端解码后还原原密码
     local userinfo="${method}:${password}"
-    local b64=$(printf '%s' "$userinfo" | base64 | tr -d '\n')
+    local b64=$(printf '%s' "$userinfo" | base64 | tr -d '\n=' | tr '+/' '-_')
     local link="ss://${b64}@${link_ip}:${port}#$(_url_encode "$name")"
 
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"}"
+    # mihomo 的 ss `udp` 默认 false(通用字段); 服务端 network 含 udp 才声明,
+    # 否则声明了 UDP 也会连不上(与 _input_port 的协议选择一致)
+    local clash_udp=""
+    [[ "$network_val" == *"udp"* ]] && clash_udp=", udp: true"
+    local clash="- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${clash_udp}}"
 
     if ! _save_node_meta "$tag" "$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "shadowsocks" \
@@ -2762,24 +2778,26 @@ _add_hysteria2() {
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
     link="${link}#$(_url_encode "$name")"
 
-    # clash yaml
-    local clash_insecure=""
-    [ "$self_signed" = "true" ] && clash_insecure=", skip-cert-verify: true"
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: $port, password: \"$(_yaml_dq "$auth")\", sni: \"$(_yaml_dq "$sni")\", \"congestion-control\": $congestion${clash_insecure}}"
-
     # 元数据
-    if ! _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg auth "$auth" --arg sni "$sni" --arg congestion "$congestion" \
         --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
         --arg link "$link" --argjson ss "$self_signed" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,self_signed:$ss,share_link:$link}')"; then
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,self_signed:$ss,share_link:$link}')
+    if ! _save_node_meta "$tag" "$meta_json"; then
         _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
         return 1
     fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+    # R38(P1): metadata 成功后才写派生 YAML; 条目由 _hy2_clash_line 从已落地 metadata 重建(单一来源)
+    local clash
+    if clash=$(_hy2_clash_line "$NODES_DIR/${tag}.json"); then
+        _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+    else
+        _warn "Clash 条目生成失败, 节点已创建, 可手工编辑 ${CLASH_YAML} 补齐"
+    fi
 
     _success "节点 [${name}] 创建成功"
     if [ "$self_signed" = "true" ]; then
@@ -2832,6 +2850,44 @@ _rebuild_hy2_link() {
     echo "$link"
 }
 
+# ---------------------------------------------------------------------------
+# 从 hy2 节点元数据重建 clash.yaml 条目(mihomo 格式) —— 创建/拥塞切换/带宽调整/
+# 端口跳跃切换后的唯一生成入口, 与分享链接重建(_rebuild_hy2_link)同级, 单一来源。
+# 字段依据 Meta-Docs(config/proxies/hysteria2)与 mihomo 源码(adapter/outbound/hysteria2.go):
+#   - mihomo 无 `congestion-control` 字段(会被解码器静默忽略), brutal 由 up/down 触发
+#   - 端口跳跃用 `ports`(mihomo 原生支持, hop-interval 默认 30s), flow 上下文必须加引号
+# 用法: _hy2_clash_line <meta_file>; stdout 为单行 flow 条目(以 "- {name: ...}" 开头)
+# ---------------------------------------------------------------------------
+_hy2_clash_line() {
+    local meta="$1"
+    local name addr port auth sni congestion brutal_up brutal_down self_signed
+    name=$(jq -r '.name // empty' "$meta")
+    addr=$(jq -r '.link_addr // empty' "$meta")
+    port=$(jq -r '.port // empty' "$meta")
+    auth=$(jq -r '.auth // empty' "$meta")
+    sni=$(jq -r '.sni // "build.nvidia.com"' "$meta")
+    congestion=$(jq -r '.congestion // empty' "$meta")
+    brutal_up=$(jq -r '.brutal_up // empty' "$meta")
+    brutal_down=$(jq -r '.brutal_down // empty' "$meta")
+    self_signed=$(jq -r '.self_signed // "false"' "$meta")
+    if [ -z "$name" ] || [ -z "$addr" ] || [ -z "$port" ] || [ -z "$auth" ]; then
+        _error "节点元数据缺少必要字段(name/link_addr/port/auth), 无法生成 clash 条目: $meta"
+        return 1
+    fi
+    local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: $port, password: \"$(_yaml_dq "$auth")\", sni: \"$(_yaml_dq "$sni")\""
+    # brutal/force-brutal: mihomo 以 up/down 触发 brutal 速率控制; 带宽未填则省略(与分享链接一致)
+    if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
+        [ -n "$brutal_up" ] && line="${line}, up: \"$(_yaml_dq "$brutal_up")\""
+        [ -n "$brutal_down" ] && line="${line}, down: \"$(_yaml_dq "$brutal_down")\""
+    fi
+    # 端口跳跃: 引号必须有 —— flow 映射上下文里裸逗号会被解析成字段分隔符
+    local hop_ports
+    hop_ports=$(_read_hop_ranges_display "$meta" 2>/dev/null)
+    [ -n "$hop_ports" ] && line="${line}, ports: \"${hop_ports}\""
+    [ "$self_signed" = "true" ] && line="${line}, skip-cert-verify: true"
+    printf '%s}' "$line"
+}
+
 # 重建 vless:// reality 分享链接(从元数据读参数)
 # 用法:_rebuild_reality_link <meta_file> [new_sni]  不传 new_sni 则用 meta 里的 sni
 # R38(M10): 与 _rebuild_hy2_link 同因 —— 必填字段缺失时必须失败, 不能产出含 null 的坏链接
@@ -2866,10 +2922,11 @@ _rebuild_reality_link() {
     local link
     case "$proto" in
         vless-tcp-reality-vision)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=raw&headerType=none&flow=xtls-rprx-vision&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
+            # 分享链接标准: type=tcp(非 raw)、REALITY 必带 fp 且默认 chrome、sni 需转义
+            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=tcp&flow=xtls-rprx-vision&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}"
             ;;
         vless-xhttp-reality)
-            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=${sni}&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
+            link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
             ;;
         *) echo ""; return 1 ;;
     esac
@@ -2892,7 +2949,7 @@ _rebuild_vless_enc_link() {
     local link_ip="$host"
     [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
     local enc_encoded; enc_encoded=$(_url_encode "$enc")
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_encoded}&security=none&type=raw"
+    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_encoded}&security=none&type=tcp"
     [ -n "$flow" ] && link="${link}&flow=${flow}"
     link="${link}#$(_url_encode "$name")"
     echo "$link"
@@ -2902,7 +2959,7 @@ _rebuild_vless_enc_link() {
 # 用法:_rebuild_cdn_link <meta_file>
 _rebuild_cdn_link() {
     local meta="$1"
-    local uuid host path name proto preferred_addr preferred_port sni fp alpn insecure allowInsecure
+    local uuid host path name proto preferred_addr preferred_port sni fp alpn
     uuid=$(jq -r '.uuid' "$meta")
     host=$(jq -r '.host' "$meta")
     path=$(jq -r '.path // empty' "$meta")
@@ -2911,10 +2968,10 @@ _rebuild_cdn_link() {
     preferred_addr=$(jq -r '.preferred_addr // .host' "$meta")
     preferred_port=$(jq -r '.preferred_port // "443"' "$meta")
     sni=$(jq -r '.sni // .host' "$meta")
+    # 分享链接标准: fp 省略默认为 chrome; 旧节点 metadata 曾存 firefox(已废弃), 重建时归一
     fp=$(jq -r '.fp // "chrome"' "$meta")
+    [ "$fp" = "firefox" ] && fp="chrome"
     alpn=$(jq -r '.alpn // "h2"' "$meta")
-    insecure=$(jq -r '.insecure // "0"' "$meta")
-    allowInsecure=$(jq -r '.allowInsecure // "0"' "$meta")
     local enc; enc=$(jq -r '.encryption // "none"' "$meta")
     local enc_param
     if [ "$enc" != "none" ] && [ -n "$enc" ]; then
@@ -2927,10 +2984,10 @@ _rebuild_cdn_link() {
     local link
     case "$proto" in
         vless-xhttp-cdn)
-            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${sni}&fp=${fp}&alpn=${alpn}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=xhttp&mode=auto&host=${host}&path=$(_url_encode "$path")"
+            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$sni")&fp=${fp}&alpn=${alpn}&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")"
             ;;
         vless-ws-cdn)
-            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=${sni}&fp=${fp}&insecure=${insecure}&allowInsecure=${allowInsecure}&type=ws&host=${host}&path=$(_url_encode "${path}?ed=2560")"
+            link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$sni")&fp=${fp}&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")"
             ;;
         *) echo ""; return 1 ;;
     esac
@@ -3715,6 +3772,41 @@ _remove_node_from_yaml_by_tag() {
     _remove_node_from_yaml_by_name "$name"
 }
 
+# 按 name 原位替换 clash.yaml 中某节点的条目(供端口跳跃/拥塞切换等派生字段变化后同步)。
+# 匹配串与 _remove_node_from_yaml_by_name 完全一致(name: "KEY" 含闭合引号, KEY 过 _yaml_dq),
+# 保证"写得进也换得掉"; 未找到条目 = 该节点不在派生缓存里, 不视为错误。
+# 用法: _replace_node_in_yaml <yaml_node_line> <name>
+_replace_node_in_yaml() {
+    local line="$1" name="$2"
+    [ -f "$CLASH_YAML" ] || return 0
+    local key tmp
+    key=$(_yaml_dq "$name")
+    if ! tmp=$(mktemp); then
+        _error "无法创建临时 Clash YAML 文件"
+        return 1
+    fi
+    local replaced=0 l
+    while IFS= read -r l; do
+        if [ "$replaced" = 0 ] && printf '%s' "$l" | grep -qF "name: \"${key}\""; then
+            printf '  %s\n' "$line" >> "$tmp"
+            replaced=1
+        else
+            printf '%s\n' "$l" >> "$tmp"
+        fi
+    done < "$CLASH_YAML"
+    if [ "$replaced" = 0 ]; then
+        rm -f "$tmp"
+        _warn "Clash YAML 未找到节点 [${name}] 条目, 跳过替换"
+        return 0
+    fi
+    if ! mv -f "$tmp" "$CLASH_YAML"; then
+        rm -f "$tmp"
+        _error "Clash YAML 替换失败"
+        return 1
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Hysteria2 端口跳跃管理 (iptables DNAT)
 # ---------------------------------------------------------------------------
@@ -3777,6 +3869,13 @@ _hy2_toggle_hop() {
                     _press_any_key; return
                 fi
                 _success "端口跳跃已禁用"
+                # 派生缓存同步: 从已提交 metadata 重建 clash 条目(去掉 ports)
+                local nline nname
+                nname=$(jq -r '.name // empty' "$meta")
+                if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
+                    _replace_node_in_yaml "$nline" "$nname" || \
+                        _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+                fi
                 ;;
             *) _info "已取消" ;;
         esac
@@ -3819,6 +3918,13 @@ _hy2_toggle_hop() {
             _press_any_key; return
         fi
         _success "端口跳跃已启用: ${normalized} → ${port}"
+        # 派生缓存同步: 从已提交 metadata 重建 clash 条目(加入 ports)
+        local nline nname
+        nname=$(jq -r '.name // empty' "$meta")
+        if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
+            _replace_node_in_yaml "$nline" "$nname" || \
+                _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+        fi
         _tip "iptables DNAT 已生效, 客户端可连接范围内任意端口"
         _tip "请确保防火墙/安全组已放行该 UDP 端口范围"
     fi
