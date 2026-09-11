@@ -661,7 +661,8 @@ _hy2_gen_port_newmeta() {
     rm -f "$tmpm"
     [ -n "$newlink" ] || return 1
     name=$(jq -r '.name' "$meta")
-    newname="${name//${oldport}/${newport}}"
+    # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
+    newname=$(_rename_node_with_port "$name" "$oldport" "$newport")
     jq --argjson p "$newport" --arg n "$newname" --arg l "$newlink" \
        '.port=$p | .name=$n | .share_link=$l' "$meta"
 }
@@ -705,6 +706,7 @@ _modify_port_hop() {
     local tag="$1" meta="$2" oldport="$3" newport="$4"; shift 4
     local ranges="$*" newmeta display
     display=$(_read_hop_ranges_display "$meta")
+    local old_name; old_name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     newmeta=$(_hy2_gen_port_newmeta "$meta" "$newport") || { _error "生成新元数据失败"; return 1; }
     _info "检测到端口跳跃规则, 正在统一事务更新(config/metadata/iptables)..."
     # shellcheck disable=SC2086
@@ -714,6 +716,8 @@ _modify_port_hop() {
         return 1
     fi
     _tip "端口跳跃规则已更新: ${display} → ${newport}"
+    # F1: 事务成功后同步 clash 派生缓存(端口/名称可能都变了)
+    _sync_node_clash "$meta" "$old_name"
     return 0
 }
 
@@ -899,6 +903,25 @@ _input_port() {
     echo "$port"
 }
 
+# 为 tunnel inbound(仅监听 127.0.0.1)生成一个排除已知冲突的随机端口(F9)。
+# 原 `_gen_random_port` 裸输出: 撞上已占用端口/已在 config 的端口/与 $1 指定端口相同
+# 时, verified-restart 会失败回滚, 用户只见"创建失败"。重试 20 次; 极端情况下仍放行
+# 随机值, 由 _mutate_config 的 verified-restart 兜底。
+# 用法: tport=$(_gen_free_tunnel_port [exclude_port])
+_gen_free_tunnel_port() {
+    local exclude="${1:-}" i r
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        r=$(_gen_random_port)
+        [ -n "$exclude" ] && [ "$r" = "$exclude" ] && continue
+        _check_port_occupied "$r" "" && continue
+        _check_port_in_config "$r" && continue
+        printf '%s' "$r"
+        return 0
+    done
+    printf '%s' "$(_gen_random_port)"
+    return 0
+}
+
 # 检查端口是否已存在于 config.json
 _check_port_in_config() {
     local port="$1"
@@ -993,12 +1016,17 @@ _render_template() {
 }
 
 # ---------------------------------------------------------------------------
-# 统一的 config.json 修改流程: backup → jq → test → rollback/restart
+# 统一的 config.json 修改流程: backup → jq → 重排 → verified-restart → 失败回滚
 # 用法:_mutate_config [--arg/--argjson ...] <jq_filter>
 # 参数: jq 选项在前, jq filter 在最后(必须)
-# 所有 config 修改应通过此函数, 不再各自实现 backup/test/rollback
+# 所有 config 修改应通过此函数, 不再各自实现 backup/test/rollback。
+# 并发防护(F5): 全体修改经 _with_config_lock 串行化, 实际事务体在 _mutate_config_locked。
 # ---------------------------------------------------------------------------
 _mutate_config() {
+    _with_config_lock _mutate_config_locked "$@"
+}
+
+_mutate_config_locked() {
     if ! _backup_config; then
         _error "配置备份失败,中止操作"
         return 1
@@ -1941,13 +1969,14 @@ _add_vless_tcp_reality_vision() {
     _validate_domain "$sni" || { _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $sni"; return 1; }
 
     # R42: 直连模式无 tunnel 入站, 不申请 tunnel 端口
+    # F9: 生成放在 Reality 端口输入之后, 以便把用户端口加入排除项
     local tunnel_port=""
-    if [ "$mode" = "tunnel" ]; then
-        tunnel_port=$(_gen_random_port)
-        _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
-    fi
     echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
     local port=$(_input_port tcp)
+    if [ "$mode" = "tunnel" ]; then
+        tunnel_port=$(_gen_free_tunnel_port "$port")
+        _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
+    fi
 
     local default_name="Reality-Vision-${port}"
     read -rp "  节点名称 (默认 ${default_name}): " name
@@ -2077,13 +2106,14 @@ _add_vless_xhttp_reality() {
     _validate_domain "$sni" || { _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $sni"; return 1; }
 
     # R42: 直连模式无 tunnel 入站, 不申请 tunnel 端口
+    # F9: 生成放在 Reality 端口输入之后, 以便把用户端口加入排除项
     local tunnel_port=""
-    if [ "$mode" = "tunnel" ]; then
-        tunnel_port=$(_gen_random_port)
-        _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
-    fi
     echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
     local port=$(_input_port tcp)
+    if [ "$mode" = "tunnel" ]; then
+        tunnel_port=$(_gen_free_tunnel_port "$port")
+        _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
+    fi
 
     local path=$(_gen_rand_path)
     read -rp "  XHTTP path (默认 ${path}): " custom_path
@@ -2888,6 +2918,117 @@ _hy2_clash_line() {
     printf '%s}' "$line"
 }
 
+# ---------------------------------------------------------------------------
+# 从节点 metadata 重建 clash.yaml 条目 —— 全协议统一入口(2026-09-12 审查 F1)。
+# 背景: 此前只有 hy2 有 builder(_hy2_clash_line), 其余协议的条目只存在于创建时刻
+# (各 _add_* 内联拼接), 之后改端口/改监听/Reality 域名切换都不会同步 clash.yaml,
+# 留下"订阅陈旧 + 删除时幽灵条目"的派生缓存分裂。
+# 字段口径与各 _add_* 的内联条目逐字段一致(含 support-x25519mlkem768: true 与
+# chrome 指纹 —— 新 Reality 服务器要求, 见 _add_vless_tcp_reality_vision 注释)。
+# 失败(被采纳节点缺字段等)返回 1 且无输出, 由 _sync_node_clash 保留旧行并告警。
+# 用法: line=$(_rebuild_clash_line <meta_file>)
+# ---------------------------------------------------------------------------
+_rebuild_clash_line() {
+    local meta="$1" proto name addr port uuid enc enc_clash=""
+    proto=$(jq -r '.protocol // empty' "$meta" 2>/dev/null)
+    name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
+    addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
+    port=$(jq -r '.port // empty' "$meta" 2>/dev/null)
+    uuid=$(jq -r '.uuid // empty' "$meta" 2>/dev/null)
+    [ -n "$name" ] && [ -n "$addr" ] && [ -n "$port" ] || return 1
+    enc=$(jq -r '.encryption // "none"' "$meta" 2>/dev/null)
+    if [ -n "$enc" ] && [ "$enc" != "none" ]; then
+        enc_clash=", encryption: \"$(_yaml_dq "$enc")\""
+    fi
+    case "$proto" in
+        hysteria2)
+            _hy2_clash_line "$meta"
+            ;;
+        vless-tcp-reality-vision)
+            local pk sid sni
+            pk=$(jq -r '.public_key // empty' "$meta")
+            sid=$(jq -r '.short_id // empty' "$meta")
+            sni=$(jq -r '.sni // empty' "$meta")
+            [ -n "$uuid" ] && [ -n "$pk" ] && [ -n "$sid" ] && [ -n "$sni" ] || return 1
+            printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $pk, short-id: $sid, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, network: tcp}"
+            ;;
+        vless-xhttp-reality)
+            local pk sid sni path
+            pk=$(jq -r '.public_key // empty' "$meta")
+            sid=$(jq -r '.short_id // empty' "$meta")
+            sni=$(jq -r '.sni // empty' "$meta")
+            path=$(jq -r '.path // empty' "$meta")
+            [ -n "$uuid" ] && [ -n "$pk" ] && [ -n "$sid" ] && [ -n "$sni" ] && [ -n "$path" ] || return 1
+            printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $pk, short-id: $sid, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
+            ;;
+        vless-enc)
+            # enc 节点必有密钥(创建即生成); metadata 缺 encryption 说明是半套元数据, 不重建
+            [ -n "$uuid" ] && [ -n "$enc" ] && [ "$enc" != "none" ] || return 1
+            local flow fl=""
+            flow=$(jq -r '.flow // empty' "$meta")
+            [ -n "$flow" ] && fl=", flow: ${flow}"
+            printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, encryption: \"$(_yaml_dq "$enc")\", network: tcp, tls: false${fl}}"
+            ;;
+        vless-xhttp-cdn|vless-ws-cdn)
+            # CDN 条目指向 CDN 入口(preferred_addr/port), 不是 xray 监听端口(R7/M12 口径)
+            local pref_addr pref_port host path
+            pref_addr=$(jq -r '.preferred_addr // .host // empty' "$meta")
+            pref_port=$(jq -r '.preferred_port // "443"' "$meta")
+            host=$(jq -r '.host // empty' "$meta")
+            path=$(jq -r '.path // empty' "$meta")
+            [ -n "$uuid" ] && [ -n "$host" ] && [ -n "$path" ] && [ -n "$pref_addr" ] || return 1
+            [[ "$pref_port" =~ ^[0-9]+$ ]] || pref_port=443
+            if [ "$proto" = "vless-xhttp-cdn" ]; then
+                printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$pref_addr")\", port: $pref_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
+            else
+                printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$pref_addr")\", port: $pref_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
+            fi
+            ;;
+        shadowsocks)
+            # udp 标志的权威来源是 config 的 settings.network(metadata 未存)
+            local method password net udp_clash=""
+            method=$(jq -r '.method // empty' "$meta")
+            password=$(jq -r '.password // empty' "$meta")
+            [ -n "$method" ] && [ -n "$password" ] || return 1
+            local tag; tag=$(jq -r '.tag // empty' "$meta" 2>/dev/null)
+            [ -n "$tag" ] && net=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.network // "tcp,udp"' "$CONFIG_FILE" 2>/dev/null)
+            [[ "$net" == *"udp"* ]] && udp_clash=", udp: true"
+            printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${udp_clash}}"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 把节点 metadata 的当前状态同步进 clash.yaml 派生缓存(F1 的统一入口)。
+# 用法: _sync_node_clash <meta_file> [old_name]
+#   old_name 非空且与现名不同(改端口会连带改名)时先删旧行, 避免残留幽灵条目。
+# best-effort: builder 失败(被采纳节点缺字段)或文件写失败只告警, 不阻断主流程 ——
+# clash.yaml 是可再生派生导出, 权威身份始终是 tag/config/metadata。
+# ---------------------------------------------------------------------------
+_sync_node_clash() {
+    local meta="$1" old_name="${2:-}" line name key
+    line=$(_rebuild_clash_line "$meta") || {
+        _warn "Clash 条目重建失败(元数据缺少必要字段), clash.yaml 未同步: $meta"
+        return 0
+    }
+    name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
+    [ -n "$name" ] || return 0
+    if [ -n "$old_name" ] && [ "$old_name" != "$name" ]; then
+        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || \
+            _warn "Clash YAML 旧条目删除失败(${old_name}), 可手工编辑 ${CLASH_YAML}"
+    fi
+    key=$(_yaml_dq "$name")
+    if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
+        _replace_node_in_yaml "$line" "$name" || \
+            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+    else
+        _add_node_to_yaml "$line" "$name" || \
+            _warn "Clash YAML 条目追加失败, 可手工编辑 ${CLASH_YAML}"
+    fi
+    return 0
+}
+
 # 重建 vless:// reality 分享链接(从元数据读参数)
 # 用法:_rebuild_reality_link <meta_file> [new_sni]  不传 new_sni 则用 meta 里的 sni
 # R38(M10): 与 _rebuild_hy2_link 同因 —— 必填字段缺失时必须失败, 不能产出含 null 的坏链接
@@ -3471,7 +3612,8 @@ _modify_port() {
         local tmpm newmeta newlink old_name new_name
         tmpm=$(mktemp "${meta}.port.XXXXXX") || { _error "创建临时文件失败"; _press_any_key; return 1; }
         old_name=$(jq -r '.name' "$meta")
-        new_name="${old_name//${oldport}/${newport}}"
+        # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
+        new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
         # R42: 顺带回填 reality_mode —— 旧节点(无该字段)改端口后元数据自描述, 不再依赖推导
         if ! jq --argjson p "$newport" --arg nt "$new_tag" --arg ntg "$new_tunnel_tag" \
             --arg nn "$new_name" --arg rm "$rmode" \
@@ -3536,6 +3678,8 @@ _modify_port() {
         else
             _success "端口已改为 ${newport}(直连模式, 标签已同步更新)"
         fi
+        # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
+        _sync_node_clash "$meta" "$old_name"
         _press_any_key
         return
     fi
@@ -3563,22 +3707,12 @@ _modify_port() {
         vless-enc) newlink=$(_rebuild_vless_enc_link "$meta") || rebuild_rc=1 ;;
         vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$meta") || rebuild_rc=1 ;;
         *)
-            # 其他协议: @ 锚定分割确保只替换 host:port 段(不误伤 path/sni/name)
-            local oldlink; oldlink=$(jq -r '.share_link' "$meta")
-            local before_at="${oldlink%%@*}"
-            local after_at="${oldlink#*@}"
-            local host_part
-            if [[ "$after_at" == "["* ]]; then
-                host_part="${after_at%%]*}]"
-            else
-                host_part="${after_at%%[:/?#]*}"
-            fi
-            if [[ "$host_part" == "["* ]]; then
-                local tail_offset=$((${#host_part} + ${#oldport} + 1))
-                newlink="${before_at}@${host_part}:${newport}${after_at:$tail_offset}"
-            else
-                newlink="${before_at}@${host_part}:${newport}${after_at#${host_part}:${oldport}}"
-            fi
+            # 其他协议: @ 锚定分割确保只替换 host:port 段(不误伤 path/sni/name)。
+            # F7: 链接不含 @(被采纳节点的 "#tag (adopted)" 占位)时输出空串,
+            # 走下方 rebuild_rc=1 分支保留原链接 —— 实测原写法会产出 "...@:新端口..." 垃圾。
+            local oldlink; oldlink=$(jq -r '.share_link' "$meta" 2>/dev/null)
+            newlink=$(_rewrite_link_port "$oldlink" "$oldport" "$newport")
+            [ -n "$newlink" ] || rebuild_rc=1
             ;;
     esac
 
@@ -3593,7 +3727,8 @@ _modify_port() {
     # 同步更新节点名称(名称通常包含端口号) + 分享链接; 原子写(R15)
     local old_name new_name meta2
     old_name=$(jq -r '.name' "$meta")
-    new_name="${old_name//${oldport}/${newport}}"
+    # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
+    new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
     if [ "$new_name" != "$old_name" ]; then
         meta2=$(jq --arg l "$newlink" --arg n "$new_name" '.share_link=$l | .name=$n' "$meta") || { _error "生成元数据失败"; _press_any_key; return 1; }
     else
@@ -3602,6 +3737,8 @@ _modify_port() {
     if ! _atomic_write_json "$meta" "$meta2"; then
         _error "分享链接元数据写入失败"; _press_any_key; return 1
     fi
+    # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
+    _sync_node_clash "$meta" "$old_name"
     _success "端口已改为 ${newport}"
     _press_any_key
 }
@@ -3673,29 +3810,22 @@ _update_listen() {
     esac
     [ -z "$newaddr" ] && newaddr="$oldaddr"
 
-    # 重写链接里的地址(纯 bash, 不用 sed -E —— busybox 不支持)
+    # 重写链接里的地址(F7/F1: 收口到 _rewrite_link_addr)。
+    # 链接不含 @(被采纳节点的 "#tag (adopted)" 占位)时输出空串 —— 此时只更新
+    # listen/link_addr, 保留原链接, 实测原写法会产出 "...@:端口..." 垃圾。
     local oldlink newlink
-    oldlink=$(jq -r '.share_link' "$meta")
-    # 链接形如 proto://uuid@addr:port... 或 ss://b64@addr:port...
-    local before_at="${oldlink%%@*}" after_at="${oldlink#*@}"
-    # after_at 可能是 addr:port?... 或 [addr]:port?... 或 addr/path?...
-    local old_host_part
-    if [[ "$after_at" == "["* ]]; then
-        # IPv6: [addr]:port
-        old_host_part="${after_at%%]*}]"
+    oldlink=$(jq -r '.share_link' "$meta" 2>/dev/null)
+    newlink=$(_rewrite_link_addr "$oldlink" "$newaddr")
+    if [ -n "$newlink" ]; then
+        _meta_update "$meta" '.listen=$l | .link_addr=$a | .share_link=$link' \
+            --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
     else
-        # IPv4/域名: addr:port 或 addr/path
-        old_host_part="${after_at%%[:/?#]*}"
+        _warn "分享链接非标准格式(被采纳节点?), 仅更新监听与链接地址记录"
+        _meta_update "$meta" '.listen=$l | .link_addr=$a' \
+            --arg l "$newlisten" --arg a "$newaddr" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
     fi
-    # IPv6 地址加括号
-    local new_host="$newaddr"
-    if [[ "$newaddr" == *":"* && "$newaddr" != *"["* ]]; then
-        new_host="[${newaddr}]"
-    fi
-    newlink="${before_at}@${new_host}${after_at#"$old_host_part"}"
-
-    _meta_update "$meta" '.listen=$l | .link_addr=$a | .share_link=$link' \
-        --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
+    # F1: 监听/链接地址变化需同步 clash 条目的 server 字段
+    _sync_node_clash "$meta"
 
     _success "监听已更新为 ${newlisten}, 链接地址更新为 ${newaddr}"
     _press_any_key

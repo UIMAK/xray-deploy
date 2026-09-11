@@ -550,7 +550,7 @@ _route_rules_menu() {
         echo -e "  ${GREEN}[2]${NC} 恢复默认规则(重新引用 geo 数据)"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
-        read -rp "  请选择: " choice
+        read -rp "  请选择: " choice || return 0
         case "${choice:-0}" in
             0) return ;;
             1)

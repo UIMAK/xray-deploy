@@ -682,3 +682,98 @@ _press_any_key() {
     echo -e "${YELLOW}按回车键继续...${NC}" >&2
     read -r
 }
+
+# ---------------------------------------------------------------------------
+# 跨进程配置修改锁(2026-09-12 审查 F5, 借鉴 singbox-lite _with_state_lock):
+# 包住 _mutate_config 的 read-modify-write, 防止两个并发 xd 会话交叠产生丢失更新。
+# best-effort 语义, 与 singbox-lite 的"缺 flock 硬失败"刻意不同:
+#   - flock 不可用(裁剪版 busybox)时直接放行 —— 配置写者只有单管理员 TUI 一个,
+#     为锁而拒绝服务比偶发竞态更伤; 放行属于已声明的降级而非静默吞错。
+#   - 持锁者导出 XRAY_DEPLOY_LOCK_HELD=1 支持重入(当前无嵌套调用, 防御性保留)。
+# 注意: "$@" 在子 shell 中执行 —— _mutate_config 及其下游不向调用方回传全局变量,
+# 返回码经子 shell 退出码透传; fd 9 随子 shell 结束自动关闭并释放锁。
+# ---------------------------------------------------------------------------
+_with_config_lock() {
+    if [ "${XRAY_DEPLOY_LOCK_HELD:-0}" = "1" ]; then
+        "$@"
+        return $?
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        "$@"
+        return $?
+    fi
+    (
+        mkdir -p "$DEPLOY_DIR" 2>/dev/null
+        if ! exec 9>"$DEPLOY_DIR/.config.lock" 2>/dev/null; then
+            _error "无法创建配置锁文件 $DEPLOY_DIR/.config.lock(目录不可写?), 放弃本次修改"
+            exit 1
+        fi
+        local i
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+            flock -n 9 2>/dev/null && break
+            sleep 1
+        done
+        if ! flock -n 9 2>/dev/null; then
+            _error "等待配置锁超时(15s), 可能有其他 xd 会话正在修改配置"
+            exit 1
+        fi
+        export XRAY_DEPLOY_LOCK_HELD=1
+        "$@"
+    )
+}
+
+# ---------------------------------------------------------------------------
+# 节点改名(端口号出现在名称尾部)的安全替换(2026-09-12 审查 F8)。
+# 原 `${name//${oldport}/${newport}}` 全局子串替换会把名称中恰好包含端口号的
+# 其他数字一并改掉(实测: HY2-54321 + 5432→7777 得 HY2-77771)。默认命名形如
+# <Proto>-<port>, 因此只替换 "-<oldport>" 后缀; 无后缀匹配时名称原样保留。
+# 用法: new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
+# ---------------------------------------------------------------------------
+_rename_node_with_port() {
+    local name="$1" oldport="$2" newport="$3"
+    if [ -n "$name" ] && [ -n "$oldport" ] && [ -n "$newport" ] \
+       && [[ "$name" == *"-${oldport}" ]]; then
+        printf '%s-%s' "${name%"-${oldport}"}" "$newport"
+    else
+        printf '%s' "$name"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 分享链接地址/端口改写(2026-09-12 审查 F7, 收口 _modify_port 与 _update_listen
+# 原本各自维护的两份字符串手术)。@ 锚定分割, 不误伤 path/sni/name 段。
+#   _rewrite_link_addr <link> <newaddr>          —— 只换 host 段, 保留端口(改监听)
+#   _rewrite_link_port <link> <oldport> <newport>—— 换 host:port 段(改端口, host 不变)
+# IPv6 目标自动加括号; IPv6 源 host_part 经 ${var%%]*} + 字面 "]" 还原成 "[addr]"。
+# **链接不含 @**(被采纳节点的 "#tag (adopted)" 占位)时输出空串 —— 调用方必须
+# 保留原链接并提示, 不得把 "@:新端口" 垃圾写回 metadata(实测复现过的 bug)。
+# ---------------------------------------------------------------------------
+_rewrite_link_addr() {
+    local oldlink="$1" newaddr="$2"
+    [[ "$oldlink" == *@* ]] || { printf ''; return 0; }
+    local before_at="${oldlink%%@*}" after_at="${oldlink#*@}"
+    local host_part
+    if [[ "$after_at" == "["* ]]; then
+        host_part="${after_at%%]*}]"
+    else
+        host_part="${after_at%%[:/?#]*}"
+    fi
+    local new_host="$newaddr"
+    if [[ "$newaddr" == *":"* && "$newaddr" != *"["* ]]; then
+        new_host="[${newaddr}]"
+    fi
+    printf '%s' "${before_at}@${new_host}${after_at#"$host_part"}"
+}
+
+_rewrite_link_port() {
+    local oldlink="$1" oldport="$2" newport="$3"
+    [[ "$oldlink" == *@* ]] || { printf ''; return 0; }
+    local before_at="${oldlink%%@*}" after_at="${oldlink#*@}"
+    local host_part
+    if [[ "$after_at" == "["* ]]; then
+        host_part="${after_at%%]*}]"
+    else
+        host_part="${after_at%%[:/?#]*}"
+    fi
+    printf '%s' "${before_at}@${host_part}:${newport}${after_at#"$host_part:$oldport"}"
+}
