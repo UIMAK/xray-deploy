@@ -650,6 +650,13 @@ _hy2_toggle_brutal() {
         _press_any_key; return
     fi
     _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
+    # clash.yaml 派生同步: 拥塞模式/带宽变化会改变条目的 up/down 字段
+    local nline nname
+    nname=$(jq -r '.name // empty' "$meta")
+    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
+        _replace_node_in_yaml "$nline" "$nname" || \
+            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+    fi
     _press_any_key
 }
 
@@ -713,6 +720,13 @@ _hy2_adjust_bandwidth() {
         _press_any_key; return
     fi
     _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
+    # clash.yaml 派生同步: 带宽变化会改变条目的 up/down 字段
+    local nline nname
+    nname=$(jq -r '.name // empty' "$meta")
+    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
+        _replace_node_in_yaml "$nline" "$nname" || \
+            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+    fi
     _success "带宽已更新: 上传=${new_up:-不限}  下载=${new_down:-不限}"
     _press_any_key
 }
