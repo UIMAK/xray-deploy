@@ -3786,7 +3786,9 @@ _replace_node_in_yaml() {
         return 1
     fi
     local replaced=0 l
-    while IFS= read -r l; do
+    # || [ -n "$l" ]: read 在 EOF 且末行无结尾换行时返回 1 但 $l 已含该行内容,
+    # 缺此守卫会把最后一行留在循环外 —— 替换中间条目时会随 mv 静默丢掉它
+    while IFS= read -r l || [ -n "$l" ]; do
         if [ "$replaced" = 0 ] && printf '%s' "$l" | grep -qF "name: \"${key}\""; then
             printf '  %s\n' "$line" >> "$tmp"
             replaced=1
