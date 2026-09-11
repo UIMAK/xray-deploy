@@ -113,6 +113,47 @@ _maybe_drop_caches() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# 下载完整性校验(2026-09-12 审查 F2, 对齐官方 Xray-install install-release.sh
+# L442-459 的 .dgst 方案; singbox-lite xray_manager 同款)。
+# Xray release 的 <url>.dgst 为多行文本, 形如 "SHA2-256= <hex>"(实测), 
+# _dgst_sha256_of 取 sha+256 行最后一个字段并只留 hex, 供单测。
+# 校验失败/解析异常/sha256sum 缺失一律 fail-closed —— 宁可中止升级, 不落地
+# 未校验的二进制(docs/security-audit.md 曾认定".dgst 不可行", 系误判, 已纠正)。
+# ---------------------------------------------------------------------------
+
+# 从 .dgst 文本文件解析 SHA256(hex, 64 位); 解析不出输出空串
+_dgst_sha256_of() {
+    awk 'tolower($0) ~ /sha/ && /256/ {print tolower($NF); exit}' "$1" 2>/dev/null \
+        | tr -cd '0-9a-f'
+}
+
+# 校验已下载的 zip 与其官方 .dgst; 通过返回 0, 任何异常返回 1(调用方中止替换)
+_xray_verify_sha256() {
+    local zip="$1" url="$2" dgst want got
+    dgst="${zip}.dgst"
+    if ! _http_download "${url}.dgst" "$dgst" 30; then
+        _error "下载校验文件失败(${url}.dgst), 取消替换(不使用未校验的二进制)"
+        return 1
+    fi
+    want=$(_dgst_sha256_of "$dgst")
+    rm -f "$dgst"
+    if [ "${#want}" -ne 64 ]; then
+        _error "校验文件中未解析到 SHA256(格式异常?), 取消替换"
+        return 1
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        _error "sha256sum 不可用, 无法校验下载完整性, 取消替换"
+        return 1
+    fi
+    got=$(sha256sum "$zip" 2>/dev/null | awk '{print tolower($1)}')
+    if [ "$got" != "$want" ]; then
+        _error "SHA256 校验失败(下载损坏或被篡改?), 取消替换"
+        return 1
+    fi
+    return 0
+}
+
 _xray_download_replace() {
     local tag="$1"
     local asset tmp_dir tmp_zip
@@ -132,6 +173,11 @@ _xray_download_replace() {
     # curl 优先 + 可移植 wget 兜底(原 wget --show-progress 在 busybox 上直接失败)
     if ! _http_download "$dl_url" "$tmp_zip" 120; then
         _error "下载失败: $dl_url"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    # 完整性校验(F2): 先验 SHA256 再解压, 坏包不进入替换事务
+    if ! _xray_verify_sha256 "$tmp_zip" "$dl_url"; then
         rm -rf "$tmp_dir"
         return 1
     fi

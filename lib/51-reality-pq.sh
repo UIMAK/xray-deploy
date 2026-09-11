@@ -33,8 +33,14 @@ _detect_reality_pq() {
 
     _info "检测 Reality 后量子兼容性: $target"
     local ping_out
-    # 两次 ping(mack-a 同款:一次判 X25519MLKEM768,一次取证书长度)
-    ping_out=$(XRAY_LOCATION_ASSET= "$XRAY_BIN" tls ping "$target" 2>/dev/null)
+    # 两次 ping(mack-a 同款:一次判 X25519MLKEM768,一次取证书长度)。
+    # 2026-09-12 实测加固: tls ping 无内建超时, 目标网络黑洞时菜单永久挂起 ——
+    # 外包 timeout(Debian coreutils / busybox 均有)兜底; 超时按"不可达"处理。
+    if command -v timeout >/dev/null 2>&1; then
+        ping_out=$(timeout 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" tls ping "$target" 2>/dev/null)
+    else
+        ping_out=$(XRAY_LOCATION_ASSET= "$XRAY_BIN" tls ping "$target" 2>/dev/null)
+    fi
 
     if [ -z "$ping_out" ]; then
         PQ_REASON="xray tls ping 无输出(目标不可达或 xray 不支持 tls ping)"
