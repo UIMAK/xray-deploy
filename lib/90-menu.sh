@@ -300,6 +300,18 @@ _timed_restart_menu() {
         4)
             read -rp "  输入 cron 表达式 (如 30 3 * * *): " cron_expr
             [ -z "$cron_expr" ] && { _warn "表达式为空, 取消"; _press_any_key; return; }
+            # 2026-09-12 三审(S4): 基本格式校验 —— 5 个字段, 每字段仅数字/*/,/- 字符集。
+            # 过松会让坏行被 cron 反复报解析错误; 不校验取值范围是刻意的, 不会误伤 */3 等合法写法。
+            local -a _ce
+            read -ra _ce <<< "$cron_expr"
+            if [ "${#_ce[@]}" -ne 5 ]; then
+                _warn "cron 表达式须为 5 个字段(分 时 日 月 周), 已取消"
+                _press_any_key; return
+            fi
+            local _cw
+            for _cw in "${_ce[@]}"; do
+                [[ "$_cw" =~ ^[0-9*,/-]+$ ]] || { _warn "cron 字段含非法字符: ${_cw}"; _press_any_key; return; }
+            done
             ;;
         5)
             _timed_restart_disable
@@ -445,7 +457,12 @@ _reset_config() {
             y|Y) ;;
             *) _info "已取消"; return ;;
         esac
-        _backup_config
+        # 2026-09-12 三审(M1): 重置是清空全部节点数据的破坏性操作, 备份失败(磁盘满/IO 错误)
+        # 必须中止 —— 原写法忽略返回值, 备份失败仍 rm config, 用户在无备份情况下丢失全部节点。
+        if ! _backup_config; then
+            _error "配置备份失败(磁盘空间/IO?), 已取消重置以保护现有数据"
+            return
+        fi
     fi
     # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then

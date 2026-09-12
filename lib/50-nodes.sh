@@ -1041,7 +1041,12 @@ _mutate_config_locked() {
     # 构建参数列表: 去掉最后一个(filter), 追加合并后的 filter
     local args=("${@:1:$#-1}" "${combined}")
     if ! jq "${args[@]}" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
-        rm -f "$tmp"; _error "jq 处理失败"; return 1
+        rm -f "$tmp"
+        # 2026-09-12 三审: 仅失败路径重放一次拿 jq stderr(正常路径零开销),
+        # 否则用户只见一句"jq 处理失败", 无法定位是哪段过滤/哪份手改配置出的问题。
+        local jq_err; jq_err=$(jq "${args[@]}" "$CONFIG_FILE" 2>&1 >/dev/null | head -3)
+        _error "jq 处理失败: ${jq_err:-未知错误}"
+        return 1
     fi
     if [ ! -s "$tmp" ]; then
         rm -f "$tmp"; _error "生成的配置为空"; return 1
@@ -1873,8 +1878,13 @@ _remove_orphan_inbounds() {
         return 1
     fi
 
-    local filter='.inbounds |= map(select(.tag as $t | ($rm | index($t)) | not))
-                 | .routing.rules |= map(select(.inboundTag == null
+    # 2026-09-12 三审(M2): 规则过滤加 (type != "object") 前置守卫 —— 手工编辑可能把某条
+    # 规则写成裸字符串, 旧过滤对其求 .inboundTag 会让 jq 整体报错中止, 于是"移除孤儿入站"
+    # 在最需要它的坏配置上反而不可用(4 处同类过滤一并修复)。非对象元素一律保留(不是我们的业务)。
+    # 注意 inbounds 段必须用 `as $tg` 先绑定 tag 再 index —— jq 的 index(f) 参数以被索引
+    # 数组为输入求值, 直接写 index(.tag // "") 会把 .tag 作用到 $rm 上而报错(实测)。
+    local filter='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
+                 | .routing.rules |= map(select((type != "object") or .inboundTag == null
                        or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))'
 
     if _mutate_config --argjson rm "$tags_json" "$filter"; then
@@ -2120,6 +2130,8 @@ _add_vless_xhttp_reality() {
     local path=$(_gen_rand_path)
     read -rp "  XHTTP path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
+    # M5: path 直拼 JSON 模板, 含 " \ 换行或 {{ 占位符会让渲染失败/值被二次替换, 输入侧拒绝
+    _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     local default_name="Reality-XHTTP-${port}"
     read -rp "  节点名称 (默认 ${default_name}): " name
@@ -2438,6 +2450,8 @@ _add_vless_xhttp_cdn() {
     local path=$(_gen_rand_path)
     read -rp "  XHTTP path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
+    # M5: 见 _add_vless_xhttp_reality 同处说明
+    _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     local default_name="XHTTP-CDN-${port}"
     read -rp "  节点名称 (默认 ${default_name}): " name
@@ -2526,6 +2540,8 @@ _add_vless_ws_cdn() {
     local path=$(_gen_rand_path)
     read -rp "  WS path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
+    # M5: 见 _add_vless_xhttp_reality 同处说明
+    _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     local default_name="WS-CDN-${port}"
     read -rp "  节点名称 (默认 ${default_name}): " name
@@ -2626,6 +2642,8 @@ _add_shadowsocks() {
     fi
     read -rp "  密码 (默认随机): " custom_pw
     password=${custom_pw:-$password}
+    # M5: 密码直拼 JSON 模板与 SS 链接, 含 " \ 换行或 {{ 会让渲染失败/值被二次替换
+    _validate_json_text "$password" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     local default_name="SS-${method%%-*}-${port}"
     read -rp "  节点名称 (默认 ${default_name}): " name
@@ -2693,7 +2711,10 @@ _gen_hy2_cert() {
         openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE_PATH" 2>/dev/null \
             && openssl req -new -x509 -days 3650 -key "$KEY_FILE_PATH" \
                 -out "$CERT_FILE_PATH" -subj "/CN=build.nvidia.com" 2>/dev/null
-    elif [ -x "$XRAY_BIN" ]; then
+    fi
+    # 2026-09-12 三审(L8): openssl 缺失或执行失败(旧版/被裁剪)时回退 xray tls cert,
+    # 而不是"openssl 存在但失败就直接报错"—— 报错文案明明写着"需安装 openssl 或使用 xray tls cert"。
+    if { [ ! -f "$CERT_FILE_PATH" ] || [ ! -f "$KEY_FILE_PATH" ]; } && [ -x "$XRAY_BIN" ]; then
         # xray tls cert 的 --file 是"路径前缀", 实际产出 <前缀>.crt / <前缀>.key。
         # 因此前缀必须落在 cert_dir 内部(传目录本身会在其父目录生成 <目录名>.crt/.key)。
         XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain build.nvidia.com \
@@ -2722,6 +2743,9 @@ _add_hysteria2() {
     read -rp "  cert 路径 (回车自签): " custom_cert
     if [ -n "$custom_cert" ]; then
         read -rp "  key 路径: " custom_key
+        # M5: 证书路径直拼 JSON 模板, 先做字符校验再判存在性(报错可理解)
+        _validate_json_text "$custom_cert" || { _error "cert 路径含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
+        _validate_json_text "$custom_key" || { _error "key 路径含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
         if [ ! -f "$custom_cert" ] || [ ! -f "$custom_key" ]; then
             _error "证书文件不存在"; return 1
         fi
@@ -2750,6 +2774,8 @@ _add_hysteria2() {
     auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
     read -rp "  认证密码 (回车随机): " custom_auth
     auth=${custom_auth:-$auth}
+    # M5: 认证串直拼 JSON 模板与 hy2 链接, 校验同 _add_shadowsocks
+    _validate_json_text "$auth" || { _error "认证密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     # 拥塞控制
     echo -e "  拥塞控制:"
@@ -3278,7 +3304,8 @@ _delete_node() {
         fi
         # 无排除项: 沿用原语义(清空 inbounds, 连手工添加的入站一并清掉)
         # 有排除项: 只删可安全删除的 tag(含其 tunnel_tag), 保留被排除节点的入站
-        local all_filter='.inbounds = [] | .routing.rules |= map(select(.inboundTag == null or (.inboundTag | type) == "array" and (.inboundTag | length) == 0))'
+        # (M2 同口径: 非对象规则元素保留, 避免 jq 整体报错)
+        local all_filter='.inbounds = [] | .routing.rules |= map(select((type != "object") or .inboundTag == null or ((.inboundTag | type) == "array" and (.inboundTag | length) == 0)))'
         local all_ok=0
         if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ]; then
             _mutate_config "$all_filter" && all_ok=1
@@ -3297,8 +3324,8 @@ _delete_node() {
                 _press_any_key; return
             fi
             _mutate_config --argjson rm "$rm_json" \
-                '.inbounds |= map(select(.tag as $t | ($rm | index($t)) | not))
-                 | .routing.rules |= map(select(.inboundTag == null
+                '.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
+                 | .routing.rules |= map(select((type != "object") or .inboundTag == null
                        or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))' && all_ok=1
         fi
         if [ "$all_ok" -eq 1 ]; then
@@ -3373,9 +3400,11 @@ _delete_node() {
         [ ${#del_ttags[@]} -gt 0 ] && tun_json=$(printf '%s\n' "${del_ttags[@]}" | jq -R . | jq -s .)
         local all_json; all_json=$(printf '%s\n' "${del_tags[@]}" "${del_ttags[@]}" | jq -R . | jq -s .)
 
-        local jq_multi='.inbounds |= map(select(.tag as $t | $all_tags | index($t) | not))'
+        # M2 同口径: type 守卫防止非对象规则/入站元素让 jq 整体报错。
+        # tag 同样需 as 绑定后再 index(index 参数以 $all_tags 为输入求值, 见 _remove_orphan_inbounds 注)
+        local jq_multi='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($all_tags | index($tg)) == null)))'
         if [ ${#del_ttags[@]} -gt 0 ]; then
-            jq_multi="$jq_multi | .routing.rules |= map(select(.inboundTag == null or (.inboundTag as $it | $tun_tags | index($it) | not)))"
+            jq_multi="$jq_multi | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag as \$it | \$tun_tags | index(\$it)) == null)))"
         fi
 
         if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
@@ -3405,12 +3434,13 @@ _delete_node() {
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     # 读取 tunnel_tag, 一次性删除 tunnel + reality + 路由(原子操作)
+    # M2 同口径: type 守卫防止非对象入站/规则元素让 jq 整体报错(手改 config 时删除被拒绝服务)
     local tunnel_tag
     tunnel_tag=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
-    local jq_filter='.inbounds |= map(select(.tag != $t))'
+    local jq_filter='.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))'
     if [ -n "$tunnel_tag" ]; then
-        jq_filter="$jq_filter | .routing.rules |= map(select(.inboundTag == null or (.inboundTag | index(\$tg)) == null))
-            | .inbounds |= map(select(.tag != \$tg))"
+        jq_filter="$jq_filter | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag | index(\$tg)) == null)))
+            | .inbounds |= map(select((type != \"object\") or ((.tag // \"\") != \$tg)))"
     fi
     # R17: 先清理端口跳跃规则(teardown 事务; 失败则取消删除, 节点整体保持原状)
     # R30(P1): fail-closed——metadata 损坏/缺 protocol 不能当"非 HY2"跳过 teardown,
@@ -3796,7 +3826,9 @@ _update_listen() {
         echo -e "  ${YELLOW}该节点为 CDN 协议, 必须使用 CDN 域名${NC}"
         echo -e "  当前链接服务器地址: ${oldaddr}"
         read -rp "  请输入 CDN 域名: " newaddr
-        [[ "$newaddr" == *"."* ]] || { _warn "CDN 节点须填域名, 而非 IP"; _press_any_key; return; }
+        # 2026-09-12 三审(L3): 旧判据 *"."* 连 IPv4 都放行, 与"须填域名"的提示自相矛盾;
+        # 改用与创建路径一致的域名格式校验(R38 _validate_domain)。
+        _validate_domain "$newaddr" || { _warn "CDN 节点须填域名, 而非 IP"; _press_any_key; return; }
         ;;
     *)
         if _is_listen_loopback "$newlisten"; then
@@ -3816,15 +3848,22 @@ _update_listen() {
     # 重写链接里的地址(F7/F1: 收口到 _rewrite_link_addr)。
     # 链接不含 @(被采纳节点的 "#tag (adopted)" 占位)时输出空串 —— 此时只更新
     # listen/link_addr, 保留原链接, 实测原写法会产出 "...@:端口..." 垃圾。
+    # 2026-09-12 三审(M6): CDN 节点同步更新 preferred_addr —— clash 条目与
+    # _rebuild_cdn_link 的权威地址是 preferred_addr, 只改 link_addr 会留下
+    # "本次链接已更新、下次端口修改重建时又回退到旧地址"的元数据自相矛盾。
+    # 用 has("preferred_addr") 判断, 非 CDN 节点(无该字段)不受影响。
     local oldlink newlink
     oldlink=$(jq -r '.share_link' "$meta" 2>/dev/null)
     newlink=$(_rewrite_link_addr "$oldlink" "$newaddr")
     if [ -n "$newlink" ]; then
-        _meta_update "$meta" '.listen=$l | .link_addr=$a | .share_link=$link' \
+        _meta_update "$meta" '.listen=$l | .link_addr=$a
+            | (if has("preferred_addr") then .preferred_addr=$a else . end)
+            | .share_link=$link' \
             --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
     else
         _warn "分享链接非标准格式(被采纳节点?), 仅更新监听与链接地址记录"
-        _meta_update "$meta" '.listen=$l | .link_addr=$a' \
+        _meta_update "$meta" '.listen=$l | .link_addr=$a
+            | (if has("preferred_addr") then .preferred_addr=$a else . end)' \
             --arg l "$newlisten" --arg a "$newaddr" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
     fi
     # F1: 监听/链接地址变化需同步 clash 条目的 server 字段
