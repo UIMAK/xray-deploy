@@ -520,7 +520,9 @@ _route_rules_menu() {
         echo
         local total=0 geo=0 node=0 mark=0 stats_ok=1
         local stats; stats=$(_route_rules_stats) || stats_ok=0
-        read -r total geo node mark <<< "$stats"
+        # 2026-09-12 三审(L9): stats 失败时不读 —— read 对空输入会把上面初始化的 0 覆盖成空串,
+        # 后续 [ "" -eq 0 ] 会打出 bash "integer expression expected" 噪音(条件恒假, 不致命但困惑)。
+        [ "$stats_ok" -eq 1 ] && read -r total geo node mark <<< "$stats"
         if [ "$stats_ok" -ne 1 ]; then
             _warn "无法读取当前路由规则(Xray 未安装 / 配置缺失 / jq 不可用)"
         else

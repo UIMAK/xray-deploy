@@ -248,9 +248,10 @@ _validate_listen() {
     case "$addr" in
         "::"|"0.0.0.0"|"127.0.0.1"|"::1") return 0 ;;
     esac
-    # IPv4 字面量
-    if [[ "$addr" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-        return 0
+    # IPv4 字面量(每段 0-255; 裸 [0-9]+ 会放行 999.1.1.1, xray 启动才报错)
+    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && return 0
+        return 1
     fi
     # IPv6 字面量(简单校验:含多个冒号且字符合法)
     if [[ "$addr" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$addr" == *:* ]]; then
@@ -285,6 +286,21 @@ _validate_domain() {
     [ -n "$d" ] || return 1
     [ "${#d}" -le 253 ] || return 1
     [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# 用户自定义值(path/密码/认证串/证书路径)进入 JSON 模板前的字符安全校验(2026-09-12 三审 M5)。
+# _render_template 用 bash 占位符替换 + jq 兜底校验: 值含 " 或 \ 或换行/制表符会让渲染
+# 产物 JSON 不合法, 用户只能看到一句含混的"模板渲染后 JSON 不合法"(fail-closed 但不可诊断);
+# 含 {{ 占位符字样还会被后续替换轮次二次改写(如密码输入 "{{NETWORK}}" 会被偷换成 network 值)。
+# 在输入侧直接拒绝这四类字符, 给出可理解的报错。正常值(字母数字/中文/空格/点/斜杠)不受影响。
+# 用法: _validate_json_text <值>  非法返回 1
+# ---------------------------------------------------------------------------
+_validate_json_text() {
+    case "$1" in
+        *'"'*|*'\'*|*$'\n'*|*$'\r'*|*$'\t'*|*"{{"*) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -552,6 +568,11 @@ _normalize_config_format() {
     ' "$CONFIG_FILE" 2>/dev/null) || return 0
     # 变换结果为空(输入是空白/非对象): 保持原文件不动, 交由 xray 自己报配置错误
     [ -n "$content" ] || return 0
+    # 2026-09-12 三审(L5): 本函数在每次主菜单启动都会跑; 内容无变化时跳过写入,
+    # 避免无条件 mv 让 config.json 的 mtime 每次启动都被刷新(纯 I/O 浪费)。
+    local cur
+    cur=$(cat "$CONFIG_FILE" 2>/dev/null) || cur=""
+    [ "$content" = "$cur" ] && return 0
     _atomic_write_json "$CONFIG_FILE" "$content"
 }
 
@@ -775,5 +796,9 @@ _rewrite_link_port() {
     else
         host_part="${after_at%%[:/?#]*}"
     fi
+    # 2026-09-12 三审(L2): oldport 与链接实际端口不符(metadata 被手改/损坏)时,
+    # 下面的 ${after_at#...} 删除不生效, 结果会变成 "host:9999host:443?..." 拼接垃圾。
+    # 与 F7 同一口径: 无法确定改写目标时输出空串, 调用方保留原链接。
+    [[ "$after_at" == "$host_part:$oldport"* ]] || { printf ''; return 0; }
     printf '%s' "${before_at}@${host_part}:${newport}${after_at#"$host_part:$oldport"}"
 }

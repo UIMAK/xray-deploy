@@ -195,10 +195,24 @@ mkdir -p "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR"
 LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 if [ -f "${LOCAL_DIR}/xray-deploy.sh" ]; then
     echo "[信息] 检测到本地源, 从本地拷贝"
-    cp -f "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"
-    cp -f "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" 2>/dev/null
-    cp -f "${LOCAL_DIR}"/lib/*.sh "$INSTALL_LIB_DIR/" 2>/dev/null
-    cp -f "${LOCAL_DIR}"/templates/*.jsonc "$INSTALL_TPL_DIR/" 2>/dev/null
+    # 2026-09-12 三审(M4): 拷贝失败(磁盘满/权限)必须中止 —— 原写法全部 2>/dev/null 吞掉,
+    # lib/模板拷贝失败仍报"安装完成", 用户执行 xd 时才会以"source 失败"的形式暴露。
+    if ! cp -f "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"; then
+        echo "[错误] 本地源拷贝失败: xray-deploy.sh(磁盘空间/权限?)"; exit 1
+    fi
+    if [ -f "${LOCAL_DIR}/VERSION" ]; then
+        cp -f "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" || { echo "[错误] 本地源拷贝失败: VERSION"; exit 1; }
+    else
+        echo "[警告] 本地源缺少 VERSION, 更新检查将显示未知版本"
+    fi
+    if [ ! -d "${LOCAL_DIR}/lib" ]; then
+        echo "[错误] 本地源缺少 lib/ 目录, 安装中止"; exit 1
+    fi
+    cp -f "${LOCAL_DIR}"/lib/*.sh "$INSTALL_LIB_DIR/" || { echo "[错误] 本地源拷贝失败: lib/"; exit 1; }
+    if [ ! -d "${LOCAL_DIR}/templates" ]; then
+        echo "[错误] 本地源缺少 templates/ 目录, 安装中止"; exit 1
+    fi
+    cp -f "${LOCAL_DIR}"/templates/*.jsonc "$INSTALL_TPL_DIR/" || { echo "[错误] 本地源拷贝失败: templates/"; exit 1; }
 else
     if ! download_all; then
         echo "[错误] 关键文件下载失败, 安装中止"

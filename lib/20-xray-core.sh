@@ -338,9 +338,23 @@ _install_or_switch_xray() {
         return 1
     fi
 
-    # 确保配置与 service 存在(首次安装)
-    _init_config_if_empty
-    _create_xray_service
+    # 确保配置与 service 存在(首次安装)。2026-09-12 三审(M3): 两者失败都显式中止 ——
+    # 原写法不检查返回值, 配置初始化失败(jq 缺失/磁盘满)时仍写出指向不存在配置的 unit 并
+    # 强行重启, 把"配置没建好"伪装成"新核心起不来", 误导排障方向。失败时尝试拉起旧服务。
+    if ! _init_config_if_empty; then
+        _error "配置初始化失败, 中止安装/切换"
+        if [ -x "$XRAY_BIN" ]; then
+            _manage_xray start >/dev/null 2>&1 || true
+        fi
+        return 1
+    fi
+    if ! _create_xray_service; then
+        _error "service 文件创建失败, 中止安装/切换"
+        if [ -x "$XRAY_BIN" ]; then
+            _manage_xray start >/dev/null 2>&1 || true
+        fi
+        return 1
+    fi
 
     # 重启并确认"稳定运行"而非仅命令返回 0(systemd Type=simple 在进程崩溃前即返回 0)。
     # 不在此处跑 xray -test(低内存 OOM); verified-restart 会完整观察 8s。
@@ -600,6 +614,10 @@ StartLimitBurst=20
 [Service]
 Type=simple
 ${env_line}
+# 2026-09-12 三审(S1) 最小加固: xray 运行期不需要 exec 任何 setuid/setgid 程序,
+# NoNewPrivileges 只是一次 prctl 调用, 不依赖 capability, 在受限容器(LXC/Podman)内同样生效,
+# 不会触发 OpenRC capabilities 那类 exec 前 EPERM(H2 同类风险为零)。
+NoNewPrivileges=true
 ExecStart=${XRAY_BIN} run -c ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=3
@@ -612,8 +630,14 @@ EOF
     # world-inaccessible" 告警。unit 不含机密(token 在 cloudflared 侧, 且那本就是既有形态),
     # 显式给 644 以符合系统集成惯例。
     chmod 644 /etc/systemd/system/xray.service 2>/dev/null || true
-    systemctl daemon-reload
-    systemctl enable xray 2>/dev/null
+    # 2026-09-12 三审(M3): 返回值现在被 _install_or_switch_xray 消费 —— daemon-reload 失败
+    # 说明 service 文件根本没被 systemd 识别, 必须 fail; enable 失败只影响开机自启, 不中止安装。
+    if ! systemctl daemon-reload; then
+        _error "systemd daemon-reload 失败"
+        return 1
+    fi
+    systemctl enable xray 2>/dev/null || _warn "xray 开机自启设置失败(可手动: systemctl enable xray)"
+    return 0
 }
 
 _create_xray_openrc_service() {
@@ -653,8 +677,10 @@ depend() {
     after firewall
 }
 EOF
-    chmod +x /etc/init.d/xray
-    rc-update add xray default 2>/dev/null
+    chmod +x /etc/init.d/xray || return 1
+    # enable 失败只影响开机自启, 不中止安装(与 systemd 分支同一口径, 2026-09-12 三审 M3)
+    rc-update add xray default 2>/dev/null || _warn "xray 开机自启设置失败(可手动: rc-update add xray default)"
+    return 0
 }
 
 _create_xray_service() {
