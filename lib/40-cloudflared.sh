@@ -686,6 +686,13 @@ _install_cloudflared() {
 # 卸载 cloudflared(彻底清)
 # ---------------------------------------------------------------------------
 _uninstall_cloudflared() {
+    # 2026-09-12 三审(L1): /etc/cloudflared 凭据清理必须放在二进制存在性判断之前 ——
+    # 用户可能只删了二进制(或二进制损坏不可执行), 此时提前 return 会把 token 留在盘上(RT-3 同源)。
+    # 只删 token 文件 + 仅在目录已空时 rmdir —— 手工配置的 config.yml 永不被触碰。
+    if [ -f /etc/cloudflared/token ]; then
+        rm -f /etc/cloudflared/token
+    fi
+    rmdir /etc/cloudflared 2>/dev/null || true
     [ -x "$CF_BIN" ] || { _warn "cloudflared 未安装"; return 0; }
     _info "卸载 cloudflared..."
     "$CF_BIN" service uninstall 2>/dev/null || true
@@ -703,13 +710,6 @@ _uninstall_cloudflared() {
     esac
     rm -f "$CF_BIN"
     rm -f "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6"
-    # RT-3(2026-09-12 实测): cloudflared service install 会在 /etc/cloudflared 写入 token
-    # 凭据文件; 新版 service uninstall 会自删它, 但可能留下空目录, 旧版可能两者都不清。
-    # 只删 token 文件 + 仅在目录已空时 rmdir —— 手工配置的 config.yml 永不被触碰。
-    if [ -f /etc/cloudflared/token ]; then
-        rm -f /etc/cloudflared/token
-    fi
-    rmdir /etc/cloudflared 2>/dev/null || true
     _success "cloudflared 已卸载(二进制/服务/状态已清除)"
 }
 
