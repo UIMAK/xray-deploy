@@ -1295,7 +1295,9 @@ _ask_link_addr() {
         _warn "未能自动获取公网 IP,请手动填写客户端连接地址(公网IP或域名)"
         while true; do
             local addr
-            read -rp "  客户端连接地址: " addr
+            # RT-1 同类: 管道驱动/会话异常的 EOF 下 read 立即返回且 addr 恒空, 无守卫会死循环刷告警。
+            # EOF 即无法再获得输入, 显式 return 1 让调用方按"孤儿入站"惯例中止(5 个调用点均校验)。
+            read -rp "  客户端连接地址: " addr || return 1
             [ -n "$addr" ] && { echo "$addr"; return 0; }
             _warn "不能为空"
         done
@@ -2026,7 +2028,7 @@ _add_vless_tcp_reality_vision() {
         _commit_inbound "$reality_json" || return 1
     fi
 
-    local addr; addr=$(_ask_link_addr)
+    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
@@ -2165,7 +2167,7 @@ _add_vless_xhttp_reality() {
         _commit_inbound "$reality_json" || return 1
     fi
 
-    local addr; addr=$(_ask_link_addr)
+    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
@@ -2369,7 +2371,7 @@ _add_vless_enc() {
     inbound=$(_render_template "$(_tpl_path vless-enc)") || return 1
     _commit_inbound "$inbound" || return 1
 
-    local addr; addr=$(_ask_link_addr)
+    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
@@ -2638,7 +2640,7 @@ _add_shadowsocks() {
     _commit_inbound "$inbound" || return 1
 
     local addr
-    addr=$(_ask_link_addr)
+    addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     # ss 链接(SIP002): userinfo 必须 base64url 无填充 —— 标准 base64 可能含 + / =,
@@ -2793,7 +2795,7 @@ _add_hysteria2() {
     _commit_inbound "$inbound" || return 1
 
     local addr
-    addr=$(_ask_link_addr)
+    addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
@@ -2986,7 +2988,8 @@ _rebuild_clash_line() {
             ;;
         shadowsocks)
             # udp 标志的权威来源是 config 的 settings.network(metadata 未存)
-            local method password net udp_clash=""
+            # net 给默认值: metadata 缺 tag 时(手工编辑/损坏)上一行短路, set -u 下读 $net 会崩溃
+            local method password net="" udp_clash=""
             method=$(jq -r '.method // empty' "$meta")
             password=$(jq -r '.password // empty' "$meta")
             [ -n "$method" ] && [ -n "$password" ] || return 1
