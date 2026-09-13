@@ -81,17 +81,38 @@ _hysteria_cached_version() {
     echo "$ver"
 }
 
+# 版本号 canonicalize: 官方 GitHub release tag 形态为 app/v2.12.2(2026-09-13 实测),
+# GitHub API fallback 会拿到 app/ 前缀; 统一在此剥离并校验 v2.x.x 格式
+_hysteria_canon_version() {
+    local v="${1#app/}"
+    [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$v"; return 0; }
+    return 1
+}
+
+# 从官方 hashes.txt 提取指定资产的 SHA256(格式 "<sha256>  build/<asset>")。
+# 精确锚定行尾防前缀误匹配(amd64 vs amd64-avx); 条目唯一性由调用方对 0/多结果 fail-closed。
+# 返回 1 = 无条目或条目形态异常; stdout = 64 位十六进制摘要
+_hysteria_expected_sha256() {
+    local f="$1" name="$2" line sha
+    [ -s "$f" ] || return 1
+    line=$(grep -E " build/${name}\$" "$f" 2>/dev/null | tail -1)
+    [ -n "$line" ] || return 1
+    sha=$(printf '%s' "$line" | awk '{print $1}')
+    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$sha"
+}
+
 # 最新版本: 官方下载服务的 302 终点 URL 携带版本段(/app/latest/<asset> → /app/v2.12.2/<asset>);
-# 失败回落 GitHub API tag_name。两个通道都失败 → 输出空, 调用方显式处理。
+# 失败回落 GitHub API latest(注意: 仓库改名后 API 会 301, 必须 -L 跟随; tag 形态 app/v2.x.x,
+# 经 canonicalize)。两个通道都失败 → 输出空, 调用方显式处理。
 _hysteria_latest_version() {
     local asset final ver
     asset=$(_hysteria_arch_asset) || return 1
     final=$(curl -sIL -o /dev/null --max-time 15 -w '%{url_effective}' \
             "${HYSTERIA_DL_BASE}/latest/hysteria-linux-${asset}" 2>/dev/null) || final=""
-    ver=$(printf '%s' "$final" | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -1)
+    ver=$(_hysteria_canon_version "$(printf '%s' "$final" | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -1)")
     if [ -z "$ver" ] && command -v jq >/dev/null 2>&1; then
-        ver=$(jq -r '.tag_name // empty' <(
-            curl -fsSL --max-time 15 "$HYSTERIA_GH_API" 2>/dev/null) 2>/dev/null) || ver=""
+        ver=$(_hysteria_canon_version "$(curl -fsSL --max-time 15 "$HYSTERIA_GH_API" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)")
     fi
     [ -n "$ver" ] && echo "$ver"
     return 0
@@ -156,8 +177,11 @@ _hysteria_download_install() {
         want=$(_hysteria_latest_version)
         [ -n "$want" ] || { _error "无法获取最新版本(网络受限?), 可改用指定版本安装"; return 1; }
     fi
-    [[ "$want" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { _error "版本号格式应为 v2.x.x: $want"; return 1; }
+    # 版本号 canonicalize(评审 0.16.2: GitHub tag 形态 app/v2.x.x, 输入侧统一剥离)
+    want=$(_hysteria_canon_version "$want") || { _error "版本号格式应为 v2.x.x: $1"; return 1; }
     url="${HYSTERIA_DL_BASE}/${want}/hysteria-linux-${asset}"
+    # 完整性校验前置: sha256sum 不可用则整个下载无意义(fail-closed, 与 xray .dgst 同口径)
+    command -v sha256sum >/dev/null 2>&1 || { _error "sha256sum 不可用, 无法验证下载完整性"; return 1; }
     _info "下载 ${url}"
     mkdir -p "$BIN_DIR" || return 1
     tmp=$(mktemp "$BIN_DIR/hysteria.dl.XXXXXX") || { _error "临时文件创建失败"; return 1; }
@@ -166,8 +190,27 @@ _hysteria_download_install() {
         _error "下载失败(网络受限?), 当前安装未变动"
         return 1
     fi
+    # P1-1(官方 hashes.txt, 2026-09-13 实证与 binary 同目录发布): SHA256 校验 fail-closed。
+    # 拿不到官方校验和 = 不可信任下载内容, 直接中止(自检+版本匹配只能证明"能执行且报对版本",
+    # 无法证明"就是官方发布的那个 binary")。hashes.txt 格式: "<sha256>  build/<asset>"。
+    local h_file expected sha
+    h_file=$(mktemp "$BIN_DIR/hashes.txt.XXXXXX") || { rm -f "$tmp"; _error "临时文件创建失败"; return 1; }
+    if ! _http_download "${HYSTERIA_DL_BASE}/${want}/hashes.txt" "$h_file" 60 || [ ! -s "$h_file" ]; then
+        rm -f "$h_file" "$tmp"
+        _error "无法获取官方 hashes.txt 校验文件, 为防供应链篡改已中止(当前安装未变动)"
+        return 1
+    fi
+    expected=$(_hysteria_expected_sha256 "$h_file" "hysteria-linux-${asset}")
+    rm -f "$h_file"
+    [ -n "$expected" ] || { rm -f "$tmp"; _error "hashes.txt 中无 hysteria-linux-${asset} 条目, 已中止"; return 1; }
+    sha=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+    [ "$sha" = "$expected" ] || {
+        rm -f "$tmp"
+        _error "SHA256 不匹配(期望 ${expected}, 实际 ${sha:-无法计算}), 已放弃替换"
+        return 1
+    }
     chmod 755 "$tmp" 2>/dev/null
-    # 无官方校验和(.sha256sum 404): 完整性兜底 = ELF 可执行 + version 子命令输出预期版本
+    # 第二层: 可执行自检 + version 子命令输出与目标版本一致(官方解析口径)
     ver=$("$tmp" version 2>/dev/null | grep '^Version' | grep -o 'v[.0-9]*' | head -1)
     if [ "$ver" != "$want" ]; then
         rm -f "$tmp"
@@ -349,8 +392,13 @@ _manage_hysteria() {
                         echo "running"
                     else
                         rm -f "$HYSTERIA_PID_FILE"
-                        nohup "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" --disable-update-check \
-                            >>"$HYSTERIA_LOG_FILE" 2>&1 9>&- &
+                        # 与 systemd WorkingDirectory/openrc directory 语义统一;
+                        # 子壳层 exec 使 $! 即 hysteria 进程 pid(no-hup 承接同一 pid)
+                        (
+                            cd "$HYSTERIA_DATA_DIR" 2>/dev/null || cd /
+                            exec nohup "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" --disable-update-check \
+                                >>"$HYSTERIA_LOG_FILE" 2>&1 9>&-
+                        ) &
                         echo $! > "$HYSTERIA_PID_FILE"
                         sleep 1
                         if [ "$(cat "/proc/$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)/comm" 2>/dev/null)" != "hysteria" ]; then
@@ -473,6 +521,9 @@ respawn_delay=5
 pidfile="${HYSTERIA_PID_FILE}"
 output_log="${HYSTERIA_LOG_FILE}"
 error_log="${HYSTERIA_LOG_FILE}"
+
+# 与 systemd WorkingDirectory 语义统一: ACL geo 下载等相对路径行为三后端一致
+directory="${HYSTERIA_DATA_DIR}"
 
 # 不设 rc_ulimit 抬升与 capabilities: 容器内 EPERM 会在 exec 前中止启动(H2 同类教训);
 # 端口跳跃需要的 NET_ADMIN 以 root 运行天然满足
@@ -610,11 +661,153 @@ _hysteria_config_txn() {
     _with_config_lock _hysteria_config_txn_locked "$@"
 }
 
+# ---------------------------------------------------------------------------
+# 服务级统一事务(评审 0.16.2 P1-4): hysteria.json(官方配置) + server_meta.json(manager
+# 元数据)必须作为一个整体提交 —— 先 config 后 meta 的两段式会在"config 已提交而 meta
+# 写失败"时产生状态漂移(服务是新 TLS / 链接按旧 TLS 重建)。
+# 用法: _hysteria_server_txn [--arg/--argjson ...] <config_filter> <meta_filter>
+#   meta_filter 传 "-" 表示本事务不动 server_meta。
+# 契约: 双备份 → config 变更 → meta 变更 → verified-restart → 失败双回滚+重启。
+# ---------------------------------------------------------------------------
+_hysteria_server_txn_locked() {
+    _hysteria_config_preflight || return 1
+    [ "$#" -ge 2 ] || { _error "server_txn 参数不足(config_filter, meta_filter)"; return 1; }
+    local config_filter="$1" meta_filter="$2"; shift 2
+    if ! _hysteria_backup_config; then
+        _error "配置备份失败, 中止操作"
+        return 1
+    fi
+    # --- 阶段 1: config 变更(到此为止的失败 = 一切未变, 直接中止) ---
+    local tmp
+    tmp=$(mktemp "${HYSTERIA_CONFIG}.XXXXXX") || { _error "无法创建临时配置"; return 1; }
+    if ! jq "${@}" "$config_filter" "$HYSTERIA_CONFIG" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        local jq_err; jq_err=$(jq "${@}" "$config_filter" "$HYSTERIA_CONFIG" 2>&1 >/dev/null | head -3)
+        _error "jq 处理失败: ${jq_err:-未知错误}"
+        return 1
+    fi
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; _error "生成的配置为空"; return 1
+    fi
+    if ! mv -f "$tmp" "$HYSTERIA_CONFIG"; then
+        rm -f "$tmp"
+        _error "配置替换失败, 保留旧配置"
+        return 1
+    fi
+    # --- 至此 config 已变更: 之后任何失败都必须恢复 config + meta 并重启 ---
+    local meta_bak="" meta_had=0 meta_created=0
+    if [ "$meta_filter" != "-" ]; then
+        if [ -f "$HYSTERIA_SERVER_META" ]; then
+            meta_had=1
+            meta_bak=$(mktemp "${HYSTERIA_SERVER_META}.bak.XXXXXX") || {
+                _hysteria_restore_config; _hysteria_restart_verified >/dev/null 2>&1
+                _error "无法创建元数据备份"; return 1
+            }
+            if ! cp -p "$HYSTERIA_SERVER_META" "$meta_bak"; then
+                rm -f "$meta_bak"
+                _hysteria_restore_config; _hysteria_restart_verified >/dev/null 2>&1
+                _error "元数据备份失败"; return 1
+            fi
+            chmod 600 "$meta_bak" 2>/dev/null
+        fi
+        if [ ! -f "$HYSTERIA_SERVER_META" ]; then
+            # meta 文件不存在(meta_had=0): 尝试以 {} 起步; 该创建本身计入可回滚变更
+            if ! _atomic_write_json "$HYSTERIA_SERVER_META" '{}'; then
+                _hysteria_restore_config; _hysteria_restart_verified >/dev/null 2>&1
+                _error "server_meta 初始化失败, 已回滚配置"; return 1
+            fi
+            meta_created=1
+        fi
+        local newmeta
+        if ! newmeta=$(jq "${@}" "$meta_filter" "$HYSTERIA_SERVER_META" 2>/dev/null) || [ -z "$newmeta" ]; then
+            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
+            _error "server_meta 变换失败, 已回滚配置"
+            return 1
+        fi
+        if ! _atomic_write_json "$HYSTERIA_SERVER_META" "$newmeta"; then
+            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
+            _error "server_meta 提交失败, 已回滚配置"
+            return 1
+        fi
+    fi
+    # --- 阶段 2: verified-restart, 失败双回滚 ---
+    if ! _hysteria_restart_verified; then
+        _error "hysteria 启动失败, 回滚配置与元数据"
+        if ! _hysteria_restore_config; then
+            _error "配置回滚失败(lastbak 不存在或恢复出错), 未尝试重启"
+            return 1
+        fi
+        _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
+        if _hysteria_restart_verified; then
+            _warn "已回滚到旧配置并重启"
+        else
+            _error "回滚后仍启动失败, 请查看日志"
+        fi
+        return 1
+    fi
+    [ -n "$meta_bak" ] && rm -f "$meta_bak" 2>/dev/null
+    return 0
+}
+
+# server_txn 的 meta 侧回滚(meta_had=1 还原备份; meta_created=1 删除新建; 失败显式报告)
+_hysteria_server_txn_rollback() {
+    local meta_had="$1" meta_created="$2" meta_bak="$3" mc
+    if [ "$meta_had" -eq 1 ] && [ -s "$meta_bak" ]; then
+        mc=$(cat "$meta_bak" 2>/dev/null)
+        if [ -n "$mc" ] && _atomic_write_json "$HYSTERIA_SERVER_META" "$mc"; then
+            :
+        else
+            _warn "server_meta 回滚失败, 请人工核对 $HYSTERIA_SERVER_META"
+        fi
+    elif [ "$meta_created" -eq 1 ]; then
+        rm -f "$HYSTERIA_SERVER_META"
+    fi
+    [ -n "$meta_bak" ] && rm -f "$meta_bak" 2>/dev/null
+    return 0
+}
+
+_hysteria_server_txn() {
+    _with_config_lock _hysteria_server_txn_txn_wrapper "$@"
+}
+
+_hysteria_server_txn_txn_wrapper() {
+    # 拆参: 最后两个参数是 config/meta filter, 其余为 jq 选项
+    [ "$#" -ge 2 ] || { _error "server_txn 参数不足"; return 1; }
+    local meta_filter="${!#}"
+    local config_filter="${@: -2:1}"
+    local jq_args=("${@:1:$#-2}")
+    if [ "${#jq_args[@]}" -gt 0 ]; then
+        _hysteria_server_txn_locked "$config_filter" "$meta_filter" "${jq_args[@]}"
+    else
+        _hysteria_server_txn_locked "$config_filter" "$meta_filter"
+    fi
+}
+
 # 服务器是否已完成初始化(配置存在 + jq 可解析 + auth 段就绪)
-_hysteria_server_initialized() {
+# 三态判定(评审 0.16.2 P1-3): 官方 auth.type 有 password/userpass/http/command 四种,
+# 绝不能把"存在但非 userpass"的合法官方配置当成未初始化而 bootstrap 覆盖。
+_hysteria_config_exists() {
     [ -f "$HYSTERIA_CONFIG" ] && [ -s "$HYSTERIA_CONFIG" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
+    jq -e . "$HYSTERIA_CONFIG" >/dev/null 2>&1
+}
+
+_hysteria_server_initialized() {
+    _hysteria_config_exists || return 1
     jq -e '.auth.type == "userpass" and (.auth.userpass | type == "object")' "$HYSTERIA_CONFIG" >/dev/null 2>&1
+}
+
+# 菜单操作闸门: initialized → 放行; 配置存在但 auth 非 userpass → 明确"不接管";
+# 无配置 → 提示初始化路径。返回 1 时调用方中止操作。
+_hysteria_gate() {
+    _hysteria_server_initialized && return 0
+    if _hysteria_config_exists; then
+        _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 userpass 模式"
+        _tip "为防止覆盖现有配置, 菜单操作不可用; 如需接管请自行备份并手工把 auth 段转换为 userpass 表, 或删除该配置后重新初始化"
+    else
+        _warn "Hysteria 服务器未初始化, 请先通过 [添加节点] 初始化"
+    fi
+    return 1
 }
 
 # manager 自有元数据(server_meta.json)读写; 文件不存在时输出空
@@ -759,17 +952,22 @@ _hysteria_listen_port_part() {
 #   a) 系统已监听的 UDP 端口落进范围(会被官方 REDIRECT 遮蔽)
 #   b) Xray config inbound 端口落进范围
 #   c) Xray Hy2 节点的 iptables 跳跃范围与本范围相交
-# 用法: _hysteria_check_hop_conflicts <lo> <hi>; 有冲突返回 1(已打印说明)
+# 第 3 参 exclude = 当前 hysteria 自身监听的首端口(评审 0.16.2 P2): 改跳跃范围时新
+# 范围包含当前端口(如 :443 → :443-50000)是官方语义允许的合法配置 —— restart 后旧
+# 监听即释放, 自身端口不算外部冲突。
+# 用法: _hysteria_check_hop_conflicts <lo> <hi> [exclude]; 有冲突返回 1(已打印说明)
 _hysteria_check_hop_conflicts() {
-    local lo="$1" hi="$2" p
+    local lo="$1" hi="$2" exclude="${3:-}" p
     [[ "$lo" =~ ^[0-9]+$ ]] && [[ "$hi" =~ ^[0-9]+$ ]] || return 1
     local hit=""
-    # a) 一次 ss 快照(范围可上万, 逐端口探测太慢)
+    # a) 一次 ss 快照(范围可上万, 逐端口探测太慢); exclude = hysteria 自身端口。
+    #    列位: ss 数据行 $4=本机 addr:port, $5=对端(*:*, 无端口) —— 用 $5 是空扫(已修)。
     if command -v ss >/dev/null 2>&1; then
         while read -r p; do
             [ -n "$p" ] || continue
+            [ -n "$exclude" ] && [ "$p" = "$exclude" ] && continue
             [ "$p" -ge "$lo" ] && [ "$p" -le "$hi" ] && hit="$hit $p"
-        done <<< "$(ss -lun 2>/dev/null | awk '{print $5}' | grep -oE '[0-9]+$' | sort -un)"
+        done <<< "$(ss -lun 2>/dev/null | awk 'NR > 1 {print $4}' | grep -oE '[0-9]+$' | sort -un)"
     fi
     [ -n "$hit" ] && { _error "以下端口已被本机监听, 与跳跃范围冲突:$hit"; return 1; }
     # b) Xray config 端口
@@ -839,8 +1037,10 @@ _hysteria_rebuild_all_links() {
 }
 
 _hysteria_port_menu() {
-    local choice part lo hi new_listen
-    _hysteria_server_initialized || { _warn "Hysteria 服务器未初始化, 请先通过 [添加节点] 初始化"; _press_any_key; return; }
+    local choice part lo hi new_listen cur_first
+    _hysteria_gate || { _press_any_key; return; }
+    cur_first=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)" 2>/dev/null)
+    cur_first=${cur_first%%-*}   # 跳跃范围下监听的只是首端口
     while true; do
         clear
         echo; echo -e "  ${CYAN}【端口 / 端口跳跃】${NC}"
@@ -859,12 +1059,15 @@ _hysteria_port_menu() {
                 read -rp "  新监听端口 (回车取消): " part
                 [ -z "$part" ] && { _press_any_key; continue; }
                 _validate_port "$part" || { _warn "无效端口(1-65535)"; _press_any_key; continue; }
-                _check_port_occupied "$part" udp && { _warn "端口 $part 已被占用"; _press_any_key; continue; }
-                _check_port_in_config "$part" && { _warn "端口 $part 已被 Xray 节点使用"; _press_any_key; continue; }
-                new_listen=":${part}"
-                if ! _hysteria_config_txn --arg l "$new_listen" '.listen = $l'; then
+                # 新端口 == 当前自身监听端口: 未变更, 无需占用检查(自身持有不算冲突)
+                if [ "$part" != "$cur_first" ]; then
+                    _check_port_occupied "$part" udp && { _warn "端口 $part 已被占用"; _press_any_key; continue; }
+                    _check_port_in_config "$part" && { _warn "端口 $part 已被 Xray 节点使用"; _press_any_key; continue; }
+                fi
+                if ! _hysteria_config_txn --arg l ":${part}" '.listen = $l'; then
                     _error "端口修改失败"
                 else
+                    cur_first=$part
                     _hysteria_rebuild_all_links || _warn "部分分享链接重建失败, 可用 [查看节点] 核对"
                     _success "监听端口已修改为 $part"
                 fi
@@ -879,10 +1082,12 @@ _hysteria_port_menu() {
                 parsed=$(_parse_hop_ranges "$part") || { _press_any_key; continue; }
                 lo="${parsed%%:*}"; hi="${parsed##*:}"
                 [ "$lo" = "$hi" ] && { _warn "跳跃范围至少两个端口(单端口无需跳跃)"; _press_any_key; continue; }
-                _hysteria_check_hop_conflicts "$lo" "$hi" || { _press_any_key; continue; }
+                # exclude=当前自身监听首端口(评审 P2): :443 → :443-50000 是官方允许的合法变更
+                _hysteria_check_hop_conflicts "$lo" "$hi" "$cur_first" || { _press_any_key; continue; }
                 if ! _hysteria_config_txn --arg l ":${lo}-${hi}" '.listen = $l'; then
                     _error "端口跳跃设置失败"
                 else
+                    cur_first=$lo
                     _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
                     _success "端口跳跃已启用: ${lo}-${hi} (监听 ${lo}, 其余端口自动重定向)"
                     _tip "NAT VPS 请确认宿主已转发该范围 UDP 端口"
@@ -893,10 +1098,13 @@ _hysteria_port_menu() {
                 read -rp "  新单端口 (回车取消): " part
                 [ -z "$part" ] && { _press_any_key; continue; }
                 _validate_port "$part" || { _warn "无效端口"; _press_any_key; continue; }
-                _check_port_occupied "$part" udp && { _warn "端口 $part 已被占用"; _press_any_key; continue; }
+                if [ "$part" != "$cur_first" ]; then
+                    _check_port_occupied "$part" udp && { _warn "端口 $part 已被占用"; _press_any_key; continue; }
+                fi
                 if ! _hysteria_config_txn --arg l ":${part}" '.listen = $l'; then
                     _error "修改失败"
                 else
+                    cur_first=$part
                     _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
                     _success "已回到单端口: $part"
                 fi
@@ -909,22 +1117,23 @@ _hysteria_port_menu() {
 }
 
 _hysteria_tls_menu() {
-    _hysteria_server_initialized || { _warn "Hysteria 服务器未初始化, 请先通过 [添加节点] 初始化"; _press_any_key; return; }
+    _hysteria_gate || { _press_any_key; return; }
     echo; echo -e "  当前 TLS: ${CYAN}$(_hysteria_tls_desc)${NC}"
     if ! _hysteria_prompt_tls; then
         _info "已取消"
         _press_any_key
         return 0
     fi
-    if ! _hysteria_config_txn --argjson blk "$HY_TLS_JSON" \
-         '. + $blk | if $blk | has("tls") then del(.acme) else del(.tls) end'; then
+    # 统一事务(评审 P1-4): 官方配置与 manager 元数据(tls_mode/sni/pin)作为一个整体
+    # 提交/回滚, 杜绝"config=新 TLS / server_meta=旧 TLS"的漂移
+    if ! _hysteria_server_txn --argjson blk "$HY_TLS_JSON" \
+         --arg m "$HY_TLS_MODE" --arg s "$HY_TLS_SNI" --arg p "$HY_TLS_PIN" \
+         '. + $blk | if $blk | has("tls") then del(.acme) else del(.tls) end' \
+         '.tls_mode=$m | .sni=$s | .pin=$p'; then
         _error "TLS 设置失败"
         _press_any_key
         return 0
     fi
-    _hysteria_meta_set tls_mode "$HY_TLS_MODE"
-    _hysteria_meta_set sni "$HY_TLS_SNI"
-    _hysteria_meta_set pin "$HY_TLS_PIN"
     _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
     _success "TLS 已切换: $(_hysteria_tls_desc)"
     [ "$HY_TLS_MODE" = "selfsigned" ] && _tip "自签证书: 客户端需 insecure=1 + pinSHA256(已写入链接)"
@@ -935,7 +1144,7 @@ _hysteria_tls_menu() {
 
 _hysteria_obfs_menu() {
     local choice pw cur_obfs
-    _hysteria_server_initialized || { _warn "Hysteria 服务器未初始化, 请先通过 [添加节点] 初始化"; _press_any_key; return; }
+    _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【混淆 obfs (salamander)】${NC}"
     cur_obfs=$(_hysteria_config_get 'obfs')
@@ -981,7 +1190,7 @@ _hysteria_obfs_menu() {
 
 _hysteria_bandwidth_menu() {
     local choice up down cur_up cur_down
-    _hysteria_server_initialized || { _warn "Hysteria 服务器未初始化, 请先通过 [添加节点] 初始化"; _press_any_key; return; }
+    _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【带宽限制】${NC}"
     echo -e "  ${YELLOW}官方语义: 服务器带宽 = 每客户端收发限速, 仅对 Brutal 拥塞控制生效(BBR/ Reno 不受限);${NC}"
@@ -1025,7 +1234,7 @@ _hysteria_bandwidth_menu() {
 
 _hysteria_masquerade_menu() {
     local choice url content
-    _hysteria_server_initialized || { _warn "Hysteria 服务器未初始化, 请先通过 [添加节点] 初始化"; _press_any_key; return; }
+    _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【伪装站 masquerade】${NC}"
     echo -e "  ${YELLOW}整段缺省时官方对全部 HTTP 请求返回 404(官方默认); 伪装可降低被主动探测风险${NC}"
@@ -1121,8 +1330,10 @@ _hysteria_build_link() {
     printf '%s' "$link"
 }
 
-# clash.yaml(mihomo) 条目: mihomo hysteria2 的 auth 字段 = 原始认证串(userpass 用 user:pass,
-# 即协议口径, 所有客户端一致); ports = 官方多端口格式
+# clash.yaml(mihomo) 条目。字段依据 = mihomo 源码 adapter/outbound/hysteria2.go 的
+# Hysteria2Option 解码器(2026-09-13 核验): 认证字段只有 `password`(无 auth/username),
+# 值为原始协议认证串 —— userpass 服务端填 "user:pass"(按首个冒号切分);
+# `ports` 启用跳跃并忽略 port(port 保留作旧版 mihomo 的兜底)。
 _hysteria_clash_line() {
     local meta="$1" name addr user auth
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
@@ -1135,7 +1346,7 @@ _hysteria_clash_line() {
     }
     local port_part
     port_part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)") || return 1
-    local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, auth: \"$(_yaml_dq "$user"):$( _yaml_dq "$auth")\""
+    local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$user"):$( _yaml_dq "$auth")\""
     local sni; sni=$(_hysteria_meta_get sni)
     [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
     [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ] && line="${line}, skip-cert-verify: true"
@@ -1222,6 +1433,14 @@ _hysteria_bootstrap() {
     local user auth name def_name
     echo; echo -e "  ${CYAN}=== 初始化官方 Hysteria2 服务器 ===${NC}"
     _tip "官方架构: 单服务多用户, 以下为服务器级设置; 每个节点 = 一个认证用户"
+
+    # 0) 前置保护: 存在非本 Manager 管理的官方配置(auth != userpass)时绝不 bootstrap
+    #    —— bootstrap 会整体重写配置文件, 静默覆盖用户已有的合法配置是不可接受的
+    if _hysteria_config_exists && ! _hysteria_server_initialized; then
+        _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 userpass 模式"
+        _tip "为防止覆盖现有配置, 已取消初始化; 如需接管请自行备份并手工转换 auth 段, 或确认无用后删除该配置再重试"
+        return 1
+    fi
 
     # 0) 核心
     if ! _hysteria_installed; then
@@ -1471,8 +1690,7 @@ _hysteria_add_node() {
 _hysteria_view_nodes() {
     clear
     echo; echo -e "  ${CYAN}【Hysteria2 (官方) 节点】${NC}"
-    if ! _hysteria_server_initialized; then
-        _warn "服务器未初始化"
+    if ! _hysteria_gate; then
         _press_any_key
         return 0
     fi
@@ -1505,7 +1723,7 @@ _hysteria_list_users() {
 
 _hysteria_delete_node() {
     local choice users=() i=1 user name
-    _hysteria_server_initialized || { _warn "服务器未初始化"; _press_any_key; return; }
+    _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 节点】${NC}"
     for f in "$HYSTERIA_NODES_DIR"/*.json; do
@@ -1552,7 +1770,7 @@ _hysteria_delete_node() {
 
 _hysteria_change_password() {
     local choice users=() i=1 user name auth
-    _hysteria_server_initialized || { _warn "服务器未初始化"; _press_any_key; return; }
+    _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【修改节点密码】${NC}"
     for f in "$HYSTERIA_NODES_DIR"/*.json; do

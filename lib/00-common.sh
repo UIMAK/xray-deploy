@@ -361,6 +361,12 @@ _yaml_dq() {
 # ---------------------------------------------------------------------------
 # 端口占用检测(复用 singbox-lite 思路)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 端口占用检测(复用 singbox-lite 思路)
+# 2026-09-13(0.16.2 评审轮) 实测修正: ss 数据行的本机监听在 $4(Local Address:Port),
+# $5 是对端(*:*, 无端口可提取) —— 原写法在装了 ss 的系统上是空扫(永远报未占用);
+# netstat 分支的 $4 本来就正确。两分支统一按本机地址列提取。
+# ---------------------------------------------------------------------------
 _check_port_occupied() {
     local port="$1" proto="${2:-}"
     local ss_opts
@@ -370,7 +376,7 @@ _check_port_occupied() {
         *)   ss_opts="-lntu" ;;
     esac
     if command -v ss >/dev/null 2>&1; then
-        ss ${ss_opts} 2>/dev/null | awk '{print $5}' | grep -q ":${port}$" && return 0
+        ss ${ss_opts} 2>/dev/null | awk 'NR > 1 {print $4}' | grep -q ":${port}$" && return 0
     elif command -v netstat >/dev/null 2>&1; then
         netstat ${ss_opts} 2>/dev/null | awk '{print $4}' | grep -q ":${port}$" && return 0
     fi
