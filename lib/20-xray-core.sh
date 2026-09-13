@@ -900,9 +900,13 @@ _uninstall_xray() {
         _hy2_cleanup_all_hops
     fi
     # 官方 Hysteria2 前置清理(其数据目录随 DEPLOY_DIR 一并删除, 但 service 定义在系统目录,
-    # 不先停服删 unit 会留下指向已删 binary 的孤儿服务; declare -F 守卫兼容混装旧版)
+    # 不先停服删 unit 会留下指向已删 binary 的孤儿服务; declare -F 守卫兼容混装旧版)。
+    # 0.16.3: 停止必须确认进程真正退出 —— 仍存活时中止整个卸载(防孤儿进程), 由用户处理。
     if declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
-        _hysteria_cleanup_before_uninstall
+        if ! _hysteria_cleanup_before_uninstall; then
+            _error "官方 Hysteria2 进程未能停止, 已中止卸载(文件未删除), 请手动处理后重试"
+            return 1
+        fi
     fi
     # 清理 logrotate 配置
     if declare -F _logrotate_cleanup >/dev/null 2>&1; then
