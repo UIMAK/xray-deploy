@@ -41,7 +41,9 @@ export HYSTERIA_GH_API="https://api.github.com/repos/apernet/hysteria/releases/l
 # ---------------------------------------------------------------------------
 _hysteria_ensure_dirs() {
     local ok=1 d f
-    for d in "$HYSTERIA_DATA_DIR" "$HYSTERIA_NODES_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR" "$HYSTERIA_ACME_DIR"; do
+    # LOG_DIR 一并确保: openrc output_log / direct 启动重定向都写 $LOG_DIR/hysteria.log,
+    # 而模块可能被非 xd 主入口路径调用(cron/直接 source), 不能假设 _ensure_dirs 已跑过
+    for d in "$HYSTERIA_DATA_DIR" "$HYSTERIA_NODES_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR" "$HYSTERIA_ACME_DIR" "$LOG_DIR"; do
         mkdir -p "$d" || ok=0
         chmod 700 "$d" 2>/dev/null || ok=0
     done
@@ -304,12 +306,16 @@ _hysteria_is_running() {
 
 _manage_hysteria() {
     local action="$1"
+    # fd9 关闭(9>&-): 本函数可能在 _with_config_lock 的锁子 shell 内被调用(config 事务),
+    # openrc 的 supervise-daemon / direct 模式的 nohup 会继承全部打开 fd —— 守护进程
+    # 持有 fd9 = flock 永远被持有, 后续所有配置事务 15s 超时失败(2026-09-13 Alpine 实测;
+    # systemd 不继承业务 fd 故 Ubuntu 无感)。对齐 singbox-lite 的锁 fd 泄漏修复。
     case "$INIT_SYSTEM" in
         systemd)
             case "$action" in
-                start)   systemctl start "$HYSTERIA_SVC" 2>/dev/null ;;
-                stop)    systemctl stop "$HYSTERIA_SVC" 2>/dev/null ;;
-                restart) systemctl restart "$HYSTERIA_SVC" 2>/dev/null ;;
+                start)   systemctl start "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
+                stop)    systemctl stop "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
+                restart) systemctl restart "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
                 status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
@@ -318,12 +324,19 @@ _manage_hysteria() {
                 # supervise-daemon respawn 耗尽进入 crashed 态后 start/restart 会被拒;
                 # 仅在确认无真实业务进程时 zap 复位(与 _manage_xray openrc 分支同口径)
                 start)
-                    _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1
-                    rc-service "$HYSTERIA_SVC" start 2>/dev/null ;;
-                stop)    rc-service "$HYSTERIA_SVC" stop 2>/dev/null ;;
+                    _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1 9>&-
+                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- ;;
+                stop)
+                    rc-service "$HYSTERIA_SVC" stop 2>/dev/null 9>&-
+                    _hysteria_kill_stale_supervisor ;;
                 restart)
-                    _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1
-                    rc-service "$HYSTERIA_SVC" restart 2>/dev/null ;;
+                    # 不用 rc-service restart: 子进程 FATAL 后 supervisor 进入 respawn-wait,
+                    # openrc 状态机会标 stopped 而 supervisor 仍在 → restart 只跑 start 阶段,
+                    # 被 "already running" 拒绝(rc=1)。显式 stop(含孤儿清理)+start 必然全新启动。
+                    rc-service "$HYSTERIA_SVC" stop 2>/dev/null 9>&-
+                    _hysteria_kill_stale_supervisor
+                    _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1 9>&-
+                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- ;;
                 status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
@@ -337,7 +350,7 @@ _manage_hysteria() {
                     else
                         rm -f "$HYSTERIA_PID_FILE"
                         nohup "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" --disable-update-check \
-                            >>"$HYSTERIA_LOG_FILE" 2>&1 &
+                            >>"$HYSTERIA_LOG_FILE" 2>&1 9>&- &
                         echo $! > "$HYSTERIA_PID_FILE"
                         sleep 1
                         if [ "$(cat "/proc/$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)/comm" 2>/dev/null)" != "hysteria" ]; then
@@ -370,10 +383,39 @@ _manage_hysteria() {
     esac
 }
 
+# openrc 状态机与 supervise-daemon 脱同步清理(2026-09-13 Alpine 实测):
+# 子进程 FATAL 后 supervisor 进入 respawn-wait(仍存活), openrc 却把服务标记 stopped;
+# 此后 start 被 "supervise-daemon: already running" 拒绝, 服务永远起不来。
+# stop 后若 pidfile 仍指向存活的 supervise-daemo(busybox comm 截断 15 字符), 显式 kill。
+# 归属安全: pidfile 是本服务专属路径, 且必须 comm 匹配才动手。
+_hysteria_kill_stale_supervisor() {
+    local a c k
+    a=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
+    [[ "$a" =~ ^[0-9]+$ ]] || return 0
+    [ -d "/proc/$a" ] || { rm -f "$HYSTERIA_PID_FILE"; return 0; }
+    c=$(cat "/proc/$a/comm" 2>/dev/null)
+    case "$c" in
+        supervise-daemo*)
+            kill "$a" 2>/dev/null
+            for k in 1 2 3 4 5; do
+                kill -0 "$a" 2>/dev/null || break
+                sleep 1
+            done
+            kill -0 "$a" 2>/dev/null && kill -9 "$a" 2>/dev/null
+            ;;
+    esac
+    rm -f "$HYSTERIA_PID_FILE"
+    return 0
+}
+
 # 重启并确认稳定运行(坏配置=启动即 FATAL, 状态非 running → 触发上层回滚)
+# 成败判定一律以 8s 轮询为准, 服务命令 rc 仅决定是否补一次 start —— openrc+
+# supervise-daemon 下命令 rc 不可靠(实测: "already running" 被拒时 rc=1 但服务健康;
+# 反之 FATAL 崩溃时 rc=0 但服务会死), 按 rc 提前判失败会把健康服务误判为失败。
 _hysteria_restart_verified() {
-    if ! _manage_hysteria restart 2>/dev/null; then
-        _manage_hysteria start 2>/dev/null || return 1
+    _manage_hysteria restart 2>/dev/null
+    if [ "$(_manage_hysteria status 2>/dev/null)" != "running" ]; then
+        _manage_hysteria start 2>/dev/null
     fi
     local i
     for i in 1 2 3 4 5 6 7 8; do
