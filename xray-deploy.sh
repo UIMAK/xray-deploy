@@ -36,6 +36,8 @@ LIB_DIR="$SCRIPT_DIR/lib"
 . "$LIB_DIR/50-nodes.sh"
 # shellcheck source=lib/51-reality-pq.sh
 . "$LIB_DIR/51-reality-pq.sh"
+# shellcheck source=lib/55-hysteria.sh
+. "$LIB_DIR/55-hysteria.sh"
 # shellcheck source=lib/90-menu.sh
 . "$LIB_DIR/90-menu.sh"
 

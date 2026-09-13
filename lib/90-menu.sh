@@ -57,6 +57,19 @@ _print_status_bar() {
         fi
     fi
 
+    # 官方 Hysteria2(独立于 Xray Hy2; 未安装时不显示, 不占状态栏空间)
+    local hyline=""
+    if [ -x "$HYSTERIA_BIN" ]; then
+        local hver hst=""
+        hver=$(_hysteria_cached_version 2>/dev/null)
+        if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
+            hst="${GREEN}● 运行中${NC}"
+        else
+            hst="${RED}○ 已停止${NC}"
+        fi
+        hyline="  Hysteria2(官方) v${hver#v}: ${hst}"
+    fi
+
     # Geo(真相源: config.json 的 geodata.cron, 兼容旧 state)
     local geostate; geostate=$(_geo_auto_state 2>/dev/null); [ -z "$geostate" ] && geostate="off"
     local geostr
@@ -65,6 +78,7 @@ _print_status_bar() {
     echo -e "  系统: ${CYAN}${os_info}${NC}  |  init: ${CYAN}${INIT_SYSTEM}${NC}"
     echo -e "  Xray${CYAN}${xver}${NC} [${xchannel}]: ${xstatus}  |  节点: ${CYAN}${ncount}${NC}"
     echo -e "  cloudflared: ${cfstatus}  |  Geo: ${geostr}"
+    [ -n "$hyline" ] && echo -e "$hyline"
     echo
 }
 
@@ -115,11 +129,12 @@ _main_menu() {
         echo -e "  ${GREEN}[3]${NC} 删除节点"
         echo -e "  ${GREEN}[4]${NC} 修改端口"
         echo -e "  ${GREEN}[5]${NC} 更新监听"
-        echo -e "  ${GREEN}[6]${NC} Hysteria2 管理"
+        echo -e "  ${GREEN}[6]${NC} Xray Hy2 管理"
         echo -e "  ${GREEN}[7]${NC} Reality 域名管理"
+        echo -e "  ${GREEN}[8]${NC} Hysteria2 管理 (官方)"
         echo
         echo -e "  ${CYAN}【核心与服务】${NC}"
-        local _core=8
+        local _core=9
         local _ops_start=$((_core+3))
         printf "  ${GREEN}[%d]${NC} 安装/更新或切换 Xray 核心(稳定/预览)\n" "$_core"
         printf "  ${GREEN}[%d]${NC} Geo 数据自动更新\n" $((_core+1))
@@ -153,6 +168,9 @@ _main_menu() {
         fi
         if [ "$choice" = "7" ]; then
             _reality_domain_menu; continue
+        fi
+        if [ "$choice" = "8" ]; then
+            _hysteria_menu; continue
         fi
         # 动态编号: 核心与服务 / 运维
         _ops_start=$((_core+3))
@@ -561,10 +579,10 @@ _hy2_manage_menu() {
     while true; do
         clear
         echo
-        echo -e "  ${CYAN}【Hysteria2 管理】${NC}"
+        echo -e "  ${CYAN}【Xray Hy2 管理 (Xray-core 实现)】${NC}"
         # 暂无节点守卫 (M18: CLAUDE.md 规约 — 无节点时显示警告)
         if ! _has_hy2_nodes; then
-            echo -e "  ${YELLOW}暂无 Hysteria2 节点${NC}"
+            echo -e "  ${YELLOW}暂无 Xray Hy2 节点${NC}"
         fi
         echo
         echo -e "  ${GREEN}[1]${NC} 切换拥塞控制 (bbr/brutal/force-brutal)"
@@ -590,7 +608,7 @@ _hy2_manage_menu() {
 # ---------------------------------------------------------------------------
 _hy2_toggle_brutal() {
     clear
-    _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【切换 brutal / bbr】${NC}"
     local tags=() i=1
     for f in "$NODES_DIR"/*.json; do
@@ -603,7 +621,7 @@ _hy2_toggle_brutal() {
         printf "  ${GREEN}[%d]${NC} %-20s 当前: %s\n" "$i" "$name" "$cc"
         i=$((i+1))
     done
-    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
@@ -704,7 +722,7 @@ _hy2_toggle_brutal() {
 _hy2_adjust_bandwidth() {
     local choice
     clear
-    _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【调整 brutal 带宽】${NC}"
     local tags=() i=1
     for f in "$NODES_DIR"/*.json; do
@@ -718,7 +736,7 @@ _hy2_adjust_bandwidth() {
         printf "  ${GREEN}[%d]${NC} %-20s cc=%-6s up=%-12s down=%s\n" "$i" "$name" "$cc" "${up:--}" "${down:--}"
         i=$((i+1))
     done
-    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
