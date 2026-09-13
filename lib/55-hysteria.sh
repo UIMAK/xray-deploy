@@ -36,7 +36,9 @@ export HYSTERIA_ACME_DIR="$DEPLOY_DIR/hysteria/acme"
 export HYSTERIA_SVC="xray-deploy-hysteria"
 export HYSTERIA_PID_FILE="/run/xray-deploy-hysteria.pid"
 export HYSTERIA_DL_BASE="https://download.hysteria.network/app"
-export HYSTERIA_GH_API="https://api.github.com/repos/apernet/hysteria/releases/latest"
+# P2-2(0.16.5 评审): 官方仓库已由 apernet/hysteria 更名为 HyNetworks/hysteria
+# (2026-09-13 实证: API full_name=HyNetworks/hysteria; 旧路径 301 重定向仍可用但不再依赖)
+export HYSTERIA_GH_API="https://api.github.com/repos/HyNetworks/hysteria/releases/latest"
 
 # ---------------------------------------------------------------------------
 # 数据目录(启动时由 _hysteria_menu 调用, 幂等; 对齐 _ensure_dirs 的权限口径)
@@ -230,7 +232,9 @@ _hysteria_download_install() {
         cp -p "$HYSTERIA_BIN" "$backup" || { rm -f "$tmp"; _error "旧核心备份失败, 已中止"; return 1; }
         if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
             was_running=1
-            _manage_hysteria stop || { _error "停止服务失败, 已中止升级"; rm -f "$backup"; return 1; }
+            # P2-1(0.16.5 评审): 升级替换 binary 前统一用 stop_and_verify —— 确认旧进程真正退出
+            # (exe 兜底强杀), 避免"旧进程仍持有旧 inode + 新 binary 已就位"的中间态
+            _hysteria_stop_and_verify || { _error "停止服务失败(进程未退出), 已中止升级"; rm -f "$backup"; return 1; }
         fi
         if ! mv -f "$tmp" "$HYSTERIA_BIN"; then
             rm -f "$tmp"
@@ -681,7 +685,8 @@ _hysteria_config_txn_locked() {
         if ! _hysteria_restart_verified; then
             _error "hysteria 启动失败, 回滚配置"
             if ! _hysteria_restore_config; then
-                _error "回滚失败(lastbak 不存在或恢复出错), 未尝试重启"
+                _error "配置回滚失败, 已进入降级状态(config 可能为新内容)"
+                _tip "请人工核对: $HYSTERIA_CONFIG(旧内容见 ${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak)"
                 return 1
             fi
             if _hysteria_restart_verified; then
@@ -696,7 +701,8 @@ _hysteria_config_txn_locked() {
         if ! _hysteria_validate_transient; then
             _error "hysteria 配置验证失败(瞬态启动), 回滚配置"
             if ! _hysteria_restore_config; then
-                _error "回滚失败, 未尝试验证"
+                _error "配置回滚失败, 已进入降级状态(config 可能为新内容)"
+                _tip "请人工核对: $HYSTERIA_CONFIG(旧内容见 ${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak)"
                 return 1
             fi
             _hysteria_validate_transient >/dev/null 2>&1 || _warn "回滚后配置瞬态验证失败, 下次启动可能失败, 请检查"
@@ -784,11 +790,17 @@ _hysteria_server_txn_locked() {
     if [ "$was_running" = "running" ]; then
         if ! _hysteria_restart_verified; then
             _error "hysteria 启动失败, 回滚配置与元数据"
-            if ! _hysteria_restore_config; then
-                _error "配置回滚失败(lastbak 不存在或恢复出错), 未尝试重启"
+            # P1-1(0.16.5 评审): 无论 config 回滚成败都必须继续回滚 meta 并给出降级状态 ——
+            # 原写法在 restore 失败时提前 return, 留下"config 新/meta 新"或"config 未知/meta 新"
+            # 的不一致状态且无人工指引, 违反"失败即恢复原状或明确降级"。
+            local cfg_ok=0
+            _hysteria_restore_config && cfg_ok=1
+            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
+            if [ "$cfg_ok" -ne 1 ]; then
+                _error "配置回滚失败, 已进入降级状态(config 可能为新内容); meta 已尽力还原"
+                _tip "请人工核对: $HYSTERIA_CONFIG 与 $HYSTERIA_SERVER_META"
                 return 1
             fi
-            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
             if _hysteria_restart_verified; then
                 _warn "已回滚到旧配置并重启"
             else
@@ -799,16 +811,20 @@ _hysteria_server_txn_locked() {
     else
         if ! _hysteria_validate_transient; then
             _error "hysteria 配置验证失败(瞬态启动), 回滚配置与元数据"
-            if ! _hysteria_restore_config; then
-                _error "配置回滚失败, 未尝试验证"
+            local cfg_ok=0
+            _hysteria_restore_config && cfg_ok=1
+            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
+            if [ "$cfg_ok" -ne 1 ]; then
+                _error "配置回滚失败, 已进入降级状态(config 可能为新内容); meta 已尽力还原"
+                _tip "请人工核对: $HYSTERIA_CONFIG 与 $HYSTERIA_SERVER_META"
                 return 1
             fi
-            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
             _hysteria_validate_transient >/dev/null 2>&1 || _warn "回滚后配置瞬态验证失败, 下次启动可能失败, 请检查"
             return 1
         fi
     fi
-    [ -n "$meta_bak" ] && rm -f "$meta_bak" 2>/dev/null
+    # P2-3(0.16.5 评审): 备份清理失败给出告警(严格事务系统不应静默吞掉清理失败)
+    [ -n "$meta_bak" ] && { rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"; }
     return 0
 }
 
@@ -825,7 +841,7 @@ _hysteria_server_txn_rollback() {
     elif [ "$meta_created" -eq 1 ]; then
         rm -f "$HYSTERIA_SERVER_META"
     fi
-    [ -n "$meta_bak" ] && rm -f "$meta_bak" 2>/dev/null
+    [ -n "$meta_bak" ] && { rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"; }
     return 0
 }
 
@@ -949,12 +965,16 @@ _hysteria_node_txn_locked() {
     if [ "$was_running" = "running" ]; then
         if ! _hysteria_restart_verified; then
             _error "hysteria 启动失败, 回滚配置与节点状态"
-            if ! _hysteria_restore_config; then
-                _error "配置回滚失败, 未尝试重启"
+            # P1-1(0.16.5 评审): config 回滚失败也必须继续回滚节点元数据并报降级状态
+            local cfg_ok=0
+            _hysteria_restore_config && cfg_ok=1
+            _hysteria_node_txn_meta_rollback
+            rm -f "$meta_bak" 2>/dev/null
+            if [ "$cfg_ok" -ne 1 ]; then
+                _error "配置回滚失败, 已进入降级状态(config 可能为新内容); 节点元数据已尽力还原"
+                _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file"
                 return 1
             fi
-            _hysteria_node_txn_meta_rollback
-            rm -f "$meta_bak"
             if _hysteria_restart_verified; then
                 _warn "已回滚并重启"
             else
@@ -965,10 +985,16 @@ _hysteria_node_txn_locked() {
     else
         if ! _hysteria_validate_transient; then
             _error "hysteria 配置验证失败(瞬态启动), 回滚配置与节点状态"
-            _hysteria_restore_config
+            local cfg_ok=0
+            _hysteria_restore_config && cfg_ok=1
             _hysteria_node_txn_meta_rollback
+            rm -f "$meta_bak" 2>/dev/null
+            if [ "$cfg_ok" -ne 1 ]; then
+                _error "配置回滚失败, 已进入降级状态(config 可能为新内容); 节点元数据已尽力还原"
+                _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file"
+                return 1
+            fi
             _hysteria_validate_transient >/dev/null 2>&1 || _warn "回滚后配置瞬态验证失败, 请检查"
-            rm -f "$meta_bak"
             return 1
         fi
     fi
@@ -979,6 +1005,7 @@ _hysteria_node_txn_locked() {
     else
         _hysteria_sync_clash "$meta_file" || _warn "clash 条目同步失败, 节点本体不受影响, 可手工编辑 ${CLASH_YAML}"
     fi
+    [ -n "$meta_bak" ] && { rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"; }
     return 0
 }
 
@@ -1826,6 +1853,7 @@ _hysteria_bootstrap() {
     # 8) 服务(创建结果必须消费: P2-3 —— 创建失败 ≠ 启动失败, 报错要指向真实步骤)
     if ! _hysteria_create_service; then
         _error "service 创建失败(daemon-reload/权限?), 回滚初始化"
+        _hysteria_cleanup_service_units
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
         rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
         return 1
@@ -1833,16 +1861,8 @@ _hysteria_bootstrap() {
     if [ "$INIT_SYSTEM" != "direct" ]; then
         if ! _hysteria_restart_verified; then
             _error "Hysteria 服务启动失败, 回滚初始化(配置/服务)..."
-            _manage_hysteria stop 2>/dev/null
-            case "$INIT_SYSTEM" in
-                systemd)
-                    systemctl disable "$HYSTERIA_SVC" 2>/dev/null
-                    rm -f "/etc/systemd/system/${HYSTERIA_SVC}.service"
-                    systemctl daemon-reload 2>/dev/null ;;
-                openrc)
-                    rc-update del "$HYSTERIA_SVC" default 2>/dev/null
-                    rm -f "/etc/init.d/${HYSTERIA_SVC}" ;;
-            esac
+            _hysteria_stop_and_verify >/dev/null 2>&1 || _warn "停止服务时仍有残留进程, 请人工核对"
+            _hysteria_cleanup_service_units
             rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
             rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
             _warn "初始化已回滚"
@@ -2126,6 +2146,40 @@ _hysteria_stop_and_verify() {
     return 1
 }
 
+# service 定义清理 + 最终状态验证(P1-2 0.16.5 评审): 原回滚路径的 disable/rm/daemon-reload
+# 全是 best-effort, 失败会让"unit 残留 + config 已删"的半残状态静默通过。这里逐步执行并
+# 复核 unit 确实消失(systemd 用 LoadState=not-found, openrc 用文件不存在), 残留时大声告警
+# 并给出人工命令 —— 属"明确降级"而非静默成功。返回 0=已清理干净; 1=仍有残留(已告警)。
+_hysteria_cleanup_service_units() {
+    local ok=1
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl disable "$HYSTERIA_SVC" 2>/dev/null
+            rm -f "/etc/systemd/system/${HYSTERIA_SVC}.service"
+            systemctl daemon-reload 2>/dev/null
+            systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
+            [ "$(systemctl show -p LoadState --value "$HYSTERIA_SVC" 2>/dev/null)" = "not-found" ] && ok=0
+            [ "$ok" -eq 0 ] || {
+                _error "systemd unit ${HYSTERIA_SVC} 清理后仍可被 systemd 识别(残留)"
+                _tip "请人工核对: systemctl status ${HYSTERIA_SVC}; ls -l /etc/systemd/system/${HYSTERIA_SVC}.service"
+            }
+            ;;
+        openrc)
+            rc-update del "$HYSTERIA_SVC" default 2>/dev/null
+            rm -f "/etc/init.d/${HYSTERIA_SVC}"
+            [ ! -e "/etc/init.d/${HYSTERIA_SVC}" ] && ok=0
+            [ "$ok" -eq 0 ] || {
+                _error "openrc init 脚本 ${HYSTERIA_SVC} 未能删除(残留)"
+                _tip "请人工核对: ls -l /etc/init.d/${HYSTERIA_SVC}"
+            }
+            ;;
+        *)
+            ok=0 ;;
+    esac
+    rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+    return "$ok"
+}
+
 # 独立卸载(菜单 [13]): 停服(确认进程退出) → 删 service → 删派生缓存条目 → 删 binary/配置/数据/证书/日志/state
 _hysteria_uninstall() {
     local ans f name
@@ -2137,18 +2191,9 @@ _hysteria_uninstall() {
         *) _info "已取消"; _press_any_key; return 0 ;;
     esac
     _hysteria_stop_and_verify || { _error "hysteria 进程未退出, 已中止卸载以避免孤儿进程(文件未删除), 请手动停止后重试"; _press_any_key; return 1; }
+    _hysteria_cleanup_service_units || _warn "service 定义未完全清理干净, 请按上方提示人工核对"
     case "$INIT_SYSTEM" in
-        systemd)
-            systemctl disable "$HYSTERIA_SVC" 2>/dev/null
-            rm -f "/etc/systemd/system/${HYSTERIA_SVC}.service"
-            systemctl daemon-reload 2>/dev/null
-            systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
-            ;;
-        openrc)
-            rc-update del "$HYSTERIA_SVC" default 2>/dev/null
-            rm -f "/etc/init.d/${HYSTERIA_SVC}"
-            ;;
-    esac
+        systemd) ;; openrc) ;; esac
     # 官方端口跳跃规则由 binary 启建/停清; 服务被 SIGKILL 过的极端情况可能残留, 提示人工核查
     if [ -f "$HYSTERIA_CONFIG" ]; then
         local part
@@ -2178,19 +2223,7 @@ _hysteria_cleanup_before_uninstall() {
     # BLOCKER3: 停止必须确认进程真正退出(exe 兜底强杀), 否则 _uninstall_xray 的
     # rm -rf $DEPLOY_DIR 会留下"文件已删/进程仍在"的孤儿进程; 返回 1 时调用方中止卸载
     _hysteria_stop_and_verify || return 1
-    case "$INIT_SYSTEM" in
-        systemd)
-            systemctl disable "$HYSTERIA_SVC" 2>/dev/null
-            rm -f "/etc/systemd/system/${HYSTERIA_SVC}.service"
-            systemctl daemon-reload 2>/dev/null
-            systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
-            ;;
-        openrc)
-            rc-update del "$HYSTERIA_SVC" default 2>/dev/null
-            rm -f "/etc/init.d/${HYSTERIA_SVC}"
-            ;;
-    esac
-    rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+    _hysteria_cleanup_service_units || _warn "service 定义未完全清理干净, 请按上方提示人工核对"
     rm -f "$HYSTERIA_PID_FILE" 2>/dev/null
     return 0
 }
