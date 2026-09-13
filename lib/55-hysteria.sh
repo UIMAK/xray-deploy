@@ -112,7 +112,9 @@ _hysteria_expected_sha256() {
 _hysteria_latest_version() {
     local asset final ver
     asset=$(_hysteria_arch_asset) || return 1
-    final=$(curl -sIL -o /dev/null --max-time 15 -w '%{url_effective}' \
+    # P3-1(0.16.6 评审): 用 GET(-o /dev/null, 只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层
+    # 对 HEAD 返回 405 而 GET 正常, 强依赖 HEAD 是无谓的脆弱点
+    final=$(curl -fsSL -o /dev/null --max-time 15 -w '%{url_effective}' \
             "${HYSTERIA_DL_BASE}/latest/hysteria-linux-${asset}" 2>/dev/null) || final=""
     ver=$(_hysteria_canon_version "$(printf '%s' "$final" | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -1)")
     if [ -z "$ver" ] && command -v jq >/dev/null 2>&1; then
@@ -160,12 +162,20 @@ _hysteria_cpu_has_avx() {
     grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | grep -qw avx
 }
 
-# 结合用户变体偏好(state/hysteria_variant)给出最终资产名
+# 结合用户变体偏好(state/hysteria_variant)给出最终资产名。
+# P2-3(0.16.6 评审): 业务层必须**再次**校验 CPU 能力 —— UI 侧检查不足以信任(状态文件可能
+# 从别的机器迁移过来, 或 CPU 特性被容器屏蔽), 否则会下载 amd64-avx 在无 AVX 的 CPU 上 SIGILL。
+# 最终判据: variant=avx **且** 本机 /proc/cpuinfo 确有 avx, 否则回落普通 amd64。
 _hysteria_pick_asset() {
     local base
     base=$(_hysteria_arch_asset) || return 1
     if [ "$base" = "amd64" ] && [ "$(_state_get hysteria_variant 2>/dev/null)" = "avx" ]; then
-        echo "amd64-avx"
+        if _hysteria_cpu_has_avx; then
+            echo "amd64-avx"
+        else
+            _warn "状态记录为 AVX 变体, 但本机 CPU 无 avx 支持, 已回落到普通 amd64(防 SIGILL)"
+            echo "amd64"
+        fi
     else
         echo "$base"
     fi
@@ -179,7 +189,7 @@ _hysteria_pick_asset() {
 # 用法: _hysteria_download_install <version|latest>
 # ---------------------------------------------------------------------------
 _hysteria_download_install() {
-    local want="$1" asset url tmp ver was_running=0 backup=""
+    local want="$1" asset url tmp ver was_running=0 backup="" old_ver=""
     [ -n "$want" ] || { _error "未指定目标版本"; return 1; }
     asset=$(_hysteria_pick_asset) || { _error "不支持的 CPU 架构: $(uname -m)"; return 1; }
     if [ "$want" = "latest" ]; then
@@ -230,6 +240,8 @@ _hysteria_download_install() {
     if _hysteria_installed; then
         backup="$BIN_DIR/.hysteria.rollback.$$"
         cp -p "$HYSTERIA_BIN" "$backup" || { rm -f "$tmp"; _error "旧核心备份失败, 已中止"; return 1; }
+        # P3-2(0.16.6 评审): 记录旧版本, 回滚后据此校验"确实恢复到了旧版本"而不只是"服务在跑"
+        old_ver=$(_hysteria_current_version)
         if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
             was_running=1
             # P2-1(0.16.5 评审): 升级替换 binary 前统一用 stop_and_verify —— 确认旧进程真正退出
@@ -258,14 +270,22 @@ _hysteria_download_install() {
         else
             _error "升级后启动失败, 回滚旧核心..."
             if [ -n "$backup" ] && mv -f "$backup" "$HYSTERIA_BIN" 2>/dev/null; then
+                # P3-2: 恢复后既验证服务运行, 也验证版本确实回到旧版(防备份错/替换错)
+                local now_ver=""
                 if _hysteria_restart_verified; then
-                    _warn "已回滚旧核心并恢复运行"
+                    now_ver=$(_hysteria_current_version)
+                    if [ -n "$old_ver" ] && [ "$now_ver" != "$old_ver" ]; then
+                        _error "已恢复运行但版本不符(期望 ${old_ver}, 实际 ${now_ver:-未知}), 请人工核对 $HYSTERIA_BIN"
+                    else
+                        _warn "已回滚旧核心并恢复运行(${now_ver:-未知})"
+                    fi
                 else
                     _error "回滚后仍启动失败, 请手动查看日志"
                 fi
             else
                 _error "回滚失败(备份不可用?), 请手动恢复 ${backup}"
             fi
+            _state_set hysteria_version "$old_ver" 2>/dev/null || true
             [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
             return 1
         fi
@@ -795,9 +815,10 @@ _hysteria_server_txn_locked() {
             # 的不一致状态且无人工指引, 违反"失败即恢复原状或明确降级"。
             local cfg_ok=0
             _hysteria_restore_config && cfg_ok=1
-            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
-            if [ "$cfg_ok" -ne 1 ]; then
-                _error "配置回滚失败, 已进入降级状态(config 可能为新内容); meta 已尽力还原"
+            local meta_ok=0
+            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak" && meta_ok=1
+            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ]; then
+                _error "回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败)), 已进入降级状态"
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $HYSTERIA_SERVER_META"
                 return 1
             fi
@@ -813,9 +834,10 @@ _hysteria_server_txn_locked() {
             _error "hysteria 配置验证失败(瞬态启动), 回滚配置与元数据"
             local cfg_ok=0
             _hysteria_restore_config && cfg_ok=1
-            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
-            if [ "$cfg_ok" -ne 1 ]; then
-                _error "配置回滚失败, 已进入降级状态(config 可能为新内容); meta 已尽力还原"
+            local meta_ok=0
+            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak" && meta_ok=1
+            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ]; then
+                _error "回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败)), 已进入降级状态"
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $HYSTERIA_SERVER_META"
                 return 1
             fi
@@ -829,20 +851,24 @@ _hysteria_server_txn_locked() {
 }
 
 # server_txn 的 meta 侧回滚(meta_had=1 还原备份; meta_created=1 删除新建; 失败显式报告)
+# server_meta 侧回滚。**返回真实状态**(P2-1 0.16.6 评审): 0=已还原到原状, 1=未能还原。
+# 原实现无条件 return 0, 调用方无从区分"回滚完成"与"回滚失败但已告警"; 严格事务 API 必须
+# 让调用者能据此判定是否进入 degraded state。
 _hysteria_server_txn_rollback() {
-    local meta_had="$1" meta_created="$2" meta_bak="$3" mc
+    local meta_had="$1" meta_created="$2" meta_bak="$3" mc rc=0
     if [ "$meta_had" -eq 1 ] && [ -s "$meta_bak" ]; then
         mc=$(cat "$meta_bak" 2>/dev/null)
         if [ -n "$mc" ] && _atomic_write_json "$HYSTERIA_SERVER_META" "$mc"; then
-            :
+            rc=0
         else
             _warn "server_meta 回滚失败, 请人工核对 $HYSTERIA_SERVER_META"
+            rc=1
         fi
     elif [ "$meta_created" -eq 1 ]; then
-        rm -f "$HYSTERIA_SERVER_META"
+        if rm -f "$HYSTERIA_SERVER_META"; then rc=0; else _warn "server_meta 删除失败, 请人工核对"; rc=1; fi
     fi
     [ -n "$meta_bak" ] && { rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"; }
-    return 0
+    return "$rc"
 }
 
 _hysteria_server_txn() {
@@ -925,7 +951,10 @@ _hysteria_node_txn_locked() {
         return 1
     fi
     # 节点侧回滚 helper(meta 还原/删除 + clash 派生同步)
+    # 节点侧回滚 helper(meta 还原/删除 + clash 派生同步)。返回真实状态(P2-1 0.16.6 评审):
+    # 0=已还原; 1=未能还原(调用方据此判 degraded, 不再假定"回滚完成")
     _hysteria_node_txn_meta_rollback() {
+        local rc=0
         if [ "$meta_had" -eq 1 ] && [ -s "$meta_bak" ]; then
             local mc
             mc=$(cat "$meta_bak" 2>/dev/null)
@@ -933,13 +962,19 @@ _hysteria_node_txn_locked() {
                 _hysteria_sync_clash "$meta_file" 2>/dev/null || true
             else
                 _warn "节点元数据回滚失败, 请人工核对 $meta_file"
+                rc=1
             fi
         else
-            rm -f "$meta_file"
-            if [ -n "$node_name" ]; then
-                _hysteria_remove_clash_by_name "$node_name"
+            if rm -f "$meta_file"; then
+                if [ -n "$node_name" ]; then
+                    _hysteria_remove_clash_by_name "$node_name"
+                fi
+            else
+                _warn "节点元数据删除失败, 请人工核对 $meta_file"
+                rc=1
             fi
         fi
+        return "$rc"
     }
     # --- 阶段 2: 节点元数据变更 ---
     if [ "$meta_op" = "create" ]; then
@@ -968,10 +1003,11 @@ _hysteria_node_txn_locked() {
             # P1-1(0.16.5 评审): config 回滚失败也必须继续回滚节点元数据并报降级状态
             local cfg_ok=0
             _hysteria_restore_config && cfg_ok=1
-            _hysteria_node_txn_meta_rollback
+            local meta_ok=0
+            _hysteria_node_txn_meta_rollback && meta_ok=1
             rm -f "$meta_bak" 2>/dev/null
-            if [ "$cfg_ok" -ne 1 ]; then
-                _error "配置回滚失败, 已进入降级状态(config 可能为新内容); 节点元数据已尽力还原"
+            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ]; then
+                _error "回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败)), 已进入降级状态"
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file"
                 return 1
             fi
@@ -987,10 +1023,11 @@ _hysteria_node_txn_locked() {
             _error "hysteria 配置验证失败(瞬态启动), 回滚配置与节点状态"
             local cfg_ok=0
             _hysteria_restore_config && cfg_ok=1
-            _hysteria_node_txn_meta_rollback
+            local meta_ok=0
+            _hysteria_node_txn_meta_rollback && meta_ok=1
             rm -f "$meta_bak" 2>/dev/null
-            if [ "$cfg_ok" -ne 1 ]; then
-                _error "配置回滚失败, 已进入降级状态(config 可能为新内容); 节点元数据已尽力还原"
+            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ]; then
+                _error "回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败)), 已进入降级状态"
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file"
                 return 1
             fi
@@ -1853,7 +1890,13 @@ _hysteria_bootstrap() {
     # 8) 服务(创建结果必须消费: P2-3 —— 创建失败 ≠ 启动失败, 报错要指向真实步骤)
     if ! _hysteria_create_service; then
         _error "service 创建失败(daemon-reload/权限?), 回滚初始化"
-        _hysteria_cleanup_service_units
+        # P2-2(0.16.6 评审): service 定义未能清理干净时**保留**配置/元数据供人工恢复,
+        # 而不是删掉文件留下"unit 残留 + config 缺失"的不可恢复状态
+        if ! _hysteria_cleanup_service_units; then
+            _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
+            _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODES_DIR/${user}.json"
+            return 1
+        fi
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
         rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
         return 1
@@ -1862,7 +1905,11 @@ _hysteria_bootstrap() {
         if ! _hysteria_restart_verified; then
             _error "Hysteria 服务启动失败, 回滚初始化(配置/服务)..."
             _hysteria_stop_and_verify >/dev/null 2>&1 || _warn "停止服务时仍有残留进程, 请人工核对"
-            _hysteria_cleanup_service_units
+            if ! _hysteria_cleanup_service_units; then
+                _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
+                _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODES_DIR/${user}.json"
+                return 1
+            fi
             rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
             rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
             _warn "初始化已回滚"
