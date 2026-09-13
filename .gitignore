@@ -16,6 +16,9 @@ Thumbs.db
 .trellis/
 .agents/
 .dsh/
+.mimosa/
+.scratch/
+.zcode/
 AGENTS.md
 CLAUDE.md
 
