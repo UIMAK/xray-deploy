@@ -224,18 +224,29 @@ _http_download() {
 
 # ---------------------------------------------------------------------------
 # URL 编解码(节点链接生成用)
+# 实现 NOTE(2026-09-13, Alpine musl 实测): 旧版"按字符迭代 + printf '%%02X' 'c"依赖
+# locale 的字符/字节语义 —— glibc 下 LC_ALL=C 按字节迭代结果正确, 但 musl 的 C locale
+# 本身是 UTF-8, printf "'c" 对非 ASCII 字节会返回 0xDF00+byte 一类的错误码值, CJK
+# 名称被编码成 %DFE8 这类垃圾。现改为 od 拆字节后逐字节判定, 输出与平台/locale 无关:
+# 允许集(字母/数字/.~_-)保留字面量, 其余字节 %XX 大写十六进制(与旧行为逐字节一致)。
 # ---------------------------------------------------------------------------
 _url_encode() {
-    local LC_ALL=C
-    local s="$1" out="" i c o
-    for ((i=0; i<${#s}; i++)); do
-        c="${s:$i:1}"
-        case "$c" in
-            [a-zA-Z0-9.~_-]) out+="$c" ;;
-            *) printf -v o '%%%02X' "'$c"; out+="$o" ;;
-        esac
+    local s="$1" hex out="" b oct c o
+    hex=$(printf '%s' "$s" | od -An -v -tx1 | tr -d ' \n')
+    while [ -n "$hex" ]; do
+        b=$((16#${hex:0:2})); hex="${hex:2}"
+        if [ $(( (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 46 || b == 126 || b == 95 || b == 45 )) -eq 1 ]; then
+            # 字面字符渲染: \xHH 转义与 %02x 指令相邻会让 printf 把 % 当 hex digit 报错,
+            # 用 %b + 八进制两步构造(\141 -> a), 无子 shell
+            printf -v oct '%03o' "$b"
+            printf -v c '%b' "\\${oct}"
+            out+="$c"
+        else
+            printf -v o '%%%02X' "$b"
+            out+="$o"
+        fi
     done
-    echo "$out"
+    printf '%s' "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -725,7 +736,11 @@ _with_config_lock() {
     fi
     (
         mkdir -p "$DEPLOY_DIR" 2>/dev/null
-        if ! exec 9>"$DEPLOY_DIR/.config.lock" 2>/dev/null; then
+        # 注意: exec 仅带重定向时重定向会**持久化**到整个子 shell —— 原写法
+        # `exec 9>... 2>/dev/null` 把子 shell 的 stderr 永久吞掉, 事务体内的全部
+        # _error/超时提示静默丢失(2026-09-13 Alpine 实测)。去掉 2>/dev/null:
+        # open 失败时 bash 自身报错 + 下面的 _error 都可见, 语义更正确。
+        if ! exec 9>"$DEPLOY_DIR/.config.lock"; then
             _error "无法创建配置锁文件 $DEPLOY_DIR/.config.lock(目录不可写?), 放弃本次修改"
             exit 1
         fi

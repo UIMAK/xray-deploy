@@ -769,12 +769,16 @@ _xray_is_running() {
 # ---------------------------------------------------------------------------
 _manage_xray() {
     local action="$1"
+    # fd9 关闭(9>&-, 2026-09-13 Alpine 实测): 本函数会在 _with_config_lock 的锁子 shell
+    # 内被调用(config 事务), openrc supervise-daemon / direct 模式 nohup 会继承打开的 fd ——
+    # 守护进程持有 fd9 = flock 永远被持有, 之后所有 _mutate_config 15s 超时静默失败。
+    # systemd 不继承业务 fd(Ubuntu 无感), openrc/direct 必须关闭; 对齐 singbox-lite 同类修复。
     case "$INIT_SYSTEM" in
         systemd)
             case "$action" in
-                start)   systemctl start xray 2>/dev/null ;;
-                stop)    systemctl stop xray 2>/dev/null ;;
-                restart) systemctl restart xray 2>/dev/null ;;
+                start)   systemctl start xray 2>/dev/null 9>&- ;;
+                stop)    systemctl stop xray 2>/dev/null 9>&- ;;
+                restart) systemctl restart xray 2>/dev/null 9>&- ;;
                 # R40: 与 openrc/direct 一致地走 _xray_is_running(绑定到 unit MainPID 的
                 # 真实主进程), 不再用裸 is-active —— 后者在主进程已死、systemd 尚未把 unit
                 # 迁出 active 的窗口内会报 running(详见 _xray_is_running 注释)。
@@ -787,12 +791,12 @@ _manage_xray() {
                 # 会被拒; 仅在"确无真实 xray 业务进程"时 zap 复位状态机(健康运行时绝不 zap,
                 # 否则 OpenRC 误判 stopped 会再起一个实例造成端口冲突)。
                 start)
-                    _xray_is_running || rc-service xray zap >/dev/null 2>&1
-                    rc-service xray start 2>/dev/null ;;
-                stop)    rc-service xray stop 2>/dev/null ;;
+                    _xray_is_running || rc-service xray zap >/dev/null 2>&1 9>&-
+                    rc-service xray start 2>/dev/null 9>&- ;;
+                stop)    rc-service xray stop 2>/dev/null 9>&- ;;
                 restart)
-                    _xray_is_running || rc-service xray zap >/dev/null 2>&1
-                    rc-service xray restart 2>/dev/null ;;
+                    _xray_is_running || rc-service xray zap >/dev/null 2>&1 9>&-
+                    rc-service xray restart 2>/dev/null 9>&- ;;
                 status)
                     # 只认真实 xray 业务进程, 不认 supervise-daemon 父进程(否则崩溃循环被误报 running)
                     if _xray_is_running; then echo "running"; else echo "stopped"; fi
@@ -810,7 +814,7 @@ _manage_xray() {
                         echo "running"
                     else
                         rm -f /run/xray.pid
-                        XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG_FILE" >/dev/null 2>&1 &
+                        XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG_FILE" >/dev/null 2>&1 9>&- &
                         echo $! > /run/xray.pid
                         sleep 1
                         if [ "$(cat /proc/$(cat /run/xray.pid 2>/dev/null)/comm 2>/dev/null)" != "xray" ]; then
@@ -853,11 +857,14 @@ _manage_xray() {
 # 坏配置/被 OOM 进不了持续 running 态 → 返回 1 触发上层回滚。
 # ---------------------------------------------------------------------------
 _restart_xray_verified() {
-    # 服务操作本身必须成功: restart 失败再退而尝试 start; 两者都返回失败则立即判失败,
-    # 避免"操作没生效、但恰好旧进程还活着 → 后续 8s 全 running → 假成功"。
-    # (restart 偶发非 0 但服务其实已起来时, 后续 start 对 active 单元是幂等成功, 不影响。)
-    if ! _manage_xray restart 2>/dev/null; then
-        _manage_xray start 2>/dev/null || return 1
+    # 成败判定以 8s 轮询为准, 服务命令 rc 仅决定是否补一次 start(2026-09-13 Alpine 实测):
+    # openrc+supervise-daemon 下 restart/start 的 rc 不可靠 —— 子进程 FATAL 进入
+    # respawn-wait 后 openrc 标 stopped 而 supervisor 存活, 随后 start 被
+    # "already running" 拒绝(rc=1)但服务实际健康; 反之 FATAL 时 rc=0 但服务会死。
+    # 按原实现 rc=1 即提前判失败, 会把健康服务误判为失败并触发不必要的回滚。
+    _manage_xray restart 2>/dev/null
+    if [ "$(_manage_xray status 2>/dev/null)" != "running" ]; then
+        _manage_xray start 2>/dev/null
     fi
     local i
     for i in 1 2 3 4 5 6 7 8; do
