@@ -12,8 +12,10 @@
 #   - `hysteria cert` 官方自签工具, 打印 pinSHA256(小写十六进制)
 #   - 端口跳跃 = listen 写 ":<min>-<max>": binary 监听首端口并自动 nft/iptables 重定向
 #     其余端口, 停止时自清 —— 本模块绝不自己写防火墙规则(与 Xray Hy2 的 iptables DNAT 不同)
-#   - 官方下载无校验和文件(.sha256sum 404, get.hy2.sh 也不校验) → 用"可执行自检+版本匹配"兜底
-#   - 架构映射以官方 get.hy2.sh 为基准, armv5*/riscv64 取官方资产表(脚本漏列)
+#   - 完整性校验 = 官方 hashes.txt SHA256(fail-closed) + 可执行自检 + 版本匹配三层
+#     (0.16.1 曾误判"官方无校验和", 0.16.2 实证修正: hashes.txt 与 binary 同目录发布)
+#   - 架构映射以官方 get.hy2.sh 为基准; armv5*/riscv64 取官方资产表(脚本漏列),
+#     armv6/mips(BE)/mips64 因 ABI 不兼容明确拒绝(0.16.4 评审收紧)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -136,7 +138,10 @@ _hysteria_arch_asset() {
         x86_64|amd64)              echo "amd64" ;;
         i386|i486|i586|i686)       echo "386" ;;
         aarch64|arm64|armv8*)      echo "arm64" ;;
-        armv7|armv7l|armv6|armv6l) echo "arm" ;;
+        armv7|armv7l)              echo "arm" ;;
+        # armv6 明确拒绝(0.16.4 评审): 官方 linux/arm 资产是 GOARM=7 构建, 在 ARMv6 CPU 上
+        # 会因缺少 v7 指令 SIGILL; 官方 release 无独立 armv6 平台, 不猜映射
+        armv6|armv6l)              return 1 ;;
         armv5*)                    echo "armv5" ;;
         mipsle)                    echo "mipsle" ;;
         mips|mips64|mips64le)      return 1 ;;
@@ -166,8 +171,8 @@ _hysteria_pick_asset() {
 
 # ---------------------------------------------------------------------------
 # binary 安装/升级事务:
-#   解析资产 → 下载临时文件(同目录, 供原子 mv) → 可执行自检+版本匹配(无官方校验和的兜底,
-#   与官方安装脚本同级) → 备份旧 binary → 停服 → 原子替换 → 启动 → verified → commit;
+#   解析资产 → 下载临时文件(同目录, 供原子 mv) → 官方 hashes.txt SHA256 校验 + 可执行自检
+#   + 版本匹配(三层, 见下) → 备份旧 binary → 停服 → 原子替换 → 启动 → verified → commit;
 #   任一步失败恢复旧 binary 并重启旧版。配置与节点不受影响(官方 binary 更新不改配置语义)。
 # 用法: _hysteria_download_install <version|latest>
 # ---------------------------------------------------------------------------
@@ -573,15 +578,18 @@ EOF
     return 0
 }
 
+# P2-3(0.16.4 评审): 必须把 backend 的创建结果透传给调用方 —— 原实现无条件 return 0,
+# "service 创建失败"会被误报成"启动失败", 用户无法定位失败步骤。
 _hysteria_create_service() {
     case "$INIT_SYSTEM" in
         systemd) _hysteria_create_systemd_service ;;
         openrc)  _hysteria_create_openrc_service ;;
         direct)
             _warn "未检测到 systemd/openrc, 跳过 service 创建(可手动: ${HYSTERIA_BIN} server -c ${HYSTERIA_CONFIG})"
+            return 0
             ;;
+        *) return 0 ;;
     esac
-    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -826,13 +834,15 @@ _hysteria_server_txn() {
 }
 
 # ---------------------------------------------------------------------------
-# 节点级统一事务(评审 0.16.3 BLOCKER1): config.auth.userpass + 节点元数据文件 +
-# verified-restart + clash 派生 是一个整体, 消除"config 已提交而节点元数据写失败"
-# 的两阶段漂移。链接/元数据内容在事务前预构建(链接只依赖服务器级字段+本节点数据)。
-# 用法: _hysteria_node_txn [--arg/--argjson ...] <config_filter> <meta_file> <op> [content]
+# 节点级统一事务(评审 0.16.3 BLOCKER1): **config.auth.userpass + 节点元数据文件**是原子
+# 事务(含 verified-restart/瞬态验证与失败双回滚), 消除"config 已提交而节点元数据写失败"
+# 的两阶段漂移。**clash.yaml 是可再生的派生缓存, 不纳入事务** —— 阶段 4 同步失败仅告警,
+# 不回滚节点本体(与 Xray 侧 _sync_node_clash 同口径; P2-1 0.16.4 修正契约描述)。
+# 链接/元数据内容在事务前预构建(链接只依赖服务器级字段+本节点数据)。
+# 用法: _hysteria_node_txn [--arg/--argjson ...] <config_filter> <meta_file> <op> <content>
 #   op = create: 原子写入 meta_file(存在则覆盖; 回滚还原旧文件或删除新建)
-#        delete: 删除 meta_file(回滚还原)
-# 返回 0 = 三方(config/meta/clash)一致提交; 1 = 已回滚到原状(或显式报告回滚失败)
+#        delete: 删除 meta_file(fail-closed; 回滚还原)
+# 返回 0 = config+meta 一致提交(clash 同步结果另计); 1 = 已回滚到原状(或显式报告回滚失败)
 # ---------------------------------------------------------------------------
 _hysteria_node_txn() {
     _with_config_lock _hysteria_node_txn_txn_wrapper "$@"
@@ -925,7 +935,15 @@ _hysteria_node_txn_locked() {
             return 1
         fi
     elif [ "$meta_op" = "delete" ]; then
-        rm -f "$meta_file"
+        # P1-2(0.16.4 评审): rm 失败必须 fail-closed —— 否则 config 已删用户而 metadata
+        # 仍存在(权限/immutable/只读 fs/IO 错误), 事务却报成功, 留下幽灵节点。
+        if ! rm -f "$meta_file"; then
+            _error "节点元数据删除失败(权限/只读?), 回滚配置"
+            _hysteria_restore_config
+            [ "$was_running" = "running" ] && _hysteria_restart_verified >/dev/null 2>&1
+            rm -f "$meta_bak" 2>/dev/null
+            return 1
+        fi
     fi
     # --- 阶段 3: 按 was_running 提交(BLOCKER2 语义一致) ---
     if [ "$was_running" = "running" ]; then
@@ -1781,38 +1799,11 @@ _hysteria_bootstrap() {
         return 1
     fi
 
-    # 8) 服务
-    _hysteria_create_service
-    if [ "$INIT_SYSTEM" != "direct" ]; then
-        if ! _hysteria_restart_verified; then
-            _error "Hysteria 服务启动失败, 回滚初始化(配置/服务)..."
-            _manage_hysteria stop 2>/dev/null
-            case "$INIT_SYSTEM" in
-                systemd)
-                    systemctl disable "$HYSTERIA_SVC" 2>/dev/null
-                    rm -f "/etc/systemd/system/${HYSTERIA_SVC}.service"
-                    systemctl daemon-reload 2>/dev/null ;;
-                openrc)
-                    rc-update del "$HYSTERIA_SVC" default 2>/dev/null
-                    rm -f "/etc/init.d/${HYSTERIA_SVC}" ;;
-            esac
-            rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
-            rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
-            _warn "初始化已回滚"
-            return 1
-        fi
-    else
-        # direct 模式无 service: 启动并做 1s 存活检查
-        if ! _manage_hysteria start; then
-            rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
-            _error "启动失败, 已回滚配置"
-            return 1
-        fi
-    fi
-
-    # 9) 首位节点元数据 + 分享链接(配置已提交, 元数据失败仅告警)
-    # 注意: 链接构建须喂真实临时文件 —— <(process substitution) 的 fd 带 CLOEXEC,
-    # 函数内部 $(jq ...) 子进程打不开 /dev/fd/63(实测), 与 _hy2_gen_newmeta 同款模式
+    # 7.5) 首位节点元数据 + 分享链接(P1-1 0.16.4 评审): 必须在**启动服务之前**落地 ——
+    # 否则 service 已 running 而 nodes/<user>.json 缺失时, Hysteria 侧用户可用但 Manager
+    # 完全看不到该节点(幽灵用户), 且此处失败不回滚会让初始化停在半成品状态。
+    # 链接构建须喂真实临时文件 —— <(process substitution) 的 fd 带 CLOEXEC,
+    # 函数内部 $(jq ...) 子进程打不开 /dev/fd/63(实测), 与 _hy2_gen_newmeta 同款模式。
     local link meta_json tmp_meta
     tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || tmp_meta=""
     if [ -n "$tmp_meta" ]; then
@@ -1827,9 +1818,46 @@ _hysteria_bootstrap() {
         --arg addr "$addr" --arg link "$link" --arg created "$(date '+%Y-%m-%d')" \
         '{user:$u,auth:$a,name:$n,link_addr:$addr,created:$created,share_link:$link}')
     if ! _atomic_write_json "$HYSTERIA_NODES_DIR/${user}.json" "$meta_json"; then
-        _error "节点已加入配置, 但元数据写入失败(${user}); 建议删除该用户后重试"
+        _error "首位节点元数据写入失败, 回滚初始化(配置/元数据)"
+        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
         return 1
     fi
+
+    # 8) 服务(创建结果必须消费: P2-3 —— 创建失败 ≠ 启动失败, 报错要指向真实步骤)
+    if ! _hysteria_create_service; then
+        _error "service 创建失败(daemon-reload/权限?), 回滚初始化"
+        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
+        rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+        return 1
+    fi
+    if [ "$INIT_SYSTEM" != "direct" ]; then
+        if ! _hysteria_restart_verified; then
+            _error "Hysteria 服务启动失败, 回滚初始化(配置/服务)..."
+            _manage_hysteria stop 2>/dev/null
+            case "$INIT_SYSTEM" in
+                systemd)
+                    systemctl disable "$HYSTERIA_SVC" 2>/dev/null
+                    rm -f "/etc/systemd/system/${HYSTERIA_SVC}.service"
+                    systemctl daemon-reload 2>/dev/null ;;
+                openrc)
+                    rc-update del "$HYSTERIA_SVC" default 2>/dev/null
+                    rm -f "/etc/init.d/${HYSTERIA_SVC}" ;;
+            esac
+            rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
+            rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+            _warn "初始化已回滚"
+            return 1
+        fi
+    else
+        # direct 模式无 service: 启动并做 1s 存活检查
+        if ! _manage_hysteria start; then
+            rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
+            _error "启动失败, 已回滚配置"
+            return 1
+        fi
+    fi
+
+    # 9) clash 派生缓存(可再生; 失败仅告警, 不影响节点本体)
     _hysteria_sync_clash "$HYSTERIA_NODES_DIR/${user}.json" || true
     _success "官方 Hysteria2 服务器已初始化: $(_hysteria_listen_display), TLS=$(_hysteria_tls_desc)"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
