@@ -3,7 +3,7 @@
 # lib/55-hysteria.sh — Official Hysteria2 Manager(官方 Hysteria2 服务端管理)
 # 与 Xray Hy2(lib/50-nodes.sh 的 hysteria2 协议)是完全独立的两个实现:
 #   Xray Hy2        = Xray-core 实现的 hysteria2 协议, _hy2_* 函数族, config.json 模型
-#   Official Hy2    = Hysteria 官方 binary(apernet/hysteria v2.x), _hysteria_* 函数族
+#   Official Hy2    = Hysteria 官方 binary(HyNetworks/hysteria, 旧组织名已 301 重定向, v2.x), _hysteria_* 函数族
 # 两者不得共享配置模型/binary/版本管理/服务/认证与链接生成逻辑。
 #
 # 事实依据(hysteria-website 官方文档 + get.hy2.sh + 2.12.2 实测, 2026-09-13):
@@ -36,7 +36,7 @@ export HYSTERIA_ACME_DIR="$DEPLOY_DIR/hysteria/acme"
 export HYSTERIA_SVC="xray-deploy-hysteria"
 export HYSTERIA_PID_FILE="/run/xray-deploy-hysteria.pid"
 export HYSTERIA_DL_BASE="https://download.hysteria.network/app"
-# P2-2(0.16.5 评审): 官方仓库已由 apernet/hysteria 更名为 HyNetworks/hysteria
+# P2-2(0.16.5 评审): 官方仓库组织名已更改为 HyNetworks/hysteria(旧名 301 重定向)
 # (2026-09-13 实证: API full_name=HyNetworks/hysteria; 旧路径 301 重定向仍可用但不再依赖)
 export HYSTERIA_GH_API="https://api.github.com/repos/HyNetworks/hysteria/releases/latest"
 
@@ -388,9 +388,16 @@ _manage_hysteria() {
     case "$INIT_SYSTEM" in
         systemd)
             case "$action" in
-                start)   systemctl start "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
+                start)
+                    # 0.16.7(评审轮实测): 高频 stop/start(事务/瞬态验证循环)会触发 systemd
+                    # 启动限流 "start-limit-hit", 之后 start 一律被拒 → 服务再也起不来。
+                    # 启动前清掉限流计数(对未受限的 unit 是幂等 no-op), 与项目 xray 侧同口径。
+                    systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
+                    systemctl start "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
                 stop)    systemctl stop "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
-                restart) systemctl restart "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
+                restart)
+                    systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
+                    systemctl restart "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
                 status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
@@ -505,6 +512,18 @@ _hysteria_restart_verified() {
     return 0
 }
 
+# 回滚收尾: 把服务恢复到事务开始前的运行状态(P1-2 0.16.7 评审)。
+# running → 重启并验证; stopped → 确保停止(瞬态启动/异常 supervisor 都可能留下运行态,
+# 只"不主动启动"是不够的)。这是所有 rollback/recovery 路径的统一收尾入口。
+_hysteria_recover_to_state() {
+    local want="${1:-}"
+    if [ "$want" = "running" ]; then
+        _hysteria_restart_verified
+    else
+        _hysteria_stop_and_verify >/dev/null 2>&1
+    fi
+}
+
 # stopped 状态下的配置验证(评审 0.16.3 BLOCKER2): 配置事务不得隐式改变用户运行状态,
 # 但官方无 check 子命令 —— 以"瞬态启动 → 8s 验证 → 停回并确认 stopped"替代常驻重启,
 # 最终状态仍是 stopped; 若停回失败(异常)大声告警(此时状态已改变, 用户必须知道)。
@@ -524,8 +543,11 @@ _hysteria_validate_transient() {
         sleep 1
         [ "$(_manage_hysteria status 2>/dev/null)" != "running" ] && return 0
     done
-    _warn "瞬态验证后服务未能停止, 当前状态已变为 running, 请人工检查"
-    return 0
+    # P1-1(0.16.7 评审): 停不回去必须**返回失败** —— 原实现 warn 后 return 0, 上层据此判定
+    # 事务成功, 而用户原状态 stopped 已被改成 running, 直接违反"不改变运行状态"契约。
+    _error "瞬态验证后服务未能停止, 运行状态已被改变(原为 stopped)"
+    _tip "请人工检查并停止: ${HYSTERIA_BIN} / $( [ "$INIT_SYSTEM" = systemd ] && echo "systemctl stop ${HYSTERIA_SVC}" || echo "rc-service ${HYSTERIA_SVC} stop" )"
+    return 1
 }
 
 _hysteria_create_systemd_service() {
@@ -559,7 +581,10 @@ EOF
         _error "systemd daemon-reload 失败"
         return 1
     fi
-    systemctl enable "$HYSTERIA_SVC" 2>/dev/null || _warn "开机自启设置失败(可手动: systemctl enable ${HYSTERIA_SVC})"
+    # P2-3(0.16.7 评审): "service 定义已创建" 与 "开机自启已设置" 是两个不同结果, 输出必须区分
+    if ! systemctl enable "$HYSTERIA_SVC" 2>/dev/null; then
+        _warn "service 定义已创建, 但开机自启设置失败(可手动: systemctl enable ${HYSTERIA_SVC})"
+    fi
     return 0
 }
 
@@ -568,7 +593,7 @@ _hysteria_create_openrc_service() {
 #!/sbin/openrc-run
 
 name="Hysteria2 Official Server (xray-deploy)"
-description="Official Hysteria2 QUIC proxy server (apernet/hysteria)"
+description="Official Hysteria2 QUIC proxy server (HyNetworks/hysteria)"
 
 supervisor=supervise-daemon
 respawn_delay=5
@@ -593,7 +618,10 @@ depend() {
 }
 EOF
     chmod +x "/etc/init.d/${HYSTERIA_SVC}" || return 1
-    rc-update add "$HYSTERIA_SVC" default 2>/dev/null || _warn "开机自启设置失败(可手动: rc-update add ${HYSTERIA_SVC} default)"
+    # P2-3: 同 systemd —— 定义创建与开机自启分开报告
+    if ! rc-update add "$HYSTERIA_SVC" default 2>/dev/null; then
+        _warn "service 定义已创建, 但开机自启设置失败(可手动: rc-update add ${HYSTERIA_SVC} default)"
+    fi
     # Alpine 常无 logrotate: 有 /etc/logrotate.d 时 best-effort 写一份防 openrc 日志无限增长
     if [ -d /etc/logrotate.d ] && [ ! -f /etc/logrotate.d/xd-hysteria ]; then
         printf '%s\n' "${HYSTERIA_LOG_FILE} {" "    weekly" "    rotate 4" "    compress" \
@@ -770,18 +798,20 @@ _hysteria_server_txn_locked() {
         _error "配置替换失败, 保留旧配置"
         return 1
     fi
-    # --- 至此 config 已变更: 之后任何失败都必须恢复 config + meta 并重启 ---
+    # --- 至此 config 已变更: 之后任何失败都必须恢复 config + meta 并**按原运行状态**收尾 ---
+    # P1-2(0.16.7 评审): 早期回滚路径原直接 `_hysteria_restart_verified`, 忽略 was_running ——
+    # 用户原本 stopped 的服务会被一次失败的事务异常启动。统一走 _hysteria_recover_to_state。
     local meta_bak="" meta_had=0 meta_created=0
     if [ "$meta_filter" != "-" ]; then
         if [ -f "$HYSTERIA_SERVER_META" ]; then
             meta_had=1
             meta_bak=$(mktemp "${HYSTERIA_SERVER_META}.bak.XXXXXX") || {
-                _hysteria_restore_config; _hysteria_restart_verified >/dev/null 2>&1
+                _hysteria_restore_config; _hysteria_recover_to_state "$was_running"
                 _error "无法创建元数据备份"; return 1
             }
             if ! cp -p "$HYSTERIA_SERVER_META" "$meta_bak"; then
                 rm -f "$meta_bak"
-                _hysteria_restore_config; _hysteria_restart_verified >/dev/null 2>&1
+                _hysteria_restore_config; _hysteria_recover_to_state "$was_running"
                 _error "元数据备份失败"; return 1
             fi
             chmod 600 "$meta_bak" 2>/dev/null
@@ -789,7 +819,7 @@ _hysteria_server_txn_locked() {
         if [ ! -f "$HYSTERIA_SERVER_META" ]; then
             # meta 文件不存在(meta_had=0): 尝试以 {} 起步; 该创建本身计入可回滚变更
             if ! _atomic_write_json "$HYSTERIA_SERVER_META" '{}'; then
-                _hysteria_restore_config; _hysteria_restart_verified >/dev/null 2>&1
+                _hysteria_restore_config; _hysteria_recover_to_state "$was_running"
                 _error "server_meta 初始化失败, 已回滚配置"; return 1
             fi
             meta_created=1
@@ -981,7 +1011,7 @@ _hysteria_node_txn_locked() {
         if ! _atomic_write_json "$meta_file" "$meta_content"; then
             rm -f "$meta_bak"
             _hysteria_restore_config
-            [ "$was_running" = "running" ] && _hysteria_restart_verified >/dev/null 2>&1
+            _hysteria_recover_to_state "$was_running"
             _error "节点元数据写入失败, 已回滚配置"
             return 1
         fi
@@ -991,7 +1021,7 @@ _hysteria_node_txn_locked() {
         if ! rm -f "$meta_file"; then
             _error "节点元数据删除失败(权限/只读?), 回滚配置"
             _hysteria_restore_config
-            [ "$was_running" = "running" ] && _hysteria_restart_verified >/dev/null 2>&1
+            _hysteria_recover_to_state "$was_running"
             rm -f "$meta_bak" 2>/dev/null
             return 1
         fi
@@ -1290,6 +1320,13 @@ _hysteria_check_hop_conflicts() {
     return 0
 }
 
+# mimic 是否已启用(P2-1 0.16.7 评审)。官方文档 Mimic.md: "It cannot be combined with
+# port hopping... Hysteria rejects such a config at startup" —— Manager 不得主动生成该组合。
+_hysteria_mimic_enabled() {
+    [ -f "$HYSTERIA_CONFIG" ] || return 1
+    jq -e '(.mimic.enabled // false) == true' "$HYSTERIA_CONFIG" >/dev/null 2>&1
+}
+
 # 从 listen 推断展示文本
 _hysteria_listen_display() {
     local part
@@ -1369,6 +1406,13 @@ _hysteria_port_menu() {
                 parsed=$(_parse_hop_ranges "$part") || { _press_any_key; continue; }
                 lo="${parsed%%:*}"; hi="${parsed##*:}"
                 [ "$lo" = "$hi" ] && { _warn "跳跃范围至少两个端口(单端口无需跳跃)"; _press_any_key; continue; }
+                # P2-1(0.16.7 评审): 官方禁止 mimic 与端口跳跃同用(Hysteria 启动即拒绝),
+                # Manager 不得主动生成该组合
+                if _hysteria_mimic_enabled; then
+                    _error "当前配置已启用 mimic, 官方不允许 mimic 与端口跳跃同时启用(Hysteria 会拒绝启动)"
+                    _tip "请先关闭 mimic(手工编辑 hysteria.json 的 mimic.enabled)后再启用端口跳跃"
+                    _press_any_key; continue
+                fi
                 # exclude=当前自身监听首端口(评审 P2): :443 → :443-50000 是官方允许的合法变更
                 _hysteria_check_hop_conflicts "$lo" "$hi" "$cur_first" || { _press_any_key; continue; }
                 if ! _hysteria_config_txn --arg l ":${lo}-${hi}" '.listen = $l'; then
@@ -1756,6 +1800,12 @@ _hysteria_bootstrap() {
         parsed=$(_parse_hop_ranges "$hop") || return 1
         lo="${parsed%%:*}"; hi="${parsed##*:}"
         [ "$lo" = "$hi" ] && { _warn "跳跃范围至少两个端口"; return 1; }
+        # P2-1: 官方禁止 mimic + 端口跳跃组合(启动即拒绝)
+        if _hysteria_mimic_enabled; then
+            _error "配置已启用 mimic, 官方不允许 mimic 与端口跳跃同时启用"
+            _tip "请先关闭 hysteria.json 的 mimic.enabled"
+            return 1
+        fi
         [ "$lo" -le "$port" ] && [ "$port" -le "$hi" ] || {
             # 官方机制: 范围首端口即监听端口; 允许把监听端口并进范围首端
             _warn "官方机制下监听端口=范围首端口(${lo}), 输入的 $port 将被范围取代"
@@ -2284,7 +2334,7 @@ _hysteria_menu() {
     while true; do
         clear
         echo
-        echo -e "  ${CYAN}【Hysteria2 管理 — 官方核心 (apernet/hysteria)】${NC}"
+        echo -e "  ${CYAN}【Hysteria2 管理 — 官方核心 (HyNetworks/hysteria)】${NC}"
         local cur st ncount=0 f
         cur=$(_hysteria_cached_version 2>/dev/null)
         if [ -n "$cur" ]; then
