@@ -892,6 +892,11 @@ _uninstall_xray() {
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
         _hy2_cleanup_all_hops
     fi
+    # 官方 Hysteria2 前置清理(其数据目录随 DEPLOY_DIR 一并删除, 但 service 定义在系统目录,
+    # 不先停服删 unit 会留下指向已删 binary 的孤儿服务; declare -F 守卫兼容混装旧版)
+    if declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
+        _hysteria_cleanup_before_uninstall
+    fi
     # 清理 logrotate 配置
     if declare -F _logrotate_cleanup >/dev/null 2>&1; then
         _logrotate_cleanup
