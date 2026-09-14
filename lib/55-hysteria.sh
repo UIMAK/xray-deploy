@@ -238,7 +238,7 @@ _hysteria_download_install() {
     h_file=$(mktemp "$BIN_DIR/hashes.txt.XXXXXX") || { rm -f "$tmp"; _error "临时文件创建失败"; return 1; }
     if ! _http_download "${HYSTERIA_DL_BASE}/${want}/hashes.txt" "$h_file" 60 || [ ! -s "$h_file" ]; then
         rm -f "$h_file" "$tmp"
-        _error "无法获取官方 hashes.txt 校验文件, 为防供应链篡改已中止(当前安装未变动)"
+        _error "无法获取官方 hashes.txt 校验文件, 不能确认下载内容与官方发布一致, 已中止(当前安装未变动)"
         return 1
     fi
     expected=$(_hysteria_expected_sha256 "$h_file" "hysteria-linux-${asset}")
@@ -299,9 +299,11 @@ _hysteria_download_install() {
         chmod 755 "$HYSTERIA_BIN" 2>/dev/null
     fi
     _state_set hysteria_version "$want" || _warn "版本记录写入失败(不影响运行)"
-    # 记录**实际安装的资产名**(观察值, 不是用户配置): 运行期 AVX 兜底要据此判断当前
+    # 记录**实际安装的资产名**(观察值, 不是用户配置): 运行期 AVX 兜底优先据此判断当前
     # binary 是不是 AVX 变体 —— 不能靠 CPU 能力反推, 自检兜底可能已把变体换成普通版。
-    _state_set hysteria_asset "$asset" || _warn "资产记录写入失败(不影响运行)"
+    # 写失败只降级不阻断: 兜底侧对缺失记录有第二来源(amd64+CPU avx 的保守弱推断,
+    # 见 _hysteria_avx_runtime_retry), 故这里失败不影响安装本体。
+    _state_set hysteria_asset "$asset" || _warn "资产记录写入失败(不影响运行, AVX 兜底将按 CPU 弱推断)"
     if [ "$was_running" -eq 1 ]; then
         if _hysteria_restart_verified; then
             _success "官方 Hysteria2 核心已升级: ${want}"
@@ -354,9 +356,23 @@ _hysteria_download_install() {
 # ---------------------------------------------------------------------------
 _hysteria_avx_runtime_retry() {
     local want="$1" asset="$2"
-    [ "$asset" = "amd64-avx" ] || return 1
-    [ -z "${_HY_FORCE_PLAIN:-}" ] || return 1
     [ -n "$want" ] || return 1
+    [ -z "${_HY_FORCE_PLAIN:-}" ] || return 1
+    # 第二来源(P2, 十六轮评审): state/hysteria_asset 只是观察值, 可能缺失或写入失败。
+    # 不能用 `hysteria version` 反推 —— 实测 v2.12.2 输出 Architecture: amd64, **不区分**
+    # avx 变体; 也不值得为它去下载官方 hashes.txt 比对 SHA256(兜底触发频率极低, 但代价
+    # 是每次失败都要一次网络往返)。改用与 _hysteria_pick_asset 相同口径的保守弱推断:
+    # amd64 架构 + CPU 报 avx → 当初装的极可能就是 AVX 变体, 宁可多做一次兜底尝试
+    # (若当初装的其实是普通版, 这次重装普通版同样能启动, 只是多一次下载)。
+    if [ -z "$asset" ]; then
+        local base
+        base=$(_hysteria_arch_asset 2>/dev/null) || return 1
+        [ "$base" = "amd64" ] || return 1
+        _hysteria_cpu_has_avx || return 1
+        asset="amd64-avx"
+        _warn "资产记录缺失(state/hysteria_asset), 按 CPU 能力保守判定当前为 AVX 变体"
+    fi
+    [ "$asset" = "amd64-avx" ] || return 1
     _warn "AVX 版核心启动失败(自检通过但运行期不兼容), 自动改用普通 amd64 重装并重试启动(仅一次)"
     # 内层调用时服务不在运行(启动刚失败) → 它只替换 binary, 不重启; 重启与验证由这里做
     _HY_FORCE_PLAIN=1 _hysteria_download_install "$want" \
@@ -366,6 +382,7 @@ _hysteria_avx_runtime_retry() {
         return 0
     fi
     _warn "普通 amd64 亦无法启动(问题不在 AVX 变体), 继续回滚旧核心"
+    _tip "两次启动均失败通常另有原因(TLS 证书/端口占用/配置错误), 请查看服务日志定位"
     return 1
 }
 
@@ -1918,7 +1935,7 @@ _hysteria_obfs_get() {
 }
 
 # ---------------------------------------------------------------------------
-# gecko 分片尺寸的语义判定(唯一入口, 0.16.15)
+# gecko 分片尺寸的语义判定(唯一入口, 0.16.15; 0.16.16 加固结构校验)
 # 官方 Full-Server-Config「混淆」一节: gecko 子段有 minPacketSize(默认 512)/
 # maxPacketSize(默认 1200), 且 **maxPacketSize 必须 >= minPacketSize 且 <= 2048**。
 # 未写的字段按官方默认补全后再判定 —— 显式写 512/1200 与省略等价, 不该算"自定义"。
@@ -1927,51 +1944,94 @@ _hysteria_obfs_get() {
 #   default 有效尺寸 == 官方默认 512/1200 → 与官方默认语义一致, 链接可生成
 #   custom  有效尺寸偏离官方默认 → 官方 URI **没有**尺寸参数(只有 obfs/obfs-password),
 #           生成出来的链接会让客户端按默认尺寸连自定义尺寸的服务端 = 语义不等价
-#   invalid 越界(非数字 / min<1 / max<min / max>2048) → 官方 binary 直接拒绝启动
+#   invalid 越界(非数字 / min<1 / max<min / max>2048)或**结构非法** → 官方 binary 直接拒绝启动
+#
+# 0.16.16(十六轮评审 P1/P2): state/desc/why 由**同一次 jq 解析**产出 —— 旧实现是两个
+# 独立 jq, 且 has() 直接作用于未经类型检查的子段: gecko 为字符串/数组时 has() 抛错、
+# stderr 被吞 → 状态输出**空串**, 调用方既非 custom 也非 invalid → URI 照常生成;
+# minPacketSize:null 会被 `// 512` 静默当默认值(state 判 invalid 而 desc 显示 512,
+# 自相矛盾)。现在全部结构检查前置(type 先于 has), 非法结构明确归 invalid。
+# 已知取舍(有意): `.obfs.gecko` 为 **null/缺失** 时按"未写尺寸"处理(= default) ——
+# 尺寸语义上空对象就是官方默认; 密码缺失是另一维度, 由 build_link/clash 的
+# fail-closed(密码为空拒绝生成)兜住, 不混进本状态机。
 # ---------------------------------------------------------------------------
-_hysteria_gecko_size_state() {
-    [ -f "$HYSTERIA_CONFIG" ] || { echo "none"; return 0; }
-    jq -r '
-        (.obfs // {}) as $o
-        | if ($o.type // "") != "gecko" then "none"
+# 用法: _hysteria_gecko_size_get <state|desc|why>
+#   state = none|default|custom|invalid(解析失败也归 invalid, fail-closed)
+#   desc  = "min=X max=Y"(非法值原样 tojson 展示, 不再冒充默认值)
+#   why   = 空串(无缺口)或完整原因文本(供 _hysteria_obfs_uri_gap 原样透出)
+_hysteria_gecko_size_get() {
+    [ -f "$HYSTERIA_CONFIG" ] || { [ "$1" = "state" ] && echo "none"; return 0; }
+    jq -r --arg k "$1" '
+        (if .obfs == null then {} else .obfs end) as $o
+        | if ($o | type) != "object" then
+            (if $k == "state" then "invalid"
+             elif $k == "desc" then "obfs 段不是对象(实际 \($o | type))"
+             else "gecko 混淆配置无法解析: obfs 段不是对象(官方 schema 要求 type 选择器对象)" end)
+          elif ($o.type // "") != "gecko" then
+            (if $k == "state" then "none" else "" end)
           else
-            ($o.gecko // {}) as $g
-            | (if $g | has("minPacketSize") then $g.minPacketSize else 512 end) as $mn
-            | (if $g | has("maxPacketSize") then $g.maxPacketSize else 1200 end) as $mx
-            | if (($mn | type) != "number" or ($mx | type) != "number") then "invalid"
-              elif ($mn < 1 or $mx < 1 or $mn > $mx or $mx > 2048) then "invalid"
-              elif ($mn == 512 and $mx == 1200) then "default"
-              else "custom" end
+            (if ($o | has("gecko")) then $o.gecko else {} end) as $g
+            | if ($g != null and ($g | type) != "object") then
+                (if $k == "state" then "invalid"
+                 elif $k == "desc" then "gecko 子段不是对象(实际 \($g | type))"
+                 else "gecko 混淆配置无法解析: gecko 子段不是对象" end)
+              else
+                (if $g == null then {} else $g end) as $gg
+                | (if ($gg | has("minPacketSize")) then $gg.minPacketSize else 512 end) as $mn
+                | (if ($gg | has("maxPacketSize")) then $gg.maxPacketSize else 1200 end) as $mx
+                | (if (($mn | type) != "number" or ($mx | type) != "number") then "invalid"
+                   elif ($mn < 1 or $mx < 1 or $mn > $mx or $mx > 2048) then "invalid"
+                   elif ($mn == 512 and $mx == 1200) then "default"
+                   else "custom" end) as $st
+                | (if ($mn | type) == "number" then ($mn | tostring) else ($mn | tojson) end) as $mns
+                | (if ($mx | type) == "number" then ($mx | tostring) else ($mx | tojson) end) as $mxs
+                | if $k == "state" then $st
+                  elif $k == "desc" then "min=\($mns) max=\($mxs)"
+                  else
+                    if $st == "invalid" then
+                      if ($mn | type) != "number" or ($mx | type) != "number" then
+                        "gecko 分片尺寸类型错误(min=\($mns) max=\($mxs)): 官方要求两者为整数, 服务端会拒绝启动"
+                      else
+                        "gecko 分片尺寸越界(min=\($mns) max=\($mxs)): 官方要求 min>=1、max>=min 且 max<=2048, 服务端会拒绝启动"
+                      end
+                    elif $st == "custom" then
+                      "gecko 使用自定义分片尺寸(min=\($mns) max=\($mxs)), 官方 URI 无对应参数"
+                    else "" end
+                  end
+              end
           end' "$HYSTERIA_CONFIG" 2>/dev/null
 }
-
-# gecko 有效尺寸的可读描述(min/max, 未写的按官方默认补全); 非 gecko 时输出空
+# jq 自身失败(配置损坏/被并发改写)时宁可误报 invalid 也不静默放行 —— 上面的表达式
+# 对一切输入都应产出结果, 走到这里说明解析层出了问题
+_hysteria_gecko_size_state() {
+    local s
+    s=$(_hysteria_gecko_size_get state)
+    [ -n "$s" ] && { printf '%s' "$s"; return 0; }
+    echo "invalid"
+}
 _hysteria_gecko_size_desc() {
-    [ -f "$HYSTERIA_CONFIG" ] || return 0
-    jq -r '
-        (.obfs // {}) as $o
-        | if ($o.type // "") != "gecko" then ""
-          else (($o.gecko // {}) as $g
-                | "min=\($g.minPacketSize // 512) max=\($g.maxPacketSize // 1200)") end' \
-        "$HYSTERIA_CONFIG" 2>/dev/null
+    _hysteria_gecko_size_get desc
 }
 
-# 分享 URI 能否**完整表达**当前 obfs 配置(P1, 十五轮评审)。
+# 分享 URI 能否**完整表达**当前 obfs 配置(P1, 十五轮评审; 0.16.16 扩大覆盖)。
 # 官方 URI-Scheme 只有 obfs / obfs-password 两个混淆参数, **没有** gecko 分片尺寸参数
 # (minPacketSize/maxPacketSize 只是 hysteria.json 的配置字段)。所以 gecko 用非默认尺寸时,
 # 生成出来的 URI "看起来完全正常"却让客户端按官方默认(512/1200)去连服务端 —— 用户会复制
 # 转发这条链接, 参数却不一致, 且界面无从察觉。本函数是该判断的唯一入口:
 #   stdout 非空 = 不可完整表达的原因(原样展示给用户); 空 = 可完整表达
+# 0.16.16(十六轮评审 P2)新增: obfs.type **枚举白名单** —— 官方只有 salamander/gecko,
+# 手改成别的值时官方 binary 会 FATAL, 而旧实现会把任意字符串写进链接/未转义拼进 clash。
 _hysteria_obfs_uri_gap() {
-    case "$(_hysteria_gecko_size_state)" in
-        custom)
-            printf 'gecko 使用自定义分片尺寸(%s), 官方 URI 无对应参数' "$(_hysteria_gecko_size_desc)"
-            ;;
-        invalid)
-            printf 'gecko 分片尺寸非法(%s): 官方要求 min>=1、max>=min 且 max<=2048, 服务端会拒绝启动' \
-                "$(_hysteria_gecko_size_desc)"
+    local o_type
+    o_type=$(_hysteria_obfs_get type)
+    case "$o_type" in
+        ""|salamander|gecko) ;;
+        *)
+            printf 'obfs 类型 "%s" 不是官方枚举值(salamander/gecko), 官方 binary 会拒绝启动' "$o_type"
+            return 0
             ;;
     esac
+    _hysteria_gecko_size_get why
     return 0
 }
 
@@ -2094,14 +2154,26 @@ _hysteria_clash_line() {
         _error "检测到非法 gecko 分片尺寸($(_hysteria_gecko_size_desc)): 官方要求 min>=1、max>=min 且 max<=2048; 请先修正 $HYSTERIA_CONFIG"
         return 1
     fi
+    # obfs.type 枚举白名单(P2, 十六轮评审): 官方只有 salamander/gecko。type 原样拼进
+    # 单行 YAML(无引号), 手改成异常字符串会产出 malformed YAML —— 枚举字段按枚举校验,
+    # 白名单比 YAML escaping 更正确。type 异常时官方 binary 也会 FATAL, 拒绝派生。
+    local o_type o_pw o_min o_max
+    o_type=$(_hysteria_obfs_get type)
+    if [ -n "$o_type" ]; then
+        case "$o_type" in
+            salamander|gecko) ;;
+            *)
+                _error "obfs 类型 \"$o_type\" 不是官方枚举值(salamander/gecko), 已拒绝生成 clash 条目; 请修正 $HYSTERIA_CONFIG"
+                return 1
+                ;;
+        esac
+    fi
     local port_part
     port_part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)") || return 1
     local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$user"):$( _yaml_dq "$auth")\""
     local sni; sni=$(_hysteria_meta_get sni)
     [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
     [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ] && line="${line}, skip-cert-verify: true"
-    local o_type o_pw o_min o_max
-    o_type=$(_hysteria_obfs_get type)
     if [ -n "$o_type" ]; then
         o_pw=$(_hysteria_obfs_get password)
         line="${line}, obfs: ${o_type}, obfs-password: \"$(_yaml_dq "$o_pw")\""
