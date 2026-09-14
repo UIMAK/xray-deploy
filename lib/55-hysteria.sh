@@ -2,20 +2,20 @@
 # =============================================================================
 # lib/55-hysteria.sh — Official Hysteria2 Manager(官方 Hysteria2 服务端管理)
 # 与 Xray Hy2(lib/50-nodes.sh 的 hysteria2 协议)是完全独立的两个实现:
-#   Xray Hy2        = Xray-core 实现的 hysteria2 协议, _hy2_* 函数族, config.json 模型
-#   Official Hy2    = Hysteria 官方 binary(HyNetworks/hysteria, 旧组织名已 301 重定向, v2.x), _hysteria_* 函数族
+# Xray Hy2        = Xray-core 实现的 hysteria2 协议, _hy2_* 函数族, config.json 模型
+# Official Hy2    = Hysteria 官方 binary(HyNetworks/hysteria, 旧组织名已 301 重定向, v2.x), _hysteria_* 函数族
 # 两者不得共享配置模型/binary/版本管理/服务/认证与链接生成逻辑。
 #
 # 事实依据(hysteria-website 官方文档 + get.hy2.sh + 2.12.2 实测, 2026-09-13):
-#   - 官方配置完整支持 JSON(与 YAML 同构), 故配置文件为 hysteria.json, 全部 jq 生成/变更
-#   - 无 check/validate 子命令, 坏配置=启动 FATAL exit 1 → 只能靠 verified-restart 失败回滚
-#   - `hysteria cert` 官方自签工具, 打印 pinSHA256(小写十六进制)
-#   - 端口跳跃 = listen 写 ":<min>-<max>": binary 监听首端口并自动 nft/iptables 重定向
-#     其余端口, 停止时自清 —— 本模块绝不自己写防火墙规则(与 Xray Hy2 的 iptables DNAT 不同)
-#   - 完整性校验 = 官方 hashes.txt SHA256(fail-closed) + 可执行自检 + 版本匹配三层
-#     (0.16.1 曾误判"官方无校验和", 0.16.2 实证修正: hashes.txt 与 binary 同目录发布)
-#   - 架构映射以官方 get.hy2.sh 为基准; armv5*/riscv64 取官方资产表(脚本漏列),
-#     armv6/mips(BE)/mips64 因 ABI 不兼容明确拒绝(0.16.4 评审收紧)
+# - 官方配置完整支持 JSON(与 YAML 同构), 故配置文件为 hysteria.json, 全部 jq 生成/变更
+# - 无 check/validate 子命令, 坏配置=启动 FATAL exit 1 → 只能靠 verified-restart 失败回滚
+# - `hysteria cert` 官方自签工具, 打印 pinSHA256(小写十六进制)
+# - 端口跳跃 = listen 写 ":<min>-<max>": binary 监听首端口并自动 nft/iptables 重定向
+# 其余端口, 停止时自清 —— 本模块绝不自己写防火墙规则(与 Xray Hy2 的 iptables DNAT 不同)
+# - 完整性校验 = 官方 hashes.txt SHA256(fail-closed) + 可执行自检 + 版本匹配三层
+# (0.16.1 曾误判"官方无校验和", 0.16.2 实证修正: hashes.txt 与 binary 同目录发布)
+# - 架构映射以官方 get.hy2.sh 为基准; armv5*/riscv64 取官方资产表(脚本漏列),
+# armv6/mips(BE)/mips64 因 ABI 不兼容明确拒绝(收紧)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ export HYSTERIA_ACME_DIR="$DEPLOY_DIR/hysteria/acme"
 export HYSTERIA_SVC="xray-deploy-hysteria"
 export HYSTERIA_PID_FILE="/run/xray-deploy-hysteria.pid"
 export HYSTERIA_DL_BASE="https://download.hysteria.network/app"
-# P2-2(0.16.5 评审): 官方仓库组织名已更改为 HyNetworks/hysteria(旧名 301 重定向)
+# 官方仓库组织名已更改为 HyNetworks/hysteria(旧名 301 重定向)
 # (2026-09-13 实证: API full_name=HyNetworks/hysteria; 旧路径 301 重定向仍可用但不再依赖)
 export HYSTERIA_GH_API="https://api.github.com/repos/HyNetworks/hysteria/releases/latest"
 
@@ -112,7 +112,7 @@ _hysteria_expected_sha256() {
 _hysteria_latest_version() {
     local asset final ver
     asset=$(_hysteria_arch_asset) || return 1
-    # P3-1(0.16.6 评审): 用 GET(-o /dev/null, 只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层
+    # 用 GET(-o /dev/null, 只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层
     # 对 HEAD 返回 405 而 GET 正常, 强依赖 HEAD 是无谓的脆弱点
     final=$(curl -fsSL -o /dev/null --max-time 15 -w '%{url_effective}' \
             "${HYSTERIA_DL_BASE}/latest/hysteria-linux-${asset}" 2>/dev/null) || final=""
@@ -127,12 +127,12 @@ _hysteria_latest_version() {
 # ---------------------------------------------------------------------------
 # 架构映射(uname -m → 官方资产名)
 # 基准 = 官方 get.hy2.sh 的映射表; 差异点:
-#   - armv5* → armv5 官方资产(资产表明确提供; get.hy2.sh 把 armv5tel 映去 arm, 但 armv7
-#     二进制在 armv5 CPU 上必然 SIGILL, 资产表优先)
-#   - riscv64 → riscv64 官方资产(资产表提供, get.hy2.sh 未映射)
-#   - 0.16.3 评审收紧: mips(BE)/mips64/mips64le 明确拒绝 —— uname 名相似 ≠ ABI 兼容,
-#     大端 CPU 跑 mipsle(小端)资产必然失败, 32 位 LE 资产在 64 位用户态也不保证可跑;
-#     无法可靠判定就拒绝并提示, 不猜。mipsle(含软浮点设备手选 mipsle-sf)不受影响。
+# - armv5* → armv5 官方资产(资产表明确提供; get.hy2.sh 把 armv5tel 映去 arm, 但 armv7
+# 二进制在 armv5 CPU 上必然 SIGILL, 资产表优先)
+# - riscv64 → riscv64 官方资产(资产表提供, get.hy2.sh 未映射)
+# - 收紧口径: mips(BE)/mips64/mips64le 明确拒绝 —— uname 名相似 ≠ ABI 兼容,
+# 大端 CPU 跑 mipsle(小端)资产必然失败, 32 位 LE 资产在 64 位用户态也不保证可跑;
+# 无法可靠判定就拒绝并提示, 不猜。mipsle(含软浮点设备手选 mipsle-sf)不受影响。
 # 返回: stdout=资产名; 非 0 = 不支持的架构
 # ---------------------------------------------------------------------------
 _hysteria_arch_asset() {
@@ -143,7 +143,7 @@ _hysteria_arch_asset() {
         i386|i486|i586|i686)       echo "386" ;;
         aarch64|arm64|armv8*)      echo "arm64" ;;
         armv7|armv7l)              echo "arm" ;;
-        # armv6 明确拒绝(0.16.4 评审): 官方 linux/arm 资产是 GOARM=7 构建, 在 ARMv6 CPU 上
+        # armv6 明确拒绝: 官方 linux/arm 资产是 GOARM=7 构建, 在 ARMv6 CPU 上
         # 会因缺少 v7 指令 SIGILL; 官方 release 无独立 armv6 平台, 不猜映射
         armv6|armv6l)              return 1 ;;
         armv5*)                    echo "armv5" ;;
@@ -163,7 +163,7 @@ _hysteria_cpu_has_avx() {
 }
 
 # 结合用户变体偏好(state/hysteria_variant)给出最终资产名。
-# P2-3(0.16.6 评审): 业务层必须**再次**校验 CPU 能力 —— UI 侧检查不足以信任(状态文件可能
+# 业务层必须**再次**校验 CPU 能力 —— UI 侧检查不足以信任(状态文件可能
 # 从别的机器迁移过来, 或 CPU 特性被容器屏蔽), 否则会下载 amd64-avx 在无 AVX 的 CPU 上 SIGILL。
 # 最终判据: variant=avx **且** 本机 /proc/cpuinfo 确有 avx, 否则回落普通 amd64。
 _hysteria_pick_asset() {
@@ -183,9 +183,9 @@ _hysteria_pick_asset() {
 
 # ---------------------------------------------------------------------------
 # binary 安装/升级事务:
-#   解析资产 → 下载临时文件(同目录, 供原子 mv) → 官方 hashes.txt SHA256 校验 + 可执行自检
-#   + 版本匹配(三层, 见下) → 备份旧 binary → 停服 → 原子替换 → 启动 → verified → commit;
-#   任一步失败恢复旧 binary 并重启旧版。配置与节点不受影响(官方 binary 更新不改配置语义)。
+# 解析资产 → 下载临时文件(同目录, 供原子 mv) → 官方 hashes.txt SHA256 校验 + 可执行自检
+# + 版本匹配(三层, 见下) → 备份旧 binary → 停服 → 原子替换 → 启动 → verified → commit;
+# 任一步失败恢复旧 binary 并重启旧版。配置与节点不受影响(官方 binary 更新不改配置语义)。
 # 用法: _hysteria_download_install <version|latest>
 # ---------------------------------------------------------------------------
 _hysteria_download_install() {
@@ -210,7 +210,7 @@ _hysteria_download_install() {
         _error "下载失败(网络受限?), 当前安装未变动"
         return 1
     fi
-    # P1-1(官方 hashes.txt, 2026-09-13 实证与 binary 同目录发布): SHA256 校验 fail-closed。
+    # (官方 hashes.txt, 2026-09-13 实证与 binary 同目录发布): SHA256 校验 fail-closed。
     # 拿不到官方校验和 = 不可信任下载内容, 直接中止(自检+版本匹配只能证明"能执行且报对版本",
     # 无法证明"就是官方发布的那个 binary")。hashes.txt 格式: "<sha256>  build/<asset>"。
     local h_file expected sha
@@ -240,11 +240,11 @@ _hysteria_download_install() {
     if _hysteria_installed; then
         backup="$BIN_DIR/.hysteria.rollback.$$"
         cp -p "$HYSTERIA_BIN" "$backup" || { rm -f "$tmp"; _error "旧核心备份失败, 已中止"; return 1; }
-        # P3-2(0.16.6 评审): 记录旧版本, 回滚后据此校验"确实恢复到了旧版本"而不只是"服务在跑"
+        # 记录旧版本, 回滚后据此校验"确实恢复到了旧版本"而不只是"服务在跑"
         old_ver=$(_hysteria_current_version)
         if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
             was_running=1
-            # P2-1(0.16.5 评审): 升级替换 binary 前统一用 stop_and_verify —— 确认旧进程真正退出
+            # 升级替换 binary 前统一用 stop_and_verify —— 确认旧进程真正退出
             # (exe 兜底强杀), 避免"旧进程仍持有旧 inode + 新 binary 已就位"的中间态
             _hysteria_stop_and_verify || { _error "停止服务失败(进程未退出), 已中止升级"; rm -f "$backup"; return 1; }
         fi
@@ -270,7 +270,7 @@ _hysteria_download_install() {
         else
             _error "升级后启动失败, 回滚旧核心..."
             if [ -n "$backup" ] && mv -f "$backup" "$HYSTERIA_BIN" 2>/dev/null; then
-                # P3-2: 恢复后既验证服务运行, 也验证版本确实回到旧版(防备份错/替换错)
+                # 恢复后既验证服务运行, 也验证版本确实回到旧版(防备份错/替换错)
                 local now_ver=""
                 if _hysteria_restart_verified; then
                     now_ver=$(_hysteria_current_version)
@@ -347,11 +347,11 @@ _hysteria_core_menu() {
 _hysteria_is_running() {
     # 结构复刻 _xray_is_running 的三分支判活(该函数是项目加固最重的函数, 不参数化共用,
     # 避免"为了 DRY 动它"引入回归; 本函数独立维护同样的判活口径):
-    #   systemd: unit 已知时 MainPID 权威, MainPID=0 即 stopped, 不回退全机扫描
-    #            (否则宿主上别人的 hysteria 会被当成我们的服务)
-    #   openrc : pidfile 是 supervise-daemon 父进程, 需回溯 ppid 链找业务子进程
-    #   direct : pidfile 即业务进程
-    #   兜底  : 全机扫描, 只认 exe 指向 $HYSTERIA_BIN 的进程
+    # systemd: unit 已知时 MainPID 权威, MainPID=0 即 stopped, 不回退全机扫描
+    # (否则宿主上别人的 hysteria 会被当成我们的服务)
+    # openrc : pidfile 是 supervise-daemon 父进程, 需回溯 ppid 链找业务子进程
+    # direct : pidfile 即业务进程
+    # 兜底  : 全机扫描, 只认 exe 指向 $HYSTERIA_BIN 的进程
     local anchor="" load=""
     case "$INIT_SYSTEM" in
         systemd)
@@ -369,7 +369,15 @@ _hysteria_is_running() {
                     return 1 ;;
             esac
             ;;
-        openrc|direct)
+        direct)
+            # direct: pidfile 即业务进程本身 → 必须用 exe 归属校验(P1-2), 只看 comm 会把
+            # 陈旧 pidfile 指向的他方 hysteria 误认成本项目服务
+            anchor=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
+            _hysteria_pid_is_ours "${anchor:-}" && return 0
+            ;;
+        openrc)
+            # openrc: pidfile 是 supervise-daemon 父进程(其 exe 不是 hysteria), 不能用 exe
+            # 直接校验 anchor, 需沿 ppid 链回溯业务子进程(与 _xray_is_running 同口径)
             anchor=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
             if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] && [ -d "/proc/$anchor" ]; then
                 _proc_named_under "$anchor" hysteria && return 0
@@ -377,6 +385,23 @@ _hysteria_is_running() {
             ;;
     esac
     _proc_any_named hysteria "$HYSTERIA_BIN"
+}
+
+# direct backend 的 PID 归属判定: 只看 comm=="hysteria" 太宽 ——
+# PID reuse / 陈旧 pidfile 场景下, 别的 hysteria(系统包 / 用户自建)会被误认成本项目的服务,
+# 甚至被 kill。项目在卸载路径已用 /proc/<pid>/exe 判归属, 这里统一到同一口径:
+# pid 数字合法 + /proc/<pid>/exe(含 "(deleted)" 就地替换形态, 经 readlink -f 归一) == $HYSTERIA_BIN
+# 返回 0 = 确属本项目的 hysteria 进程; 1 = 不是(含进程不存在)。
+_hysteria_pid_is_ours() {
+    local pid="${1:-}" exe want
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [ -d "/proc/$pid" ] || return 1
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
+    [ -n "$exe" ] || return 1
+    exe="${exe% (deleted)}"
+    [ "$exe" = "$HYSTERIA_BIN" ] && return 0
+    want=$(readlink -f "$HYSTERIA_BIN" 2>/dev/null) || return 1
+    [ -n "$want" ] && [ "$exe" = "$want" ]
 }
 
 _manage_hysteria() {
@@ -427,7 +452,9 @@ _manage_hysteria() {
                 start)
                     local dpid0
                     [ -f "$HYSTERIA_PID_FILE" ] && dpid0=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
-                    if [ -n "${dpid0:-}" ] && [ "$(cat "/proc/$dpid0/comm" 2>/dev/null)" = "hysteria" ]; then
+                    # 归属用 exe 校验(不只看 comm); 陈旧 pidfile 指向他方 hysteria 时
+                    # 判为 stale → 清 pidfile 并正常启动, 绝不误认 running
+                    if _hysteria_pid_is_ours "${dpid0:-}"; then
                         echo "running"
                     else
                         rm -f "$HYSTERIA_PID_FILE"
@@ -440,7 +467,7 @@ _manage_hysteria() {
                         ) &
                         echo $! > "$HYSTERIA_PID_FILE"
                         sleep 1
-                        if [ "$(cat "/proc/$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)/comm" 2>/dev/null)" != "hysteria" ]; then
+                        if ! _hysteria_pid_is_ours "$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)"; then
                             _warn "Hysteria 启动失败, 进程已退出(查看 $HYSTERIA_LOG_FILE)"
                             rm -f "$HYSTERIA_PID_FILE"
                             return 1
@@ -451,7 +478,8 @@ _manage_hysteria() {
                     if [ -f "$HYSTERIA_PID_FILE" ]; then
                         local dpid
                         dpid=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
-                        if [ -n "$dpid" ] && [ "$(cat "/proc/$dpid/comm" 2>/dev/null)" = "hysteria" ]; then
+                        # 只对本项目自己的 hysteria(exe 归属)发信号, 绝不误杀同名的他方进程
+                        if _hysteria_pid_is_ours "$dpid"; then
                             kill "$dpid" 2>/dev/null
                             local k
                             for k in 1 2 3 4 5; do
@@ -512,19 +540,24 @@ _hysteria_restart_verified() {
     return 0
 }
 
-# 回滚收尾: 把服务恢复到事务开始前的运行状态(P1-2 0.16.7 评审)。
+# 回滚收尾: 把服务恢复到事务开始前的运行状态。
 # running → 重启并验证; stopped → 确保停止(瞬态启动/异常 supervisor 都可能留下运行态,
 # 只"不主动启动"是不够的)。这是所有 rollback/recovery 路径的统一收尾入口。
 _hysteria_recover_to_state() {
     local want="${1:-}"
-    if [ "$want" = "running" ]; then
-        _hysteria_restart_verified
-    else
-        _hysteria_stop_and_verify >/dev/null 2>&1
-    fi
+    # 未知/空状态不得默认为 stopped —— 未来某 backend 返回
+    # unknown/failed/not-found 时被当成 stopped 会掩盖真实异常。只接受两个明确值。
+    case "$want" in
+        running) _hysteria_restart_verified ;;
+        stopped) _hysteria_stop_and_verify >/dev/null 2>&1 ;;
+        *)
+            _error "未知的原运行状态 '${want}', 无法安全恢复; 请人工确认服务状态"
+            return 1
+            ;;
+    esac
 }
 
-# stopped 状态下的配置验证(评审 0.16.3 BLOCKER2): 配置事务不得隐式改变用户运行状态,
+# stopped 状态下的配置验证(): 配置事务不得隐式改变用户运行状态,
 # 但官方无 check 子命令 —— 以"瞬态启动 → 8s 验证 → 停回并确认 stopped"替代常驻重启,
 # 最终状态仍是 stopped; 若停回失败(异常)大声告警(此时状态已改变, 用户必须知道)。
 _hysteria_validate_transient() {
@@ -543,7 +576,7 @@ _hysteria_validate_transient() {
         sleep 1
         [ "$(_manage_hysteria status 2>/dev/null)" != "running" ] && return 0
     done
-    # P1-1(0.16.7 评审): 停不回去必须**返回失败** —— 原实现 warn 后 return 0, 上层据此判定
+    # 停不回去必须**返回失败** —— 原实现 warn 后 return 0, 上层据此判定
     # 事务成功, 而用户原状态 stopped 已被改成 running, 直接违反"不改变运行状态"契约。
     _error "瞬态验证后服务未能停止, 运行状态已被改变(原为 stopped)"
     _tip "请人工检查并停止: ${HYSTERIA_BIN} / $( [ "$INIT_SYSTEM" = systemd ] && echo "systemctl stop ${HYSTERIA_SVC}" || echo "rc-service ${HYSTERIA_SVC} stop" )"
@@ -581,7 +614,7 @@ EOF
         _error "systemd daemon-reload 失败"
         return 1
     fi
-    # P2-3(0.16.7 评审): "service 定义已创建" 与 "开机自启已设置" 是两个不同结果, 输出必须区分
+    # "service 定义已创建" 与 "开机自启已设置" 是两个不同结果, 输出必须区分
     if ! systemctl enable "$HYSTERIA_SVC" 2>/dev/null; then
         _warn "service 定义已创建, 但开机自启设置失败(可手动: systemctl enable ${HYSTERIA_SVC})"
     fi
@@ -618,7 +651,7 @@ depend() {
 }
 EOF
     chmod +x "/etc/init.d/${HYSTERIA_SVC}" || return 1
-    # P2-3: 同 systemd —— 定义创建与开机自启分开报告
+    # 同 systemd —— 定义创建与开机自启分开报告
     if ! rc-update add "$HYSTERIA_SVC" default 2>/dev/null; then
         _warn "service 定义已创建, 但开机自启设置失败(可手动: rc-update add ${HYSTERIA_SVC} default)"
     fi
@@ -630,7 +663,7 @@ EOF
     return 0
 }
 
-# P2-3(0.16.4 评审): 必须把 backend 的创建结果透传给调用方 —— 原实现无条件 return 0,
+# 必须把 backend 的创建结果透传给调用方 —— 原实现无条件 return 0,
 # "service 创建失败"会被误报成"启动失败", 用户无法定位失败步骤。
 _hysteria_create_service() {
     case "$INIT_SYSTEM" in
@@ -705,7 +738,7 @@ _hysteria_restore_config() {
 
 _hysteria_config_txn_locked() {
     _hysteria_config_preflight || return 1
-    # 评审 0.16.3 BLOCKER2: 事务不得隐式改变用户运行状态 —— stopped 时只做瞬态验证
+    # 事务不得隐式改变用户运行状态 —— stopped 时只做瞬态验证
     local was_running; was_running=$(_manage_hysteria status 2>/dev/null)
     if ! _hysteria_backup_config; then
         _error "配置备份失败, 中止操作"
@@ -740,7 +773,10 @@ _hysteria_config_txn_locked() {
             if _hysteria_restart_verified; then
                 _warn "已回滚到旧配置并重启"
             else
-                _error "回滚后仍启动失败,请手动检查"
+                # 文件回滚成功但运行状态恢复失败 —— 必须明确报降级,
+                # 不能只说"回滚后仍启动失败"(用户会以为文件也没回滚)
+                _error "降级: 配置已回滚, 但服务未能恢复运行(原状态 running); 请人工检查"
+                _tip "核对: $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / 日志 ${HYSTERIA_LOG_FILE}"
             fi
             return 1
         fi
@@ -753,7 +789,13 @@ _hysteria_config_txn_locked() {
                 _tip "请人工核对: $HYSTERIA_CONFIG(旧内容见 ${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak)"
                 return 1
             fi
-            _hysteria_validate_transient >/dev/null 2>&1 || _warn "回滚后配置瞬态验证失败, 下次启动可能失败, 请检查"
+            if _hysteria_validate_transient; then
+                _warn "已回滚配置(原状态 stopped 保持)"
+            else
+                # 文件已回滚, 但原 stopped 状态的收尾验证失败 —— 明确降级语义
+                _error "降级: 配置已回滚, 但原运行状态(stopped)恢复验证失败; 请人工检查服务状态"
+                _tip "核对: $HYSTERIA_CONFIG / 日志 ${HYSTERIA_LOG_FILE}"
+            fi
             return 1
         fi
     fi
@@ -765,11 +807,11 @@ _hysteria_config_txn() {
 }
 
 # ---------------------------------------------------------------------------
-# 服务级统一事务(评审 0.16.2 P1-4): hysteria.json(官方配置) + server_meta.json(manager
+# 服务级统一事务(P1-4): hysteria.json(官方配置) + server_meta.json(manager
 # 元数据)必须作为一个整体提交 —— 先 config 后 meta 的两段式会在"config 已提交而 meta
 # 写失败"时产生状态漂移(服务是新 TLS / 链接按旧 TLS 重建)。
 # 用法: _hysteria_server_txn [--arg/--argjson ...] <config_filter> <meta_filter>
-#   meta_filter 传 "-" 表示本事务不动 server_meta。
+# meta_filter 传 "-" 表示本事务不动 server_meta。
 # 契约: 双备份 → config 变更 → meta 变更 → verified-restart → 失败双回滚+重启。
 # ---------------------------------------------------------------------------
 _hysteria_server_txn_locked() {
@@ -799,7 +841,7 @@ _hysteria_server_txn_locked() {
         return 1
     fi
     # --- 至此 config 已变更: 之后任何失败都必须恢复 config + meta 并**按原运行状态**收尾 ---
-    # P1-2(0.16.7 评审): 早期回滚路径原直接 `_hysteria_restart_verified`, 忽略 was_running ——
+    # 早期回滚路径原直接 `_hysteria_restart_verified`, 忽略 was_running ——
     # 用户原本 stopped 的服务会被一次失败的事务异常启动。统一走 _hysteria_recover_to_state。
     local meta_bak="" meta_had=0 meta_created=0
     if [ "$meta_filter" != "-" ]; then
@@ -836,11 +878,11 @@ _hysteria_server_txn_locked() {
             return 1
         fi
     fi
-    # --- 阶段 2: 按 was_running 提交(BLOCKER2: stopped 不被隐式启动) ---
+    # --- 阶段 2: 按 was_running 提交(stopped 不被隐式启动) ---
     if [ "$was_running" = "running" ]; then
         if ! _hysteria_restart_verified; then
             _error "hysteria 启动失败, 回滚配置与元数据"
-            # P1-1(0.16.5 评审): 无论 config 回滚成败都必须继续回滚 meta 并给出降级状态 ——
+            # 无论 config 回滚成败都必须继续回滚 meta 并给出降级状态 ——
             # 原写法在 restore 失败时提前 return, 留下"config 新/meta 新"或"config 未知/meta 新"
             # 的不一致状态且无人工指引, 违反"失败即恢复原状或明确降级"。
             local cfg_ok=0
@@ -855,7 +897,8 @@ _hysteria_server_txn_locked() {
             if _hysteria_restart_verified; then
                 _warn "已回滚到旧配置并重启"
             else
-                _error "回滚后仍启动失败, 请查看日志"
+                _error "降级: 配置与元数据已回滚, 但服务未能恢复运行(原状态 running); 请人工检查"
+                _tip "核对: $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / 日志 ${HYSTERIA_LOG_FILE}"
             fi
             return 1
         fi
@@ -871,17 +914,22 @@ _hysteria_server_txn_locked() {
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $HYSTERIA_SERVER_META"
                 return 1
             fi
-            _hysteria_validate_transient >/dev/null 2>&1 || _warn "回滚后配置瞬态验证失败, 下次启动可能失败, 请检查"
+            if _hysteria_validate_transient; then
+                _warn "已回滚配置与元数据(原状态 stopped 保持)"
+            else
+                _error "降级: 配置与元数据已回滚, 但原运行状态(stopped)恢复验证失败; 请人工检查"
+                _tip "核对: $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / 日志 ${HYSTERIA_LOG_FILE}"
+            fi
             return 1
         fi
     fi
-    # P2-3(0.16.5 评审): 备份清理失败给出告警(严格事务系统不应静默吞掉清理失败)
+    # 备份清理失败给出告警(严格事务系统不应静默吞掉清理失败)
     [ -n "$meta_bak" ] && { rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"; }
     return 0
 }
 
 # server_txn 的 meta 侧回滚(meta_had=1 还原备份; meta_created=1 删除新建; 失败显式报告)
-# server_meta 侧回滚。**返回真实状态**(P2-1 0.16.6 评审): 0=已还原到原状, 1=未能还原。
+# server_meta 侧回滚。**返回真实状态**: 0=已还原到原状, 1=未能还原。
 # 原实现无条件 return 0, 调用方无从区分"回滚完成"与"回滚失败但已告警"; 严格事务 API 必须
 # 让调用者能据此判定是否进入 degraded state。
 _hysteria_server_txn_rollback() {
@@ -906,14 +954,14 @@ _hysteria_server_txn() {
 }
 
 # ---------------------------------------------------------------------------
-# 节点级统一事务(评审 0.16.3 BLOCKER1): **config.auth.userpass + 节点元数据文件**是原子
+# 节点级统一事务(): **config.auth.userpass + 节点元数据文件**是原子
 # 事务(含 verified-restart/瞬态验证与失败双回滚), 消除"config 已提交而节点元数据写失败"
 # 的两阶段漂移。**clash.yaml 是可再生的派生缓存, 不纳入事务** —— 阶段 4 同步失败仅告警,
 # 不回滚节点本体(与 Xray 侧 _sync_node_clash 同口径; P2-1 0.16.4 修正契约描述)。
 # 链接/元数据内容在事务前预构建(链接只依赖服务器级字段+本节点数据)。
 # 用法: _hysteria_node_txn [--arg/--argjson ...] <config_filter> <meta_file> <op> <content>
-#   op = create: 原子写入 meta_file(存在则覆盖; 回滚还原旧文件或删除新建)
-#        delete: 删除 meta_file(fail-closed; 回滚还原)
+# op = create: 原子写入 meta_file(存在则覆盖; 回滚还原旧文件或删除新建)
+# delete: 删除 meta_file(fail-closed; 回滚还原)
 # 返回 0 = config+meta 一致提交(clash 同步结果另计); 1 = 已回滚到原状(或显式报告回滚失败)
 # ---------------------------------------------------------------------------
 _hysteria_node_txn() {
@@ -981,7 +1029,7 @@ _hysteria_node_txn_locked() {
         return 1
     fi
     # 节点侧回滚 helper(meta 还原/删除 + clash 派生同步)
-    # 节点侧回滚 helper(meta 还原/删除 + clash 派生同步)。返回真实状态(P2-1 0.16.6 评审):
+    # 节点侧回滚 helper(meta 还原/删除 + clash 派生同步)。返回真实状态:
     # 0=已还原; 1=未能还原(调用方据此判 degraded, 不再假定"回滚完成")
     _hysteria_node_txn_meta_rollback() {
         local rc=0
@@ -1016,7 +1064,7 @@ _hysteria_node_txn_locked() {
             return 1
         fi
     elif [ "$meta_op" = "delete" ]; then
-        # P1-2(0.16.4 评审): rm 失败必须 fail-closed —— 否则 config 已删用户而 metadata
+        # rm 失败必须 fail-closed —— 否则 config 已删用户而 metadata
         # 仍存在(权限/immutable/只读 fs/IO 错误), 事务却报成功, 留下幽灵节点。
         if ! rm -f "$meta_file"; then
             _error "节点元数据删除失败(权限/只读?), 回滚配置"
@@ -1026,11 +1074,11 @@ _hysteria_node_txn_locked() {
             return 1
         fi
     fi
-    # --- 阶段 3: 按 was_running 提交(BLOCKER2 语义一致) ---
+    # --- 阶段 3: 按 was_running 提交(语义一致) ---
     if [ "$was_running" = "running" ]; then
         if ! _hysteria_restart_verified; then
             _error "hysteria 启动失败, 回滚配置与节点状态"
-            # P1-1(0.16.5 评审): config 回滚失败也必须继续回滚节点元数据并报降级状态
+            # config 回滚失败也必须继续回滚节点元数据并报降级状态
             local cfg_ok=0
             _hysteria_restore_config && cfg_ok=1
             local meta_ok=0
@@ -1044,7 +1092,8 @@ _hysteria_node_txn_locked() {
             if _hysteria_restart_verified; then
                 _warn "已回滚并重启"
             else
-                _error "回滚后仍启动失败, 请查看日志"
+                _error "降级: 配置与节点元数据已回滚, 但服务未能恢复运行(原状态 running); 请人工检查"
+                _tip "核对: $HYSTERIA_CONFIG / $meta_file / 日志 ${HYSTERIA_LOG_FILE}"
             fi
             return 1
         fi
@@ -1061,7 +1110,12 @@ _hysteria_node_txn_locked() {
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file"
                 return 1
             fi
-            _hysteria_validate_transient >/dev/null 2>&1 || _warn "回滚后配置瞬态验证失败, 请检查"
+            if _hysteria_validate_transient; then
+                _warn "已回滚配置与节点元数据(原状态 stopped 保持)"
+            else
+                _error "降级: 配置与节点元数据已回滚, 但原运行状态(stopped)恢复验证失败; 请人工检查"
+                _tip "核对: $HYSTERIA_CONFIG / $meta_file / 日志 ${HYSTERIA_LOG_FILE}"
+            fi
             return 1
         fi
     fi
@@ -1090,7 +1144,7 @@ _hysteria_server_txn_txn_wrapper() {
 }
 
 # 服务器是否已完成初始化(配置存在 + jq 可解析 + auth 段就绪)
-# 三态判定(评审 0.16.2 P1-3): 官方 auth.type 有 password/userpass/http/command 四种,
+# 三态判定(P1-3): 官方 auth.type 有 password/userpass/http/command 四种,
 # 绝不能把"存在但非 userpass"的合法官方配置当成未初始化而 bootstrap 覆盖。
 _hysteria_config_exists() {
     [ -f "$HYSTERIA_CONFIG" ] && [ -s "$HYSTERIA_CONFIG" ] || return 1
@@ -1255,10 +1309,10 @@ _hysteria_listen_port_part() {
 }
 
 # 端口跳跃范围冲突检查(只检查, 不写防火墙 —— 官方 binary 启动自建/停止自清):
-#   a) 系统已监听的 UDP 端口落进范围(会被官方 REDIRECT 遮蔽)
-#   b) Xray config inbound 端口落进范围
-#   c) Xray Hy2 节点的 iptables 跳跃范围与本范围相交
-# 第 3 参 exclude = 当前 hysteria 自身监听的首端口(评审 0.16.2 P2): 改跳跃范围时新
+# a) 系统已监听的 UDP 端口落进范围(会被官方 REDIRECT 遮蔽)
+# b) Xray config inbound 端口落进范围
+# c) Xray Hy2 节点的 iptables 跳跃范围与本范围相交
+# 第 3 参 exclude = 当前 hysteria 自身监听的首端口(P2): 改跳跃范围时新
 # 范围包含当前端口(如 :443 → :443-50000)是官方语义允许的合法配置 —— restart 后旧
 # 监听即释放, 自身端口不算外部冲突。
 # 用法: _hysteria_check_hop_conflicts <lo> <hi> [exclude]; 有冲突返回 1(已打印说明)
@@ -1267,7 +1321,7 @@ _hysteria_check_hop_conflicts() {
     [[ "$lo" =~ ^[0-9]+$ ]] && [[ "$hi" =~ ^[0-9]+$ ]] || return 1
     local hit=""
     # a) 一次 ss 快照(范围可上万, 逐端口探测太慢); exclude = hysteria 自身端口。
-    #    列位: ss 数据行 $4=本机 addr:port, $5=对端(*:*, 无端口) —— 用 $5 是空扫(已修)。
+    # 列位: ss 数据行 $4=本机 addr:port, $5=对端(*:*, 无端口) —— 用 $5 是空扫(已修)。
     if command -v ss >/dev/null 2>&1; then
         while read -r p; do
             [ -n "$p" ] || continue
@@ -1277,9 +1331,9 @@ _hysteria_check_hop_conflicts() {
     fi
     [ -n "$hit" ] && { _error "以下端口已被本机监听, 与跳跃范围冲突:$hit"; return 1; }
     # b) Xray config 中 **UDP 能力** 的入站端口(P2-3: TCP-only 的 vless/reality/xhttp 等
-    #    不与 hysteria 的 UDP 范围冲突 —— TCP 443 与 UDP 443 可共存)。UDP 能力口径:
-    #    hysteria2(QUIC)/dokodemo-door 原生 UDP; socks 需 settings.udp=true;
-    #    mKCP/QUIC 传输走 UDP。
+    # 不与 hysteria 的 UDP 范围冲突 —— TCP 443 与 UDP 443 可共存)。UDP 能力口径:
+    # hysteria2(QUIC)/dokodemo-door 原生 UDP; socks 需 settings.udp=true;
+    # mKCP/QUIC 传输走 UDP。
     if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
         while read -r p; do
             [ -n "$p" ] || continue
@@ -1320,7 +1374,7 @@ _hysteria_check_hop_conflicts() {
     return 0
 }
 
-# mimic 是否已启用(P2-1 0.16.7 评审)。官方文档 Mimic.md: "It cannot be combined with
+# mimic 是否已启用。官方文档 Mimic.md: "It cannot be combined with
 # port hopping... Hysteria rejects such a config at startup" —— Manager 不得主动生成该组合。
 _hysteria_mimic_enabled() {
     [ -f "$HYSTERIA_CONFIG" ] || return 1
@@ -1371,6 +1425,10 @@ _hysteria_port_menu() {
         echo -e "  当前: ${CYAN}$(_hysteria_listen_display)${NC}"
         echo -e "  ${YELLOW}官方机制: 端口跳跃 = listen 写端口范围, binary 监听首端口并自动重定向其余端口,${NC}"
         echo -e "  ${YELLOW}停止服务时自动清理防火墙规则(与 Xray Hy2 的 iptables 方案相互独立)${NC}"
+        # 手工扩展的高级官方字段(如 mimic/ech)不在菜单管理范围内,
+        # 但可能与本页操作互斥或依赖特定运行环境, 在此给出提示
+        echo -e "  ${YELLOW}提示: 手工在 hysteria.json 扩展的高级字段(mimic/ech 等)需满足官方运行要求${NC}"
+        echo -e "  ${YELLOW}(如 mimic 需 mimic 程序+内核模块+root); 其中 mimic 与端口跳跃互斥, 本菜单会拒绝该组合${NC}"
         echo
         echo -e "  ${GREEN}[1]${NC} 修改监听端口"
         echo -e "  ${GREEN}[2]${NC} 启用/修改端口跳跃 (单段连续范围)"
@@ -1406,7 +1464,7 @@ _hysteria_port_menu() {
                 parsed=$(_parse_hop_ranges "$part") || { _press_any_key; continue; }
                 lo="${parsed%%:*}"; hi="${parsed##*:}"
                 [ "$lo" = "$hi" ] && { _warn "跳跃范围至少两个端口(单端口无需跳跃)"; _press_any_key; continue; }
-                # P2-1(0.16.7 评审): 官方禁止 mimic 与端口跳跃同用(Hysteria 启动即拒绝),
+                # 官方禁止 mimic 与端口跳跃同用(Hysteria 启动即拒绝),
                 # Manager 不得主动生成该组合
                 if _hysteria_mimic_enabled; then
                     _error "当前配置已启用 mimic, 官方不允许 mimic 与端口跳跃同时启用(Hysteria 会拒绝启动)"
@@ -1766,7 +1824,7 @@ _hysteria_bootstrap() {
     _tip "官方架构: 单服务多用户, 以下为服务器级设置; 每个节点 = 一个认证用户"
 
     # 0) 前置保护: 存在非本 Manager 管理的官方配置(auth != userpass)时绝不 bootstrap
-    #    —— bootstrap 会整体重写配置文件, 静默覆盖用户已有的合法配置是不可接受的
+    # —— bootstrap 会整体重写配置文件, 静默覆盖用户已有的合法配置是不可接受的
     if _hysteria_config_exists && ! _hysteria_server_initialized; then
         _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 userpass 模式"
         _tip "为防止覆盖现有配置, 已取消初始化; 如需接管请自行备份并手工转换 auth 段, 或确认无用后删除该配置再重试"
@@ -1800,7 +1858,7 @@ _hysteria_bootstrap() {
         parsed=$(_parse_hop_ranges "$hop") || return 1
         lo="${parsed%%:*}"; hi="${parsed##*:}"
         [ "$lo" = "$hi" ] && { _warn "跳跃范围至少两个端口"; return 1; }
-        # P2-1: 官方禁止 mimic + 端口跳跃组合(启动即拒绝)
+        # 官方禁止 mimic + 端口跳跃组合(启动即拒绝)
         if _hysteria_mimic_enabled; then
             _error "配置已启用 mimic, 官方不允许 mimic 与端口跳跃同时启用"
             _tip "请先关闭 hysteria.json 的 mimic.enabled"
@@ -1913,7 +1971,7 @@ _hysteria_bootstrap() {
         return 1
     fi
 
-    # 7.5) 首位节点元数据 + 分享链接(P1-1 0.16.4 评审): 必须在**启动服务之前**落地 ——
+    # 7.5) 首位节点元数据 + 分享链接: 必须在**启动服务之前**落地 ——
     # 否则 service 已 running 而 nodes/<user>.json 缺失时, Hysteria 侧用户可用但 Manager
     # 完全看不到该节点(幽灵用户), 且此处失败不回滚会让初始化停在半成品状态。
     # 链接构建须喂真实临时文件 —— <(process substitution) 的 fd 带 CLOEXEC,
@@ -1940,7 +1998,7 @@ _hysteria_bootstrap() {
     # 8) 服务(创建结果必须消费: P2-3 —— 创建失败 ≠ 启动失败, 报错要指向真实步骤)
     if ! _hysteria_create_service; then
         _error "service 创建失败(daemon-reload/权限?), 回滚初始化"
-        # P2-2(0.16.6 评审): service 定义未能清理干净时**保留**配置/元数据供人工恢复,
+        # service 定义未能清理干净时**保留**配置/元数据供人工恢复,
         # 而不是删掉文件留下"unit 残留 + config 缺失"的不可恢复状态
         if ! _hysteria_cleanup_service_units; then
             _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
@@ -2012,7 +2070,7 @@ _hysteria_add_node() {
         _tip "默认名已被占用, 自动命名为 ${name}"
     fi
 
-    # 节点级统一事务(BLOCKER1): 链接/元数据在事务前预构建(链接只依赖服务器级字段+本节点
+    # 节点级统一事务(): 链接/元数据在事务前预构建(链接只依赖服务器级字段+本节点
     # 数据, userpass 变更不影响链接), userpass+元数据+clash 派生 三方整体提交/回滚。
     # 链接构建喂 mktemp 临时文件(<(fd) 带 CLOEXEC, 函数内 $(jq) 子进程打不开, 见 bootstrap 同注)
     local tmp_meta
@@ -2108,7 +2166,7 @@ _hysteria_delete_node() {
         y|Y) ;;
         *) _info "已取消"; _press_any_key; return ;;
     esac
-    # 节点级统一事务(BLOCKER1): userpass 删除 + 节点元数据删除 + clash 移除一体提交/回滚
+    # 节点级统一事务(): userpass 删除 + 节点元数据删除 + clash 移除一体提交/回滚
     if ! _hysteria_node_txn --arg u "$user" 'del(.auth.userpass[$u])' \
         "$HYSTERIA_NODES_DIR/${user}.json" delete "-"; then
         _error "删除失败(节点状态保持原状)"
@@ -2144,9 +2202,9 @@ _hysteria_change_password() {
     read -rp "  新密码 (回车随机): " auth2
     auth=${auth2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符"; _press_any_key; return; }
-    # 节点级统一事务(BLOCKER1): 先用新密码预构建链接与元数据, 再整体提交。
+    # 节点级统一事务(): 先用新密码预构建链接与元数据, 再整体提交。
     # (顺带修复: 旧实现先提交 config 再从"旧 auth 的元数据"重建链接 → share_link 里
-    #  装的是旧密码, 元数据更新只改了 clash 侧, 链接与元数据分裂)
+    # 装的是旧密码, 元数据更新只改了 clash 侧, 链接与元数据分裂)
     local meta="$HYSTERIA_NODES_DIR/${user}.json" newlink tmp_meta
     [ -f "$meta" ] || { _error "节点元数据不存在($meta), 无法改密码, 请删除后重建"; _press_any_key; return; }
     tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || tmp_meta=""
@@ -2218,7 +2276,7 @@ _hysteria_view_log() {
     return 0
 }
 
-# 卸载/清理前的停止确认(评审 0.16.3 BLOCKER3): stop 后轮询确认业务进程真正退出;
+# 卸载/清理前的停止确认(): stop 后轮询确认业务进程真正退出;
 # 仍存活时按 exe 归属(readlink /proc/*/exe == $HYSTERIA_BIN, 含 "(deleted)" 就地替换
 # 形态)强制终止 —— exe 校验保证绝不误杀同名的他方进程; 再不退则返回 1 交人工处理,
 # 调用方必须拒绝继续删除文件, 避免"文件已删/进程仍在"的孤儿进程。
@@ -2243,7 +2301,7 @@ _hysteria_stop_and_verify() {
     return 1
 }
 
-# service 定义清理 + 最终状态验证(P1-2 0.16.5 评审): 原回滚路径的 disable/rm/daemon-reload
+# service 定义清理 + 最终状态验证: 原回滚路径的 disable/rm/daemon-reload
 # 全是 best-effort, 失败会让"unit 残留 + config 已删"的半残状态静默通过。这里逐步执行并
 # 复核 unit 确实消失(systemd 用 LoadState=not-found, openrc 用文件不存在), 残留时大声告警
 # 并给出人工命令 —— 属"明确降级"而非静默成功。返回 0=已清理干净; 1=仍有残留(已告警)。
@@ -2288,7 +2346,15 @@ _hysteria_uninstall() {
         *) _info "已取消"; _press_any_key; return 0 ;;
     esac
     _hysteria_stop_and_verify || { _error "hysteria 进程未退出, 已中止卸载以避免孤儿进程(文件未删除), 请手动停止后重试"; _press_any_key; return 1; }
-    _hysteria_cleanup_service_units || _warn "service 定义未完全清理干净, 请按上方提示人工核对"
+    # service 定义清理失败必须**中止卸载并保留文件** —— 原写法 warn 后
+    # 继续 rm, 会留下"unit 残留 + binary/config 缺失"(unit 仍 enabled 时下次开机尝试启动一个
+    # 已不存在的 ExecStart)。与 bootstrap 的"清理失败保留现场"契约统一。
+    if ! _hysteria_cleanup_service_units; then
+        _error "service 定义清理失败, 已中止卸载(核心/配置/数据均保留)"
+        _tip "请按上方提示人工清理 service 后重试卸载"
+        _press_any_key
+        return 1
+    fi
     case "$INIT_SYSTEM" in
         systemd) ;; openrc) ;; esac
     # 官方端口跳跃规则由 binary 启建/停清; 服务被 SIGKILL 过的极端情况可能残留, 提示人工核查
@@ -2317,10 +2383,12 @@ _hysteria_uninstall() {
 # Xray 整站卸载(_uninstall_xray 会 rm -rf $DEPLOY_DIR)的前置清理:
 # 不停服删 unit 会留下指向已删 binary 的孤儿服务。数据目录随 DEPLOY_DIR 一并消失。
 _hysteria_cleanup_before_uninstall() {
-    # BLOCKER3: 停止必须确认进程真正退出(exe 兜底强杀), 否则 _uninstall_xray 的
+    # 停止必须确认进程真正退出(exe 兜底强杀), 否则 _uninstall_xray 的
     # rm -rf $DEPLOY_DIR 会留下"文件已删/进程仍在"的孤儿进程; 返回 1 时调用方中止卸载
     _hysteria_stop_and_verify || return 1
-    _hysteria_cleanup_service_units || _warn "service 定义未完全清理干净, 请按上方提示人工核对"
+    # 清理失败返回 1 → 调用方(_uninstall_xray)中止 rm -rf;
+    # 保留文件避免"unit 残留 + 项目目录已删"的不可恢复状态
+    _hysteria_cleanup_service_units || return 1
     rm -f "$HYSTERIA_PID_FILE" 2>/dev/null
     return 0
 }
