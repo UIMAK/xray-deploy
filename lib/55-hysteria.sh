@@ -2041,11 +2041,13 @@ _hysteria_gecko_size_desc() {
 # 0.16.16(十六轮评审 P2)新增类型校验; 0.16.17 修正事实表述: 官方 server 的 wrapObfs
 # 实际接受 ""/"plain"/"salamander"/"gecko"(plain = 无混淆, 读取层已归一为空), Manager
 # 创建流程只会产生 salamander/gecko —— 两者都成立, 但"官方枚举只有两种"是错的。
+# 白名单不列 plain(十八轮评审 P3): plain 在读取层已归一为空串, 永远不会作为值到达这里;
+# "" 分支同时覆盖"未启用混淆"与"type=plain", 列 plain 反而是与数据流脱节的死分支。
 _hysteria_obfs_uri_gap() {
     local o_type
     o_type=$(_hysteria_obfs_get type)
     case "$o_type" in
-        ""|plain|salamander|gecko) ;;
+        ""|salamander|gecko) ;;
         *)
             printf 'obfs 类型 "%s" 不受支持(官方 server 接受 plain/salamander/gecko, 本 Manager 只生成后两种), 官方 binary 会拒绝启动' "$o_type"
             return 0
@@ -2177,12 +2179,13 @@ _hysteria_clash_line() {
     # obfs.type 白名单(P2, 十六轮评审; 0.16.17 修正口径): type 原样拼进单行 YAML(无引号),
     # 异常字符串会产出 malformed YAML —— 枚举按枚举校验, 白名单比 escaping 更正确。
     # 官方 server 的 wrapObfs 接受 ""/"plain"/"salamander"/"gecko"; ""与"plain"(无混淆)
-    # 在读取层已归一为空串(见 _hysteria_obfs_get), 这里不会出现; 万一出现也放行(不写字段)。
+    # 在读取层已归一为空串(见 _hysteria_obfs_get), 因此 plain **不会**到达这里 ——
+    # 白名单不列 plain(十八轮评审 P3), 与数据流一致, 不留死分支。
     local o_type o_pw o_min o_max
     o_type=$(_hysteria_obfs_get type)
     if [ -n "$o_type" ]; then
         case "$o_type" in
-            plain|salamander|gecko) ;;
+            salamander|gecko) ;;
             *)
                 _error "obfs 类型 \"$o_type\" 不受支持(官方接受 plain/salamander/gecko), 已拒绝生成 clash 条目; 请修正 $HYSTERIA_CONFIG"
                 return 1
