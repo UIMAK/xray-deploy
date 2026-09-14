@@ -1912,10 +1912,14 @@ _hysteria_masquerade_menu() {
 # ---------------------------------------------------------------------------
 
 # 读取 hysteria.json 的 obfs 段; $1 = type|password|min|max, 未启用时输出空串。
-# 官方只定义 salamander 与 gecko 两种实现(Full-Server-Config "混淆" 一节), 但此处
+# 官方只定义 salamander 与 gecko 两种**混淆**实现(Full-Server-Config "混淆" 一节), 但此处
 # **按类型名泛化**: 类型原样透出, 密码取同名子段的 password —— 官方 URI 的
 # `obfs` / `obfs-password` 本就是泛化参数(URI-Scheme.md), 将来官方再加第三种实现时
 # 链接不会静默丢参数。参数用"字段名"而非拼串, 避免密码含分隔符时的解析歧义。
+# **plain 归一化**(十七轮评审 P2): 官方 server 的 wrapObfs(app/cmd/server.go)实际接受
+# `""` 与 `"plain"`(两者都是**不做混淆**, 直接原样透传), 故 type=plain 在读取层就归一为
+# 空串 —— 链接/clash/菜单天然按"未启用混淆"处理(客户端无 obfs 连接即正确), 而不是把
+# `obfs=plain` 这种客户端不认的参数写进链接、把未知类型写进 clash。
 # 反面教训(0.16.12 及以前): 实现只认 .obfs.salamander.password —— 用户按官方文档把类型
 # 改成 gecko 后, 分享链接与 clash 条目**一个混淆参数都不写**, 客户端按无混淆连接而服务端
 # 要求混淆 → 必然连不上, 且界面没有任何提示。实机对照(真实客户端, 2026-09-14):
@@ -1927,7 +1931,7 @@ _hysteria_obfs_get() {
         (.obfs // {}) as $o
         | ($o.type // "") as $t
         | if $t == "" then ""
-          elif $k == "type"     then $t
+          elif $k == "type"     then (if $t == "plain" then "" else $t end)
           elif $k == "password" then ($o[$t].password // "")
           elif $k == "min"      then (($o[$t].minPacketSize // "") | tostring)
           elif $k == "max"      then (($o[$t].maxPacketSize // "") | tostring)
@@ -1962,6 +1966,14 @@ _hysteria_obfs_get() {
 _hysteria_gecko_size_get() {
     [ -f "$HYSTERIA_CONFIG" ] || { [ "$1" = "state" ] && echo "none"; return 0; }
     jq -r --arg k "$1" '
+        (type) as $rt
+        | if $rt != "object" then
+            # 顶层就不是一个 JSON 对象(手工把 hysteria.json 写成 null/[]/"foo"): 统一 invalid,
+            # 不给 null 开"等价于无 obfs"的口子 —— 与 fail-closed 口径一致(十七轮评审 P3)
+            (if $k == "state" then "invalid"
+             elif $k == "desc" then "顶层配置不是 JSON 对象(实际 \($rt))"
+             else "Hysteria 配置无法解析: 顶层不是 JSON 对象(官方配置要求 object)" end)
+          else
         (if .obfs == null then {} else .obfs end) as $o
         | if ($o | type) != "object" then
             (if $k == "state" then "invalid"
@@ -1979,27 +1991,34 @@ _hysteria_gecko_size_get() {
                 (if $g == null then {} else $g end) as $gg
                 | (if ($gg | has("minPacketSize")) then $gg.minPacketSize else 512 end) as $mn
                 | (if ($gg | has("maxPacketSize")) then $gg.maxPacketSize else 1200 end) as $mx
-                | (if (($mn | type) != "number" or ($mx | type) != "number") then "invalid"
-                   elif ($mn < 1 or $mx < 1 or $mn > $mx or $mx > 2048) then "invalid"
+                # 官方 schema 是 Go int(app/cmd/server.go: MinPacketSize/MaxPacketSize int),
+                # JSON number 里的分数(512.5)会被 Go 反序列化拒绝 —— 必须单独判,
+                # 不能靠 `type == "number"`(512.5 也是 number)。512.0 数值上 == 512, 合法。
+                | (if ($mn | type) != "number" then "type"
+                   elif ($mx | type) != "number" then "type"
+                   elif (($mn | floor) != $mn or ($mx | floor) != $mx) then "frac"
+                   elif ($mn < 1 or $mx < 1 or $mn > $mx or $mx > 2048) then "range"
                    elif ($mn == 512 and $mx == 1200) then "default"
                    else "custom" end) as $st
                 | (if ($mn | type) == "number" then ($mn | tostring) else ($mn | tojson) end) as $mns
                 | (if ($mx | type) == "number" then ($mx | tostring) else ($mx | tojson) end) as $mxs
-                | if $k == "state" then $st
+                | if $k == "state" then
+                    (if $st == "default" or $st == "custom" then $st else "invalid" end)
                   elif $k == "desc" then "min=\($mns) max=\($mxs)"
                   else
-                    if $st == "invalid" then
-                      if ($mn | type) != "number" or ($mx | type) != "number" then
-                        "gecko 分片尺寸类型错误(min=\($mns) max=\($mxs)): 官方要求两者为整数, 服务端会拒绝启动"
-                      else
-                        "gecko 分片尺寸越界(min=\($mns) max=\($mxs)): 官方要求 min>=1、max>=min 且 max<=2048, 服务端会拒绝启动"
-                      end
+                    if $st == "type" then
+                      "gecko 分片尺寸类型错误(min=\($mns) max=\($mxs)): 官方为 Go int 字段, 服务端会拒绝启动"
+                    elif $st == "frac" then
+                      "gecko 分片尺寸必须为整数(min=\($mns) max=\($mxs)): 官方字段是 Go int, 分数值会被拒绝启动"
+                    elif $st == "range" then
+                      "gecko 分片尺寸越界(min=\($mns) max=\($mxs)): 官方要求 min>=1、max>=min 且 max<=2048, 服务端会拒绝启动"
                     elif $st == "custom" then
                       "gecko 使用自定义分片尺寸(min=\($mns) max=\($mxs)), 官方 URI 无对应参数"
                     else "" end
                   end
               end
-          end' "$HYSTERIA_CONFIG" 2>/dev/null
+          end
+        end' "$HYSTERIA_CONFIG" 2>/dev/null
 }
 # jq 自身失败(配置损坏/被并发改写)时宁可误报 invalid 也不静默放行 —— 上面的表达式
 # 对一切输入都应产出结果, 走到这里说明解析层出了问题
@@ -2019,15 +2038,16 @@ _hysteria_gecko_size_desc() {
 # 生成出来的 URI "看起来完全正常"却让客户端按官方默认(512/1200)去连服务端 —— 用户会复制
 # 转发这条链接, 参数却不一致, 且界面无从察觉。本函数是该判断的唯一入口:
 #   stdout 非空 = 不可完整表达的原因(原样展示给用户); 空 = 可完整表达
-# 0.16.16(十六轮评审 P2)新增: obfs.type **枚举白名单** —— 官方只有 salamander/gecko,
-# 手改成别的值时官方 binary 会 FATAL, 而旧实现会把任意字符串写进链接/未转义拼进 clash。
+# 0.16.16(十六轮评审 P2)新增类型校验; 0.16.17 修正事实表述: 官方 server 的 wrapObfs
+# 实际接受 ""/"plain"/"salamander"/"gecko"(plain = 无混淆, 读取层已归一为空), Manager
+# 创建流程只会产生 salamander/gecko —— 两者都成立, 但"官方枚举只有两种"是错的。
 _hysteria_obfs_uri_gap() {
     local o_type
     o_type=$(_hysteria_obfs_get type)
     case "$o_type" in
-        ""|salamander|gecko) ;;
+        ""|plain|salamander|gecko) ;;
         *)
-            printf 'obfs 类型 "%s" 不是官方枚举值(salamander/gecko), 官方 binary 会拒绝启动' "$o_type"
+            printf 'obfs 类型 "%s" 不受支持(官方 server 接受 plain/salamander/gecko, 本 Manager 只生成后两种), 官方 binary 会拒绝启动' "$o_type"
             return 0
             ;;
     esac
@@ -2154,16 +2174,17 @@ _hysteria_clash_line() {
         _error "检测到非法 gecko 分片尺寸($(_hysteria_gecko_size_desc)): 官方要求 min>=1、max>=min 且 max<=2048; 请先修正 $HYSTERIA_CONFIG"
         return 1
     fi
-    # obfs.type 枚举白名单(P2, 十六轮评审): 官方只有 salamander/gecko。type 原样拼进
-    # 单行 YAML(无引号), 手改成异常字符串会产出 malformed YAML —— 枚举字段按枚举校验,
-    # 白名单比 YAML escaping 更正确。type 异常时官方 binary 也会 FATAL, 拒绝派生。
+    # obfs.type 白名单(P2, 十六轮评审; 0.16.17 修正口径): type 原样拼进单行 YAML(无引号),
+    # 异常字符串会产出 malformed YAML —— 枚举按枚举校验, 白名单比 escaping 更正确。
+    # 官方 server 的 wrapObfs 接受 ""/"plain"/"salamander"/"gecko"; ""与"plain"(无混淆)
+    # 在读取层已归一为空串(见 _hysteria_obfs_get), 这里不会出现; 万一出现也放行(不写字段)。
     local o_type o_pw o_min o_max
     o_type=$(_hysteria_obfs_get type)
     if [ -n "$o_type" ]; then
         case "$o_type" in
-            salamander|gecko) ;;
+            plain|salamander|gecko) ;;
             *)
-                _error "obfs 类型 \"$o_type\" 不是官方枚举值(salamander/gecko), 已拒绝生成 clash 条目; 请修正 $HYSTERIA_CONFIG"
+                _error "obfs 类型 \"$o_type\" 不受支持(官方接受 plain/salamander/gecko), 已拒绝生成 clash 条目; 请修正 $HYSTERIA_CONFIG"
                 return 1
                 ;;
         esac
