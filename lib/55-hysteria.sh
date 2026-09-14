@@ -14,6 +14,15 @@
 # 其余端口, 停止时自清 —— 本模块绝不自己写防火墙规则(与 Xray Hy2 的 iptables DNAT 不同)
 # - 完整性校验 = 官方 hashes.txt SHA256(fail-closed) + 可执行自检 + 版本匹配三层
 # (0.16.1 曾误判"官方无校验和", 0.16.2 实证修正: hashes.txt 与 binary 同目录发布)
+# - 混淆 obfs 官方有两种实现 salamander / gecko(Full-Server-Config "混淆" 一节),
+# 链接与 clash 必须按**实际类型**输出参数(读取统一走 _hysteria_obfs_get) ——
+# 只认 salamander 会让 gecko 配置的链接/clash 完全丢参数(0.16.13 前实测缺陷)
+# - gecko 分片尺寸(minPacketSize 默认 512 / maxPacketSize 默认 1200, 且 max<=2048)是
+# **配置文件字段**, 官方 URI-Scheme 只有 obfs / obfs-password 两个混淆参数, 没有尺寸参数。
+# 故 gecko 非默认尺寸时链接**拒绝生成**(否则是一条"看着正常、语义不等价"的链接),
+# 判据唯一入口 _hysteria_obfs_uri_gap; clash 条目有独立字段可完整表达, 不受影响(0.16.15)
+# - AVX 变体的兜底覆盖两层: 下载后 `version` 可执行自检(0.16.14) + **装机后真实启动验证**
+# (0.16.15) —— 自检不覆盖热路径 AVX 指令, 只有后者能抓住"能跑 version 但启动 SIGILL"
 # - 架构映射以官方 get.hy2.sh 为基准; armv5*/riscv64 取官方资产表(脚本漏列),
 # armv6/mips(BE)/mips64 因 ABI 不兼容明确拒绝(收紧)
 # =============================================================================
@@ -112,9 +121,12 @@ _hysteria_expected_sha256() {
 _hysteria_latest_version() {
     local asset final ver
     asset=$(_hysteria_arch_asset) || return 1
-    # 用 GET(-o /dev/null, 只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层
-    # 对 HEAD 返回 405 而 GET 正常, 强依赖 HEAD 是无谓的脆弱点
-    final=$(curl -fsSL -o /dev/null --max-time 15 -w '%{url_effective}' \
+    # 用 GET(只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层对 HEAD 返回 405 而 GET 正常,
+    # 强依赖 HEAD 是无谓的脆弱点。加 `-r 0-0`(Range: 只取第 1 字节): 这里要的只是 302 终点
+    # URL, 不加 Range 时 curl 会把**整个 23MB binary** 拉完才结束 —— 弱机/慢 CDN 上 15s 超时
+    # 后只剩 GitHub API 兜底, 实测因此让一次 E2E 误判为"重装失败"(2026-09-14)。官方 CDN 支持
+    # Range(实测 206 + size_download=1), 服务器若忽略 Range 则退化为旧行为, 不会更差。
+    final=$(curl -fsSL -r 0-0 -o /dev/null --max-time 15 -w '%{url_effective}' \
             "${HYSTERIA_DL_BASE}/latest/hysteria-linux-${asset}" 2>/dev/null) || final=""
     ver=$(_hysteria_canon_version "$(printf '%s' "$final" | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -1)")
     if [ -z "$ver" ] && command -v jq >/dev/null 2>&1; then
@@ -156,28 +168,37 @@ _hysteria_arch_asset() {
     esac
 }
 
-# CPU 是否支持 AVX(仅用于 amd64 AVX 变体的显式选择提示; 绝不默认选 AVX)
+# CPU 是否支持 AVX(amd64 AVX 变体的唯一判据: 支持即优先使用)
+# 用 `tr` 拆词 + `grep -qx` 精确整行匹配, 而非 `grep -qw avx`: busybox 的 `-w` 在部分
+# 构建里不生效(实测 Alpine 上 `grep -ow avx` 把 avx2/avx_vnni 也算了进来, 返回 3 个匹配),
+# 而 `-qx` 的语义是 POSIX 明确的, 与 grep 实现无关。方向上也安全: 只认真正的 avx 词条。
 _hysteria_cpu_has_avx() {
     [ -r /proc/cpuinfo ] || return 1
-    grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | grep -qw avx
+    grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | tr ' ' '\n' | grep -qx avx
 }
 
-# 结合用户变体偏好(state/hysteria_variant)给出最终资产名。
-# 业务层必须**再次**校验 CPU 能力 —— UI 侧检查不足以信任(状态文件可能
-# 从别的机器迁移过来, 或 CPU 特性被容器屏蔽), 否则会下载 amd64-avx 在无 AVX 的 CPU 上 SIGILL。
-# 最终判据: variant=avx **且** 本机 /proc/cpuinfo 确有 avx, 否则回落普通 amd64。
+# 结合 CPU 能力给出最终资产名: x86_64 且本机 /proc/cpuinfo 有 avx → amd64-avx(**优先**),
+# 否则普通 amd64。**变体不再由用户选择** —— 旧版有 [4] 手动开关 + state/hysteria_variant,
+# 现改为纯自动检测。依据: 官方文档的 Client/Server 示例直接把 `hysteria-linux-amd64-avx`
+# 当作 amd64 的产物名, 且实测官方 release v2.6.0/v2.9.2/v2.12.2 均提供该资产。
+# 自动选择必须自带兜底: 万一"cpuinfo 有 avx 但 AVX 指令实际不可执行", 下载后的可执行自检
+# 会失败, 此时 _hysteria_download_install 以 _HY_FORCE_PLAIN=1 重试普通 amd64 —— 手动开关
+# 已移除, 没有这条自愈路径用户会被永久锁在"装不上"的状态。
 _hysteria_pick_asset() {
     local base
     base=$(_hysteria_arch_asset) || return 1
-    if [ "$base" = "amd64" ] && [ "$(_state_get hysteria_variant 2>/dev/null)" = "avx" ]; then
-        if _hysteria_cpu_has_avx; then
-            echo "amd64-avx"
-        else
-            _warn "状态记录为 AVX 变体, 但本机 CPU 无 avx 支持, 已回落到普通 amd64(防 SIGILL)"
-            echo "amd64"
-        fi
-    else
+    if [ "$base" != "amd64" ]; then
         echo "$base"
+        return 0
+    fi
+    if [ -n "${_HY_FORCE_PLAIN:-}" ]; then
+        echo "amd64"
+        return 0
+    fi
+    if _hysteria_cpu_has_avx; then
+        echo "amd64-avx"
+    else
+        echo "amd64"
     fi
 }
 
@@ -189,7 +210,7 @@ _hysteria_pick_asset() {
 # 用法: _hysteria_download_install <version|latest>
 # ---------------------------------------------------------------------------
 _hysteria_download_install() {
-    local want="$1" asset url tmp ver was_running=0 backup="" old_ver=""
+    local want="$1" asset url tmp ver was_running=0 backup="" old_ver="" old_asset=""
     [ -n "$want" ] || { _error "未指定目标版本"; return 1; }
     asset=$(_hysteria_pick_asset) || { _error "不支持的 CPU 架构: $(uname -m)"; return 1; }
     if [ "$want" = "latest" ]; then
@@ -217,7 +238,7 @@ _hysteria_download_install() {
     h_file=$(mktemp "$BIN_DIR/hashes.txt.XXXXXX") || { rm -f "$tmp"; _error "临时文件创建失败"; return 1; }
     if ! _http_download "${HYSTERIA_DL_BASE}/${want}/hashes.txt" "$h_file" 60 || [ ! -s "$h_file" ]; then
         rm -f "$h_file" "$tmp"
-        _error "无法获取官方 hashes.txt 校验文件, 为防供应链篡改已中止(当前安装未变动)"
+        _error "无法获取官方 hashes.txt 校验文件, 不能确认下载内容与官方发布一致, 已中止(当前安装未变动)"
         return 1
     fi
     expected=$(_hysteria_expected_sha256 "$h_file" "hysteria-linux-${asset}")
@@ -234,14 +255,28 @@ _hysteria_download_install() {
     ver=$("$tmp" version 2>/dev/null | grep '^Version' | grep -o 'v[.0-9]*' | head -1)
     if [ "$ver" != "$want" ]; then
         rm -f "$tmp"
+        # 自愈兜底: 选了 AVX 版但本机执行不了(cpuinfo 报 avx 而实际不可执行, 或容器屏蔽)
+        # → 自动改用普通 amd64 重试一次。变体已改为自动选择、手动开关已移除, 没有这条
+        # 路径用户会永久卡在"每次安装都失败"。_HY_FORCE_PLAIN 保证只重试一次(前缀赋值仅
+        # 作用于该次调用), 普通版再失败就是真失败, 正常报错返回。
+        if [ "$asset" = "amd64-avx" ] && [ -z "${_HY_FORCE_PLAIN:-}" ]; then
+            _warn "AVX 版无法在本机执行(可执行自检未通过), 自动改用普通 amd64 重试"
+            _HY_FORCE_PLAIN=1 _hysteria_download_install "$want"
+            return $?
+        fi
         _error "下载内容校验失败(期望 ${want}, 实际 ${ver:-无法执行}), 已放弃替换"
         return 1
     fi
     if _hysteria_installed; then
-        backup="$BIN_DIR/.hysteria.rollback.$$"
-        cp -p "$HYSTERIA_BIN" "$backup" || { rm -f "$tmp"; _error "旧核心备份失败, 已中止"; return 1; }
-        # 记录旧版本, 回滚后据此校验"确实恢复到了旧版本"而不只是"服务在跑"
+        # 备份名必须**每次调用唯一**: 运行期 AVX 兜底会在本函数内再调一次本函数(嵌套),
+        # 固定名 ".hysteria.rollback.$$" 会被内层覆盖、并在内层收尾时删除 —— 外层回滚
+        # 就失去了旧 binary(嵌套调用同 PID, $$ 不区分层级)。
+        backup=$(mktemp "$BIN_DIR/.hysteria.rollback.XXXXXX") \
+            || { rm -f "$tmp"; _error "回滚备份文件创建失败, 已中止"; return 1; }
+        cp -p "$HYSTERIA_BIN" "$backup" || { rm -f "$tmp" "$backup"; _error "旧核心备份失败, 已中止"; return 1; }
+        # 记录旧版本/旧资产, 回滚后据此校验"确实恢复到了旧版本"而不只是"服务在跑"
         old_ver=$(_hysteria_current_version)
+        old_asset=$(_state_get hysteria_asset 2>/dev/null)
         if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
             was_running=1
             # 升级替换 binary 前统一用 stop_and_verify —— 确认旧进程真正退出
@@ -264,10 +299,21 @@ _hysteria_download_install() {
         chmod 755 "$HYSTERIA_BIN" 2>/dev/null
     fi
     _state_set hysteria_version "$want" || _warn "版本记录写入失败(不影响运行)"
+    # 记录**实际安装的资产名**(观察值, 不是用户配置): 运行期 AVX 兜底优先据此判断当前
+    # binary 是不是 AVX 变体 —— 不能靠 CPU 能力反推, 自检兜底可能已把变体换成普通版。
+    # 写失败只降级不阻断: 兜底侧对缺失记录有第二来源(amd64+CPU avx 的保守弱推断,
+    # 见 _hysteria_avx_runtime_retry), 故这里失败不影响安装本体。
+    _state_set hysteria_asset "$asset" || _warn "资产记录写入失败(不影响运行, AVX 兜底将按 CPU 弱推断)"
     if [ "$was_running" -eq 1 ]; then
         if _hysteria_restart_verified; then
             _success "官方 Hysteria2 核心已升级: ${want}"
         else
+            # P2-1(十五轮评审): 自检只跑 `version` 子命令, 不覆盖热路径 AVX 指令。
+            # 装的是 AVX 变体且启动失败时, 先换普通 amd64 重装重试, 再考虑回滚旧核心。
+            if _hysteria_avx_runtime_retry "$want" "$asset"; then
+                [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
+                return 0
+            fi
             _error "升级后启动失败, 回滚旧核心..."
             if [ -n "$backup" ] && mv -f "$backup" "$HYSTERIA_BIN" 2>/dev/null; then
                 # 恢复后既验证服务运行, 也验证版本确实回到旧版(防备份错/替换错)
@@ -286,6 +332,7 @@ _hysteria_download_install() {
                 _error "回滚失败(备份不可用?), 请手动恢复 ${backup}"
             fi
             _state_set hysteria_version "$old_ver" 2>/dev/null || true
+            _state_set hysteria_asset "$old_asset" 2>/dev/null || true
             [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
             return 1
         fi
@@ -296,8 +343,51 @@ _hysteria_download_install() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# AVX 运行期兜底(P2-1, 十五轮评审):
+# 下载阶段的自检只执行 `hysteria version` —— 它证明"这个 binary 能在本机执行",
+# 但**不覆盖服务热路径**里的 AVX 指令。cpuinfo 报 avx 而实际不可执行(容器屏蔽、
+# 虚拟化暴露不完整、异构迁移)时可能出现"自检通过 → 装机 → 启动 SIGILL"。
+# 此时把已装上的 AVX 变体换成普通 amd64 重装并重试启动一次, 与自检兜底合成
+# 完整生命周期: 自检失败 → 兜底; 自检通过但启动失败 → 本兜底。
+# 仅当**当前实际装的确实是 AVX 变体**才动手(据 state/hysteria_asset 这一观察值判断,
+# 不用 CPU 能力反推); _HY_FORCE_PLAIN 保证只重试一次(内层调用不再递归兜底)。
+# 用法: _hysteria_avx_runtime_retry <version> <asset>; 返回 0 = 已换普通版且启动成功
+# ---------------------------------------------------------------------------
+_hysteria_avx_runtime_retry() {
+    local want="$1" asset="$2"
+    [ -n "$want" ] || return 1
+    [ -z "${_HY_FORCE_PLAIN:-}" ] || return 1
+    # 第二来源(P2, 十六轮评审): state/hysteria_asset 只是观察值, 可能缺失或写入失败。
+    # 不能用 `hysteria version` 反推 —— 实测 v2.12.2 输出 Architecture: amd64, **不区分**
+    # avx 变体; 也不值得为它去下载官方 hashes.txt 比对 SHA256(兜底触发频率极低, 但代价
+    # 是每次失败都要一次网络往返)。改用与 _hysteria_pick_asset 相同口径的保守弱推断:
+    # amd64 架构 + CPU 报 avx → 当初装的极可能就是 AVX 变体, 宁可多做一次兜底尝试
+    # (若当初装的其实是普通版, 这次重装普通版同样能启动, 只是多一次下载)。
+    if [ -z "$asset" ]; then
+        local base
+        base=$(_hysteria_arch_asset 2>/dev/null) || return 1
+        [ "$base" = "amd64" ] || return 1
+        _hysteria_cpu_has_avx || return 1
+        asset="amd64-avx"
+        _warn "资产记录缺失(state/hysteria_asset), 按 CPU 能力保守判定当前为 AVX 变体"
+    fi
+    [ "$asset" = "amd64-avx" ] || return 1
+    _warn "AVX 版核心启动失败(自检通过但运行期不兼容), 自动改用普通 amd64 重装并重试启动(仅一次)"
+    # 内层调用时服务不在运行(启动刚失败) → 它只替换 binary, 不重启; 重启与验证由这里做
+    _HY_FORCE_PLAIN=1 _hysteria_download_install "$want" \
+        || { _warn "普通 amd64 安装失败, 继续回滚旧核心"; return 1; }
+    if _hysteria_restart_verified; then
+        _success "已自动改用普通 amd64 核心并启动成功: ${want}"
+        return 0
+    fi
+    _warn "普通 amd64 亦无法启动(问题不在 AVX 变体), 继续回滚旧核心"
+    _tip "两次启动均失败通常另有原因(TLS 证书/端口占用/配置错误), 请查看服务日志定位"
+    return 1
+}
+
 _hysteria_core_menu() {
-    local choice cur latest asset avx_note=""
+    local choice cur latest
     cur=$(_hysteria_cached_version 2>/dev/null)
     echo; echo -e "  ${CYAN}【官方核心管理】${NC}"
     if [ -n "$cur" ]; then
@@ -305,16 +395,11 @@ _hysteria_core_menu() {
     else
         echo -e "  当前版本: ${RED}未安装${NC}"
     fi
-    local asset avx_note=""
-    if asset=$(_hysteria_arch_asset) && [ "$asset" = "amd64" ] && _hysteria_cpu_has_avx; then
-        local variant="普通版"
-        [ "$(_state_get hysteria_variant 2>/dev/null)" = "avx" ] && variant="AVX"
-        avx_note="  [4] 切换 AVX 变体 (当前: ${variant})"
-    fi
+    # AVX 变体不再提供手动切换: 变体由 CPU 能力自动决定(见 _hysteria_pick_asset),
+    # 具体下载的资产名会在安装时的"下载 <url>"一行里体现(含 -avx 后缀)。
     echo
     echo -e "  ${GREEN}[1]${NC} 安装/更新到最新版"
     echo -e "  ${GREEN}[2]${NC} 安装指定版本 (v2.x.x)"
-    [ -n "$avx_note" ] && echo -e "$avx_note"
     echo -e "  ${GREEN}[0]${NC} 返回"
     echo
     read -rp "  请选择: " choice || return 0
@@ -324,13 +409,6 @@ _hysteria_core_menu() {
             read -rp "  输入版本号 (如 v2.12.2): " latest
             [ -z "$latest" ] && { _info "已取消"; return 0; }
             _hysteria_download_install "$latest"
-            ;;
-        4)
-            if [ "$(_state_get hysteria_variant 2>/dev/null)" = "avx" ]; then
-                _state_set hysteria_variant "plain" && _success "已切换为普通版, 请执行 [1] 重新安装生效"
-            else
-                _state_set hysteria_variant "avx" && _success "已切换为 AVX 变体, 请执行 [1] 重新安装生效"
-            fi
             ;;
         0) return 0 ;;
         *) _warn "无效选择" ;;
@@ -1513,11 +1591,18 @@ _hysteria_node_link() {
 # 重新同步所有节点的派生数据(clash 条目)。链接无需"重建写回"——它是动态派生的。
 # 保留本函数作为服务器级变更后的统一收尾入口(旧调用点语义不变)。
 _hysteria_rebuild_all_links() {
-    local f fail=0
+    local f fail=0 gap
+    # 语义缺口(gecko 自定义尺寸)是**服务器级**的: 每个节点的链接都派生不出来,
+    # 但这不是节点元数据的问题。故只告警一次, 并跳过逐节点的链接校验 —— 否则会为
+    # 每个节点刷一条"元数据缺字段?"的误导告警(clash 条目不受影响, 照常同步)。
+    gap=$(_hysteria_obfs_uri_gap)
+    if [ -n "$gap" ]; then
+        _warn "分享链接不可生成: ${gap} (clash/mihomo 条目不受影响, 仍会同步)"
+    fi
     for f in "$HYSTERIA_NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         # 校验派生链接可用(缺字段/坏配置时告警, 但不写回)
-        if ! _hysteria_node_link "$f" >/dev/null; then
+        if [ -z "$gap" ] && ! _hysteria_node_link "$f" >/dev/null; then
             _warn "分享链接派生失败(元数据缺字段?): $(basename "$f" .json)"
             fail=1
             continue
@@ -1645,37 +1730,75 @@ _hysteria_tls_menu() {
 }
 
 _hysteria_obfs_menu() {
-    local choice pw cur_obfs
+    local choice pw pw2 cur_type cur_min cur_max
     _hysteria_gate || { _press_any_key; return; }
     clear
-    echo; echo -e "  ${CYAN}【混淆 obfs (salamander)】${NC}"
-    cur_obfs=$(_hysteria_config_get 'obfs')
-    if [ -n "$cur_obfs" ]; then
-        echo -e "  当前状态: ${GREEN}已启用${NC}"
+    echo; echo -e "  ${CYAN}【混淆 obfs (salamander / gecko)】${NC}"
+    # 类型从配置实际读取(旧实现固定打印 salamander, gecko 配置下显示与实际不符)
+    cur_type=$(_hysteria_obfs_get type)
+    if [ -n "$cur_type" ]; then
+        echo -e "  当前状态: ${GREEN}已启用${NC} (类型: ${CYAN}${cur_type}${NC})"
     else
         echo -e "  当前状态: ${RED}未启用${NC}"
     fi
-    echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(官方文档), 需客户端带相同混淆参数${NC}"
+    echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(官方文档), 客户端必须带相同类型与密码${NC}"
+    echo -e "  ${YELLOW}salamander: 全部主流客户端支持; gecko(官方标注实验性): 官方/sing-box/mihomo 支持${NC}"
+    # 版本提示不写死具体 stable 版本号(P2-3, 十五轮评审): Xray release 变化很快, 把
+    # "26.3.27 = 稳定版且不支持" 固化进长期 UI 会迅速变成过期信息。只给方向 + 已知下限。
+    echo -e "  ${YELLOW}Xray 对 gecko 的支持取决于客户端版本: 旧版(如 26.3.27)不支持, 已知需 >= 26.9.9${NC}"
+    echo -e "  ${YELLOW}只用 Xray 客户端且不便升级时, 请选 salamander${NC}"
+    # gecko 分片尺寸: 官方 URI 只有 obfs / obfs-password, **没有**尺寸参数 —— 非默认尺寸时
+    # 链接拒绝生成(见 _hysteria_obfs_uri_gap); 非法尺寸连服务都起不来。此处如实回显。
+    if [ "$cur_type" = "gecko" ]; then
+        case "$(_hysteria_gecko_size_state)" in
+            custom)
+                echo -e "  ${YELLOW}注意: 当前 gecko 使用自定义分片尺寸($(_hysteria_gecko_size_desc)), 官方 URI 无法携带,${NC}"
+                echo -e "  ${YELLOW}分享链接将不生成(避免给出语义不完整的链接); clash/mihomo 条目会带该值${NC}"
+                ;;
+            invalid)
+                echo -e "  ${RED}警告: 当前 gecko 分片尺寸非法($(_hysteria_gecko_size_desc)) ——${NC}"
+                echo -e "  ${RED}官方要求 min>=1、max>=min 且 max<=2048, 服务端会拒绝启动, 请修正 hysteria.json${NC}"
+                ;;
+        esac
+    fi
     echo
-    echo -e "  ${GREEN}[1]${NC} 启用/更换混淆密码"
-    echo -e "  ${GREEN}[2]${NC} 禁用混淆"
+    echo -e "  ${GREEN}[1]${NC} 启用/更换 salamander 混淆密码"
+    echo -e "  ${GREEN}[2]${NC} 启用/更换 gecko 混淆密码"
+    echo -e "  ${GREEN}[3]${NC} 禁用混淆"
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  请选择: " choice || return 0
     case "$choice" in
-        1)
+        1|2)
+            local otype; [ "$choice" = "2" ] && otype="gecko" || otype="salamander"
             pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
             read -rp "  混淆密码 (回车随机): " pw2
             pw=${pw2:-$pw}
             _validate_json_text "$pw" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; _press_any_key; return 0; }
-            if ! _hysteria_config_txn --arg p "$pw" \
-                 '.obfs = {type: "salamander", salamander: {password: $p}}'; then
+            # 分片尺寸是 **gecko 专有字段**(官方 Full-Server-Config: gecko 段才有
+            # minPacketSize/maxPacketSize)。继承条件必须**同时**满足"切到 gecko"与
+            # "当前本来就是 gecko"(P3-1, 十五轮评审): 旧实现只判前者, 于是 current=
+            # salamander 时会把 salamander 子段里遗留的同名字段(对 salamander 毫无意义,
+            # 可能是手工粘贴残留)重新解释成 gecko 参数, 凭空改变服务端行为。
+            # 非 gecko 来源一律回到官方默认(不写这两个字段)。
+            if [ "$otype" = "gecko" ] && [ "$cur_type" = "gecko" ]; then
+                cur_min=$(_hysteria_obfs_get min); cur_max=$(_hysteria_obfs_get max)
+            else
+                cur_min=""; cur_max=""
+            fi
+            if ! _hysteria_config_txn --arg t "$otype" --arg p "$pw" --arg min "$cur_min" --arg max "$cur_max" \
+                 '.obfs = {type: $t}
+                          | .obfs[$t] = ({password: $p}
+                              + (if $min != "" then {minPacketSize: ($min | tonumber)} else {} end)
+                              + (if $max != "" then {maxPacketSize: ($max | tonumber)} else {} end))'; then
                 _error "混淆设置失败"
             else
                 _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
-                _success "混淆已启用"
+                _success "混淆已启用 (类型: ${otype})"
+                # 不断言"已写入分享链接": gecko 自定义尺寸下链接是**不生成**的(P1)
+                [ "$otype" = "gecko" ] && _tip "gecko 为官方实验性实现; Xray 旧版客户端不支持 gecko(已知需 >= 26.9.9), 只用 Xray 客户端请改用 salamander"
             fi
             ;;
-        2)
+        3)
             if ! _hysteria_config_txn 'del(.obfs)'; then
                 _error "混淆禁用失败"
             else
@@ -1785,15 +1908,168 @@ _hysteria_masquerade_menu() {
 }
 
 # ---------------------------------------------------------------------------
+# 官方混淆 obfs 读取(链接与 clash 共用的唯一入口)
+# ---------------------------------------------------------------------------
+
+# 读取 hysteria.json 的 obfs 段; $1 = type|password|min|max, 未启用时输出空串。
+# 官方只定义 salamander 与 gecko 两种**混淆**实现(Full-Server-Config "混淆" 一节), 但此处
+# **按类型名泛化**: 类型原样透出, 密码取同名子段的 password —— 官方 URI 的
+# `obfs` / `obfs-password` 本就是泛化参数(URI-Scheme.md), 将来官方再加第三种实现时
+# 链接不会静默丢参数。参数用"字段名"而非拼串, 避免密码含分隔符时的解析歧义。
+# **plain 归一化**(十七轮评审 P2): 官方 server 的 wrapObfs(app/cmd/server.go)实际接受
+# `""` 与 `"plain"`(两者都是**不做混淆**, 直接原样透传), 故 type=plain 在读取层就归一为
+# 空串 —— 链接/clash/菜单天然按"未启用混淆"处理(客户端无 obfs 连接即正确), 而不是把
+# `obfs=plain` 这种客户端不认的参数写进链接、把未知类型写进 clash。
+# 反面教训(0.16.12 及以前): 实现只认 .obfs.salamander.password —— 用户按官方文档把类型
+# 改成 gecko 后, 分享链接与 clash 条目**一个混淆参数都不写**, 客户端按无混淆连接而服务端
+# 要求混淆 → 必然连不上, 且界面没有任何提示。实机对照(真实客户端, 2026-09-14):
+# 服务端 gecko + 本模块条目 → mihomo 连不上(HTTP 000); 手工补上 obfs 参数 → HTTP 200。
+_hysteria_obfs_get() {
+    local key="$1"
+    [ -f "$HYSTERIA_CONFIG" ] || return 0
+    jq -r --arg k "$key" '
+        (.obfs // {}) as $o
+        | ($o.type // "") as $t
+        | if $t == "" then ""
+          elif $k == "type"     then (if $t == "plain" then "" else $t end)
+          elif $k == "password" then ($o[$t].password // "")
+          elif $k == "min"      then (($o[$t].minPacketSize // "") | tostring)
+          elif $k == "max"      then (($o[$t].maxPacketSize // "") | tostring)
+          else "" end' "$HYSTERIA_CONFIG" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# gecko 分片尺寸的语义判定(唯一入口, 0.16.15; 0.16.16 加固结构校验)
+# 官方 Full-Server-Config「混淆」一节: gecko 子段有 minPacketSize(默认 512)/
+# maxPacketSize(默认 1200), 且 **maxPacketSize 必须 >= minPacketSize 且 <= 2048**。
+# 未写的字段按官方默认补全后再判定 —— 显式写 512/1200 与省略等价, 不该算"自定义"。
+# 四种状态是**产品行为**的分界, 不是校验洁癖:
+#   none    当前 obfs 不是 gecko(尺寸字段不适用)
+#   default 有效尺寸 == 官方默认 512/1200 → 与官方默认语义一致, 链接可生成
+#   custom  有效尺寸偏离官方默认 → 官方 URI **没有**尺寸参数(只有 obfs/obfs-password),
+#           生成出来的链接会让客户端按默认尺寸连自定义尺寸的服务端 = 语义不等价
+#   invalid 越界(非数字 / min<1 / max<min / max>2048)或**结构非法** → 官方 binary 直接拒绝启动
+#
+# 0.16.16(十六轮评审 P1/P2): state/desc/why 由**同一次 jq 解析**产出 —— 旧实现是两个
+# 独立 jq, 且 has() 直接作用于未经类型检查的子段: gecko 为字符串/数组时 has() 抛错、
+# stderr 被吞 → 状态输出**空串**, 调用方既非 custom 也非 invalid → URI 照常生成;
+# minPacketSize:null 会被 `// 512` 静默当默认值(state 判 invalid 而 desc 显示 512,
+# 自相矛盾)。现在全部结构检查前置(type 先于 has), 非法结构明确归 invalid。
+# 已知取舍(有意): `.obfs.gecko` 为 **null/缺失** 时按"未写尺寸"处理(= default) ——
+# 尺寸语义上空对象就是官方默认; 密码缺失是另一维度, 由 build_link/clash 的
+# fail-closed(密码为空拒绝生成)兜住, 不混进本状态机。
+# ---------------------------------------------------------------------------
+# 用法: _hysteria_gecko_size_get <state|desc|why>
+#   state = none|default|custom|invalid(解析失败也归 invalid, fail-closed)
+#   desc  = "min=X max=Y"(非法值原样 tojson 展示, 不再冒充默认值)
+#   why   = 空串(无缺口)或完整原因文本(供 _hysteria_obfs_uri_gap 原样透出)
+_hysteria_gecko_size_get() {
+    [ -f "$HYSTERIA_CONFIG" ] || { [ "$1" = "state" ] && echo "none"; return 0; }
+    jq -r --arg k "$1" '
+        (type) as $rt
+        | if $rt != "object" then
+            # 顶层就不是一个 JSON 对象(手工把 hysteria.json 写成 null/[]/"foo"): 统一 invalid,
+            # 不给 null 开"等价于无 obfs"的口子 —— 与 fail-closed 口径一致(十七轮评审 P3)
+            (if $k == "state" then "invalid"
+             elif $k == "desc" then "顶层配置不是 JSON 对象(实际 \($rt))"
+             else "Hysteria 配置无法解析: 顶层不是 JSON 对象(官方配置要求 object)" end)
+          else
+        (if .obfs == null then {} else .obfs end) as $o
+        | if ($o | type) != "object" then
+            (if $k == "state" then "invalid"
+             elif $k == "desc" then "obfs 段不是对象(实际 \($o | type))"
+             else "gecko 混淆配置无法解析: obfs 段不是对象(官方 schema 要求 type 选择器对象)" end)
+          elif ($o.type // "") != "gecko" then
+            (if $k == "state" then "none" else "" end)
+          else
+            (if ($o | has("gecko")) then $o.gecko else {} end) as $g
+            | if ($g != null and ($g | type) != "object") then
+                (if $k == "state" then "invalid"
+                 elif $k == "desc" then "gecko 子段不是对象(实际 \($g | type))"
+                 else "gecko 混淆配置无法解析: gecko 子段不是对象" end)
+              else
+                (if $g == null then {} else $g end) as $gg
+                | (if ($gg | has("minPacketSize")) then $gg.minPacketSize else 512 end) as $mn
+                | (if ($gg | has("maxPacketSize")) then $gg.maxPacketSize else 1200 end) as $mx
+                # 官方 schema 是 Go int(app/cmd/server.go: MinPacketSize/MaxPacketSize int),
+                # JSON number 里的分数(512.5)会被 Go 反序列化拒绝 —— 必须单独判,
+                # 不能靠 `type == "number"`(512.5 也是 number)。512.0 数值上 == 512, 合法。
+                | (if ($mn | type) != "number" then "type"
+                   elif ($mx | type) != "number" then "type"
+                   elif (($mn | floor) != $mn or ($mx | floor) != $mx) then "frac"
+                   elif ($mn < 1 or $mx < 1 or $mn > $mx or $mx > 2048) then "range"
+                   elif ($mn == 512 and $mx == 1200) then "default"
+                   else "custom" end) as $st
+                | (if ($mn | type) == "number" then ($mn | tostring) else ($mn | tojson) end) as $mns
+                | (if ($mx | type) == "number" then ($mx | tostring) else ($mx | tojson) end) as $mxs
+                | if $k == "state" then
+                    (if $st == "default" or $st == "custom" then $st else "invalid" end)
+                  elif $k == "desc" then "min=\($mns) max=\($mxs)"
+                  else
+                    if $st == "type" then
+                      "gecko 分片尺寸类型错误(min=\($mns) max=\($mxs)): 官方为 Go int 字段, 服务端会拒绝启动"
+                    elif $st == "frac" then
+                      "gecko 分片尺寸必须为整数(min=\($mns) max=\($mxs)): 官方字段是 Go int, 分数值会被拒绝启动"
+                    elif $st == "range" then
+                      "gecko 分片尺寸越界(min=\($mns) max=\($mxs)): 官方要求 min>=1、max>=min 且 max<=2048, 服务端会拒绝启动"
+                    elif $st == "custom" then
+                      "gecko 使用自定义分片尺寸(min=\($mns) max=\($mxs)), 官方 URI 无对应参数"
+                    else "" end
+                  end
+              end
+          end
+        end' "$HYSTERIA_CONFIG" 2>/dev/null
+}
+# jq 自身失败(配置损坏/被并发改写)时宁可误报 invalid 也不静默放行 —— 上面的表达式
+# 对一切输入都应产出结果, 走到这里说明解析层出了问题
+_hysteria_gecko_size_state() {
+    local s
+    s=$(_hysteria_gecko_size_get state)
+    [ -n "$s" ] && { printf '%s' "$s"; return 0; }
+    echo "invalid"
+}
+_hysteria_gecko_size_desc() {
+    _hysteria_gecko_size_get desc
+}
+
+# 分享 URI 能否**完整表达**当前 obfs 配置(P1, 十五轮评审; 0.16.16 扩大覆盖)。
+# 官方 URI-Scheme 只有 obfs / obfs-password 两个混淆参数, **没有** gecko 分片尺寸参数
+# (minPacketSize/maxPacketSize 只是 hysteria.json 的配置字段)。所以 gecko 用非默认尺寸时,
+# 生成出来的 URI "看起来完全正常"却让客户端按官方默认(512/1200)去连服务端 —— 用户会复制
+# 转发这条链接, 参数却不一致, 且界面无从察觉。本函数是该判断的唯一入口:
+#   stdout 非空 = 不可完整表达的原因(原样展示给用户); 空 = 可完整表达
+# 0.16.16(十六轮评审 P2)新增类型校验; 0.16.17 修正事实表述: 官方 server 的 wrapObfs
+# 实际接受 ""/"plain"/"salamander"/"gecko"(plain = 无混淆, 读取层已归一为空), Manager
+# 创建流程只会产生 salamander/gecko —— 两者都成立, 但"官方枚举只有两种"是错的。
+# 白名单不列 plain(十八轮评审 P3): plain 在读取层已归一为空串, 永远不会作为值到达这里;
+# "" 分支同时覆盖"未启用混淆"与"type=plain", 列 plain 反而是与数据流脱节的死分支。
+_hysteria_obfs_uri_gap() {
+    local o_type
+    o_type=$(_hysteria_obfs_get type)
+    case "$o_type" in
+        ""|salamander|gecko) ;;
+        *)
+            printf 'obfs 类型 "%s" 不受支持(官方 server 接受 plain/salamander/gecko, 本 Manager 只生成后两种), 官方 binary 会拒绝启动' "$o_type"
+            return 0
+            ;;
+    esac
+    _hysteria_gecko_size_get why
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 分享链接(官方 URI scheme)与 clash 条目
 # ---------------------------------------------------------------------------
 
-# 构建官方 hysteria2:// 链接。服务器级参数(listen/tls/obfs)读 hysteria.json,
-# 节点级参数(user/auth/name/link_addr)读节点元数据 —— 官方 URI 无 congestion/up/down
-# 等客户端参数(官方文档明示 "parameters should never include ... bandwidth values")。
-# 用法: _hysteria_build_link <meta_file>; 失败返回 1
-_hysteria_build_link() {
-    local meta="$1" user auth name link_addr
+# 分享链接的**前置校验**: 节点元数据完整性 + 服务器 listen 可解析。
+# 与"URI 能否完整表达 obfs 配置"是两件不同的事, 必须分开:
+#   - 缺字段/坏 listen = 元数据或服务器配置不完整 → 调用方**必须中止**节点操作;
+#   - gecko 自定义尺寸 = 链接表达不了(语义缺口) → 只影响链接的**呈现**,
+#     **不得**阻断节点增删改(否则手改过尺寸的用户连加节点都做不到)。
+# 成功: stdout=<port_part>(如 443 / 20000-50000); 失败: 返回 1 且已打印原因
+_hysteria_link_preflight() {
+    local meta="$1" user auth name link_addr port_part
+    [ -f "$meta" ] || { _error "节点元数据文件不存在: $meta"; return 1; }
     user=$(jq -r '.user // empty' "$meta" 2>/dev/null)
     auth=$(jq -r '.auth // empty' "$meta" 2>/dev/null)
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
@@ -1802,11 +2078,32 @@ _hysteria_build_link() {
         _error "节点元数据缺少必要字段(user/auth/name/link_addr), 无法构建链接"
         return 1
     }
-    local port_part
     port_part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)") || {
         _error "无法解析 hysteria.json 的 listen: $(_hysteria_config_get listen)"
         return 1
     }
+    printf '%s' "$port_part"
+}
+
+# 构建官方 hysteria2:// 链接。服务器级参数(listen/tls/obfs)读 hysteria.json,
+# 节点级参数(user/auth/name/link_addr)读节点元数据 —— 官方 URI 无 congestion/up/down
+# 等客户端参数(官方文档明示 "parameters should never include ... bandwidth values")。
+# **语义缺口时拒绝生成**(P1, 十五轮评审): gecko 自定义/非法分片尺寸无法写进官方 URI,
+# 此时返回 1 且不输出任何 URI —— 宁可让 UI 明确说"链接不可生成", 也不产出一条
+# "看着正常、语义不等价"的链接(见 _hysteria_obfs_uri_gap)。
+# 用法: _hysteria_build_link <meta_file>; 失败返回 1
+_hysteria_build_link() {
+    local meta="$1" user auth name link_addr port_part gap
+    port_part=$(_hysteria_link_preflight "$meta") || return 1
+    gap=$(_hysteria_obfs_uri_gap)
+    if [ -n "$gap" ]; then
+        _warn "分享链接不可生成: ${gap}"
+        return 1
+    fi
+    user=$(jq -r '.user // empty' "$meta" 2>/dev/null)
+    auth=$(jq -r '.auth // empty' "$meta" 2>/dev/null)
+    name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
+    link_addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
     local link_ip="$link_addr"
     [[ "$link_addr" == *":"* && "$link_addr" != *"["* ]] && link_ip="[${link_addr}]"
     local tls_mode sni pin params=""
@@ -1822,14 +2119,41 @@ _hysteria_build_link() {
         [ -n "$pin" ] && params="${params}&pinSHA256=${pin}"
     fi
     [ -n "$sni" ] && params="${params}${params:+&}sni=$(_url_encode "$sni")"
-    local obfs_pw
-    obfs_pw=$(jq -r '.obfs.salamander.password // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    [ -n "$obfs_pw" ] && params="${params}${params:+&}obfs=salamander&obfs-password=$(_url_encode "$obfs_pw")"
+    # 混淆: 类型与密码都按官方 URI 的泛化参数写(obfs / obfs-password), 不写死 salamander。
+    # gecko 尺寸的语义缺口已在上方统一拦截, 故这里不需要(也不允许)再判断一次。
+    local o_type o_pw
+    o_type=$(_hysteria_obfs_get type)
+    if [ -n "$o_type" ]; then
+        o_pw=$(_hysteria_obfs_get password)
+        params="${params}${params:+&}obfs=$(_url_encode "$o_type")&obfs-password=$(_url_encode "$o_pw")"
+    fi
     # 官方多端口格式直接写在 port 段(443 或 20000-50000), 无 mport 参数
     local link="hysteria2://$(_url_encode "$user"):$(_url_encode "$auth")@${link_ip}:${port_part}/"
     [ -n "$params" ] && link="${link}?${params}"
     link="${link}#$(_url_encode "$name")"
     printf '%s' "$link"
+}
+
+# 分享链接的**呈现**入口(所有展示点的唯一入口, 0.16.15 P1)。
+# 存在的理由: 缺口必须由"链接生成"这一层统一处理, 而不是靠每个展示点各自记得检查 ——
+# 漏掉任何一处都会重新产出"看起来正常"的不完整链接。$2 是标签(分享链接/新分享链接)。
+# 返回 0 = 已打印 URI; 1 = 未打印(已给出原因), 调用方不得再自行打印 URI
+_hysteria_print_link() {
+    local meta="$1" label="${2:-分享链接}" gap link
+    gap=$(_hysteria_obfs_uri_gap)
+    if [ -n "$gap" ]; then
+        _warn "${label}不可生成: ${gap}"
+        if [ "$(_hysteria_gecko_size_state)" = "invalid" ]; then
+            _tip "该尺寸下服务端根本无法启动, 请先按官方约束修正 $HYSTERIA_CONFIG 的 gecko 分片尺寸"
+        else
+            _tip "官方 URI 无法表达 gecko 分片尺寸; 请使用 clash/mihomo 配置(可完整表达), 或在客户端手工设置相同尺寸"
+        fi
+        return 1
+    fi
+    link=$(_hysteria_build_link "$meta") || { _error "${label}派生失败(服务器配置不完整?)"; return 1; }
+    [ -n "$link" ] || { _error "${label}派生失败(结果为空)"; return 1; }
+    echo -e "  ${CYAN}${label}:${NC} ${link}"
+    return 0
 }
 
 # clash.yaml(mihomo) 条目。字段依据 = mihomo 源码 adapter/outbound/hysteria2.go 的
@@ -1846,15 +2170,44 @@ _hysteria_clash_line() {
         _error "节点元数据缺少必要字段(name/link_addr/user/auth), 无法生成 clash 条目"
         return 1
     }
+    # 非法 gecko 尺寸(P2-2, 十五轮评审): 官方 binary 会拒绝启动, 不把明显无效的值写进
+    # 派生缓存。只拦 invalid —— **custom 尺寸合法且可表达**(mihomo 有独立字段), 照常透出。
+    if [ "$(_hysteria_gecko_size_state)" = "invalid" ]; then
+        _error "检测到非法 gecko 分片尺寸($(_hysteria_gecko_size_desc)): 官方要求 min>=1、max>=min 且 max<=2048; 请先修正 $HYSTERIA_CONFIG"
+        return 1
+    fi
+    # obfs.type 白名单(P2, 十六轮评审; 0.16.17 修正口径): type 原样拼进单行 YAML(无引号),
+    # 异常字符串会产出 malformed YAML —— 枚举按枚举校验, 白名单比 escaping 更正确。
+    # 官方 server 的 wrapObfs 接受 ""/"plain"/"salamander"/"gecko"; ""与"plain"(无混淆)
+    # 在读取层已归一为空串(见 _hysteria_obfs_get), 因此 plain **不会**到达这里 ——
+    # 白名单不列 plain(十八轮评审 P3), 与数据流一致, 不留死分支。
+    local o_type o_pw o_min o_max
+    o_type=$(_hysteria_obfs_get type)
+    if [ -n "$o_type" ]; then
+        case "$o_type" in
+            salamander|gecko) ;;
+            *)
+                _error "obfs 类型 \"$o_type\" 不受支持(官方接受 plain/salamander/gecko), 已拒绝生成 clash 条目; 请修正 $HYSTERIA_CONFIG"
+                return 1
+                ;;
+        esac
+    fi
     local port_part
     port_part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)") || return 1
     local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$user"):$( _yaml_dq "$auth")\""
     local sni; sni=$(_hysteria_meta_get sni)
     [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
     [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ] && line="${line}, skip-cert-verify: true"
-    local obfs_pw
-    obfs_pw=$(jq -r '.obfs.salamander.password // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    [ -n "$obfs_pw" ] && line="${line}, obfs: salamander, obfs-password: \"$(_yaml_dq "$obfs_pw")\""
+    if [ -n "$o_type" ]; then
+        o_pw=$(_hysteria_obfs_get password)
+        line="${line}, obfs: ${o_type}, obfs-password: \"$(_yaml_dq "$o_pw")\""
+        # gecko 的分片尺寸: mihomo 有独立字段(obfs-min-packet-size / obfs-max-packet-size),
+        # 仅在服务端显式写了尺寸时透出 —— 未写即两端都用官方默认(512/1200)。
+        o_min=$(_hysteria_obfs_get min)
+        o_max=$(_hysteria_obfs_get max)
+        [ -n "$o_min" ] && line="${line}, obfs-min-packet-size: ${o_min}"
+        [ -n "$o_max" ] && line="${line}, obfs-max-packet-size: ${o_max}"
+    fi
     local up down
     up=$(jq -r '.bandwidth.up // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
     down=$(jq -r '.bandwidth.down // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
@@ -1925,14 +2278,16 @@ _hysteria_name_taken() {
     return 1
 }
 
-# 默认名已被占用时自动追加序号(HY2官方-443-2/-3...); 返回可用名
+# 默认名已被占用时自动追加序号(HY2官方 → HY2官方-2 → HY2官方-3...); 返回可用名。
+# 序号必须基于**原始基名**递增: 旧实现原地改写 base, 于是第三个节点会得到
+# "HY2官方-2-3" 这种叠加后缀(实测), 而不是 "HY2官方-3"。
 _hysteria_autofill_name() {
-    local base="$1" i=2
-    while _hysteria_name_taken "$base"; do
-        base="${base}-${i}"
+    local base="$1" cand="$1" i=2
+    while _hysteria_name_taken "$cand"; do
+        cand="${base}-${i}"
         i=$((i+1))
     done
-    printf '%s' "$base"
+    printf '%s' "$cand"
 }
 
 # 服务器初始化向导(bootstrap): 仅由 [添加节点] 在未初始化时触发, 单一入口避免双路径漂移。
@@ -1941,7 +2296,7 @@ _hysteria_autofill_name() {
 # 失败回滚已发生的步骤并返回 1。
 _hysteria_bootstrap() {
     local port hop parsed lo hi listen tls_json tls_mode tls_sni tls_pin
-    local obfs_pw="" masq_url="" up="" down="" addr
+    local obfs_pw="" obfs_type="" masq_url="" up="" down="" addr
     local user auth name def_name
     echo; echo -e "  ${CYAN}=== 初始化官方 Hysteria2 服务器 ===${NC}"
     _tip "官方架构: 单服务多用户, 以下为服务器级设置; 每个节点 = 一个认证用户"
@@ -2003,17 +2358,20 @@ _hysteria_bootstrap() {
     if ! _hysteria_prompt_tls; then _info "已取消"; return 1; fi
     tls_json="$HY_TLS_JSON"; tls_mode="$HY_TLS_MODE"; tls_sni="$HY_TLS_SNI"; tls_pin="$HY_TLS_PIN"
 
-    # 3) obfs(可选)
+    # 3) obfs(可选)。单次提问决定"是否启用 + 类型", 不新增提示行 —— 既有的自动化
+    # 输入序列(端口/跳跃/TLS/证书域名/本项/…)长度不变; y/Y 保留旧语义(= salamander)。
     local ans2=""
-    read -rp "  启用 salamander 混淆? [y/N]: " ans2
+    read -rp "  启用混淆? [1] salamander [2] gecko(官方标注实验性, Xray 旧版客户端不支持) (回车不启用): " ans2
     case "$ans2" in
-        y|Y)
-            obfs_pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
-            read -rp "  混淆密码 (回车随机): " ans2
-            obfs_pw=${ans2:-$obfs_pw}
-            _validate_json_text "$obfs_pw" || { _error "混淆密码含非法字符"; return 1; }
-            ;;
+        1|y|Y) obfs_type="salamander" ;;
+        2)     obfs_type="gecko" ;;
     esac
+    if [ -n "$obfs_type" ]; then
+        obfs_pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
+        read -rp "  混淆密码 (回车随机): " ans2
+        obfs_pw=${ans2:-$obfs_pw}
+        _validate_json_text "$obfs_pw" || { _error "混淆密码含非法字符"; return 1; }
+    fi
 
     # 4) 带宽(可选, 仅限速语义)
     read -rp "  上行限速 (如 100 mbps, 回车不限): " up
@@ -2043,7 +2401,7 @@ _hysteria_bootstrap() {
     read -rp "  认证密码 (回车随机): " ans2
     auth=${ans2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
-    def_name="HY2官方-${port}"
+    def_name="HY2官方"
     read -rp "  节点名称 (回车默认 ${def_name}): " ans2
     name=${ans2:-$def_name}
     _validate_json_text "$name" || { _error "名称含非法字符"; return 1; }
@@ -2057,12 +2415,15 @@ _hysteria_bootstrap() {
     local config_json
     config_json=$(jq -n \
         --arg listen "$listen" --argjson tlsblk "$tls_json" \
-        --arg obfspw "$obfs_pw" --arg up "$up" --arg down "$down" --arg masqurl "$masq_url" \
+        --arg obfspw "$obfs_pw" --arg obfstype "$obfs_type" \
+        --arg up "$up" --arg down "$down" --arg masqurl "$masq_url" \
         --arg u "$user" --arg p "$auth" \
         '{listen: $listen}
          + $tlsblk
          + {auth: {type: "userpass", userpass: {($u): $p}}}
-         + (if $obfspw != "" then {obfs: {type: "salamander", salamander: {password: $obfspw}}} else {} end)
+         + (if $obfspw != "" then
+              {obfs: ({type: $obfstype} | .[$obfstype] = {password: $obfspw})}
+            else {} end)
          + (if ($up != "" or $down != "") then
               {bandwidth: ((if $up != "" then {up: $up} else {} end)
                            + (if $down != "" then {down: $down} else {} end))}
@@ -2100,7 +2461,9 @@ _hysteria_bootstrap() {
     # 链接构建须喂真实临时文件 —— <(process substitution) 的 fd 带 CLOEXEC,
     # 函数内部 $(jq ...) 子进程打不开 /dev/fd/63(实测), 与 _hy2_gen_newmeta 同款模式。
     # 链接派生失败必须中止初始化(不得固化空链接); share_link 不再持久化(动态派生)。
-    local link meta_json tmp_meta
+    # 0.16.15 起预检只查完整性(元数据字段 + listen 可解析), 不再把"URI 表达不了 gecko
+    # 自定义尺寸"当作初始化失败 —— 那是**呈现**缺口, 不该阻断服务器初始化。
+    local meta_json tmp_meta
     tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
         _error "临时节点元数据创建失败, 回滚初始化"
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
@@ -2113,9 +2476,9 @@ _hysteria_bootstrap() {
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
         return 1
     fi
-    if ! link=$(_hysteria_build_link "$tmp_meta") || [ -z "$link" ]; then
+    if ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
         rm -f "$tmp_meta"
-        _error "分享链接派生失败, 回滚初始化"
+        _error "分享链接预检失败, 回滚初始化"
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
         return 1
     fi
@@ -2145,31 +2508,38 @@ _hysteria_bootstrap() {
     fi
     if [ "$INIT_SYSTEM" != "direct" ]; then
         if ! _hysteria_restart_verified; then
-            _error "Hysteria 服务启动失败, 回滚初始化(配置/服务)..."
-            _hysteria_stop_and_verify >/dev/null 2>&1 || _warn "停止服务时仍有残留进程, 请人工核对"
-            if ! _hysteria_cleanup_service_units; then
-                _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
-                _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODES_DIR/${user}.json"
+            # P2-1(十五轮评审): 装机后的**真实启动**失败也可能是 AVX 变体在本机不可执行
+            # (下载自检只跑 `version`)。先自动换普通 amd64 重装重试一次, 再谈回滚 ——
+            # 否则"cpuinfo 报 avx 但热路径 SIGILL"会让用户在初始化阶段被永久挡住。
+            if ! _hysteria_avx_runtime_retry "$(_hysteria_cached_version)" "$(_state_get hysteria_asset 2>/dev/null)"; then
+                _error "Hysteria 服务启动失败, 回滚初始化(配置/服务)..."
+                _hysteria_stop_and_verify >/dev/null 2>&1 || _warn "停止服务时仍有残留进程, 请人工核对"
+                if ! _hysteria_cleanup_service_units; then
+                    _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
+                    _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODES_DIR/${user}.json"
+                    return 1
+                fi
+                rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
+                rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+                _warn "初始化已回滚"
                 return 1
             fi
-            rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
-            rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
-            _warn "初始化已回滚"
-            return 1
         fi
     else
         # direct 模式无 service: 启动并做 1s 存活检查
         if ! _manage_hysteria start; then
-            rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
-            _error "启动失败, 已回滚配置"
-            return 1
+            if ! _hysteria_avx_runtime_retry "$(_hysteria_cached_version)" "$(_state_get hysteria_asset 2>/dev/null)"; then
+                rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
+                _error "启动失败, 已回滚配置"
+                return 1
+            fi
         fi
     fi
 
     # 9) clash 派生缓存(可再生; 失败仅告警, 不影响节点本体 —— helper 内部已 _warn)
     _hysteria_sync_clash "$HYSTERIA_NODES_DIR/${user}.json" || true
     _success "官方 Hysteria2 服务器已初始化: $(_hysteria_listen_display), TLS=$(_hysteria_tls_desc)"
-    echo -e "  ${CYAN}分享链接:${NC} ${link}"
+    _hysteria_print_link "$HYSTERIA_NODES_DIR/${user}.json" || true
     return 0
 }
 
@@ -2194,7 +2564,10 @@ _hysteria_add_node() {
     read -rp "  认证密码 (回车随机): " auth2
     auth=${auth2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
-    local def_name="HY2官方-$( _hysteria_listen_port_part "$(_hysteria_config_get listen)")"
+    # 默认名不含端口: 端口是服务器级设置、全部用户共用, 放进逐节点的显示名没有信息量
+    # (跳跃范围下还会变成 "HY2官方-20000-50000" 这种更没意义的形态); 重名由
+    # _hysteria_autofill_name 追加序号解决。
+    local def_name="HY2官方"
     read -rp "  节点名称 (回车默认 ${def_name}): " name
     name=${name:-$def_name}
     _validate_json_text "$name" || { _error "名称含非法字符"; return 1; }
@@ -2207,8 +2580,10 @@ _hysteria_add_node() {
     # 节点级统一事务: userpass + 节点元数据 整体提交/回滚; clash 为可再生派生缓存。
     # P1-1(第八轮评审): 链接是节点创建结果的一部分, 派生失败必须**中止创建** —— 不得把空
     # 链接固化进节点(用户会"创建成功"却拿不到链接)。链接已改为动态派生, 故此处仅做预检。
-    # 链接构建喂 mktemp 临时文件(<(fd) 带 CLOEXEC, 函数内 $(jq) 子进程打不开, 见 bootstrap 同注)
-    local tmp_meta link
+    # 0.16.15 起预检只查"元数据/服务器配置完整性": gecko 自定义尺寸属**呈现**缺口,
+    # 不能因此阻断节点创建(见 _hysteria_link_preflight 注释)。
+    # 预检喂 mktemp 临时文件(<(fd) 带 CLOEXEC, 函数内 $(jq) 子进程打不开, 见 bootstrap 同注)
+    local tmp_meta
     tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
         _error "临时节点元数据创建失败, 节点未创建"
         return 1
@@ -2220,9 +2595,9 @@ _hysteria_add_node() {
         _error "临时节点元数据构建失败, 节点未创建"
         return 1
     fi
-    if ! link=$(_hysteria_build_link "$tmp_meta") || [ -z "$link" ]; then
+    if ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
         rm -f "$tmp_meta"
-        _error "分享链接派生失败(服务器配置不完整?), 节点未创建"
+        _error "分享链接预检失败, 节点未创建"
         _tip "请先确认 hysteria.json 的 listen/tls 等服务器级字段完整"
         return 1
     fi
@@ -2239,7 +2614,8 @@ _hysteria_add_node() {
         return 1
     fi
     _success "节点 [${name}] 创建成功"
-    echo -e "  ${CYAN}分享链接:${NC} ${link}"
+    # 呈现走统一入口: gecko 自定义尺寸时明确说"不可生成", 而不是给一条语义不完整的 URI
+    _hysteria_print_link "$HYSTERIA_NODES_DIR/${user}.json" || true
     return 0
 }
 
@@ -2251,6 +2627,14 @@ _hysteria_view_nodes() {
         return 0
     fi
     echo -e "  服务器: $(_hysteria_listen_display)  TLS: $(_hysteria_tls_desc)  状态: $(_manage_hysteria status 2>/dev/null)"
+    # 语义缺口(gecko 自定义/非法尺寸)是服务器级的: 在列表顶部说明一次, 逐节点只标记
+    # "不可生成"。**绝不能**在这种情况下回退显示旧的持久化 share_link —— 那正是
+    # "看着正常、语义不等价"的链接(0.16.15 P1)。
+    local gap; gap=$(_hysteria_obfs_uri_gap)
+    if [ -n "$gap" ]; then
+        _warn "分享链接不可生成: ${gap}"
+        echo -e "  ${YELLOW}clash/mihomo 配置可完整表达该尺寸; 手工客户端请自行设置相同分片尺寸${NC}"
+    fi
     echo
     local f n=0
     for f in "$HYSTERIA_NODES_DIR"/*.json; do
@@ -2259,9 +2643,13 @@ _hysteria_view_nodes() {
         local name user link
         name=$(jq -r '.name // empty' "$f" 2>/dev/null)
         user=$(jq -r '.user // empty' "$f" 2>/dev/null)
+        echo -e "  ${GREEN}[$n]${NC} ${name}  (用户: ${user})"
+        if [ -n "$gap" ]; then
+            echo -e "      ${YELLOW}(分享链接不可生成, 见上方说明)${NC}"
+            continue
+        fi
         # share_link 动态派生(旧节点若残留持久化值, 仅在派生失败时回退显示, 避免信息丢失)
         link=$(_hysteria_node_link "$f") || link=$(jq -r '.share_link // empty' "$f" 2>/dev/null)
-        echo -e "  ${GREEN}[$n]${NC} ${name}  (用户: ${user})"
         [ -n "$link" ] && echo -e "      ${link}"
     done
     [ "$n" -eq 0 ] && _warn "暂无节点(用户)"
@@ -2349,15 +2737,16 @@ _hysteria_change_password() {
     auth=${auth2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符"; _press_any_key; return; }
     # 节点级统一事务: 只用新密码更新元数据(auth), 链接动态派生 → 天然使用新密码。
-    # 链接先预检(派生失败则中止), 但不再把 link 写回元数据(避免第 4 份需同步的状态)。
-    local meta="$HYSTERIA_NODES_DIR/${user}.json" newlink tmp_meta
+    # 链接先预检(元数据/服务器配置不完整则中止), 但不再把 link 写回元数据(避免第 4 份需
+    # 同步的状态)。0.16.15 起预检不因 gecko 自定义尺寸而中止(那只是链接的**呈现**缺口)。
+    local meta="$HYSTERIA_NODES_DIR/${user}.json" tmp_meta
     [ -f "$meta" ] || { _error "节点元数据不存在($meta), 无法改密码, 请删除后重建"; _press_any_key; return; }
     tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || { _error "临时文件创建失败"; _press_any_key; return; }
     if ! jq --arg p "$auth" '.auth=$p | del(.share_link)' "$meta" > "$tmp_meta" 2>/dev/null; then
         rm -f "$tmp_meta"; _error "元数据构建失败"; _press_any_key; return
     fi
-    if ! newlink=$(_hysteria_build_link "$tmp_meta") || [ -z "$newlink" ]; then
-        rm -f "$tmp_meta"; _error "分享链接派生失败(服务器配置不完整?), 未修改"; _press_any_key; return
+    if ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
+        rm -f "$tmp_meta"; _error "分享链接预检失败(服务器配置不完整?), 未修改"; _press_any_key; return
     fi
     local newmeta
     newmeta=$(cat "$tmp_meta") || { rm -f "$tmp_meta"; _error "元数据读取失败"; _press_any_key; return; }
@@ -2369,7 +2758,8 @@ _hysteria_change_password() {
         return
     fi
     _success "密码已修改"
-    echo -e "  ${CYAN}新分享链接:${NC} ${newlink}"
+    # 呈现走统一入口: 缺口时明确说"不可生成", 不给语义不完整的 URI
+    _hysteria_print_link "$meta" "新分享链接" || true
     _press_any_key
     return 0
 }
@@ -2526,6 +2916,16 @@ _hysteria_uninstall() {
     return 0
 }
 
+# 兼容清理(一次性): 旧版用 state/hysteria_variant 记录"用户手动选择的变体"(配套已删除的
+# [4] 菜单项)。变体现由 CPU 能力自动决定, 该键已无意义 —— 残留会让后来者误以为它仍生效。
+# 若用户曾显式选过 plain, 本次起会改用 AVX, 属**行为变更**, 故必须说出来而不是静默忽略
+# (删除用 rm -f 而非写空串: 空值会留下 0 字节 state 文件, 仍是个"存在的键")。
+_hysteria_purge_legacy_variant_state() {
+    [ -f "$STATE_DIR/hysteria_variant" ] || return 0
+    rm -f "$STATE_DIR/hysteria_variant" \
+        && _warn "已移除废弃记录 state/hysteria_variant: AVX 变体现在按 CPU 能力自动选择(支持即优先使用)"
+}
+
 # Xray 整站卸载(_uninstall_xray 会 rm -rf $DEPLOY_DIR)的前置清理:
 # 不停服删 unit 会留下指向已删 binary 的孤儿服务。数据目录随 DEPLOY_DIR 一并消失。
 _hysteria_cleanup_before_uninstall() {
@@ -2545,6 +2945,8 @@ _hysteria_cleanup_before_uninstall() {
 _hysteria_menu() {
     local choice
     _hysteria_ensure_dirs || { _press_any_key; return 0; }
+    # 进入菜单时的一次性幂等清理(declare -F 守卫, 与主菜单对混合版本安装的惯例一致)
+    declare -F _hysteria_purge_legacy_variant_state >/dev/null 2>&1 && _hysteria_purge_legacy_variant_state
     while true; do
         clear
         echo
@@ -2562,7 +2964,11 @@ _hysteria_menu() {
             echo -e "  核心: ${RED}未安装${NC}"
         fi
         [ -d "$HYSTERIA_NODES_DIR" ] && { for f in "$HYSTERIA_NODES_DIR"/*.json; do [ -f "$f" ] && ncount=$((ncount+1)); done; }
-        echo -e "  节点: ${CYAN}${ncount}${NC}  监听: $(_hysteria_server_initialized && _hysteria_listen_display || echo "未初始化")"
+        # 只报节点数: 官方是"单服务多用户"模型, 端口/跳跃属于服务器级设置且所有节点共用,
+        # 单值 "监听: <port>" 既表达不了跳跃范围的全貌(客户端实际用的是整个范围, 真实
+        # listening socket 只是范围首端口), 也容易被误读成"每个节点一个端口"。端口现况在
+        # [7] 端口/端口跳跃 里按范围显示, 并已写入每条分享链接。
+        echo -e "  节点: ${CYAN}${ncount}${NC}"
         echo
         echo -e "  ${GREEN}[1]${NC} 安装/更新官方核心"
         echo -e "  ${GREEN}[2]${NC} 添加节点 (=新增认证用户)"
