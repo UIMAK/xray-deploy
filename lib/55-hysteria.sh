@@ -14,6 +14,9 @@
 # 其余端口, 停止时自清 —— 本模块绝不自己写防火墙规则(与 Xray Hy2 的 iptables DNAT 不同)
 # - 完整性校验 = 官方 hashes.txt SHA256(fail-closed) + 可执行自检 + 版本匹配三层
 # (0.16.1 曾误判"官方无校验和", 0.16.2 实证修正: hashes.txt 与 binary 同目录发布)
+# - 混淆 obfs 官方有两种实现 salamander / gecko(Full-Server-Config "混淆" 一节),
+# 链接与 clash 必须按**实际类型**输出参数(读取统一走 _hysteria_obfs_get) ——
+# 只认 salamander 会让 gecko 配置的链接/clash 完全丢参数(0.16.13 前实测缺陷)
 # - 架构映射以官方 get.hy2.sh 为基准; armv5*/riscv64 取官方资产表(脚本漏列),
 # armv6/mips(BE)/mips64 因 ABI 不兼容明确拒绝(收紧)
 # =============================================================================
@@ -1645,37 +1648,63 @@ _hysteria_tls_menu() {
 }
 
 _hysteria_obfs_menu() {
-    local choice pw cur_obfs
+    local choice pw pw2 cur_type cur_min cur_max
     _hysteria_gate || { _press_any_key; return; }
     clear
-    echo; echo -e "  ${CYAN}【混淆 obfs (salamander)】${NC}"
-    cur_obfs=$(_hysteria_config_get 'obfs')
-    if [ -n "$cur_obfs" ]; then
-        echo -e "  当前状态: ${GREEN}已启用${NC}"
+    echo; echo -e "  ${CYAN}【混淆 obfs (salamander / gecko)】${NC}"
+    # 类型从配置实际读取(旧实现固定打印 salamander, gecko 配置下显示与实际不符)
+    cur_type=$(_hysteria_obfs_get type)
+    if [ -n "$cur_type" ]; then
+        echo -e "  当前状态: ${GREEN}已启用${NC} (类型: ${CYAN}${cur_type}${NC})"
     else
         echo -e "  当前状态: ${RED}未启用${NC}"
     fi
-    echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(官方文档), 需客户端带相同混淆参数${NC}"
+    echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(官方文档), 客户端必须带相同类型与密码${NC}"
+    echo -e "  ${YELLOW}salamander: 全部主流客户端支持; gecko(实验性): 官方/sing-box/mihomo 支持,${NC}"
+    echo -e "  ${YELLOW}但 Xray 稳定版(26.3.27)不支持 gecko —— 只用 Xray 客户端的用户请选 salamander${NC}"
+    # gecko 分片尺寸手改过时, URI 无法表达(官方 URI 只有 obfs / obfs-password 两个混淆参数)
+    if [ "$cur_type" = "gecko" ]; then
+        cur_min=$(_hysteria_obfs_get min); cur_max=$(_hysteria_obfs_get max)
+        if [ -n "$cur_min" ] || [ -n "$cur_max" ]; then
+            echo -e "  ${YELLOW}注意: 已手改 gecko 分片尺寸(${cur_min:-默认}/${cur_max:-默认}), 分享链接无法携带该值,${NC}"
+            echo -e "  ${YELLOW}需客户端自行设置或改回官方默认(512/1200); clash 条目已带该值${NC}"
+        fi
+    fi
     echo
-    echo -e "  ${GREEN}[1]${NC} 启用/更换混淆密码"
-    echo -e "  ${GREEN}[2]${NC} 禁用混淆"
+    echo -e "  ${GREEN}[1]${NC} 启用/更换 salamander 混淆密码"
+    echo -e "  ${GREEN}[2]${NC} 启用/更换 gecko 混淆密码"
+    echo -e "  ${GREEN}[3]${NC} 禁用混淆"
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  请选择: " choice || return 0
     case "$choice" in
-        1)
+        1|2)
+            local otype; [ "$choice" = "2" ] && otype="gecko" || otype="salamander"
             pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
             read -rp "  混淆密码 (回车随机): " pw2
             pw=${pw2:-$pw}
             _validate_json_text "$pw" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; _press_any_key; return 0; }
-            if ! _hysteria_config_txn --arg p "$pw" \
-                 '.obfs = {type: "salamander", salamander: {password: $p}}'; then
+            # 分片尺寸是 **gecko 专有字段**(官方 Full-Server-Config: gecko 段才有
+            # minPacketSize/maxPacketSize)。故只在"切到 gecko 且已有尺寸"时保留,
+            # 切到 salamander 必须丢弃 —— 否则会把 gecko 的字段写进 salamander 子段,
+            # 官方 binary 面对未知字段的宽容度不作保证(且语义上根本不适用)。
+            if [ "$otype" = "gecko" ]; then
+                cur_min=$(_hysteria_obfs_get min); cur_max=$(_hysteria_obfs_get max)
+            else
+                cur_min=""; cur_max=""
+            fi
+            if ! _hysteria_config_txn --arg t "$otype" --arg p "$pw" --arg min "$cur_min" --arg max "$cur_max" \
+                 '.obfs = {type: $t}
+                          | .obfs[$t] = ({password: $p}
+                              + (if $min != "" then {minPacketSize: ($min | tonumber)} else {} end)
+                              + (if $max != "" then {maxPacketSize: ($max | tonumber)} else {} end))'; then
                 _error "混淆设置失败"
             else
                 _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
-                _success "混淆已启用"
+                _success "混淆已启用 (类型: ${otype})"
+                [ "$otype" = "gecko" ] && _tip "gecko 为实验性实现, 且 Xray 稳定版客户端不支持; 已写入分享链接与 clash 条目"
             fi
             ;;
-        2)
+        3)
             if ! _hysteria_config_txn 'del(.obfs)'; then
                 _error "混淆禁用失败"
             else
@@ -1785,6 +1814,33 @@ _hysteria_masquerade_menu() {
 }
 
 # ---------------------------------------------------------------------------
+# 官方混淆 obfs 读取(链接与 clash 共用的唯一入口)
+# ---------------------------------------------------------------------------
+
+# 读取 hysteria.json 的 obfs 段; $1 = type|password|min|max, 未启用时输出空串。
+# 官方只定义 salamander 与 gecko 两种实现(Full-Server-Config "混淆" 一节), 但此处
+# **按类型名泛化**: 类型原样透出, 密码取同名子段的 password —— 官方 URI 的
+# `obfs` / `obfs-password` 本就是泛化参数(URI-Scheme.md), 将来官方再加第三种实现时
+# 链接不会静默丢参数。参数用"字段名"而非拼串, 避免密码含分隔符时的解析歧义。
+# 反面教训(0.16.12 及以前): 实现只认 .obfs.salamander.password —— 用户按官方文档把类型
+# 改成 gecko 后, 分享链接与 clash 条目**一个混淆参数都不写**, 客户端按无混淆连接而服务端
+# 要求混淆 → 必然连不上, 且界面没有任何提示。实机对照(真实客户端, 2026-09-14):
+# 服务端 gecko + 本模块条目 → mihomo 连不上(HTTP 000); 手工补上 obfs 参数 → HTTP 200。
+_hysteria_obfs_get() {
+    local key="$1"
+    [ -f "$HYSTERIA_CONFIG" ] || return 0
+    jq -r --arg k "$key" '
+        (.obfs // {}) as $o
+        | ($o.type // "") as $t
+        | if $t == "" then ""
+          elif $k == "type"     then $t
+          elif $k == "password" then ($o[$t].password // "")
+          elif $k == "min"      then (($o[$t].minPacketSize // "") | tostring)
+          elif $k == "max"      then (($o[$t].maxPacketSize // "") | tostring)
+          else "" end' "$HYSTERIA_CONFIG" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
 # 分享链接(官方 URI scheme)与 clash 条目
 # ---------------------------------------------------------------------------
 
@@ -1822,9 +1878,16 @@ _hysteria_build_link() {
         [ -n "$pin" ] && params="${params}&pinSHA256=${pin}"
     fi
     [ -n "$sni" ] && params="${params}${params:+&}sni=$(_url_encode "$sni")"
-    local obfs_pw
-    obfs_pw=$(jq -r '.obfs.salamander.password // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    [ -n "$obfs_pw" ] && params="${params}${params:+&}obfs=salamander&obfs-password=$(_url_encode "$obfs_pw")"
+    # 混淆: 类型与密码都按官方 URI 的泛化参数写(obfs / obfs-password), 不写死 salamander。
+    # gecko 的 minPacketSize/maxPacketSize **无法在 URI 中表达**(官方 URI-Scheme 只有这两个
+    # 混淆参数), 故这里不透出 —— 使用默认值(512/1200)时两端一致; 手改过尺寸的配置见
+    # _hysteria_obfs_menu 的告警。clash 条目可表达, 故在那边透出。
+    local o_type o_pw
+    o_type=$(_hysteria_obfs_get type)
+    if [ -n "$o_type" ]; then
+        o_pw=$(_hysteria_obfs_get password)
+        params="${params}${params:+&}obfs=$(_url_encode "$o_type")&obfs-password=$(_url_encode "$o_pw")"
+    fi
     # 官方多端口格式直接写在 port 段(443 或 20000-50000), 无 mport 参数
     local link="hysteria2://$(_url_encode "$user"):$(_url_encode "$auth")@${link_ip}:${port_part}/"
     [ -n "$params" ] && link="${link}?${params}"
@@ -1852,9 +1915,18 @@ _hysteria_clash_line() {
     local sni; sni=$(_hysteria_meta_get sni)
     [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
     [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ] && line="${line}, skip-cert-verify: true"
-    local obfs_pw
-    obfs_pw=$(jq -r '.obfs.salamander.password // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    [ -n "$obfs_pw" ] && line="${line}, obfs: salamander, obfs-password: \"$(_yaml_dq "$obfs_pw")\""
+    local o_type o_pw o_min o_max
+    o_type=$(_hysteria_obfs_get type)
+    if [ -n "$o_type" ]; then
+        o_pw=$(_hysteria_obfs_get password)
+        line="${line}, obfs: ${o_type}, obfs-password: \"$(_yaml_dq "$o_pw")\""
+        # gecko 的分片尺寸: mihomo 有独立字段(obfs-min-packet-size / obfs-max-packet-size),
+        # 仅在服务端显式写了尺寸时透出 —— 未写即两端都用官方默认(512/1200)。
+        o_min=$(_hysteria_obfs_get min)
+        o_max=$(_hysteria_obfs_get max)
+        [ -n "$o_min" ] && line="${line}, obfs-min-packet-size: ${o_min}"
+        [ -n "$o_max" ] && line="${line}, obfs-max-packet-size: ${o_max}"
+    fi
     local up down
     up=$(jq -r '.bandwidth.up // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
     down=$(jq -r '.bandwidth.down // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
@@ -1925,14 +1997,16 @@ _hysteria_name_taken() {
     return 1
 }
 
-# 默认名已被占用时自动追加序号(HY2官方-443-2/-3...); 返回可用名
+# 默认名已被占用时自动追加序号(HY2官方 → HY2官方-2 → HY2官方-3...); 返回可用名。
+# 序号必须基于**原始基名**递增: 旧实现原地改写 base, 于是第三个节点会得到
+# "HY2官方-2-3" 这种叠加后缀(实测), 而不是 "HY2官方-3"。
 _hysteria_autofill_name() {
-    local base="$1" i=2
-    while _hysteria_name_taken "$base"; do
-        base="${base}-${i}"
+    local base="$1" cand="$1" i=2
+    while _hysteria_name_taken "$cand"; do
+        cand="${base}-${i}"
         i=$((i+1))
     done
-    printf '%s' "$base"
+    printf '%s' "$cand"
 }
 
 # 服务器初始化向导(bootstrap): 仅由 [添加节点] 在未初始化时触发, 单一入口避免双路径漂移。
@@ -1941,7 +2015,7 @@ _hysteria_autofill_name() {
 # 失败回滚已发生的步骤并返回 1。
 _hysteria_bootstrap() {
     local port hop parsed lo hi listen tls_json tls_mode tls_sni tls_pin
-    local obfs_pw="" masq_url="" up="" down="" addr
+    local obfs_pw="" obfs_type="" masq_url="" up="" down="" addr
     local user auth name def_name
     echo; echo -e "  ${CYAN}=== 初始化官方 Hysteria2 服务器 ===${NC}"
     _tip "官方架构: 单服务多用户, 以下为服务器级设置; 每个节点 = 一个认证用户"
@@ -2003,17 +2077,20 @@ _hysteria_bootstrap() {
     if ! _hysteria_prompt_tls; then _info "已取消"; return 1; fi
     tls_json="$HY_TLS_JSON"; tls_mode="$HY_TLS_MODE"; tls_sni="$HY_TLS_SNI"; tls_pin="$HY_TLS_PIN"
 
-    # 3) obfs(可选)
+    # 3) obfs(可选)。单次提问决定"是否启用 + 类型", 不新增提示行 —— 既有的自动化
+    # 输入序列(端口/跳跃/TLS/证书域名/本项/…)长度不变; y/Y 保留旧语义(= salamander)。
     local ans2=""
-    read -rp "  启用 salamander 混淆? [y/N]: " ans2
+    read -rp "  启用混淆? [1] salamander [2] gecko(实验性, Xray 稳定版不支持) (回车不启用): " ans2
     case "$ans2" in
-        y|Y)
-            obfs_pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
-            read -rp "  混淆密码 (回车随机): " ans2
-            obfs_pw=${ans2:-$obfs_pw}
-            _validate_json_text "$obfs_pw" || { _error "混淆密码含非法字符"; return 1; }
-            ;;
+        1|y|Y) obfs_type="salamander" ;;
+        2)     obfs_type="gecko" ;;
     esac
+    if [ -n "$obfs_type" ]; then
+        obfs_pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
+        read -rp "  混淆密码 (回车随机): " ans2
+        obfs_pw=${ans2:-$obfs_pw}
+        _validate_json_text "$obfs_pw" || { _error "混淆密码含非法字符"; return 1; }
+    fi
 
     # 4) 带宽(可选, 仅限速语义)
     read -rp "  上行限速 (如 100 mbps, 回车不限): " up
@@ -2043,7 +2120,7 @@ _hysteria_bootstrap() {
     read -rp "  认证密码 (回车随机): " ans2
     auth=${ans2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
-    def_name="HY2官方-${port}"
+    def_name="HY2官方"
     read -rp "  节点名称 (回车默认 ${def_name}): " ans2
     name=${ans2:-$def_name}
     _validate_json_text "$name" || { _error "名称含非法字符"; return 1; }
@@ -2057,12 +2134,15 @@ _hysteria_bootstrap() {
     local config_json
     config_json=$(jq -n \
         --arg listen "$listen" --argjson tlsblk "$tls_json" \
-        --arg obfspw "$obfs_pw" --arg up "$up" --arg down "$down" --arg masqurl "$masq_url" \
+        --arg obfspw "$obfs_pw" --arg obfstype "$obfs_type" \
+        --arg up "$up" --arg down "$down" --arg masqurl "$masq_url" \
         --arg u "$user" --arg p "$auth" \
         '{listen: $listen}
          + $tlsblk
          + {auth: {type: "userpass", userpass: {($u): $p}}}
-         + (if $obfspw != "" then {obfs: {type: "salamander", salamander: {password: $obfspw}}} else {} end)
+         + (if $obfspw != "" then
+              {obfs: ({type: $obfstype} | .[$obfstype] = {password: $obfspw})}
+            else {} end)
          + (if ($up != "" or $down != "") then
               {bandwidth: ((if $up != "" then {up: $up} else {} end)
                            + (if $down != "" then {down: $down} else {} end))}
@@ -2194,7 +2274,10 @@ _hysteria_add_node() {
     read -rp "  认证密码 (回车随机): " auth2
     auth=${auth2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
-    local def_name="HY2官方-$( _hysteria_listen_port_part "$(_hysteria_config_get listen)")"
+    # 默认名不含端口: 端口是服务器级设置、全部用户共用, 放进逐节点的显示名没有信息量
+    # (跳跃范围下还会变成 "HY2官方-20000-50000" 这种更没意义的形态); 重名由
+    # _hysteria_autofill_name 追加序号解决。
+    local def_name="HY2官方"
     read -rp "  节点名称 (回车默认 ${def_name}): " name
     name=${name:-$def_name}
     _validate_json_text "$name" || { _error "名称含非法字符"; return 1; }
@@ -2562,7 +2645,11 @@ _hysteria_menu() {
             echo -e "  核心: ${RED}未安装${NC}"
         fi
         [ -d "$HYSTERIA_NODES_DIR" ] && { for f in "$HYSTERIA_NODES_DIR"/*.json; do [ -f "$f" ] && ncount=$((ncount+1)); done; }
-        echo -e "  节点: ${CYAN}${ncount}${NC}  监听: $(_hysteria_server_initialized && _hysteria_listen_display || echo "未初始化")"
+        # 只报节点数: 官方是"单服务多用户"模型, 端口/跳跃属于服务器级设置且所有节点共用,
+        # 单值 "监听: <port>" 既表达不了跳跃范围的全貌(客户端实际用的是整个范围, 真实
+        # listening socket 只是范围首端口), 也容易被误读成"每个节点一个端口"。端口现况在
+        # [7] 端口/端口跳跃 里按范围显示, 并已写入每条分享链接。
+        echo -e "  节点: ${CYAN}${ncount}${NC}"
         echo
         echo -e "  ${GREEN}[1]${NC} 安装/更新官方核心"
         echo -e "  ${GREEN}[2]${NC} 添加节点 (=新增认证用户)"
