@@ -347,12 +347,12 @@ _hysteria_core_menu() {
 _hysteria_is_running() {
     # 结构复刻 _xray_is_running 的三分支判活(该函数是项目加固最重的函数, 不参数化共用,
     # 避免"为了 DRY 动它"引入回归; 本函数独立维护同样的判活口径):
-    # systemd: unit 已知时 MainPID 权威, MainPID=0 即 stopped, 不回退全机扫描
-    # (否则宿主上别人的 hysteria 会被当成我们的服务)
+    # systemd: 必须 ActiveState=active 且 SubState=running, 且 MainPID 非 0 —— 只认"service
+    # 真正在跑", 不回退全机扫描(否则宿主上别人的 hysteria 会被当成我们的服务)
     # openrc : pidfile 是 supervise-daemon 父进程, 需回溯 ppid 链找业务子进程
     # direct : pidfile 即业务进程
     # 兜底  : 全机扫描, 只认 exe 指向 $HYSTERIA_BIN 的进程
-    local anchor="" load=""
+    local anchor="" load="" active=""
     case "$INIT_SYSTEM" in
         systemd)
             load=$(systemctl show -p LoadState --value "$HYSTERIA_SVC" 2>/dev/null)
@@ -362,6 +362,21 @@ _hysteria_is_running() {
                     systemctl is-active --quiet "$HYSTERIA_SVC" 2>/dev/null || return 1
                     ;;
                 *)
+                    # P2-1(第十轮评审): 判活语义从"进程存在"提升为"service 真正 active/running"。
+                    # 只看 MainPID != 0 会把 activating(auto-restart 等待期)/deactivating 也算成
+                    # running —— 与瞬态验证的连续采样修复同源(同一类"崩溃重启窗口"误判): 配置
+                    # 启动后 8~10s 才崩的场景下, 旧的 8 次全 running 轮询可能整体落在
+                    # activating/auto-restart 窗口内而误判成功并提交。加 ActiveState/SubState
+                    # 后 activating/deactivating/failed/auto-restart 自然全部排除。
+                    active=$(systemctl show -p ActiveState --value "$HYSTERIA_SVC" 2>/dev/null)
+                    if [ -n "$active" ]; then
+                        [ "$active" = "active" ] || return 1
+                        [ "$(systemctl show -p SubState --value "$HYSTERIA_SVC" 2>/dev/null)" = "running" ] || return 1
+                    else
+                        # --value 不可用(systemd < 230): 退回 is-active 精确判定,
+                        # 仍然不依赖裸 MainPID
+                        systemctl is-active --quiet "$HYSTERIA_SVC" 2>/dev/null || return 1
+                    fi
                     anchor=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null)
                     [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
                     [ "$anchor" != "0" ] || return 1
