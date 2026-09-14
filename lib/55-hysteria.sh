@@ -404,6 +404,32 @@ _hysteria_pid_is_ours() {
     [ -n "$want" ] && [ "$exe" = "$want" ]
 }
 
+# 判断以 anchor 为根(含自身)的进程树里是否存在 exe == $HYSTERIA_BIN 的进程(P2-1 第八轮评审)。
+# 用于 openrc supervisor 归属校验: supervisor 自身 exe 是 supervise-daemon, 需向下找业务子进程;
+# 深度 4 足以覆盖 supervisor→hysteria 拓扑。exe 读不到时按"无法确认"处理(不放行), 因为
+# 本函数的用途是"动手杀进程前确认归属", 假阳性会误杀他方服务。
+_hysteria_proc_tree_has_bin() {
+    local anchor="$1" p c cur i
+    [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
+    [ "$anchor" != "0" ] || return 1
+    _proc_exe_is "$anchor" "$HYSTERIA_BIN" && return 0
+    for p in /proc/[0-9]*; do
+        c="${p#/proc/}"
+        cur="$c"
+        i=0
+        while [ "$i" -lt 4 ]; do
+            cur=$(_proc_ppid "$cur") || break
+            if [ "$cur" = "$anchor" ]; then
+                _proc_exe_is "$c" "$HYSTERIA_BIN" && return 0
+                break
+            fi
+            if [ "$cur" = "1" ] || [ "$cur" = "0" ]; then break; fi
+            i=$((i+1))
+        done
+    done
+    return 1
+}
+
 _manage_hysteria() {
     local action="$1"
     # fd9 关闭(9>&-): 本函数可能在 _with_config_lock 的锁子 shell 内被调用(config 事务),
@@ -502,7 +528,10 @@ _manage_hysteria() {
 # 子进程 FATAL 后 supervisor 进入 respawn-wait(仍存活), openrc 却把服务标记 stopped;
 # 此后 start 被 "supervise-daemon: already running" 拒绝, 服务永远起不来。
 # stop 后若 pidfile 仍指向存活的 supervise-daemo(busybox comm 截断 15 字符), 显式 kill。
-# 归属安全: pidfile 是本服务专属路径, 且必须 comm 匹配才动手。
+# 归属安全(P2-1 第八轮评审): 不能只看 comm=supervise-daemo* —— pidfile 陈旧且 PID 被**别的**
+# openrc 服务的 supervisor 复用时, 只看名字会误杀他方进程。openrc 的 pidfile 是 supervisor
+# 父进程(其 exe 不是 hysteria), 无法像 direct 那样直接比 exe; 改为校验**其进程树里确实存在
+# exe == $HYSTERIA_BIN 的进程**, 归属确属本项目才动手。
 _hysteria_kill_stale_supervisor() {
     local a c k
     a=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
@@ -511,12 +540,16 @@ _hysteria_kill_stale_supervisor() {
     c=$(cat "/proc/$a/comm" 2>/dev/null)
     case "$c" in
         supervise-daemo*)
-            kill "$a" 2>/dev/null
-            for k in 1 2 3 4 5; do
-                kill -0 "$a" 2>/dev/null || break
-                sleep 1
-            done
-            kill -0 "$a" 2>/dev/null && kill -9 "$a" 2>/dev/null
+            if _hysteria_proc_tree_has_bin "$a"; then
+                kill "$a" 2>/dev/null
+                for k in 1 2 3 4 5; do
+                    kill -0 "$a" 2>/dev/null || break
+                    sleep 1
+                done
+                kill -0 "$a" 2>/dev/null && kill -9 "$a" 2>/dev/null
+            else
+                _warn "pidfile 指向的 supervise-daemon(pid=$a) 未管理本项目的 hysteria, 不杀(可能是他方服务)"
+            fi
             ;;
     esac
     rm -f "$HYSTERIA_PID_FILE"
@@ -1154,16 +1187,23 @@ _hysteria_config_exists() {
 
 _hysteria_server_initialized() {
     _hysteria_config_exists || return 1
-    jq -e '.auth.type == "userpass" and (.auth.userpass | type == "object")' "$HYSTERIA_CONFIG" >/dev/null 2>&1
+    # P2-2(第八轮评审): 空 userpass 表不是可运行状态(官方 binary 直接 FATAL), 也不能算已初始化
+    # —— 否则手工留下 {"type":"userpass","userpass":{}} 时菜单放行, 但服务起不来且无节点。
+    jq -e '.auth.type == "userpass" and (.auth.userpass | type == "object") and ((.auth.userpass | length) > 0)' "$HYSTERIA_CONFIG" >/dev/null 2>&1
 }
 
-# 菜单操作闸门: initialized → 放行; 配置存在但 auth 非 userpass → 明确"不接管";
-# 无配置 → 提示初始化路径。返回 1 时调用方中止操作。
+# 菜单操作闸门: initialized → 放行; 配置存在但 auth 非 userpass 或 userpass 为空 → 明确
+# "不接管/状态不完整"; 无配置 → 提示初始化路径。返回 1 时调用方中止操作。
 _hysteria_gate() {
     _hysteria_server_initialized && return 0
     if _hysteria_config_exists; then
-        _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 userpass 模式"
-        _tip "为防止覆盖现有配置, 菜单操作不可用; 如需接管请自行备份并手工把 auth 段转换为 userpass 表, 或删除该配置后重新初始化"
+        if jq -e '.auth.type == "userpass"' "$HYSTERIA_CONFIG" >/dev/null 2>&1; then
+            _error "Hysteria 配置的 auth.userpass 表为空(不完整状态): $HYSTERIA_CONFIG"
+            _tip "空表无法启动(官方 binary 会 FATAL); 请删除该配置后重新初始化, 或手工补一个用户"
+        else
+            _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 userpass 模式"
+            _tip "为防止覆盖现有配置, 菜单操作不可用; 如需接管请自行备份并手工把 auth 段转换为 userpass 表, 或删除该配置后重新初始化"
+        fi
     else
         _warn "Hysteria 服务器未初始化, 请先通过 [添加节点] 初始化"
     fi
@@ -1399,16 +1439,32 @@ _hysteria_config_get() {
 }
 
 # 重建所有节点分享链接(端口/TLS/obfs 等服务器级变更后调用)并同步 clash
+# 分享链接 = 纯派生值(评审第八轮 P1-1/P1-2 方案 A): 由 hysteria.json(服务器级) +
+# server_meta.json + 节点元数据实时计算, **不再作为持久 canonical state 写回 nodes/*.json**。
+# 理由: share_link 本质是 "server state + node state" 的表示形式, 持久化会引入第 4 份需要
+# 同步的状态 —— 服务器级变更(TLS/端口/obfs)后若写回失败, 用户会看到旧链接而操作仍报成功;
+# 节点创建时若预构建失败, 又会把空链接固化。改为动态派生后两个问题一并消失。
+# 用法: link=$(_hysteria_node_link <meta_file>); 失败/缺字段时输出空串并返回 1
+_hysteria_node_link() {
+    local meta="$1" link
+    [ -f "$meta" ] || return 1
+    link=$(_hysteria_build_link "$meta") || return 1
+    [ -n "$link" ] || return 1
+    printf '%s' "$link"
+}
+
+# 重新同步所有节点的派生数据(clash 条目)。链接无需"重建写回"——它是动态派生的。
+# 保留本函数作为服务器级变更后的统一收尾入口(旧调用点语义不变)。
 _hysteria_rebuild_all_links() {
-    local f link name fail=0
+    local f fail=0
     for f in "$HYSTERIA_NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
-        if ! link=$(_hysteria_build_link "$f") || [ -z "$link" ]; then
-            _warn "分享链接重建失败(元数据缺字段?): $(basename "$f" .json)"
+        # 校验派生链接可用(缺字段/坏配置时告警, 但不写回)
+        if ! _hysteria_node_link "$f" >/dev/null; then
+            _warn "分享链接派生失败(元数据缺字段?): $(basename "$f" .json)"
             fail=1
             continue
         fi
-        _meta_update "$f" '.share_link=$l' --arg l "$link" || { fail=1; continue; }
         _hysteria_sync_clash "$f" || fail=1
     done
     return "$fail"
@@ -1976,19 +2032,30 @@ _hysteria_bootstrap() {
     # 完全看不到该节点(幽灵用户), 且此处失败不回滚会让初始化停在半成品状态。
     # 链接构建须喂真实临时文件 —— <(process substitution) 的 fd 带 CLOEXEC,
     # 函数内部 $(jq ...) 子进程打不开 /dev/fd/63(实测), 与 _hy2_gen_newmeta 同款模式。
+    # 链接派生失败必须中止初始化(不得固化空链接); share_link 不再持久化(动态派生)。
     local link meta_json tmp_meta
-    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || tmp_meta=""
-    if [ -n "$tmp_meta" ]; then
-        jq -n --arg u "$user" --arg a "$auth" --arg n "$name" --arg addr "$addr" \
-            '{user:$u,auth:$a,name:$n,link_addr:$addr}' > "$tmp_meta" 2>/dev/null
-        link=$(_hysteria_build_link "$tmp_meta") || link=""
+    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
+        _error "临时节点元数据创建失败, 回滚初始化"
+        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
+        return 1
+    }
+    if ! jq -n --arg u "$user" --arg a "$auth" --arg n "$name" --arg addr "$addr" \
+         '{user:$u,auth:$a,name:$n,link_addr:$addr}' > "$tmp_meta" 2>/dev/null; then
         rm -f "$tmp_meta"
-    else
-        link=""
+        _error "临时节点元数据构建失败, 回滚初始化"
+        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
+        return 1
     fi
+    if ! link=$(_hysteria_build_link "$tmp_meta") || [ -z "$link" ]; then
+        rm -f "$tmp_meta"
+        _error "分享链接派生失败, 回滚初始化"
+        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
+        return 1
+    fi
+    rm -f "$tmp_meta"
     meta_json=$(jq -n --arg u "$user" --arg a "$auth" --arg n "$name" \
-        --arg addr "$addr" --arg link "$link" --arg created "$(date '+%Y-%m-%d')" \
-        '{user:$u,auth:$a,name:$n,link_addr:$addr,created:$created,share_link:$link}')
+        --arg addr "$addr" --arg created "$(date '+%Y-%m-%d')" \
+        '{user:$u,auth:$a,name:$n,link_addr:$addr,created:$created}')
     if ! _atomic_write_json "$HYSTERIA_NODES_DIR/${user}.json" "$meta_json"; then
         _error "首位节点元数据写入失败, 回滚初始化(配置/元数据)"
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
@@ -2070,23 +2137,34 @@ _hysteria_add_node() {
         _tip "默认名已被占用, 自动命名为 ${name}"
     fi
 
-    # 节点级统一事务(): 链接/元数据在事务前预构建(链接只依赖服务器级字段+本节点
-    # 数据, userpass 变更不影响链接), userpass+元数据+clash 派生 三方整体提交/回滚。
+    # 节点级统一事务: userpass + 节点元数据 整体提交/回滚; clash 为可再生派生缓存。
+    # P1-1(第八轮评审): 链接是节点创建结果的一部分, 派生失败必须**中止创建** —— 不得把空
+    # 链接固化进节点(用户会"创建成功"却拿不到链接)。链接已改为动态派生, 故此处仅做预检。
     # 链接构建喂 mktemp 临时文件(<(fd) 带 CLOEXEC, 函数内 $(jq) 子进程打不开, 见 bootstrap 同注)
-    local tmp_meta
-    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || tmp_meta=""
-    link=""
-    if [ -n "$tmp_meta" ]; then
-        jq -n --arg u "$user" --arg a "$auth" --arg n "$name" \
-            --arg addr "$(_hysteria_meta_get link_addr)" \
-            '{user:$u,auth:$a,name:$n,link_addr:$addr}' > "$tmp_meta" 2>/dev/null
-        link=$(_hysteria_build_link "$tmp_meta") || link=""
+    local tmp_meta link
+    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
+        _error "临时节点元数据创建失败, 节点未创建"
+        return 1
+    }
+    if ! jq -n --arg u "$user" --arg a "$auth" --arg n "$name" \
+         --arg addr "$(_hysteria_meta_get link_addr)" \
+         '{user:$u,auth:$a,name:$n,link_addr:$addr}' > "$tmp_meta" 2>/dev/null; then
         rm -f "$tmp_meta"
+        _error "临时节点元数据构建失败, 节点未创建"
+        return 1
     fi
+    if ! link=$(_hysteria_build_link "$tmp_meta") || [ -z "$link" ]; then
+        rm -f "$tmp_meta"
+        _error "分享链接派生失败(服务器配置不完整?), 节点未创建"
+        _tip "请先确认 hysteria.json 的 listen/tls 等服务器级字段完整"
+        return 1
+    fi
+    rm -f "$tmp_meta"
+    # 元数据不再持久化 share_link(动态派生): 只存 node state
+    local meta_json
     meta_json=$(jq -n --arg u "$user" --arg a "$auth" --arg n "$name" \
-        --arg addr "$(_hysteria_meta_get link_addr)" --arg link "$link" \
-        --arg created "$(date '+%Y-%m-%d')" \
-        '{user:$u,auth:$a,name:$n,link_addr:$addr,created:$created,share_link:$link}')
+        --arg addr "$(_hysteria_meta_get link_addr)" --arg created "$(date '+%Y-%m-%d')" \
+        '{user:$u,auth:$a,name:$n,link_addr:$addr,created:$created}')
     if ! _hysteria_node_txn --arg u "$user" --arg p "$auth" \
         '.auth.userpass[$u] = $p' \
         "$HYSTERIA_NODES_DIR/${user}.json" create "$meta_json"; then
@@ -2114,7 +2192,8 @@ _hysteria_view_nodes() {
         local name user link
         name=$(jq -r '.name // empty' "$f" 2>/dev/null)
         user=$(jq -r '.user // empty' "$f" 2>/dev/null)
-        link=$(jq -r '.share_link // empty' "$f" 2>/dev/null)
+        # share_link 动态派生(旧节点若残留持久化值, 仅在派生失败时回退显示, 避免信息丢失)
+        link=$(_hysteria_node_link "$f") || link=$(jq -r '.share_link // empty' "$f" 2>/dev/null)
         echo -e "  ${GREEN}[$n]${NC} ${name}  (用户: ${user})"
         [ -n "$link" ] && echo -e "      ${link}"
     done
@@ -2202,19 +2281,19 @@ _hysteria_change_password() {
     read -rp "  新密码 (回车随机): " auth2
     auth=${auth2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符"; _press_any_key; return; }
-    # 节点级统一事务(): 先用新密码预构建链接与元数据, 再整体提交。
-    # (顺带修复: 旧实现先提交 config 再从"旧 auth 的元数据"重建链接 → share_link 里
-    # 装的是旧密码, 元数据更新只改了 clash 侧, 链接与元数据分裂)
+    # 节点级统一事务: 只用新密码更新元数据(auth), 链接动态派生 → 天然使用新密码。
+    # 链接先预检(派生失败则中止), 但不再把 link 写回元数据(避免第 4 份需同步的状态)。
     local meta="$HYSTERIA_NODES_DIR/${user}.json" newlink tmp_meta
     [ -f "$meta" ] || { _error "节点元数据不存在($meta), 无法改密码, 请删除后重建"; _press_any_key; return; }
-    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || tmp_meta=""
-    if [ -z "$tmp_meta" ]; then _error "临时文件创建失败"; _press_any_key; return; fi
-    if ! jq --arg p "$auth" '.auth=$p' "$meta" > "$tmp_meta" 2>/dev/null; then
+    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || { _error "临时文件创建失败"; _press_any_key; return; }
+    if ! jq --arg p "$auth" '.auth=$p | del(.share_link)' "$meta" > "$tmp_meta" 2>/dev/null; then
         rm -f "$tmp_meta"; _error "元数据构建失败"; _press_any_key; return
     fi
-    newlink=$(_hysteria_build_link "$tmp_meta") || { rm -f "$tmp_meta"; _error "分享链接重建失败"; _press_any_key; return; }
+    if ! newlink=$(_hysteria_build_link "$tmp_meta") || [ -z "$newlink" ]; then
+        rm -f "$tmp_meta"; _error "分享链接派生失败(服务器配置不完整?), 未修改"; _press_any_key; return
+    fi
     local newmeta
-    newmeta=$(jq --arg p "$auth" --arg l "$newlink" '.auth=$p | .share_link=$l' "$meta") || { rm -f "$tmp_meta"; _error "元数据构建失败"; _press_any_key; return; }
+    newmeta=$(cat "$tmp_meta") || { rm -f "$tmp_meta"; _error "元数据读取失败"; _press_any_key; return; }
     rm -f "$tmp_meta"
     if ! _hysteria_node_txn --arg u "$user" --arg p "$auth" \
         '.auth.userpass[$u] = $p' "$meta" create "$newmeta"; then
