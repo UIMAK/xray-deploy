@@ -115,9 +115,12 @@ _hysteria_expected_sha256() {
 _hysteria_latest_version() {
     local asset final ver
     asset=$(_hysteria_arch_asset) || return 1
-    # 用 GET(-o /dev/null, 只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层
-    # 对 HEAD 返回 405 而 GET 正常, 强依赖 HEAD 是无谓的脆弱点
-    final=$(curl -fsSL -o /dev/null --max-time 15 -w '%{url_effective}' \
+    # 用 GET(只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层对 HEAD 返回 405 而 GET 正常,
+    # 强依赖 HEAD 是无谓的脆弱点。加 `-r 0-0`(Range: 只取第 1 字节): 这里要的只是 302 终点
+    # URL, 不加 Range 时 curl 会把**整个 23MB binary** 拉完才结束 —— 弱机/慢 CDN 上 15s 超时
+    # 后只剩 GitHub API 兜底, 实测因此让一次 E2E 误判为"重装失败"(2026-09-14)。官方 CDN 支持
+    # Range(实测 206 + size_download=1), 服务器若忽略 Range 则退化为旧行为, 不会更差。
+    final=$(curl -fsSL -r 0-0 -o /dev/null --max-time 15 -w '%{url_effective}' \
             "${HYSTERIA_DL_BASE}/latest/hysteria-linux-${asset}" 2>/dev/null) || final=""
     ver=$(_hysteria_canon_version "$(printf '%s' "$final" | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -1)")
     if [ -z "$ver" ] && command -v jq >/dev/null 2>&1; then
@@ -159,28 +162,37 @@ _hysteria_arch_asset() {
     esac
 }
 
-# CPU 是否支持 AVX(仅用于 amd64 AVX 变体的显式选择提示; 绝不默认选 AVX)
+# CPU 是否支持 AVX(amd64 AVX 变体的唯一判据: 支持即优先使用)
+# 用 `tr` 拆词 + `grep -qx` 精确整行匹配, 而非 `grep -qw avx`: busybox 的 `-w` 在部分
+# 构建里不生效(实测 Alpine 上 `grep -ow avx` 把 avx2/avx_vnni 也算了进来, 返回 3 个匹配),
+# 而 `-qx` 的语义是 POSIX 明确的, 与 grep 实现无关。方向上也安全: 只认真正的 avx 词条。
 _hysteria_cpu_has_avx() {
     [ -r /proc/cpuinfo ] || return 1
-    grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | grep -qw avx
+    grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | tr ' ' '\n' | grep -qx avx
 }
 
-# 结合用户变体偏好(state/hysteria_variant)给出最终资产名。
-# 业务层必须**再次**校验 CPU 能力 —— UI 侧检查不足以信任(状态文件可能
-# 从别的机器迁移过来, 或 CPU 特性被容器屏蔽), 否则会下载 amd64-avx 在无 AVX 的 CPU 上 SIGILL。
-# 最终判据: variant=avx **且** 本机 /proc/cpuinfo 确有 avx, 否则回落普通 amd64。
+# 结合 CPU 能力给出最终资产名: x86_64 且本机 /proc/cpuinfo 有 avx → amd64-avx(**优先**),
+# 否则普通 amd64。**变体不再由用户选择** —— 旧版有 [4] 手动开关 + state/hysteria_variant,
+# 现改为纯自动检测。依据: 官方文档的 Client/Server 示例直接把 `hysteria-linux-amd64-avx`
+# 当作 amd64 的产物名, 且实测官方 release v2.6.0/v2.9.2/v2.12.2 均提供该资产。
+# 自动选择必须自带兜底: 万一"cpuinfo 有 avx 但 AVX 指令实际不可执行", 下载后的可执行自检
+# 会失败, 此时 _hysteria_download_install 以 _HY_FORCE_PLAIN=1 重试普通 amd64 —— 手动开关
+# 已移除, 没有这条自愈路径用户会被永久锁在"装不上"的状态。
 _hysteria_pick_asset() {
     local base
     base=$(_hysteria_arch_asset) || return 1
-    if [ "$base" = "amd64" ] && [ "$(_state_get hysteria_variant 2>/dev/null)" = "avx" ]; then
-        if _hysteria_cpu_has_avx; then
-            echo "amd64-avx"
-        else
-            _warn "状态记录为 AVX 变体, 但本机 CPU 无 avx 支持, 已回落到普通 amd64(防 SIGILL)"
-            echo "amd64"
-        fi
-    else
+    if [ "$base" != "amd64" ]; then
         echo "$base"
+        return 0
+    fi
+    if [ -n "${_HY_FORCE_PLAIN:-}" ]; then
+        echo "amd64"
+        return 0
+    fi
+    if _hysteria_cpu_has_avx; then
+        echo "amd64-avx"
+    else
+        echo "amd64"
     fi
 }
 
@@ -237,6 +249,15 @@ _hysteria_download_install() {
     ver=$("$tmp" version 2>/dev/null | grep '^Version' | grep -o 'v[.0-9]*' | head -1)
     if [ "$ver" != "$want" ]; then
         rm -f "$tmp"
+        # 自愈兜底: 选了 AVX 版但本机执行不了(cpuinfo 报 avx 而实际不可执行, 或容器屏蔽)
+        # → 自动改用普通 amd64 重试一次。变体已改为自动选择、手动开关已移除, 没有这条
+        # 路径用户会永久卡在"每次安装都失败"。_HY_FORCE_PLAIN 保证只重试一次(前缀赋值仅
+        # 作用于该次调用), 普通版再失败就是真失败, 正常报错返回。
+        if [ "$asset" = "amd64-avx" ] && [ -z "${_HY_FORCE_PLAIN:-}" ]; then
+            _warn "AVX 版无法在本机执行(可执行自检未通过), 自动改用普通 amd64 重试"
+            _HY_FORCE_PLAIN=1 _hysteria_download_install "$want"
+            return $?
+        fi
         _error "下载内容校验失败(期望 ${want}, 实际 ${ver:-无法执行}), 已放弃替换"
         return 1
     fi
@@ -300,7 +321,7 @@ _hysteria_download_install() {
 }
 
 _hysteria_core_menu() {
-    local choice cur latest asset avx_note=""
+    local choice cur latest
     cur=$(_hysteria_cached_version 2>/dev/null)
     echo; echo -e "  ${CYAN}【官方核心管理】${NC}"
     if [ -n "$cur" ]; then
@@ -308,16 +329,11 @@ _hysteria_core_menu() {
     else
         echo -e "  当前版本: ${RED}未安装${NC}"
     fi
-    local asset avx_note=""
-    if asset=$(_hysteria_arch_asset) && [ "$asset" = "amd64" ] && _hysteria_cpu_has_avx; then
-        local variant="普通版"
-        [ "$(_state_get hysteria_variant 2>/dev/null)" = "avx" ] && variant="AVX"
-        avx_note="  [4] 切换 AVX 变体 (当前: ${variant})"
-    fi
+    # AVX 变体不再提供手动切换: 变体由 CPU 能力自动决定(见 _hysteria_pick_asset),
+    # 具体下载的资产名会在安装时的"下载 <url>"一行里体现(含 -avx 后缀)。
     echo
     echo -e "  ${GREEN}[1]${NC} 安装/更新到最新版"
     echo -e "  ${GREEN}[2]${NC} 安装指定版本 (v2.x.x)"
-    [ -n "$avx_note" ] && echo -e "$avx_note"
     echo -e "  ${GREEN}[0]${NC} 返回"
     echo
     read -rp "  请选择: " choice || return 0
@@ -327,13 +343,6 @@ _hysteria_core_menu() {
             read -rp "  输入版本号 (如 v2.12.2): " latest
             [ -z "$latest" ] && { _info "已取消"; return 0; }
             _hysteria_download_install "$latest"
-            ;;
-        4)
-            if [ "$(_state_get hysteria_variant 2>/dev/null)" = "avx" ]; then
-                _state_set hysteria_variant "plain" && _success "已切换为普通版, 请执行 [1] 重新安装生效"
-            else
-                _state_set hysteria_variant "avx" && _success "已切换为 AVX 变体, 请执行 [1] 重新安装生效"
-            fi
             ;;
         0) return 0 ;;
         *) _warn "无效选择" ;;
@@ -2609,6 +2618,16 @@ _hysteria_uninstall() {
     return 0
 }
 
+# 兼容清理(一次性): 旧版用 state/hysteria_variant 记录"用户手动选择的变体"(配套已删除的
+# [4] 菜单项)。变体现由 CPU 能力自动决定, 该键已无意义 —— 残留会让后来者误以为它仍生效。
+# 若用户曾显式选过 plain, 本次起会改用 AVX, 属**行为变更**, 故必须说出来而不是静默忽略
+# (删除用 rm -f 而非写空串: 空值会留下 0 字节 state 文件, 仍是个"存在的键")。
+_hysteria_purge_legacy_variant_state() {
+    [ -f "$STATE_DIR/hysteria_variant" ] || return 0
+    rm -f "$STATE_DIR/hysteria_variant" \
+        && _warn "已移除废弃记录 state/hysteria_variant: AVX 变体现在按 CPU 能力自动选择(支持即优先使用)"
+}
+
 # Xray 整站卸载(_uninstall_xray 会 rm -rf $DEPLOY_DIR)的前置清理:
 # 不停服删 unit 会留下指向已删 binary 的孤儿服务。数据目录随 DEPLOY_DIR 一并消失。
 _hysteria_cleanup_before_uninstall() {
@@ -2628,6 +2647,8 @@ _hysteria_cleanup_before_uninstall() {
 _hysteria_menu() {
     local choice
     _hysteria_ensure_dirs || { _press_any_key; return 0; }
+    # 进入菜单时的一次性幂等清理(declare -F 守卫, 与主菜单对混合版本安装的惯例一致)
+    declare -F _hysteria_purge_legacy_variant_state >/dev/null 2>&1 && _hysteria_purge_legacy_variant_state
     while true; do
         clear
         echo
