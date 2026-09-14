@@ -368,20 +368,34 @@ _hysteria_is_running() {
                     # 启动后 8~10s 才崩的场景下, 旧的 8 次全 running 轮询可能整体落在
                     # activating/auto-restart 窗口内而误判成功并提交。加 ActiveState/SubState
                     # 后 activating/deactivating/failed/auto-restart 自然全部排除。
+                    #
+                    # 关于 `--value`: 进入本分支说明它**可用** —— 上面的 LoadState 就是用
+                    # `--value` 读到的, 读到非空即证明本机 systemctl 支持该选项(systemd >= 230)。
+                    # `--value` 不支持的机器(老 systemd / 容器内无 systemctl)会在上面落到
+                    # `load=""` 分支, 走 "is-active + 本机 binary 归属" 兜底, **不会**走到这里;
+                    # 所以此处不再为 `--value` 不可用做额外分支, 否则会出现"注释声称兼容、
+                    # 实际这条路径永远不执行"的误导(第十轮评审 P2 的合理内核)。
                     active=$(systemctl show -p ActiveState --value "$HYSTERIA_SVC" 2>/dev/null)
                     if [ -n "$active" ]; then
                         [ "$active" = "active" ] || return 1
                         [ "$(systemctl show -p SubState --value "$HYSTERIA_SVC" 2>/dev/null)" = "running" ] || return 1
-                    else
-                        # --value 不可用(systemd < 230): 退回 is-active 精确判定,
-                        # 仍然不依赖裸 MainPID
-                        systemctl is-active --quiet "$HYSTERIA_SVC" 2>/dev/null || return 1
+                        anchor=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null)
+                        [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
+                        [ "$anchor" != "0" ] || return 1
+                        _proc_named_under "$anchor" hysteria && return 0
+                        return 1
                     fi
+                    # ActiveState 读不到(理论上不可达: 能读到 LoadState 就说明 --value 可用)。
+                    # 用 is-active 精确判定, 再**尽量**用 MainPID 定位本单元进程树; 但 MainPID
+                    # 读不到时绝不判 stopped —— 交给函数末尾的全机 binary 归属扫描兜底。
+                    # (评审担心的"读不到 → 误报 stopped"正由这层兜底消除; 而 MainPID 可读时
+                    # 仍走更严格的本单元进程树校验, 不因兜底而降级。)
+                    systemctl is-active --quiet "$HYSTERIA_SVC" 2>/dev/null || return 1
                     anchor=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null)
-                    [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
-                    [ "$anchor" != "0" ] || return 1
-                    _proc_named_under "$anchor" hysteria && return 0
-                    return 1 ;;
+                    if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ]; then
+                        _proc_named_under "$anchor" hysteria && return 0
+                    fi
+                    ;;
             esac
             ;;
         direct)
