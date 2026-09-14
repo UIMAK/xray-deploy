@@ -405,11 +405,21 @@ _hysteria_pid_is_ours() {
 }
 
 # 判断以 anchor 为根(含自身)的进程树里是否存在 exe == $HYSTERIA_BIN 的进程(P2-1 第八轮评审)。
-# 用于 openrc supervisor 归属校验: supervisor 自身 exe 是 supervise-daemon, 需向下找业务子进程;
-# 深度 4 足以覆盖 supervisor→hysteria 拓扑。exe 读不到时按"无法确认"处理(不放行), 因为
-# 本函数的用途是"动手杀进程前确认归属", 假阳性会误杀他方服务。
+# 用于 openrc supervisor 归属校验: supervisor 自身 exe 是 supervise-daemon, 需向下找业务子进程。
+#
+# **深度 4 是实现假设, 不是通用保证**(第九轮评审 P2-3): 本函数的契约是
+#   - rc=0: 在 anchor 向下 ≤4 层内找到 exe 完全等于 $HYSTERIA_BIN 的进程 ⇒ 确认归属;
+#   - rc=1: **未确认归属** —— 既包括"确实不是我们的进程", 也包括"确实是我们的但层级 >4 或
+#     /proc 读不到 exe"。两种"未确认"故意不区分: 调用方(杀进程前确认归属)只关心
+#     "能否证明是我们的", 证明不了就不动手。
+# 因此本函数**失败方向是 fail-closed**(宁可漏杀也不误杀他方服务): 覆盖不到时返回 1,
+# 调用方 `_hysteria_kill_stale_supervisor` 走"不杀 + 告警"分支, 由人工处理;
+# 绝不会因为"看不清"而 kill 一个可能属于他方的 supervisor。
+# 之所以是 4: 本项目 openrc 服务是 `supervise-daemon → hysteria` 一层拓扑, 4 层留足余量;
+# 若未来服务定义改成多层 wrapper(如 sudo/env 嵌套), 需同步调大此值。
 _hysteria_proc_tree_has_bin() {
     local anchor="$1" p c cur i
+    local depth=4   # 见上方契约说明: 实现假设, 超出即返回 1(fail-closed)
     [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
     [ "$anchor" != "0" ] || return 1
     _proc_exe_is "$anchor" "$HYSTERIA_BIN" && return 0
@@ -417,7 +427,7 @@ _hysteria_proc_tree_has_bin() {
         c="${p#/proc/}"
         cur="$c"
         i=0
-        while [ "$i" -lt 4 ]; do
+        while [ "$i" -lt "$depth" ]; do
             cur=$(_proc_ppid "$cur") || break
             if [ "$cur" = "$anchor" ]; then
                 _proc_exe_is "$c" "$HYSTERIA_BIN" && return 0
@@ -595,12 +605,25 @@ _hysteria_recover_to_state() {
 # 最终状态仍是 stopped; 若停回失败(异常)大声告警(此时状态已改变, 用户必须知道)。
 _hysteria_validate_transient() {
     _manage_hysteria start 2>/dev/null
-    local i running=0
+    local i streak=0 stable=0
+    # 必须**连续 3 次**采样均为 running 才算启动成功。单次命中不足以证明"配置可用":
+    # 坏配置下 systemd 单元(Restart=on-failure / RestartSec=3)处于崩溃重启循环,
+    # ActiveState=activating 而 MainPID 在每次重启尝试的瞬间非零, 1s 采样会撞上该窗口
+    # 误报 running —— 2026-09-14 实测(坏 tls 配置): 0.2s 采样 60 次命中 1 次, 彼时
+    # NRestarts=4 / ActiveState=activating。一次误判会让坏配置被**提交**(而非回滚),
+    # 服务随即崩溃循环, 后续所有事务/操作级联失败。
+    # 连续 3 次命中要求进程在 3 个采样点都存活; 崩溃循环(存活 <1s、间隔 3s)无法满足,
+    # 而正常配置启动 <1s 后长驻, 只多花 ~2s。
     for i in 1 2 3 4 5 6 7 8; do
         sleep 1
-        [ "$(_manage_hysteria status 2>/dev/null)" = "running" ] && { running=1; break; }
+        if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
+            streak=$((streak + 1))
+            if [ "$streak" -ge 3 ]; then stable=1; break; fi
+        else
+            streak=0
+        fi
     done
-    if [ "$running" -ne 1 ]; then
+    if [ "$stable" -ne 1 ]; then
         _manage_hysteria stop 2>/dev/null
         return 1
     fi
@@ -1070,7 +1093,9 @@ _hysteria_node_txn_locked() {
             local mc
             mc=$(cat "$meta_bak" 2>/dev/null)
             if [ -n "$mc" ] && _atomic_write_json "$meta_file" "$mc"; then
-                _hysteria_sync_clash "$meta_file" 2>/dev/null || true
+                # clash 是**可再生派生缓存**: 同步失败不回滚权威状态, 也不把"元数据已还原"
+                # 升级成 degraded(_hysteria_sync_clash 内部已 _warn 说明手工修法)
+                _hysteria_sync_clash "$meta_file" || true
             else
                 _warn "节点元数据回滚失败, 请人工核对 $meta_file"
                 rc=1
@@ -1078,7 +1103,8 @@ _hysteria_node_txn_locked() {
         else
             if rm -f "$meta_file"; then
                 if [ -n "$node_name" ]; then
-                    _hysteria_remove_clash_by_name "$node_name"
+                    # 同上: 派生缓存失败不回滚权威状态(helper 内部已告警)
+                    _hysteria_remove_clash_by_name "$node_name" || true
                 fi
             else
                 _warn "节点元数据删除失败, 请人工核对 $meta_file"
@@ -1153,11 +1179,13 @@ _hysteria_node_txn_locked() {
         fi
     fi
     rm -f "$meta_bak" 2>/dev/null
-    # --- 阶段 4: clash 派生(可再生缓存, 失败不回滚本体, 仅告警) ---
+    # --- 阶段 4: clash 派生(可再生缓存, 失败不回滚本体; helper 内部已告警) ---
     if [ "$meta_op" = "delete" ]; then
-        [ -n "$node_name" ] && _hysteria_remove_clash_by_name "$node_name"
+        if [ -n "$node_name" ]; then
+            _hysteria_remove_clash_by_name "$node_name" || true
+        fi
     else
-        _hysteria_sync_clash "$meta_file" || _warn "clash 条目同步失败, 节点本体不受影响, 可手工编辑 ${CLASH_YAML}"
+        _hysteria_sync_clash "$meta_file" || true
     fi
     [ -n "$meta_bak" ] && { rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"; }
     return 0
@@ -1819,17 +1847,27 @@ _hysteria_sync_clash() {
         _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || true
     fi
     if [ -f "$CLASH_YAML" ] && grep -qF "name: \"$(_yaml_dq "$name")\"" "$CLASH_YAML" 2>/dev/null; then
-        _replace_node_in_yaml "$line" "$name" || _warn "clash 条目替换失败, 可手工编辑 ${CLASH_YAML}"
+        # 返回值契约: clash 是**可再生派生缓存**, 同步失败不回滚核心事务(节点本体不受影响),
+        # 但必须如实返回 1 让上层知道"派生缓存已过期"(原实现 || _warn 后 return 0, 调用方的
+        # `|| fail=1` 永远不会触发, 失败被静默吞掉)。告警文本由本函数统一给出 —— 有调用点
+        # 是 `|| true`(事务回滚路径)不会再补告警, 消息放这里才不会漏。
+        _replace_node_in_yaml "$line" "$name" \
+            || { _warn "clash 条目替换失败(clash 为可再生派生缓存, 节点本体不受影响), 可手工编辑 ${CLASH_YAML}"; return 1; }
     else
-        _add_node_to_yaml "$line" "$name" || _warn "clash 条目追加失败, 可手工编辑 ${CLASH_YAML}"
+        _add_node_to_yaml "$line" "$name" \
+            || { _warn "clash 条目追加失败(clash 为可再生派生缓存, 节点本体不受影响), 可手工编辑 ${CLASH_YAML}"; return 1; }
     fi
     return 0
 }
 
+# 从 clash.yaml 移除节点条目(派生缓存)。同样如实返回状态: 失败返回 1 并在此告警,
+# 不静默吞错 —— 否则"删除节点成功"但订阅里仍残留幽灵条目, 无人知晓。
 _hysteria_remove_clash_by_name() {
     local name="$1"
     [ -n "$name" ] || return 0
-    _remove_node_from_yaml_by_name "$name" 2>/dev/null || true
+    _remove_node_from_yaml_by_name "$name" 2>/dev/null \
+        || { _warn "clash 条目删除失败(clash 为可再生派生缓存, 节点本体不受影响), 可手工编辑 ${CLASH_YAML}"; return 1; }
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -2099,7 +2137,7 @@ _hysteria_bootstrap() {
         fi
     fi
 
-    # 9) clash 派生缓存(可再生; 失败仅告警, 不影响节点本体)
+    # 9) clash 派生缓存(可再生; 失败仅告警, 不影响节点本体 —— helper 内部已 _warn)
     _hysteria_sync_clash "$HYSTERIA_NODES_DIR/${user}.json" || true
     _success "官方 Hysteria2 服务器已初始化: $(_hysteria_listen_display), TLS=$(_hysteria_tls_desc)"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
