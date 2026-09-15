@@ -3141,26 +3141,63 @@ _hysteria_view_log() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# 停止状态判定(0.16.20 外部复审 P1; 与 _hysteria_is_running 是两个不同的问题)
+# ---------------------------------------------------------------------------
+# **为什么不能拿 !_hysteria_is_running 当"已停止"**: _hysteria_is_running 的契约是
+# "service 此刻真正在跑(ActiveState=active 且 SubState=running 且 MainPID≠0)"。
+# 于是 activating / auto-restart / deactivating / failed **全都返回 1** —— 它们既不是
+# "在跑", 也**不是"已停止"**, 而是"过渡态"。单元是 Restart=on-failure/RestartSec=3,
+# 崩溃重启循环里 systemd 把 SERVICE_AUTO_RESTART 映射为 UNIT_ACTIVATING, 因此
+# `_hysteria_is_running || return 0` 会在 auto-restart 等待期**立即**判"已停止" ——
+# 调用方随即删掉配置, 而 systemd 3 秒后照样拉起 → "配置已删 / unit 仍在"(实测竞态)。
+#
+# 本判据要求**终态**: systemd 必须明确停在 inactive/failed, 且 MainPID=0, 且全机扫描
+# 确认没有本项目的 hysteria 进程(exe 归属)。读不到 unit 信息时**绝不判"已停止"**
+# (fail-closed) —— 交给 _hysteria_stop_and_verify 的 exe 强杀 + 复验兜底, 而不是靠
+# "读不到 ⇒ 大概停了"赌一把。
+#   rc 0 = 确认处于停止终态; rc 1 = 仍在运行/过渡态/读不到(调用方必须继续收敛)
+_hysteria_stopped_state() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            local active mainpid
+            active=$(systemctl show -p ActiveState --value "$HYSTERIA_SVC" 2>/dev/null)
+            case "$active" in
+                # 只有明确终态算"已停止"; active/activating/deactivating/reloading/空串都不算
+                inactive|failed) ;;
+                *) return 1 ;;
+            esac
+            mainpid=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null)
+            [ "$mainpid" = "0" ] || return 1
+            _proc_any_named hysteria "$HYSTERIA_BIN" && return 1
+            return 0
+            ;;
+        *)
+            # openrc/direct: pidfile 已由 _manage_hysteria stop 清理; 用 exe 归属确认无进程
+            _proc_any_named hysteria "$HYSTERIA_BIN" && return 1
+            return 0
+            ;;
+    esac
+}
+
 # 卸载/删除/升级前的停止确认(): stop 后轮询确认业务进程真正退出;
 # 仍存活时按 exe 归属(readlink /proc/*/exe == $HYSTERIA_BIN, 含 "(deleted)" 就地替换
 # 形态)强制终止 —— exe 校验保证绝不误杀同名的他方进程; 再不退则返回 1 交人工处理,
 # 调用方必须拒绝继续删除文件, 避免"文件已删/进程仍在"的孤儿进程。
 #
-# **契约 = "持续停止", 不是"某一刻没有进程"(0.16.20 外部复审)。** 单元是
-# Restart=on-failure/RestartSec=3: 若某进程在"退出"之后才失败退出, systemd 会再拉起一个;
-# 而 _hysteria_is_running 的 systemd 分支在 SubState=auto-restart 时**恰好看不到它**
-# (ActiveState=activating ⇒ 返回 stopped)。于是"轮询到一次 stopped"可能是崩溃重启循环里的
-# 一个窗口 —— 调用方据此删掉配置, 下一个拉起就会失败, 留下"配置已删/unit 仍在"。
-# 故本函数必须保证: 最后一次 stop **之后**再确认进程消失, 否则继续收敛(再 stop / 再杀),
-# 全程不成功则返回 1。与 _hysteria_restart_verified 的连续采样同因(同一类崩溃重启窗口)。
+# **契约 = "到达停止终态", 不是"某一刻没有进程"(0.16.20 外部复审 P1)。**
+# 判定必须走 _hysteria_stopped_state(要求 systemd 明确 inactive/failed), **不得**用
+# `!_hysteria_is_running` —— 后者把 activating/auto-restart 也当"已停止", 会在崩溃重启
+# 循环里提前放行(见该函数注释)。强杀绕过 init 系统后必须**再 stop 一次**(Restart=
+# on-failure 的单元可能因退出码重新拉起), 然后才复验; 全程不成功返回 1。
 _hysteria_stop_and_verify() {
     _manage_hysteria stop 2>/dev/null
     local i p exe
     for i in 1 2 3 4 5 6 7 8; do
-        _hysteria_is_running || return 0
+        _hysteria_stopped_state && return 0
         sleep 1
     done
-    _warn "服务停止后仍有 hysteria 进程存活, 按 exe 归属强制终止..."
+    _warn "服务停止后仍处于运行/过渡态, 按 exe 归属强制终止..."
     for p in /proc/[0-9]*; do
         exe=$(readlink "${p}/exe" 2>/dev/null) || continue
         case "$exe" in
@@ -3171,10 +3208,10 @@ _hysteria_stop_and_verify() {
     done
     sleep 1
     # 强杀是绕过 init 系统的动作: Restart=on-failure 的单元可能因该进程的退出码而重新拉起,
-    # 故必须**再 stop 一次**, 然后才确认最终状态(顺序不可交换)。
+    # 故必须**再 stop 一次**, 然后才复验终态(顺序不可交换)。
     _manage_hysteria stop 2>/dev/null
     for i in 1 2 3 4 5; do
-        _hysteria_is_running || return 0
+        _hysteria_stopped_state && return 0
         sleep 1
     done
     return 1
@@ -3184,6 +3221,12 @@ _hysteria_stop_and_verify() {
 # 全是 best-effort, 失败会让"unit 残留 + config 已删"的半残状态静默通过。这里逐步执行并
 # 复核 unit 确实消失(systemd 用 LoadState=not-found, openrc 用文件不存在), 残留时大声告警
 # 并给出人工命令 —— 属"明确降级"而非静默成功。返回 0=已清理干净; 1=仍有残留(已告警)。
+#
+# **"unit 文件不存在" ≠ "注册关系已解除"(0.16.20 外部复审 P2)。** systemd 的 enable 本质是
+# 在 `<target>.wants/` 下建符号链接, disable 才是删链接 —— 若 disable 失败而 rm unit 成功,
+# LoadState 照样是 not-found, 却留下 dangling 的 wants 链接(systemd 自己用 is-enabled 才能
+# 回答"是否仍被启用")。故 systemd 侧补验 is-enabled 不得为 enabled, 并扫掉指向本 unit 的
+# 残留符号链接; openrc 侧同理补验 runlevel 注册已解除(rc-update show), 不能只看 init 脚本文件。
 _hysteria_cleanup_service_units() {
     local ok=1
     case "$INIT_SYSTEM" in
@@ -3192,20 +3235,36 @@ _hysteria_cleanup_service_units() {
             rm -f "/etc/systemd/system/${HYSTERIA_SVC}.service"
             systemctl daemon-reload 2>/dev/null
             systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
+            # 1) unit 本身必须已不可被 systemd 识别
             [ "$(systemctl show -p LoadState --value "$HYSTERIA_SVC" 2>/dev/null)" = "not-found" ] && ok=0
-            [ "$ok" -eq 0 ] || {
-                _error "systemd unit ${HYSTERIA_SVC} 清理后仍可被 systemd 识别(残留)"
-                _tip "请人工核对: systemctl status ${HYSTERIA_SVC}; ls -l /etc/systemd/system/${HYSTERIA_SVC}.service"
-            }
+            # 2) 不得仍处于 enabled(disable 失败的典型残局)
+            if [ "$(systemctl is-enabled "$HYSTERIA_SVC" 2>/dev/null)" = "enabled" ]; then
+                ok=1
+                _error "systemd unit ${HYSTERIA_SVC} 仍处于 enabled 状态(disable 未生效)"
+                _tip "请人工执行: systemctl disable ${HYSTERIA_SVC}"
+            fi
+            # 3) 不得残留指向本 unit 的 dangling 符号链接(enable 的 .wants/.requires 链接)
+            local lnk
+            lnk=$(find /etc/systemd/system -type l -name "${HYSTERIA_SVC}.service" 2>/dev/null)
+            if [ -n "$lnk" ]; then
+                ok=1
+                _error "systemd unit ${HYSTERIA_SVC} 仍有残留符号链接(enable 关系未解除)"
+                _tip "请人工清理: ${lnk}"
+            fi
+            [ "$ok" -eq 0 ] || _tip "请人工核对: systemctl status ${HYSTERIA_SVC}; systemctl is-enabled ${HYSTERIA_SVC}"
             ;;
         openrc)
             rc-update del "$HYSTERIA_SVC" default 2>/dev/null
             rm -f "/etc/init.d/${HYSTERIA_SVC}"
+            # 1) init 脚本必须已删除
             [ ! -e "/etc/init.d/${HYSTERIA_SVC}" ] && ok=0
-            [ "$ok" -eq 0 ] || {
-                _error "openrc init 脚本 ${HYSTERIA_SVC} 未能删除(残留)"
-                _tip "请人工核对: ls -l /etc/init.d/${HYSTERIA_SVC}"
-            }
+            # 2) runlevel 注册必须已解除(rc-update del 失败的残局: 文件没了但注册还在)
+            if rc-update show default 2>/dev/null | grep -qE "(^|[[:space:]])${HYSTERIA_SVC}([[:space:]]|$)"; then
+                ok=1
+                _error "openrc 服务 ${HYSTERIA_SVC} 仍在 default runlevel 注册中(rc-update del 未生效)"
+                _tip "请人工执行: rc-update del ${HYSTERIA_SVC} default"
+            fi
+            [ "$ok" -eq 0 ] || _tip "请人工核对: ls -l /etc/init.d/${HYSTERIA_SVC}; rc-update show"
             ;;
         *)
             ok=0 ;;
