@@ -2874,10 +2874,14 @@ _hysteria_add_node() {
         _press_any_key
         return 1
     fi
-    # 节点元数据已落地后才回写 server_meta(顺序不可交换, 见上)
+    # 节点元数据已落地后才回写 server_meta(顺序不可交换, 见上)。
+    # 失败文案必须准确(外部复审 P2): 此时 node.json **已含** link_addr, 而
+    # `_hysteria_node_exists` 已为真 → 下次 [2] 走"已有节点"分支, **不会再询问地址**。
+    # 所以不能说"下次会重新询问"; 该字段在本路径也只是缓存 —— 链接/clash 一律从
+    # node.json 读 link_addr, server_meta.link_addr 全项目仅此一处消费(接管时复用)。
     if [ "$addr_need_save" -eq 1 ]; then
         _hysteria_meta_set link_addr "$addr" \
-            || _warn "连接地址写入 server_meta 失败(节点已创建, 下次 [2] 会重新询问该地址)"
+            || _warn "连接地址未同步到 server_meta(节点已创建, 连接地址已保存在节点元数据中, 不影响链接与 clash 条目)"
     fi
     _hysteria_sync_clash "$HYSTERIA_NODE_META" || _warn "clash 条目同步失败(可手工编辑 ${CLASH_YAML})"
     _success "节点 [${name}] 已接管(认证密码沿用服务器现有值)"
