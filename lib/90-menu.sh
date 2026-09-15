@@ -833,15 +833,6 @@ _hy2_obfs_menu() {
         || { _error "config.json 中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
-    # 启用前 fail-closed: 若该入站已有一层**不是我们写的** type=salamander, 追加我们那层
-    # 会让 Xray 依次套两层 salamander(双重混淆, 客户端只做一层 ⇒ 必然连不上)。
-    # 不替用户猜(既不吃掉别人的层, 也不硬套), 交人工处理。
-    if _hy2_udp_has_foreign_salamander "$tag"; then
-        _error "该入站的 finalmask.udp 已存在**非本脚本写入**的 salamander 层;"
-        _error "继续启用会叠加成双重混淆(客户端只做一层, 必然连不上)。"
-        _tip "请先手工编辑 ${CONFIG_FILE} 移除或改名该层(本脚本写入的层带 settings.xd_managed=true)"
-        _press_any_key; return
-    fi
     local cur_type cur_pw cur_size
     cur_type=$(jq -r '.obfs_type // empty' "$meta")
     cur_pw=$(jq -r '.obfs_password // empty' "$meta")
@@ -868,6 +859,18 @@ _hy2_obfs_menu() {
     case "${obfs_choice:-0}" in
         0) return ;;
         1|2)
+            # 启用/更换 的 fail-closed 闸门: 该入站若已有一层**不是我们写的** type=salamander,
+            # 追加我们那层会让 Xray 依次套两层 salamander(双重混淆, 客户端只做一层 ⇒ 必然
+            # 连不上)。不替用户猜(既不吃掉别人的层, 也不硬套), 交人工处理。
+            # **只挡 1|2, 不挡 3**: 关闭只剔除我们自己带标记的那层、保留别人的层, 是完全
+            # 安全的操作 —— 在菜单入口无条件拦截会让用户连自己那层都删不掉(实测缺陷)。
+            if _hy2_udp_has_foreign_salamander "$tag"; then
+                _error "该入站的 finalmask.udp 已存在**非本脚本写入**的 salamander 层;"
+                _error "继续启用会叠加成双重混淆(客户端只做一层, 必然连不上)。"
+                _tip "请先手工编辑 ${CONFIG_FILE} 移除或改名该层(本脚本写入的层带 settings.xd_managed=true)"
+                _tip "若只想关闭本脚本的混淆, 请选 [3](只删本脚本那层, 保留其它层)"
+                _press_any_key; return
+            fi
             otype="salamander"
             opw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
             read -rp "  混淆密码 (回车随机): " opw_in
