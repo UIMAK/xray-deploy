@@ -41,6 +41,12 @@
 # 本模块自 0.16.19 起即为单密码模型, 从未发布过 userpass 多用户版本, 故**不做任何
 # 旧配置迁移** —— 迁移代码属于没有真实受众的死代码(项目惯例: 不留不可达分支,
 # 同 0.16.18 清理 plain 死分支)。检测到非 password 的 auth 一律按"外来配置"拒绝接管。
+# - **[4] 删除节点 = 删除服务器配置并停止服务**(0.16.20, 用户要求, 动机是省内存/省消耗):
+# 官方 Hysteria 里"配置即节点", 旧实现只删 Manager 侧记录(hysteria/node.json)不释放
+# 任何资源 —— 服务照跑、内存照占。现固定顺序: 停服 → 删 hysteria.json → 删 node.json
+# → 清 service 定义/logrotate → 清 clash 派生条目(删配置必须早于清 unit, 否则删配置失败时
+# unit 已消失、原运行状态无法恢复); 核心 binary / server_meta / 自签证书保留(重新初始化
+# 可复用), 彻底移除仍走 [14] 卸载。
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -2817,7 +2823,7 @@ _hysteria_add_node() {
         _press_any_key
         return 1
     fi
-    _tip "服务器已有认证凭据(手工部署或此前清除了节点记录), 将按现有密码重建节点"
+    _tip "服务器已有认证凭据(手工部署或此前删除过节点记录), 将按现有密码重建节点"
     _tip "认证密码保持不变(不会使已分发的链接失效)"
     local def_name
     def_name=$(_hysteria_default_name)
@@ -2915,9 +2921,9 @@ _hysteria_view_nodes() {
     fi
     if ! _hysteria_node_exists; then
         # 区分两种"没有节点": 服务器根本没配 vs 配了但 Manager 侧无记录
-        # (后者是"清除了节点记录"的中间态, 必须明确指路 [2] 重建, 否则用户会以为要卸载重装)
+        # (后者是"只清除了节点记录"的中间态, 必须明确指路 [2] 重建, 否则用户会以为要卸载重装)
         if _hysteria_server_initialized; then
-            _warn "Manager 侧暂无节点记录, 但服务器已有认证凭据(手工部署或此前清除了记录)"
+            _warn "Manager 侧暂无节点记录, 但服务器已有认证凭据(手工部署或此前只清除了记录)"
             _tip "用 [2] 添加节点 可按现有密码重建记录(认证密码不变)"
         else
             _warn "暂无节点(请用 [2] 添加节点 初始化)"
@@ -2945,43 +2951,89 @@ _hysteria_view_nodes() {
     return 0
 }
 
+# [4] 删除节点 —— 0.16.20 语义变更: 删除**服务器配置**并停止服务(用户要求, 2026-09-15)
+#
+# 旧实现只删 Manager 侧的节点记录(hysteria/node.json), 配置与服务原样保留 —— 但官方 Hysteria
+# 里"配置即节点", 服务在跑就一直占用内存/端口。改为: 停止服务 + 删除服务器配置(hysteria.json)
+# + 删除节点记录 + 清理派生缓存, 以真正释放资源(低配 NAT VPS 的主要动机: 省内存/省消耗)。
+#
+# **保留**: 核心 binary(下载耗时, 与"删配置"无关)、server_meta.json(link_addr/TLS 选择是
+# Manager 侧缓存, 重新初始化时可复用)、自签证书(下次初始化可继续用同一证书路径)。
+# **一并清理**: service 定义(systemd unit / openrc init)与 logrotate 片段。
+# **顺序不可交换**: 停服 → 删配置(用户目的) → 删记录 → 清 unit → 清 clash。
+#   - 删配置必须早于清 unit: 否则一旦删配置失败, unit 已消失 → 原运行状态再也无法恢复
+#     (没有 unit 可重启, [2] 又因"配置可运行"只提示改密码 ⇒ 用户被卡住)。反过来 unit 清理
+#     失败时配置已删、服务已停(用户目的已达成), 残留 unit 只影响下次开机且会被下次 [2]
+#     重新写入覆盖(自愈), 故只告警不中止 —— 与 [14] 卸载的"清理失败保留现场"口径一致。
+#   - 任何"配置删除之前"的中止(停服失败)都不改变运行状态; 删配置失败则恢复原运行状态。
 _hysteria_delete_node() {
-    local name auth ans
+    local name="" ans was_running
     _hysteria_gate || { _press_any_key; return; }
     clear
-    echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 节点】${NC}"
-    if ! _hysteria_node_file_present; then
-        _warn "暂无节点"
+    echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 服务器配置】${NC}"
+    if ! _hysteria_config_exists; then
+        _warn "暂无服务器配置(未初始化)"
         _press_any_key
         return
     fi
-    if _hysteria_node_broken; then
-        _error "节点元数据已损坏(无法解析或缺少必要字段), 无法安全清除"
-        _tip "请用 [2] 添加节点 删除损坏记录并重建(认证密码不变)"
-        _press_any_key
-        return
+    # 节点名(clash 条目按 name 删除): 记录缺失/损坏时如实说明, 但不影响删除动作本身 ——
+    # 本操作删的是服务器配置, 记录只是顺带清掉的 Manager 侧缓存。
+    if _hysteria_node_file_present; then
+        if _hysteria_node_exists; then
+            name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+        else
+            _warn "节点元数据已损坏(无法解析或缺少必要字段), 读不到节点名(clash 条目可能需手工清理)"
+        fi
     fi
-    name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
-    # 官方 binary 对空密码 FATAL(实测): 删掉唯一凭据 = 服务起不来。
-    # 故本菜单**不**删除认证段, 只清除 Manager 侧的节点元数据(分享链接/clash 条目)。
-    echo -e "  当前节点: ${GREEN}${name}${NC}"
-    echo -e "  ${YELLOW}官方 password 模式只有一个认证密码: 删除后服务将无凭据可用(会启动失败)${NC}"
-    echo -e "  ${YELLOW}本操作只清除 Manager 侧节点记录(分享链接/clash 条目), 不改动 hysteria.json 的认证段${NC}"
-    echo -e "  ${CYAN}清除后可随时用 [2] 添加节点 按现有密码重建记录(认证密码不变)${NC}"
-    echo -e "  ${YELLOW}如需彻底移除请用 [14] 卸载 Hysteria; 如需换密码请用 [5] 修改节点密码${NC}"
-    read -rp "  确认清除节点记录 [${name}]? [y/N]: " ans
+    echo -e "  服务器: $(_hysteria_listen_display)  TLS: $(_hysteria_tls_desc)  状态: $(_manage_hysteria status 2>/dev/null)"
+    if [ -n "$name" ]; then
+        echo -e "  节点: ${GREEN}${name}${NC}"
+    else
+        echo -e "  节点: ${YELLOW}(Manager 侧无节点记录, 仅删除服务器配置)${NC}"
+    fi
+    echo -e "  ${YELLOW}将停止 Hysteria 服务并删除服务器配置(${HYSTERIA_CONFIG})${NC}"
+    echo -e "  ${YELLOW}所有已分发的分享链接/客户端配置会立即失效${NC}"
+    echo -e "  ${CYAN}核心 binary 与 server_meta/证书保留; 之后可用 [2] 添加节点 重新初始化${NC}"
+    echo -e "  ${YELLOW}如需连核心一并移除请用 [14] 卸载 Hysteria${NC}"
+    read -rp "  确认删除服务器配置并停止服务? [y/N]: " ans
     case "$ans" in
         y|Y) ;;
         *) _info "已取消"; _press_any_key; return ;;
     esac
-    # 只删元数据 + clash 条目(clash 为可再生派生缓存, 失败不回滚元数据)
-    if ! rm -f "$HYSTERIA_NODE_META"; then
-        _error "节点元数据删除失败(权限/只读?), 未改动"
+    # 保留(本函数刻意不删): $HYSTERIA_SERVER_META(Manager 侧缓存: link_addr/TLS 选择) /
+    # 核心 binary / 自签证书 —— 重新初始化可复用, 无需重新下载或重签; 彻底移除走 [14] 卸载。
+    was_running=$(_manage_hysteria status 2>/dev/null)
+    # 1) 先停服: 内存立即释放; 且保证没有进程继续持有即将删除的配置。
+    #    失败说明进程仍在(运行状态未变), 故无需"恢复"—— 直接中止。
+    if ! _hysteria_stop_and_verify; then
+        _error "服务未能停止(进程未退出), 已中止(配置未删除)"
+        _tip "请先停止服务(菜单 [6] 服务管理)后重试"
         _press_any_key
-        return
+        return 1
     fi
-    _hysteria_remove_clash_by_name "$name" || true
-    _success "节点记录已清除"
+    # 2) 删服务器配置(用户目的)。**必须先于 service 定义清理**(见上方顺序契约):
+    #    失败 ⇒ 中止并恢复原运行状态(此时 unit 仍在, 重启有效)。
+    if ! rm -f "$HYSTERIA_CONFIG"; then
+        _error "服务器配置删除失败(权限/只读?), 已中止"
+        _tip "请人工核对: $HYSTERIA_CONFIG"
+        _hysteria_recover_to_state "$was_running" || _warn "原运行状态恢复失败, 请人工检查服务状态"
+        _press_any_key
+        return 1
+    fi
+    # 3) 节点记录(Manager 侧缓存): 失败仅告警 —— 配置已删, 残留会被下次 [2] 整份覆盖
+    if ! rm -f "$HYSTERIA_NODE_META"; then
+        _warn "节点记录删除失败(权限/只读?): $HYSTERIA_NODE_META"
+        _tip "服务器配置已删除; 该残留记录会在下次 [2] 添加节点 时被整份覆盖, 也可手工删除"
+    fi
+    # 4) 清 service 定义 + logrotate 片段: 配置已删、服务已停(用户目的已达成), 失败只告警 ——
+    #    残留 unit 仅影响下次开机(缺配置启动失败, 且被 systemd 启动限流自行停下), 且下次
+    #    [2] 重新初始化时会重写该 unit(自愈)。这里**不**回滚配置删除(回滚等于丢掉用户要的结果)。
+    _hysteria_cleanup_service_units \
+        || _warn "service 定义清理失败(配置已删除, 服务已停止): 残留 unit 可能在下次开机尝试启动并失败, 请按上方提示人工清理"
+    # 5) 派生缓存(clash 条目): 可再生, 失败仅告警(helper 内部已给出人工修法)
+    [ -n "$name" ] && { _hysteria_remove_clash_by_name "$name" || true; }
+    _success "服务器配置已删除, 服务已停止(核心 binary 保留)"
+    _tip "如需重新启用: [2] 添加节点 会重新初始化配置(可复用现有 TLS 证书与连接地址)"
     _press_any_key
     return 0
 }
@@ -3256,7 +3308,10 @@ _hysteria_menu() {
         read -rp "  请选择: " choice || return 0
         case "$choice" in
             1) _hysteria_core_menu ;;
-            2) _hysteria_add_node; _press_any_key ;;
+            # [2] 不得再追加 _press_any_key: _hysteria_add_node 的每条返回路径都已自带一次
+            # (含 bootstrap/接管/取消), 再追加会让用户连按两次回车(实机发现)。与 [3]/[4]/[5]
+            # 同口径 —— 菜单只负责调用, 暂停由被调函数自己收尾。
+            2) _hysteria_add_node ;;
             3) _hysteria_view_nodes ;;
             4) _hysteria_delete_node ;;
             5) _hysteria_change_password ;;
