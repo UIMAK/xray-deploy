@@ -797,7 +797,8 @@ _hy2_adjust_bandwidth() {
 # 注意: 官方文档没有 hysteriaSettings.obfs 字段; 链接侧 obfs/obfs-password 参数名
 # 来自 Hysteria 官方 URI-Scheme(Xray 文档未定义 hy2 分享链接)。
 # 服务端变更走 _mutate_config(事务 + verified-restart + 回滚); 元数据在 config 提交成功后写,
-# 失败时把 config 回滚为无混淆, 保持两侧一致(顺序与 _hy2_toggle_brutal 一致)。
+# 失败时把 config 回滚为**改动前**的混淆形态(不是一律清空), 保持两侧一致
+# (顺序与 _hy2_toggle_brutal 一致; 回滚见 _hy2_obfs_rollback)。
 # ---------------------------------------------------------------------------
 _hy2_obfs_menu() {
     local choice
@@ -826,7 +827,7 @@ _hy2_obfs_menu() {
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     # 入站必须真实存在于 config: 元数据在而 config 被手工改过时, 下面的
-    # `(.inbounds[] | select(.tag == $t) | ...) = $m` 会匹配 0 条路径 —— jq 返回 0、
+    # `(.inbounds[] | select(.tag == $t)) |= …` 会匹配 0 条路径 —— jq 返回 0、
     # 配置原样不动, _mutate_config 重启成功并报"已启用", 于是元数据与服务器再次分裂。
     jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
         || { _error "config.json 中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
@@ -869,15 +870,22 @@ _hy2_obfs_menu() {
                     _warn "当前核心不支持 gecko 分片(需 >= ${_HY2_GECKO_MIN_VER}); 已按普通 salamander 配置"
                     osize=""
                 else
-                    read -rp "  packetSize (Int32Range, 如 512-1200; 回车用官方默认): " osize
-                    osize="${osize// /}"      # 归一化, 便于元数据/clash 直接解析
+                    # 空输入必须落成显式尺寸: Xray 侧 packetSize 留空 = **不启用 Gecko**
+                    # (退化成普通 salamander)。所填 512-1200 来自 Hysteria 官方
+                    # Full-Client-Config 的 gecko 默认值, 不是 Xray 文档里的默认值。
+                    read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " osize
+                    osize="${osize:-512-1200}"
                     local size_why; size_why=$(_hy2_obfs_size_invalid "$osize")
                     [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; _press_any_key; return; }
+                    # 规范化(排序)后回写, 使元数据/clash 与 Xray 看到同一区间
+                    osize=$(_hy2_obfs_size_canon "$osize") || { _error "packetSize 规范化失败"; _press_any_key; return; }
                 fi
             fi
             omask=$(_hy2_obfs_mask_block "$otype" "$opw" "$osize") || { _error "混淆参数构造失败"; _press_any_key; return; }
-            if ! _mutate_config --arg t "$tag" --argjson m "[$omask]" \
-                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.udp) = $m'; then
+            # 只管理**我们自己那一层**(见 XD_UDP_JQ_UPSERT): 用户/其它工具可能在同一
+            # udp 数组里放了别的伪装层, 整体替换会静默清掉它们。
+            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --argjson new "$omask" \
+                 "$XD_UDP_JQ_UPSERT"; then
                 _error "混淆启用失败, 已回滚"; _press_any_key; return
             fi
             if ! _meta_update "$meta" \
@@ -892,8 +900,8 @@ _hy2_obfs_menu() {
             _success "混淆已启用 (${otype}${osize:+ · packetSize=${osize}})"
             ;;
         3)
-            if ! _mutate_config --arg t "$tag" \
-                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.udp) = []'; then
+            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" \
+                 "$XD_UDP_JQ_DROP"; then
                 _error "关闭混淆失败, 已回滚"; _press_any_key; return
             fi
             if ! _meta_update "$meta" 'del(.obfs_type) | del(.obfs_password) | del(.obfs_packet_size)'; then
@@ -906,24 +914,32 @@ _hy2_obfs_menu() {
             ;;
         *) _warn "无效选择"; _press_any_key; return ;;
     esac
-    # 服务器级变更 → 分享链接与 clash 条目必须同步(链接含 obfs 参数; clash 含 obfs 字段)
-    local link
-    if ! link=$(_rebuild_hy2_link "$meta") || [ -z "$link" ]; then
-        _warn "混淆已变更, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
-        _press_any_key; return
+    # 服务器级变更 → 分享链接与 clash 条目必须同步。链接重建有两种失败, **不可混为一谈**:
+    #   (a) 该节点是 gecko(带尺寸) ⇒ 官方 hy2 URI 无法表达, 这是**刻意**不生成链接。
+    #       此时必须清空旧链接(否则它仍写着旧混淆), 并**继续**同步 clash(clash 是尺寸唯一载体)。
+    #   (b) 元数据缺字段 ⇒ 保留旧链接(它可能仍可用), 只如实报告, 不做任何破坏性写入。
+    local link nline nname
+    if link=$(_rebuild_hy2_link "$meta") && [ -n "$link" ]; then
+        _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
+    elif _hy2_link_unexpressible "$meta"; then
+        _meta_update "$meta" '.share_link=""' || { _error "分享链接清空失败"; _press_any_key; return; }
+        _warn "当前混淆(gecko 带自定义分片尺寸)无法用官方 hy2 链接表达, 已清空分享链接"
+        _tip "请用下方 Clash 条目(含 obfs-min/max-packet-size)导入客户端; 菜单 [2] 查看节点 不再显示链接"
+    else
+        _warn "分享链接重建失败(节点元数据缺少必要字段), 已保留原链接"
     fi
-    _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
-    local nline nname
     nname=$(jq -r '.name // empty' "$meta")
     if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
         _replace_node_in_yaml "$nline" "$nname" || \
             _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+    else
+        _warn "Clash 条目生成失败(元数据不完整), 可手工编辑 ${CLASH_YAML}"
     fi
     _press_any_key
 }
 
-# 把 config 里该节点的 finalmask.udp 回滚为指定字面量(见 _hy2_obfs_menu 的回滚路径)。
-# $2 = _hy2_obfs_mask_block 的输出; 为空 ⇒ 回滚成"无混淆"(udp: []),
+# 把 config 里该节点的**我们那一层** finalmask.udp 回滚为指定形态(见 _hy2_obfs_menu 的回滚路径)。
+# $2 = _hy2_obfs_mask_block 的输出; 空 ⇒ 回滚成"无混淆"(只剔除我们那层, 保留其它层),
 # 为 __INVALID__ ⇒ 改动前的元数据本身无法解析(畸形), 此时**拒绝动 config**:
 # 拿"无混淆"当回滚值会把一个可能在工作的混淆配置静默清掉, 宁可不回滚并如实报告。
 # 用法: _hy2_obfs_rollback <tag> <mask_or_empty_or_INVALID>
@@ -933,8 +949,12 @@ _hy2_obfs_rollback() {
         _error "改动前的混淆元数据无法解析, 未回滚配置(请手工核对 ${CONFIG_FILE})"
         return 1
     fi
-    _mutate_config --arg t "$tag" --argjson m "[$mask]" \
-        '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.udp) = $m'
+    if [ -z "$mask" ]; then
+        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" "$XD_UDP_JQ_DROP"
+    else
+        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --argjson new "$mask" \
+            "$XD_UDP_JQ_UPSERT"
+    fi
 }
 _reality_domain_menu() {
     local choice

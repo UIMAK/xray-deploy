@@ -39,62 +39,74 @@ _normalize_bandwidth() {
 }
 
 # ---------------------------------------------------------------------------
-# Hysteria2 混淆(FinalMask.udp)辅助 —— 官方依据: Xray-docs-next
-#   config/transports/finalmask.md「UDPMask」一节:
-#     "udp": [ { "type": "", "settings": {} } ]  —— 数组第一个为最内层伪装;
-#     type = "salamander" 时 settings = { "password": ..., "packetSize": "512-1200" }
-#   packetSize 为 Int32Range(development/intro/guide.md「Int32Range」): 引号内的
-#   "114" / "114-514", 或独立 int(仅单数字); From>To 自动交换; "" 视为 0。
-#   非空即启用 Gecko(对 QUIC 长包头额外分片填充), 上限不得超过 2048。
-# 注意: 官方文档没有 `hysteriaSettings.obfs` 字段 —— 混淆只存在于 finalmask.udp。
-# 本函数只把用户输入规范化成 JSON 字面量; 合法性判定统一走 _hy2_obfs_size_invalid。
+# Hysteria2 混淆(FinalMask.udp)辅助
+#
+# 依据分两层(项目红线: 两层不得混用, 代码注释必须点名来源):
+#
+# [Xray 官方] config/transports/finalmask.md「UDPMask」/「### salamander」/「#### gecko」:
+#   "udp": [ { "type": "", "settings": {} } ]  —— 数组第一个为最内层伪装;
+#   type = "salamander" 时 settings = { "password": ..., "packetSize": "512-1200" };
+#   **packetSize 不为空则启用 Gecko**(对 QUIC 长包头额外分片填充), 上限不能超过 2048。
+#   packetSize 为 Int32Range(development/intro/guide.md): "114" / "114-514" 引号内范围,
+#   或独立 int(仅单数字); **From>To 会自动交换**; "" 视为 0。
+#   Xray 官方文档**没有** `hysteriaSettings.obfs` 字段 —— 混淆只存在于 finalmask.udp。
+#
+# [Hysteria 2 官方] developers/URI-Scheme.md + advanced/Full-Client-Config.md:
+#   URI scheme `hysteria2` 或 `hy2`; 参数 `obfs`(类型枚举: salamander|gecko)与
+#   `obfs-password`; **URI 参数表中没有 gecko 的尺寸参数**(尺寸只存在于客户端配置文件的
+#   `obfs.gecko.minPacketSize` / `maxPacketSize`)。
+#   Gecko 客户端尺寸: minPacketSize 默认 512, maxPacketSize 默认 1200,
+#   **必须 max >= min 且 max <= 2048**。
+#
+# [mihomo 官方] Meta-Docs config/proxies/hysteria2 + 源码 adapter/outbound/hysteria2.go:
+#   proxy 字段名 `obfs` / `obfs-password` / `obfs-min-packet-size` / `obfs-max-packet-size`;
+#   源码里尺寸字段**只在 `case ObfsTypeGecko` 分支被读取**(salamander 分支只取密码)。
+#
+# 尺寸文本的**唯一规范化入口是 _hy2_obfs_size_canon**: 三个消费者(Xray config 的
+# packetSize、mihomo 的 obfs-min/max-packet-size、菜单/链接回显)必须看到**同一个**已排序
+# 区间。否则 `1500-800` 会在 Xray 侧被自动交换成 800-1500, 而 mihomo 侧照抄成
+# min=1500/max=800 —— 违反 Hysteria 官方 max>=min 约束的非法客户端配置。
 # ---------------------------------------------------------------------------
 
-# 规范化用户输入的 packetSize 文本, 输出可直拼 JSON 的片段(裸数字 / "a-b" 字符串)
-# 用法: _hy2_obfs_size_json <raw>; 空输入 → 空输出(表示用官方默认)
-_hy2_obfs_size_json() {
-    local raw="$1"
-    raw="${raw// /}"                      # 去掉空格, 便于接受 "512 - 1200" 这类写法
-    [ -z "$raw" ] && return 0
-    if [[ "$raw" =~ ^[0-9]+-[0-9]+$ ]]; then
-        echo "\"$raw\""
-    elif [[ "$raw" =~ ^[0-9]+$ ]]; then
-        echo "$raw"
-    else
-        return 1
-    fi
-}
-
-# 读取元数据里的 packetSize 值(裸字符串, 用于分享链接/clash/回显); 未设置 → 空
-_hy2_obfs_size_get() {
-    local meta="$1"
-    jq -r '(.obfs_packet_size // "") | tostring' "$meta" 2>/dev/null
-}
-
-# packetSize 合法性判定(唯一入口): 按 Int32Range 语义解析后按官方上限校验。
-# 输出: ""(合法/未启用) 或 人类可读原因。官方限制: 非空启用 Gecko 时 From>0 且 To<=2048。
-# 用法: why=$(_hy2_obfs_size_invalid <raw>)
-# 注意: 先做长度门限再比较 —— bash 的 [ 对 >= 2^63 的整数会报 "integer expected" 且
-# 返回非零, 不设门限时超大输入会被静默判为"合法"(实测 20 位数字), 直到核心侧
-# Int32Range 解析失败才暴露(白等一次 8 秒重启回滚)。Int32Range 是 int32, 10 位已远超。
-_hy2_obfs_size_invalid() {
+# packetSize 文本规范化(唯一入口): 去空格 → 解析 → 按 Int32Range 语义排序 → 规范形式。
+# 输出: ""(未填/表示不启用 gecko) 或 "N" / "min-max"(min<=max)。
+# 非法返回 1 且**无输出**(调用方必须消费返回码, 不得把空输出当"未启用")。
+# 用法: canon=$(_hy2_obfs_size_canon <raw>)
+_hy2_obfs_size_canon() {
     local raw="$1" a b
-    raw="${raw// /}"
+    raw="${raw// /}"                      # 去掉空格, 便于接受 "512 - 1200" 这类写法
     [ -z "$raw" ] && return 0
     if [[ "$raw" =~ ^([0-9]+)-([0-9]+)$ ]]; then
         a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
     elif [[ "$raw" =~ ^[0-9]+$ ]]; then
         a="$raw"; b="$raw"
     else
+        return 1
+    fi
+    # 先做长度门限再比较: bash 的 [ 对 >= 2^63 的整数会报 "integer expected" 且返回非零,
+    # 不设门限时超大输入会被静默判为"合法"(实测 20 位数字), 直到核心侧 Int32Range 解析
+    # 失败才暴露(白等一次 8 秒重启回滚)。10 位门限只是**防 bash 溢出**, 不等于 int32 上界;
+    # 真正的范围上界由调用方的 _hy2_obfs_size_invalid(To<=2048)兜住。
+    [ "${#a}" -le 10 ] && [ "${#b}" -le 10 ] || return 1
+    # Int32Range: From>To 自动交换 —— 规范化阶段就交换, 使所有下游看到同一区间
+    if [ "$a" -gt "$b" ]; then local t="$a"; a="$b"; b="$t"; fi
+    if [ "$a" = "$b" ]; then echo "$a"; else echo "${a}-${b}"; fi
+}
+
+# packetSize 合法性判定: 输出 ""(合法/未填) 或人类可读原因。
+# 规则来自两层官方文档: 数字或 "min-max"; 非空启用 gecko 时 From>=1 且 To<=2048。
+# 先做形式检查再规范化, 使"格式错"与"数值超范围"给出**不同**的原因
+# (canon 对两者都返回 1, 直接透传会把 20 位数字误报成格式错)。
+_hy2_obfs_size_invalid() {
+    local raw="$1" canon
+    raw="${raw// /}"
+    [ -z "$raw" ] && return 0
+    if ! [[ "$raw" =~ ^[0-9]+$ || "$raw" =~ ^[0-9]+-[0-9]+$ ]]; then
         echo "packetSize 只能是数字或 \"min-max\" 形式"
         return 0
     fi
-    if [ "${#a}" -gt 10 ] || [ "${#b}" -gt 10 ]; then
-        echo "数值超出 Int32Range 可表示范围"
-        return 0
-    fi
-    # Int32Range: From>To 自动交换, 故只校验排序后的两端
-    if [ "$a" -gt "$b" ]; then local t="$a"; a="$b"; b="$t"; fi
+    canon=$(_hy2_obfs_size_canon "$raw") || { echo "数值超出 Int32Range 可表示范围"; return 0; }
+    local a="${canon%%-*}" b="${canon##*-}"
     if [ "$a" -le 0 ]; then
         echo "最小值必须 >= 1"
     elif [ "$b" -gt 2048 ]; then
@@ -102,26 +114,81 @@ _hy2_obfs_size_invalid() {
     fi
 }
 
+# 规范区间的最小值(裸数字, 用于 mihomo obfs-min-packet-size); 未填/非法 → 空。
+_hy2_obfs_size_min() {
+    local canon; canon=$(_hy2_obfs_size_canon "$1") || return 0
+    [ -z "$canon" ] && return 0
+    echo "${canon%%-*}"
+}
+
+# 规范区间的最大值(裸数字, 用于 mihomo obfs-max-packet-size); 未填/非法 → 空。
+_hy2_obfs_size_max() {
+    local canon; canon=$(_hy2_obfs_size_canon "$1") || return 0
+    [ -z "$canon" ] && return 0
+    echo "${canon##*-}"
+}
+
+# 读取元数据里的 packetSize 值(规范形式, 用于分享链接/clash/回显); 未设置 → 空
+_hy2_obfs_size_get() {
+    local meta="$1"
+    jq -r '(.obfs_packet_size // "") | tostring' "$meta" 2>/dev/null
+}
+
+# 该节点的混淆形态是否**无法用官方 hy2 URI 表达**(= gecko, 即带非空尺寸)。
+# 与"元数据缺字段"是两回事: 前者应清空旧链接并指路 clash, 后者应保留旧链接并如实报错。
+# _rebuild_hy2_link 对两者都返回 1, 调用方必须用本函数区分, 否则会把"元数据缺失"误报成
+# "gecko 无法表达", 并把一条本来可用的旧链接毁掉。
+# 用法: _hy2_link_unexpressible <meta_file>
+_hy2_link_unexpressible() {
+    local meta="$1" otype osize
+    otype=$(jq -r '.obfs_type // empty' "$meta" 2>/dev/null)
+    [ -n "$otype" ] || return 1
+    osize=$(_hy2_obfs_size_get "$meta")
+    [ -n "$osize" ]
+}
+
+# ---------------------------------------------------------------------------
+# finalmask.udp 的**自作用域**写过滤器(Xray 官方: udp 是数组, 第一个为最内层伪装,
+# 因此它可以有多层 —— 我们只拥有自己写的那一层, 不是整个数组)。
+# 全项目唯一副本; 90-menu 的启用/关闭/回滚三处都引用它, 不得各自复制(副本会漂移)。
+#
+#   $XD_UDP_OUR_TYPE  我们写入的层 type(Xray 侧 gecko 也是 type=salamander, 见下)
+#   $XD_UDP_NEW       要写入的层对象(单个, 不是数组)
+#
+# 启用: 找到我们自己那层就**原位替换**(保留其前后的其它层), 没有就追加到末尾。
+# 关闭: 只剔除我们自己那层, 其它层原样保留。
+# 注意: 我们写入的层恒为 type="salamander" —— Xray 侧 gecko 是 **salamander + 非空
+# packetSize**(官方文档没有 type="gecko"), 故这一个 type 就唯一标识了我们这一层。
+# ---------------------------------------------------------------------------
+XD_UDP_OUR_TYPE="salamander"
+XD_UDP_JQ_UPSERT='def xd_udp_ours($new): .streamSettings.finalmask.udp = ((.streamSettings.finalmask.udp // []) as $a | ($a | map(.type == $ourtype) | index(true)) as $i | if $i == null then $a + [$new] else $a[0:$i] + [$new] + $a[$i+1:] end); (.inbounds[] | select(.tag == $t)) |= xd_udp_ours($new)'
+XD_UDP_JQ_DROP='(.inbounds[] | select(.tag == $t)) |= (.streamSettings.finalmask.udp = ((.streamSettings.finalmask.udp // []) | map(select(.type != $ourtype))))'
+
 # 从 (type, password, packetSize) 构造 finalmask.udp 数组字面量
 # 用法: _hy2_obfs_mask_block <type> <password> <packet_size_raw>
 # 输出: 空(未启用) 或 {"type": ..., "settings": {...}}  (可直接放进 [ ])
 # 失败(非法 packetSize)返回 1 —— 调用方必须消费返回码, 绝不能拿空输出当"无混淆"用:
 # 回滚/关闭路径上把"解析失败"误当"无混淆"会静默清掉一个正在工作的混淆配置。
 _hy2_obfs_mask_block() {
-    local otype="$1" opw="$2" osize="$3" size_json=""
+    local otype="$1" opw="$2" osize="$3" canon=""
     [ -z "$otype" ] && return 0
-    size_json=$(_hy2_obfs_size_json "$osize") || return 1
+    canon=$(_hy2_obfs_size_canon "$osize") || return 1
+    # 单值(如 "2048")与区间在 Int32Range 下等价; 区间时写成字符串, 单值时写裸数字。
+    local size_json=""
+    [ -n "$canon" ] && { case "$canon" in *-*) size_json="\"$canon\"" ;; *) size_json="$canon" ;; esac; }
     # 格式串必须是字面量: 第三个实参曾同时充当格式串, 一旦 size_json 的正则放宽就是
     # 用户可控的 printf 格式串注入。这里用 %s 逐个拼装, 用户数据永远只当数据。
     printf '%s' "{\"type\": \"${otype}\", \"settings\": {\"password\": \"${opw}\"${size_json:+, \"packetSize\": ${size_json}}}}"
 }
 
 # gecko(非空 packetSize)需要的最小核心版本 —— 版本门控, 与 R44/R45 同口径。
-# 依据: 逐 tag 核对 Xray-core 的 infra/conf/transport_internet.go 的 json tag 与
-# transport/internet/finalmask/salamander/config.proto:
-#   v26.3.27   Salamander{Password}                          —— 无 packetSize 字段
-#   v26.6.1    Salamander{Password, PacketSize *Int32Range}  —— 非 nil 即 GeckoConfig
-#   v26.7.11+  Salamander{Password, PacketSize Int32Range}   —— 当前形态(To>0 即 Gecko)
+# **依据层级必须分清**: Xray 官方 llms-full.txt / docs **没有**任何版本门控表述
+# ("文档未提及, 不能确认"); 下列版本来自**官方源码**逐 tag 核对
+# infra/conf/transport_internet.go 的 json tag(属"源码事实", 不是"文档依据"):
+#   v26.3.27 / v26.4.13 / v26.4.15 / v26.4.17 / v26.4.25 / v26.5.3 / v26.5.9
+#       Salamander{ Password }                                —— 无 packetSize 字段
+#   v26.6.1   Salamander{ Password, PacketSize *Int32Range }  —— 非 nil 即 GeckoConfig
+#   v26.7.11+ Salamander{ Password, PacketSize Int32Range }   —— 当前形态(To>0 即 Gecko)
 # Go 的 encoding/json 静默忽略未识别字段 ⇒ 旧核心会把 packetSize 丢掉、退化成**无分片的
 # salamander** 照常启动; 而按客户端 gecko 生成的条目连不上, 且报错发生在客户端一侧,
 # 服务端日志干净 —— 典型的静默失效。故启用 gecko 前先做版本门控。
@@ -2932,11 +2999,18 @@ _add_hysteria2() {
                     _warn "当前核心不支持 gecko 分片(需 >= ${_HY2_GECKO_MIN_VER}); 已按普通 salamander 配置"
                     obfs_size=""
                 else
-                    # gecko: packetSize 非空即启用(官方 finalmask.md「#### gecko」), 上限 2048
-                    read -rp "  packetSize (Int32Range, 如 512-1200; 回车用官方默认): " obfs_size
-                    obfs_size="${obfs_size// /}"      # 归一化, 便于元数据/clash 直接解析
+                    # gecko: packetSize 非空即启用(Xray 官方 finalmask.md「#### gecko」)。
+                    # **空输入必须落成显式尺寸**: Xray 侧 packetSize 留空 = 不启用 Gecko
+                    # (退化成普通 salamander), 所以"回车用默认"只能填**具体值** —— 否则
+                    # 用户选了 [3] 却得到 salamander。所填 512-1200 来自 Hysteria 官方
+                    # Full-Client-Config 的 gecko 默认值(minPacketSize 默认 512,
+                    # maxPacketSize 默认 1200), **不是 Xray 文档里的默认值**。
+                    read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " obfs_size
+                    obfs_size="${obfs_size:-512-1200}"
                     local size_why; size_why=$(_hy2_obfs_size_invalid "$obfs_size")
                     [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; return 1; }
+                    # 规范化(排序)后回写, 使元数据/clash 与 Xray 看到同一区间
+                    obfs_size=$(_hy2_obfs_size_canon "$obfs_size") || { _error "packetSize 规范化失败"; return 1; }
                 fi
             fi
             obfs_mask=$(_hy2_obfs_mask_block "$obfs_type" "$obfs_pw" "$obfs_size") || { _error "混淆参数构造失败"; return 1; }
@@ -2979,7 +3053,7 @@ _add_hysteria2() {
     [ -n "$obfs_type" ] && link="${link}&obfs=${obfs_type}&obfs-password=$(_url_encode "$obfs_pw")"
     link="${link}#$(_url_encode "$name")"
 
-    # 元数据(obfs_* 供分享链接/clash 重建; packetSize 为 null 表示用官方默认)
+    # 元数据(obfs_* 供分享链接/clash 重建; packetSize 为 null/空 = **未启用 gecko**)
     local meta_json
     meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
@@ -3008,7 +3082,13 @@ _add_hysteria2() {
         _tip "使用自定义证书, SNI: ${sni}"
     fi
     echo -e "  ${CYAN}拥塞控制:${NC} ${congestion}"
-    [ -n "$obfs_type" ] && echo -e "  ${CYAN}混淆:${NC} salamander (FinalMask.udp)${obfs_size:+ · gecko packetSize=${obfs_size}}"
+    if [ -n "$obfs_type" ]; then
+        if [ -n "$obfs_size" ]; then
+            echo -e "  ${CYAN}混淆:${NC} salamander + gecko 分片 (FinalMask.udp) · packetSize=${obfs_size}"
+        else
+            echo -e "  ${CYAN}混淆:${NC} salamander (FinalMask.udp)"
+        fi
+    fi
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
 
@@ -3046,6 +3126,8 @@ _rebuild_hy2_link() {
     # 若照抄成 `obfs=salamander`, 客户端会按"无分片"连接而服务端在分片长包头 ⇒ 握手必失败;
     # 若写成 `obfs=gecko` 又丢了尺寸(服务端非默认尺寸时语义不等价)。两种写法都是
     # "看着正常、连不上"的链接, 故一律不生成, 由 clash 条目(有独立尺寸字段)承载。
+    # 调用方用 _hy2_link_unexpressible 区分"无法表达"(应清空旧链接)与"元数据缺字段"
+    # (应保留旧链接并如实报告) —— 两者都返回 1, 混为一谈会误报原因并毁掉可用的旧链接。
     local obfs_type obfs_pw obfs_size
     obfs_type=$(jq -r '.obfs_type // empty' "$meta")
     obfs_pw=$(jq -r '.obfs_password // empty' "$meta")
@@ -3099,13 +3181,14 @@ _hy2_clash_line() {
     obfs_pw=$(jq -r '.obfs_password // empty' "$meta")
     obfs_size=$(_hy2_obfs_size_get "$meta")
     if [ -n "$obfs_size" ]; then
-        if [[ "$obfs_size" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            obfs_min="${BASH_REMATCH[1]}"; obfs_max="${BASH_REMATCH[2]}"
-        elif [[ "$obfs_size" =~ ^[0-9]+$ ]]; then
-            obfs_min="$obfs_size"; obfs_max="$obfs_size"
-        fi
+        # 尺寸经**唯一规范化入口**取 min/max: 必须与 Xray 侧看到的是同一个已排序区间。
+        # 直接按 "-" 切分会把 `1500-800` 原样导出成 min=1500/max=800 —— Xray 的
+        # Int32Range 会自动交换成 800-1500 照常工作, 而 Hysteria/mihomo 要求
+        # max>=min, 于是客户端侧拿到一份**非法**配置(服务端与客户端语义分裂)。
+        obfs_min=$(_hy2_obfs_size_min "$obfs_size")
+        obfs_max=$(_hy2_obfs_size_max "$obfs_size")
         # 有尺寸但解析不出两端 = 畸形元数据; 宁可拒绝也不产出"写着 salamander、实际服务端在分片"的条目
-        [ -n "$obfs_min" ] || return 1
+        [ -n "$obfs_min" ] && [ -n "$obfs_max" ] || return 1
         obfs_type="gecko"
     fi
     if [ -z "$name" ] || [ -z "$addr" ] || [ -z "$port" ] || [ -z "$auth" ]; then
@@ -3434,7 +3517,20 @@ _view_nodes() {
             echo
             echo -e "  ${CYAN}【${name}】${NC}"
             [ "$auth" != "—" ] && echo -e "  认证算法: ${auth}"
-            echo -e "  ${GREEN}${link}${NC}"
+            # 空/缺失链接: 该节点当前混淆形态无法用官方 hy2 URI 表达(gecko 带尺寸), 或元数据被清过。
+            # 说明必须打到 **stdout**(与链接同一通道) —— _warn/_tip 写 stderr, 只捕获 stdout 时
+            # 用户看到的是"什么都没有", 与修复前打印空行的观感相同。
+            if [ -z "$link" ] || [ "$link" = "null" ]; then
+                echo -e "  ${YELLOW}该节点当前无可用分享链接${NC}"
+                if _hy2_link_unexpressible "$f"; then
+                    echo -e "  ${YELLOW}原因: gecko 自定义分片尺寸无法用官方 hy2 URI 表达${NC}"
+                    echo -e "  ${YELLOW}请改用 clash/mihomo 条目导入(含 obfs-min/max-packet-size), 见 ${CLASH_YAML}${NC}"
+                else
+                    echo -e "  ${YELLOW}原因: 节点元数据缺少链接所需字段(可删除后重建, 或用 [采纳孤儿入站] 补回)${NC}"
+                fi
+            else
+                echo -e "  ${GREEN}${link}${NC}"
+            fi
             local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
             case "$proto" in *cdn*) _warn "此为 CDN 协议, 禁止直连, 须经 Cloudflare 回源" ;; esac
             break
