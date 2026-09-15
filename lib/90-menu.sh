@@ -850,7 +850,7 @@ _hy2_obfs_menu() {
     fi
     echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(Hysteria 官方文档 Full-Server-Config), 客户端必须带相同类型与密码${NC}"
     echo -e "  ${GREEN}[1]${NC} 启用/更换 salamander 混淆"
-    echo -e "  ${GREEN}[2]${NC} 启用/更换 salamander + gecko 分片"
+    echo -e "  ${GREEN}[2]${NC} 启用/更换 gecko"
     echo -e "  ${GREEN}[3]${NC} 关闭混淆"
     echo -e "  ${GREEN}[0]${NC} 返回"
     local obfs_choice
