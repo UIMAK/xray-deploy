@@ -877,21 +877,24 @@ _hy2_obfs_menu() {
             opw=${opw_in:-$opw}
             _validate_json_text "$opw" || { _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; _press_any_key; return; }
             if [ "$obfs_choice" = "2" ]; then
-                # gecko 需要核心支持 packetSize; 旧核心静默忽略该字段 ⇒ 服务端退化成无分片
+                # gecko 需要核心支持 packetSize; 旧核心静默忽略该字段 ⇒ 服务端退化成无分片。
+                # **不支持时直接拒绝, 不自动降级** —— 用户明确选了 gecko, 替他改成另一种混淆
+                # 形态是改变请求(且客户端按 gecko 配、服务端跑 salamander)。版本门控的存在
+                # 本身已表明"旧核心无法安全承载 gecko", 故 fail-closed。
                 if ! _hy2_gecko_supported; then
-                    _warn "当前核心不支持 gecko 分片(需 >= ${_HY2_GECKO_MIN_VER}); 已按普通 salamander 配置"
-                    osize=""
-                else
-                    # 空输入必须落成显式尺寸: Xray 侧 packetSize 留空 = **不启用 Gecko**
-                    # (退化成普通 salamander)。所填 512-1200 来自 Hysteria 官方
-                    # Full-Client-Config 的 gecko 默认值, 不是 Xray 文档里的默认值。
-                    read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " osize
-                    osize="${osize:-512-1200}"
-                    local size_why; size_why=$(_hy2_obfs_size_invalid "$osize")
-                    [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; _press_any_key; return; }
-                    # 规范化(排序)后回写, 使元数据/clash 与 Xray 看到同一区间
-                    osize=$(_hy2_obfs_size_canon "$osize") || { _error "packetSize 规范化失败"; _press_any_key; return; }
+                    _error "当前核心不支持 gecko 分片(packetSize 需核心 >= ${_HY2_GECKO_MIN_VER}); 已取消, 未修改任何配置"
+                    _tip "请先升级/切换 Xray 核心, 或改选 [1] 普通 salamander"
+                    _press_any_key; return
                 fi
+                # 空输入必须落成显式尺寸: Xray 侧 packetSize 留空 = **不启用 Gecko**
+                # (退化成普通 salamander)。所填 512-1200 来自 Hysteria 官方
+                # Full-Client-Config 的 gecko 默认值, 不是 Xray 文档里的默认值。
+                read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " osize
+                osize="${osize:-512-1200}"
+                local size_why; size_why=$(_hy2_obfs_size_invalid "$osize")
+                [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; _press_any_key; return; }
+                # 规范化(排序 + 去前导零)后回写, 使元数据/clash 与 Xray 看到同一区间
+                osize=$(_hy2_obfs_size_canon "$osize") || { _error "packetSize 规范化失败"; _press_any_key; return; }
             fi
             omask=$(_hy2_obfs_mask_block "$otype" "$opw" "$osize") || { _error "混淆参数构造失败"; _press_any_key; return; }
             # 只管理**我们自己那一层**(见 XD_UDP_JQ_UPSERT): 用户/其它工具可能在同一

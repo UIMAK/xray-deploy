@@ -69,8 +69,8 @@ _normalize_bandwidth() {
 # min=1500/max=800 —— 违反 Hysteria 官方 max>=min 约束的非法客户端配置。
 # ---------------------------------------------------------------------------
 
-# packetSize 文本规范化(唯一入口): 去空格 → 解析 → 按 Int32Range 语义排序 → 规范形式。
-# 输出: ""(未填/表示不启用 gecko) 或 "N" / "min-max"(min<=max)。
+# packetSize 文本规范化(唯一入口): 去空格 → 解析 → 排序(Int32Range 语义) → 去前导零 → 规范形式。
+# 输出: ""(未填/表示不启用 gecko) 或 "N" / "min-max"(min<=max, 十进制无前导零)。
 # 非法返回 1 且**无输出**(调用方必须消费返回码, 不得把空输出当"未启用")。
 # 用法: canon=$(_hy2_obfs_size_canon <raw>)
 _hy2_obfs_size_canon() {
@@ -89,13 +89,21 @@ _hy2_obfs_size_canon() {
     # 失败才暴露(白等一次 8 秒重启回滚)。10 位门限只是**防 bash 溢出**, 不等于 int32 上界;
     # 真正的范围上界由调用方的 _hy2_obfs_size_invalid(To<=2048)兜住。
     [ "${#a}" -le 10 ] && [ "${#b}" -le 10 ] || return 1
+    # 去前导零(十进制字面量规范化): "008" → "8"。Xray 的 Int32Range 按数值解释, 前导零本
+    # 无影响; 但同一区间会同时写进 metadata 与外部 YAML(clash), 各解析器对前导零的处理
+    # 未必一致 ⇒ 在唯一入口就归一, 让所有下游看到同一字面量。用 10# 强制十进制, 避免
+    # bash 把 "008" 当八进制(那会让 008/0010 直接报错)。
+    a=$((10#$a)); b=$((10#$b))
     # Int32Range: From>To 自动交换 —— 规范化阶段就交换, 使所有下游看到同一区间
     if [ "$a" -gt "$b" ]; then local t="$a"; a="$b"; b="$t"; fi
     if [ "$a" = "$b" ]; then echo "$a"; else echo "${a}-${b}"; fi
 }
 
 # packetSize 合法性判定: 输出 ""(合法/未填) 或人类可读原因。
-# 规则来自两层官方文档: 数字或 "min-max"; 非空启用 gecko 时 From>=1 且 To<=2048。
+# 规则: 数字或 "min-max"; 非空启用 gecko 时 To<=2048(Xray 官方 finalmask.md「#### gecko」
+# 明文的硬上限)。**From>=1 是本脚本自身的输入限制, 不是两个官方文档写明的统一硬限制** ——
+# Xray 的 Int32Range 通用定义允许 ""(视为 0)且未给所有字段规定"不能为 0"; Hysteria 官方
+# gecko 段落只写 max>=min 且 max<=2048。0 长度分片无意义, 故脚本层拒绝并如实说明来源。
 # 先做形式检查再规范化, 使"格式错"与"数值超范围"给出**不同**的原因
 # (canon 对两者都返回 1, 直接透传会把 20 位数字误报成格式错)。
 _hy2_obfs_size_invalid() {
@@ -109,7 +117,7 @@ _hy2_obfs_size_invalid() {
     canon=$(_hy2_obfs_size_canon "$raw") || { echo "数值超出 Int32Range 可表示范围"; return 0; }
     local a="${canon%%-*}" b="${canon##*-}"
     if [ "$a" -le 0 ]; then
-        echo "最小值必须 >= 1"
+        echo "本脚本要求最小值 >= 1(0 长度分片无意义)"
     elif [ "$b" -gt 2048 ]; then
         echo "最大值不得超过 2048"
     fi
@@ -3021,23 +3029,26 @@ _add_hysteria2() {
             if [ "$obfs_choice" = "3" ]; then
                 # gecko 需要核心支持 packetSize(见 _hy2_gecko_supported): 旧核心会静默忽略
                 # 该字段、退化成无分片的 salamander, 服务端照常启动而客户端连不上。
+                # **不支持时直接拒绝, 不自动降级**: 用户明确选了 gecko, 替他改成一个不同的
+                # 混淆形态是改变请求(且客户端会按 gecko 配置而服务端在跑 salamander)。
+                # 版本门控的存在本身已表明"旧核心无法安全承载 gecko", 故 fail-closed。
                 if ! _hy2_gecko_supported; then
-                    _warn "当前核心不支持 gecko 分片(需 >= ${_HY2_GECKO_MIN_VER}); 已按普通 salamander 配置"
-                    obfs_size=""
-                else
-                    # gecko: packetSize 非空即启用(Xray 官方 finalmask.md「#### gecko」)。
-                    # **空输入必须落成显式尺寸**: Xray 侧 packetSize 留空 = 不启用 Gecko
-                    # (退化成普通 salamander), 所以"回车用默认"只能填**具体值** —— 否则
-                    # 用户选了 [3] 却得到 salamander。所填 512-1200 来自 Hysteria 官方
-                    # Full-Client-Config 的 gecko 默认值(minPacketSize 默认 512,
-                    # maxPacketSize 默认 1200), **不是 Xray 文档里的默认值**。
-                    read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " obfs_size
-                    obfs_size="${obfs_size:-512-1200}"
-                    local size_why; size_why=$(_hy2_obfs_size_invalid "$obfs_size")
-                    [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; return 1; }
-                    # 规范化(排序)后回写, 使元数据/clash 与 Xray 看到同一区间
-                    obfs_size=$(_hy2_obfs_size_canon "$obfs_size") || { _error "packetSize 规范化失败"; return 1; }
+                    _error "当前核心不支持 gecko 分片(packetSize 需核心 >= ${_HY2_GECKO_MIN_VER}); 已取消, 未修改任何配置"
+                    _tip "请先升级/切换 Xray 核心(核心版本门控见项目文档), 或改选 [2] 普通 salamander"
+                    return 1
                 fi
+                # gecko: packetSize 非空即启用(Xray 官方 finalmask.md「#### gecko」)。
+                # **空输入必须落成显式尺寸**: Xray 侧 packetSize 留空 = 不启用 Gecko
+                # (退化成普通 salamander), 所以"回车用默认"只能填**具体值** —— 否则
+                # 用户选了 [3] 却得到 salamander。所填 512-1200 来自 Hysteria 官方
+                # Full-Client-Config 的 gecko 默认值(minPacketSize 默认 512,
+                # maxPacketSize 默认 1200), **不是 Xray 文档里的默认值**。
+                read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " obfs_size
+                obfs_size="${obfs_size:-512-1200}"
+                local size_why; size_why=$(_hy2_obfs_size_invalid "$obfs_size")
+                [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; return 1; }
+                # 规范化(排序 + 去前导零)后回写, 使元数据/clash 与 Xray 看到同一区间
+                obfs_size=$(_hy2_obfs_size_canon "$obfs_size") || { _error "packetSize 规范化失败"; return 1; }
             fi
             obfs_mask=$(_hy2_obfs_mask_block "$obfs_type" "$obfs_pw" "$obfs_size") || { _error "混淆参数构造失败"; return 1; }
             ;;
