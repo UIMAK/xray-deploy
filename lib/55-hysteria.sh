@@ -38,8 +38,9 @@
 # 代价(已与用户确认): 官方服务端一个 auth 段只能有一个密码, 故**不再支持多用户** ——
 # 节点 = 这一台服务器的唯一认证凭据, 模型见下。
 # - 服务器配置为**单文件**(hysteria.json) + **单节点元数据**(node.json)。
-# 旧版 userpass 多用户模型(每用户一个 nodes/<user>.json)已废弃; 旧节点数据由
-# _hysteria_migrate_legacy_nodes 在进菜单时一次性迁移(取首个用户的密码, 其余丢弃并告警)。
+# 本模块自 0.16.19 起即为单密码模型, 从未发布过 userpass 多用户版本, 故**不做任何
+# 旧配置迁移** —— 迁移代码属于没有真实受众的死代码(项目惯例: 不留不可达分支,
+# 同 0.16.18 清理 plain 死分支)。检测到非 password 的 auth 一律按"外来配置"拒绝接管。
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -51,8 +52,6 @@ export HYSTERIA_DATA_DIR="$DEPLOY_DIR/hysteria"
 export HYSTERIA_BACKUP_DIR="$DEPLOY_DIR/hysteria/backup"
 # 唯一节点元数据(单密码模型: 一台服务器只有一个认证凭据 → 一份节点元数据)
 export HYSTERIA_NODE_META="$DEPLOY_DIR/hysteria/node.json"
-# 旧 userpass 多用户模型的节点目录(仅用于一次性迁移与清理; 不再作为权威存储)
-export HYSTERIA_NODES_DIR="$DEPLOY_DIR/hysteria/nodes"
 # manager 自有元数据(link_addr/tls_mode/sni/pin 等)。绝不写进 hysteria.json ——
 # 那是官方 binary 的配置文件, 只允许出现官方字段。
 export HYSTERIA_SERVER_META="$DEPLOY_DIR/hysteria/server_meta.json"
@@ -74,8 +73,6 @@ _hysteria_ensure_dirs() {
     local ok=1 d f
     # LOG_DIR 一并确保: openrc output_log / direct 启动重定向都写 $LOG_DIR/hysteria.log,
     # 而模块可能被非 xd 主入口路径调用(cron/直接 source), 不能假设 _ensure_dirs 已跑过。
-    # **不创建 $HYSTERIA_NODES_DIR**: 那是旧 userpass 多用户模型的目录, 已废弃;
-    # 由 _hysteria_migrate_legacy_nodes 改名保留, 不重造(否则每次进菜单都会凭空出现空目录)。
     for d in "$HYSTERIA_DATA_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR" "$HYSTERIA_ACME_DIR" "$LOG_DIR"; do
         mkdir -p "$d" || ok=0
         chmod 700 "$d" 2>/dev/null || ok=0
@@ -1345,23 +1342,13 @@ _hysteria_config_exists() {
 # 本 Manager 认定的**可运行**认证状态。官方 binary 实测(2.12.2):
 #   - 缺 auth 段 / auth.type 为空 → FATAL "auth.type: empty auth type"
 #   - auth.type=password 且 password 为空串 → FATAL "auth.password: empty auth password"
-#   - auth.type=userpass 且表为空 → FATAL "empty auth userpass"
-# 本 Manager 的模型是**单密码**(见文件头), 但 userpass(旧模型/手工配置)同为官方合法
-# 且可运行 —— 故"已初始化"接受两者, 只是 userpass 会由 _hysteria_gate 提示迁移。
-# 不接受 http/command: 它们依赖外部后端, Manager 无从校验, 也不该接管。
+# 本 Manager 的模型是**单密码**(见文件头): 只有 password 且密码非空才算已初始化。
+# 不接受 userpass/http/command: 它们都不是本模型 —— userpass 是被本模型取代的
+# 多用户形态(从未随本模块发布, 无需迁移), http/command 依赖外部后端, Manager
+# 无从校验也不该接管。判据只认一个模型, 才能保证"已初始化 ⇒ 本模块能管理它"。
 _hysteria_auth_ok() {
     _hysteria_config_exists || return 1
-    jq -e '
-        (.auth.type == "password" and (.auth.password | type == "string") and (.auth.password | length) > 0)
-        or
-        (.auth.type == "userpass" and (.auth.userpass | type == "object") and ((.auth.userpass | length) > 0))
-    ' "$HYSTERIA_CONFIG" >/dev/null 2>&1
-}
-
-# 当前 auth 是否为旧 userpass 模型(用于菜单提示迁移; 非错误)
-_hysteria_auth_is_userpass() {
-    _hysteria_config_exists || return 1
-    jq -e '.auth.type == "userpass"' "$HYSTERIA_CONFIG" >/dev/null 2>&1
+    jq -e '(.auth.type == "password") and (.auth.password | type == "string") and ((.auth.password | length) > 0)' "$HYSTERIA_CONFIG" >/dev/null 2>&1
 }
 
 _hysteria_server_initialized() {
@@ -1376,9 +1363,6 @@ _hysteria_gate() {
         if jq -e '.auth.type == "password"' "$HYSTERIA_CONFIG" >/dev/null 2>&1; then
             _error "Hysteria 配置的 auth.password 为空(不完整状态): $HYSTERIA_CONFIG"
             _tip "空密码无法启动(官方 binary 会 FATAL: empty auth password); 请删除该配置后重新初始化"
-        elif _hysteria_auth_is_userpass; then
-            _error "Hysteria 配置的 auth.userpass 表为空(不完整状态): $HYSTERIA_CONFIG"
-            _tip "空表无法启动(官方 binary 会 FATAL: empty auth userpass); 请删除该配置后重新初始化"
         else
             _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 password 模式"
             _tip "为防止覆盖现有配置, 菜单操作不可用; 如需接管请自行备份并把 auth 段改为 {type: password, password: ...}, 或删除该配置后重新初始化"
@@ -2390,71 +2374,6 @@ _hysteria_remove_clash_by_name() {
 # **没有"用户名"这一维**: 官方 password 模式不接受用户名, 客户端(Xray/sing-box/mihomo)
 # 只需填认证密码 —— 这正是用户要求"只要认证密码"的原因。
 
-# 旧 userpass 多用户模型的一次性迁移(进菜单时调用, 幂等):
-# 官方一个 auth 段只能有一个密码, 故多用户配置**无法**无损转成单密码。
-# 取"第一个用户"的密码作为单密码(确定性: 按用户名排序, 避免 glob 顺序漂移),
-# 其余用户的密码被丢弃 —— 这是模型切换的必然代价, 必须**显式告警**而不是静默丢弃。
-# 节点元数据若已有(单文件), 只做 auth 段转换; 否则从旧节点文件重建一份。
-# 旧 nodes/ 目录改名保留(不删)供人工核对, 避免用户凭据被无声抹掉。
-# 返回 0 = 已迁移或无需迁移; 1 = 迁移失败(已告警, 配置保持原样)
-_hysteria_migrate_legacy_nodes() {
-    _hysteria_auth_is_userpass || return 0
-    _hysteria_config_exists || return 0
-    local first_user first_pass others n
-    # 按用户名排序取第一个(确定性); keys[] 排序后取首项
-    first_user=$(jq -r '.auth.userpass | keys | sort | .[0] // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    [ -n "$first_user" ] || return 0
-    first_pass=$(jq -r --arg u "$first_user" '.auth.userpass[$u] // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    [ -n "$first_pass" ] || return 0
-    n=$(jq -r '.auth.userpass | length' "$HYSTERIA_CONFIG" 2>/dev/null)
-    others=$((n - 1))
-    # 配置转换(走统一事务: 备份 + jq + verified-restart + 失败回滚)
-    if ! _hysteria_config_txn --arg p "$first_pass" \
-         '.auth = {type: "password", password: $p}'; then
-        _error "旧 userpass 配置迁移失败, 配置保持原样(仍可用旧凭据连接)"
-        return 1
-    fi
-    # 节点元数据: 已有单文件则只对齐 auth 值; 否则从旧节点文件重建
-    local name="" addr=""
-    if [ -f "$HYSTERIA_NODE_META" ]; then
-        local cur
-        cur=$(cat "$HYSTERIA_NODE_META" 2>/dev/null)
-        if [ -n "$cur" ]; then
-            name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
-            addr=$(jq -r '.link_addr // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
-        fi
-    fi
-    local old_node="$HYSTERIA_NODES_DIR/${first_user}.json"
-    if [ -z "$name" ] || [ -z "$addr" ]; then
-        if [ -f "$old_node" ]; then
-            name=$(jq -r '.name // empty' "$old_node" 2>/dev/null)
-            addr=$(jq -r '.link_addr // empty' "$old_node" 2>/dev/null)
-        fi
-    fi
-    [ -n "$addr" ] || addr=$(_hysteria_meta_get link_addr)
-    [ -n "$name" ] || name="HY2官方"
-    local meta_json
-    meta_json=$(jq -n --arg a "$first_pass" --arg n "$name" --arg addr "$addr" \
-        --arg created "$(date '+%Y-%m-%d')" \
-        '{auth:$a,name:$n,link_addr:$addr,created:$created}')
-    if ! _atomic_write_json "$HYSTERIA_NODE_META" "$meta_json"; then
-        _warn "节点元数据写入失败, 请手工核对 $HYSTERIA_NODE_META"
-    fi
-    # 旧目录改名保留(不删): 用户凭据不静默消失, 但也不再被本模块读取
-    if [ -d "$HYSTERIA_NODES_DIR" ]; then
-        local legacy="${HYSTERIA_DATA_DIR}/nodes.userpass.bak"
-        rm -rf "$legacy" 2>/dev/null
-        mv "$HYSTERIA_NODES_DIR" "$legacy" 2>/dev/null \
-            || _warn "旧节点目录改名失败, 保留原样: $HYSTERIA_NODES_DIR"
-    fi
-    _warn "已把旧 userpass 多用户配置迁移为单密码模型(官方 password 模式)"
-    _tip "保留密码: 用户 ${first_user} 的密码(其余 $others 个用户的密码已不再生效, 客户端请改用该密码)"
-    [ "$others" -gt 0 ] && _tip "旧凭据备份在 ${HYSTERIA_DATA_DIR}/nodes.userpass.bak/ 供人工核对(本模块不再读取)"
-    _success "认证模型迁移完成"
-    _hysteria_rebuild_all_links || true
-    return 0
-}
-
 # 节点显示名是否已被占用(clash.yaml 按 name 删除/替换, 重名会串条目; 与 Xray 侧
 # _ensure_unique_name 同一约束, 作用域是 hysteria 自己的节点元数据)
 _hysteria_name_taken() {
@@ -2517,8 +2436,8 @@ _hysteria_bootstrap() {
     echo; echo -e "  ${CYAN}=== 初始化官方 Hysteria2 服务器 ===${NC}"
     _tip "官方架构: 单服务单密码; 以下为服务器级设置, 认证密码即客户端唯一凭据"
 
-    # 0) 前置保护: 存在非本 Manager 管理的官方配置(auth 既非 password 也非 userpass)时
-    # 绝不 bootstrap —— bootstrap 会整体重写配置文件, 静默覆盖用户已有的合法配置是不可接受的
+    # 0) 前置保护: 存在非本 Manager 管理的官方配置(auth 非 password 模式)时绝不 bootstrap
+    # —— bootstrap 会整体重写配置文件, 静默覆盖用户已有的合法配置是不可接受的
     if _hysteria_config_exists && ! _hysteria_server_initialized; then
         _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 password 模式"
         _tip "为防止覆盖现有配置, 已取消初始化; 如需接管请自行备份并手工转换 auth 段, 或确认无用后删除该配置再重试"
@@ -2804,10 +2723,6 @@ _hysteria_add_node() {
         return $?
     fi
     echo; echo -e "  ${CYAN}=== 添加 Hysteria2 (官方) 节点 ===${NC}"
-    # 旧 userpass 配置: 先迁移再谈"已存在"(否则提示会指向不存在的多用户模型)
-    if _hysteria_auth_is_userpass; then
-        _hysteria_migrate_legacy_nodes || return 1
-    fi
     _warn "官方 password 模式只支持**一个**认证密码, 服务器已有节点(认证凭据已存在)"
     _tip "如需更换认证密码请用 [5] 修改节点密码; 如需多套独立凭据请分别部署多台服务器"
     _press_any_key
@@ -2820,9 +2735,6 @@ _hysteria_view_nodes() {
     if ! _hysteria_gate; then
         _press_any_key
         return 0
-    fi
-    if _hysteria_auth_is_userpass; then
-        _warn "当前为旧 userpass 多用户配置; 请先执行 [2] 添加节点 触发一次性迁移"
     fi
     echo -e "  服务器: $(_hysteria_listen_display)  TLS: $(_hysteria_tls_desc)  状态: $(_manage_hysteria status 2>/dev/null)"
     # 语义缺口(gecko 自定义/非法尺寸)是服务器级的: 在列表顶部说明一次。
@@ -2870,11 +2782,6 @@ _hysteria_delete_node() {
     _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 节点】${NC}"
-    if _hysteria_auth_is_userpass; then
-        _warn "当前为旧 userpass 多用户配置; 请先执行 [2] 添加节点 触发一次性迁移后再删除"
-        _press_any_key
-        return
-    fi
     if [ ! -f "$HYSTERIA_NODE_META" ]; then
         _warn "暂无节点"
         _press_any_key
@@ -2909,11 +2816,6 @@ _hysteria_change_password() {
     _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【修改节点密码】${NC}"
-    if _hysteria_auth_is_userpass; then
-        _warn "当前为旧 userpass 多用户配置; 请先执行 [2] 添加节点 触发一次性迁移后再改密码"
-        _press_any_key
-        return
-    fi
     if [ ! -f "$HYSTERIA_NODE_META" ]; then
         _warn "暂无节点(请用 [2] 添加节点 初始化)"
         _press_any_key
@@ -3088,18 +2990,10 @@ _hysteria_uninstall() {
             *-*) _warn "该配置启用了端口跳跃: 若服务曾被强制杀死, 请人工核查 nft/iptables 是否残留重定向规则" ;;
         esac
     fi
-    # clash.yaml 派生条目(在数据目录删除前取名字)。单密码模型: 唯一节点元数据 +
-    # 旧 userpass 目录(若存在, 兼容手工留下的备份, 一并清条目)
+    # clash.yaml 派生条目(在数据目录删除前取名字)。单密码模型: 只有一份节点元数据。
     if [ -f "$HYSTERIA_NODE_META" ]; then
         name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
         [ -n "$name" ] && _hysteria_remove_clash_by_name "$name"
-    fi
-    if [ -d "$HYSTERIA_NODES_DIR" ]; then
-        for f in "$HYSTERIA_NODES_DIR"/*.json; do
-            [ -f "$f" ] || continue
-            name=$(jq -r '.name // empty' "$f" 2>/dev/null)
-            [ -n "$name" ] && _hysteria_remove_clash_by_name "$name"
-        done
     fi
     rm -f "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META" "$HYSTERIA_LOG_FILE" /etc/logrotate.d/xd-hysteria
     rm -rf "$HYSTERIA_DATA_DIR" "$HYSTERIA_CERT_DIR"
@@ -3139,17 +3033,6 @@ _hysteria_menu() {
     _hysteria_ensure_dirs || { _press_any_key; return 0; }
     # 进入菜单时的一次性幂等清理(declare -F 守卫, 与主菜单对混合版本安装的惯例一致)
     declare -F _hysteria_purge_legacy_variant_state >/dev/null 2>&1 && _hysteria_purge_legacy_variant_state
-    # 旧 userpass 多用户配置 → 单密码模型的一次性迁移(幂等; 失败只告警, 不阻断菜单 ——
-    # 配置保持原样仍可用旧凭据连接, 用户可在 [2] 里重试)。
-    # 迁移走 config 事务(verified-restart), 故仅在核心已安装时尝试; 未安装时只提示,
-    # 避免每次进菜单都刷一条"核心未安装"的错误。
-    if declare -F _hysteria_migrate_legacy_nodes >/dev/null 2>&1 && _hysteria_auth_is_userpass; then
-        if _hysteria_installed; then
-            _hysteria_migrate_legacy_nodes || true
-        else
-            _warn "检测到旧 userpass 多用户配置; 装好核心后进入 [2] 会自动迁移为单密码模型"
-        fi
-    fi
     while true; do
         clear
         echo
