@@ -67,7 +67,7 @@ _print_status_bar() {
         else
             hst="${RED}○ 已停止${NC}"
         fi
-        hyline="  Hysteria2(官方) v${hver#v}: ${hst}"
+        hyline="  Hysteria2 v${hver#v}: ${hst}"
     fi
 
     # Geo(真相源: config.json 的 geodata.cron, 兼容旧 state)
@@ -131,12 +131,12 @@ _main_menu() {
         echo -e "  ${GREEN}[5]${NC} 更新监听"
         echo -e "  ${GREEN}[6]${NC} Xray Hy2 管理"
         echo -e "  ${GREEN}[7]${NC} Reality 域名管理"
-        echo -e "  ${GREEN}[8]${NC} Hysteria2 管理 (官方)"
+        echo -e "  ${GREEN}[8]${NC} Hysteria2 管理"
         echo
         echo -e "  ${CYAN}【核心与服务】${NC}"
         local _core=9
         local _ops_start=$((_core+3))
-        printf "  ${GREEN}[%d]${NC} 安装/更新或切换 Xray 核心(稳定/预览)\n" "$_core"
+        printf "  ${GREEN}[%d]${NC} 安装/更新或切换 Xray 核心\n" "$_core"
         printf "  ${GREEN}[%d]${NC} Geo 数据自动更新\n" $((_core+1))
         printf "  ${GREEN}[%d]${NC} cloudflared 管理\n" $((_core+2))
         echo

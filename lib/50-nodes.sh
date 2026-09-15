@@ -1925,7 +1925,11 @@ _adopt_orphan_inbounds() {
 # ---------------------------------------------------------------------------
 _add_node() {
     clear
-    [ -x "$XRAY_BIN" ] || { _error "Xray 未安装,请先在 [8] 安装/更新或切换 Xray 核心(稳定/预览)"; _press_any_key; return 1; }
+    # 规约(backend/quality-guidelines「Don't: hardcode a menu number in a message emitted from
+    # another module」): 运维/核心区的编号由 _main_menu 按 _core/_ops_start 现算, 写死字面量
+    # 只在下一次插入菜单项前正确 —— 这里原本写死 `[8]`, 而 [8] 现已是「Hysteria2 管理」。
+    # 只点名目的地, 不写编号。
+    [ -x "$XRAY_BIN" ] || { _error "Xray 未安装,请先到主菜单的 [安装/更新或切换 Xray 核心] 安装核心"; _press_any_key; return 1; }
     _ensure_dirs || return 1
     echo
     echo -e "  ${CYAN}【添加节点 — 选择协议】${NC}"
