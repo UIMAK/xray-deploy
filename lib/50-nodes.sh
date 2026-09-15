@@ -41,7 +41,8 @@ _normalize_bandwidth() {
 # ---------------------------------------------------------------------------
 # Hysteria2 混淆(FinalMask.udp)辅助
 #
-# 依据分两层(项目红线: 两层不得混用, 代码注释必须点名来源):
+# 依据分三层(项目红线: 层与层不得混用, 注释必须点名来源; 用户 2026-09-15 明确接受
+# mihomo 官方作为 clash 字段名的第三层依据, 以及"官方源码"作为 Xray 版本门控的依据):
 #
 # [Xray 官方] config/transports/finalmask.md「UDPMask」/「### salamander」/「#### gecko」:
 #   "udp": [ { "type": "", "settings": {} } ]  —— 数组第一个为最内层伪装;
@@ -182,9 +183,10 @@ _hy2_obfs_mask_block() {
 }
 
 # gecko(非空 packetSize)需要的最小核心版本 —— 版本门控, 与 R44/R45 同口径。
-# **依据层级必须分清**: Xray 官方 llms-full.txt / docs **没有**任何版本门控表述
+# **依据层级必须分清**: Xray 官方 llms-full.txt / docs **没有任何版本门控表述**
 # ("文档未提及, 不能确认"); 下列版本来自**官方源码**逐 tag 核对
-# infra/conf/transport_internet.go 的 json tag(属"源码事实", 不是"文档依据"):
+# infra/conf/transport_internet.go 的 json tag —— 属"源码事实", 不是"文档依据"。
+# 用户 2026-09-15 明确接受"官方源码"作为 Xray 侧的第二依据(与文档依据分开声明)。
 #   v26.3.27 / v26.4.13 / v26.4.15 / v26.4.17 / v26.4.25 / v26.5.3 / v26.5.9
 #       Salamander{ Password }                                —— 无 packetSize 字段
 #   v26.6.1   Salamander{ Password, PacketSize *Int32Range }  —— 非 nil 即 GeckoConfig
