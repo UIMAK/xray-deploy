@@ -39,6 +39,102 @@ _normalize_bandwidth() {
 }
 
 # ---------------------------------------------------------------------------
+# Hysteria2 混淆(FinalMask.udp)辅助 —— 官方依据: Xray-docs-next
+#   config/transports/finalmask.md「UDPMask」一节:
+#     "udp": [ { "type": "", "settings": {} } ]  —— 数组第一个为最内层伪装;
+#     type = "salamander" 时 settings = { "password": ..., "packetSize": "512-1200" }
+#   packetSize 为 Int32Range(development/intro/guide.md「Int32Range」): 引号内的
+#   "114" / "114-514", 或独立 int(仅单数字); From>To 自动交换; "" 视为 0。
+#   非空即启用 Gecko(对 QUIC 长包头额外分片填充), 上限不得超过 2048。
+# 注意: 官方文档没有 `hysteriaSettings.obfs` 字段 —— 混淆只存在于 finalmask.udp。
+# 本函数只把用户输入规范化成 JSON 字面量; 合法性判定统一走 _hy2_obfs_size_invalid。
+# ---------------------------------------------------------------------------
+
+# 规范化用户输入的 packetSize 文本, 输出可直拼 JSON 的片段(裸数字 / "a-b" 字符串)
+# 用法: _hy2_obfs_size_json <raw>; 空输入 → 空输出(表示用官方默认)
+_hy2_obfs_size_json() {
+    local raw="$1"
+    raw="${raw// /}"                      # 去掉空格, 便于接受 "512 - 1200" 这类写法
+    [ -z "$raw" ] && return 0
+    if [[ "$raw" =~ ^[0-9]+-[0-9]+$ ]]; then
+        echo "\"$raw\""
+    elif [[ "$raw" =~ ^[0-9]+$ ]]; then
+        echo "$raw"
+    else
+        return 1
+    fi
+}
+
+# 读取元数据里的 packetSize 值(裸字符串, 用于分享链接/clash/回显); 未设置 → 空
+_hy2_obfs_size_get() {
+    local meta="$1"
+    jq -r '(.obfs_packet_size // "") | tostring' "$meta" 2>/dev/null
+}
+
+# packetSize 合法性判定(唯一入口): 按 Int32Range 语义解析后按官方上限校验。
+# 输出: ""(合法/未启用) 或 人类可读原因。官方限制: 非空启用 Gecko 时 From>0 且 To<=2048。
+# 用法: why=$(_hy2_obfs_size_invalid <raw>)
+# 注意: 先做长度门限再比较 —— bash 的 [ 对 >= 2^63 的整数会报 "integer expected" 且
+# 返回非零, 不设门限时超大输入会被静默判为"合法"(实测 20 位数字), 直到核心侧
+# Int32Range 解析失败才暴露(白等一次 8 秒重启回滚)。Int32Range 是 int32, 10 位已远超。
+_hy2_obfs_size_invalid() {
+    local raw="$1" a b
+    raw="${raw// /}"
+    [ -z "$raw" ] && return 0
+    if [[ "$raw" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+    elif [[ "$raw" =~ ^[0-9]+$ ]]; then
+        a="$raw"; b="$raw"
+    else
+        echo "packetSize 只能是数字或 \"min-max\" 形式"
+        return 0
+    fi
+    if [ "${#a}" -gt 10 ] || [ "${#b}" -gt 10 ]; then
+        echo "数值超出 Int32Range 可表示范围"
+        return 0
+    fi
+    # Int32Range: From>To 自动交换, 故只校验排序后的两端
+    if [ "$a" -gt "$b" ]; then local t="$a"; a="$b"; b="$t"; fi
+    if [ "$a" -le 0 ]; then
+        echo "最小值必须 >= 1"
+    elif [ "$b" -gt 2048 ]; then
+        echo "最大值不得超过 2048"
+    fi
+}
+
+# 从 (type, password, packetSize) 构造 finalmask.udp 数组字面量
+# 用法: _hy2_obfs_mask_block <type> <password> <packet_size_raw>
+# 输出: 空(未启用) 或 {"type": ..., "settings": {...}}  (可直接放进 [ ])
+# 失败(非法 packetSize)返回 1 —— 调用方必须消费返回码, 绝不能拿空输出当"无混淆"用:
+# 回滚/关闭路径上把"解析失败"误当"无混淆"会静默清掉一个正在工作的混淆配置。
+_hy2_obfs_mask_block() {
+    local otype="$1" opw="$2" osize="$3" size_json=""
+    [ -z "$otype" ] && return 0
+    size_json=$(_hy2_obfs_size_json "$osize") || return 1
+    # 格式串必须是字面量: 第三个实参曾同时充当格式串, 一旦 size_json 的正则放宽就是
+    # 用户可控的 printf 格式串注入。这里用 %s 逐个拼装, 用户数据永远只当数据。
+    printf '%s' "{\"type\": \"${otype}\", \"settings\": {\"password\": \"${opw}\"${size_json:+, \"packetSize\": ${size_json}}}}"
+}
+
+# gecko(非空 packetSize)需要的最小核心版本 —— 版本门控, 与 R44/R45 同口径。
+# 依据: 逐 tag 核对 Xray-core 的 infra/conf/transport_internet.go 的 json tag 与
+# transport/internet/finalmask/salamander/config.proto:
+#   v26.3.27   Salamander{Password}                          —— 无 packetSize 字段
+#   v26.6.1    Salamander{Password, PacketSize *Int32Range}  —— 非 nil 即 GeckoConfig
+#   v26.7.11+  Salamander{Password, PacketSize Int32Range}   —— 当前形态(To>0 即 Gecko)
+# Go 的 encoding/json 静默忽略未识别字段 ⇒ 旧核心会把 packetSize 丢掉、退化成**无分片的
+# salamander** 照常启动; 而按客户端 gecko 生成的条目连不上, 且报错发生在客户端一侧,
+# 服务端日志干净 —— 典型的静默失效。故启用 gecko 前先做版本门控。
+_HY2_GECKO_MIN_VER="v26.6.1"
+_hy2_gecko_supported() {
+    [ -x "$XRAY_BIN" ] || return 1
+    declare -F _xray_version_ge >/dev/null 2>&1 || return 1
+    # _xray_version_ge <min>: 内部自取当前版本(纯数字三段比较, busybox 安全);
+    # 版本读不到时返回 1 = 不满足, 正好是保守侧。
+    _xray_version_ge "$_HY2_GECKO_MIN_VER"
+}
+
+# ---------------------------------------------------------------------------
 # iptables / 端口跳跃辅助(Hysteria2 端口跳跃用)
 # 原理: iptables nat PREROUTING DNAT 把 UDP 端口范围转发到 hy2 监听端口
 # 支持格式: "3010-3020" / "3050" / "3010-3020,3050,3100-3110" (逗号分隔混合)
@@ -963,7 +1059,7 @@ _render_template() {
     : "${R_SERVER_NAME:=}" "${R_PRIVATE_KEY:=}" "${R_SHORT_ID:=}" "${R_PATH:=}"
     : "${R_HOST:=}" "${R_METHOD:=}" "${R_PASSWORD:=}" "${R_MLDSA65_SEED:=}"
     : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
-    : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}"
+    : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}" "${R_OBFS_MASK_BLOCK:=}"
     : "${R_TUNNEL_PORT:=}" "${R_TUNNEL_TAG:=}"
     : "${R_FLOW:=}" "${R_DECRYPTION:=none}" "${R_NETWORK:=}"
 
@@ -996,6 +1092,13 @@ _render_template() {
     p="{{BRUTAL_PARAMS_BLOCK}}"
     if [ -n "$R_BRUTAL_PARAMS_BLOCK" ]; then
         content="${content//$p/$R_BRUTAL_PARAMS_BLOCK}"
+    else
+        content="${content//$p/}"
+    fi
+    # Hysteria2 混淆块(可选: 官方文档 finalmask.udp 数组; 未启用混淆时置空 → "udp": [])
+    p="{{OBFS_MASK_BLOCK}}"
+    if [ -n "$R_OBFS_MASK_BLOCK" ]; then
+        content="${content//$p/$R_OBFS_MASK_BLOCK}"
     else
         content="${content//$p/}"
     fi
@@ -2786,6 +2889,7 @@ _add_hysteria2() {
     echo -e "  ${GREEN}[1]${NC} bbr"
     echo -e "  ${GREEN}[2]${NC} brutal"
     echo -e "  ${GREEN}[3]${NC} force-brutal"
+    local cc_choice
     read -rp "  选择 (默认 1): " cc_choice
     local congestion="bbr"
     local brutal_up="" brutal_down=""
@@ -2807,6 +2911,38 @@ _add_hysteria2() {
 
     local listen="::"
 
+    # 混淆(FinalMask.udp) —— 官方文档 finalmask.md「UDPMask」; 默认不启用。
+    # 兼容性提示的出处是 Hysteria 官方文档 Full-Server-Config「混淆」(Xray 的
+    # finalmask.md 只定义字段, 没有这句兼容性说明), 故按来源点名而不写"官方"。
+    local obfs_type="" obfs_pw="" obfs_size="" obfs_mask="" obfs_pw_in="" obfs_choice
+    echo -e "  混淆 (FinalMask.udp, 默认关闭):"
+    echo -e "  ${GREEN}[1]${NC} 不启用  ${GREEN}[2]${NC} salamander  ${GREEN}[3]${NC} salamander + gecko 分片"
+    read -rp "  选择 (默认 1): " obfs_choice
+    case "${obfs_choice:-1}" in
+        2|3)
+            obfs_type="salamander"
+            obfs_pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
+            read -rp "  混淆密码 (回车随机): " obfs_pw_in
+            obfs_pw=${obfs_pw_in:-$obfs_pw}
+            _validate_json_text "$obfs_pw" || { _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
+            if [ "$obfs_choice" = "3" ]; then
+                # gecko 需要核心支持 packetSize(见 _hy2_gecko_supported): 旧核心会静默忽略
+                # 该字段、退化成无分片的 salamander, 服务端照常启动而客户端连不上。
+                if ! _hy2_gecko_supported; then
+                    _warn "当前核心不支持 gecko 分片(需 >= ${_HY2_GECKO_MIN_VER}); 已按普通 salamander 配置"
+                    obfs_size=""
+                else
+                    # gecko: packetSize 非空即启用(官方 finalmask.md「#### gecko」), 上限 2048
+                    read -rp "  packetSize (Int32Range, 如 512-1200; 回车用官方默认): " obfs_size
+                    obfs_size="${obfs_size// /}"      # 归一化, 便于元数据/clash 直接解析
+                    local size_why; size_why=$(_hy2_obfs_size_invalid "$obfs_size")
+                    [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; return 1; }
+                fi
+            fi
+            obfs_mask=$(_hy2_obfs_mask_block "$obfs_type" "$obfs_pw" "$obfs_size") || { _error "混淆参数构造失败"; return 1; }
+            ;;
+    esac
+
     # 构建 brutal 参数块(brutal / force-brutal 模式有值)
     local brutal_block=""
     if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
@@ -2819,6 +2955,7 @@ _add_hysteria2() {
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag"
     R_AUTH="$auth" R_CERT_FILE="$cert_file" R_KEY_FILE="$key_file"
     R_CONGESTION="$congestion" R_BRUTAL_PARAMS_BLOCK="$brutal_block"
+    R_OBFS_MASK_BLOCK="$obfs_mask"
     local inbound
     inbound=$(_render_template "$(_tpl_path hysteria2)") || return 1
 
@@ -2838,17 +2975,20 @@ _add_hysteria2() {
     link="${link}&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
+    # 混淆参数: obfs/obfs-password(官方 Hysteria URI-Scheme; Xray 文档未定义 hy2 链接)
+    [ -n "$obfs_type" ] && link="${link}&obfs=${obfs_type}&obfs-password=$(_url_encode "$obfs_pw")"
     link="${link}#$(_url_encode "$name")"
 
-    # 元数据
+    # 元数据(obfs_* 供分享链接/clash 重建; packetSize 为 null 表示用官方默认)
     local meta_json
     meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg auth "$auth" --arg sni "$sni" --arg congestion "$congestion" \
         --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
+        --arg obfsType "$obfs_type" --arg obfsPw "$obfs_pw" --arg obfsSize "$obfs_size" \
         --arg link "$link" --argjson ss "$self_signed" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,self_signed:$ss,share_link:$link}')
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,obfs_type:$obfsType,obfs_password:$obfsPw,obfs_packet_size:(if $obfsSize == "" then null else $obfsSize end),self_signed:$ss,share_link:$link}')
     if ! _save_node_meta "$tag" "$meta_json"; then
         _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
         return 1
@@ -2868,6 +3008,7 @@ _add_hysteria2() {
         _tip "使用自定义证书, SNI: ${sni}"
     fi
     echo -e "  ${CYAN}拥塞控制:${NC} ${congestion}"
+    [ -n "$obfs_type" ] && echo -e "  ${CYAN}混淆:${NC} salamander (FinalMask.udp)${obfs_size:+ · gecko packetSize=${obfs_size}}"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
 
@@ -2897,6 +3038,18 @@ _rebuild_hy2_link() {
         _error "节点元数据缺少必要字段(auth/link_addr/port/congestion/name), 无法重建分享链接: $meta"
         return 1
     fi
+    # 混淆(obfs/obfs-password) —— 客户端侧参数名来自官方 Hysteria URI-Scheme;
+    # Xray 文档未定义 hy2 分享链接, 故此处以 Hysteria 官方为准(与服务端 finalmask.udp 对应)。
+    # **gecko 时拒绝生成链接**(与官方 Hysteria2 模块 _hysteria_obfs_uri_gap 同口径):
+    # 官方 URI 的 `obfs` 是**类型**枚举(salamander | gecko), 只有 obfs/obfs-password
+    # 两个参数、**没有任何尺寸参数**。服务端 Xray 侧 gecko = type:salamander + packetSize,
+    # 若照抄成 `obfs=salamander`, 客户端会按"无分片"连接而服务端在分片长包头 ⇒ 握手必失败;
+    # 若写成 `obfs=gecko` 又丢了尺寸(服务端非默认尺寸时语义不等价)。两种写法都是
+    # "看着正常、连不上"的链接, 故一律不生成, 由 clash 条目(有独立尺寸字段)承载。
+    local obfs_type obfs_pw obfs_size
+    obfs_type=$(jq -r '.obfs_type // empty' "$meta")
+    obfs_pw=$(jq -r '.obfs_password // empty' "$meta")
+    obfs_size=$(_hy2_obfs_size_get "$meta")
     local link_ip="$host"
     [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
     local link="hy2://$(_url_encode "$auth")@${link_ip}:${port}/?sni=$(_url_encode "$sni")"
@@ -2904,6 +3057,10 @@ _rebuild_hy2_link() {
     link="${link}&congestion=${congestion}"
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
+    if [ -n "$obfs_type" ]; then
+        [ -n "$obfs_size" ] && return 1
+        link="${link}&obfs=${obfs_type}&obfs-password=$(_url_encode "$obfs_pw")"
+    fi
     # 端口跳跃端口(如果已配置, 统一通过 _read_hop_ranges_display 读取, M9)
     local hop_ports
     hop_ports=$(_read_hop_ranges_display "$meta" 2>/dev/null)
@@ -2918,6 +3075,7 @@ _rebuild_hy2_link() {
 # 字段依据 Meta-Docs(config/proxies/hysteria2)与 mihomo 源码(adapter/outbound/hysteria2.go):
 #   - mihomo 无 `congestion-control` 字段(会被解码器静默忽略), brutal 由 up/down 触发
 #   - 端口跳跃用 `ports`(mihomo 原生支持, hop-interval 默认 30s), flow 上下文必须加引号
+#   - 混淆用 `obfs`/`obfs-password`, gecko 尺寸用 `obfs-min/max-packet-size`(仅 gecko)
 # 用法: _hy2_clash_line <meta_file>; stdout 为单行 flow 条目(以 "- {name: ...}" 开头)
 # ---------------------------------------------------------------------------
 _hy2_clash_line() {
@@ -2932,6 +3090,24 @@ _hy2_clash_line() {
     brutal_up=$(jq -r '.brutal_up // empty' "$meta")
     brutal_down=$(jq -r '.brutal_down // empty' "$meta")
     self_signed=$(jq -r '.self_signed // "false"' "$meta")
+    # 混淆字段依据 Meta-Docs(config/proxies/hysteria2): obfs / obfs-password /
+    # obfs-min-packet-size / obfs-max-packet-size。mihomo 只在 `obfs: gecko` 分支读取
+    # 尺寸字段(case "salamander" 只取密码, 尺寸会被解码器静默忽略), 故 **有尺寸时
+    # obfs 必须写 gecko** —— 这正是官方 URI 表达不出来的那部分, clash 条目是它的唯一载体。
+    local obfs_type obfs_pw obfs_size obfs_min="" obfs_max=""
+    obfs_type=$(jq -r '.obfs_type // empty' "$meta")
+    obfs_pw=$(jq -r '.obfs_password // empty' "$meta")
+    obfs_size=$(_hy2_obfs_size_get "$meta")
+    if [ -n "$obfs_size" ]; then
+        if [[ "$obfs_size" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            obfs_min="${BASH_REMATCH[1]}"; obfs_max="${BASH_REMATCH[2]}"
+        elif [[ "$obfs_size" =~ ^[0-9]+$ ]]; then
+            obfs_min="$obfs_size"; obfs_max="$obfs_size"
+        fi
+        # 有尺寸但解析不出两端 = 畸形元数据; 宁可拒绝也不产出"写着 salamander、实际服务端在分片"的条目
+        [ -n "$obfs_min" ] || return 1
+        obfs_type="gecko"
+    fi
     if [ -z "$name" ] || [ -z "$addr" ] || [ -z "$port" ] || [ -z "$auth" ]; then
         _error "节点元数据缺少必要字段(name/link_addr/port/auth), 无法生成 clash 条目: $meta"
         return 1
@@ -2941,6 +3117,12 @@ _hy2_clash_line() {
     if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
         [ -n "$brutal_up" ] && line="${line}, up: \"$(_yaml_dq "$brutal_up")\""
         [ -n "$brutal_down" ] && line="${line}, down: \"$(_yaml_dq "$brutal_down")\""
+    fi
+    # 混淆: mihomo 有独立字段可完整表达(含 gecko 分片尺寸; 官方 hy2 URI 无尺寸参数)
+    if [ -n "$obfs_type" ]; then
+        line="${line}, obfs: ${obfs_type}, obfs-password: \"$(_yaml_dq "$obfs_pw")\""
+        [ -n "$obfs_min" ] && line="${line}, obfs-min-packet-size: ${obfs_min}"
+        [ -n "$obfs_max" ] && line="${line}, obfs-max-packet-size: ${obfs_max}"
     fi
     # 端口跳跃: 引号必须有 —— flow 映射上下文里裸逗号会被解析成字段分隔符
     local hop_ports

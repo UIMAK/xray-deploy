@@ -589,6 +589,7 @@ _hy2_manage_menu() {
         echo -e "  ${GREEN}[2]${NC} 调整 brutal 带宽"
         echo -e "  ${GREEN}[3]${NC} 端口跳跃 (iptables)"
         echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
+        echo -e "  ${GREEN}[5]${NC} 混淆 salamander / gecko (FinalMask.udp)"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
@@ -597,6 +598,7 @@ _hy2_manage_menu() {
             2) _hy2_adjust_bandwidth ;;
             3) _hy2_toggle_hop ;;
             4) _hy2_view_hop ;;
+            5) _hy2_obfs_menu ;;
             0) return ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
@@ -788,8 +790,152 @@ _hy2_adjust_bandwidth() {
 }
 
 # ---------------------------------------------------------------------------
-# Reality 域名管理(切换 target SNI)
+# Hysteria2: 混淆 salamander / gecko (FinalMask.udp)
+# 官方依据: Xray-docs-next config/transports/finalmask.md「UDPMask」
+#   finalmask.udp = [ {type:"salamander", settings:{password, packetSize}} ]
+#   packetSize 为 Int32Range, 非空即启用 Gecko(QUIC 长包头额外分片填充), 上限 2048。
+# 注意: 官方文档没有 hysteriaSettings.obfs 字段; 链接侧 obfs/obfs-password 参数名
+# 来自 Hysteria 官方 URI-Scheme(Xray 文档未定义 hy2 分享链接)。
+# 服务端变更走 _mutate_config(事务 + verified-restart + 回滚); 元数据在 config 提交成功后写,
+# 失败时把 config 回滚为无混淆, 保持两侧一致(顺序与 _hy2_toggle_brutal 一致)。
 # ---------------------------------------------------------------------------
+_hy2_obfs_menu() {
+    local choice
+    clear
+    _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+    echo; echo -e "  ${CYAN}【混淆 salamander / gecko (FinalMask.udp)】${NC}"
+    local tags=() i=1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        local tag name otype osize
+        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
+        otype=$(jq -r '.obfs_type // empty' "$f")
+        osize=$(_hy2_obfs_size_get "$f")
+        tags+=("$tag")
+        printf "  ${GREEN}[%d]${NC} %-20s 当前: %s%s\n" "$i" "$name" "${otype:-未启用}" "${osize:+ (packetSize=${osize})}"
+        i=$((i+1))
+    done
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    read -rp "  选择节点: " choice
+    [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
+    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+
+    # 入站必须真实存在于 config: 元数据在而 config 被手工改过时, 下面的
+    # `(.inbounds[] | select(.tag == $t) | ...) = $m` 会匹配 0 条路径 —— jq 返回 0、
+    # 配置原样不动, _mutate_config 重启成功并报"已启用", 于是元数据与服务器再次分裂。
+    jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
+        || { _error "config.json 中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
+
+    local meta="$NODES_DIR/${tag}.json"
+    local cur_type cur_pw cur_size
+    cur_type=$(jq -r '.obfs_type // empty' "$meta")
+    cur_pw=$(jq -r '.obfs_password // empty' "$meta")
+    cur_size=$(_hy2_obfs_size_get "$meta")
+    # 回滚目标 = **改动前**的混淆形态(不是"无混淆"): 元数据写失败时若一律回滚成
+    # udp:[], 一个正在用混淆工作的节点会被静默清成无混淆, 而链接/clash 仍写着 obfs
+    # ⇒ 所有已分发客户端立刻连不上。cur_type 为空时该表达式自然得到 [], 首次启用不受影响。
+    local rollback_mask
+    rollback_mask=$(_hy2_obfs_mask_block "$cur_type" "$cur_pw" "$cur_size") || rollback_mask="__INVALID__"
+    echo
+    if [ -n "$cur_type" ]; then
+        echo -e "  当前: ${GREEN}${cur_type}${NC}${cur_size:+ (packetSize=${cur_size})}"
+    else
+        echo -e "  当前: ${RED}未启用${NC}"
+    fi
+    echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(Hysteria 官方文档 Full-Server-Config), 客户端必须带相同类型与密码${NC}"
+    echo -e "  ${GREEN}[1]${NC} 启用/更换 salamander 混淆"
+    echo -e "  ${GREEN}[2]${NC} 启用/更换 salamander + gecko 分片"
+    echo -e "  ${GREEN}[3]${NC} 关闭混淆"
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    local obfs_choice
+    read -rp "  请选择: " obfs_choice
+    local otype="" opw="" osize="" omask="" opw_in=""
+    case "${obfs_choice:-0}" in
+        0) return ;;
+        1|2)
+            otype="salamander"
+            opw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
+            read -rp "  混淆密码 (回车随机): " opw_in
+            opw=${opw_in:-$opw}
+            _validate_json_text "$opw" || { _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; _press_any_key; return; }
+            if [ "$obfs_choice" = "2" ]; then
+                # gecko 需要核心支持 packetSize; 旧核心静默忽略该字段 ⇒ 服务端退化成无分片
+                if ! _hy2_gecko_supported; then
+                    _warn "当前核心不支持 gecko 分片(需 >= ${_HY2_GECKO_MIN_VER}); 已按普通 salamander 配置"
+                    osize=""
+                else
+                    read -rp "  packetSize (Int32Range, 如 512-1200; 回车用官方默认): " osize
+                    osize="${osize// /}"      # 归一化, 便于元数据/clash 直接解析
+                    local size_why; size_why=$(_hy2_obfs_size_invalid "$osize")
+                    [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; _press_any_key; return; }
+                fi
+            fi
+            omask=$(_hy2_obfs_mask_block "$otype" "$opw" "$osize") || { _error "混淆参数构造失败"; _press_any_key; return; }
+            if ! _mutate_config --arg t "$tag" --argjson m "[$omask]" \
+                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.udp) = $m'; then
+                _error "混淆启用失败, 已回滚"; _press_any_key; return
+            fi
+            if ! _meta_update "$meta" \
+                 '.obfs_type=$t | .obfs_password=$p | .obfs_packet_size=(if $s == "" then null else $s end)' \
+                 --arg t "$otype" --arg p "$opw" --arg s "$osize"; then
+                # config 已提交而元数据未落地 → 回滚 config(回到**改动前**的形态), 否则链接/clash 与服务器行为不一致
+                _hy2_obfs_rollback "$tag" "$rollback_mask" \
+                    || _error "元数据写入失败, 且配置回滚失败, 请手工检查 ${CONFIG_FILE}"
+                _error "混淆元数据写入失败, 已回滚配置"
+                _press_any_key; return
+            fi
+            _success "混淆已启用 (${otype}${osize:+ · packetSize=${osize}})"
+            ;;
+        3)
+            if ! _mutate_config --arg t "$tag" \
+                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.udp) = []'; then
+                _error "关闭混淆失败, 已回滚"; _press_any_key; return
+            fi
+            if ! _meta_update "$meta" 'del(.obfs_type) | del(.obfs_password) | del(.obfs_packet_size)'; then
+                _hy2_obfs_rollback "$tag" "$rollback_mask" \
+                    || _error "元数据写入失败, 且配置回滚失败, 请手工检查 ${CONFIG_FILE}"
+                _error "混淆元数据写入失败, 已回滚配置"
+                _press_any_key; return
+            fi
+            _success "混淆已关闭"
+            ;;
+        *) _warn "无效选择"; _press_any_key; return ;;
+    esac
+    # 服务器级变更 → 分享链接与 clash 条目必须同步(链接含 obfs 参数; clash 含 obfs 字段)
+    local link
+    if ! link=$(_rebuild_hy2_link "$meta") || [ -z "$link" ]; then
+        _warn "混淆已变更, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
+        _press_any_key; return
+    fi
+    _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
+    local nline nname
+    nname=$(jq -r '.name // empty' "$meta")
+    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
+        _replace_node_in_yaml "$nline" "$nname" || \
+            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+    fi
+    _press_any_key
+}
+
+# 把 config 里该节点的 finalmask.udp 回滚为指定字面量(见 _hy2_obfs_menu 的回滚路径)。
+# $2 = _hy2_obfs_mask_block 的输出; 为空 ⇒ 回滚成"无混淆"(udp: []),
+# 为 __INVALID__ ⇒ 改动前的元数据本身无法解析(畸形), 此时**拒绝动 config**:
+# 拿"无混淆"当回滚值会把一个可能在工作的混淆配置静默清掉, 宁可不回滚并如实报告。
+# 用法: _hy2_obfs_rollback <tag> <mask_or_empty_or_INVALID>
+_hy2_obfs_rollback() {
+    local tag="$1" mask="$2"
+    if [ "$mask" = "__INVALID__" ]; then
+        _error "改动前的混淆元数据无法解析, 未回滚配置(请手工核对 ${CONFIG_FILE})"
+        return 1
+    fi
+    _mutate_config --arg t "$tag" --argjson m "[$mask]" \
+        '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.udp) = $m'
+}
 _reality_domain_menu() {
     local choice
     _has_reality_nodes || { _warn "暂无 Reality 节点"; _press_any_key; return; }
