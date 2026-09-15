@@ -1355,6 +1355,23 @@ _hysteria_server_initialized() {
     _hysteria_auth_ok
 }
 
+# 读取 hysteria.json 的认证密码(只读; 不存在/非 password 模式输出空)
+_hysteria_config_password() {
+    _hysteria_config_exists || return 0
+    jq -r 'if .auth.type == "password" then (.auth.password // "") else "" end' "$HYSTERIA_CONFIG" 2>/dev/null
+}
+
+# **服务器是否已有认证凭据** —— 与 _hysteria_server_initialized 是两个不同的判断:
+#   _hysteria_server_initialized = 配置可运行(config.json 有 password)
+#   本函数                        = **Manager 已接管这台服务器**(有 node.json 元数据)
+# 二者必须分开: 单密码模型下"有凭据"不等于"本 Manager 管过它" —— 用户可能手工
+# 部署过 Official Hysteria 再装上本脚本, 此时 config 有 password 但 node.json 不存在。
+# 用 initialized 去挡"添加节点"会造成**状态死结**(删了 node.json 就再也加不回来),
+# 用本函数才正确: 没有 node.json ⇒ 走接管流程重建元数据。
+_hysteria_node_exists() {
+    [ -f "$HYSTERIA_NODE_META" ] && [ -s "$HYSTERIA_NODE_META" ]
+}
+
 # 菜单操作闸门: initialized → 放行; 配置存在但 auth 段不可运行/非本模型 → 明确
 # "不接管/状态不完整"; 无配置 → 提示初始化路径。返回 1 时调用方中止操作。
 _hysteria_gate() {
@@ -2714,8 +2731,15 @@ _hysteria_bootstrap() {
 # [2] 添加节点: 单密码模型下"添加节点"= 初始化服务器并创建唯一凭据。
 # 已初始化时**不能**再加节点(官方 password 模式一个 auth 段只有一个密码), 如实告知
 # 并指向改密码/卸载重建 —— 绝不静默覆盖现有密码(那会让所有已分发链接失效)。
+# [2] 添加节点。单密码模型下只有三种情形, 必须**分别处理**(旧实现只判
+# `_hysteria_server_initialized`, 于是"删了 node.json 但配置仍有密码"会形成死结:
+# 既提示"已有节点"不给重建, 又无法再初始化 —— 见 _hysteria_node_exists 注释)。
+#   1) 配置可运行 + node.json 存在 → 已有节点, 指向 [5] 改密码
+#   2) 配置可运行 + node.json 缺失 → **接管**: 用配置里现成的认证密码重建节点元数据
+#      (绝不改动认证段 —— 凭据是用户已经在用的, 换掉会让已分发的链接全部失效)
+#   3) 配置不可运行/不存在 → bootstrap 新建(含认证密码)
 _hysteria_add_node() {
-    local auth name meta_json
+    local auth name meta_json addr
     _hysteria_ensure_dirs || return 1
     if ! _hysteria_server_initialized; then
         # bootstrap 含认证密码创建(官方 binary 拒绝空密码, 不可先建空服务器)
@@ -2723,8 +2747,76 @@ _hysteria_add_node() {
         return $?
     fi
     echo; echo -e "  ${CYAN}=== 添加 Hysteria2 (官方) 节点 ===${NC}"
-    _warn "官方 password 模式只支持**一个**认证密码, 服务器已有节点(认证凭据已存在)"
-    _tip "如需更换认证密码请用 [5] 修改节点密码; 如需多套独立凭据请分别部署多台服务器"
+    # 情形 1: 本 Manager 已接管(有节点元数据)
+    if _hysteria_node_exists; then
+        _warn "官方 password 模式只支持**一个**认证密码, 服务器已有节点(认证凭据已存在)"
+        _tip "如需更换认证密码请用 [5] 修改节点密码; 如需多套独立凭据请分别部署多台服务器"
+        _press_any_key
+        return 0
+    fi
+    # 情形 2: 服务器已有认证凭据但 Manager 侧无节点记录(手工部署过 / 删过节点记录)。
+    # **接管**: 复用现成密码重建元数据, 不改 hysteria.json 的认证段。
+    auth=$(_hysteria_config_password)
+    if [ -z "$auth" ]; then
+        _error "无法读取 hysteria.json 的认证密码, 已取消(请检查 $HYSTERIA_CONFIG 的 auth 段)"
+        _press_any_key
+        return 1
+    fi
+    _tip "服务器已有认证凭据(手工部署或此前清除了节点记录), 将按现有密码重建节点"
+    _tip "认证密码保持不变(不会使已分发的链接失效)"
+    local def_name
+    def_name=$(_hysteria_default_name)
+    read -rp "  节点名称 (回车默认 ${def_name}): " name
+    name=${name:-$def_name}
+    _validate_json_text "$name" || { _error "名称含非法字符"; _press_any_key; return 1; }
+    if _hysteria_name_taken "$name"; then
+        [ "$name" = "$def_name" ] || { _error "节点名称已存在: ${name}"; _press_any_key; return 1; }
+        name=$(_hysteria_autofill_name "$def_name")
+        _tip "默认名已被占用, 自动命名为 ${name}"
+    fi
+    # 客户端连接地址: 优先沿用 server_meta 里已有的(接管场景多半已有), 无则询问
+    addr=$(_hysteria_meta_get link_addr)
+    if [ -z "$addr" ]; then
+        addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址, 已取消"; _press_any_key; return 1; }
+        _hysteria_meta_set link_addr "$addr" || _warn "连接地址写入 server_meta 失败(节点本体不受影响)"
+    else
+        _info "沿用已有客户端连接地址: ${addr}"
+    fi
+    # 预检(元数据完整性 + listen 可解析), 失败不得固化半成品节点
+    local tmp_meta
+    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
+        _error "临时节点元数据创建失败, 节点未创建"
+        _press_any_key
+        return 1
+    }
+    if ! jq -n --arg a "$auth" --arg n "$name" --arg ad "$addr" \
+         '{auth:$a,name:$n,link_addr:$ad}' > "$tmp_meta" 2>/dev/null; then
+        rm -f "$tmp_meta"
+        _error "临时节点元数据构建失败, 节点未创建"
+        _press_any_key
+        return 1
+    fi
+    if ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
+        rm -f "$tmp_meta"
+        _error "分享链接预检失败, 节点未创建"
+        _tip "请先确认 hysteria.json 的 listen/tls 等服务器级字段完整"
+        _press_any_key
+        return 1
+    fi
+    rm -f "$tmp_meta"
+    meta_json=$(jq -n --arg a "$auth" --arg n "$name" --arg ad "$addr" \
+        --arg created "$(date '+%Y-%m-%d')" \
+        '{auth:$a,name:$n,link_addr:$ad,created:$created}')
+    # 节点元数据是 Manager 侧权威状态, 与 config 无关 → 直接原子写(无需 config 事务:
+    # 本路径**不改 hysteria.json**, 没有需要回滚的配置变更)
+    if ! _atomic_write_json "$HYSTERIA_NODE_META" "$meta_json"; then
+        _error "节点元数据写入失败, 节点未创建"
+        _press_any_key
+        return 1
+    fi
+    _hysteria_sync_clash "$HYSTERIA_NODE_META" || _warn "clash 条目同步失败(可手工编辑 ${CLASH_YAML})"
+    _success "节点 [${name}] 已接管(认证密码沿用服务器现有值)"
+    _hysteria_print_link "$HYSTERIA_NODE_META" || true
     _press_any_key
     return 0
 }
@@ -2746,8 +2838,15 @@ _hysteria_view_nodes() {
         echo -e "  ${YELLOW}clash/mihomo 配置可完整表达该尺寸; 手工客户端请自行设置相同分片尺寸${NC}"
     fi
     echo
-    if [ ! -f "$HYSTERIA_NODE_META" ]; then
-        _warn "暂无节点(请用 [2] 添加节点 初始化)"
+    if ! _hysteria_node_exists; then
+        # 区分两种"没有节点": 服务器根本没配 vs 配了但 Manager 侧无记录
+        # (后者是"清除了节点记录"的中间态, 必须明确指路 [2] 重建, 否则用户会以为要卸载重装)
+        if _hysteria_server_initialized; then
+            _warn "Manager 侧暂无节点记录, 但服务器已有认证凭据(手工部署或此前清除了记录)"
+            _tip "用 [2] 添加节点 可按现有密码重建记录(认证密码不变)"
+        else
+            _warn "暂无节点(请用 [2] 添加节点 初始化)"
+        fi
         _press_any_key
         return 0
     fi
@@ -2771,12 +2870,6 @@ _hysteria_view_nodes() {
     return 0
 }
 
-# 旧接口保留(无调用方, 仅为兼容可能的 stale lib 引用): 单密码模型下没有"用户名"概念,
-# 恒输出空。**不要**把它接回任何 UI —— 用户名已不是本模型的维度。
-_hysteria_list_users() {
-    return 0
-}
-
 _hysteria_delete_node() {
     local name auth ans
     _hysteria_gate || { _press_any_key; return; }
@@ -2793,7 +2886,8 @@ _hysteria_delete_node() {
     echo -e "  当前节点: ${GREEN}${name}${NC}"
     echo -e "  ${YELLOW}官方 password 模式只有一个认证密码: 删除后服务将无凭据可用(会启动失败)${NC}"
     echo -e "  ${YELLOW}本操作只清除 Manager 侧节点记录(分享链接/clash 条目), 不改动 hysteria.json 的认证段${NC}"
-    echo -e "  ${YELLOW}如需彻底移除请用 [13] 卸载 Hysteria; 如需换密码请用 [5] 修改节点密码${NC}"
+    echo -e "  ${CYAN}清除后可随时用 [2] 添加节点 按现有密码重建记录(认证密码不变)${NC}"
+    echo -e "  ${YELLOW}如需彻底移除请用 [14] 卸载 Hysteria; 如需换密码请用 [5] 修改节点密码${NC}"
     read -rp "  确认清除节点记录 [${name}]? [y/N]: " ans
     case "$ans" in
         y|Y) ;;
