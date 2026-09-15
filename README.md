@@ -33,7 +33,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/UIMAK/xray-deploy/main/insta
 - 官方 `userpass` 的客户端认证串是 **`用户名:密码`**。Xray 的 hysteria 入站认证字段(`settings.users[].auth`)与 sing-box 的 hysteria2 `password` 都只是"一个字符串", **不会替你拼 `user:pass`** —— 用户必须手填 `user:pass` 才能连上。sing-box 官方文档亦明文: "官方程序支持 userpass…本质上是把 `<username>:<password>` 当实际密码, 而 sing-box 不提供此别名"。
 - 单密码下, 分享链接的 userinfo 只有一个 auth 段(`hysteria2://<密码>@host:port/`)、clash/mihomo 的 `password` 就是密码本身, 与 Xray/sing-box 的"认证密码"一一对应, **复制即用**。
 
-代价(已与用户确认): 官方服务端一个 auth 段只能有一个密码, 故本模块**不再支持多用户** —— 一个节点 = 这一台服务器的唯一凭据。旧版 `userpass` 多用户配置会在进入菜单或执行 `[2] 添加节点` 时**一次性迁移**: 取用户名排序后的第一个用户的密码, 其余用户的密码不再生效(会明确告警), 旧 `nodes/` 目录改名保留为 `hysteria/nodes.userpass.bak/` 供人工核对。
+代价(已与用户确认): 官方服务端一个 auth 段只能有一个密码, 故本模块**不支持多用户** —— 一个节点 = 这一台服务器的唯一凭据。
+
+本模块自引入起即为单密码模型, **不做 `userpass` → `password` 迁移**: 检测到 `auth` 不是 `password` 模式的现成配置时一律按"外来配置"处理 —— 菜单拒绝接管(不静默覆盖你的配置), 并提示你自行备份/转换或删除后重新初始化。
 
 > 需要多套独立凭据时, 请分别部署多台服务器(每个实例一套密码)。
 
