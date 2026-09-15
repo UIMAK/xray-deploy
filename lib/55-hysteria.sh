@@ -1339,18 +1339,26 @@ _hysteria_config_exists() {
     jq -e . "$HYSTERIA_CONFIG" >/dev/null 2>&1
 }
 
-# 本 Manager 认定的**可运行**认证状态。官方 binary 实测(2.12.2):
+# 本 Manager 认定的**可管理**认证状态。官方 binary 实测(2.12.2):
 #   - 缺 auth 段 / auth.type 为空 → FATAL "auth.type: empty auth type"
 #   - auth.type=password 且 password 为空串 → FATAL "auth.password: empty auth password"
-# 本 Manager 的模型是**单密码**(见文件头): 只有 password 且密码非空才算已初始化。
+# 本 Manager 的模型是**单密码**(见文件头): 只有 password 且密码非空才算就绪。
 # 不接受 userpass/http/command: 它们都不是本模型 —— userpass 是被本模型取代的
 # 多用户形态(从未随本模块发布, 无需迁移), http/command 依赖外部后端, Manager
-# 无从校验也不该接管。判据只认一个模型, 才能保证"已初始化 ⇒ 本模块能管理它"。
+# 无从校验也不该接管。判据只认一个模型, 才能保证"就绪 ⇒ 本模块能管理它"。
+#
+# **契约边界(外部复审 P3, 已在此声明, 不靠函数名暗示)**: 本判据只证明"auth 段可用
+# 且是本模型", **不证明服务能启动** —— 官方 binary 无 validate/check 子命令, 坏配置
+# (listen 冲突、TLS 路径错等)只能靠真实启动结果判断, 那是 `_hysteria_restart_verified`
+# / `_hysteria_validate_transient` 的职责。函数名沿用 `server_initialized`(全模块 +
+# 测试套件的稳定契约), 但**不得**据此断言"服务在运行"; 需要运行事实请查
+# `_manage_hysteria status`。
 _hysteria_auth_ok() {
     _hysteria_config_exists || return 1
     jq -e '(.auth.type == "password") and (.auth.password | type == "string") and ((.auth.password | length) > 0)' "$HYSTERIA_CONFIG" >/dev/null 2>&1
 }
 
+# 别名(全模块既有调用点): 语义完全同 _hysteria_auth_ok, 见上方的契约边界说明。
 _hysteria_server_initialized() {
     _hysteria_auth_ok
 }
@@ -1361,15 +1369,43 @@ _hysteria_config_password() {
     jq -r 'if .auth.type == "password" then (.auth.password // "") else "" end' "$HYSTERIA_CONFIG" 2>/dev/null
 }
 
-# **服务器是否已有认证凭据** —— 与 _hysteria_server_initialized 是两个不同的判断:
+# **Manager 是否已接管这台服务器** —— 与 _hysteria_server_initialized 是两个不同的判断:
 #   _hysteria_server_initialized = 配置可运行(config.json 有 password)
-#   本函数                        = **Manager 已接管这台服务器**(有 node.json 元数据)
+#   本函数                        = **Manager 侧有可用节点元数据**
 # 二者必须分开: 单密码模型下"有凭据"不等于"本 Manager 管过它" —— 用户可能手工
 # 部署过 Official Hysteria 再装上本脚本, 此时 config 有 password 但 node.json 不存在。
 # 用 initialized 去挡"添加节点"会造成**状态死结**(删了 node.json 就再也加不回来),
 # 用本函数才正确: 没有 node.json ⇒ 走接管流程重建元数据。
-_hysteria_node_exists() {
+#
+# **"存在"与"可用"必须分开判**(外部复审 P2): 旧实现只判 `-f && -s`, 于是半截/损坏的
+# node.json(JSON 语法错、缺 auth/name/link_addr)也被当成"已有节点" → [2] 说"已有节点"
+# 不给重建, [5] 改密码在 jq 上失败, [4] 又取不到 name —— 人为制造出**第二个死结**。
+# 契约: _hysteria_node_exists = 文件存在且**结构可用**(下游可直接 jq 取值)。
+# 只判"文件在不在"的场景(如卸载清 clash)用 _hysteria_node_file_present。
+_hysteria_node_file_present() {
     [ -f "$HYSTERIA_NODE_META" ] && [ -s "$HYSTERIA_NODE_META" ]
+}
+
+# 返回值**归一化为 0/1** —— jq 对非法 JSON 会返回 2/5 等非 1 码, 直接透出会让
+# 调用方/断言看到"意料外的错误码"; 布尔契约必须只有两种取值。
+_hysteria_node_exists() {
+    _hysteria_node_file_present || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    if jq -e '
+        (.auth      | type == "string") and ((.auth      | length) > 0) and
+        (.name      | type == "string") and ((.name      | length) > 0) and
+        (.link_addr | type == "string") and ((.link_addr | length) > 0)
+    ' "$HYSTERIA_NODE_META" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# 节点元数据是否**存在但损坏**(供菜单给出可操作的恢复指引: 提示并允许 [2] 重建)
+_hysteria_node_broken() {
+    _hysteria_node_file_present || return 1
+    _hysteria_node_exists && return 1
+    return 0
 }
 
 # 菜单操作闸门: initialized → 放行; 配置存在但 auth 段不可运行/非本模型 → 明确
@@ -2747,12 +2783,31 @@ _hysteria_add_node() {
         return $?
     fi
     echo; echo -e "  ${CYAN}=== 添加 Hysteria2 (官方) 节点 ===${NC}"
-    # 情形 1: 本 Manager 已接管(有节点元数据)
+    # 情形 1: 本 Manager 已接管(有**可用**节点元数据)
     if _hysteria_node_exists; then
         _warn "官方 password 模式只支持**一个**认证密码, 服务器已有节点(认证凭据已存在)"
         _tip "如需更换认证密码请用 [5] 修改节点密码; 如需多套独立凭据请分别部署多台服务器"
         _press_any_key
         return 0
+    fi
+    # 情形 1.5: 元数据存在但**损坏**(半截 JSON / 缺字段)—— 不能让损坏文件把 [2] 挡在
+    # "已有节点"上, 否则 [5]/[4] 又都在 jq 上失败, 形成第二个死结(外部复审 P2)。
+    # 确认后删除损坏文件, 继续走接管路径重建。
+    if _hysteria_node_broken; then
+        _warn "节点元数据已损坏(无法解析或缺少必要字段): $HYSTERIA_NODE_META"
+        _tip "重建不会改动服务器认证密码, 只重写 Manager 侧的节点记录/链接/clash 条目"
+        local ans_repair
+        read -rp "  删除损坏的节点元数据并重建? [y/N]: " ans_repair
+        case "$ans_repair" in
+            y|Y) ;;
+            *) _info "已取消(损坏文件保留, 可手工核对后重试)"; _press_any_key; return 0 ;;
+        esac
+        if ! rm -f "$HYSTERIA_NODE_META"; then
+            _error "损坏的节点元数据删除失败(权限/只读?), 已取消"
+            _press_any_key
+            return 1
+        fi
+        _info "已移除损坏的节点元数据, 继续重建"
     fi
     # 情形 2: 服务器已有认证凭据但 Manager 侧无节点记录(手工部署过 / 删过节点记录)。
     # **接管**: 复用现成密码重建元数据, 不改 hysteria.json 的认证段。
@@ -2774,11 +2829,16 @@ _hysteria_add_node() {
         name=$(_hysteria_autofill_name "$def_name")
         _tip "默认名已被占用, 自动命名为 ${name}"
     fi
-    # 客户端连接地址: 优先沿用 server_meta 里已有的(接管场景多半已有), 无则询问
+    # 客户端连接地址: 优先沿用 server_meta 里已有的(接管场景多半已有), 无则询问。
+    # **先只记在内存, 不在 node.json 落盘前持久化**(外部复审 P2): 旧实现在询问后立刻
+    # _hysteria_meta_set, 若随后的 node.json 写入失败, 就留下"server_meta 已改 / node.json
+    # 仍无"的半成品接管 —— 下次 [2] 会静默复用那个残留地址。改为**节点元数据先落盘,
+    # 成功后才回写 server_meta**: 失败时 server_meta 原样, 无部分状态。
+    local addr_need_save=0
     addr=$(_hysteria_meta_get link_addr)
     if [ -z "$addr" ]; then
         addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址, 已取消"; _press_any_key; return 1; }
-        _hysteria_meta_set link_addr "$addr" || _warn "连接地址写入 server_meta 失败(节点本体不受影响)"
+        addr_need_save=1
     else
         _info "沿用已有客户端连接地址: ${addr}"
     fi
@@ -2810,9 +2870,14 @@ _hysteria_add_node() {
     # 节点元数据是 Manager 侧权威状态, 与 config 无关 → 直接原子写(无需 config 事务:
     # 本路径**不改 hysteria.json**, 没有需要回滚的配置变更)
     if ! _atomic_write_json "$HYSTERIA_NODE_META" "$meta_json"; then
-        _error "节点元数据写入失败, 节点未创建"
+        _error "节点元数据写入失败, 节点未创建(server_meta 未改动, 无部分状态)"
         _press_any_key
         return 1
+    fi
+    # 节点元数据已落地后才回写 server_meta(顺序不可交换, 见上)
+    if [ "$addr_need_save" -eq 1 ]; then
+        _hysteria_meta_set link_addr "$addr" \
+            || _warn "连接地址写入 server_meta 失败(节点已创建, 下次 [2] 会重新询问该地址)"
     fi
     _hysteria_sync_clash "$HYSTERIA_NODE_META" || _warn "clash 条目同步失败(可手工编辑 ${CLASH_YAML})"
     _success "节点 [${name}] 已接管(认证密码沿用服务器现有值)"
@@ -2838,6 +2903,12 @@ _hysteria_view_nodes() {
         echo -e "  ${YELLOW}clash/mihomo 配置可完整表达该尺寸; 手工客户端请自行设置相同分片尺寸${NC}"
     fi
     echo
+    if _hysteria_node_broken; then
+        _error "节点元数据已损坏(无法解析或缺少必要字段): $HYSTERIA_NODE_META"
+        _tip "请用 [2] 添加节点 删除损坏记录并按服务器现有密码重建(认证密码不变)"
+        _press_any_key
+        return 0
+    fi
     if ! _hysteria_node_exists; then
         # 区分两种"没有节点": 服务器根本没配 vs 配了但 Manager 侧无记录
         # (后者是"清除了节点记录"的中间态, 必须明确指路 [2] 重建, 否则用户会以为要卸载重装)
@@ -2875,8 +2946,14 @@ _hysteria_delete_node() {
     _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 节点】${NC}"
-    if [ ! -f "$HYSTERIA_NODE_META" ]; then
+    if ! _hysteria_node_file_present; then
         _warn "暂无节点"
+        _press_any_key
+        return
+    fi
+    if _hysteria_node_broken; then
+        _error "节点元数据已损坏(无法解析或缺少必要字段), 无法安全清除"
+        _tip "请用 [2] 添加节点 删除损坏记录并重建(认证密码不变)"
         _press_any_key
         return
     fi
@@ -2910,8 +2987,13 @@ _hysteria_change_password() {
     _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【修改节点密码】${NC}"
-    if [ ! -f "$HYSTERIA_NODE_META" ]; then
-        _warn "暂无节点(请用 [2] 添加节点 初始化)"
+    if ! _hysteria_node_exists; then
+        if _hysteria_node_broken; then
+            _error "节点元数据已损坏(无法解析或缺少必要字段), 无法改密码"
+            _tip "请用 [2] 添加节点 删除损坏记录并重建(认证密码不变)"
+        else
+            _warn "暂无节点(请用 [2] 添加节点 初始化)"
+        fi
         _press_any_key
         return
     fi
