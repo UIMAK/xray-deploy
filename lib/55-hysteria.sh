@@ -1824,12 +1824,6 @@ _hysteria_obfs_menu() {
         echo -e "  当前状态: ${RED}未启用${NC}"
     fi
     echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(官方文档), 客户端必须带相同类型与密码${NC}"
-    echo -e "  ${YELLOW}salamander: 全部主流客户端支持; gecko: 官方/sing-box/mihomo 支持${NC}"
-    # 版本提示不写死具体 stable 版本号(P2-3, 十五轮评审): Xray release 变化很快, 把
-    # "26.3.27 = 稳定版且不支持" 固化进长期 UI 会迅速变成过期信息。只给方向 + 已知下限。
-    # 用户反馈: 向导里的同类括注太长, 已从提问行移除; 菜单里的完整说明保留(它是可选项页,
-    # 用户主动进入, 有空间讲清代价), 但同样收敛为两行。
-    echo -e "  ${YELLOW}Xray 对 gecko 的支持取决于客户端版本(已知需 >= 26.9.9); 只用 Xray 客户端请选 salamander${NC}"
     # gecko 分片尺寸: 官方 URI 只有 obfs / obfs-password, **没有**尺寸参数 —— 非默认尺寸时
     # 链接拒绝生成(见 _hysteria_obfs_uri_gap); 非法尺寸连服务都起不来。此处如实回显。
     if [ "$cur_type" = "gecko" ]; then
@@ -1878,7 +1872,7 @@ _hysteria_obfs_menu() {
                 _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
                 _success "混淆已启用 (类型: ${otype})"
                 # 不断言"已写入分享链接": gecko 自定义尺寸下链接是**不生成**的(P1)
-                [ "$otype" = "gecko" ] && _tip "gecko 为官方实验性实现; Xray 旧版客户端不支持 gecko(已知需 >= 26.9.9), 只用 Xray 客户端请改用 salamander"
+                [ "$otype" = "gecko" ]
             fi
             ;;
         3)
