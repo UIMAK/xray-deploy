@@ -3017,7 +3017,7 @@ _add_hysteria2() {
     # finalmask.md 只定义字段, 没有这句兼容性说明), 故按来源点名而不写"官方"。
     local obfs_type="" obfs_pw="" obfs_size="" obfs_mask="" obfs_pw_in="" obfs_choice
     echo -e "  混淆 (FinalMask.udp, 默认关闭):"
-    echo -e "  ${GREEN}[1]${NC} 不启用  ${GREEN}[2]${NC} salamander  ${GREEN}[3]${NC} salamander + gecko 分片"
+    echo -e "  ${GREEN}[1]${NC} 不启用  ${GREEN}[2]${NC} salamander  ${GREEN}[3]${NC} gecko"
     read -rp "  选择 (默认 1): " obfs_choice
     case "${obfs_choice:-1}" in
         2|3)
@@ -3123,7 +3123,7 @@ _add_hysteria2() {
     echo -e "  ${CYAN}拥塞控制:${NC} ${congestion}"
     if [ -n "$obfs_type" ]; then
         if [ -n "$obfs_size" ]; then
-            echo -e "  ${CYAN}混淆:${NC} salamander + gecko 分片 (FinalMask.udp) · packetSize=${obfs_size}"
+            echo -e "  ${CYAN}混淆:${NC} gecko (FinalMask.udp) · packetSize=${obfs_size}"
         else
             echo -e "  ${CYAN}混淆:${NC} salamander (FinalMask.udp)"
         fi
