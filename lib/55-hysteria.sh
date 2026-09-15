@@ -25,6 +25,21 @@
 # (0.16.15) —— 自检不覆盖热路径 AVX 指令, 只有后者能抓住"能跑 version 但启动 SIGILL"
 # - 架构映射以官方 get.hy2.sh 为基准; armv5*/riscv64 取官方资产表(脚本漏列),
 # armv6/mips(BE)/mips64 因 ABI 不兼容明确拒绝(收紧)
+# - **认证模型 = 单一认证密码(auth.type: password), 不是 userpass**(0.16.19 用户实测):
+# 用户要求"只要认证密码、不要用户名"。这不是偏好问题而是**互操作硬约束** —— 官方
+# `userpass` 的认证串是 `username:password`, 客户端必须原样提交该串:
+#   * Xray 的 hysteria 入站 `settings.users[].auth` = "任意长度字符串"(无 userpass 概念),
+#     sing-box 的 hysteria2 出站/入站 `password` 同样只是"认证密码"; 两者都不会替你拼
+#     `user:pass`, 用户必须手填 `user:pass` 才能连上 —— 实测正是"用户名+认证密码都不支持连接"。
+#   * sing-box 官方文档明文: "官方程序支持 userpass...本质上是将用户名与密码的组合
+#     <username>:<password> 作为实际上的密码, 而 sing-box 不提供此别名"。
+# 故本模块改用 `auth.type=password`(单密码), 与 `hysteria2://` 链接的 userinfo
+# (单一 auth 段)、clash/mihomo 的 `password` 字段、Xray/sing-box 的"认证密码"一一对应。
+# 代价(已与用户确认): 官方服务端一个 auth 段只能有一个密码, 故**不再支持多用户** ——
+# 节点 = 这一台服务器的唯一认证凭据, 模型见下。
+# - 服务器配置为**单文件**(hysteria.json) + **单节点元数据**(node.json)。
+# 旧版 userpass 多用户模型(每用户一个 nodes/<user>.json)已废弃; 旧节点数据由
+# _hysteria_migrate_legacy_nodes 在进菜单时一次性迁移(取首个用户的密码, 其余丢弃并告警)。
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -33,8 +48,11 @@
 export HYSTERIA_BIN="$BIN_DIR/hysteria"
 export HYSTERIA_CONFIG="$DEPLOY_DIR/hysteria.json"
 export HYSTERIA_DATA_DIR="$DEPLOY_DIR/hysteria"
-export HYSTERIA_NODES_DIR="$DEPLOY_DIR/hysteria/nodes"
 export HYSTERIA_BACKUP_DIR="$DEPLOY_DIR/hysteria/backup"
+# 唯一节点元数据(单密码模型: 一台服务器只有一个认证凭据 → 一份节点元数据)
+export HYSTERIA_NODE_META="$DEPLOY_DIR/hysteria/node.json"
+# 旧 userpass 多用户模型的节点目录(仅用于一次性迁移与清理; 不再作为权威存储)
+export HYSTERIA_NODES_DIR="$DEPLOY_DIR/hysteria/nodes"
 # manager 自有元数据(link_addr/tls_mode/sni/pin 等)。绝不写进 hysteria.json ——
 # 那是官方 binary 的配置文件, 只允许出现官方字段。
 export HYSTERIA_SERVER_META="$DEPLOY_DIR/hysteria/server_meta.json"
@@ -55,12 +73,14 @@ export HYSTERIA_GH_API="https://api.github.com/repos/HyNetworks/hysteria/release
 _hysteria_ensure_dirs() {
     local ok=1 d f
     # LOG_DIR 一并确保: openrc output_log / direct 启动重定向都写 $LOG_DIR/hysteria.log,
-    # 而模块可能被非 xd 主入口路径调用(cron/直接 source), 不能假设 _ensure_dirs 已跑过
-    for d in "$HYSTERIA_DATA_DIR" "$HYSTERIA_NODES_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR" "$HYSTERIA_ACME_DIR" "$LOG_DIR"; do
+    # 而模块可能被非 xd 主入口路径调用(cron/直接 source), 不能假设 _ensure_dirs 已跑过。
+    # **不创建 $HYSTERIA_NODES_DIR**: 那是旧 userpass 多用户模型的目录, 已废弃;
+    # 由 _hysteria_migrate_legacy_nodes 改名保留, 不重造(否则每次进菜单都会凭空出现空目录)。
+    for d in "$HYSTERIA_DATA_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR" "$HYSTERIA_ACME_DIR" "$LOG_DIR"; do
         mkdir -p "$d" || ok=0
         chmod 700 "$d" 2>/dev/null || ok=0
     done
-    for f in "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR"/*.json; do
+    for f in "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META"; do
         [ -f "$f" ] && { chmod 600 "$f" 2>/dev/null || ok=0; }
     done
     [ "$ok" -eq 1 ] || { _error "Hysteria 数据目录/权限设置失败(只读文件系统?)"; return 1; }
@@ -1117,11 +1137,13 @@ _hysteria_server_txn() {
 }
 
 # ---------------------------------------------------------------------------
-# 节点级统一事务(): **config.auth.userpass + 节点元数据文件**是原子
+# 节点级统一事务(): **config.auth.password + 节点元数据文件**是原子
 # 事务(含 verified-restart/瞬态验证与失败双回滚), 消除"config 已提交而节点元数据写失败"
 # 的两阶段漂移。**clash.yaml 是可再生的派生缓存, 不纳入事务** —— 阶段 4 同步失败仅告警,
 # 不回滚节点本体(与 Xray 侧 _sync_node_clash 同口径; P2-1 0.16.4 修正契约描述)。
 # 链接/元数据内容在事务前预构建(链接只依赖服务器级字段+本节点数据)。
+# 单密码模型下节点元数据只有一份($HYSTERIA_NODE_META), 但本事务的通用形态保留
+# (create/delete + 任意 config filter), 改密码与未来扩展都走同一条路径。
 # 用法: _hysteria_node_txn [--arg/--argjson ...] <config_filter> <meta_file> <op> <content>
 # op = create: 原子写入 meta_file(存在则覆盖; 回滚还原旧文件或删除新建)
 # delete: 删除 meta_file(fail-closed; 回滚还原)
@@ -1313,31 +1335,53 @@ _hysteria_server_txn_txn_wrapper() {
 
 # 服务器是否已完成初始化(配置存在 + jq 可解析 + auth 段就绪)
 # 三态判定(P1-3): 官方 auth.type 有 password/userpass/http/command 四种,
-# 绝不能把"存在但非 userpass"的合法官方配置当成未初始化而 bootstrap 覆盖。
+# 绝不能把"存在但非本 Manager 模型"的合法官方配置当成未初始化而 bootstrap 覆盖。
 _hysteria_config_exists() {
     [ -f "$HYSTERIA_CONFIG" ] && [ -s "$HYSTERIA_CONFIG" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
     jq -e . "$HYSTERIA_CONFIG" >/dev/null 2>&1
 }
 
-_hysteria_server_initialized() {
+# 本 Manager 认定的**可运行**认证状态。官方 binary 实测(2.12.2):
+#   - 缺 auth 段 / auth.type 为空 → FATAL "auth.type: empty auth type"
+#   - auth.type=password 且 password 为空串 → FATAL "auth.password: empty auth password"
+#   - auth.type=userpass 且表为空 → FATAL "empty auth userpass"
+# 本 Manager 的模型是**单密码**(见文件头), 但 userpass(旧模型/手工配置)同为官方合法
+# 且可运行 —— 故"已初始化"接受两者, 只是 userpass 会由 _hysteria_gate 提示迁移。
+# 不接受 http/command: 它们依赖外部后端, Manager 无从校验, 也不该接管。
+_hysteria_auth_ok() {
     _hysteria_config_exists || return 1
-    # P2-2(第八轮评审): 空 userpass 表不是可运行状态(官方 binary 直接 FATAL), 也不能算已初始化
-    # —— 否则手工留下 {"type":"userpass","userpass":{}} 时菜单放行, 但服务起不来且无节点。
-    jq -e '.auth.type == "userpass" and (.auth.userpass | type == "object") and ((.auth.userpass | length) > 0)' "$HYSTERIA_CONFIG" >/dev/null 2>&1
+    jq -e '
+        (.auth.type == "password" and (.auth.password | type == "string") and (.auth.password | length) > 0)
+        or
+        (.auth.type == "userpass" and (.auth.userpass | type == "object") and ((.auth.userpass | length) > 0))
+    ' "$HYSTERIA_CONFIG" >/dev/null 2>&1
 }
 
-# 菜单操作闸门: initialized → 放行; 配置存在但 auth 非 userpass 或 userpass 为空 → 明确
+# 当前 auth 是否为旧 userpass 模型(用于菜单提示迁移; 非错误)
+_hysteria_auth_is_userpass() {
+    _hysteria_config_exists || return 1
+    jq -e '.auth.type == "userpass"' "$HYSTERIA_CONFIG" >/dev/null 2>&1
+}
+
+_hysteria_server_initialized() {
+    _hysteria_auth_ok
+}
+
+# 菜单操作闸门: initialized → 放行; 配置存在但 auth 段不可运行/非本模型 → 明确
 # "不接管/状态不完整"; 无配置 → 提示初始化路径。返回 1 时调用方中止操作。
 _hysteria_gate() {
     _hysteria_server_initialized && return 0
     if _hysteria_config_exists; then
-        if jq -e '.auth.type == "userpass"' "$HYSTERIA_CONFIG" >/dev/null 2>&1; then
+        if jq -e '.auth.type == "password"' "$HYSTERIA_CONFIG" >/dev/null 2>&1; then
+            _error "Hysteria 配置的 auth.password 为空(不完整状态): $HYSTERIA_CONFIG"
+            _tip "空密码无法启动(官方 binary 会 FATAL: empty auth password); 请删除该配置后重新初始化"
+        elif _hysteria_auth_is_userpass; then
             _error "Hysteria 配置的 auth.userpass 表为空(不完整状态): $HYSTERIA_CONFIG"
-            _tip "空表无法启动(官方 binary 会 FATAL); 请删除该配置后重新初始化, 或手工补一个用户"
+            _tip "空表无法启动(官方 binary 会 FATAL: empty auth userpass); 请删除该配置后重新初始化"
         else
-            _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 userpass 模式"
-            _tip "为防止覆盖现有配置, 菜单操作不可用; 如需接管请自行备份并手工把 auth 段转换为 userpass 表, 或删除该配置后重新初始化"
+            _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 password 模式"
+            _tip "为防止覆盖现有配置, 菜单操作不可用; 如需接管请自行备份并把 auth 段改为 {type: password, password: ...}, 或删除该配置后重新初始化"
         fi
     else
         _warn "Hysteria 服务器未初始化, 请先通过 [添加节点] 初始化"
@@ -1573,43 +1617,38 @@ _hysteria_config_get() {
     jq -r --arg k "$key" 'getpath($k | split(".")) // empty' "$HYSTERIA_CONFIG" 2>/dev/null
 }
 
-# 重建所有节点分享链接(端口/TLS/obfs 等服务器级变更后调用)并同步 clash
+# 重建分享链接(端口/TLS/obfs 等服务器级变更后调用)并同步 clash
 # 分享链接 = 纯派生值(评审第八轮 P1-1/P1-2 方案 A): 由 hysteria.json(服务器级) +
-# server_meta.json + 节点元数据实时计算, **不再作为持久 canonical state 写回 nodes/*.json**。
+# server_meta.json + 节点元数据实时计算, **不再作为持久 canonical state 写回节点元数据**。
 # 理由: share_link 本质是 "server state + node state" 的表示形式, 持久化会引入第 4 份需要
 # 同步的状态 —— 服务器级变更(TLS/端口/obfs)后若写回失败, 用户会看到旧链接而操作仍报成功;
 # 节点创建时若预构建失败, 又会把空链接固化。改为动态派生后两个问题一并消失。
-# 用法: link=$(_hysteria_node_link <meta_file>); 失败/缺字段时输出空串并返回 1
+# 单密码模型下只有一份节点元数据, 故函数名保留(调用点语义不变)但只处理一个节点。
+# 用法: link=$(_hysteria_node_link [meta_file]); 缺省用 $HYSTERIA_NODE_META; 失败输出空串并返回 1
 _hysteria_node_link() {
-    local meta="$1" link
+    local meta="${1:-$HYSTERIA_NODE_META}" link
     [ -f "$meta" ] || return 1
     link=$(_hysteria_build_link "$meta") || return 1
     [ -n "$link" ] || return 1
     printf '%s' "$link"
 }
 
-# 重新同步所有节点的派生数据(clash 条目)。链接无需"重建写回"——它是动态派生的。
-# 保留本函数作为服务器级变更后的统一收尾入口(旧调用点语义不变)。
+# 服务器级变更(端口/TLS/obfs/带宽)后的统一收尾: 同步唯一节点的 clash 条目。
+# 保留原函数名作为调用点契约(旧调用点语义不变: 返回非 0 = 派生失败, 调用方告警)。
 _hysteria_rebuild_all_links() {
-    local f fail=0 gap
-    # 语义缺口(gecko 自定义尺寸)是**服务器级**的: 每个节点的链接都派生不出来,
-    # 但这不是节点元数据的问题。故只告警一次, 并跳过逐节点的链接校验 —— 否则会为
-    # 每个节点刷一条"元数据缺字段?"的误导告警(clash 条目不受影响, 照常同步)。
+    local gap
+    # 语义缺口(gecko 自定义尺寸)是**服务器级**的: 链接派生不出来, 但这不是节点元数据的问题。
     gap=$(_hysteria_obfs_uri_gap)
     if [ -n "$gap" ]; then
         _warn "分享链接不可生成: ${gap} (clash/mihomo 条目不受影响, 仍会同步)"
     fi
-    for f in "$HYSTERIA_NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        # 校验派生链接可用(缺字段/坏配置时告警, 但不写回)
-        if [ -z "$gap" ] && ! _hysteria_node_link "$f" >/dev/null; then
-            _warn "分享链接派生失败(元数据缺字段?): $(basename "$f" .json)"
-            fail=1
-            continue
-        fi
-        _hysteria_sync_clash "$f" || fail=1
-    done
-    return "$fail"
+    [ -f "$HYSTERIA_NODE_META" ] || return 0
+    # 校验派生链接可用(缺字段/坏配置时告警, 但不写回)
+    if [ -z "$gap" ] && ! _hysteria_node_link "$HYSTERIA_NODE_META" >/dev/null; then
+        _warn "分享链接派生失败(节点元数据缺字段?)"
+    fi
+    _hysteria_sync_clash "$HYSTERIA_NODE_META" || return 1
+    return 0
 }
 
 _hysteria_port_menu() {
@@ -1742,11 +1781,12 @@ _hysteria_obfs_menu() {
         echo -e "  当前状态: ${RED}未启用${NC}"
     fi
     echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(官方文档), 客户端必须带相同类型与密码${NC}"
-    echo -e "  ${YELLOW}salamander: 全部主流客户端支持; gecko(官方标注实验性): 官方/sing-box/mihomo 支持${NC}"
+    echo -e "  ${YELLOW}salamander: 全部主流客户端支持; gecko: 官方/sing-box/mihomo 支持${NC}"
     # 版本提示不写死具体 stable 版本号(P2-3, 十五轮评审): Xray release 变化很快, 把
     # "26.3.27 = 稳定版且不支持" 固化进长期 UI 会迅速变成过期信息。只给方向 + 已知下限。
-    echo -e "  ${YELLOW}Xray 对 gecko 的支持取决于客户端版本: 旧版(如 26.3.27)不支持, 已知需 >= 26.9.9${NC}"
-    echo -e "  ${YELLOW}只用 Xray 客户端且不便升级时, 请选 salamander${NC}"
+    # 用户反馈: 向导里的同类括注太长, 已从提问行移除; 菜单里的完整说明保留(它是可选项页,
+    # 用户主动进入, 有空间讲清代价), 但同样收敛为两行。
+    echo -e "  ${YELLOW}Xray 对 gecko 的支持取决于客户端版本(已知需 >= 26.9.9); 只用 Xray 客户端请选 salamander${NC}"
     # gecko 分片尺寸: 官方 URI 只有 obfs / obfs-password, **没有**尺寸参数 —— 非默认尺寸时
     # 链接拒绝生成(见 _hysteria_obfs_uri_gap); 非法尺寸连服务都起不来。此处如实回显。
     if [ "$cur_type" = "gecko" ]; then
@@ -1855,6 +1895,93 @@ _hysteria_bandwidth_menu() {
     esac
     _press_any_key
     return 0
+}
+
+# 读取 hysteria.json 的 congestion 段; $1 = type|profile, 未配置时输出空串。
+# 官方 Full-Server-Config "拥塞控制": congestion.type ∈ {bbr, reno}(默认 bbr),
+# bbrProfile ∈ {standard, conservative, aggressive}(仅 type=bbr 时生效, 默认 standard)。
+# **只有该方向未使用 Brutal 时才生效** —— 故菜单必须如实说明它与带宽的关系。
+_hysteria_congestion_get() {
+    local key="$1"
+    [ -f "$HYSTERIA_CONFIG" ] || return 0
+    case "$key" in
+        type)    _hysteria_config_get 'congestion.type' ;;
+        profile) _hysteria_config_get 'congestion.bbrProfile' ;;
+    esac
+}
+
+# 拥塞控制展示摘要(唯一入口, 菜单与列表共用)
+_hysteria_congestion_desc() {
+    local t p
+    t=$(_hysteria_congestion_get type)
+    p=$(_hysteria_congestion_get profile)
+    case "$t" in
+        ""|null) echo "bbr/standard (官方默认, 未写入配置)" ;;
+        reno)    echo "reno" ;;
+        bbr)     echo "bbr/${p:-standard}" ;;
+        *)       echo "${t}(非官方枚举)" ;;
+    esac
+}
+
+# [11] 拥塞控制: 选择控制器类型与 BBR 预设(官方 congestion 段)。
+# 与原脚本的设计语言一致(枚举菜单 + 回车默认), 但字段口径严格按官方文档 ——
+# 这里**不是** Xray 的 congestionControl/brutal 开关, 而是官方 binary 的本地控制器。
+_hysteria_congestion_menu() {
+    local choice t p cur_t cur_p
+    _hysteria_gate || { _press_any_key; return; }
+    cur_t=$(_hysteria_congestion_get type)
+    cur_p=$(_hysteria_congestion_get profile)
+    while true; do
+        clear
+        echo; echo -e "  ${CYAN}【拥塞控制 congestion】${NC}"
+        echo -e "  ${YELLOW}官方语义: 只有该方向**未使用 Brutal** 时才生效(Brutal 方向由带宽决定, 见 [10]);${NC}"
+        echo -e "  ${YELLOW}congestion 是每一端各自的本地配置, 不会通过协议协商${NC}"
+        echo -e "  当前: ${CYAN}$(_hysteria_congestion_desc)${NC}"
+        echo
+        echo -e "  ${GREEN}[1]${NC} bbr (Google BBR v1, 官方默认)"
+        echo -e "  ${GREEN}[2]${NC} reno (New Reno)"
+        echo -e "  ${GREEN}[3]${NC} 恢复官方默认 (删除 congestion 段 = bbr/standard)"
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  请选择: " choice || return 0
+        case "$choice" in
+            1)
+                read -rp "  BBR 预设 [1] standard [2] conservative [3] aggressive (回车 standard): " p
+                case "$p" in
+                    2) p="conservative" ;;
+                    3) p="aggressive" ;;
+                    *) p="standard" ;;
+                esac
+                if ! _hysteria_config_txn --arg pr "$p" \
+                     '.congestion = {type: "bbr", bbrProfile: $pr}'; then
+                    _error "拥塞控制设置失败"
+                else
+                    cur_t="bbr"; cur_p="$p"
+                    _success "拥塞控制已设为 bbr/${p}"
+                fi
+                _press_any_key
+                ;;
+            2)
+                if ! _hysteria_config_txn '.congestion = {type: "reno"}'; then
+                    _error "拥塞控制设置失败"
+                else
+                    cur_t="reno"; cur_p=""
+                    _success "拥塞控制已设为 reno"
+                fi
+                _press_any_key
+                ;;
+            3)
+                if ! _hysteria_config_txn 'del(.congestion)'; then
+                    _error "恢复默认失败"
+                else
+                    cur_t=""; cur_p=""
+                    _success "已恢复官方默认(bbr/standard)"
+                fi
+                _press_any_key
+                ;;
+            0) return 0 ;;
+            *) _warn "无效选择"; _press_any_key ;;
+        esac
+    done
 }
 
 _hysteria_masquerade_menu() {
@@ -2068,14 +2195,13 @@ _hysteria_obfs_uri_gap() {
 #     **不得**阻断节点增删改(否则手改过尺寸的用户连加节点都做不到)。
 # 成功: stdout=<port_part>(如 443 / 20000-50000); 失败: 返回 1 且已打印原因
 _hysteria_link_preflight() {
-    local meta="$1" user auth name link_addr port_part
+    local meta="$1" auth name link_addr port_part
     [ -f "$meta" ] || { _error "节点元数据文件不存在: $meta"; return 1; }
-    user=$(jq -r '.user // empty' "$meta" 2>/dev/null)
     auth=$(jq -r '.auth // empty' "$meta" 2>/dev/null)
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     link_addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
-    [ -n "$user" ] && [ -n "$auth" ] && [ -n "$name" ] && [ -n "$link_addr" ] || {
-        _error "节点元数据缺少必要字段(user/auth/name/link_addr), 无法构建链接"
+    [ -n "$auth" ] && [ -n "$name" ] && [ -n "$link_addr" ] || {
+        _error "节点元数据缺少必要字段(auth/name/link_addr), 无法构建链接"
         return 1
     }
     port_part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)") || {
@@ -2086,21 +2212,25 @@ _hysteria_link_preflight() {
 }
 
 # 构建官方 hysteria2:// 链接。服务器级参数(listen/tls/obfs)读 hysteria.json,
-# 节点级参数(user/auth/name/link_addr)读节点元数据 —— 官方 URI 无 congestion/up/down
+# 节点级参数(auth/name/link_addr)读节点元数据 —— 官方 URI 无 congestion/up/down
 # 等客户端参数(官方文档明示 "parameters should never include ... bandwidth values")。
+# **userinfo 只有一个 auth 段**(单密码模型): 官方 URI-Scheme 明确 "认证凭据应放在
+# auth 段", 仅当服务端用 userpass 时才写成 `username:password`。本 Manager 用
+# auth.type=password, 故此处**只写密码** —— 这也正是 Xray/sing-box 能直接使用的原因。
+# 实测对照(2.12.2): `hysteria share` 对 password 服务端产出 `hysteria2://<pass>@host:port/`,
+# 对 userpass 服务端产出 `hysteria2://<user>:<pass>@host:port/`。
 # **语义缺口时拒绝生成**(P1, 十五轮评审): gecko 自定义/非法分片尺寸无法写进官方 URI,
 # 此时返回 1 且不输出任何 URI —— 宁可让 UI 明确说"链接不可生成", 也不产出一条
 # "看着正常、语义不等价"的链接(见 _hysteria_obfs_uri_gap)。
 # 用法: _hysteria_build_link <meta_file>; 失败返回 1
 _hysteria_build_link() {
-    local meta="$1" user auth name link_addr port_part gap
+    local meta="$1" auth name link_addr port_part gap
     port_part=$(_hysteria_link_preflight "$meta") || return 1
     gap=$(_hysteria_obfs_uri_gap)
     if [ -n "$gap" ]; then
         _warn "分享链接不可生成: ${gap}"
         return 1
     fi
-    user=$(jq -r '.user // empty' "$meta" 2>/dev/null)
     auth=$(jq -r '.auth // empty' "$meta" 2>/dev/null)
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     link_addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
@@ -2128,7 +2258,7 @@ _hysteria_build_link() {
         params="${params}${params:+&}obfs=$(_url_encode "$o_type")&obfs-password=$(_url_encode "$o_pw")"
     fi
     # 官方多端口格式直接写在 port 段(443 或 20000-50000), 无 mport 参数
-    local link="hysteria2://$(_url_encode "$user"):$(_url_encode "$auth")@${link_ip}:${port_part}/"
+    local link="hysteria2://$(_url_encode "$auth")@${link_ip}:${port_part}/"
     [ -n "$params" ] && link="${link}?${params}"
     link="${link}#$(_url_encode "$name")"
     printf '%s' "$link"
@@ -2139,7 +2269,7 @@ _hysteria_build_link() {
 # 漏掉任何一处都会重新产出"看起来正常"的不完整链接。$2 是标签(分享链接/新分享链接)。
 # 返回 0 = 已打印 URI; 1 = 未打印(已给出原因), 调用方不得再自行打印 URI
 _hysteria_print_link() {
-    local meta="$1" label="${2:-分享链接}" gap link
+    local meta="${1:-$HYSTERIA_NODE_META}" label="${2:-分享链接}" gap link
     gap=$(_hysteria_obfs_uri_gap)
     if [ -n "$gap" ]; then
         _warn "${label}不可生成: ${gap}"
@@ -2157,17 +2287,17 @@ _hysteria_print_link() {
 }
 
 # clash.yaml(mihomo) 条目。字段依据 = mihomo 源码 adapter/outbound/hysteria2.go 的
-# Hysteria2Option 解码器(2026-09-13 核验): 认证字段只有 `password`(无 auth/username),
-# 值为原始协议认证串 —— userpass 服务端填 "user:pass"(按首个冒号切分);
-# `ports` 启用跳跃并忽略 port(port 保留作旧版 mihomo 的兜底)。
+# Hysteria2Option 解码器(2026-09-13 核验): 认证字段只有 `password`(无 auth/username)。
+# **单密码模型下 password 就是认证密码本身**(不再有 user:pass 拼接 —— 那是官方
+# userpass 的语义, 客户端不认, 见文件头); `ports` 启用跳跃并忽略 port(port 保留作
+# 旧版 mihomo 的兜底)。
 _hysteria_clash_line() {
-    local meta="$1" name addr user auth
+    local meta="${1:-$HYSTERIA_NODE_META}" name addr auth
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
-    user=$(jq -r '.user // empty' "$meta" 2>/dev/null)
     auth=$(jq -r '.auth // empty' "$meta" 2>/dev/null)
-    [ -n "$name" ] && [ -n "$addr" ] && [ -n "$user" ] && [ -n "$auth" ] || {
-        _error "节点元数据缺少必要字段(name/link_addr/user/auth), 无法生成 clash 条目"
+    [ -n "$name" ] && [ -n "$addr" ] && [ -n "$auth" ] || {
+        _error "节点元数据缺少必要字段(name/link_addr/auth), 无法生成 clash 条目"
         return 1
     }
     # 非法 gecko 尺寸(P2-2, 十五轮评审): 官方 binary 会拒绝启动, 不把明显无效的值写进
@@ -2194,7 +2324,7 @@ _hysteria_clash_line() {
     fi
     local port_part
     port_part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)") || return 1
-    local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$user"):$( _yaml_dq "$auth")\""
+    local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$auth")\""
     local sni; sni=$(_hysteria_meta_get sni)
     [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
     [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ] && line="${line}, skip-cert-verify: true"
@@ -2253,34 +2383,91 @@ _hysteria_remove_clash_by_name() {
 }
 
 # ---------------------------------------------------------------------------
-# 节点(= 官方 auth.userpass 用户)生命周期
+# 节点(单密码模型)生命周期
 # ---------------------------------------------------------------------------
+# 本 Manager 的模型 = 官方 `auth.type: password`(单认证密码), 见文件头说明。
+# 节点元数据 = $HYSTERIA_NODE_META(单文件), 字段: auth/name/link_addr/created。
+# **没有"用户名"这一维**: 官方 password 模式不接受用户名, 客户端(Xray/sing-box/mihomo)
+# 只需填认证密码 —— 这正是用户要求"只要认证密码"的原因。
 
-# 节点用户名合法性: username 即元数据文件名 → 白名单字符集(与 _validate_domain 同风格),
-# 且不得含 ':'(官方 userpass 按首个冒号切分用户名)
-_hysteria_validate_username() {
-    local u="$1"
-    [ -n "$u" ] || return 1
-    [ "${#u}" -le 64 ] || return 1
-    [[ "$u" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] || return 1
+# 旧 userpass 多用户模型的一次性迁移(进菜单时调用, 幂等):
+# 官方一个 auth 段只能有一个密码, 故多用户配置**无法**无损转成单密码。
+# 取"第一个用户"的密码作为单密码(确定性: 按用户名排序, 避免 glob 顺序漂移),
+# 其余用户的密码被丢弃 —— 这是模型切换的必然代价, 必须**显式告警**而不是静默丢弃。
+# 节点元数据若已有(单文件), 只做 auth 段转换; 否则从旧节点文件重建一份。
+# 旧 nodes/ 目录改名保留(不删)供人工核对, 避免用户凭据被无声抹掉。
+# 返回 0 = 已迁移或无需迁移; 1 = 迁移失败(已告警, 配置保持原样)
+_hysteria_migrate_legacy_nodes() {
+    _hysteria_auth_is_userpass || return 0
+    _hysteria_config_exists || return 0
+    local first_user first_pass others n
+    # 按用户名排序取第一个(确定性); keys[] 排序后取首项
+    first_user=$(jq -r '.auth.userpass | keys | sort | .[0] // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
+    [ -n "$first_user" ] || return 0
+    first_pass=$(jq -r --arg u "$first_user" '.auth.userpass[$u] // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
+    [ -n "$first_pass" ] || return 0
+    n=$(jq -r '.auth.userpass | length' "$HYSTERIA_CONFIG" 2>/dev/null)
+    others=$((n - 1))
+    # 配置转换(走统一事务: 备份 + jq + verified-restart + 失败回滚)
+    if ! _hysteria_config_txn --arg p "$first_pass" \
+         '.auth = {type: "password", password: $p}'; then
+        _error "旧 userpass 配置迁移失败, 配置保持原样(仍可用旧凭据连接)"
+        return 1
+    fi
+    # 节点元数据: 已有单文件则只对齐 auth 值; 否则从旧节点文件重建
+    local name="" addr=""
+    if [ -f "$HYSTERIA_NODE_META" ]; then
+        local cur
+        cur=$(cat "$HYSTERIA_NODE_META" 2>/dev/null)
+        if [ -n "$cur" ]; then
+            name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+            addr=$(jq -r '.link_addr // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+        fi
+    fi
+    local old_node="$HYSTERIA_NODES_DIR/${first_user}.json"
+    if [ -z "$name" ] || [ -z "$addr" ]; then
+        if [ -f "$old_node" ]; then
+            name=$(jq -r '.name // empty' "$old_node" 2>/dev/null)
+            addr=$(jq -r '.link_addr // empty' "$old_node" 2>/dev/null)
+        fi
+    fi
+    [ -n "$addr" ] || addr=$(_hysteria_meta_get link_addr)
+    [ -n "$name" ] || name="HY2官方"
+    local meta_json
+    meta_json=$(jq -n --arg a "$first_pass" --arg n "$name" --arg addr "$addr" \
+        --arg created "$(date '+%Y-%m-%d')" \
+        '{auth:$a,name:$n,link_addr:$addr,created:$created}')
+    if ! _atomic_write_json "$HYSTERIA_NODE_META" "$meta_json"; then
+        _warn "节点元数据写入失败, 请手工核对 $HYSTERIA_NODE_META"
+    fi
+    # 旧目录改名保留(不删): 用户凭据不静默消失, 但也不再被本模块读取
+    if [ -d "$HYSTERIA_NODES_DIR" ]; then
+        local legacy="${HYSTERIA_DATA_DIR}/nodes.userpass.bak"
+        rm -rf "$legacy" 2>/dev/null
+        mv "$HYSTERIA_NODES_DIR" "$legacy" 2>/dev/null \
+            || _warn "旧节点目录改名失败, 保留原样: $HYSTERIA_NODES_DIR"
+    fi
+    _warn "已把旧 userpass 多用户配置迁移为单密码模型(官方 password 模式)"
+    _tip "保留密码: 用户 ${first_user} 的密码(其余 $others 个用户的密码已不再生效, 客户端请改用该密码)"
+    [ "$others" -gt 0 ] && _tip "旧凭据备份在 ${HYSTERIA_DATA_DIR}/nodes.userpass.bak/ 供人工核对(本模块不再读取)"
+    _success "认证模型迁移完成"
+    _hysteria_rebuild_all_links || true
     return 0
 }
 
 # 节点显示名是否已被占用(clash.yaml 按 name 删除/替换, 重名会串条目; 与 Xray 侧
-# _ensure_unique_name 同一约束, 但作用域是 hysteria 自己的元数据目录)
+# _ensure_unique_name 同一约束, 作用域是 hysteria 自己的节点元数据)
 _hysteria_name_taken() {
-    local name="$1" f n
-    for f in "$HYSTERIA_NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        n=$(jq -r '.name // empty' "$f" 2>/dev/null) || continue
-        [ -n "$n" ] && [ "$n" = "$name" ] && return 0
-    done
+    local name="$1" n
+    [ -f "$HYSTERIA_NODE_META" ] || return 1
+    n=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null) || return 1
+    [ -n "$n" ] && [ "$n" = "$name" ] && return 0
     return 1
 }
 
-# 默认名已被占用时自动追加序号(HY2官方 → HY2官方-2 → HY2官方-3...); 返回可用名。
+# 默认名已被占用时自动追加序号(基名-2 → 基名-3...); 返回可用名。
 # 序号必须基于**原始基名**递增: 旧实现原地改写 base, 于是第三个节点会得到
-# "HY2官方-2-3" 这种叠加后缀(实测), 而不是 "HY2官方-3"。
+# "基名-2-3" 这种叠加后缀(实测), 而不是 "基名-3"。
 _hysteria_autofill_name() {
     local base="$1" cand="$1" i=2
     while _hysteria_name_taken "$cand"; do
@@ -2290,21 +2477,50 @@ _hysteria_autofill_name() {
     printf '%s' "$cand"
 }
 
+# 默认节点名 = 协议+端口(用户要求: 与原脚本的命名规则一致; "HY2官方" 是自作多情的名字)。
+# Xray 侧同协议默认名形如 "HY2-<port>"(50-nodes), 这里沿用同一形态;
+# 跳跃范围下端口取**范围首端口**(与 listen 实际监听端口一致, 不会变成 "HY2-20000-50000")。
+_hysteria_default_name() {
+    local part
+    part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)" 2>/dev/null) || part=""
+    part=${part%%-*}
+    if [ -n "$part" ]; then
+        printf 'HY2-%s' "$part"
+    else
+        printf 'HY2'
+    fi
+}
+
+# 在**提交前**预演默认名: bootstrap 里 listen 由本向导决定, 尚未写进配置(配置可能还不存在),
+# 故不能用 _hysteria_default_name 去读配置。$1 = 本向导将要写入的 listen(如 ":443" 或
+# ":20000-50000"); 跳跃范围取首端口, 与提交后的 _hysteria_default_name 结果一致。
+_hysteria_default_name_for_listen() {
+    local listen="$1" part
+    part=$(_hysteria_listen_port_part "$listen" 2>/dev/null) || part=""
+    part=${part%%-*}
+    if [ -n "$part" ]; then
+        printf 'HY2-%s' "$part"
+    else
+        printf 'HY2'
+    fi
+}
+
 # 服务器初始化向导(bootstrap): 仅由 [添加节点] 在未初始化时触发, 单一入口避免双路径漂移。
-# 实测约束(2.12.2): 官方 binary 对空 userpass 表 FATAL("empty auth userpass"),
-# 因此**第一个用户必须与配置同时落地**——本向导包含首位用户的创建, 成功返回后节点已可用。
+# 实测约束(2.12.2): 官方 binary 对缺 auth 段 / 空密码 FATAL
+# ("empty auth type" / "empty auth password"), 因此**认证密码必须与配置同时落地**
+# ——本向导包含唯一认证密码的创建, 成功返回后服务器即可用。
 # 失败回滚已发生的步骤并返回 1。
 _hysteria_bootstrap() {
     local port hop parsed lo hi listen tls_json tls_mode tls_sni tls_pin
     local obfs_pw="" obfs_type="" masq_url="" up="" down="" addr
-    local user auth name def_name
+    local auth name def_name cc_type cc_profile
     echo; echo -e "  ${CYAN}=== 初始化官方 Hysteria2 服务器 ===${NC}"
-    _tip "官方架构: 单服务多用户, 以下为服务器级设置; 每个节点 = 一个认证用户"
+    _tip "官方架构: 单服务单密码; 以下为服务器级设置, 认证密码即客户端唯一凭据"
 
-    # 0) 前置保护: 存在非本 Manager 管理的官方配置(auth != userpass)时绝不 bootstrap
-    # —— bootstrap 会整体重写配置文件, 静默覆盖用户已有的合法配置是不可接受的
+    # 0) 前置保护: 存在非本 Manager 管理的官方配置(auth 既非 password 也非 userpass)时
+    # 绝不 bootstrap —— bootstrap 会整体重写配置文件, 静默覆盖用户已有的合法配置是不可接受的
     if _hysteria_config_exists && ! _hysteria_server_initialized; then
-        _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 userpass 模式"
+        _error "检测到现有 Hysteria 官方配置($HYSTERIA_CONFIG), 其 auth 不是本 Manager 管理的 password 模式"
         _tip "为防止覆盖现有配置, 已取消初始化; 如需接管请自行备份并手工转换 auth 段, 或确认无用后删除该配置再重试"
         return 1
     fi
@@ -2320,11 +2536,17 @@ _hysteria_bootstrap() {
     fi
 
     # 1) 端口 / 端口跳跃
+    # 设计语言对齐原脚本(xray_manager/singbox.sh): 提示写"(回车随机生成)", 用户回车后
+    # 用 _info 回显**实际分配的端口**, 而不是把候选值塞进提示里(用户明确要求"回车后显示
+    # 随机的端口是多少")。
     local def_port
     def_port=$(_gen_random_port)
     while true; do
-        read -rp "  监听端口 (回车随机 ${def_port}): " port
-        port=${port:-$def_port}
+        read -rp "  监听端口 (回车随机生成): " port
+        if [ -z "$port" ]; then
+            port="$def_port"
+            _info "已随机分配监听端口: ${port}"
+        fi
         _validate_port "$port" || { _warn "无效端口(1-65535)"; continue; }
         _check_port_occupied "$port" udp && { _warn "端口 $port 已被占用, 换一个"; def_port=$(_gen_random_port); continue; }
         _check_port_in_config "$port" && { _warn "端口 $port 已被 Xray 节点使用, 换一个"; def_port=$(_gen_random_port); continue; }
@@ -2359,12 +2581,19 @@ _hysteria_bootstrap() {
     tls_json="$HY_TLS_JSON"; tls_mode="$HY_TLS_MODE"; tls_sni="$HY_TLS_SNI"; tls_pin="$HY_TLS_PIN"
 
     # 3) obfs(可选)。单次提问决定"是否启用 + 类型", 不新增提示行 —— 既有的自动化
-    # 输入序列(端口/跳跃/TLS/证书域名/本项/…)长度不变; y/Y 保留旧语义(= salamander)。
+    # 输入序列(端口/跳跃/TLS/证书域名/本项/…)长度不变。
+    # 提示文案(用户要求): 去掉提问行里那段冗长的 gecko 括注(实验性/旧客户端不支持),
+    # 版本兼容性说明改在 [9] 混淆菜单里给出(用户主动进入, 有空间讲清代价);
+    # 补 [3] 显式"不启用", 回车 = 不启用(默认项与用户预期一致)。
     local ans2=""
-    read -rp "  启用混淆? [1] salamander [2] gecko(官方标注实验性, Xray 旧版客户端不支持) (回车不启用): " ans2
+    read -rp "  启用混淆? [1] salamander [2] gecko [3] 不启用 (回车不启用): " ans2
     case "$ans2" in
-        1|y|Y) obfs_type="salamander" ;;
-        2)     obfs_type="gecko" ;;
+        1) obfs_type="salamander" ;;
+        2) obfs_type="gecko" ;;
+        # y/Y 保留旧语义(= salamander), 3/空 均为不启用
+        y|Y) obfs_type="salamander" ;;
+        3|"") obfs_type="" ;;
+        *) _warn "无效选择, 按不启用处理" ; obfs_type="" ;;
     esac
     if [ -n "$obfs_type" ]; then
         obfs_pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
@@ -2378,6 +2607,26 @@ _hysteria_bootstrap() {
     read -rp "  下行限速 (如 100 mbps, 回车不限): " down
     up=$(_normalize_bandwidth "$up"); down=$(_normalize_bandwidth "$down")
 
+    # 4.5) 拥塞控制(可选, 官方 congestion 段)。只有该方向未使用 Brutal 时才生效
+    # (官方文档: "只有在该方向没有使用 Brutal 时才会生效") —— 即带宽为空/未启用 Brutal 时
+    # 才是真正生效的控制器选择, 故此处如实提示。
+    # 回车 = 官方默认(bbr/standard), 此时**不写** congestion 段(与官方缺省等价)。
+    echo -e "  拥塞控制 (非 Brutal 方向生效; 回车用官方默认 bbr/standard):"
+    read -rp "  类型 [1] bbr [2] reno (回车 bbr): " cc_type
+    case "$cc_type" in
+        2) cc_type="reno" ;;
+        *) cc_type="bbr" ;;
+    esac
+    cc_profile=""
+    if [ "$cc_type" = "bbr" ]; then
+        read -rp "  BBR 预设 [1] standard [2] conservative [3] aggressive (回车 standard): " cc_profile
+        case "$cc_profile" in
+            2) cc_profile="conservative" ;;
+            3) cc_profile="aggressive" ;;
+            *) cc_profile="standard" ;;
+        esac
+    fi
+
     # 5) 伪装(可选, 默认官方 404)
     read -rp "  伪装站 URL (回车用官方默认 404): " masq_url
     if [ -n "$masq_url" ]; then
@@ -2388,20 +2637,15 @@ _hysteria_bootstrap() {
     # 6) 客户端连接地址(与其他协议共用同一问法/兜底)
     addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址, 已取消初始化"; return 1; }
 
-    # 6.5) 首位用户(官方 binary 拒绝空 userpass 表, 必须随配置一起写入)
-    while true; do
-        user="user$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 6)"
-        read -rp "  首位用户名 (回车随机 ${user}): " ans2
-        user=${ans2:-$user}
-        _hysteria_validate_username "$user" || { _warn "用户名仅限字母/数字/./_/-, 不含冒号, 2-64 位"; continue; }
-        [ -f "$HYSTERIA_NODES_DIR/${user}.json" ] && { _warn "用户名已存在"; continue; }
-        break
-    done
+    # 6.5) 认证密码(单密码模型: 官方 password 模式只需一个密码, **没有用户名**)
+    # 用户明确要求: 不提示用户名 —— userpass 的 "用户名:密码" 客户端(Xray/sing-box)不认,
+    # 手填 user:pass 才能连上, 这正是"都不支持连接"的根因(见文件头)。
     auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
     read -rp "  认证密码 (回车随机): " ans2
     auth=${ans2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
-    def_name="HY2官方"
+    # 节点名 = 协议+端口(与原脚本命名规则一致), 端口取 listen 实际端口(跳跃下为首端口)
+    def_name=$(_hysteria_default_name_for_listen "$listen")
     read -rp "  节点名称 (回车默认 ${def_name}): " ans2
     name=${ans2:-$def_name}
     _validate_json_text "$name" || { _error "名称含非法字符"; return 1; }
@@ -2417,10 +2661,11 @@ _hysteria_bootstrap() {
         --arg listen "$listen" --argjson tlsblk "$tls_json" \
         --arg obfspw "$obfs_pw" --arg obfstype "$obfs_type" \
         --arg up "$up" --arg down "$down" --arg masqurl "$masq_url" \
-        --arg u "$user" --arg p "$auth" \
+        --arg p "$auth" \
+        --arg cctype "$cc_type" --arg ccprofile "$cc_profile" \
         '{listen: $listen}
          + $tlsblk
-         + {auth: {type: "userpass", userpass: {($u): $p}}}
+         + {auth: {type: "password", password: $p}}
          + (if $obfspw != "" then
               {obfs: ({type: $obfstype} | .[$obfstype] = {password: $obfspw})}
             else {} end)
@@ -2428,12 +2673,16 @@ _hysteria_bootstrap() {
               {bandwidth: ((if $up != "" then {up: $up} else {} end)
                            + (if $down != "" then {down: $down} else {} end))}
             else {} end)
+         + (if $cctype == "reno" then {congestion: {type: "reno"}}
+            elif $cctype == "bbr" and $ccprofile != "standard" then
+              {congestion: {type: "bbr", bbrProfile: $ccprofile}}
+            else {} end)
          + (if $masqurl != "" then
               {masquerade: {type: "proxy", proxy: {url: $masqurl, rewriteHost: true}}}
             else {} end)') || { _error "配置组装失败"; return 1; }
-    # 防御: 空表会 FATAL(实测), 组装结果必须至少含首位用户
-    jq -e --arg u "$user" '.auth.userpass[$u] != null' <<< "$config_json" >/dev/null || {
-        _error "配置组装异常(userpass 为空), 已中止"
+    # 防御: 空密码会 FATAL(实测), 组装结果必须含非空 password
+    jq -e '.auth.type == "password" and (.auth.password | length) > 0' <<< "$config_json" >/dev/null || {
+        _error "配置组装异常(auth.password 为空), 已中止"
         return 1
     }
     _hysteria_ensure_dirs || return 1
@@ -2455,9 +2704,9 @@ _hysteria_bootstrap() {
         return 1
     fi
 
-    # 7.5) 首位节点元数据 + 分享链接: 必须在**启动服务之前**落地 ——
-    # 否则 service 已 running 而 nodes/<user>.json 缺失时, Hysteria 侧用户可用但 Manager
-    # 完全看不到该节点(幽灵用户), 且此处失败不回滚会让初始化停在半成品状态。
+    # 7.5) 节点元数据 + 分享链接: 必须在**启动服务之前**落地 ——
+    # 否则 service 已 running 而节点元数据缺失时, Hysteria 侧凭据可用但 Manager
+    # 完全看不到该节点(幽灵节点), 且此处失败不回滚会让初始化停在半成品状态。
     # 链接构建须喂真实临时文件 —— <(process substitution) 的 fd 带 CLOEXEC,
     # 函数内部 $(jq ...) 子进程打不开 /dev/fd/63(实测), 与 _hy2_gen_newmeta 同款模式。
     # 链接派生失败必须中止初始化(不得固化空链接); share_link 不再持久化(动态派生)。
@@ -2469,8 +2718,8 @@ _hysteria_bootstrap() {
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
         return 1
     }
-    if ! jq -n --arg u "$user" --arg a "$auth" --arg n "$name" --arg addr "$addr" \
-         '{user:$u,auth:$a,name:$n,link_addr:$addr}' > "$tmp_meta" 2>/dev/null; then
+    if ! jq -n --arg a "$auth" --arg n "$name" --arg addr "$addr" \
+         '{auth:$a,name:$n,link_addr:$addr}' > "$tmp_meta" 2>/dev/null; then
         rm -f "$tmp_meta"
         _error "临时节点元数据构建失败, 回滚初始化"
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
@@ -2483,11 +2732,11 @@ _hysteria_bootstrap() {
         return 1
     fi
     rm -f "$tmp_meta"
-    meta_json=$(jq -n --arg u "$user" --arg a "$auth" --arg n "$name" \
+    meta_json=$(jq -n --arg a "$auth" --arg n "$name" \
         --arg addr "$addr" --arg created "$(date '+%Y-%m-%d')" \
-        '{user:$u,auth:$a,name:$n,link_addr:$addr,created:$created}')
-    if ! _atomic_write_json "$HYSTERIA_NODES_DIR/${user}.json" "$meta_json"; then
-        _error "首位节点元数据写入失败, 回滚初始化(配置/元数据)"
+        '{auth:$a,name:$n,link_addr:$addr,created:$created}')
+    if ! _atomic_write_json "$HYSTERIA_NODE_META" "$meta_json"; then
+        _error "节点元数据写入失败, 回滚初始化(配置/元数据)"
         rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
         return 1
     fi
@@ -2499,10 +2748,10 @@ _hysteria_bootstrap() {
         # 而不是删掉文件留下"unit 残留 + config 缺失"的不可恢复状态
         if ! _hysteria_cleanup_service_units; then
             _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
-            _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODES_DIR/${user}.json"
+            _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META"
             return 1
         fi
-        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
+        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META"
         rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
         return 1
     fi
@@ -2516,10 +2765,10 @@ _hysteria_bootstrap() {
                 _hysteria_stop_and_verify >/dev/null 2>&1 || _warn "停止服务时仍有残留进程, 请人工核对"
                 if ! _hysteria_cleanup_service_units; then
                     _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
-                    _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODES_DIR/${user}.json"
+                    _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META"
                     return 1
                 fi
-                rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
+                rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META"
                 rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
                 _warn "初始化已回滚"
                 return 1
@@ -2529,7 +2778,7 @@ _hysteria_bootstrap() {
         # direct 模式无 service: 启动并做 1s 存活检查
         if ! _manage_hysteria start; then
             if ! _hysteria_avx_runtime_retry "$(_hysteria_cached_version)" "$(_state_get hysteria_asset 2>/dev/null)"; then
-                rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODES_DIR/${user}.json"
+                rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META"
                 _error "启动失败, 已回滚配置"
                 return 1
             fi
@@ -2537,85 +2786,31 @@ _hysteria_bootstrap() {
     fi
 
     # 9) clash 派生缓存(可再生; 失败仅告警, 不影响节点本体 —— helper 内部已 _warn)
-    _hysteria_sync_clash "$HYSTERIA_NODES_DIR/${user}.json" || true
+    _hysteria_sync_clash "$HYSTERIA_NODE_META" || true
     _success "官方 Hysteria2 服务器已初始化: $(_hysteria_listen_display), TLS=$(_hysteria_tls_desc)"
-    _hysteria_print_link "$HYSTERIA_NODES_DIR/${user}.json" || true
+    _hysteria_print_link "$HYSTERIA_NODE_META" || true
     return 0
 }
 
+# [2] 添加节点: 单密码模型下"添加节点"= 初始化服务器并创建唯一凭据。
+# 已初始化时**不能**再加节点(官方 password 模式一个 auth 段只有一个密码), 如实告知
+# 并指向改密码/卸载重建 —— 绝不静默覆盖现有密码(那会让所有已分发链接失效)。
 _hysteria_add_node() {
-    local user auth name meta_json link
+    local auth name meta_json
     _hysteria_ensure_dirs || return 1
     if ! _hysteria_server_initialized; then
-        # bootstrap 含首位用户创建(官方 binary 拒绝空 userpass 表, 不可先建空服务器)
+        # bootstrap 含认证密码创建(官方 binary 拒绝空密码, 不可先建空服务器)
         _hysteria_bootstrap
         return $?
     fi
-    echo; echo -e "  ${CYAN}=== 添加 Hysteria2 (官方) 节点 = 新增认证用户 ===${NC}"
-    while true; do
-        user="user$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 6)"
-        read -rp "  用户名 (回车随机 ${user}): " user2
-        user=${user2:-$user}
-        _hysteria_validate_username "$user" || { _warn "用户名仅限字母/数字/./_/-, 不含冒号, 2-64 位"; continue; }
-        [ -f "$HYSTERIA_NODES_DIR/${user}.json" ] && { _warn "用户名已存在"; continue; }
-        break
-    done
-    auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
-    read -rp "  认证密码 (回车随机): " auth2
-    auth=${auth2:-$auth}
-    _validate_json_text "$auth" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
-    # 默认名不含端口: 端口是服务器级设置、全部用户共用, 放进逐节点的显示名没有信息量
-    # (跳跃范围下还会变成 "HY2官方-20000-50000" 这种更没意义的形态); 重名由
-    # _hysteria_autofill_name 追加序号解决。
-    local def_name="HY2官方"
-    read -rp "  节点名称 (回车默认 ${def_name}): " name
-    name=${name:-$def_name}
-    _validate_json_text "$name" || { _error "名称含非法字符"; return 1; }
-    if _hysteria_name_taken "$name"; then
-        [ "$name" = "$def_name" ] || { _error "节点名称已存在: ${name}"; return 1; }
-        name=$(_hysteria_autofill_name "$def_name")
-        _tip "默认名已被占用, 自动命名为 ${name}"
+    echo; echo -e "  ${CYAN}=== 添加 Hysteria2 (官方) 节点 ===${NC}"
+    # 旧 userpass 配置: 先迁移再谈"已存在"(否则提示会指向不存在的多用户模型)
+    if _hysteria_auth_is_userpass; then
+        _hysteria_migrate_legacy_nodes || return 1
     fi
-
-    # 节点级统一事务: userpass + 节点元数据 整体提交/回滚; clash 为可再生派生缓存。
-    # P1-1(第八轮评审): 链接是节点创建结果的一部分, 派生失败必须**中止创建** —— 不得把空
-    # 链接固化进节点(用户会"创建成功"却拿不到链接)。链接已改为动态派生, 故此处仅做预检。
-    # 0.16.15 起预检只查"元数据/服务器配置完整性": gecko 自定义尺寸属**呈现**缺口,
-    # 不能因此阻断节点创建(见 _hysteria_link_preflight 注释)。
-    # 预检喂 mktemp 临时文件(<(fd) 带 CLOEXEC, 函数内 $(jq) 子进程打不开, 见 bootstrap 同注)
-    local tmp_meta
-    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
-        _error "临时节点元数据创建失败, 节点未创建"
-        return 1
-    }
-    if ! jq -n --arg u "$user" --arg a "$auth" --arg n "$name" \
-         --arg addr "$(_hysteria_meta_get link_addr)" \
-         '{user:$u,auth:$a,name:$n,link_addr:$addr}' > "$tmp_meta" 2>/dev/null; then
-        rm -f "$tmp_meta"
-        _error "临时节点元数据构建失败, 节点未创建"
-        return 1
-    fi
-    if ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
-        rm -f "$tmp_meta"
-        _error "分享链接预检失败, 节点未创建"
-        _tip "请先确认 hysteria.json 的 listen/tls 等服务器级字段完整"
-        return 1
-    fi
-    rm -f "$tmp_meta"
-    # 元数据不再持久化 share_link(动态派生): 只存 node state
-    local meta_json
-    meta_json=$(jq -n --arg u "$user" --arg a "$auth" --arg n "$name" \
-        --arg addr "$(_hysteria_meta_get link_addr)" --arg created "$(date '+%Y-%m-%d')" \
-        '{user:$u,auth:$a,name:$n,link_addr:$addr,created:$created}')
-    if ! _hysteria_node_txn --arg u "$user" --arg p "$auth" \
-        '.auth.userpass[$u] = $p' \
-        "$HYSTERIA_NODES_DIR/${user}.json" create "$meta_json"; then
-        _error "节点添加失败"
-        return 1
-    fi
-    _success "节点 [${name}] 创建成功"
-    # 呈现走统一入口: gecko 自定义尺寸时明确说"不可生成", 而不是给一条语义不完整的 URI
-    _hysteria_print_link "$HYSTERIA_NODES_DIR/${user}.json" || true
+    _warn "官方 password 模式只支持**一个**认证密码, 服务器已有节点(认证凭据已存在)"
+    _tip "如需更换认证密码请用 [5] 修改节点密码; 如需多套独立凭据请分别部署多台服务器"
+    _press_any_key
     return 0
 }
 
@@ -2626,9 +2821,12 @@ _hysteria_view_nodes() {
         _press_any_key
         return 0
     fi
+    if _hysteria_auth_is_userpass; then
+        _warn "当前为旧 userpass 多用户配置; 请先执行 [2] 添加节点 触发一次性迁移"
+    fi
     echo -e "  服务器: $(_hysteria_listen_display)  TLS: $(_hysteria_tls_desc)  状态: $(_manage_hysteria status 2>/dev/null)"
-    # 语义缺口(gecko 自定义/非法尺寸)是服务器级的: 在列表顶部说明一次, 逐节点只标记
-    # "不可生成"。**绝不能**在这种情况下回退显示旧的持久化 share_link —— 那正是
+    # 语义缺口(gecko 自定义/非法尺寸)是服务器级的: 在列表顶部说明一次。
+    # **绝不能**在这种情况下回退显示旧的持久化 share_link —— 那正是
     # "看着正常、语义不等价"的链接(0.16.15 P1)。
     local gap; gap=$(_hysteria_obfs_uri_gap)
     if [ -n "$gap" ]; then
@@ -2636,130 +2834,119 @@ _hysteria_view_nodes() {
         echo -e "  ${YELLOW}clash/mihomo 配置可完整表达该尺寸; 手工客户端请自行设置相同分片尺寸${NC}"
     fi
     echo
-    local f n=0
-    for f in "$HYSTERIA_NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        n=$((n+1))
-        local name user link
-        name=$(jq -r '.name // empty' "$f" 2>/dev/null)
-        user=$(jq -r '.user // empty' "$f" 2>/dev/null)
-        echo -e "  ${GREEN}[$n]${NC} ${name}  (用户: ${user})"
-        if [ -n "$gap" ]; then
-            echo -e "      ${YELLOW}(分享链接不可生成, 见上方说明)${NC}"
-            continue
-        fi
-        # share_link 动态派生(旧节点若残留持久化值, 仅在派生失败时回退显示, 避免信息丢失)
-        link=$(_hysteria_node_link "$f") || link=$(jq -r '.share_link // empty' "$f" 2>/dev/null)
-        [ -n "$link" ] && echo -e "      ${link}"
-    done
-    [ "$n" -eq 0 ] && _warn "暂无节点(用户)"
+    if [ ! -f "$HYSTERIA_NODE_META" ]; then
+        _warn "暂无节点(请用 [2] 添加节点 初始化)"
+        _press_any_key
+        return 0
+    fi
+    local name auth link
+    name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+    echo -e "  ${GREEN}[1]${NC} ${name}"
+    echo -e "      认证密码: ${CYAN}$(jq -r '.auth // empty' "$HYSTERIA_NODE_META" 2>/dev/null)${NC}"
+    if [ -n "$gap" ]; then
+        echo -e "      ${YELLOW}(分享链接不可生成, 见上方说明)${NC}"
+        _press_any_key
+        return 0
+    fi
+    # share_link 动态派生(不持久化): 派生失败时如实报告, 不回退显示旧值
+    link=$(_hysteria_node_link "$HYSTERIA_NODE_META") || link=""
+    if [ -n "$link" ]; then
+        echo -e "      ${link}"
+    else
+        _warn "分享链接派生失败(节点元数据缺字段? 请用 [2] 重新初始化或核对 $HYSTERIA_NODE_META)"
+    fi
     _press_any_key
     return 0
 }
 
-# 列出节点用户名(每行一个)
+# 旧接口保留(无调用方, 仅为兼容可能的 stale lib 引用): 单密码模型下没有"用户名"概念,
+# 恒输出空。**不要**把它接回任何 UI —— 用户名已不是本模型的维度。
 _hysteria_list_users() {
-    local f
-    for f in "$HYSTERIA_NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        jq -r '.user // empty' "$f" 2>/dev/null
-    done
+    return 0
 }
 
 _hysteria_delete_node() {
-    local choice users=() i=1 user name
+    local name auth ans
     _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 节点】${NC}"
-    for f in "$HYSTERIA_NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        name=$(jq -r '.name // empty' "$f" 2>/dev/null)
-        users+=("$(jq -r '.user // empty' "$f" 2>/dev/null)")
-        printf "  ${GREEN}[%d]${NC} %-24s (用户: %s)\n" "$i" "$name" "${users[${#users[@]}-1]}"
-        i=$((i+1))
-    done
-    [ ${#users[@]} -eq 0 ] && { _warn "暂无节点"; _press_any_key; return; }
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice || return 0
-    [ "$choice" = "0" ] && return 0
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
-    local idx=$((choice-1))
-    user="${users[$idx]:-}"
-    [ -z "$user" ] && { _warn "无效选择"; _press_any_key; return; }
-    # 官方 binary 对空 userpass 表 FATAL(实测 2.12.2): 最后 1 个用户不可经此删除
-    local ucount
-    ucount=$(jq -r '[.auth.userpass | keys[]] | length' "$HYSTERIA_CONFIG" 2>/dev/null)
-    if [ "$ucount" = "1" ]; then
-        _warn "官方 binary 拒绝空认证表, 至少保留 1 个节点(完全移除请用 [卸载 Hysteria])"
+    if _hysteria_auth_is_userpass; then
+        _warn "当前为旧 userpass 多用户配置; 请先执行 [2] 添加节点 触发一次性迁移后再删除"
         _press_any_key
         return
     fi
-    name=$(jq -r '.name // empty' "$HYSTERIA_NODES_DIR/${user}.json" 2>/dev/null)
-    read -rp "  确认删除节点 [${name}](用户 ${user})? [y/N]: " ans
+    if [ ! -f "$HYSTERIA_NODE_META" ]; then
+        _warn "暂无节点"
+        _press_any_key
+        return
+    fi
+    name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+    # 官方 binary 对空密码 FATAL(实测): 删掉唯一凭据 = 服务起不来。
+    # 故本菜单**不**删除认证段, 只清除 Manager 侧的节点元数据(分享链接/clash 条目)。
+    echo -e "  当前节点: ${GREEN}${name}${NC}"
+    echo -e "  ${YELLOW}官方 password 模式只有一个认证密码: 删除后服务将无凭据可用(会启动失败)${NC}"
+    echo -e "  ${YELLOW}本操作只清除 Manager 侧节点记录(分享链接/clash 条目), 不改动 hysteria.json 的认证段${NC}"
+    echo -e "  ${YELLOW}如需彻底移除请用 [13] 卸载 Hysteria; 如需换密码请用 [5] 修改节点密码${NC}"
+    read -rp "  确认清除节点记录 [${name}]? [y/N]: " ans
     case "$ans" in
         y|Y) ;;
         *) _info "已取消"; _press_any_key; return ;;
     esac
-    # 节点级统一事务(): userpass 删除 + 节点元数据删除 + clash 移除一体提交/回滚
-    if ! _hysteria_node_txn --arg u "$user" 'del(.auth.userpass[$u])' \
-        "$HYSTERIA_NODES_DIR/${user}.json" delete "-"; then
-        _error "删除失败(节点状态保持原状)"
+    # 只删元数据 + clash 条目(clash 为可再生派生缓存, 失败不回滚元数据)
+    if ! rm -f "$HYSTERIA_NODE_META"; then
+        _error "节点元数据删除失败(权限/只读?), 未改动"
         _press_any_key
         return
     fi
-    _success "节点已删除"
+    _hysteria_remove_clash_by_name "$name" || true
+    _success "节点记录已清除"
     _press_any_key
     return 0
 }
 
 _hysteria_change_password() {
-    local choice users=() i=1 user name auth
+    local auth auth2 name meta_json
     _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【修改节点密码】${NC}"
-    for f in "$HYSTERIA_NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        name=$(jq -r '.name // empty' "$f" 2>/dev/null)
-        users+=("$(jq -r '.user // empty' "$f" 2>/dev/null)")
-        printf "  ${GREEN}[%d]${NC} %-24s (用户: %s)\n" "$i" "$name" "${users[${#users[@]}-1]}"
-        i=$((i+1))
-    done
-    [ ${#users[@]} -eq 0 ] && { _warn "暂无节点"; _press_any_key; return; }
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice || return 0
-    [ "$choice" = "0" ] && return 0
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
-    local idx=$((choice-1))
-    user="${users[$idx]:-}"
-    [ -z "$user" ] && { _warn "无效选择"; _press_any_key; return; }
+    if _hysteria_auth_is_userpass; then
+        _warn "当前为旧 userpass 多用户配置; 请先执行 [2] 添加节点 触发一次性迁移后再改密码"
+        _press_any_key
+        return
+    fi
+    if [ ! -f "$HYSTERIA_NODE_META" ]; then
+        _warn "暂无节点(请用 [2] 添加节点 初始化)"
+        _press_any_key
+        return
+    fi
+    name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+    echo -e "  节点: ${GREEN}${name}${NC}"
+    echo -e "  ${YELLOW}改密码会让所有已分发的分享链接/客户端配置立即失效, 需重新分发${NC}"
     auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
     read -rp "  新密码 (回车随机): " auth2
     auth=${auth2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符"; _press_any_key; return; }
-    # 节点级统一事务: 只用新密码更新元数据(auth), 链接动态派生 → 天然使用新密码。
-    # 链接先预检(元数据/服务器配置不完整则中止), 但不再把 link 写回元数据(避免第 4 份需
-    # 同步的状态)。0.16.15 起预检不因 gecko 自定义尺寸而中止(那只是链接的**呈现**缺口)。
-    local meta="$HYSTERIA_NODES_DIR/${user}.json" tmp_meta
-    [ -f "$meta" ] || { _error "节点元数据不存在($meta), 无法改密码, 请删除后重建"; _press_any_key; return; }
+    # 节点级统一事务: auth.password(config) + 节点元数据(auth) 原子提交/回滚;
+    # 链接动态派生 → 天然使用新密码。先预检元数据/服务器配置完整性。
+    local tmp_meta
     tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || { _error "临时文件创建失败"; _press_any_key; return; }
-    if ! jq --arg p "$auth" '.auth=$p | del(.share_link)' "$meta" > "$tmp_meta" 2>/dev/null; then
+    if ! jq --arg p "$auth" '.auth=$p | del(.share_link)' "$HYSTERIA_NODE_META" > "$tmp_meta" 2>/dev/null; then
         rm -f "$tmp_meta"; _error "元数据构建失败"; _press_any_key; return
     fi
     if ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
         rm -f "$tmp_meta"; _error "分享链接预检失败(服务器配置不完整?), 未修改"; _press_any_key; return
     fi
-    local newmeta
-    newmeta=$(cat "$tmp_meta") || { rm -f "$tmp_meta"; _error "元数据读取失败"; _press_any_key; return; }
+    meta_json=$(cat "$tmp_meta") || { rm -f "$tmp_meta"; _error "元数据读取失败"; _press_any_key; return; }
     rm -f "$tmp_meta"
-    if ! _hysteria_node_txn --arg u "$user" --arg p "$auth" \
-        '.auth.userpass[$u] = $p' "$meta" create "$newmeta"; then
+    if ! _hysteria_node_txn --arg p "$auth" \
+        '.auth = {type: "password", password: $p}' "$HYSTERIA_NODE_META" create "$meta_json"; then
         _error "密码修改失败"
         _press_any_key
         return
     fi
     _success "密码已修改"
     # 呈现走统一入口: 缺口时明确说"不可生成", 不给语义不完整的 URI
-    _hysteria_print_link "$meta" "新分享链接" || true
+    _hysteria_print_link "$HYSTERIA_NODE_META" "新分享链接" || true
     _press_any_key
     return 0
 }
@@ -2901,15 +3088,20 @@ _hysteria_uninstall() {
             *-*) _warn "该配置启用了端口跳跃: 若服务曾被强制杀死, 请人工核查 nft/iptables 是否残留重定向规则" ;;
         esac
     fi
-    # clash.yaml 派生条目(在数据目录删除前取名字)
+    # clash.yaml 派生条目(在数据目录删除前取名字)。单密码模型: 唯一节点元数据 +
+    # 旧 userpass 目录(若存在, 兼容手工留下的备份, 一并清条目)
+    if [ -f "$HYSTERIA_NODE_META" ]; then
+        name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+        [ -n "$name" ] && _hysteria_remove_clash_by_name "$name"
+    fi
     if [ -d "$HYSTERIA_NODES_DIR" ]; then
         for f in "$HYSTERIA_NODES_DIR"/*.json; do
             [ -f "$f" ] || continue
             name=$(jq -r '.name // empty' "$f" 2>/dev/null)
-            _hysteria_remove_clash_by_name "$name"
+            [ -n "$name" ] && _hysteria_remove_clash_by_name "$name"
         done
     fi
-    rm -f "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_LOG_FILE" /etc/logrotate.d/xd-hysteria
+    rm -f "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META" "$HYSTERIA_LOG_FILE" /etc/logrotate.d/xd-hysteria
     rm -rf "$HYSTERIA_DATA_DIR" "$HYSTERIA_CERT_DIR"
     rm -f "$STATE_DIR/hysteria_version" "$STATE_DIR/hysteria_variant"
     _success "官方 Hysteria2 已卸载"
@@ -2947,6 +3139,17 @@ _hysteria_menu() {
     _hysteria_ensure_dirs || { _press_any_key; return 0; }
     # 进入菜单时的一次性幂等清理(declare -F 守卫, 与主菜单对混合版本安装的惯例一致)
     declare -F _hysteria_purge_legacy_variant_state >/dev/null 2>&1 && _hysteria_purge_legacy_variant_state
+    # 旧 userpass 多用户配置 → 单密码模型的一次性迁移(幂等; 失败只告警, 不阻断菜单 ——
+    # 配置保持原样仍可用旧凭据连接, 用户可在 [2] 里重试)。
+    # 迁移走 config 事务(verified-restart), 故仅在核心已安装时尝试; 未安装时只提示,
+    # 避免每次进菜单都刷一条"核心未安装"的错误。
+    if declare -F _hysteria_migrate_legacy_nodes >/dev/null 2>&1 && _hysteria_auth_is_userpass; then
+        if _hysteria_installed; then
+            _hysteria_migrate_legacy_nodes || true
+        else
+            _warn "检测到旧 userpass 多用户配置; 装好核心后进入 [2] 会自动迁移为单密码模型"
+        fi
+    fi
     while true; do
         clear
         echo
@@ -2963,15 +3166,16 @@ _hysteria_menu() {
         else
             echo -e "  核心: ${RED}未安装${NC}"
         fi
-        [ -d "$HYSTERIA_NODES_DIR" ] && { for f in "$HYSTERIA_NODES_DIR"/*.json; do [ -f "$f" ] && ncount=$((ncount+1)); done; }
-        # 只报节点数: 官方是"单服务多用户"模型, 端口/跳跃属于服务器级设置且所有节点共用,
-        # 单值 "监听: <port>" 既表达不了跳跃范围的全貌(客户端实际用的是整个范围, 真实
-        # listening socket 只是范围首端口), 也容易被误读成"每个节点一个端口"。端口现况在
-        # [7] 端口/端口跳跃 里按范围显示, 并已写入每条分享链接。
+        # 节点 = 服务器唯一认证凭据(单密码模型): 有元数据即 1, 否则 0。
+        # 端口/跳跃属于服务器级设置, 单值 "监听: <port>" 表达不了跳跃范围的全貌(客户端实际
+        # 用的是整个范围, 真实 listening socket 只是范围首端口), 故端口现况在
+        # [7] 端口/端口跳跃 里按范围显示, 并已写入分享链接。
+        local ncount=0
+        [ -f "$HYSTERIA_NODE_META" ] && ncount=1
         echo -e "  节点: ${CYAN}${ncount}${NC}"
         echo
         echo -e "  ${GREEN}[1]${NC} 安装/更新官方核心"
-        echo -e "  ${GREEN}[2]${NC} 添加节点 (=新增认证用户)"
+        echo -e "  ${GREEN}[2]${NC} 添加节点"
         echo -e "  ${GREEN}[3]${NC} 查看节点"
         echo -e "  ${GREEN}[4]${NC} 删除节点"
         echo -e "  ${GREEN}[5]${NC} 修改节点密码"
@@ -2980,9 +3184,10 @@ _hysteria_menu() {
         echo -e "  ${GREEN}[8]${NC} TLS 设置"
         echo -e "  ${GREEN}[9]${NC} 混淆 obfs"
         echo -e "  ${GREEN}[10]${NC} 带宽限制"
-        echo -e "  ${GREEN}[11]${NC} 伪装站 masquerade"
-        echo -e "  ${GREEN}[12]${NC} 查看日志"
-        echo -e "  ${GREEN}[13]${NC} 卸载 Hysteria"
+        echo -e "  ${GREEN}[11]${NC} 拥塞控制"
+        echo -e "  ${GREEN}[12]${NC} 伪装站 masquerade"
+        echo -e "  ${GREEN}[13]${NC} 查看日志"
+        echo -e "  ${GREEN}[14]${NC} 卸载 Hysteria"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
@@ -2997,9 +3202,10 @@ _hysteria_menu() {
             8) _hysteria_tls_menu ;;
             9) _hysteria_obfs_menu ;;
             10) _hysteria_bandwidth_menu ;;
-            11) _hysteria_masquerade_menu ;;
-            12) _hysteria_view_log ;;
-            13) _hysteria_uninstall ;;
+            11) _hysteria_congestion_menu ;;
+            12) _hysteria_masquerade_menu ;;
+            13) _hysteria_view_log ;;
+            14) _hysteria_uninstall ;;
             0) return 0 ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
