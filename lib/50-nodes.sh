@@ -143,7 +143,27 @@ _hy2_obfs_size_get() {
     jq -r '(.obfs_packet_size // "") | tostring' "$meta" 2>/dev/null
 }
 
-# 该节点的混淆形态是否**无法用官方 hy2 URI 表达**(= gecko, 即带非空尺寸)。
+# Hysteria 官方 Full-Client-Config 的 gecko 尺寸默认值(minPacketSize 默认 512 /
+# maxPacketSize 默认 1200; 必须 max>=min 且 max<=2048)。**这两个值同时是官方 URI 的
+# 隐含默认** —— 官方 URI-Scheme 的 obfs 参数表只给类型枚举(salamander|gecko), 没有尺寸
+# 参数, 所以只有"恰好等于客户端默认尺寸"的 gecko 才能被 obfs=gecko 完整表达。
+_HY2_GECKO_DEFAULT_SIZE="512-1200"
+
+# 该 metadata 的 gecko 尺寸是否**恰好等于官方客户端默认**(= 可被 obfs=gecko 完整表达)。
+# 未填尺寸时按 Xray 语义**不是** gecko(留空=不启用 Gecko, 退化成普通 salamander),
+# 故一律返回 1(由调用方按 salamander 分支处理)。
+# 用法: _hy2_obfs_size_is_default <meta_file>
+_hy2_obfs_size_is_default() {
+    local canon
+    canon=$(_hy2_obfs_size_canon "$(_hy2_obfs_size_get "$1")") || return 1
+    [ "$canon" = "$_HY2_GECKO_DEFAULT_SIZE" ]
+}
+
+# 该节点的混淆形态是否**无法用官方 hy2 URI 表达**。
+# **判据是"gecko 且尺寸不是官方默认", 不是"有尺寸"**: 官方 URI-Scheme 明确支持
+# `obfs=gecko`("Currently salamander and gecko are supported"), 只是**没有尺寸参数** ——
+# 因此默认 512-1200 的 gecko 可以完整表达, 只有**自定义尺寸**才丢信息(客户端会用默认
+# 512-1200 去连一个非默认的服务端 ⇒ 握手尺寸不一致)。
 # 与"元数据缺字段"是两回事: 前者应清空旧链接并指路 clash, 后者应保留旧链接并如实报错。
 # _rebuild_hy2_link 对两者都返回 1, 调用方必须用本函数区分, 否则会把"元数据缺失"误报成
 # "gecko 无法表达", 并把一条本来可用的旧链接毁掉。
@@ -151,9 +171,11 @@ _hy2_obfs_size_get() {
 _hy2_link_unexpressible() {
     local meta="$1" otype osize
     otype=$(jq -r '.obfs_type // empty' "$meta" 2>/dev/null)
-    [ -n "$otype" ] || return 1
+    [ -n "$otype" ] || return 1                    # 无混淆 ⇒ 可表达
     osize=$(_hy2_obfs_size_get "$meta")
-    [ -n "$osize" ]
+    [ -n "$osize" ] || return 1                    # 无尺寸 = 普通 salamander ⇒ 可表达
+    _hy2_obfs_size_is_default "$meta" && return 1  # 官方默认尺寸 ⇒ obfs=gecko 可完整表达
+    return 0                                       # gecko + 自定义尺寸 ⇒ 不可表达
 }
 
 # ---------------------------------------------------------------------------
@@ -836,12 +858,17 @@ _hy2_hop_retarget() {
 # 在内存中生成完整新 metadata: 传入 hop 字段变换后的 hopmeta 内容, 重建分享链接(读临时文件, 因为
 # _rebuild_hy2_link 从文件读), 输出 newmeta(hop 字段 + 新 share_link)。失败返回 1(未落地任何文件)。
 _hy2_gen_newmeta() {
-    local meta="$1" hopmeta="$2" tmp_meta newlink
+    local meta="$1" hopmeta="$2" tmp_meta newlink rc
     tmp_meta=$(mktemp "${meta}.hop.XXXXXX") || return 1
     printf '%s' "$hopmeta" > "$tmp_meta" || { rm -f "$tmp_meta"; return 1; }
-    newlink=$(_rebuild_hy2_link "$tmp_meta")
+    newlink=$(_rebuild_hy2_link "$tmp_meta"); rc=$?
+    # 两种失败必须区分(同 _hy2_sync_derived): 不可表达(gecko 自定义尺寸) ⇒ 链接**留空**
+    # 是正常结果, clash 是尺寸唯一载体; 元数据缺字段 ⇒ 无法安全重建, 拒绝(不写坏链接)。
+    if [ "$rc" != 0 ] && ! _hy2_link_unexpressible "$tmp_meta"; then
+        rm -f "$tmp_meta"
+        return 1
+    fi
     rm -f "$tmp_meta"
-    [ -n "$newlink" ] || return 1
     jq --arg l "$newlink" '.share_link=$l' <<< "$hopmeta"
 }
 
@@ -849,14 +876,18 @@ _hy2_gen_newmeta() {
 # 供 _hy2_port_txn 使用: 事务内只做一次 _atomic_write_json 提交整份新 metadata, 消除两段式写窗口。
 # 失败返回 1(输出为空); 调用方通过 $(...) 捕获, 未落地任何文件。
 _hy2_gen_port_newmeta() {
-    local meta="$1" newport="$2" oldport tmpm newlink name newname
+    local meta="$1" newport="$2" oldport tmpm newlink rc name newname
     oldport=$(jq -r '.port' "$meta")
     [ -n "$oldport" ] || return 1
     tmpm=$(mktemp "${meta}.port.XXXXXX") || return 1
     jq --argjson p "$newport" '.port=$p' "$meta" > "$tmpm" || { rm -f "$tmpm"; return 1; }
-    newlink=$(_rebuild_hy2_link "$tmpm")
+    newlink=$(_rebuild_hy2_link "$tmpm"); rc=$?
+    # 同 _hy2_sync_derived: gecko 自定义尺寸 ⇒ 链接留空(正常); 元数据缺字段 ⇒ 拒绝
+    if [ "$rc" != 0 ] && ! _hy2_link_unexpressible "$tmpm"; then
+        rm -f "$tmpm"
+        return 1
+    fi
     rm -f "$tmpm"
-    [ -n "$newlink" ] || return 1
     name=$(jq -r '.name' "$meta")
     # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
     newname=$(_rename_node_with_port "$name" "$oldport" "$newport")
@@ -3096,23 +3127,13 @@ _add_hysteria2() {
         return 1
     fi
     local meta="$NODES_DIR/${tag}.json"
-    # link: 从 metadata 重建(gecko 带尺寸时 _rebuild_hy2_link 拒绝生成, 与菜单路径一致)
+    # 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived, 与菜单/改端口路径同源:
+    # 按 _hy2_link_unexpressible 区分"gecko 自定义尺寸不可表达"(清空链接 + 继续同步 clash)
+    # 与"元数据缺字段"(保留旧链接); clash 步骤是 upsert, 故新建节点会追加条目。
+    # 派生缓存写入失败只告警, **不**回滚已提交的 config/metadata。
+    _hy2_sync_derived "$meta" || _warn "派生状态同步失败, 请核对 ${meta} 与 ${CLASH_YAML}"
     local link=""
-    if ! link=$(_rebuild_hy2_link "$meta") || [ -z "$link" ]; then
-        link=""
-        _meta_update "$meta" '.share_link=""' || true
-        _warn "gecko 自定义分片尺寸无法用官方 hy2 链接表达, 分享链接留空"
-        _tip "请用下方 Clash 条目(含 obfs-min/max-packet-size)导入客户端"
-    else
-        _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; return 1; }
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML; 条目由 _hy2_clash_line 从已落地 metadata 重建(单一来源)
-    local clash
-    if clash=$(_hy2_clash_line "$meta"); then
-        _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
-    else
-        _warn "Clash 条目生成失败, 节点已创建, 可手工编辑 ${CLASH_YAML} 补齐"
-    fi
+    link=$(jq -r '.share_link // ""' "$meta" 2>/dev/null)
 
     _success "节点 [${name}] 创建成功"
     if [ "$self_signed" = "true" ]; then
@@ -3163,12 +3184,13 @@ _rebuild_hy2_link() {
     fi
     # 混淆(obfs/obfs-password) —— 客户端侧参数名来自官方 Hysteria URI-Scheme;
     # Xray 文档未定义 hy2 分享链接, 故此处以 Hysteria 官方为准(与服务端 finalmask.udp 对应)。
-    # **gecko 时拒绝生成链接**(与官方 Hysteria2 模块 _hysteria_obfs_uri_gap 同口径):
-    # 官方 URI 的 `obfs` 是**类型**枚举(salamander | gecko), 只有 obfs/obfs-password
-    # 两个参数、**没有任何尺寸参数**。服务端 Xray 侧 gecko = type:salamander + packetSize,
-    # 若照抄成 `obfs=salamander`, 客户端会按"无分片"连接而服务端在分片长包头 ⇒ 握手必失败;
-    # 若写成 `obfs=gecko` 又丢了尺寸(服务端非默认尺寸时语义不等价)。两种写法都是
-    # "看着正常、连不上"的链接, 故一律不生成, 由 clash 条目(有独立尺寸字段)承载。
+    # **类型映射不能照抄**: 服务端 Xray 侧 gecko = type:"salamander" + 非空 packetSize
+    # (官方没有 type:"gecko"); 而客户端 URI 的 `obfs` 是**类型枚举**(salamander|gecko)。
+    # 故 gecko 必须写成 `obfs=gecko` —— 若照抄成 `obfs=salamander`, 客户端会按"无分片"
+    # 连接而服务端在分片长包头 ⇒ 握手必失败。
+    # **只有自定义尺寸才无法表达**(官方 URI-Scheme 明确支持 obfs=gecko, 但**没有尺寸参数**):
+    # 默认 512-1200 的 gecko 可被 obfs=gecko 完整表达; 自定义尺寸会让客户端退回默认值
+    # ⇒ 尺寸不一致, 此时拒绝生成, 由 clash 条目(有独立尺寸字段)承载。
     # 调用方用 _hy2_link_unexpressible 区分"无法表达"(应清空旧链接)与"元数据缺字段"
     # (应保留旧链接并如实报告) —— 两者都返回 1, 混为一谈会误报原因并毁掉可用的旧链接。
     local obfs_type obfs_pw obfs_size
@@ -3183,8 +3205,12 @@ _rebuild_hy2_link() {
     [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
     [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
     if [ -n "$obfs_type" ]; then
-        [ -n "$obfs_size" ] && return 1
-        link="${link}&obfs=${obfs_type}&obfs-password=$(_url_encode "$obfs_pw")"
+        # 自定义尺寸无法用 URI 表达 ⇒ 拒绝(默认 512-1200 可表达, 见上方注释)
+        [ -n "$obfs_size" ] && ! _hy2_obfs_size_is_default "$meta" && return 1
+        # 服务端 gecko(Xray type=salamander + packetSize) 在客户端 URI 里是 obfs=gecko
+        local uri_obfs="$obfs_type"
+        [ -n "$obfs_size" ] && uri_obfs="gecko"
+        link="${link}&obfs=${uri_obfs}&obfs-password=$(_url_encode "$obfs_pw")"
     fi
     # 端口跳跃端口(如果已配置, 统一通过 _read_hop_ranges_display 读取, M9)
     local hop_ports
@@ -3256,6 +3282,69 @@ _hy2_clash_line() {
     [ -n "$hop_ports" ] && line="${line}, ports: \"${hop_ports}\""
     [ "$self_signed" = "true" ] && line="${line}, skip-cert-verify: true"
     printf '%s}' "$line"
+}
+
+# ---------------------------------------------------------------------------
+# hy2 派生状态(分享链接 + clash 条目)的**唯一同步入口**。
+# 背景: _rebuild_hy2_link 对"gecko + **自定义**分片尺寸"刻意返回 1 —— 官方 Hysteria URI 的
+# obfs 是**类型枚举**(支持 obfs=gecko)但**没有尺寸参数**, 自定义尺寸会让客户端退回默认
+# 512-1200 去连一个非默认的服务端(尺寸不一致), 故此时不生成链接, 由 clash 条目
+# (含 obfs-min/max-packet-size)承载。默认 512-1200 的 gecko 可被 obfs=gecko 完整表达。
+# 这使"链接重建失败"分裂为两种**必须区分**的原因, 而每个调用方各写一遍判定必然漂移
+# (0.17.0 曾漏掉 _modify_port 非 hop 路径: 端口已提交而链接/ clash 双双停在旧值, 且以
+# "分享链接重建失败"报错, 用户看到失败字样但服务器端口其实已改 —— 三态不一致 + 伪报错)。
+# 语义(与 _add_hysteria2 / _hy2_obfs_menu 完全一致):
+#   (a) 可表达            → 写回 share_link, 并同步 clash;
+#   (b) 不可表达(gecko 自定义尺寸) → 清空 share_link(否则旧链接仍写着旧参数), **继续**同步 clash;
+#   (c) 元数据缺字段       → **保留**旧 share_link(它可能仍可用), 如实报告, 不写坏值;
+#   任何情况下 clash 都按当前 metadata 重建同步(clash 是自定义尺寸的唯一载体)。
+# **返回码 = share_link / clash 任一写入失败 ⇒ 1**(调用方据此提示人工核对); 但这两者都是
+# 派生状态, 失败**不**回滚已提交的 config/metadata(调用方只 _warn, 不当作事务失败)。
+# 用法: _hy2_sync_derived <meta_file>
+# ---------------------------------------------------------------------------
+_hy2_sync_derived() {
+    local meta="$1" link="" nname="" nline=""
+    if link=$(_rebuild_hy2_link "$meta") && [ -n "$link" ]; then
+        _meta_update "$meta" '.share_link=$l' --arg l "$link" || {
+            _error "分享链接写入失败: $meta"
+            return 1
+        }
+    elif _hy2_link_unexpressible "$meta"; then
+        # 区分依据必须是 _hy2_link_unexpressible(gecko=有尺寸), 不能用"重建失败"本身 ——
+        # 否则会把"元数据缺字段"误报成"gecko 无法表达"并毁掉一条仍可用的旧链接。
+        _meta_update "$meta" '.share_link=""' || {
+            _error "分享链接清空失败: $meta"
+            return 1
+        }
+        _warn "当前混淆(gecko 带自定义分片尺寸)无法用官方 hy2 链接表达, 已清空分享链接"
+        _tip "官方 URI 的 obfs 只表达类型(salamander/gecko), 没有尺寸参数; 只有默认 512-1200 可表达"
+        _tip "请用 Clash 条目(含 obfs-min/max-packet-size)导入客户端"
+    else
+        _warn "分享链接重建失败(元数据缺少必要字段), 已保留原链接"
+    fi
+    # clash 派生缓存: 必须 **upsert**(条目在 → 替换; 不在 → 追加), 否则新建节点时
+    # "只替换不追加"会静默漏掉条目。分支规则与 _sync_node_clash 相同, 但这里要返回真实
+    # 返回码(那个 helper 按设计把 clash 失败吞成 0, 因为对多数调用方 clash 只是可再生缓存)。
+    nname=$(jq -r '.name // empty' "$meta" 2>/dev/null)
+    local crc=0 key
+    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
+        key=$(_yaml_dq "$nname")
+        if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
+            _replace_node_in_yaml "$nline" "$nname" || {
+                crc=1
+                _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+            }
+        else
+            _add_node_to_yaml "$nline" "$nname" || {
+                crc=1
+                _warn "Clash YAML 条目追加失败, 可手工编辑 ${CLASH_YAML}"
+            }
+        fi
+    else
+        crc=1
+        _warn "Clash 条目生成失败(元数据不完整), 可手工编辑 ${CLASH_YAML}"
+    fi
+    return "$crc"
 }
 
 # ---------------------------------------------------------------------------
@@ -3566,7 +3655,7 @@ _view_nodes() {
             if [ -z "$link" ] || [ "$link" = "null" ]; then
                 echo -e "  ${YELLOW}该节点当前无可用分享链接${NC}"
                 if _hy2_link_unexpressible "$f"; then
-                    echo -e "  ${YELLOW}原因: gecko 自定义分片尺寸无法用官方 hy2 URI 表达${NC}"
+                    echo -e "  ${YELLOW}原因: gecko 使用了自定义分片尺寸(官方 hy2 URI 的 obfs 只表达类型, 无尺寸参数)${NC}"
                     echo -e "  ${YELLOW}请改用 clash/mihomo 条目导入(含 obfs-min/max-packet-size), 见 ${CLASH_YAML}${NC}"
                 else
                     echo -e "  ${YELLOW}原因: 节点元数据缺少链接所需字段(可删除后重建, 或用 [采纳孤儿入站] 补回)${NC}"
@@ -4055,12 +4144,34 @@ _modify_port() {
         _error "端口元数据写入失败"; _press_any_key; return 1
     fi
 
-    # 按协议重建分享链接(避免裸字符串替换误伤其他字段, S4)
+    # 名称: 名称通常包含端口号。hy2 分支必须在重建派生状态**之前**把它落盘 ——
+    # 链接的 #fragment 与 clash 条目都取 .name, 后落会写出"新端口 + 旧名"的派生值
+    # (与 _hy2_gen_port_newmeta 在内存里先改名再重建同源)。其余协议保持原有的一次原子写。
+    local old_name new_name
+    old_name=$(jq -r '.name' "$meta")
+    # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
+    new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
+
+    # hy2: 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived, 与创建/菜单路径同源。
+    # gecko(带非空 packetSize)节点的链接无法用官方 hy2 URI 表达, _rebuild_hy2_link 会返回 1;
+    # 此处必须像 _hy2_obfs_menu 那样区分"不可表达"(清空旧链接 + **继续**同步 clash)与
+    # "元数据缺字段"(保留旧链接), 而不是一律以失败告终 —— 修复前: 端口已提交、链接与
+    # clash 双双停在旧端口, 还以"分享链接重建失败"报错, 用户看到失败字样却不知端口其实已改。
+    if [ "$proto" = "hysteria2" ]; then
+        if [ "$new_name" != "$old_name" ]; then
+            _meta_update "$meta" '.name=$n' --arg n "$new_name" || { _error "节点名称写入失败"; _press_any_key; return 1; }
+        fi
+        _hy2_sync_derived "$meta" || _warn "派生状态同步失败, 请核对 ${meta} 与 ${CLASH_YAML}"
+        _success "端口已改为 ${newport}"
+        _press_any_key
+        return 0
+    fi
+
+    # 非 hy2: 按协议重建分享链接(避免裸字符串替换误伤其他字段, S4)
     # R38(M10): 消费 rebuild 的返回码 —— 被采纳的节点缺少 auth/public_key 等字段, 重建会失败;
     # 此时必须保留原 share_link(config 端口已改, 链接需用户手动重建), 不能写入坏链接。
     local newlink rebuild_rc=0
     case "$proto" in
-        hysteria2) newlink=$(_rebuild_hy2_link "$meta") || rebuild_rc=1 ;;
         vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$meta") || rebuild_rc=1 ;;
         vless-enc) newlink=$(_rebuild_vless_enc_link "$meta") || rebuild_rc=1 ;;
         vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$meta") || rebuild_rc=1 ;;
@@ -4083,10 +4194,7 @@ _modify_port() {
     fi
 
     # 同步更新节点名称(名称通常包含端口号) + 分享链接; 原子写(R15)
-    local old_name new_name meta2
-    old_name=$(jq -r '.name' "$meta")
-    # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
-    new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
+    local meta2
     if [ "$new_name" != "$old_name" ]; then
         meta2=$(jq --arg l "$newlink" --arg n "$new_name" '.share_link=$l | .name=$n' "$meta") || { _error "生成元数据失败"; _press_any_key; return 1; }
     else
@@ -4368,13 +4476,8 @@ _hy2_toggle_hop() {
                     _press_any_key; return
                 fi
                 _success "端口跳跃已禁用"
-                # 派生缓存同步: 从已提交 metadata 重建 clash 条目(去掉 ports)
-                local nline nname
-                nname=$(jq -r '.name // empty' "$meta")
-                if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
-                    _replace_node_in_yaml "$nline" "$nname" || \
-                        _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
-                fi
+                # 派生状态(链接 + clash)走**唯一入口**(去掉 mport / ports)
+                _hy2_sync_derived "$meta" || _warn "派生状态同步失败, 请核对 ${meta} 与 ${CLASH_YAML}"
                 ;;
             *) _info "已取消" ;;
         esac
@@ -4417,13 +4520,8 @@ _hy2_toggle_hop() {
             _press_any_key; return
         fi
         _success "端口跳跃已启用: ${normalized} → ${port}"
-        # 派生缓存同步: 从已提交 metadata 重建 clash 条目(加入 ports)
-        local nline nname
-        nname=$(jq -r '.name // empty' "$meta")
-        if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
-            _replace_node_in_yaml "$nline" "$nname" || \
-                _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
-        fi
+        # 派生状态(链接 + clash)走**唯一入口**(加入 mport / ports)
+        _hy2_sync_derived "$meta" || _warn "派生状态同步失败, 请核对 ${meta} 与 ${CLASH_YAML}"
         _tip "iptables DNAT 已生效, 客户端可连接范围内任意端口"
         _tip "请确保防火墙/安全组已放行该 UDP 端口范围"
     fi
