@@ -3237,15 +3237,29 @@ _hysteria_cleanup_service_units() {
             systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
             # 1) unit 本身必须已不可被 systemd 识别
             [ "$(systemctl show -p LoadState --value "$HYSTERIA_SVC" 2>/dev/null)" = "not-found" ] && ok=0
-            # 2) 不得仍处于 enabled(disable 失败的典型残局)
-            if [ "$(systemctl is-enabled "$HYSTERIA_SVC" 2>/dev/null)" = "enabled" ]; then
-                ok=1
-                _error "systemd unit ${HYSTERIA_SVC} 仍处于 enabled 状态(disable 未生效)"
-                _tip "请人工执行: systemctl disable ${HYSTERIA_SVC}"
-            fi
-            # 3) 不得残留指向本 unit 的 dangling 符号链接(enable 的 .wants/.requires 链接)
+            # 2) 不得仍处于任何"被启用"形态(disable 失败的典型残局)。
+            #    is-enabled 不止输出 enabled —— 还有 enabled-runtime / alias / linked /
+            #    indirect 等; 只比 `= "enabled"` 会漏掉 enabled-runtime/alias 这类仍会被拉起的
+            #    形态。本项目 unit 带 [Install] WantedBy=multi-user.target, 正常只有 enabled,
+            #    但把"非 enabled 就安全"写死是错的 —— 改为**否定白名单**: 只有明确表示
+            #    "未启用"的取值才算安全, 其余(含未来新增状态)一律按"仍被启用"处理(fail-closed)。
+            local en
+            en=$(systemctl is-enabled "$HYSTERIA_SVC" 2>/dev/null)
+            case "$en" in
+                ""|disabled|masked|masked-runtime|static|not-found) ;;
+                *)
+                    ok=1
+                    _error "systemd unit ${HYSTERIA_SVC} 仍处于启用形态(is-enabled=${en})"
+                    _tip "请人工执行: systemctl disable ${HYSTERIA_SVC}"
+                    ;;
+            esac
+            # 3) 不得残留指向本 unit 的符号链接(enable 的 .wants/.requires 链接)。
+            #    搜索路径覆盖 systemd 的 unit 搜索位置 —— /etc/systemd/system 是 enable 的落点,
+            #    /run/systemd/system 与 /usr/lib/systemd/system 亦可能被植入链接(项目 unit 只写
+            #    /etc, 但残留可能出现在任一搜索路径上)。
             local lnk
-            lnk=$(find /etc/systemd/system -type l -name "${HYSTERIA_SVC}.service" 2>/dev/null)
+            lnk=$(find /etc/systemd/system /run/systemd/system /usr/lib/systemd/system \
+                       -type l -name "${HYSTERIA_SVC}.service" 2>/dev/null)
             if [ -n "$lnk" ]; then
                 ok=1
                 _error "systemd unit ${HYSTERIA_SVC} 仍有残留符号链接(enable 关系未解除)"
