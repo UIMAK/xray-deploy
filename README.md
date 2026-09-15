@@ -37,6 +37,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/UIMAK/xray-deploy/main/insta
 
 本模块自引入起即为单密码模型, **不做 `userpass` → `password` 迁移**: 检测到 `auth` 不是 `password` 模式的现成配置时一律按"外来配置"处理 —— 菜单拒绝接管(不静默覆盖你的配置), 并提示你自行备份/转换或删除后重新初始化。
 
+反过来, 若你**手工部署过** Official Hysteria(`auth.type: password` + 你自己的密码)再装上本脚本, 或此前用 `[4]` 清除了节点记录: `[2] 添加节点` 会按**现有密码**重建节点记录(**不改动认证段**, 已分发的链接不会失效)。
+
 > 需要多套独立凭据时, 请分别部署多台服务器(每个实例一套密码)。
 
 `[11] 拥塞控制` 对应官方 `congestion` 段: `type ∈ {bbr, reno}`(默认 bbr)、`bbrProfile ∈ {standard, conservative, aggressive}`(仅 `type: bbr` 时生效)。该段**只在对应方向未使用 Brutal 时生效**; 回车即用官方默认(不写入配置段)。
