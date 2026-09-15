@@ -3041,7 +3041,6 @@ _hysteria_delete_node() {
     # 5) 派生缓存(clash 条目): 可再生, 失败仅告警(helper 内部已给出人工修法)
     [ -n "$name" ] && { _hysteria_remove_clash_by_name "$name" || true; }
     _success "服务器配置已删除, 服务已停止(核心 binary 保留)"
-    _tip "如需重新启用: [2] 添加节点 会重新初始化配置(可复用现有 TLS 证书与连接地址)"
     _press_any_key
     return 0
 }
