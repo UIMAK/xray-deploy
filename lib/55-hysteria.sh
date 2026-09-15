@@ -1872,7 +1872,6 @@ _hysteria_obfs_menu() {
                 _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
                 _success "混淆已启用 (类型: ${otype})"
                 # 不断言"已写入分享链接": gecko 自定义尺寸下链接是**不生成**的(P1)
-                [ "$otype" = "gecko" ]
             fi
             ;;
         3)
