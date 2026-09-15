@@ -153,21 +153,45 @@ _hy2_link_unexpressible() {
 # 因此它可以有多层 —— 我们只拥有自己写的那一层, 不是整个数组)。
 # 全项目唯一副本; 90-menu 的启用/关闭/回滚三处都引用它, 不得各自复制(副本会漂移)。
 #
-#   $XD_UDP_OUR_TYPE  我们写入的层 type(Xray 侧 gecko 也是 type=salamander, 见下)
-#   $XD_UDP_NEW       要写入的层对象(单个, 不是数组)
+#   $XD_UDP_OUR_TYPE     我们写入的层 type(Xray 侧 gecko 也是 type=salamander, 见下)
+#   $XD_UDP_OUR_MARKER   我们写入的 settings 里的**归属标记**字段名
+#   $XD_UDP_NEW          要写入的层对象(单个, 不是数组); $new == null 表示"剔除我们那层"
 #
-# 启用: 找到我们自己那层就**原位替换**(保留其前后的其它层), 没有就追加到末尾。
-# 关闭: 只剔除我们自己那层, 其它层原样保留。
-# 注意: 我们写入的层恒为 type="salamander" —— Xray 侧 gecko 是 **salamander + 非空
-# packetSize**(官方文档没有 type="gecko"), 故这一个 type 就唯一标识了我们这一层。
+# **身份判定必须是正向标记, 不能只靠 `type == "salamander"`**: 该 type 是 Xray 的
+# 官方伪装类型名, 任何用户/其它工具都可以在同一个 udp 数组里放自己的 salamander 层。
+# 只按 type 匹配实际是"管理所有 salamander 层" —— 替换会吃掉别人的层, 关闭会一次删光,
+# 与"只管理自己写的那一层"的契约不符。故我们写入的层带一个可自证的归属标记
+# (settings.xd_managed = true), 识别与剔除都只认它; 它不影响 Xray(Go 的 json 解码
+# 按 struct 字段取用, settings 里的未知键被忽略), 也不改变任何官方字段的语义。
+# 兼容: 标记是我们自己上一版写下的层没有 —— 此时退化为"取 settings.password 存在且
+# 无其它伪装类型特征的那一层"? 不: 不做模糊推断(会把别人的层误认成自己的),
+# 而是**只在找到带标记的层时原位替换, 否则追加一层**; 无标记的旧层按"别人的层"保留。
 # ---------------------------------------------------------------------------
 XD_UDP_OUR_TYPE="salamander"
-XD_UDP_JQ_UPSERT='def xd_udp_ours($new): .streamSettings.finalmask.udp = ((.streamSettings.finalmask.udp // []) as $a | ($a | map(.type == $ourtype) | index(true)) as $i | if $i == null then $a + [$new] else $a[0:$i] + [$new] + $a[$i+1:] end); (.inbounds[] | select(.tag == $t)) |= xd_udp_ours($new)'
-XD_UDP_JQ_DROP='(.inbounds[] | select(.tag == $t)) |= (.streamSettings.finalmask.udp = ((.streamSettings.finalmask.udp // []) | map(select(.type != $ourtype))))'
+XD_UDP_OUR_MARKER="xd_managed"
+XD_UDP_JQ_UPSERT='def xd_udp_ours($new): .streamSettings.finalmask.udp = ((.streamSettings.finalmask.udp // []) as $a | ($a | map(.type == $ourtype and (.settings // {})[$ourmark] == true) | index(true)) as $i | if $i == null then (if $new == null then $a else $a + [$new] end) else (if $new == null then $a[0:$i] + $a[$i+1:] else $a[0:$i] + [$new] + $a[$i+1:] end) end); (.inbounds[] | select(.tag == $t)) |= xd_udp_ours($new)'
+# 兼容别名: 语义与 UPSERT($new=null) 完全相同 —— 保留独立常量只为调用点可读,
+# 但**不得**再各自复制一份过滤逻辑(两份副本会漂移)。
+XD_UDP_JQ_DROP="$XD_UDP_JQ_UPSERT"
+
+# 外来 salamander 层探测(只读): 该入站的 finalmask.udp 里是否存在 type=salamander
+# 但**没有**我们归属标记的层。存在时不得启用混淆 —— 追加我们那层会让 Xray 依次套两层
+# salamander(双重混淆, 客户端只做一层 ⇒ 必然连不上), 而"删掉别人的层"更不可接受。
+# 这是 fail-closed: 交给用户人工判断, 而不是替他猜。
+# 用法: _hy2_udp_has_foreign_salamander <tag>; rc=0 表示存在
+_hy2_udp_has_foreign_salamander() {
+    local tag="$1"
+    jq -e --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" \
+        '[.inbounds[]? | select(.tag == $t) | (.streamSettings.finalmask.udp // [])[]
+          | select(.type == $ourtype and (.settings // {})[$ourmark] != true)] | length > 0' \
+        "$CONFIG_FILE" >/dev/null 2>&1
+}
 
 # 从 (type, password, packetSize) 构造 finalmask.udp 数组字面量
 # 用法: _hy2_obfs_mask_block <type> <password> <packet_size_raw>
 # 输出: 空(未启用) 或 {"type": ..., "settings": {...}}  (可直接放进 [ ])
+# 生成的层带**归属标记** settings.xd_managed=true, 使 XD_UDP_JQ_UPSERT/DROP 能精确
+# 认出"我们写的那一层"而不是"所有 type=salamander 的层"(见上面过滤器注释)。
 # 失败(非法 packetSize)返回 1 —— 调用方必须消费返回码, 绝不能拿空输出当"无混淆"用:
 # 回滚/关闭路径上把"解析失败"误当"无混淆"会静默清掉一个正在工作的混淆配置。
 _hy2_obfs_mask_block() {
@@ -179,7 +203,7 @@ _hy2_obfs_mask_block() {
     [ -n "$canon" ] && { case "$canon" in *-*) size_json="\"$canon\"" ;; *) size_json="$canon" ;; esac; }
     # 格式串必须是字面量: 第三个实参曾同时充当格式串, 一旦 size_json 的正则放宽就是
     # 用户可控的 printf 格式串注入。这里用 %s 逐个拼装, 用户数据永远只当数据。
-    printf '%s' "{\"type\": \"${otype}\", \"settings\": {\"password\": \"${opw}\"${size_json:+, \"packetSize\": ${size_json}}}}"
+    printf '%s' "{\"type\": \"${otype}\", \"settings\": {\"password\": \"${opw}\", \"${XD_UDP_OUR_MARKER}\": true${size_json:+, \"packetSize\": ${size_json}}}}"
 }
 
 # gecko(非空 packetSize)需要的最小核心版本 —— 版本门控, 与 R44/R45 同口径。
@@ -3039,23 +3063,14 @@ _add_hysteria2() {
 
     local addr
     addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
-    local link_ip="$addr"
-    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
-    # hy2:// 分享链接(标准格式: hy2://password@host:port/?sni=...&insecure=...&congestion=...)
-    # 密码/SNI 均 URL 编码(自定义密码可能含 @:/?# 等保留字符)
-    local enc_auth enc_sni
-    enc_auth=$(_url_encode "$auth"); enc_sni=$(_url_encode "$sni")
-    local link="hy2://${enc_auth}@${link_ip}:${port}/?sni=${enc_sni}"
-    [ "$self_signed" = "true" ] && link="${link}&insecure=1&allowInsecure=1"
-    link="${link}&congestion=${congestion}"
-    [ -n "$brutal_up" ] && link="${link}&up=$(_url_encode "$brutal_up")"
-    [ -n "$brutal_down" ] && link="${link}&down=$(_url_encode "$brutal_down")"
-    # 混淆参数: obfs/obfs-password(官方 Hysteria URI-Scheme; Xray 文档未定义 hy2 链接)
-    [ -n "$obfs_type" ] && link="${link}&obfs=${obfs_type}&obfs-password=$(_url_encode "$obfs_pw")"
-    link="${link}#$(_url_encode "$name")"
-
-    # 元数据(obfs_* 供分享链接/clash 重建; packetSize 为 null/空 = **未启用 gecko**)
+    # ---------------------------------------------------------------------
+    # 先落 **canonical metadata**, 再由它派生 link 与 clash —— 与修改路径**同一条**逻辑。
+    # 创建路径曾自己内联拼 link(无条件 `&obfs=salamander`), 于是 gecko 节点会被写进一条
+    # 无法表达 packetSize 的链接, 而同一节点走菜单修改时 _rebuild_hy2_link 却拒绝生成
+    # ⇒ 同一状态两个入口两种结果。现统一为:
+    #   metadata(权威) → _rebuild_hy2_link(可表达才生成) / _hy2_clash_line(尺寸唯一载体)
+    # ---------------------------------------------------------------------
     local meta_json
     meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
@@ -3063,15 +3078,26 @@ _add_hysteria2() {
         --arg auth "$auth" --arg sni "$sni" --arg congestion "$congestion" \
         --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
         --arg obfsType "$obfs_type" --arg obfsPw "$obfs_pw" --arg obfsSize "$obfs_size" \
-        --arg link "$link" --argjson ss "$self_signed" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,obfs_type:$obfsType,obfs_password:$obfsPw,obfs_packet_size:(if $obfsSize == "" then null else $obfsSize end),self_signed:$ss,share_link:$link}')
+        --argjson ss "$self_signed" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,obfs_type:$obfsType,obfs_password:$obfsPw,obfs_packet_size:(if $obfsSize == "" then null else $obfsSize end),self_signed:$ss,share_link:""}')
     if ! _save_node_meta "$tag" "$meta_json"; then
         _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
         return 1
     fi
+    local meta="$NODES_DIR/${tag}.json"
+    # link: 从 metadata 重建(gecko 带尺寸时 _rebuild_hy2_link 拒绝生成, 与菜单路径一致)
+    local link=""
+    if ! link=$(_rebuild_hy2_link "$meta") || [ -z "$link" ]; then
+        link=""
+        _meta_update "$meta" '.share_link=""' || true
+        _warn "gecko 自定义分片尺寸无法用官方 hy2 链接表达, 分享链接留空"
+        _tip "请用下方 Clash 条目(含 obfs-min/max-packet-size)导入客户端"
+    else
+        _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; return 1; }
+    fi
     # R38(P1): metadata 成功后才写派生 YAML; 条目由 _hy2_clash_line 从已落地 metadata 重建(单一来源)
     local clash
-    if clash=$(_hy2_clash_line "$NODES_DIR/${tag}.json"); then
+    if clash=$(_hy2_clash_line "$meta"); then
         _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
     else
         _warn "Clash 条目生成失败, 节点已创建, 可手工编辑 ${CLASH_YAML} 补齐"
@@ -3091,7 +3117,11 @@ _add_hysteria2() {
             echo -e "  ${CYAN}混淆:${NC} salamander (FinalMask.udp)"
         fi
     fi
-    echo -e "  ${CYAN}分享链接:${NC} ${link}"
+    if [ -n "$link" ]; then
+        echo -e "  ${CYAN}分享链接:${NC} ${link}"
+    else
+        echo -e "  ${YELLOW}分享链接: 无(见上方说明; 客户端配置见 Clash 条目)${NC}"
+    fi
 }
 
 # ---------------------------------------------------------------------------
