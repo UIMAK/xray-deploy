@@ -589,6 +589,7 @@ _hy2_manage_menu() {
         echo -e "  ${GREEN}[2]${NC} 调整 brutal 带宽"
         echo -e "  ${GREEN}[3]${NC} 端口跳跃 (iptables)"
         echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
+        echo -e "  ${GREEN}[5]${NC} 混淆 salamander / gecko (FinalMask.udp)"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
@@ -597,6 +598,7 @@ _hy2_manage_menu() {
             2) _hy2_adjust_bandwidth ;;
             3) _hy2_toggle_hop ;;
             4) _hy2_view_hop ;;
+            5) _hy2_obfs_menu ;;
             0) return ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
@@ -788,8 +790,189 @@ _hy2_adjust_bandwidth() {
 }
 
 # ---------------------------------------------------------------------------
-# Reality 域名管理(切换 target SNI)
+# Hysteria2: 混淆 salamander / gecko (FinalMask.udp)
+# 官方依据: Xray-docs-next config/transports/finalmask.md「UDPMask」
+#   finalmask.udp = [ {type:"salamander", settings:{password, packetSize}} ]
+#   packetSize 为 Int32Range, 非空即启用 Gecko(QUIC 长包头额外分片填充), 上限 2048。
+# 注意: 官方文档没有 hysteriaSettings.obfs 字段; 链接侧 obfs/obfs-password 参数名
+# 来自 Hysteria 官方 URI-Scheme(Xray 文档未定义 hy2 分享链接)。
+# 服务端变更走 _mutate_config(事务 + verified-restart + 回滚); 元数据在 config 提交成功后写,
+# 失败时把 config 回滚为**改动前**的混淆形态(不是一律清空), 保持两侧一致
+# (顺序与 _hy2_toggle_brutal 一致; 回滚见 _hy2_obfs_rollback)。
 # ---------------------------------------------------------------------------
+_hy2_obfs_menu() {
+    local choice
+    clear
+    _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+    echo; echo -e "  ${CYAN}【混淆 salamander / gecko (FinalMask.udp)】${NC}"
+    local tags=() i=1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        local tag name otype osize
+        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
+        otype=$(jq -r '.obfs_type // empty' "$f")
+        osize=$(_hy2_obfs_size_get "$f")
+        tags+=("$tag")
+        printf "  ${GREEN}[%d]${NC} %-20s 当前: %s%s\n" "$i" "$name" "${otype:-未启用}" "${osize:+ (packetSize=${osize})}"
+        i=$((i+1))
+    done
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    read -rp "  选择节点: " choice
+    [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
+    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+
+    # 入站必须真实存在于 config: 元数据在而 config 被手工改过时, 下面的
+    # `(.inbounds[] | select(.tag == $t)) |= …` 会匹配 0 条路径 —— jq 返回 0、
+    # 配置原样不动, _mutate_config 重启成功并报"已启用", 于是元数据与服务器再次分裂。
+    jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
+        || { _error "config.json 中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
+
+    local meta="$NODES_DIR/${tag}.json"
+    local cur_type cur_pw cur_size
+    cur_type=$(jq -r '.obfs_type // empty' "$meta")
+    cur_pw=$(jq -r '.obfs_password // empty' "$meta")
+    cur_size=$(_hy2_obfs_size_get "$meta")
+    # 回滚目标 = **改动前**的混淆形态(不是"无混淆"): 元数据写失败时若一律回滚成
+    # udp:[], 一个正在用混淆工作的节点会被静默清成无混淆, 而链接/clash 仍写着 obfs
+    # ⇒ 所有已分发客户端立刻连不上。cur_type 为空时该表达式自然得到 [], 首次启用不受影响。
+    local rollback_mask
+    rollback_mask=$(_hy2_obfs_mask_block "$cur_type" "$cur_pw" "$cur_size") || rollback_mask="__INVALID__"
+    echo
+    if [ -n "$cur_type" ]; then
+        echo -e "  当前: ${GREEN}${cur_type}${NC}${cur_size:+ (packetSize=${cur_size})}"
+    else
+        echo -e "  当前: ${RED}未启用${NC}"
+    fi
+    echo -e "  ${YELLOW}启用后服务端不再兼容标准 QUIC/HTTP3 连接(Hysteria 官方文档 Full-Server-Config), 客户端必须带相同类型与密码${NC}"
+    echo -e "  ${GREEN}[1]${NC} 启用/更换 salamander 混淆"
+    echo -e "  ${GREEN}[2]${NC} 启用/更换 salamander + gecko 分片"
+    echo -e "  ${GREEN}[3]${NC} 关闭混淆"
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    local obfs_choice
+    read -rp "  请选择: " obfs_choice
+    local otype="" opw="" osize="" omask="" opw_in=""
+    case "${obfs_choice:-0}" in
+        0) return ;;
+        1|2)
+            # 启用/更换 的 fail-closed 闸门: 该入站若已有一层**不是我们写的** type=salamander,
+            # 追加我们那层会让 Xray 依次套两层 salamander(双重混淆, 客户端只做一层 ⇒ 必然
+            # 连不上)。不替用户猜(既不吃掉别人的层, 也不硬套), 交人工处理。
+            # **只挡 1|2, 不挡 3**: 关闭只剔除我们自己带标记的那层、保留别人的层, 是完全
+            # 安全的操作 —— 在菜单入口无条件拦截会让用户连自己那层都删不掉(实测缺陷)。
+            if _hy2_udp_has_foreign_salamander "$tag"; then
+                _error "该入站的 finalmask.udp 已存在**非本脚本写入**的 salamander 层;"
+                _error "继续启用会叠加成双重混淆(客户端只做一层, 必然连不上)。"
+                _tip "请先手工编辑 ${CONFIG_FILE} 移除或改名该层(本脚本写入的层带 settings.xd_managed=true)"
+                _tip "若只想关闭本脚本的混淆, 请选 [3](只删本脚本那层, 保留其它层)"
+                _press_any_key; return
+            fi
+            otype="salamander"
+            opw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
+            read -rp "  混淆密码 (回车随机): " opw_in
+            opw=${opw_in:-$opw}
+            _validate_json_text "$opw" || { _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; _press_any_key; return; }
+            if [ "$obfs_choice" = "2" ]; then
+                # gecko 需要核心支持 packetSize; 旧核心静默忽略该字段 ⇒ 服务端退化成无分片。
+                # **不支持时直接拒绝, 不自动降级** —— 用户明确选了 gecko, 替他改成另一种混淆
+                # 形态是改变请求(且客户端按 gecko 配、服务端跑 salamander)。版本门控的存在
+                # 本身已表明"旧核心无法安全承载 gecko", 故 fail-closed。
+                if ! _hy2_gecko_supported; then
+                    _error "当前核心不支持 gecko 分片(packetSize 需核心 >= ${_HY2_GECKO_MIN_VER}); 已取消, 未修改任何配置"
+                    _tip "请先升级/切换 Xray 核心, 或改选 [1] 普通 salamander"
+                    _press_any_key; return
+                fi
+                # 空输入必须落成显式尺寸: Xray 侧 packetSize 留空 = **不启用 Gecko**
+                # (退化成普通 salamander)。所填 512-1200 来自 Hysteria 官方
+                # Full-Client-Config 的 gecko 默认值, 不是 Xray 文档里的默认值。
+                read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " osize
+                osize="${osize:-512-1200}"
+                local size_why; size_why=$(_hy2_obfs_size_invalid "$osize")
+                [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; _press_any_key; return; }
+                # 规范化(排序 + 去前导零)后回写, 使元数据/clash 与 Xray 看到同一区间
+                osize=$(_hy2_obfs_size_canon "$osize") || { _error "packetSize 规范化失败"; _press_any_key; return; }
+            fi
+            omask=$(_hy2_obfs_mask_block "$otype" "$opw" "$osize") || { _error "混淆参数构造失败"; _press_any_key; return; }
+            # 只管理**我们自己那一层**(见 XD_UDP_JQ_UPSERT): 用户/其它工具可能在同一
+            # udp 数组里放了别的伪装层(含别人的 salamander 层), 只按 type 匹配会吃掉它们。
+            # 归属由我们写入的 settings.xd_managed 标记判定。
+            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new "$omask" \
+                 "$XD_UDP_JQ_UPSERT"; then
+                _error "混淆启用失败, 已回滚"; _press_any_key; return
+            fi
+            if ! _meta_update "$meta" \
+                 '.obfs_type=$t | .obfs_password=$p | .obfs_packet_size=(if $s == "" then null else $s end)' \
+                 --arg t "$otype" --arg p "$opw" --arg s "$osize"; then
+                # config 已提交而元数据未落地 → 回滚 config(回到**改动前**的形态), 否则链接/clash 与服务器行为不一致
+                _hy2_obfs_rollback "$tag" "$rollback_mask" \
+                    || _error "元数据写入失败, 且配置回滚失败, 请手工检查 ${CONFIG_FILE}"
+                _error "混淆元数据写入失败, 已回滚配置"
+                _press_any_key; return
+            fi
+            _success "混淆已启用 (${otype}${osize:+ · packetSize=${osize}})"
+            ;;
+        3)
+            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new null \
+                 "$XD_UDP_JQ_UPSERT"; then
+                _error "关闭混淆失败, 已回滚"; _press_any_key; return
+            fi
+            if ! _meta_update "$meta" 'del(.obfs_type) | del(.obfs_password) | del(.obfs_packet_size)'; then
+                _hy2_obfs_rollback "$tag" "$rollback_mask" \
+                    || _error "元数据写入失败, 且配置回滚失败, 请手工检查 ${CONFIG_FILE}"
+                _error "混淆元数据写入失败, 已回滚配置"
+                _press_any_key; return
+            fi
+            _success "混淆已关闭"
+            ;;
+        *) _warn "无效选择"; _press_any_key; return ;;
+    esac
+    # 服务器级变更 → 分享链接与 clash 条目必须同步。链接重建有两种失败, **不可混为一谈**:
+    #   (a) 该节点是 gecko(带尺寸) ⇒ 官方 hy2 URI 无法表达, 这是**刻意**不生成链接。
+    #       此时必须清空旧链接(否则它仍写着旧混淆), 并**继续**同步 clash(clash 是尺寸唯一载体)。
+    #   (b) 元数据缺字段 ⇒ 保留旧链接(它可能仍可用), 只如实报告, 不做任何破坏性写入。
+    local link nline nname
+    if link=$(_rebuild_hy2_link "$meta") && [ -n "$link" ]; then
+        _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
+    elif _hy2_link_unexpressible "$meta"; then
+        _meta_update "$meta" '.share_link=""' || { _error "分享链接清空失败"; _press_any_key; return; }
+        _warn "当前混淆(gecko 带自定义分片尺寸)无法用官方 hy2 链接表达, 已清空分享链接"
+        _tip "请用下方 Clash 条目(含 obfs-min/max-packet-size)导入客户端; 菜单 [2] 查看节点 不再显示链接"
+    else
+        _warn "分享链接重建失败(节点元数据缺少必要字段), 已保留原链接"
+    fi
+    nname=$(jq -r '.name // empty' "$meta")
+    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
+        _replace_node_in_yaml "$nline" "$nname" || \
+            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+    else
+        _warn "Clash 条目生成失败(元数据不完整), 可手工编辑 ${CLASH_YAML}"
+    fi
+    _press_any_key
+}
+
+# 把 config 里该节点的**我们那一层** finalmask.udp 回滚为指定形态(见 _hy2_obfs_menu 的回滚路径)。
+# $2 = _hy2_obfs_mask_block 的输出; 空 ⇒ 回滚成"无混淆"(只剔除我们那层, 保留其它层),
+# 为 __INVALID__ ⇒ 改动前的元数据本身无法解析(畸形), 此时**拒绝动 config**:
+# 拿"无混淆"当回滚值会把一个可能在工作的混淆配置静默清掉, 宁可不回滚并如实报告。
+# 用法: _hy2_obfs_rollback <tag> <mask_or_empty_or_INVALID>
+_hy2_obfs_rollback() {
+    local tag="$1" mask="$2"
+    if [ "$mask" = "__INVALID__" ]; then
+        _error "改动前的混淆元数据无法解析, 未回滚配置(请手工核对 ${CONFIG_FILE})"
+        return 1
+    fi
+    if [ -z "$mask" ]; then
+        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new null \
+            "$XD_UDP_JQ_UPSERT"
+    else
+        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new "$mask" \
+            "$XD_UDP_JQ_UPSERT"
+    fi
+}
 _reality_domain_menu() {
     local choice
     _has_reality_nodes || { _warn "暂无 Reality 节点"; _press_any_key; return; }
