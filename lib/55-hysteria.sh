@@ -41,6 +41,12 @@
 # 本模块自 0.16.19 起即为单密码模型, 从未发布过 userpass 多用户版本, 故**不做任何
 # 旧配置迁移** —— 迁移代码属于没有真实受众的死代码(项目惯例: 不留不可达分支,
 # 同 0.16.18 清理 plain 死分支)。检测到非 password 的 auth 一律按"外来配置"拒绝接管。
+# - **[4] 删除节点 = 删除服务器配置并停止服务**(0.16.20, 用户要求, 动机是省内存/省消耗):
+# 官方 Hysteria 里"配置即节点", 旧实现只删 Manager 侧记录(hysteria/node.json)不释放
+# 任何资源 —— 服务照跑、内存照占。现固定顺序: 停服 → 删 hysteria.json → 删 node.json
+# → 清 service 定义/logrotate → 清 clash 派生条目(删配置必须早于清 unit, 否则删配置失败时
+# unit 已消失、原运行状态无法恢复); 核心 binary / server_meta / 自签证书保留(重新初始化
+# 可复用), 彻底移除仍走 [14] 卸载。
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -2817,7 +2823,7 @@ _hysteria_add_node() {
         _press_any_key
         return 1
     fi
-    _tip "服务器已有认证凭据(手工部署或此前清除了节点记录), 将按现有密码重建节点"
+    _tip "服务器已有认证凭据(手工部署或此前删除过节点记录), 将按现有密码重建节点"
     _tip "认证密码保持不变(不会使已分发的链接失效)"
     local def_name
     def_name=$(_hysteria_default_name)
@@ -2915,9 +2921,9 @@ _hysteria_view_nodes() {
     fi
     if ! _hysteria_node_exists; then
         # 区分两种"没有节点": 服务器根本没配 vs 配了但 Manager 侧无记录
-        # (后者是"清除了节点记录"的中间态, 必须明确指路 [2] 重建, 否则用户会以为要卸载重装)
+        # (后者是"只清除了节点记录"的中间态, 必须明确指路 [2] 重建, 否则用户会以为要卸载重装)
         if _hysteria_server_initialized; then
-            _warn "Manager 侧暂无节点记录, 但服务器已有认证凭据(手工部署或此前清除了记录)"
+            _warn "Manager 侧暂无节点记录, 但服务器已有认证凭据(手工部署或此前只清除了记录)"
             _tip "用 [2] 添加节点 可按现有密码重建记录(认证密码不变)"
         else
             _warn "暂无节点(请用 [2] 添加节点 初始化)"
@@ -2945,43 +2951,97 @@ _hysteria_view_nodes() {
     return 0
 }
 
+# [4] 删除节点 —— 0.16.20 语义变更: 删除**服务器配置**并停止服务(用户要求, 2026-09-15)
+#
+# 旧实现只删 Manager 侧的节点记录(hysteria/node.json), 配置与服务原样保留 —— 但官方 Hysteria
+# 里"配置即节点", 服务在跑就一直占用内存/端口。改为: 停止服务 + 删除服务器配置(hysteria.json)
+# + 删除节点记录 + 清理派生缓存, 以真正释放资源(低配 NAT VPS 的主要动机: 省内存/省消耗)。
+#
+# **保留**: 核心 binary(下载耗时, 与"删配置"无关)、server_meta.json(link_addr/TLS 选择是
+# Manager 侧缓存, 重新初始化时可复用)、自签证书(下次初始化可继续用同一证书路径)。
+# **一并清理**: service 定义(systemd unit / openrc init)与 logrotate 片段。
+# **顺序不可交换**: 停服 → 删配置(用户目的) → 删记录 → 清 unit → 清 clash。
+#   - 删配置必须早于清 unit: 否则一旦删配置失败, unit 已消失 → 原运行状态再也无法恢复
+#     (没有 unit 可重启, [2] 又因"配置可运行"只提示改密码 ⇒ 用户被卡住)。反过来 unit 清理
+#     失败时配置已删、服务已停(用户目的已达成), 残留 unit 只影响下次开机且会被下次 [2]
+#     重新写入覆盖(自愈), 故只告警不中止 —— 与 [14] 卸载的"清理失败保留现场"口径一致。
+#   - 任何"配置删除之前"的中止(停服失败)都不改变运行状态; 删配置失败则恢复原运行状态。
 _hysteria_delete_node() {
-    local name auth ans
+    local name="" ans was_running
     _hysteria_gate || { _press_any_key; return; }
     clear
-    echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 节点】${NC}"
-    if ! _hysteria_node_file_present; then
-        _warn "暂无节点"
+    echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 服务器配置】${NC}"
+    if ! _hysteria_config_exists; then
+        _warn "暂无服务器配置(未初始化)"
         _press_any_key
         return
     fi
-    if _hysteria_node_broken; then
-        _error "节点元数据已损坏(无法解析或缺少必要字段), 无法安全清除"
-        _tip "请用 [2] 添加节点 删除损坏记录并重建(认证密码不变)"
-        _press_any_key
-        return
+    # 节点名(clash 条目按 name 删除): 记录缺失/损坏时如实说明, 但不影响删除动作本身 ——
+    # 本操作删的是服务器配置, 记录只是顺带清掉的 Manager 侧缓存。
+    # **读不到名字时不得静默跳过 clash 清理**(外部复审): clash.yaml 是按 name 删除的,
+    # 没有名字就删不掉, 而用户会以为"删除节点"已把订阅条目一并清掉 —— 留下幽灵条目。
+    # 故显式告警 + 指路手工清理, 而不是无声略过。
+    if _hysteria_node_file_present; then
+        if _hysteria_node_exists; then
+            name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+        else
+            _warn "节点元数据已损坏(无法解析或缺少必要字段), 读不到节点名"
+        fi
     fi
-    name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
-    # 官方 binary 对空密码 FATAL(实测): 删掉唯一凭据 = 服务起不来。
-    # 故本菜单**不**删除认证段, 只清除 Manager 侧的节点元数据(分享链接/clash 条目)。
-    echo -e "  当前节点: ${GREEN}${name}${NC}"
-    echo -e "  ${YELLOW}官方 password 模式只有一个认证密码: 删除后服务将无凭据可用(会启动失败)${NC}"
-    echo -e "  ${YELLOW}本操作只清除 Manager 侧节点记录(分享链接/clash 条目), 不改动 hysteria.json 的认证段${NC}"
-    echo -e "  ${CYAN}清除后可随时用 [2] 添加节点 按现有密码重建记录(认证密码不变)${NC}"
-    echo -e "  ${YELLOW}如需彻底移除请用 [14] 卸载 Hysteria; 如需换密码请用 [5] 修改节点密码${NC}"
-    read -rp "  确认清除节点记录 [${name}]? [y/N]: " ans
+    [ -n "$name" ] || _warn "无法确定原节点名称, 未能自动清理 clash 派生条目(如需清理请手工编辑 ${CLASH_YAML})"
+    echo -e "  服务器: $(_hysteria_listen_display)  TLS: $(_hysteria_tls_desc)  状态: $(_manage_hysteria status 2>/dev/null)"
+    if [ -n "$name" ]; then
+        echo -e "  节点: ${GREEN}${name}${NC}"
+    else
+        echo -e "  节点: ${YELLOW}(Manager 侧无节点记录, 仅删除服务器配置)${NC}"
+    fi
+    echo -e "  ${YELLOW}将停止 Hysteria 服务并删除服务器配置(${HYSTERIA_CONFIG})${NC}"
+    echo -e "  ${YELLOW}所有已分发的分享链接/客户端配置会立即失效${NC}"
+    echo -e "  ${CYAN}核心 binary 与 server_meta/证书保留; 之后可用 [2] 添加节点 重新初始化${NC}"
+    echo -e "  ${YELLOW}如需连核心一并移除请用 [14] 卸载 Hysteria${NC}"
+    read -rp "  确认删除服务器配置并停止服务? [y/N]: " ans
     case "$ans" in
         y|Y) ;;
         *) _info "已取消"; _press_any_key; return ;;
     esac
-    # 只删元数据 + clash 条目(clash 为可再生派生缓存, 失败不回滚元数据)
-    if ! rm -f "$HYSTERIA_NODE_META"; then
-        _error "节点元数据删除失败(权限/只读?), 未改动"
+    # 保留(本函数刻意不删): $HYSTERIA_SERVER_META(Manager 侧缓存: link_addr/TLS 选择) /
+    # 核心 binary / 自签证书 —— 重新初始化可复用, 无需重新下载或重签; 彻底移除走 [14] 卸载。
+    was_running=$(_manage_hysteria status 2>/dev/null)
+    # 1) 先停服: 内存立即释放; 且保证没有进程继续持有即将删除的配置。
+    #    失败说明进程仍在(运行状态未变), 故无需"恢复"—— 直接中止。
+    if ! _hysteria_stop_and_verify; then
+        _error "服务未能停止(进程未退出), 已中止(配置未删除)"
+        _tip "请先停止服务(菜单 [6] 服务管理)后重试"
         _press_any_key
-        return
+        return 1
     fi
-    _hysteria_remove_clash_by_name "$name" || true
-    _success "节点记录已清除"
+    # 2) 删服务器配置(用户目的)。**必须先于 service 定义清理**(见上方顺序契约):
+    #    失败 ⇒ 中止并恢复原运行状态(此时 unit 仍在, 重启有效)。
+    if ! rm -f "$HYSTERIA_CONFIG"; then
+        _error "服务器配置删除失败(权限/只读?), 已中止"
+        _tip "请人工核对: $HYSTERIA_CONFIG"
+        _hysteria_recover_to_state "$was_running" || _warn "原运行状态恢复失败, 请人工检查服务状态"
+        _press_any_key
+        return 1
+    fi
+    # 3) 节点记录(Manager 侧缓存): 失败仅告警。**文案必须与真实控制流一致**(外部复审):
+    #    配置已删 ⇒ _hysteria_server_initialized 为假 ⇒ 下次 [2] 走的是 **bootstrap
+    #    重新初始化**(而 bootstrap 会整份重写 node.json), 不是"接管时覆盖"。故如实说明
+    #    "重新初始化并重新生成记录", 并补一条手工删除路径。
+    if ! rm -f "$HYSTERIA_NODE_META"; then
+        _warn "节点记录删除失败(权限/只读?): $HYSTERIA_NODE_META"
+        _tip "服务器配置已删除; 下次用 [2] 添加节点 会重新初始化服务器并重新生成节点记录"
+        _tip "如需立即清除该残留记录, 可手工删除: $HYSTERIA_NODE_META"
+    fi
+    # 4) 清 service 定义 + logrotate 片段: 配置已删、服务已停(用户目的已达成), 失败只告警 ——
+    #    残留 unit 仅影响下次开机(缺配置启动失败, 且被 systemd 启动限流自行停下), 且下次
+    #    [2] 重新初始化时会重写该 unit(自愈)。这里**不**回滚配置删除(回滚等于丢掉用户要的结果)。
+    _hysteria_cleanup_service_units \
+        || _warn "service 定义清理失败(配置已删除, 服务已停止): 残留 unit 可能在下次开机尝试启动并失败, 请按上方提示人工清理"
+    # 5) 派生缓存(clash 条目): 可再生, 失败仅告警(helper 内部已给出人工修法)
+    [ -n "$name" ] && { _hysteria_remove_clash_by_name "$name" || true; }
+    _success "服务器配置已删除, 服务已停止(核心 binary 保留)"
+    _tip "如需重新启用: [2] 添加节点 会重新初始化配置(可复用现有 TLS 证书与连接地址)"
     _press_any_key
     return 0
 }
@@ -3081,18 +3141,63 @@ _hysteria_view_log() {
     return 0
 }
 
-# 卸载/清理前的停止确认(): stop 后轮询确认业务进程真正退出;
+# ---------------------------------------------------------------------------
+# 停止状态判定(0.16.20 外部复审 P1; 与 _hysteria_is_running 是两个不同的问题)
+# ---------------------------------------------------------------------------
+# **为什么不能拿 !_hysteria_is_running 当"已停止"**: _hysteria_is_running 的契约是
+# "service 此刻真正在跑(ActiveState=active 且 SubState=running 且 MainPID≠0)"。
+# 于是 activating / auto-restart / deactivating / failed **全都返回 1** —— 它们既不是
+# "在跑", 也**不是"已停止"**, 而是"过渡态"。单元是 Restart=on-failure/RestartSec=3,
+# 崩溃重启循环里 systemd 把 SERVICE_AUTO_RESTART 映射为 UNIT_ACTIVATING, 因此
+# `_hysteria_is_running || return 0` 会在 auto-restart 等待期**立即**判"已停止" ——
+# 调用方随即删掉配置, 而 systemd 3 秒后照样拉起 → "配置已删 / unit 仍在"(实测竞态)。
+#
+# 本判据要求**终态**: systemd 必须明确停在 inactive/failed, 且 MainPID=0, 且全机扫描
+# 确认没有本项目的 hysteria 进程(exe 归属)。读不到 unit 信息时**绝不判"已停止"**
+# (fail-closed) —— 交给 _hysteria_stop_and_verify 的 exe 强杀 + 复验兜底, 而不是靠
+# "读不到 ⇒ 大概停了"赌一把。
+#   rc 0 = 确认处于停止终态; rc 1 = 仍在运行/过渡态/读不到(调用方必须继续收敛)
+_hysteria_stopped_state() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            local active mainpid
+            active=$(systemctl show -p ActiveState --value "$HYSTERIA_SVC" 2>/dev/null)
+            case "$active" in
+                # 只有明确终态算"已停止"; active/activating/deactivating/reloading/空串都不算
+                inactive|failed) ;;
+                *) return 1 ;;
+            esac
+            mainpid=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null)
+            [ "$mainpid" = "0" ] || return 1
+            _proc_any_named hysteria "$HYSTERIA_BIN" && return 1
+            return 0
+            ;;
+        *)
+            # openrc/direct: pidfile 已由 _manage_hysteria stop 清理; 用 exe 归属确认无进程
+            _proc_any_named hysteria "$HYSTERIA_BIN" && return 1
+            return 0
+            ;;
+    esac
+}
+
+# 卸载/删除/升级前的停止确认(): stop 后轮询确认业务进程真正退出;
 # 仍存活时按 exe 归属(readlink /proc/*/exe == $HYSTERIA_BIN, 含 "(deleted)" 就地替换
 # 形态)强制终止 —— exe 校验保证绝不误杀同名的他方进程; 再不退则返回 1 交人工处理,
 # 调用方必须拒绝继续删除文件, 避免"文件已删/进程仍在"的孤儿进程。
+#
+# **契约 = "到达停止终态", 不是"某一刻没有进程"(0.16.20 外部复审 P1)。**
+# 判定必须走 _hysteria_stopped_state(要求 systemd 明确 inactive/failed), **不得**用
+# `!_hysteria_is_running` —— 后者把 activating/auto-restart 也当"已停止", 会在崩溃重启
+# 循环里提前放行(见该函数注释)。强杀绕过 init 系统后必须**再 stop 一次**(Restart=
+# on-failure 的单元可能因退出码重新拉起), 然后才复验; 全程不成功返回 1。
 _hysteria_stop_and_verify() {
     _manage_hysteria stop 2>/dev/null
     local i p exe
     for i in 1 2 3 4 5 6 7 8; do
-        _hysteria_is_running || return 0
+        _hysteria_stopped_state && return 0
         sleep 1
     done
-    _warn "服务停止后仍有 hysteria 进程存活, 按 exe 归属强制终止..."
+    _warn "服务停止后仍处于运行/过渡态, 按 exe 归属强制终止..."
     for p in /proc/[0-9]*; do
         exe=$(readlink "${p}/exe" 2>/dev/null) || continue
         case "$exe" in
@@ -3102,7 +3207,13 @@ _hysteria_stop_and_verify() {
         esac
     done
     sleep 1
-    _hysteria_is_running || return 0
+    # 强杀是绕过 init 系统的动作: Restart=on-failure 的单元可能因该进程的退出码而重新拉起,
+    # 故必须**再 stop 一次**, 然后才复验终态(顺序不可交换)。
+    _manage_hysteria stop 2>/dev/null
+    for i in 1 2 3 4 5; do
+        _hysteria_stopped_state && return 0
+        sleep 1
+    done
     return 1
 }
 
@@ -3110,6 +3221,12 @@ _hysteria_stop_and_verify() {
 # 全是 best-effort, 失败会让"unit 残留 + config 已删"的半残状态静默通过。这里逐步执行并
 # 复核 unit 确实消失(systemd 用 LoadState=not-found, openrc 用文件不存在), 残留时大声告警
 # 并给出人工命令 —— 属"明确降级"而非静默成功。返回 0=已清理干净; 1=仍有残留(已告警)。
+#
+# **"unit 文件不存在" ≠ "注册关系已解除"(0.16.20 外部复审 P2)。** systemd 的 enable 本质是
+# 在 `<target>.wants/` 下建符号链接, disable 才是删链接 —— 若 disable 失败而 rm unit 成功,
+# LoadState 照样是 not-found, 却留下 dangling 的 wants 链接(systemd 自己用 is-enabled 才能
+# 回答"是否仍被启用")。故 systemd 侧补验 is-enabled 不得为 enabled, 并扫掉指向本 unit 的
+# 残留符号链接; openrc 侧同理补验 runlevel 注册已解除(rc-update show), 不能只看 init 脚本文件。
 _hysteria_cleanup_service_units() {
     local ok=1
     case "$INIT_SYSTEM" in
@@ -3118,20 +3235,50 @@ _hysteria_cleanup_service_units() {
             rm -f "/etc/systemd/system/${HYSTERIA_SVC}.service"
             systemctl daemon-reload 2>/dev/null
             systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
+            # 1) unit 本身必须已不可被 systemd 识别
             [ "$(systemctl show -p LoadState --value "$HYSTERIA_SVC" 2>/dev/null)" = "not-found" ] && ok=0
-            [ "$ok" -eq 0 ] || {
-                _error "systemd unit ${HYSTERIA_SVC} 清理后仍可被 systemd 识别(残留)"
-                _tip "请人工核对: systemctl status ${HYSTERIA_SVC}; ls -l /etc/systemd/system/${HYSTERIA_SVC}.service"
-            }
+            # 2) 不得仍处于任何"被启用"形态(disable 失败的典型残局)。
+            #    is-enabled 不止输出 enabled —— 还有 enabled-runtime / alias / linked /
+            #    indirect 等; 只比 `= "enabled"` 会漏掉 enabled-runtime/alias 这类仍会被拉起的
+            #    形态。本项目 unit 带 [Install] WantedBy=multi-user.target, 正常只有 enabled,
+            #    但把"非 enabled 就安全"写死是错的 —— 改为**否定白名单**: 只有明确表示
+            #    "未启用"的取值才算安全, 其余(含未来新增状态)一律按"仍被启用"处理(fail-closed)。
+            local en
+            en=$(systemctl is-enabled "$HYSTERIA_SVC" 2>/dev/null)
+            case "$en" in
+                ""|disabled|masked|masked-runtime|static|not-found) ;;
+                *)
+                    ok=1
+                    _error "systemd unit ${HYSTERIA_SVC} 仍处于启用形态(is-enabled=${en})"
+                    _tip "请人工执行: systemctl disable ${HYSTERIA_SVC}"
+                    ;;
+            esac
+            # 3) 不得残留指向本 unit 的符号链接(enable 的 .wants/.requires 链接)。
+            #    搜索路径覆盖 systemd 的 unit 搜索位置 —— /etc/systemd/system 是 enable 的落点,
+            #    /run/systemd/system 与 /usr/lib/systemd/system 亦可能被植入链接(项目 unit 只写
+            #    /etc, 但残留可能出现在任一搜索路径上)。
+            local lnk
+            lnk=$(find /etc/systemd/system /run/systemd/system /usr/lib/systemd/system \
+                       -type l -name "${HYSTERIA_SVC}.service" 2>/dev/null)
+            if [ -n "$lnk" ]; then
+                ok=1
+                _error "systemd unit ${HYSTERIA_SVC} 仍有残留符号链接(enable 关系未解除)"
+                _tip "请人工清理: ${lnk}"
+            fi
+            [ "$ok" -eq 0 ] || _tip "请人工核对: systemctl status ${HYSTERIA_SVC}; systemctl is-enabled ${HYSTERIA_SVC}"
             ;;
         openrc)
             rc-update del "$HYSTERIA_SVC" default 2>/dev/null
             rm -f "/etc/init.d/${HYSTERIA_SVC}"
+            # 1) init 脚本必须已删除
             [ ! -e "/etc/init.d/${HYSTERIA_SVC}" ] && ok=0
-            [ "$ok" -eq 0 ] || {
-                _error "openrc init 脚本 ${HYSTERIA_SVC} 未能删除(残留)"
-                _tip "请人工核对: ls -l /etc/init.d/${HYSTERIA_SVC}"
-            }
+            # 2) runlevel 注册必须已解除(rc-update del 失败的残局: 文件没了但注册还在)
+            if rc-update show default 2>/dev/null | grep -qE "(^|[[:space:]])${HYSTERIA_SVC}([[:space:]]|$)"; then
+                ok=1
+                _error "openrc 服务 ${HYSTERIA_SVC} 仍在 default runlevel 注册中(rc-update del 未生效)"
+                _tip "请人工执行: rc-update del ${HYSTERIA_SVC} default"
+            fi
+            [ "$ok" -eq 0 ] || _tip "请人工核对: ls -l /etc/init.d/${HYSTERIA_SVC}; rc-update show"
             ;;
         *)
             ok=0 ;;
@@ -3240,7 +3387,9 @@ _hysteria_menu() {
         echo -e "  ${GREEN}[1]${NC} 安装/更新官方核心"
         echo -e "  ${GREEN}[2]${NC} 添加节点"
         echo -e "  ${GREEN}[3]${NC} 查看节点"
-        echo -e "  ${GREEN}[4]${NC} 删除节点"
+        # 标签必须与实际语义一致(外部复审): 该项已不只是"删 Manager 记录", 而是
+        # 停服 + 删服务器配置 + 清 unit/记录/派生条目, 故补上"停止服务"以免误导。
+        echo -e "  ${GREEN}[4]${NC} 删除节点/停止服务器"
         echo -e "  ${GREEN}[5]${NC} 修改节点密码"
         echo -e "  ${GREEN}[6]${NC} 服务管理"
         echo -e "  ${GREEN}[7]${NC} 端口 / 端口跳跃"
@@ -3256,7 +3405,10 @@ _hysteria_menu() {
         read -rp "  请选择: " choice || return 0
         case "$choice" in
             1) _hysteria_core_menu ;;
-            2) _hysteria_add_node; _press_any_key ;;
+            # [2] 不得再追加 _press_any_key: _hysteria_add_node 的每条返回路径都已自带一次
+            # (含 bootstrap/接管/取消), 再追加会让用户连按两次回车(实机发现)。与 [3]/[4]/[5]
+            # 同口径 —— 菜单只负责调用, 暂停由被调函数自己收尾。
+            2) _hysteria_add_node ;;
             3) _hysteria_view_nodes ;;
             4) _hysteria_delete_node ;;
             5) _hysteria_change_password ;;
