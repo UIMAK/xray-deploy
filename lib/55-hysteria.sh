@@ -2978,13 +2978,17 @@ _hysteria_delete_node() {
     fi
     # 节点名(clash 条目按 name 删除): 记录缺失/损坏时如实说明, 但不影响删除动作本身 ——
     # 本操作删的是服务器配置, 记录只是顺带清掉的 Manager 侧缓存。
+    # **读不到名字时不得静默跳过 clash 清理**(外部复审): clash.yaml 是按 name 删除的,
+    # 没有名字就删不掉, 而用户会以为"删除节点"已把订阅条目一并清掉 —— 留下幽灵条目。
+    # 故显式告警 + 指路手工清理, 而不是无声略过。
     if _hysteria_node_file_present; then
         if _hysteria_node_exists; then
             name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
         else
-            _warn "节点元数据已损坏(无法解析或缺少必要字段), 读不到节点名(clash 条目可能需手工清理)"
+            _warn "节点元数据已损坏(无法解析或缺少必要字段), 读不到节点名"
         fi
     fi
+    [ -n "$name" ] || _warn "无法确定原节点名称, 未能自动清理 clash 派生条目(如需清理请手工编辑 ${CLASH_YAML})"
     echo -e "  服务器: $(_hysteria_listen_display)  TLS: $(_hysteria_tls_desc)  状态: $(_manage_hysteria status 2>/dev/null)"
     if [ -n "$name" ]; then
         echo -e "  节点: ${GREEN}${name}${NC}"
@@ -3020,10 +3024,14 @@ _hysteria_delete_node() {
         _press_any_key
         return 1
     fi
-    # 3) 节点记录(Manager 侧缓存): 失败仅告警 —— 配置已删, 残留会被下次 [2] 整份覆盖
+    # 3) 节点记录(Manager 侧缓存): 失败仅告警。**文案必须与真实控制流一致**(外部复审):
+    #    配置已删 ⇒ _hysteria_server_initialized 为假 ⇒ 下次 [2] 走的是 **bootstrap
+    #    重新初始化**(而 bootstrap 会整份重写 node.json), 不是"接管时覆盖"。故如实说明
+    #    "重新初始化并重新生成记录", 并补一条手工删除路径。
     if ! rm -f "$HYSTERIA_NODE_META"; then
         _warn "节点记录删除失败(权限/只读?): $HYSTERIA_NODE_META"
-        _tip "服务器配置已删除; 该残留记录会在下次 [2] 添加节点 时被整份覆盖, 也可手工删除"
+        _tip "服务器配置已删除; 下次用 [2] 添加节点 会重新初始化服务器并重新生成节点记录"
+        _tip "如需立即清除该残留记录, 可手工删除: $HYSTERIA_NODE_META"
     fi
     # 4) 清 service 定义 + logrotate 片段: 配置已删、服务已停(用户目的已达成), 失败只告警 ——
     #    残留 unit 仅影响下次开机(缺配置启动失败, 且被 systemd 启动限流自行停下), 且下次
@@ -3133,10 +3141,18 @@ _hysteria_view_log() {
     return 0
 }
 
-# 卸载/清理前的停止确认(): stop 后轮询确认业务进程真正退出;
+# 卸载/删除/升级前的停止确认(): stop 后轮询确认业务进程真正退出;
 # 仍存活时按 exe 归属(readlink /proc/*/exe == $HYSTERIA_BIN, 含 "(deleted)" 就地替换
 # 形态)强制终止 —— exe 校验保证绝不误杀同名的他方进程; 再不退则返回 1 交人工处理,
 # 调用方必须拒绝继续删除文件, 避免"文件已删/进程仍在"的孤儿进程。
+#
+# **契约 = "持续停止", 不是"某一刻没有进程"(0.16.20 外部复审)。** 单元是
+# Restart=on-failure/RestartSec=3: 若某进程在"退出"之后才失败退出, systemd 会再拉起一个;
+# 而 _hysteria_is_running 的 systemd 分支在 SubState=auto-restart 时**恰好看不到它**
+# (ActiveState=activating ⇒ 返回 stopped)。于是"轮询到一次 stopped"可能是崩溃重启循环里的
+# 一个窗口 —— 调用方据此删掉配置, 下一个拉起就会失败, 留下"配置已删/unit 仍在"。
+# 故本函数必须保证: 最后一次 stop **之后**再确认进程消失, 否则继续收敛(再 stop / 再杀),
+# 全程不成功则返回 1。与 _hysteria_restart_verified 的连续采样同因(同一类崩溃重启窗口)。
 _hysteria_stop_and_verify() {
     _manage_hysteria stop 2>/dev/null
     local i p exe
@@ -3154,7 +3170,13 @@ _hysteria_stop_and_verify() {
         esac
     done
     sleep 1
-    _hysteria_is_running || return 0
+    # 强杀是绕过 init 系统的动作: Restart=on-failure 的单元可能因该进程的退出码而重新拉起,
+    # 故必须**再 stop 一次**, 然后才确认最终状态(顺序不可交换)。
+    _manage_hysteria stop 2>/dev/null
+    for i in 1 2 3 4 5; do
+        _hysteria_is_running || return 0
+        sleep 1
+    done
     return 1
 }
 
@@ -3292,7 +3314,9 @@ _hysteria_menu() {
         echo -e "  ${GREEN}[1]${NC} 安装/更新官方核心"
         echo -e "  ${GREEN}[2]${NC} 添加节点"
         echo -e "  ${GREEN}[3]${NC} 查看节点"
-        echo -e "  ${GREEN}[4]${NC} 删除节点"
+        # 标签必须与实际语义一致(外部复审): 该项已不只是"删 Manager 记录", 而是
+        # 停服 + 删服务器配置 + 清 unit/记录/派生条目, 故补上"停止服务"以免误导。
+        echo -e "  ${GREEN}[4]${NC} 删除节点/停止服务器"
         echo -e "  ${GREEN}[5]${NC} 修改节点密码"
         echo -e "  ${GREEN}[6]${NC} 服务管理"
         echo -e "  ${GREEN}[7]${NC} 端口 / 端口跳跃"
