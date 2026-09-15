@@ -2048,7 +2048,7 @@ _hysteria_masquerade_menu() {
             fi
             ;;
         2)
-            read -rp "  目标网站 URL (如 https://news.ycombinator.com/): " url
+            read -rp "  目标网站 URL (如 https://news.ycombinator.com): " url
             [ -z "$url" ] && { _info "已取消"; _press_any_key; return 0; }
             _validate_json_text "$url" || { _error "URL 含非法字符"; _press_any_key; return 0; }
             [[ "$url" == https://* || "$url" == http://* ]] || { _error "URL 须以 http(s):// 开头"; _press_any_key; return 0; }
