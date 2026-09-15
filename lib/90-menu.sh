@@ -833,6 +833,15 @@ _hy2_obfs_menu() {
         || { _error "config.json 中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
+    # 启用前 fail-closed: 若该入站已有一层**不是我们写的** type=salamander, 追加我们那层
+    # 会让 Xray 依次套两层 salamander(双重混淆, 客户端只做一层 ⇒ 必然连不上)。
+    # 不替用户猜(既不吃掉别人的层, 也不硬套), 交人工处理。
+    if _hy2_udp_has_foreign_salamander "$tag"; then
+        _error "该入站的 finalmask.udp 已存在**非本脚本写入**的 salamander 层;"
+        _error "继续启用会叠加成双重混淆(客户端只做一层, 必然连不上)。"
+        _tip "请先手工编辑 ${CONFIG_FILE} 移除或改名该层(本脚本写入的层带 settings.xd_managed=true)"
+        _press_any_key; return
+    fi
     local cur_type cur_pw cur_size
     cur_type=$(jq -r '.obfs_type // empty' "$meta")
     cur_pw=$(jq -r '.obfs_password // empty' "$meta")
@@ -883,8 +892,9 @@ _hy2_obfs_menu() {
             fi
             omask=$(_hy2_obfs_mask_block "$otype" "$opw" "$osize") || { _error "混淆参数构造失败"; _press_any_key; return; }
             # 只管理**我们自己那一层**(见 XD_UDP_JQ_UPSERT): 用户/其它工具可能在同一
-            # udp 数组里放了别的伪装层, 整体替换会静默清掉它们。
-            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --argjson new "$omask" \
+            # udp 数组里放了别的伪装层(含别人的 salamander 层), 只按 type 匹配会吃掉它们。
+            # 归属由我们写入的 settings.xd_managed 标记判定。
+            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new "$omask" \
                  "$XD_UDP_JQ_UPSERT"; then
                 _error "混淆启用失败, 已回滚"; _press_any_key; return
             fi
@@ -900,8 +910,8 @@ _hy2_obfs_menu() {
             _success "混淆已启用 (${otype}${osize:+ · packetSize=${osize}})"
             ;;
         3)
-            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" \
-                 "$XD_UDP_JQ_DROP"; then
+            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new null \
+                 "$XD_UDP_JQ_UPSERT"; then
                 _error "关闭混淆失败, 已回滚"; _press_any_key; return
             fi
             if ! _meta_update "$meta" 'del(.obfs_type) | del(.obfs_password) | del(.obfs_packet_size)'; then
@@ -950,9 +960,10 @@ _hy2_obfs_rollback() {
         return 1
     fi
     if [ -z "$mask" ]; then
-        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" "$XD_UDP_JQ_DROP"
+        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new null \
+            "$XD_UDP_JQ_UPSERT"
     else
-        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --argjson new "$mask" \
+        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new "$mask" \
             "$XD_UDP_JQ_UPSERT"
     fi
 }
