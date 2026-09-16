@@ -2981,28 +2981,87 @@ _add_shadowsocks() {
 # 模板: templates/hysteria2.server.jsonc
 # 来源: Xray-examples/Hysteria2/server.jsonc + Xray-docs-next hysteria.md / finalmask.md
 # ---------------------------------------------------------------------------
+# 自签证书 SAN 读取(现代 TLS 只认 SAN, 见 _gen_hy2_cert 注释)
+# ---------------------------------------------------------------------------
+# 列出证书 SAN 中的 DNS 名(每行一个, 去重); 无 SAN / 无 openssl / 读不到 ⇒ 输出为空
+_hy2_cert_san_names() {
+    local cert="$1" text=""
+    command -v openssl >/dev/null 2>&1 || return 0
+    [ -f "$cert" ] || return 0
+    # 优先 -ext subjectAltName(OpenSSL 1.1.1+/LibreSSL 3.1+), 不支持时回退整份 -text
+    text=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null)
+    [ -n "$text" ] || text=$(openssl x509 -in "$cert" -noout -text 2>/dev/null)
+    printf '%s\n' "$text" | grep -oE 'DNS:[^,[:space:]]+' | sed 's/^DNS://' | sort -u
+}
+
+# 证书 SAN 是否精确覆盖给定域名(含则返回 0)
+_hy2_cert_san_has() {
+    local cert="$1" domain="$2"
+    [ -n "$domain" ] || return 1
+    _hy2_cert_san_names "$cert" | grep -qxF "$domain"
+}
+
+# 证书可用于客户端 SNI 的域名: 优先第一个 SAN DNS 名, 缺失才回退 CN(兼容手工签发的 CN-only 证书)
+_hy2_cert_domain() {
+    local cert="$1" d=""
+    d=$(_hy2_cert_san_names "$cert" | head -1)
+    if [ -z "$d" ] && command -v openssl >/dev/null 2>&1; then
+        d=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's|/.*||')
+    fi
+    printf '%s' "$d"
+}
+
+# ---------------------------------------------------------------------------
 # 生成 Hysteria2 自签 TLS 证书(EC-256, 10 年)
-# 用法:_gen_hy2_cert <tag> [domain]
-#   domain 缺省 build.nvidia.com(向后兼容旧调用)。证书 CN 取该值 —— 它是客户端 SNI,
-#   与分享链接/clash 的 sni 必须一致, 故由调用方传入而非写死。
-# 输出:CERT_FILE_PATH / KEY_FILE_PATH 全局变量
+# 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
+#
+# **证书必须带 SAN**: Xray 官方 tls.md 明言「serverName 对应的值必须存在于服务器证书的
+# SAN 中」; 只写 CN 的证书在现代 TLS 校验下会被拒(Go crypto/x509 报 "relies on legacy
+# Common Name field, use SANs instead"), 使"输入域名"形同虚设。故 openssl 分支显式写入
+# subjectAltName + serverAuth EKU —— 与官方 `hysteria cert` 产出的证书同构(实测其带
+# DNS SAN + Extended Key Usage: TLS Web Server Authentication + BasicConstraints CA:FALSE)。
+#
+# 复用语义: 已存在证书时**校验其 SAN 是否覆盖本次域名** —— 覆盖才复用; 不覆盖则重新生成。
+# 否则用户输入新域名却静默沿用旧证书, 是"输入了但没生效"的假成功。
 _gen_hy2_cert() {
     local tag="$1" domain="${2:-build.nvidia.com}"
-    # 证书域名会写进 X.509 CN, 从输入侧拒绝非法值(仅 LDH 域名, 与 _validate_domain 同口径)
+    # 证书域名会写进 X.509 CN/SAN, 从输入侧拒绝非法值(仅 LDH 域名, 与 _validate_domain 同口径)
     _validate_domain "$domain" || { _error "证书域名格式非法(仅字母/数字/连字符, 点分段): $domain"; return 1; }
     local cert_dir="$CERT_DIR/$tag"
     mkdir -p "$cert_dir"
     CERT_FILE_PATH="${cert_dir}/cert.pem"
     KEY_FILE_PATH="${cert_dir}/key.pem"
     if [ -f "$CERT_FILE_PATH" ] && [ -f "$KEY_FILE_PATH" ]; then
-        _info "已有证书, 复用: $cert_dir"
-        return 0
+        # 无 openssl 时无法读 SAN(只能信任既有证书), 有则必须 SAN 覆盖本次域名
+        if ! command -v openssl >/dev/null 2>&1 || _hy2_cert_san_has "$CERT_FILE_PATH" "$domain"; then
+            _info "已有证书, 复用: $cert_dir"
+            return 0
+        fi
+        _warn "已有证书的 SAN 不含本次域名 ${domain}, 重新生成: $cert_dir"
     fi
-    _info "生成 TLS 自签证书 (CN=${domain})..."
+    _info "生成 TLS 自签证书 (CN=${domain}, SAN=DNS:${domain})..."
     if command -v openssl >/dev/null 2>&1; then
+        # SAN 走 openssl.cnf(不用 OpenSSL 专有的命令行扩展参数): Alpine 的 LibreSSL 不认
+        # 后者, cnf 方式在 OpenSSL/LibreSSL 两边都可用。
+        local cnf
+        cnf=$(mktemp "${cert_dir}/openssl.XXXXXX") || return 1
+        cat > "$cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+[dn]
+CN = ${domain}
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:${domain}
+EOF
         openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE_PATH" 2>/dev/null \
             && openssl req -new -x509 -days 3650 -key "$KEY_FILE_PATH" \
-                -out "$CERT_FILE_PATH" -subj "/CN=${domain}" 2>/dev/null
+                -out "$CERT_FILE_PATH" -config "$cnf" 2>/dev/null
+        rm -f "$cnf"
     fi
     # 2026-09-12 三审(L8): openssl 缺失或执行失败(旧版/被裁剪)时回退 xray tls cert,
     # 而不是"openssl 存在但失败就直接报错"—— 报错文案明明写着"需安装 openssl 或使用 xray tls cert"。
@@ -3018,6 +3077,13 @@ _gen_hy2_cert() {
     fi
     if [ ! -f "$CERT_FILE_PATH" ] || [ ! -f "$KEY_FILE_PATH" ]; then
         _error "证书生成失败, 需安装 openssl 或使用 xray tls cert"
+        return 1
+    fi
+    # 生成后必须真的带 SAN: 否则静默退回 CN-only(Xray 的 serverName 校验必失败)。
+    # 仅在有 openssl 时校验(无 openssl 走的是 xray 分支, 其证书自带 SAN, 无从也无需读)。
+    if command -v openssl >/dev/null 2>&1 && ! _hy2_cert_san_has "$CERT_FILE_PATH" "$domain"; then
+        _error "证书生成后 SAN 仍不含 ${domain}(openssl 版本过旧?); 已删除不完整证书"
+        rm -f "$CERT_FILE_PATH" "$KEY_FILE_PATH"
         return 1
     fi
     _success "TLS 证书已生成: $cert_dir"
@@ -3063,14 +3129,12 @@ _add_hysteria2() {
         _gen_hy2_cert "$tag" "$self_domain" || return 1
         cert_file="$CERT_FILE_PATH"; key_file="$KEY_FILE_PATH"
         self_signed="true"
-        # SNI 以**证书实际 CN** 为准(证书已存在时会复用旧证书, 此时本次输入的域名并未生效;
-        # 直接用输入值会让链接/clash 的 sni 与实际证书脱节)。读不到 CN 才回退输入值。
-        sni="$self_domain"
-        if command -v openssl >/dev/null 2>&1; then
-            local self_cn
-            self_cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's/\/.*//')
-            [ -n "$self_cn" ] && sni="$self_cn"
-        fi
+        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
+        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
+        # 签发的 CN-only 证书)。证书复用/重生成后都读一次, 保证链接/clash 的 sni 与实际证书一致。
+        local self_cert_domain
+        self_cert_domain=$(_hy2_cert_domain "$cert_file")
+        [ -n "$self_cert_domain" ] && sni="$self_cert_domain"
     fi
 
     # 认证密码
