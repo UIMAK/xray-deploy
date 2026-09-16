@@ -3320,7 +3320,13 @@ _hy2_cert_snapshot_drop() {
 # 调用方负责只在"自签且本次真的生成过"时调用; 本函数再用路径闸门兜底。
 _hy2_cert_restore() {
     local bak="$1" cert="$2" key="$3" cdir="$4" ok=1
-    _hy2_cert_path_inside "$cert" || { _warn "证书回滚跳过(路径不在 ${CERT_DIR} 内): $cert"; _hy2_cert_snapshot_drop "$bak"; return 0; }
+    # cert 与 key **都要**过闸门: 只查 cert 时, key 若是指向目录外的符号链接, 下面的 cp
+    # 会跟随它写到外部(路径闸门的契约是"两个目标都在 CERT_DIR 内")
+    if ! _hy2_cert_path_inside "$cert" || ! _hy2_cert_path_inside "$key"; then
+        _warn "证书回滚跳过(路径不在 ${CERT_DIR} 内或为指向外部的符号链接): $cert / $key"
+        _hy2_cert_snapshot_drop "$bak"
+        return 0
+    fi
     if [ -n "$bak" ] && [ -f "$bak/cert.pem" ]; then
         cp -p "$bak/cert.pem" "$cert" 2>/dev/null || ok=0
     else
