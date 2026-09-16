@@ -3014,15 +3014,22 @@ _hy2_cert_key_match() {
 }
 
 # 把"已校验的临时 cert/key"提交到正式路径; 失败则把正式路径**还原为提交前状态**。
-# 用法:_hy2_cert_commit <tmp_cert> <tmp_key> <cert> <key>   (返回 0 = 提交成功)
+# 用法:_hy2_cert_commit <tmp_cert> <tmp_key> <cert> <key>
+# 返回码是三态(调用方必须按码分流, 不能一律当成"已回滚"):
+#   0 = 提交成功
+#   1 = 提交失败, **已确认**回到提交前状态(备份还原成功且复核通过)
+#   2 = 提交失败, **且回滚未完成** —— cert/key 可能不一致, 备份路径已打印, 需人工处理
 #
 # 为什么需要它: cert 与 key 是两个文件, 文件系统没有"同时原子替换两者"的原语, 因此提交
 # 必须是**可回滚的两步**。做法: 先把两个旧文件都备份 → 依次 mv 新 cert / 新 key →
 # 提交后校验正式路径确实匹配; 任何一步失败就按备份还原, 使"提交失败"不留下半更新状态
 # (只换掉 cert 而 key 仍是旧的, 或反之)。
+# **回滚本身也会失败**(权限/只读/IO): 故回滚的每一步都要检查结果, 并复核正式路径确实等于
+# 提交前状态; 只有复核通过才敢返回 1 宣称"已回滚", 否则返回 2 并保留备份 —— 绝不能把
+# "回滚失败"当成"已回滚"对外谎报一致(实测过该缺陷)。
 _hy2_cert_commit() {
     local tmp_cert="$1" tmp_key="$2" cert="$3" key="$4"
-    local bak_cert="" bak_key="" rc=1
+    local bak_cert="" bak_key="" rc=1 rb_ok=1 post_ok=1
     # 备份既有文件(可能不存在 —— 首次生成时), 备份名以 XXXXXX 结尾满足 Alpine musl mktemp
     if [ -f "$cert" ]; then
         bak_cert=$(mktemp "${cert}.bak.XXXXXX") || return 1
@@ -3032,17 +3039,42 @@ _hy2_cert_commit() {
         bak_key=$(mktemp "${key}.bak.XXXXXX") || { [ -n "$bak_cert" ] && rm -f "$bak_cert"; return 1; }
         cp -p "$key" "$bak_key" 2>/dev/null || { rm -f "$bak_key" "$bak_cert"; return 1; }
     fi
-    # 提交(两步)。任一步失败 ⇒ 进入回滚。
-    if mv -f "$tmp_cert" "$cert" 2>/dev/null && mv -f "$tmp_key" "$key" 2>/dev/null; then
-        # 提交后校验正式路径确为一对匹配的 cert/key(兜底 rename 语义异常/外部干扰)
-        if _hy2_cert_key_match "$cert" "$key"; then
-            rc=0
-        fi
+    # 提交(两步)+ 提交后校验正式路径确为一对匹配的 cert/key(兜底 rename 语义异常/外部干扰)
+    if mv -f "$tmp_cert" "$cert" 2>/dev/null && mv -f "$tmp_key" "$key" 2>/dev/null \
+       && _hy2_cert_key_match "$cert" "$key"; then
+        rc=0
     fi
     if [ "$rc" != 0 ]; then
-        # 回滚: 用备份还原; 原本不存在的文件则删除(回到"没有该文件"的提交前状态)
-        if [ -n "$bak_cert" ]; then mv -f "$bak_cert" "$cert" 2>/dev/null; else rm -f "$cert"; fi
-        if [ -n "$bak_key" ]; then mv -f "$bak_key" "$key" 2>/dev/null; else rm -f "$key"; fi
+        # 回滚: 用备份还原; 原本不存在的文件则删除(回到"没有该文件"的提交前状态)。
+        # **每一步都必须检查结果** —— 回滚自身也会失败(权限/只读/IO), 不检查就会把
+        # "回滚失败"当成"已回滚", 对外谎报状态一致(实测: 回滚失败仍 rc=1 且报"已回滚")。
+        if [ -n "$bak_cert" ]; then
+            mv -f "$bak_cert" "$cert" 2>/dev/null
+        else
+            rm -f "$cert" 2>/dev/null
+        fi
+        if [ -n "$bak_key" ]; then
+            mv -f "$bak_key" "$key" 2>/dev/null
+        else
+            rm -f "$key" 2>/dev/null
+        fi
+        # 回滚**后复核**正式路径是否真的等于"提交前状态"(有备份⇒文件在; 无备份⇒文件不在),
+        # 且两者都在时必须匹配。**以复核结果为准**, 而不是以每一步 mv 的返回值累加为准 ——
+        # 某个 mv 返回非 0 但目标已是正确内容(如"提交从未替换过该文件")时, 状态其实是对的,
+        # 按 mv 返回值判会误报回滚失败。
+        if [ -n "$bak_cert" ]; then [ -f "$cert" ] || post_ok=0; else [ ! -e "$cert" ] || post_ok=0; fi
+        if [ -n "$bak_key" ];  then [ -f "$key" ]  || post_ok=0; else [ ! -e "$key" ]  || post_ok=0; fi
+        if [ -f "$cert" ] && [ -f "$key" ]; then _hy2_cert_key_match "$cert" "$key" || post_ok=0; fi
+        if [ "$post_ok" = 0 ]; then
+            # 回滚不完整: **保留**未被消费的备份(它们可能是旧文件的唯一副本), 报告路径供人工恢复
+            _error "证书提交失败, 且回滚未完成; cert/key 可能处于不一致状态, 请人工检查"
+            [ -n "$bak_cert" ] && [ -f "$bak_cert" ] && _warn "旧 cert 备份保留在: $bak_cert"
+            [ -n "$bak_key" ] && [ -f "$bak_key" ] && _warn "旧 key 备份保留在: $bak_key"
+            return 2
+        fi
+        # 状态已确认回到提交前: 清掉因某步 mv 失败而未被消费的残留备份
+        [ -n "$bak_cert" ] && [ -f "$bak_cert" ] && rm -f "$bak_cert"
+        [ -n "$bak_key" ] && [ -f "$bak_key" ] && rm -f "$bak_key"
         return 1
     fi
     [ -n "$bak_cert" ] && rm -f "$bak_cert"
@@ -3071,6 +3103,7 @@ _hy2_cert_domain() {
 # 生成 Hysteria2 自签 TLS 证书(EC-256, 10 年)
 # 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
 # 前置: 调用方应先判 `_hy2_cert_reusable` —— 可复用则直接沿用, 不要调本函数。
+# 返回: 0 成功; 1 失败(已回到提交前状态, 或本就未改动); 2 失败且回滚未完成(需人工检查)。
 #
 # **证书必须带 SAN**: Xray 官方 tls.md 明言「serverName 对应的值必须存在于服务器证书的
 # SAN 中」; 只写 CN 的证书在现代 TLS 校验下会被拒(Go crypto/x509 报 "relies on legacy
@@ -3164,12 +3197,19 @@ EOF
         # 绝不留"新 cert + 旧 key"这类半更新状态。
         if { ! command -v openssl >/dev/null 2>&1 || _hy2_cert_san_has "$tmp_cert" "$domain"; } \
            && _hy2_cert_key_match "$tmp_cert" "$tmp_key"; then
-            _hy2_cert_commit "$tmp_cert" "$tmp_key" "$CERT_FILE_PATH" "$KEY_FILE_PATH" && rc=0
+            _hy2_cert_commit "$tmp_cert" "$tmp_key" "$CERT_FILE_PATH" "$KEY_FILE_PATH"
+            rc=$?
         fi
     fi
     rm -f "$tmp_cert" "$tmp_key"
+    if [ "$rc" = 2 ]; then
+        # 提交失败且回滚未完成 —— 具体原因/备份路径已由 _hy2_cert_commit 打印, 此处不重复。
+        # 返回 2 而非 1: 让"回滚失败"这一状态在整条调用链上可区分(调用方只判非零, 行为不变)。
+        _error "证书提交失败且回滚未完成, 已中止(未继续创建节点)"
+        return 2
+    fi
     if [ "$rc" != 0 ]; then
-        _error "证书生成失败(cert/key 不完整、SAN 不含 ${domain} 或二者不匹配, 或提交失败已回滚); 既有证书保持原样, 需安装 openssl 或使用 xray tls cert"
+        _error "证书生成失败(cert/key 不完整、SAN 不含 ${domain} 或二者不匹配); 既有证书保持原样, 需安装 openssl 或使用 xray tls cert"
         return 1
     fi
     _success "TLS 证书已生成: $cert_dir"
