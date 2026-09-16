@@ -3001,9 +3001,16 @@ _hy2_cert_san_has() {
     _hy2_cert_san_names "$cert" | grep -qxF "$domain"
 }
 
-# 证书可用于客户端 SNI 的域名: 优先第一个 SAN DNS 名, 缺失才回退 CN(兼容手工签发的 CN-only 证书)
+# 证书可用于客户端 SNI 的域名
+# 用法:_hy2_cert_domain <cert> [preferred]
+#   preferred(通常=本次请求域名)在 SAN 中时优先返回它 —— 多 SAN 证书里"取排序后第一个"
+#   会挑到与本次输入无关的名字(如 SAN 有 a./z./hy2. 三个时取到 a.)。
+#   否则返回第一个 SAN DNS 名; 无 SAN 才回退 CN(兼容手工签发的 CN-only 证书)。
 _hy2_cert_domain() {
-    local cert="$1" d=""
+    local cert="$1" preferred="${2:-}" d=""
+    if [ -n "$preferred" ] && _hy2_cert_san_has "$cert" "$preferred"; then
+        printf '%s' "$preferred"; return 0
+    fi
     d=$(_hy2_cert_san_names "$cert" | head -1)
     if [ -z "$d" ] && command -v openssl >/dev/null 2>&1; then
         d=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's|/.*||')
@@ -3032,12 +3039,21 @@ _gen_hy2_cert() {
     CERT_FILE_PATH="${cert_dir}/cert.pem"
     KEY_FILE_PATH="${cert_dir}/key.pem"
     if [ -f "$CERT_FILE_PATH" ] && [ -f "$KEY_FILE_PATH" ]; then
-        # 无 openssl 时无法读 SAN(只能信任既有证书), 有则必须 SAN 覆盖本次域名
-        if ! command -v openssl >/dev/null 2>&1 || _hy2_cert_san_has "$CERT_FILE_PATH" "$domain"; then
+        if command -v openssl >/dev/null 2>&1; then
+            # 必须 SAN 覆盖本次域名, 否则重新生成(不静默沿用旧证书)
+            if _hy2_cert_san_has "$CERT_FILE_PATH" "$domain"; then
+                _info "已有证书, 复用: $cert_dir"
+                return 0
+            fi
+            _warn "已有证书的 SAN 不含本次域名 ${domain}, 重新生成: $cert_dir"
+        else
+            # 无 openssl: 无法读 SAN, 只能信任既有证书。若它来自旧版本(CN-only 无 SAN),
+            # 证书身份与本次输入域名并不一致 —— 如实提示, 不假装已统一。
+            _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${domain})"
+            _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
             _info "已有证书, 复用: $cert_dir"
             return 0
         fi
-        _warn "已有证书的 SAN 不含本次域名 ${domain}, 重新生成: $cert_dir"
     fi
     _info "生成 TLS 自签证书 (CN=${domain}, SAN=DNS:${domain})..."
     if command -v openssl >/dev/null 2>&1; then
@@ -3133,7 +3149,7 @@ _add_hysteria2() {
         # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
         # 签发的 CN-only 证书)。证书复用/重生成后都读一次, 保证链接/clash 的 sni 与实际证书一致。
         local self_cert_domain
-        self_cert_domain=$(_hy2_cert_domain "$cert_file")
+        self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
         [ -n "$self_cert_domain" ] && sni="$self_cert_domain"
     fi
 
