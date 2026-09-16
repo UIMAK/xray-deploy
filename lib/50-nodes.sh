@@ -894,8 +894,14 @@ _hy2_gen_port_newmeta() {
     local meta="$1" newport="$2" oldport tmpm newlink rc name newname
     oldport=$(jq -r '.port' "$meta")
     [ -n "$oldport" ] || return 1
+    name=$(jq -r '.name' "$meta")
+    # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
+    newname=$(_rename_node_with_port "$name" "$oldport" "$newport")
     tmpm=$(mktemp "${meta}.port.XXXXXX") || return 1
-    jq --argjson p "$newport" '.port=$p' "$meta" > "$tmpm" || { rm -f "$tmpm"; return 1; }
+    # 临时文件必须同时承载**新端口与新名称**: 链接的 #fragment 取 .name, 只改端口会让重建出的
+    # 链接停在旧名(实测 hop 改端口后 share_link 尾段仍是旧名, 而非 hop 路径给的是新名 ——
+    # 同一操作两条路径两种结果)。与 Reality 分支"临时文件承载新 port + 新 name 再重建"同源。
+    jq --argjson p "$newport" --arg n "$newname" '.port=$p | .name=$n' "$meta" > "$tmpm" || { rm -f "$tmpm"; return 1; }
     newlink=$(_rebuild_hy2_link "$tmpm"); rc=$?
     # 同 _hy2_sync_derived: gecko 自定义尺寸 ⇒ 链接留空(正常); 元数据缺字段 ⇒ 拒绝
     if [ "$rc" != 0 ] && ! _hy2_link_unexpressible "$tmpm"; then
@@ -903,9 +909,6 @@ _hy2_gen_port_newmeta() {
         return 1
     fi
     rm -f "$tmpm"
-    name=$(jq -r '.name' "$meta")
-    # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
-    newname=$(_rename_node_with_port "$name" "$oldport" "$newport")
     jq --argjson p "$newport" --arg n "$newname" --arg l "$newlink" \
        '.port=$p | .name=$n | .share_link=$l' "$meta"
 }
@@ -915,11 +918,28 @@ _hy2_gen_port_newmeta() {
 #         → 原子提交 metadata → 提交 config(_mutate_config 自带重启校验与失败回滚)。
 # 后两步失败回滚已提交步骤, 保证 config/metadata/iptables 三方一致(全部回到旧端口或全部新端口)。
 # 返回: 0 全部成功; 1 失败(已尽力回滚到旧端口并提示)
+# 并发: 整个事务(快照 → journal → iptables → metadata → config → 回滚)在 _with_config_lock
+# 内 —— 与 _port_txn / Reality 事务同一锁域。三条路径共用 <old_path>.porttxn, 不锁会让并发
+# 会话互相覆盖/删除对方的 journal(进而让崩溃恢复本身失效)。
 _hy2_port_txn() {
+    _with_config_lock _hy2_port_txn_locked "$@"
+}
+
+_hy2_port_txn_locked() {
     local tag="$1" meta="$2" oldport="$3" newport="$4" newmeta="$5"; shift 5
-    local ranges="$*" orig
+    local ranges="$*" orig journal rok
+    journal="${meta}.porttxn"
     orig=$(cat "$meta" 2>/dev/null) || return 1
-    # 1. runtime iptables old→new + 原子持久化
+    # 0. journal: iptables 是本事务第一个被改动的真实状态, journal 必须先于它落盘
+    #    (崩溃残局是四元组 config/metadata/runtime DNAT/persisted DNAT, 恢复判据与修法见
+    #    _port_txn_recover: config 未提交 ⇒ 回滚 metadata + retarget 回旧端口, 两者皆幂等)
+    if ! _port_txn_journal_write "$meta" "$meta" hy2hop "$oldport" "$newport" "$ranges" "$orig" "$newmeta"; then
+        _error "端口事务 journal 写入失败, 未做任何修改"
+        return 1
+    fi
+    # 1. runtime iptables old→new + 原子持久化。失败时 retarget 内部已尽力自愈;
+    #    **保留 journal** —— 若自愈不完整, 启动期恢复会幂等补齐(retarget 的 add/remove 均带
+    #    存在性检查, 重入安全), 比留下无法收敛的残局好。
     # shellcheck disable=SC2086
     if ! _hy2_hop_retarget "$oldport" "$newport" $ranges; then
         return 1
@@ -928,18 +948,30 @@ _hy2_port_txn() {
     if ! _atomic_write_json "$meta" "$newmeta"; then
         _error "端口元数据提交失败, 回滚 iptables 到旧端口..."
         # shellcheck disable=SC2086
-        _hy2_hop_retarget "$newport" "$oldport" $ranges || _error "iptables 回滚失败, 请手动检查"
+        if _hy2_hop_retarget "$newport" "$oldport" $ranges; then
+            rm -f "$journal"
+        else
+            _error "iptables 回滚失败, 保留 journal 待启动恢复: $journal"
+        fi
         return 1
     fi
     # 3. 提交 config(_mutate_config 失败会自行恢复旧 config 并重启回旧端口)
     if ! _mutate_config --arg t "$tag" --argjson p "$newport" \
          '(.inbounds[] | select(.tag == $t) | .port) = $p'; then
         _error "端口配置提交失败, 回滚 metadata + iptables 到旧端口..."
-        _atomic_write_json "$meta" "$orig" || _error "元数据回滚失败, 请手动检查"
+        rok=0
+        _atomic_write_json "$meta" "$orig" || { _error "元数据回滚失败, 请手动检查"; rok=1; }
         # shellcheck disable=SC2086
-        _hy2_hop_retarget "$newport" "$oldport" $ranges || _error "iptables 回滚失败, 请手动检查"
+        _hy2_hop_retarget "$newport" "$oldport" $ranges || { _error "iptables 回滚失败, 请手动检查"; rok=1; }
+        # 两边都回滚干净才删 journal; 任一失败保留它, 启动期恢复幂等收敛
+        if [ "$rok" = 0 ]; then
+            rm -f "$journal"
+        else
+            _error "保留 journal 待启动恢复: $journal"
+        fi
         return 1
     fi
+    rm -f "$journal"
     return 0
 }
 
@@ -959,8 +991,9 @@ _modify_port_hop() {
         return 1
     fi
     _tip "端口跳跃规则已更新: ${display} → ${newport}"
-    # F1: 事务成功后同步 clash 派生缓存(端口/名称可能都变了)
-    _sync_node_clash "$meta" "$old_name"
+    # 派生状态(链接 + clash)走唯一入口, 并传 old_name 删除改名前的 clash 条目
+    # (与 _modify_port 非 hop 路径完全同源; hy2 改端口不存在第二份派生逻辑)
+    _hy2_sync_derived "$meta" "$old_name" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     return 0
 }
 
@@ -3295,10 +3328,12 @@ _hy2_clash_line() {
 #   (c) 元数据缺字段         → **保留**旧 share_link, 如实报告, 不写坏值。
 # 两部分失败**分别**告警(share_link 写入 vs clash 同步), 返回码为两者合并(1 = 至少一项失败);
 # 二者都是派生状态, 失败**不**回滚已提交的 config/metadata —— 调用方只 _warn, 不当作事务失败。
-# 用法: _hy2_sync_derived <meta_file>
+# 用法: _hy2_sync_derived <meta_file> [old_name]
+#   old_name 非空且与现名不同(改端口默认连带改名)时先删旧名条目 —— 与 _sync_node_clash 同口径。
+#   _add_node_to_yaml 只按**同名**去重, 管不到旧名, 不删就会在 clash.yaml 留下指向旧端口的幽灵条目。
 # ---------------------------------------------------------------------------
 _hy2_sync_derived() {
-    local meta="$1" link="" nname="" nline="" lrc=0 crc=0
+    local meta="$1" old_name="${2:-}" link="" nname="" nline="" lrc=0 crc=0
     # (1) share_link: 派生值, 但写在 metadata 里、是用户直接看到的主输出 —— 失败要单独报。
     if link=$(_rebuild_hy2_link "$meta") && [ -n "$link" ]; then
         _meta_update "$meta" '.share_link=$l' --arg l "$link" || {
@@ -3321,6 +3356,14 @@ _hy2_sync_derived() {
     nname=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     local key
     if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
+        # 改名(改端口默认连带改名)时先删旧名条目, 否则旧条目会以"另一个节点"的形态留在
+        # clash.yaml 里指向旧端口(幽灵条目)。与 _sync_node_clash 的 old_name 处理同源。
+        if [ -n "$old_name" ] && [ "$old_name" != "$nname" ]; then
+            _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || {
+                crc=1
+                _warn "Clash YAML 旧条目删除失败(${old_name}), 可手工编辑 ${CLASH_YAML}"
+            }
+        fi
         key=$(_yaml_dq "$nname")
         if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
             _replace_node_in_yaml "$nline" "$nname" || {
@@ -3922,6 +3965,441 @@ _delete_node() {
     _press_any_key
 }
 
+# 改端口的 Reality 事务(R41)。**整个事务在 _with_config_lock 内** —— 与 _port_txn /
+# _hy2_port_txn 同一锁域: Reality 改的是 metadata 文件名 + 内容 + config(tag/port/tunnel
+# tag/routing), 且与另两条路径共用 <old_path>.porttxn, 不锁会让并发会话互相覆盖/删除
+# 对方的 journal(进而让崩溃恢复本身失效)。
+_reality_port_txn() {
+    _with_config_lock _reality_port_txn_locked "$@"
+}
+_reality_port_txn_locked() {
+    local tag="$1" meta="$2" oldport="$3" newport="$4"
+    # R42: 先经唯一入口判模式。direct 模式无 tunnel/路由需要同步, tunnel_tag 保持空,
+    # 下面的事务天然退化为"只处理主入站"(new_tunnel_tag 与 jq 的 tunnel 段都受 -n 保护);
+    # 绝不能让 direct 节点走 tunnel 分支的 fail-closed —— 那会把它永久锁成不能改端口。
+    local tunnel_tag="" tunnel_port sni trc rmode
+    rmode=$(_reality_node_mode "$tag")
+    if [ "$rmode" = "tunnel" ]; then
+        # 旧版/手动创建节点可能缺 tunnel_tag —— 从 config 关联推导(R26/R28)。
+        # R41(P1): fail-closed —— 推导失败(rc=1)或歧义(rc=2)一律拒绝改端口, 否则
+        # 只改主 tag 而 tunnel/路由未改, 重新制造 R41 要消灭的不一致。
+        tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
+        tunnel_port=$(jq -r '.tunnel_port // empty' "$meta" 2>/dev/null)
+        sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
+        if [ -z "$tunnel_tag" ]; then
+            tunnel_tag=$(_find_reality_tunnel_tag "$tag"); trc=$?
+            if [ "$trc" != "0" ]; then
+                _error "无法唯一关联 Reality tunnel (rc=${trc}), 无法安全修改端口: $tag"
+                _tip "请检查 config.json 的 realitySettings.target 与 tunnel 入站, 或删除后重建节点"
+                return 1
+            fi
+        else
+            # R41: metadata 有 tunnel_tag 也不能盲目信任 —— 外部修改/损坏 metadata 后
+            # 可能与 config 不一致。此处验证该 tag 在 config 中真实存在且为 tunnel 入站,
+            # 否则 fail-closed(避免 tunnel/路由漏改)。无 tunnel_tag 的节点走上面的
+            # _find_reality_tunnel_tag 推导, 推导失败/歧义同样 fail-closed, 绝不进入
+            # "仅改端口"的通用路径(R41 的全部 tunnel 模式分支都是 fail-closed)。
+            if ! jq -e --arg tg "$tunnel_tag" \
+                '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
+                "$CONFIG_FILE" >/dev/null 2>&1; then
+                _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
+                _tip "请检查 config.json 或使用 [采纳孤儿入站] 修复元数据"
+                return 1
+            fi
+        fi
+    fi
+
+    # 主 tag 前缀(xd-reality-vision / xd-reality-xhttp) + 新端口
+    local new_tag="${tag%-*}-${newport}"
+    # 新 tunnel tag: 仅替换末段 reality 端口(Tunnel-<sni>-<tport>-<port>);
+    # 保持 SNI 段原样(含旧版无长度封顶产生的超长 SNI 段, 不做二次截断)
+    local new_tunnel_tag=""
+    if [ -n "$tunnel_tag" ]; then
+        new_tunnel_tag="${tunnel_tag%-*}-${newport}"
+    fi
+
+    # R41(P2): 新 tag 冲突检查 —— 目标元数据文件已存在说明该端口/标签被其他节点占用,
+    # mv 会静默覆盖。不依赖 _input_port 的上游间接保证, 这里显式校验。
+    if [ -e "$NODES_DIR/${new_tag}.json" ]; then
+        _error "目标标签 ${new_tag} 已存在(端口 ${newport} 可能已被其他节点使用), 请换一个端口"
+        return 1
+    fi
+
+    # 在内存生成完整新 metadata(port/tag/tunnel_tag/reality_mode/name/share_link), 未落地任何文件。
+    # _rebuild_reality_link 从文件读, 故用临时文件承载"新 port + 新 name"再重建,
+    # 使链接 #fragment 也同步为新名(与 _hy2_gen_port_newmeta 同思路)。
+    local tmpm newmeta newlink old_name new_name
+    tmpm=$(mktemp "${meta}.port.XXXXXX") || { _error "创建临时文件失败"; return 1; }
+    old_name=$(jq -r '.name' "$meta")
+    # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
+    new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
+    # R42: 顺带回填 reality_mode —— 旧节点(无该字段)改端口后元数据自描述, 不再依赖推导
+    if ! jq --argjson p "$newport" --arg nt "$new_tag" --arg ntg "$new_tunnel_tag" \
+        --arg nn "$new_name" --arg rm "$rmode" \
+        '.port=$p | .tag=$nt | (if $ntg != "" then .tunnel_tag=$ntg else . end) | .name=$nn | .reality_mode=$rm' \
+        "$meta" > "$tmpm"; then
+        rm -f "$tmpm"; _error "生成元数据失败"; return 1
+    fi
+    if ! newlink=$(_rebuild_reality_link "$tmpm") || [ -z "$newlink" ]; then
+        rm -f "$tmpm"
+        _warn "分享链接重建失败(元数据缺少必要字段), 端口未修改"
+        _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
+        return 1
+    fi
+    if ! newmeta=$(jq --arg l "$newlink" '.share_link=$l' "$tmpm") || [ -z "$newmeta" ]; then
+        rm -f "$tmpm"; _error "生成元数据失败"; return 1
+    fi
+    rm -f "$tmpm"
+
+    # ---- 统一事务(对齐 _hy2_port_txn): journal → 重命名+提交 metadata → 提交 config ----
+    # journal 必须先于 mv 落盘: mv 是第一个被改动的真实状态, 崩溃残局是"文件名已改 /
+    # config 未改"甚至"文件名+内容已改 / config 未改"(P1-B), 由 _port_txn_recover 依据
+    # config 是否已出现 (new_tag, newport) 判定补完或回滚(回滚 = 反向 mv + 写回 old)。
+    local orig journal rrok
+    journal="$NODES_DIR/${tag}.json.porttxn"
+    orig=$(cat "$meta" 2>/dev/null) || { _error "读取元数据失败"; return 1; }
+    if ! _port_txn_journal_write "$NODES_DIR/${tag}.json" "$NODES_DIR/${new_tag}.json" \
+            reality "$oldport" "$newport" "" "$orig" "$newmeta"; then
+        _error "端口事务 journal 写入失败, 未做任何修改"
+        return 1
+    fi
+
+    # 1. 主 tag 即元数据文件名 —— 先重命名(config 未动, 失败干净中止)
+    if ! mv "$NODES_DIR/${tag}.json" "$NODES_DIR/${new_tag}.json"; then
+        _error "节点元数据文件重命名失败(${tag}.json → ${new_tag}.json), 未做任何修改"
+        rm -f "$journal"
+        return 1
+    fi
+    meta="$NODES_DIR/${new_tag}.json"
+
+    # 2. 原子提交新 metadata; 失败时反向 mv 恢复文件名(此时新文件仍是原内容), config 未动
+    if ! _atomic_write_json "$meta" "$newmeta"; then
+        _error "端口元数据提交失败, 恢复原文件名..."
+        rrok=0
+        mv -f "$NODES_DIR/${new_tag}.json" "$NODES_DIR/${tag}.json" 2>/dev/null || \
+            { _error "元数据文件名恢复失败, 请手动检查 ${NODES_DIR}"; rrok=1; }
+        # 反向 mv 成功才删 journal; 失败保留, 启动期恢复会按"config 未提交"收敛
+        if [ "$rrok" = 0 ]; then rm -f "$journal"; else _error "保留 journal 待启动恢复: $journal"; fi
+        return 1
+    fi
+
+    # 3. 最后提交 config(改端口 + 重命名主 tag + tunnel tag + 路由规则引用)。
+    #    _mutate_config 失败会自行恢复旧 config 并重启回旧端口; 这里同步回滚 metadata。
+    local jq_filter
+    jq_filter='(.inbounds[] | select(.tag == $t) | .tag) = $new_t
+| (.inbounds[] | select(.tag == $new_t) | .port) = $p'
+    if [ -n "$tunnel_tag" ]; then
+        jq_filter="$jq_filter
+| (.inbounds[] | select(.tag == \$tg) | .tag) = \$new_tg
+| .routing.rules |= map(
+    if .inboundTag != null and (.inboundTag | type) == \"array\"
+    then .inboundTag |= map(if . == \$tg then \$new_tg else . end)
+    else . end)"
+    fi
+    if ! _mutate_config --arg t "$tag" --arg new_t "$new_tag" --argjson p "$newport" \
+         --arg tg "$tunnel_tag" --arg new_tg "$new_tunnel_tag" "$jq_filter"; then
+        _error "端口配置提交失败, 回滚元数据到旧文件名与旧内容..."
+        rrok=0
+        rm -f "$NODES_DIR/${new_tag}.json" 2>/dev/null
+        _atomic_write_json "$NODES_DIR/${tag}.json" "$orig" || \
+            { _error "元数据回滚失败, 请手动检查 ${NODES_DIR}/${tag}.json"; rrok=1; }
+        # 文件名与内容都回到旧态才删 journal; 否则保留, 启动期恢复按"config 未提交"收敛
+        if [ "$rrok" = 0 ]; then rm -f "$journal"; else _error "保留 journal 待启动恢复: $journal"; fi
+        return 1
+    fi
+    rm -f "$journal"
+
+    if [ "$rmode" = "tunnel" ]; then
+        _success "端口已改为 ${newport}(标签与 tunnel 标签已同步更新)"
+    else
+        _success "端口已改为 ${newport}(直连模式, 标签已同步更新)"
+    fi
+    # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
+    _sync_node_clash "$meta" "$old_name"
+}
+
+# ---------------------------------------------------------------------------
+# 非 hop 端口修改的统一事务(与 _hy2_port_txn / Reality 分支同模型)。
+# 调用方已在内存生成完整 newmeta(port + name + share_link), 事务内只做两步提交:
+#   1. 原子提交 metadata —— 失败干净中止, config 未动;
+#   2. 提交 config(_mutate_config 自带 verified-restart 与失败回滚); 失败则回滚 metadata。
+# **顺序不可交换**: 先 config 后 metadata 会在 metadata 写失败时留下 "config 新端口 /
+# metadata 旧端口" 的分裂(节点列表、链接、删除定位全按 metadata 走, 而服务实际监听新端口)。
+#
+# **并发**: 整个事务(快照 → journal → metadata → config → 回滚)都在 _with_config_lock
+# 内。只锁 _mutate_config 是不够的 —— 失败事务的 "回滚 metadata" 会覆盖另一会话已经
+# 提交的新 metadata(lost update), 留下 config=T2 / metadata=旧 的分裂。
+# _with_config_lock 经 XRAY_DEPLOY_LOCK_HELD 可重入, 故内部 _mutate_config 不会自锁死。
+#
+# **崩溃一致性**: 单靠函数返回码只能覆盖"错误返回"路径; 进程在 metadata 已提交、config
+# 未提交之间被杀(断电 / OOM / kill -9)时没有任何函数会被调用。故事务前先落一份 journal
+# (`<meta>.porttxn`, **非 .json 后缀** —— 节点目录所有扫描都是 *.json 通配, 用 .json
+# 后缀会让它被当成一个节点), 启动期由 _port_txn_recover 依据 config 的真实端口决定
+# "补完"还是"回滚", 不会永久停在 config 旧 / metadata 新的分裂。
+# **三条端口路径同一模型**: port(本函数) / hy2hop(_hy2_port_txn) / reality
+# (_reality_port_txn) 都写同一份 journal、都在 _with_config_lock 内、都由 _port_txn_recover
+# 收敛(第三参与方 iptables DNAT / tag 重命名由 kind 区分处理)。
+# 用法: _port_txn <tag> <meta_file> <newport> <newmeta_json>
+# 返回: 0 全部成功; 1 失败(metadata 已回滚到旧内容)
+# ---------------------------------------------------------------------------
+_port_txn() {
+    _with_config_lock _port_txn_locked "$@"
+}
+
+# 端口事务 journal 的唯一写入入口(port / hy2hop / reality 三条路径共用, 防止三份 payload 漂移)。
+# journal 路径固定 \`${old_path}.porttxn\` —— **必须非 .json 后缀**(节点目录所有扫描都是
+# *.json 通配, 用 .json 会被当成一个节点)。payload 自带 old/new 全文与两侧路径, 恢复时不需要
+# 再推算, 也不依赖 newmeta 还能重建; tag/newtag 从 old/new 的 .tag 派生(三类 metadata 都带 tag)。
+# 返回非 0 ⇒ 调用方必须**立即中止**, 不得继续改动任何真实文件。
+_port_txn_journal_write() {  # <old_path> <new_path> <kind> <oldport> <newport> <ranges> <old_json> <new_json>
+    local old_path="$1" new_path="$2" kind="$3" oldport="$4" newport="$5" ranges="$6" old_json="$7" new_json="$8"
+    local payload
+    payload=$(jq -n --arg kind "$kind" --argjson op "$oldport" --argjson np "$newport" \
+        --arg opath "$old_path" --arg npath "$new_path" --arg ranges "$ranges" \
+        --argjson old "$old_json" --argjson new "$new_json" \
+        '{kind:$kind, tag:($old.tag // ""), newtag:($new.tag // ""), oldport:$op, newport:$np,
+          old_path:$opath, new_path:$npath, ranges:$ranges, old:$old, new:$new}') || return 1
+    _atomic_write_json "${old_path}.porttxn" "$payload"
+}
+
+_port_txn_locked() {
+    local tag="$1" meta="$2" newport="$3" newmeta="$4" orig oldport journal
+    journal="${meta}.porttxn"
+    orig=$(cat "$meta" 2>/dev/null) || { _error "读取元数据失败: $meta"; return 1; }
+    [ -n "$orig" ] || { _error "元数据为空, 放弃端口修改: $meta"; return 1; }
+    oldport=$(jq -r '.port // empty' <<< "$orig" 2>/dev/null)
+    # 1. journal: 先于任何真实状态改动落盘
+    if ! _port_txn_journal_write "$meta" "$meta" port "$oldport" "$newport" "" "$orig" "$newmeta"; then
+        _error "端口事务 journal 写入失败, 未做任何修改"
+        return 1
+    fi
+    # 2. 原子提交 metadata
+    if ! _atomic_write_json "$meta" "$newmeta"; then
+        _error "端口元数据提交失败, 未做任何修改"
+        rm -f "$journal"
+        return 1
+    fi
+    # 3. 提交 config
+    if ! _mutate_config --arg t "$tag" --argjson p "$newport" \
+         '(.inbounds[] | select(.tag == $t) | .port) = $p'; then
+        _error "端口配置提交失败, 回滚元数据到旧端口..."
+        # 回滚完整才删 journal; 回滚失败保留它, 让启动期恢复收敛(恢复路径幂等)
+        if _atomic_write_json "$meta" "$orig"; then
+            rm -f "$journal"
+        else
+            _error "元数据回滚失败, 保留 journal 待启动恢复: $journal"
+        fi
+        return 1
+    fi
+    rm -f "$journal"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# iptables 可用性判据(单独成函数, 便于测试注入; 恢复的 hop 修复需要它)
+_hy2_hop_available() { command -v iptables >/dev/null 2>&1; }
+
+# 启动期恢复: 处理上次被中断的端口事务(journal 还在 ⇒ 事务没走完)。
+# **整个恢复在 _with_config_lock 内** —— 与 _port_txn 同锁域, 否则一个正在执行的端口事务
+# 会与启动恢复并发写同一份 metadata(启动 TUI 通常单实例, 但一致性上不能留这个缺口)。
+#
+# 三类 journal(kind)统一处理, 判据都是 **config 的真实状态**(权威 = 服务实际在跑的配置),
+# 不是"猜哪一步失败了":
+#   port / hy2hop: config 里该 tag 的端口 == newport            ⇒ config 已提交
+#   reality:       config 里已出现 (newtag, newport) 这个入站    ⇒ config 已提交
+# 已提交 ⇒ 把 metadata 收敛到 new_path + new 内容; 否则收敛到 old_path + old 内容。
+# hy2hop 的 DNAT 在 config 之前就被改到新端口, 故回滚分支必须同步 retarget 回旧端口
+# (retarget 的 remove/add 均带存在性检查, 幂等可重入; iptables 不可用时保留 journal 待下次)。
+#
+# **事务身份校验(P2)**: 收敛前先确认 metadata 当前内容语义上等于 journal 的 old 或 new。
+# 若两者都不是, 说明崩溃后 metadata 又被外部改过 —— 此时**不自动处理**(保留 journal 与现场),
+# 避免用 journal.new 覆盖用户后来的修改。仅凭 "config 端口 == newport" 不足以证明
+# "config 就是本 journal 那次提交产生的"。
+#
+# **journal 用 .porttxn 后缀而非 .json** —— 节点目录的所有扫描都是 *.json 通配, .json 后缀
+# 会让它被当成一个节点参与列表/删除/采纳。
+# 幂等、静默(至多一条 _info), 与其它启动自动操作同级。
+# ---------------------------------------------------------------------------
+# journal 隔离: **绝不删除**(只读 fs / 权限 / I-O 异常时 mv 也会失败 —— 那恰恰是最该保住
+# 证据的场景, 保留原文件并告警)。改名后不再被 *.porttxn 扫到 ⇒ 幂等, 不会每次启动反复告警。
+# 用法: _ptx_journal_quarantine <journal> <原因>
+_ptx_journal_quarantine() {
+    local j="$1" why="$2" dest i
+    # 不覆盖既有 .corrupt 证据: 依次找第一个空位(.corrupt / .corrupt.1 / … / .corrupt.9)。
+    # 恢复在 config 锁内执行, 不存在并发竞争; 全被占满则保留原文件(仍不删)。
+    dest=""
+    for i in "" .1 .2 .3 .4 .5 .6 .7 .8 .9; do
+        [ -e "${j}.corrupt${i}" ] || { dest="${j}.corrupt${i}"; break; }
+    done
+    if [ -n "$dest" ] && mv -f "$j" "$dest" 2>/dev/null; then
+        _warn "端口事务 journal ${why}, 已隔离为 ${dest##*/} 待人工核对: $j"
+    else
+        _warn "端口事务 journal ${why}, 且隔离失败, 原文件保留待人工核对(未删除): $j"
+    fi
+}
+
+# journal 的 **schema 校验**(fail-closed): 合法 JSON 不等于合法事务记录。
+# 正常 journal 只由 _port_txn_journal_write 生成, 故这里可以严格; 任何不满足者都不得被
+# 自动恢复(尤其**未知 kind 绝不能按 port 处理**)。校验: kind 枚举 / 各 kind 的必填字段与
+# 取值(端口范围、ranges 语法) / old·new 必须是 object / tag 与 old.tag、newtag 与 new.tag
+# 必须一致(否则身份校验与收敛会基于错位的数据)。
+# 用法: _ptx_journal_ok <journal>; 0=合法
+_ptx_journal_ok() {
+    jq -e '
+      def port_ok: (type == "number") and (. >= 1) and (. <= 65535) and (. == floor);
+      def ranges_ok:
+        (type == "string") and (. == "")
+        or ((test("^[0-9]{1,5}(:[0-9]{1,5})?([,][0-9]{1,5}(:[0-9]{1,5})?)*$"))
+            and ([ splits("[,\\s]+") ] | map(select(length > 0)) | length > 0)
+            and ([ splits("[,\\s]+") | select(length > 0) |
+                   if test(":") then
+                     (split(":") | (.[0]|tonumber) >= 1 and (.[0]|tonumber) <= 65535
+                                 and (.[1]|tonumber) >= 1 and (.[1]|tonumber) <= 65535
+                                 and (.[0]|tonumber) <= (.[1]|tonumber))
+                   else ((tonumber) >= 1 and (tonumber) <= 65535) end ] | all));
+      (.kind as $k
+       | ($k == "port" or $k == "hy2hop" or $k == "reality")
+       and (.tag | type == "string" and length > 0)
+       and (.newtag | type == "string" and length > 0)
+       and (.newport | port_ok)
+       and (.oldport | port_ok)
+       and (.old | type == "object")
+       and (.new | type == "object")
+       and (.old.tag == .tag)
+       and (.new.tag == .newtag)
+       # 四元组必须自洽: 恢复是把整份 old/new 写回 metadata, 若 old.port 与 oldport 打架,
+       # 会写出 config.port 与 metadata.port 互相矛盾的残局 ⇒ 一并校验(含取值合法性)。
+       and (.old.port | port_ok)
+       and (.new.port | port_ok)
+       and (.old.port == .oldport)
+       and (.new.port == .newport)
+       and (.old_path | type == "string" and length > 0)
+       and (.new_path | type == "string" and length > 0)
+       and (.ranges | ranges_ok)
+       and (if $k == "hy2hop" then (.ranges | length > 0) else (.ranges == "") end)
+       and (if $k == "reality" then .old_path != .new_path else .old_path == .new_path end))
+    ' "$1" >/dev/null 2>&1
+}
+
+_port_txn_recover() {
+    _with_config_lock _port_txn_recover_locked
+}
+
+_port_txn_recover_locked() {
+    [ -d "$NODES_DIR" ] || return 0
+    local j kind tag newtag oldport newport old_path new_path ranges
+    local cfg_tag committed cur_path p cur_canon old_canon new_canon tgt_path tgt_obj
+    for j in "$NODES_DIR"/*.porttxn; do
+        [ -f "$j" ] || continue
+        # 1) 必须是可解析的 JSON
+        if ! jq -e . "$j" >/dev/null 2>&1; then
+            _ptx_journal_quarantine "$j" "无法解析"
+            continue
+        fi
+        # 2) 必须是**合法事务记录**, 而不仅是合法 JSON: kind 枚举 + 按 kind 的字段/取值/结构校验
+        #    (含 tag 与 old/new.tag 的一致性)。缺字段、未知 kind、越界端口、非法 ranges、old/new
+        #    非 object —— 一律 fail-closed: 隔离, **不**自动恢复(未知类型绝不当成 port 处理)。
+        if ! _ptx_journal_ok "$j"; then
+            _ptx_journal_quarantine "$j" "schema 不合法(kind/字段/取值/结构)"
+            continue
+        fi
+        kind=$(jq -r '.kind' "$j" 2>/dev/null)
+        tag=$(jq -r '.tag' "$j" 2>/dev/null)
+        newtag=$(jq -r '.newtag' "$j" 2>/dev/null)
+        oldport=$(jq -r '.oldport' "$j" 2>/dev/null)
+        newport=$(jq -r '.newport' "$j" 2>/dev/null)
+        old_path=$(jq -r '.old_path' "$j" 2>/dev/null)
+        new_path=$(jq -r '.new_path' "$j" 2>/dev/null)
+        ranges=$(jq -r '.ranges // ""' "$j" 2>/dev/null)
+
+        # (a) config 侧判据: 本事务的目标状态(tag + 端口)是否已在 config 里
+        cfg_tag="$tag"
+        [ "$kind" = "reality" ] && cfg_tag="$newtag"
+        committed=0
+        if [ -f "$CONFIG_FILE" ]; then
+            [ "$(jq -r --arg t "$cfg_tag" --argjson p "$newport" \
+                '[.inbounds[]? | select(.tag == $t and .port == $p)] | length > 0' \
+                "$CONFIG_FILE" 2>/dev/null)" = "true" ] && committed=1
+        fi
+
+        # (b) 定位 metadata 当前文件(旧名优先), 并做事务身份校验
+        cur_path=""
+        for p in "$old_path" "$new_path"; do
+            [ -f "$p" ] && { cur_path="$p"; break; }
+        done
+        if [ -z "$cur_path" ]; then
+            # 两个候选路径都没有元数据 —— 说不清的现场, 与其它非法 journal 同策: 隔离而非删除
+            _ptx_journal_quarantine "$j" "对应的元数据文件已不存在"
+            continue
+        fi
+        cur_canon=$(jq -S . "$cur_path" 2>/dev/null)
+        old_canon=$(jq -S '.old' "$j" 2>/dev/null)
+        new_canon=$(jq -S '.new' "$j" 2>/dev/null)
+        if [ "$cur_canon" != "$old_canon" ] && [ "$cur_canon" != "$new_canon" ]; then
+            _warn "端口事务 journal 残留, 但 metadata 已被外部修改, 不自动处理(请人工核对): $cur_path"
+            continue
+        fi
+        # 事务身份校验(P2): 三条路径的提交顺序都是 **metadata 先、config 后** ⇒
+        # "config 已是目标态而 metadata 仍停在 old" 这个组合**不可能由本事务产生**,
+        # 只能是外部干预(例如崩溃后有人手工把 config 改成目标端口)。仅凭
+        # "config 端口 == newport" 无法证明 config 就是本 journal 那次提交的结果,
+        # 故这里按外部干预处理: 不覆盖 metadata, 保留 journal 与现场。
+        if [ "$committed" = 1 ] && [ "$cur_canon" = "$old_canon" ]; then
+            _warn "端口事务 journal 残留: config 已在目标态而 metadata 仍是旧态(本事务不可能产生), 不自动处理(请人工核对): $cur_path"
+            continue
+        fi
+
+        # (c) 收敛到目标态: 必要时先改文件名(Reality 的 tag 改名), 再原子写内容
+        if [ "$committed" = 1 ]; then tgt_path="$new_path"; tgt_obj=".new"; else tgt_path="$old_path"; tgt_obj=".old"; fi
+        if [ "$cur_path" != "$tgt_path" ]; then
+            # 目标路径已存在 ⇒ **不是**本事务的正常残局: 需要改名的只有 Reality, 而它的正常残局
+            # 里目标(旧名或新名)必然不存在(cur_path 已优先取到存在的那个)。目标却存在, 说明
+            # 崩溃后有外部重建/替换 ⇒ 绝不覆盖, 保留 journal 转人工。
+            if [ -e "$tgt_path" ]; then
+                _warn "端口事务恢复的目标文件已存在(疑似外部重建), 不覆盖, 保留 journal 待人工核对: $tgt_path"
+                continue
+            fi
+            # mv -n: 即便在"检查"与"改名"之间被塞进目标文件也不覆盖(-n 不可用时报错 ⇒ 走失败
+            # 分支保留 journal, 仍不丢数据)。改名后源路径消失, 故下面统一对 tgt_path 写内容。
+            if ! mv -n "$cur_path" "$tgt_path" 2>/dev/null; then
+                _warn "端口事务恢复的元数据重命名失败, 保留 journal: $j"
+                continue
+            fi
+            # mv -n 在"目标已存在"时可能静默不动作却返回 0 ⇒ 事后核验源路径确实消失,
+            # 否则视为未生效(有竞态插入), 保留 journal 而不是继续写目标文件
+            if [ -e "$cur_path" ]; then
+                _warn "端口事务恢复的元数据重命名未生效(目标已存在?), 不覆盖, 保留 journal: $tgt_path"
+                continue
+            fi
+        fi
+        if ! _atomic_write_json "$tgt_path" "$(jq "$tgt_obj" "$j" 2>/dev/null)"; then
+            _warn "端口事务恢复的元数据写回失败, 保留 journal: $j"
+            continue
+        fi
+
+        # (d) hy2hop 回滚分支: DNAT 已被改到新端口, 必须一并 retarget 回旧端口
+        if [ "$kind" = "hy2hop" ] && [ "$committed" = 0 ] && [ -n "$ranges" ]; then
+            if ! _hy2_hop_available; then
+                _warn "端口跳跃规则需 iptables 修复, 保留 journal 待下次启动: $j"
+                continue
+            fi
+            # shellcheck disable=SC2086
+            if ! _hy2_hop_retarget "$newport" "$oldport" $ranges; then
+                _warn "端口跳跃规则回滚失败, 保留 journal: $j"
+                continue
+            fi
+        fi
+
+        rm -f "$j"
+        if [ "$committed" = 1 ]; then
+            _info "已补完上次中断的端口修改: ${tgt_path##*/} (端口 ${newport})"
+        else
+            _info "已回滚上次中断的端口修改: ${tgt_path##*/} (config 未提交该事务)"
+        fi
+    done
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # 修改端口(沿用思路, 适配新元数据)
 # ---------------------------------------------------------------------------
@@ -3998,176 +4476,58 @@ _modify_port() {
     # 自带回滚), 保证 config/metadata 全部回到旧端口或全部新端口。
     # ----------------------------------------------------------------------
     if [ "$proto" = "vless-tcp-reality-vision" ] || [ "$proto" = "vless-xhttp-reality" ]; then
-        # R42: 先经唯一入口判模式。direct 模式无 tunnel/路由需要同步, tunnel_tag 保持空,
-        # 下面的事务天然退化为"只处理主入站"(new_tunnel_tag 与 jq 的 tunnel 段都受 -n 保护);
-        # 绝不能让 direct 节点走 tunnel 分支的 fail-closed —— 那会把它永久锁成不能改端口。
-        local tunnel_tag="" tunnel_port sni trc rmode
-        rmode=$(_reality_node_mode "$tag")
-        if [ "$rmode" = "tunnel" ]; then
-            # 旧版/手动创建节点可能缺 tunnel_tag —— 从 config 关联推导(R26/R28)。
-            # R41(P1): fail-closed —— 推导失败(rc=1)或歧义(rc=2)一律拒绝改端口, 否则
-            # 只改主 tag 而 tunnel/路由未改, 重新制造 R41 要消灭的不一致。
-            tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
-            tunnel_port=$(jq -r '.tunnel_port // empty' "$meta" 2>/dev/null)
-            sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
-            if [ -z "$tunnel_tag" ]; then
-                tunnel_tag=$(_find_reality_tunnel_tag "$tag"); trc=$?
-                if [ "$trc" != "0" ]; then
-                    _error "无法唯一关联 Reality tunnel (rc=${trc}), 无法安全修改端口: $tag"
-                    _tip "请检查 config.json 的 realitySettings.target 与 tunnel 入站, 或删除后重建节点"
-                    _press_any_key; return 1
-                fi
-            else
-                # R41: metadata 有 tunnel_tag 也不能盲目信任 —— 外部修改/损坏 metadata 后
-                # 可能与 config 不一致。此处验证该 tag 在 config 中真实存在且为 tunnel 入站,
-                # 否则 fail-closed(避免 tunnel/路由漏改)。无 tunnel_tag 的节点走上面的
-                # _find_reality_tunnel_tag 推导, 推导失败/歧义同样 fail-closed, 绝不进入
-                # "仅改端口"的通用路径(R41 的全部 tunnel 模式分支都是 fail-closed)。
-                if ! jq -e --arg tg "$tunnel_tag" \
-                    '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
-                    "$CONFIG_FILE" >/dev/null 2>&1; then
-                    _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
-                    _tip "请检查 config.json 或使用 [采纳孤儿入站] 修复元数据"
-                    _press_any_key; return 1
-                fi
-            fi
-        fi
-
-        # 主 tag 前缀(xd-reality-vision / xd-reality-xhttp) + 新端口
-        local new_tag="${tag%-*}-${newport}"
-        # 新 tunnel tag: 仅替换末段 reality 端口(Tunnel-<sni>-<tport>-<port>);
-        # 保持 SNI 段原样(含旧版无长度封顶产生的超长 SNI 段, 不做二次截断)
-        local new_tunnel_tag=""
-        if [ -n "$tunnel_tag" ]; then
-            new_tunnel_tag="${tunnel_tag%-*}-${newport}"
-        fi
-
-        # R41(P2): 新 tag 冲突检查 —— 目标元数据文件已存在说明该端口/标签被其他节点占用,
-        # mv 会静默覆盖。不依赖 _input_port 的上游间接保证, 这里显式校验。
-        if [ -e "$NODES_DIR/${new_tag}.json" ]; then
-            _error "目标标签 ${new_tag} 已存在(端口 ${newport} 可能已被其他节点使用), 请换一个端口"
+        if ! _reality_port_txn "$tag" "$meta" "$oldport" "$newport"; then
             _press_any_key; return 1
         fi
-
-        # 在内存生成完整新 metadata(port/tag/tunnel_tag/reality_mode/name/share_link), 未落地任何文件。
-        # _rebuild_reality_link 从文件读, 故用临时文件承载"新 port + 新 name"再重建,
-        # 使链接 #fragment 也同步为新名(与 _hy2_gen_port_newmeta 同思路)。
-        local tmpm newmeta newlink old_name new_name
-        tmpm=$(mktemp "${meta}.port.XXXXXX") || { _error "创建临时文件失败"; _press_any_key; return 1; }
-        old_name=$(jq -r '.name' "$meta")
-        # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
-        new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
-        # R42: 顺带回填 reality_mode —— 旧节点(无该字段)改端口后元数据自描述, 不再依赖推导
-        if ! jq --argjson p "$newport" --arg nt "$new_tag" --arg ntg "$new_tunnel_tag" \
-            --arg nn "$new_name" --arg rm "$rmode" \
-            '.port=$p | .tag=$nt | (if $ntg != "" then .tunnel_tag=$ntg else . end) | .name=$nn | .reality_mode=$rm' \
-            "$meta" > "$tmpm"; then
-            rm -f "$tmpm"; _error "生成元数据失败"; _press_any_key; return 1
-        fi
-        if ! newlink=$(_rebuild_reality_link "$tmpm") || [ -z "$newlink" ]; then
-            rm -f "$tmpm"
-            _warn "分享链接重建失败(元数据缺少必要字段), 端口未修改"
-            _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
-            _press_any_key; return 1
-        fi
-        if ! newmeta=$(jq --arg l "$newlink" '.share_link=$l' "$tmpm") || [ -z "$newmeta" ]; then
-            rm -f "$tmpm"; _error "生成元数据失败"; _press_any_key; return 1
-        fi
-        rm -f "$tmpm"
-
-        # ---- 统一事务(对齐 _hy2_port_txn): 快照原 metadata → 重命名+提交 metadata → 提交 config ----
-        local orig
-        orig=$(cat "$meta" 2>/dev/null) || { _error "读取元数据失败"; _press_any_key; return 1; }
-
-        # 1. 主 tag 即元数据文件名 —— 先重命名(config 未动, 失败干净中止)
-        if ! mv "$NODES_DIR/${tag}.json" "$NODES_DIR/${new_tag}.json"; then
-            _error "节点元数据文件重命名失败(${tag}.json → ${new_tag}.json), 未做任何修改"
-            _press_any_key; return 1
-        fi
-        meta="$NODES_DIR/${new_tag}.json"
-
-        # 2. 原子提交新 metadata; 失败时反向 mv 恢复文件名(此时新文件仍是原内容), config 未动
-        if ! _atomic_write_json "$meta" "$newmeta"; then
-            _error "端口元数据提交失败, 恢复原文件名..."
-            mv -f "$NODES_DIR/${new_tag}.json" "$NODES_DIR/${tag}.json" 2>/dev/null || \
-                _error "元数据文件名恢复失败, 请手动检查 ${NODES_DIR}"
-            _press_any_key; return 1
-        fi
-
-        # 3. 最后提交 config(改端口 + 重命名主 tag + tunnel tag + 路由规则引用)。
-        #    _mutate_config 失败会自行恢复旧 config 并重启回旧端口; 这里同步回滚 metadata。
-        local jq_filter
-        jq_filter='(.inbounds[] | select(.tag == $t) | .tag) = $new_t
-| (.inbounds[] | select(.tag == $new_t) | .port) = $p'
-        if [ -n "$tunnel_tag" ]; then
-            jq_filter="$jq_filter
-| (.inbounds[] | select(.tag == \$tg) | .tag) = \$new_tg
-| .routing.rules |= map(
-    if .inboundTag != null and (.inboundTag | type) == \"array\"
-    then .inboundTag |= map(if . == \$tg then \$new_tg else . end)
-    else . end)"
-        fi
-        if ! _mutate_config --arg t "$tag" --arg new_t "$new_tag" --argjson p "$newport" \
-             --arg tg "$tunnel_tag" --arg new_tg "$new_tunnel_tag" "$jq_filter"; then
-            _error "端口配置提交失败, 回滚元数据到旧文件名与旧内容..."
-            rm -f "$NODES_DIR/${new_tag}.json" 2>/dev/null
-            _atomic_write_json "$NODES_DIR/${tag}.json" "$orig" || \
-                _error "元数据回滚失败, 请手动检查 ${NODES_DIR}/${tag}.json"
-            _press_any_key; return 1
-        fi
-
-        if [ "$rmode" = "tunnel" ]; then
-            _success "端口已改为 ${newport}(标签与 tunnel 标签已同步更新)"
-        else
-            _success "端口已改为 ${newport}(直连模式, 标签已同步更新)"
-        fi
-        # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
-        _sync_node_clash "$meta" "$old_name"
         _press_any_key
         return
     fi
 
-    # 非 hop 路径: 原流程(config -> metadata)
-    if ! _mutate_config --arg t "$tag" --argjson p "$newport" \
-         '(.inbounds[] | select(.tag == $t) | .port) = $p'; then
-        _error "端口修改失败, 已回滚"; _press_any_key; return 1
-    fi
-
-    # 先更新端口到元数据(rebuild 函数需要读新端口); 原子写(R15)
-    local port_meta
-    port_meta=$(jq --argjson p "$newport" '.port=$p' "$meta") || { _error "生成元数据失败"; _press_any_key; return 1; }
-    if ! _atomic_write_json "$meta" "$port_meta"; then
-        _error "端口元数据写入失败"; _press_any_key; return 1
-    fi
-
-    # 名称: 名称通常包含端口号。hy2 分支必须在重建派生状态**之前**把它落盘 ——
-    # 链接的 #fragment 与 clash 条目都取 .name, 后落会写出"新端口 + 旧名"的派生值
-    # (与 _hy2_gen_port_newmeta 在内存里先改名再重建同源)。其余协议保持原有的一次原子写。
-    local old_name new_name
+    # ----------------------------------------------------------------------
+    # 非 hop 路径: 统一端口事务(_port_txn), 与 _hy2_port_txn / Reality 分支同模型。
+    # 旧实现是 config → metadata 两段式且无回滚: config 提交成功而 metadata 写失败时
+    # 留下 "config 新端口 / metadata 旧端口" 的分裂。现在统一为:
+    #   内存生成完整新 metadata(port + name + share_link) → 原子提交 metadata
+    #   → 提交 config(_mutate_config 自带 verified-restart 与失败回滚); config 失败回滚 metadata。
+    # ----------------------------------------------------------------------
+    local old_name new_name newmeta tmpm newlink rebuild_rc=0
     old_name=$(jq -r '.name' "$meta")
     # F8: 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
     new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
 
-    # hy2: 派生状态(链接 + clash)走**唯一入口**。端口此刻已提交, 故这里绝不能因链接无法
-    # 表达而提前失败(否则链接/clash 会停在旧端口且报出误导性的"重建失败")。
     if [ "$proto" = "hysteria2" ]; then
-        if [ "$new_name" != "$old_name" ]; then
-            _meta_update "$meta" '.name=$n' --arg n "$new_name" || { _error "节点名称写入失败"; _press_any_key; return 1; }
+        # hy2 派生状态(链接 + clash)的唯一入口是 _hy2_sync_derived; 其"可表达→写回 /
+        # gecko 自定义尺寸→清空 / 缺字段→拒绝"三态在内存侧的等价实现就是
+        # _hy2_gen_port_newmeta(同一份 _hy2_link_unexpressible 判据), 故直接复用它一次生成
+        # port + name + share_link 并整体提交。旧写法"先提交端口 → 再单独写 name → 最后同步
+        # 派生"是三段式: name 那步失败会直接 return, 连派生同步都不做, 留下"新端口 + 旧链接/
+        # 旧 clash"的半完成状态。
+        newmeta=$(_hy2_gen_port_newmeta "$meta" "$newport") || {
+            _error "生成新元数据失败(元数据缺少必要字段), 端口未修改"
+            _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
+            _press_any_key; return 1
+        }
+        if ! _port_txn "$tag" "$meta" "$newport" "$newmeta"; then
+            _press_any_key; return 1
         fi
-        _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+        # 链接已随 metadata 一次提交; 这里补 clash 派生缓存(传 old_name: 改名后必须删掉旧名
+        # 条目, 否则 clash.yaml 残留指向旧端口的幽灵条目)
+        _hy2_sync_derived "$meta" "$old_name" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
         _success "端口已改为 ${newport}"
         _press_any_key
         return 0
     fi
 
-    # 非 hy2: 按协议重建分享链接(避免裸字符串替换误伤其他字段, S4)
-    # R38(M10): 消费 rebuild 的返回码 —— 被采纳的节点缺少 auth/public_key 等字段, 重建会失败;
-    # 此时必须保留原 share_link(config 端口已改, 链接需用户手动重建), 不能写入坏链接。
-    local newlink rebuild_rc=0
+    # 非 hy2: 同样在内存生成完整新 metadata, 从"承载新端口 + 新名称"的临时文件重建分享链接
+    # (链接的 #fragment 取 .name, 与 Reality 分支 / hy2 分支同源), 未落地任何真实文件。
+    tmpm=$(mktemp "${meta}.port.XXXXXX") || { _error "创建临时文件失败"; _press_any_key; return 1; }
+    if ! jq --argjson p "$newport" --arg n "$new_name" '.port=$p | .name=$n' "$meta" > "$tmpm"; then
+        rm -f "$tmpm"; _error "生成元数据失败"; _press_any_key; return 1
+    fi
     case "$proto" in
-        vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$meta") || rebuild_rc=1 ;;
-        vless-enc) newlink=$(_rebuild_vless_enc_link "$meta") || rebuild_rc=1 ;;
-        vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$meta") || rebuild_rc=1 ;;
+        vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$tmpm") || rebuild_rc=1 ;;
+        vless-enc) newlink=$(_rebuild_vless_enc_link "$tmpm") || rebuild_rc=1 ;;
+        vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$tmpm") || rebuild_rc=1 ;;
         *)
             # 其他协议: @ 锚定分割确保只替换 host:port 段(不误伤 path/sni/name)。
             # F7: 链接不含 @(被采纳节点的 "#tag (adopted)" 占位)时输出空串,
@@ -4178,23 +4538,20 @@ _modify_port() {
             ;;
     esac
 
-    # R38(M10): 重建失败或结果为空 -> 只提示, 不覆盖原 share_link
+    # R38(M10): 重建失败或结果为空(被采纳节点缺字段) -> 保留原 share_link, 只报告; 端口与
+    # 名称照常提交 —— 事务尚未开始, 不会出现"config 已改而链接没跟上"的中间态。
     if [ "$rebuild_rc" -ne 0 ] || [ -z "$newlink" ]; then
-        _warn "分享链接重建失败(元数据缺少必要字段), 端口已改为 ${newport} 但分享链接未更新"
+        _warn "分享链接重建失败(元数据缺少必要字段), 分享链接保持旧值"
         _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
-        _press_any_key
-        return 1
-    fi
-
-    # 同步更新节点名称(名称通常包含端口号) + 分享链接; 原子写(R15)
-    local meta2
-    if [ "$new_name" != "$old_name" ]; then
-        meta2=$(jq --arg l "$newlink" --arg n "$new_name" '.share_link=$l | .name=$n' "$meta") || { _error "生成元数据失败"; _press_any_key; return 1; }
+        newmeta=$(cat "$tmpm" 2>/dev/null) || newmeta=""
     else
-        meta2=$(jq --arg l "$newlink" '.share_link=$l' "$meta") || { _error "生成元数据失败"; _press_any_key; return 1; }
+        newmeta=$(jq --arg l "$newlink" '.share_link=$l' "$tmpm") || newmeta=""
     fi
-    if ! _atomic_write_json "$meta" "$meta2"; then
-        _error "分享链接元数据写入失败"; _press_any_key; return 1
+    rm -f "$tmpm"
+    [ -n "$newmeta" ] || { _error "生成元数据失败"; _press_any_key; return 1; }
+
+    if ! _port_txn "$tag" "$meta" "$newport" "$newmeta"; then
+        _press_any_key; return 1
     fi
     # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
     _sync_node_clash "$meta" "$old_name"
