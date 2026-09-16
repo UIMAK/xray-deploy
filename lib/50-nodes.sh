@@ -3228,20 +3228,105 @@ EOF
     _success "TLS 证书已生成: $cert_dir"
 }
 
-# 放弃创建节点时, 清掉**本次新建**的自签证书目录(既有证书与自定义证书绝不进入本路径)。
-# 只在"配置尚未提交"的失败路径调用 —— 提交成功后节点已引用该证书, 删掉会让节点不可用。
-_hy2_cert_discard_fresh() {
-    local dir="$1"
-    [ -n "$dir" ] || return 0
-    case "$dir" in
-        "$CERT_DIR"/*) ;;
-        *) _warn "自签证书清理跳过(路径不在 ${CERT_DIR} 内): $dir"; return 0 ;;
+# 路径的**真实身份**是否在 $CERT_DIR 之内(删除/还原这类破坏性动作的前置闸门)。
+# 只做词面前缀匹配不够: "certs/tag/../../important" 同样满足 "$CERT_DIR"/*, 而 rm -rf 的
+# 落点在 CERT_DIR 之外。故三重校验: ① 词面前缀(且不能就是 CERT_DIR 自身) ② 逐段拒绝 ".."
+# ③ 目标存在时用 pwd -P 解析真实路径复核(符号链接指向目录外同样被拒)。
+_hy2_cert_path_inside() {
+    local p="$1" base real comp
+    case "$p" in
+        "$CERT_DIR"/?*) ;;
+        *) return 1 ;;
     esac
-    rm -rf "$dir" 2>/dev/null
-    [ -e "$dir" ] && _warn "自签证书清理失败, 已残留: $dir"
+    local IFS='/'
+    for comp in $p; do
+        [ "$comp" = ".." ] && return 1
+    done
+    [ -e "$p" ] || return 0   # 不存在: 前缀 + 无 .. 已足够(后续动作也是 no-op)
+    base=$(cd "$CERT_DIR" 2>/dev/null && pwd -P) || return 1
+    if [ -d "$p" ]; then
+        real=$(cd "$p" 2>/dev/null && pwd -P) || return 1
+    else
+        # 文件路径: cd 会失败 ⇒ 解析父目录真实路径后拼回文件名(父目录的符号链接同样被复核)
+        real=$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)/$(basename "$p") || return 1
+    fi
+    case "$real" in
+        "$base"/?*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 证书 Subject CN(无 openssl / 读不到 ⇒ 空输出)
+_hy2_cert_cn() {
+    local cert="$1"
+    command -v openssl >/dev/null 2>&1 || return 0
+    [ -f "$cert" ] || return 0
+    openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's|/.*||'
+}
+
+# 可作为客户端 SNI 默认值的**具体** SAN 名(通配符 *.example.com 是匹配规则、不是合法 SNI,
+# 故跳过; 证书另有具体 SAN 时仍会命中它)。无可用项返回 1。
+_hy2_cert_sni_hint() {
+    local cert="$1" n
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        case "$n" in \*.*) continue ;; esac
+        printf '%s' "$n"; return 0
+    done <<< "$(_hy2_cert_san_names "$cert")"
+    return 1
+}
+
+# 证书快照/回滚: 让"本次重新生成证书"成为**节点创建事务的一部分**。
+# 为什么不能只看目录是否存在: 目录已存在(上次删节点时选了保留证书)但域名变了时, _gen_hy2_cert
+# 成功后旧 cert/key 已被替换、它自己的备份也已删除 —— 若此后 render/commit 失败, 只"删掉新建
+# 目录"的旧实现会因判据为假而完全不动, 留下没有任何节点引用的新证书, 且旧证书不可恢复。
+# 快照放 DEPLOY_DIR 下的临时目录(不能放 CERT_DIR 内, 否则自己会污染"目录是否为空"的判据)。
+# 用法: _hy2_cert_snapshot <cert> <key>   → stdout 快照目录; 失败返回 1
+_hy2_cert_snapshot() {
+    local cert="$1" key="$2" dir rc=0
+    dir=$(mktemp -d "$DEPLOY_DIR/hy2cert.bak.XXXXXX") || return 1
+    if [ -f "$cert" ]; then cp -p "$cert" "$dir/cert.pem" 2>/dev/null || rc=1; fi
+    if [ "$rc" = 0 ] && [ -f "$key" ]; then cp -p "$key" "$dir/key.pem" 2>/dev/null || rc=1; fi
+    if [ "$rc" != 0 ]; then
+        rm -rf "$dir" 2>/dev/null
+        [ -e "$dir" ] && _warn "证书快照清理失败, 已残留: $dir"
+        return 1
+    fi
+    printf '%s' "$dir"
+}
+
+# 丢弃证书快照(节点创建成功后调用 —— 本次改动已被节点引用, 不再需要回滚点)
+_hy2_cert_snapshot_drop() {
+    local bak="$1"
+    [ -n "$bak" ] || return 0
+    rm -rf "$bak" 2>/dev/null
+    [ -e "$bak" ] && _warn "证书快照清理失败, 已残留: $bak"
     return 0
 }
 
+# 撤销本次证书改动(仅"配置尚未提交"的失败路径调用 —— 提交成功后节点已引用该证书, 删掉
+# 会让节点不可用)。语义: 快照里有 cert/key ⇒ 还原; 没有 ⇒ 本次是新建, 删掉这些文件。
+# 用法: _hy2_cert_restore <快照目录> <cert> <key> <证书目录>
+# 调用方负责只在"自签且本次真的生成过"时调用; 本函数再用路径闸门兜底。
+_hy2_cert_restore() {
+    local bak="$1" cert="$2" key="$3" cdir="$4" ok=1
+    _hy2_cert_path_inside "$cert" || { _warn "证书回滚跳过(路径不在 ${CERT_DIR} 内): $cert"; _hy2_cert_snapshot_drop "$bak"; return 0; }
+    if [ -n "$bak" ] && [ -f "$bak/cert.pem" ]; then
+        cp -p "$bak/cert.pem" "$cert" 2>/dev/null || ok=0
+    else
+        rm -f "$cert" 2>/dev/null || ok=0
+    fi
+    if [ -n "$bak" ] && [ -f "$bak/key.pem" ]; then
+        cp -p "$bak/key.pem" "$key" 2>/dev/null || ok=0
+    else
+        rm -f "$key" 2>/dev/null || ok=0
+    fi
+    [ "$ok" = 1 ] || _warn "证书回滚未完整完成, 请检查: $cdir"
+    # 清掉已空的目录(rmdir 仅在空目录成功 ⇒ 不会误删既有内容; 非空失败即静默保留)
+    [ "$ok" = 1 ] && [ -d "$cdir" ] && rmdir "$cdir" 2>/dev/null
+    _hy2_cert_snapshot_drop "$bak"
+    return 0
+}
 # 节点正在使用的自签证书目录(仅 $CERT_DIR 之内)。返回 1 且无输出 = 该节点不是自签证书,
 # 或证书落在 CERT_DIR 之外(自定义证书永不删除)。
 # 交叉校验: metadata 声明 `self_signed=true`, config 里该入站的 certificateFile 是事实;
@@ -3251,13 +3336,24 @@ _hy2_self_cert_dir() {
     [ "$(jq -r '.self_signed // false' "$NODES_DIR/${tag}.json" 2>/dev/null)" = "true" ] || return 1
     d=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[0].certificateFile // empty' "$CONFIG_FILE" 2>/dev/null | head -1)
     [ -n "$d" ] || d="$CERT_DIR/$tag/cert.pem"
-    case "$d" in
-        "$CERT_DIR"/*) ;;
-        *) return 1 ;;
-    esac
+    _hy2_cert_path_inside "$d" || return 1
     d=$(dirname "$d")
-    [ "$d" != "$CERT_DIR" ] || return 1
+    _hy2_cert_path_inside "$d" || return 1
     printf '%s' "$d"
+}
+
+# 证书目录是否仍被 config 里的入站引用(节点删除成功后才调用 ⇒ 命中的都是存活引用)。
+# config 里被手工写成 `..` 形式的引用无法安全比较, 一律保守判定为"仍被引用"。
+_hy2_cert_dir_referenced() {
+    local dir="$1" refs ref
+    refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]?.certificateFile // empty' "$CONFIG_FILE" 2>/dev/null)
+    [ -n "$refs" ] || return 1
+    case "$refs" in *".."*) return 0 ;; esac
+    while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        case "$ref" in "$dir"/?*) return 0 ;; esac
+    done <<< "$refs"
+    return 1
 }
 
 # 删除节点时询问是否一并删除自签证书(自定义证书不提示、不删除)。结果放入 _HY2_CERT_PURGE,
@@ -3289,14 +3385,18 @@ _hy2_ask_purge_self_certs() {
 }
 
 # 落地删除上一步收集的自签证书目录(仅在节点删除成功后调用)。
+# 删除前两道闸: ① 路径真实落在 CERT_DIR 内(_hy2_cert_path_inside: 前缀 + 拒绝 ".." + pwd -P
+# 复核符号链接); ② config 里已无存活入站引用它 —— 手工改 config / 采纳孤儿可能让多个入站
+# 共用一个证书目录, 直接 rm -rf 会让仍在运行的节点立刻失去证书。
 _hy2_purge_self_certs() {
     [ "${#_HY2_CERT_PURGE[@]}" -gt 0 ] || return 0
     local d n=0
     for d in "${_HY2_CERT_PURGE[@]}"; do
-        case "$d" in
-            "$CERT_DIR"/*) [ "$d" != "$CERT_DIR" ] || continue ;;
-            *) _warn "跳过 ${CERT_DIR} 之外的证书路径: $d"; continue ;;
-        esac
+        _hy2_cert_path_inside "$d" || { _warn "跳过 ${CERT_DIR} 之外的证书路径: $d"; continue; }
+        if _hy2_cert_dir_referenced "$d"; then
+            _warn "证书目录仍被其它入站引用, 已保留: $d"
+            continue
+        fi
         rm -rf "$d" 2>/dev/null
         if [ -e "$d" ]; then _warn "自签证书删除失败, 已残留: $d"; else n=$((n+1)); fi
     done
@@ -3325,21 +3425,32 @@ _add_hysteria2() {
         cert_file="$custom_cert"; key_file="$custom_key"
         tls_mode="custom"
         _info "使用自定义证书: $cert_file"
-        # SNI 一律以**证书实际身份**为准(SAN 优先, 无 SAN 才回退 CN), **绝不用硬编码默认值**:
-        # 证书与 SNI 脱节时客户端校验必失败, 而提示里的默认值会让用户以为它来自证书。
-        # 读不到身份(无 openssl / 证书无 SAN 且无 CN)时不给默认值, 必须手输。
-        local cert_hint="" sni_in=""
-        cert_hint=$(_hy2_cert_domain "$cert_file")
+        # SNI 默认值只取**可用于现代主机名校验的具体 SAN**, 绝不用硬编码默认值:
+        #   - 通配符 SAN(*.example.com)是匹配规则、不是合法 SNI, 不能当默认值(否则会被
+        #     域名校验拒绝, 用户必须先撞一次错);
+        #   - CN-only 证书在现代校验下无效(Go crypto/x509 忽略 CN, Xray 官方 tls.md 亦要求
+        #     serverName 存在于证书 SAN), 同样不给默认值。
+        # 两种情形都只告警 + 要求手输, 不替用户猜一个"看起来对"的值。
+        local cert_hint="" cert_cn="" sni_in=""
+        cert_hint=$(_hy2_cert_sni_hint "$cert_file") || cert_hint=""
+        if [ -z "$cert_hint" ]; then
+            if [ -n "$(_hy2_cert_san_names "$cert_file")" ]; then
+                _warn "证书 SAN 只有通配符; 通配符不能作为客户端 SNI, 请填写一个具体主机名"
+            else
+                cert_cn=$(_hy2_cert_cn "$cert_file")
+                [ -n "$cert_cn" ] && _warn "证书只有 CN(${cert_cn}) 且无 SAN; 现代 TLS 主机名校验忽略 CN, 该证书可能无法通过客户端校验"
+            fi
+        fi
         while :; do
             if [ -n "$cert_hint" ]; then
                 read -rp "  SNI (默认 ${cert_hint}): " sni_in
                 sni_in=${sni_in:-$cert_hint}
             else
-                read -rp "  SNI (无法从证书读取域名, 请手动输入): " sni_in
+                read -rp "  SNI (证书无可用 SAN, 请手动输入具体主机名): " sni_in
             fi
             [ "$sni_in" = "0" ] && { _info "已取消"; return 1; }
             if [ -z "$sni_in" ]; then
-                _error "无法从证书读取 SAN/CN, SNI 不能为空"
+                _error "无法从证书读取可用 SAN, SNI 不能为空"
                 continue
             fi
             if _validate_domain "$sni_in"; then sni="$sni_in"; break; fi
@@ -3448,15 +3559,19 @@ _add_hysteria2() {
     # ---------------------------------------------------------------------
     # 自签证书: **所有提问结束后、即将提交配置时才真正生成**(0.17.7)。
     # 早先是在 TLS 提问阶段就生成, 于是"生成后 ^C / 中途放弃"会留下一个没有任何节点引用的
-    # 证书目录(实测); 提交失败时同样会留下。故: 生成推迟到此, 且本次新建的目录在"配置尚未
-    # 提交"的失败路径上由 _hy2_cert_discard_fresh 清掉 —— 证书只在节点真正创建时保留。
-    # 既有证书(复用)与自定义证书永远不进入清理路径。
+    # 证书目录(实测); 提交失败时同样会留下。故: 生成推迟到此, 且**生成本身纳入节点创建
+    # 事务** —— 生成前先对既有 cert/key 做快照, render/commit 失败时按快照还原(快照里没有
+    # 的说明是本次新建, 删掉), 而不是只看"目录是不是新出现的"。
+    # 只看目录会漏掉一类真实残局: 目录已存在(上次删节点选了保留证书)但域名变了 ⇒ 重新生成
+    # 已把旧证书替换掉、_gen_hy2_cert 自己的备份也已删除, 此时"删新建目录"判据为假 ⇒ 既不还原
+    # 也不清理, 留下无节点引用的新证书且旧证书不可恢复。
+    # 既有证书(可复用)与自定义证书不生成 ⇒ 无快照、不进入回滚路径。
     # ---------------------------------------------------------------------
-    local fresh_cert_dir=""
+    local cert_bak="" cert_dirty="false" cert_dir_existed="false"
     if [ "$tls_mode" = "selfsigned" ]; then
         cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
-        local cert_dir="$CERT_DIR/$tag" cert_existed="false" genrc=0
-        [ -e "$cert_dir" ] && cert_existed="true"
+        local cert_dir="$CERT_DIR/$tag" genrc=0
+        [ -e "$cert_dir" ] && cert_dir_existed="true"
         if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
             # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
             # 复用但如实报告, 不假装证书身份已与输入域名统一。
@@ -3468,13 +3583,17 @@ _add_hysteria2() {
         else
             [ -f "$cert_file" ] && [ -f "$key_file" ] && \
                 _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $cert_dir"
+            cert_bak=$(_hy2_cert_snapshot "$cert_file" "$key_file") || {
+                _error "证书快照失败(无法备份既有证书), 已中止, 未生成新证书"; return 1; }
             _gen_hy2_cert "$tag" "$self_domain" || genrc=$?
             if [ "$genrc" != 0 ]; then
-                # 生成失败: 目录是本次新建时顺手清掉空目录(rc=2 的备份必须保留, 不动)
-                [ "$genrc" = 1 ] && [ "$cert_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
+                # 生成失败: 证书已是提交前状态(生成器自带回滚), 丢掉快照即可;
+                # 目录是本次新建且已空 ⇒ 顺手清掉(rc=2 的备份必须保留, 绝不动)
+                _hy2_cert_snapshot_drop "$cert_bak"
+                [ "$genrc" = 1 ] && [ "$cert_dir_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
                 return 1
             fi
-            [ "$cert_existed" = "false" ] && fresh_cert_dir="$cert_dir"
+            cert_dirty="true"
         fi
         # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
         # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
@@ -3492,14 +3611,16 @@ _add_hysteria2() {
     R_OBFS_MASK_BLOCK="$obfs_mask"
     local inbound
     if ! inbound=$(_render_template "$(_tpl_path hysteria2)"); then
-        _hy2_cert_discard_fresh "$fresh_cert_dir"
+        [ "$cert_dirty" = "true" ] && _hy2_cert_restore "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag"
         return 1
     fi
 
     if ! _commit_inbound "$inbound"; then
-        _hy2_cert_discard_fresh "$fresh_cert_dir"
+        [ "$cert_dirty" = "true" ] && _hy2_cert_restore "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag"
         return 1
     fi
+    # 配置已提交(节点已引用该证书) ⇒ 回滚点作废
+    [ "$cert_dirty" = "true" ] && _hy2_cert_snapshot_drop "$cert_bak"
 
     local addr
     addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
