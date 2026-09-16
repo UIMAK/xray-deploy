@@ -108,10 +108,12 @@ _has_reality_nodes() {
 # 主菜单
 # ---------------------------------------------------------------------------
 _main_menu() {
-    # 启动时: 自动补 tag + 自动采纳孤儿入站 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
-    # 后两个用 declare -F 守卫: 混装版本(90-menu 已更新而 20/30-geo 未更新)时静默跳过
+    # 启动时: 自动补 tag + 自动采纳孤儿入站 + 恢复中断的端口事务 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
+    # 后三个用 declare -F 守卫: 混装版本(90-menu 已更新而 20/30/50-nodes 未更新)时静默跳过
     _auto_tag_tagless_inbounds
     _auto_adopt_orphans
+    # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
+    if declare -F _port_txn_recover >/dev/null 2>&1; then _port_txn_recover; fi
     if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
     if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
     _normalize_config_format
