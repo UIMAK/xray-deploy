@@ -3228,15 +3228,91 @@ EOF
     _success "TLS 证书已生成: $cert_dir"
 }
 
+# 放弃创建节点时, 清掉**本次新建**的自签证书目录(既有证书与自定义证书绝不进入本路径)。
+# 只在"配置尚未提交"的失败路径调用 —— 提交成功后节点已引用该证书, 删掉会让节点不可用。
+_hy2_cert_discard_fresh() {
+    local dir="$1"
+    [ -n "$dir" ] || return 0
+    case "$dir" in
+        "$CERT_DIR"/*) ;;
+        *) _warn "自签证书清理跳过(路径不在 ${CERT_DIR} 内): $dir"; return 0 ;;
+    esac
+    rm -rf "$dir" 2>/dev/null
+    [ -e "$dir" ] && _warn "自签证书清理失败, 已残留: $dir"
+    return 0
+}
+
+# 节点正在使用的自签证书目录(仅 $CERT_DIR 之内)。返回 1 且无输出 = 该节点不是自签证书,
+# 或证书落在 CERT_DIR 之外(自定义证书永不删除)。
+# 交叉校验: metadata 声明 `self_signed=true`, config 里该入站的 certificateFile 是事实;
+# 事实缺失(入站已被外部删除)时回退按 tag 推导的固定目录 —— 与创建路径同源。
+_hy2_self_cert_dir() {
+    local tag="$1" d=""
+    [ "$(jq -r '.self_signed // false' "$NODES_DIR/${tag}.json" 2>/dev/null)" = "true" ] || return 1
+    d=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[0].certificateFile // empty' "$CONFIG_FILE" 2>/dev/null | head -1)
+    [ -n "$d" ] || d="$CERT_DIR/$tag/cert.pem"
+    case "$d" in
+        "$CERT_DIR"/*) ;;
+        *) return 1 ;;
+    esac
+    d=$(dirname "$d")
+    [ "$d" != "$CERT_DIR" ] || return 1
+    printf '%s' "$d"
+}
+
+# 删除节点时询问是否一并删除自签证书(自定义证书不提示、不删除)。结果放入 _HY2_CERT_PURGE,
+# 由 _hy2_purge_self_certs 在节点删除**成功后**落地 —— 删除失败(已回滚)时不能动证书。
+_HY2_CERT_PURGE=()
+_hy2_ask_purge_self_certs() {
+    _HY2_CERT_PURGE=()
+    local dirs=() t d i dup ans
+    for t in "$@"; do
+        d=$(_hy2_self_cert_dir "$t") || continue
+        dup=0
+        i=0
+        while [ "$i" -lt "${#dirs[@]}" ]; do
+            [ "${dirs[$i]}" = "$d" ] && { dup=1; break; }
+            i=$((i+1))
+        done
+        [ "$dup" = 1 ] && continue
+        dirs+=("$d")
+    done
+    [ "${#dirs[@]}" -gt 0 ] || return 0
+    echo -e "  ${CYAN}检测到 ${#dirs[@]} 个节点使用自签证书:${NC}"
+    for d in "${dirs[@]}"; do echo "    - $d"; done
+    read -rp "  一并删除这些自签证书? [y/N]: " ans
+    case "$ans" in
+        y|Y) _HY2_CERT_PURGE=("${dirs[@]}") ;;
+        *) _info "保留自签证书(仅删除节点)" ;;
+    esac
+    return 0
+}
+
+# 落地删除上一步收集的自签证书目录(仅在节点删除成功后调用)。
+_hy2_purge_self_certs() {
+    [ "${#_HY2_CERT_PURGE[@]}" -gt 0 ] || return 0
+    local d n=0
+    for d in "${_HY2_CERT_PURGE[@]}"; do
+        case "$d" in
+            "$CERT_DIR"/*) [ "$d" != "$CERT_DIR" ] || continue ;;
+            *) _warn "跳过 ${CERT_DIR} 之外的证书路径: $d"; continue ;;
+        esac
+        rm -rf "$d" 2>/dev/null
+        if [ -e "$d" ]; then _warn "自签证书删除失败, 已残留: $d"; else n=$((n+1)); fi
+    done
+    [ "$n" -gt 0 ] && _info "已删除 ${n} 个自签证书目录"
+    _HY2_CERT_PURGE=()
+    return 0
+}
+
 _add_hysteria2() {
     echo -e "\n  ${CYAN}=== Hysteria2 (QUIC · 可直连 · 需 TLS 证书) ===${NC}"
     local port=$(_input_port udp)
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
-    local cert_file="" key_file="" self_signed="false" sni="build.nvidia.com" self_domain=""
-    echo -e "  TLS 证书:"
-    echo -e "  回车使用自签证书, 或输入证书文件路径"
+    local cert_file="" key_file="" self_signed="false" sni="" self_domain="" tls_mode=""
+    echo -e "  TLS 证书 回车使用自签证书, 或输入证书文件路径"
     read -rp "  cert 路径 (回车自签): " custom_cert
     if [ -n "$custom_cert" ]; then
         read -rp "  key 路径: " custom_key
@@ -3247,46 +3323,41 @@ _add_hysteria2() {
             _error "证书文件不存在"; return 1
         fi
         cert_file="$custom_cert"; key_file="$custom_key"
+        tls_mode="custom"
         _info "使用自定义证书: $cert_file"
-        # 从证书提取 CN 作为 SNI 建议
-        local cert_cn=""
-        if command -v openssl >/dev/null 2>&1; then
-            cert_cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's/\/.*//')
-        fi
-        if [ -n "$cert_cn" ]; then
-            read -rp "  SNI (默认 ${cert_cn}): " custom_sni
-            sni=${custom_sni:-$cert_cn}
-        else
-            read -rp "  SNI (证书域名): " custom_sni
-            sni=${custom_sni:-build.nvidia.com}
-        fi
-    else
-        # 自签证书: 域名是客户端 SNI 的唯一来源, 必须可输入(不能写死) —— 与官方 Hysteria2
-        # 模块的「证书域名/SAN」口径一致。回车用默认 build.nvidia.com。
-        read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain
-        self_domain=${self_domain:-build.nvidia.com}
-        cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
-        self_signed="true"
-        if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
-            # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
-            # 复用但如实报告, 不假装证书身份已与输入域名统一。
-            if ! command -v openssl >/dev/null 2>&1; then
-                _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${self_domain})"
-                _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
+        # SNI 一律以**证书实际身份**为准(SAN 优先, 无 SAN 才回退 CN), **绝不用硬编码默认值**:
+        # 证书与 SNI 脱节时客户端校验必失败, 而提示里的默认值会让用户以为它来自证书。
+        # 读不到身份(无 openssl / 证书无 SAN 且无 CN)时不给默认值, 必须手输。
+        local cert_hint="" sni_in=""
+        cert_hint=$(_hy2_cert_domain "$cert_file")
+        while :; do
+            if [ -n "$cert_hint" ]; then
+                read -rp "  SNI (默认 ${cert_hint}): " sni_in
+                sni_in=${sni_in:-$cert_hint}
+            else
+                read -rp "  SNI (无法从证书读取域名, 请手动输入): " sni_in
             fi
-            _info "已有证书, 复用: $CERT_DIR/$tag"
-        else
-            [ -f "$cert_file" ] && [ -f "$key_file" ] && \
-                _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $CERT_DIR/$tag"
-            _gen_hy2_cert "$tag" "$self_domain" || return 1
-        fi
-        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
-        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
-        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
-        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
-        local self_cert_domain
-        self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
-        sni=${self_cert_domain:-$self_domain}
+            [ "$sni_in" = "0" ] && { _info "已取消"; return 1; }
+            if [ -z "$sni_in" ]; then
+                _error "无法从证书读取 SAN/CN, SNI 不能为空"
+                continue
+            fi
+            if _validate_domain "$sni_in"; then sni="$sni_in"; break; fi
+            _error "SNI 格式非法(仅字母/数字/连字符, 点分段): ${sni_in}"
+        done
+    else
+        # 自签证书: 域名会写进证书 CN/SAN, 是客户端 SNI 的唯一来源, 必须可输入(不能写死)
+        # —— 与官方 Hysteria2 模块的「证书域名/SAN」口径一致。回车用默认 build.nvidia.com。
+        # **生成推迟到提交节点之前**(见下方 tls_mode=selfsigned 分支): 提前生成会让"中途
+        # 放弃 / ^C"留下一个没有任何节点引用的证书目录(实测)。
+        while :; do
+            read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain
+            [ "$self_domain" = "0" ] && { _info "已取消"; return 1; }
+            self_domain=${self_domain:-build.nvidia.com}
+            _validate_domain "$self_domain" && break
+            _error "域名格式非法(仅字母/数字/连字符, 点分段): ${self_domain}"
+        done
+        tls_mode="selfsigned"; self_signed="true"
     fi
 
     # 认证密码
@@ -3374,15 +3445,61 @@ _add_hysteria2() {
         [ -n "$brutal_down" ] && brutal_block="${brutal_block}, \"brutalDown\": \"${brutal_down}\""
     fi
 
+    # ---------------------------------------------------------------------
+    # 自签证书: **所有提问结束后、即将提交配置时才真正生成**(0.17.7)。
+    # 早先是在 TLS 提问阶段就生成, 于是"生成后 ^C / 中途放弃"会留下一个没有任何节点引用的
+    # 证书目录(实测); 提交失败时同样会留下。故: 生成推迟到此, 且本次新建的目录在"配置尚未
+    # 提交"的失败路径上由 _hy2_cert_discard_fresh 清掉 —— 证书只在节点真正创建时保留。
+    # 既有证书(复用)与自定义证书永远不进入清理路径。
+    # ---------------------------------------------------------------------
+    local fresh_cert_dir=""
+    if [ "$tls_mode" = "selfsigned" ]; then
+        cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
+        local cert_dir="$CERT_DIR/$tag" cert_existed="false" genrc=0
+        [ -e "$cert_dir" ] && cert_existed="true"
+        if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
+            # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
+            # 复用但如实报告, 不假装证书身份已与输入域名统一。
+            if ! command -v openssl >/dev/null 2>&1; then
+                _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${self_domain})"
+                _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
+            fi
+            _info "已有证书, 复用: $cert_dir"
+        else
+            [ -f "$cert_file" ] && [ -f "$key_file" ] && \
+                _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $cert_dir"
+            _gen_hy2_cert "$tag" "$self_domain" || genrc=$?
+            if [ "$genrc" != 0 ]; then
+                # 生成失败: 目录是本次新建时顺手清掉空目录(rc=2 的备份必须保留, 不动)
+                [ "$genrc" = 1 ] && [ "$cert_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
+                return 1
+            fi
+            [ "$cert_existed" = "false" ] && fresh_cert_dir="$cert_dir"
+        fi
+        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
+        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
+        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
+        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
+        local self_cert_domain
+        self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
+        sni=${self_cert_domain:-$self_domain}
+    fi
+
     # 渲染模板
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag"
     R_AUTH="$auth" R_CERT_FILE="$cert_file" R_KEY_FILE="$key_file"
     R_CONGESTION="$congestion" R_BRUTAL_PARAMS_BLOCK="$brutal_block"
     R_OBFS_MASK_BLOCK="$obfs_mask"
     local inbound
-    inbound=$(_render_template "$(_tpl_path hysteria2)") || return 1
+    if ! inbound=$(_render_template "$(_tpl_path hysteria2)"); then
+        _hy2_cert_discard_fresh "$fresh_cert_dir"
+        return 1
+    fi
 
-    _commit_inbound "$inbound" || return 1
+    if ! _commit_inbound "$inbound"; then
+        _hy2_cert_discard_fresh "$fresh_cert_dir"
+        return 1
+    fi
 
     local addr
     addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
@@ -3988,6 +4105,9 @@ _delete_node() {
             _error "没有可安全删除的节点"
             _press_any_key; return
         fi
+        # 自签证书: 只对 metadata 声明 self_signed=true 的节点提示(自定义证书不提示、不删除),
+        # 且在节点删除**成功后**才落地删除
+        _hy2_ask_purge_self_certs "${del_all[@]}"
         # 无排除项: 沿用原语义(清空 inbounds, 连手工添加的入站一并清掉)
         # 有排除项: 只删可安全删除的 tag(含其 tunnel_tag), 保留被排除节点的入站
         # (M2 同口径: 非对象规则元素保留, 避免 jq 整体报错)
@@ -4029,6 +4149,7 @@ _delete_node() {
                 printf 'proxies:\n' > "$CLASH_YAML"
             fi
             _success "已删除 ${#del_all[@]} 个节点"
+            _hy2_purge_self_certs
         else
             # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
             _hy2_hop_restore_after_teardown
@@ -4076,6 +4197,7 @@ _delete_node() {
             _error "没有可安全删除的节点"
             _press_any_key; return
         fi
+        _hy2_ask_purge_self_certs "${del_tags[@]}"
         local del_ttags=()
         for dt in "${del_tags[@]}"; do
             local dtt; dtt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${dt}.json" 2>/dev/null)
@@ -4107,6 +4229,7 @@ _delete_node() {
             # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
             _HY2_HOP_TD=()
             _success "已删除 ${#del_tags[@]} 个节点"
+            _hy2_purge_self_certs
         else
             # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
             _hy2_hop_restore_after_teardown
@@ -4172,6 +4295,7 @@ _delete_node() {
             fi
         fi
     fi
+    _hy2_ask_purge_self_certs "$tag"
     if _mutate_config --arg t "$tag" --arg tg "$tunnel_tag" "$jq_filter"; then
         # R18: 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
         # R19: 消费 YAML 删除返回值——失败不静默(权威删除已完成, clash.yaml 属派生导出)
@@ -4183,6 +4307,7 @@ _delete_node() {
         # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
         _HY2_HOP_TD=()
         _success "节点已删除"
+        _hy2_purge_self_certs
     else
         # config 提交失败(已回滚): 恢复已清理的 hop 规则
         # R38(P1): 原写法 `[ -n "$ranges" ] && A || _error` 在 ranges 为空时(任何非 hy2 /
