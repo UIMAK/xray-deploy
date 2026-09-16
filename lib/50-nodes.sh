@@ -2982,9 +2982,14 @@ _add_shadowsocks() {
 # 来源: Xray-examples/Hysteria2/server.jsonc + Xray-docs-next hysteria.md / finalmask.md
 # ---------------------------------------------------------------------------
 # 生成 Hysteria2 自签 TLS 证书(EC-256, 10 年)
-# 用法:_gen_hy2_cert <tag>  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
+# 用法:_gen_hy2_cert <tag> [domain]
+#   domain 缺省 build.nvidia.com(向后兼容旧调用)。证书 CN 取该值 —— 它是客户端 SNI,
+#   与分享链接/clash 的 sni 必须一致, 故由调用方传入而非写死。
+# 输出:CERT_FILE_PATH / KEY_FILE_PATH 全局变量
 _gen_hy2_cert() {
-    local tag="$1"
+    local tag="$1" domain="${2:-build.nvidia.com}"
+    # 证书域名会写进 X.509 CN, 从输入侧拒绝非法值(仅 LDH 域名, 与 _validate_domain 同口径)
+    _validate_domain "$domain" || { _error "证书域名格式非法(仅字母/数字/连字符, 点分段): $domain"; return 1; }
     local cert_dir="$CERT_DIR/$tag"
     mkdir -p "$cert_dir"
     CERT_FILE_PATH="${cert_dir}/cert.pem"
@@ -2993,18 +2998,18 @@ _gen_hy2_cert() {
         _info "已有证书, 复用: $cert_dir"
         return 0
     fi
-    _info "生成 TLS 自签证书..."
+    _info "生成 TLS 自签证书 (CN=${domain})..."
     if command -v openssl >/dev/null 2>&1; then
         openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE_PATH" 2>/dev/null \
             && openssl req -new -x509 -days 3650 -key "$KEY_FILE_PATH" \
-                -out "$CERT_FILE_PATH" -subj "/CN=build.nvidia.com" 2>/dev/null
+                -out "$CERT_FILE_PATH" -subj "/CN=${domain}" 2>/dev/null
     fi
     # 2026-09-12 三审(L8): openssl 缺失或执行失败(旧版/被裁剪)时回退 xray tls cert,
     # 而不是"openssl 存在但失败就直接报错"—— 报错文案明明写着"需安装 openssl 或使用 xray tls cert"。
     if { [ ! -f "$CERT_FILE_PATH" ] || [ ! -f "$KEY_FILE_PATH" ]; } && [ -x "$XRAY_BIN" ]; then
         # xray tls cert 的 --file 是"路径前缀", 实际产出 <前缀>.crt / <前缀>.key。
         # 因此前缀必须落在 cert_dir 内部(传目录本身会在其父目录生成 <目录名>.crt/.key)。
-        XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain build.nvidia.com \
+        XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain "$domain" \
             --file "${cert_dir}/cert" 2>/dev/null
         [ -f "${cert_dir}/cert.crt" ] && mv -f "${cert_dir}/cert.crt" "$CERT_FILE_PATH"
         [ -f "${cert_dir}/cert.key" ] && mv -f "${cert_dir}/cert.key" "$KEY_FILE_PATH"
@@ -3024,7 +3029,7 @@ _add_hysteria2() {
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
-    local cert_file="" key_file="" self_signed="false" sni="build.nvidia.com"
+    local cert_file="" key_file="" self_signed="false" sni="build.nvidia.com" self_domain=""
     echo -e "  TLS 证书:"
     echo -e "  回车使用自签证书, 或输入证书文件路径"
     read -rp "  cert 路径 (回车自签): " custom_cert
@@ -3051,9 +3056,21 @@ _add_hysteria2() {
             sni=${custom_sni:-build.nvidia.com}
         fi
     else
-        _gen_hy2_cert "$tag" || return 1
+        # 自签证书: 域名是客户端 SNI 的唯一来源, 必须可输入(不能写死) —— 与官方 Hysteria2
+        # 模块的「证书域名/SAN」口径一致。回车用默认 build.nvidia.com。
+        read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain
+        self_domain=${self_domain:-build.nvidia.com}
+        _gen_hy2_cert "$tag" "$self_domain" || return 1
         cert_file="$CERT_FILE_PATH"; key_file="$KEY_FILE_PATH"
         self_signed="true"
+        # SNI 以**证书实际 CN** 为准(证书已存在时会复用旧证书, 此时本次输入的域名并未生效;
+        # 直接用输入值会让链接/clash 的 sni 与实际证书脱节)。读不到 CN 才回退输入值。
+        sni="$self_domain"
+        if command -v openssl >/dev/null 2>&1; then
+            local self_cn
+            self_cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's/\/.*//')
+            [ -n "$self_cn" ] && sni="$self_cn"
+        fi
     fi
 
     # 认证密码
