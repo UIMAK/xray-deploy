@@ -3013,6 +3013,43 @@ _hy2_cert_key_match() {
     [ -n "$cpub" ] && [ "$cpub" = "$kpub" ]
 }
 
+# 把"已校验的临时 cert/key"提交到正式路径; 失败则把正式路径**还原为提交前状态**。
+# 用法:_hy2_cert_commit <tmp_cert> <tmp_key> <cert> <key>   (返回 0 = 提交成功)
+#
+# 为什么需要它: cert 与 key 是两个文件, 文件系统没有"同时原子替换两者"的原语, 因此提交
+# 必须是**可回滚的两步**。做法: 先把两个旧文件都备份 → 依次 mv 新 cert / 新 key →
+# 提交后校验正式路径确实匹配; 任何一步失败就按备份还原, 使"提交失败"不留下半更新状态
+# (只换掉 cert 而 key 仍是旧的, 或反之)。
+_hy2_cert_commit() {
+    local tmp_cert="$1" tmp_key="$2" cert="$3" key="$4"
+    local bak_cert="" bak_key="" rc=1
+    # 备份既有文件(可能不存在 —— 首次生成时), 备份名以 XXXXXX 结尾满足 Alpine musl mktemp
+    if [ -f "$cert" ]; then
+        bak_cert=$(mktemp "${cert}.bak.XXXXXX") || return 1
+        cp -p "$cert" "$bak_cert" 2>/dev/null || { rm -f "$bak_cert"; return 1; }
+    fi
+    if [ -f "$key" ]; then
+        bak_key=$(mktemp "${key}.bak.XXXXXX") || { [ -n "$bak_cert" ] && rm -f "$bak_cert"; return 1; }
+        cp -p "$key" "$bak_key" 2>/dev/null || { rm -f "$bak_key" "$bak_cert"; return 1; }
+    fi
+    # 提交(两步)。任一步失败 ⇒ 进入回滚。
+    if mv -f "$tmp_cert" "$cert" 2>/dev/null && mv -f "$tmp_key" "$key" 2>/dev/null; then
+        # 提交后校验正式路径确为一对匹配的 cert/key(兜底 rename 语义异常/外部干扰)
+        if _hy2_cert_key_match "$cert" "$key"; then
+            rc=0
+        fi
+    fi
+    if [ "$rc" != 0 ]; then
+        # 回滚: 用备份还原; 原本不存在的文件则删除(回到"没有该文件"的提交前状态)
+        if [ -n "$bak_cert" ]; then mv -f "$bak_cert" "$cert" 2>/dev/null; else rm -f "$cert"; fi
+        if [ -n "$bak_key" ]; then mv -f "$bak_key" "$key" 2>/dev/null; else rm -f "$key"; fi
+        return 1
+    fi
+    [ -n "$bak_cert" ] && rm -f "$bak_cert"
+    [ -n "$bak_key" ] && rm -f "$bak_key"
+    return 0
+}
+
 # 证书可用于客户端 SNI 的域名
 # 用法:_hy2_cert_domain <cert> [preferred]
 #   preferred(通常=本次请求域名)在 SAN 中时优先返回它 —— 多 SAN 证书里"取排序后第一个"
@@ -3122,16 +3159,17 @@ EOF
     if [ -s "$tmp_cert" ] && [ -s "$tmp_key" ]; then
         # 校验 1(有 openssl 时): 证书必须真的带本次域名的 SAN —— 否则静默退回 CN-only,
         #   Xray 的 serverName 校验必失败。无 openssl 走 xray 分支, 其证书自带 SAN, 无从也无需读。
-        # 校验 2: cert 与 key 必须同属一个密钥对 —— 这是"旧 cert + 新 key"错配的唯一防线。
-        # 两项都过才提交; 提交是同目录两次 rename(相邻执行, 窗口极小), 失败则回滚为"不动"。
+        # 校验 2: cert 与 key 必须同属一个密钥对 —— 这是"旧 cert + 新 key"错配的防线。
+        # 两项都过才**提交**; 提交走 _hy2_cert_commit(可回滚的两步 mv), 任一步失败即还原既有文件,
+        # 绝不留"新 cert + 旧 key"这类半更新状态。
         if { ! command -v openssl >/dev/null 2>&1 || _hy2_cert_san_has "$tmp_cert" "$domain"; } \
            && _hy2_cert_key_match "$tmp_cert" "$tmp_key"; then
-            mv -f "$tmp_cert" "$CERT_FILE_PATH" && mv -f "$tmp_key" "$KEY_FILE_PATH" && rc=0
+            _hy2_cert_commit "$tmp_cert" "$tmp_key" "$CERT_FILE_PATH" "$KEY_FILE_PATH" && rc=0
         fi
     fi
     rm -f "$tmp_cert" "$tmp_key"
     if [ "$rc" != 0 ]; then
-        _error "证书生成失败(cert/key 不完整、SAN 不含 ${domain} 或二者不匹配); 既有证书未改动, 需安装 openssl 或使用 xray tls cert"
+        _error "证书生成失败(cert/key 不完整、SAN 不含 ${domain} 或二者不匹配, 或提交失败已回滚); 既有证书保持原样, 需安装 openssl 或使用 xray tls cert"
         return 1
     fi
     _success "TLS 证书已生成: $cert_dir"
