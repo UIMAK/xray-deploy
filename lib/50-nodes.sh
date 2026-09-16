@@ -2981,38 +2981,248 @@ _add_shadowsocks() {
 # 模板: templates/hysteria2.server.jsonc
 # 来源: Xray-examples/Hysteria2/server.jsonc + Xray-docs-next hysteria.md / finalmask.md
 # ---------------------------------------------------------------------------
+# 自签证书 SAN 读取(现代 TLS 只认 SAN, 见 _gen_hy2_cert 注释)
+# ---------------------------------------------------------------------------
+# 列出证书 SAN 中的 DNS 名(每行一个, 去重); 无 SAN / 无 openssl / 读不到 ⇒ 输出为空
+_hy2_cert_san_names() {
+    local cert="$1" text=""
+    command -v openssl >/dev/null 2>&1 || return 0
+    [ -f "$cert" ] || return 0
+    # 优先 -ext subjectAltName(OpenSSL 1.1.1+/LibreSSL 3.1+), 不支持时回退整份 -text
+    text=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null)
+    [ -n "$text" ] || text=$(openssl x509 -in "$cert" -noout -text 2>/dev/null)
+    printf '%s\n' "$text" | grep -oE 'DNS:[^,[:space:]]+' | sed 's/^DNS://' | sort -u
+}
+
+# 证书 SAN 是否精确覆盖给定域名(含则返回 0)
+_hy2_cert_san_has() {
+    local cert="$1" domain="$2"
+    [ -n "$domain" ] || return 1
+    _hy2_cert_san_names "$cert" | grep -qxF "$domain"
+}
+
+# 证书与其私钥是否属于同一密钥对(cert 公钥 == key 公钥)
+# 用于生成后校验: 防止"旧 cert + 新 key"这类错配被当成有效证书对(见 _gen_hy2_cert)。
+# 无 openssl 时无从校验 ⇒ 返回 0(放行, 与 _hy2_cert_reusable 的无 openssl 口径一致)。
+_hy2_cert_key_match() {
+    local cert="$1" key="$2" cpub kpub
+    command -v openssl >/dev/null 2>&1 || return 0
+    [ -f "$cert" ] && [ -f "$key" ] || return 1
+    cpub=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null) || return 1
+    kpub=$(openssl pkey -in "$key" -pubout 2>/dev/null) || return 1
+    [ -n "$cpub" ] && [ "$cpub" = "$kpub" ]
+}
+
+# 删除证书备份文件。删不掉**不算**事务失败(残留 .bak 不影响运行态), 但必须如实报告 ——
+# 项目原则: 文件操作失败不得静默吞掉(logrotate 的 `|| true` 洗返回码就是 P1 教训)。
+_hy2_cert_bak_rm() {
+    local f
+    for f in "$@"; do
+        [ -n "$f" ] || continue
+        rm -f "$f" 2>/dev/null
+        [ -e "$f" ] && _warn "证书备份删除失败, 已残留(不影响运行): $f"
+    done
+    return 0
+}
+
+# 把"已校验的临时 cert/key"提交到正式路径; 失败则把正式路径**还原为提交前状态**。
+# 用法:_hy2_cert_commit <tmp_cert> <tmp_key> <cert> <key>
+# 返回码是三态(调用方必须按码分流, 不能一律当成"已回滚"):
+#   0 = 提交成功
+#   1 = 提交失败, **已确认**回到提交前状态(备份还原成功且复核通过)
+#   2 = 提交失败, **且回滚未完成** —— cert/key 可能不一致, 备份路径已打印, 需人工处理
+#
+# 为什么需要它: cert 与 key 是两个文件, 文件系统没有"同时原子替换两者"的原语, 因此提交
+# 必须是**可回滚的两步**。做法: 先把两个旧文件都备份 → 依次 mv 新 cert / 新 key →
+# 提交后校验正式路径确实匹配; 任何一步失败就按备份还原, 使"提交失败"不留下半更新状态
+# (只换掉 cert 而 key 仍是旧的, 或反之)。
+# **回滚本身也会失败**(权限/只读/IO): 故回滚的每一步都要检查结果, 并复核正式路径确实等于
+# 提交前状态; 只有复核通过才敢返回 1 宣称"已回滚", 否则返回 2 并保留备份 —— 绝不能把
+# "回滚失败"当成"已回滚"对外谎报一致(实测过该缺陷)。
+_hy2_cert_commit() {
+    local tmp_cert="$1" tmp_key="$2" cert="$3" key="$4"
+    local bak_cert="" bak_key="" rc=1 post_ok=1
+    # 备份既有文件(可能不存在 —— 首次生成时), 备份名以 XXXXXX 结尾满足 Alpine musl mktemp
+    if [ -f "$cert" ]; then
+        bak_cert=$(mktemp "${cert}.bak.XXXXXX") || return 1
+        cp -p "$cert" "$bak_cert" 2>/dev/null || { _hy2_cert_bak_rm "$bak_cert"; return 1; }
+    fi
+    if [ -f "$key" ]; then
+        bak_key=$(mktemp "${key}.bak.XXXXXX") || { _hy2_cert_bak_rm "$bak_cert"; return 1; }
+        cp -p "$key" "$bak_key" 2>/dev/null || { _hy2_cert_bak_rm "$bak_key" "$bak_cert"; return 1; }
+    fi
+    # 提交(两步)+ 提交后校验正式路径确为一对匹配的 cert/key(兜底 rename 语义异常/外部干扰)
+    if mv -f "$tmp_cert" "$cert" 2>/dev/null && mv -f "$tmp_key" "$key" 2>/dev/null \
+       && _hy2_cert_key_match "$cert" "$key"; then
+        rc=0
+    fi
+    if [ "$rc" != 0 ]; then
+        # 回滚: 用备份还原; 原本不存在的文件则删除(回到"没有该文件"的提交前状态)。
+        # **每一步都必须检查结果** —— 回滚自身也会失败(权限/只读/IO), 不检查就会把
+        # "回滚失败"当成"已回滚", 对外谎报状态一致(实测: 回滚失败仍 rc=1 且报"已回滚")。
+        # 用**备份内容**还原(cp 而非 mv —— 备份要留到复核之后再删); 原本不存在的文件则删除。
+        if [ -n "$bak_cert" ]; then cp -p "$bak_cert" "$cert" 2>/dev/null; else rm -f "$cert" 2>/dev/null; fi
+        if [ -n "$bak_key" ]; then cp -p "$bak_key" "$key" 2>/dev/null; else rm -f "$key" 2>/dev/null; fi
+        # 回滚**后复核**正式路径是否真的回到了"提交前状态"。判据是**与备份内容一致**
+        # (有备份⇒存在且逐字节相同; 无备份⇒不存在), 而**不是**"cert/key 必须 MATCH" ——
+        # "回到提交前状态"与"提交前状态本身健康"是两件事: 若旧状态本就是错配
+        # (历史遗留, 正是 _hy2_cert_reusable 要识别并自愈的那种), 完整恢复旧状态后
+        # cert/key 仍不匹配, 用 MATCH 判会把**成功回滚**误报成"回滚未完成"(实测)。
+        # **以复核结果为准**, 而不是累加各步 mv 的返回值 —— 某步 mv 返回非 0 但目标已是
+        # 正确内容(如"该文件从未被替换")时状态其实是对的, 按返回值判会误报。
+        if [ -n "$bak_cert" ]; then
+            if [ -f "$cert" ]; then cmp -s "$bak_cert" "$cert" || post_ok=0; else post_ok=0; fi
+        else
+            [ ! -e "$cert" ] || post_ok=0
+        fi
+        if [ -n "$bak_key" ]; then
+            if [ -f "$key" ]; then cmp -s "$bak_key" "$key" || post_ok=0; else post_ok=0; fi
+        else
+            [ ! -e "$key" ] || post_ok=0
+        fi
+        if [ "$post_ok" = 0 ]; then
+            # 回滚不完整: **保留**未被消费的备份(它们可能是旧文件的唯一副本), 报告路径供人工恢复
+            _error "证书提交失败, 且回滚未完成; cert/key 可能处于不一致状态, 请人工检查"
+            [ -n "$bak_cert" ] && [ -f "$bak_cert" ] && _warn "旧 cert 备份保留在: $bak_cert"
+            [ -n "$bak_key" ] && [ -f "$bak_key" ] && _warn "旧 key 备份保留在: $bak_key"
+            return 2
+        fi
+        # 状态已确认回到提交前: 删掉备份(删不掉只告警, 不改返回码)
+        _hy2_cert_bak_rm "$bak_cert" "$bak_key"
+        return 1
+    fi
+    _hy2_cert_bak_rm "$bak_cert" "$bak_key"
+    return 0
+}
+
+# 证书可用于客户端 SNI 的域名
+# 用法:_hy2_cert_domain <cert> [preferred]
+#   preferred(通常=本次请求域名)在 SAN 中时优先返回它 —— 多 SAN 证书里"取排序后第一个"
+#   会挑到与本次输入无关的名字(如 SAN 有 a./z./hy2. 三个时取到 a.)。
+#   否则返回第一个 SAN DNS 名; 无 SAN 才回退 CN(兼容手工签发的 CN-only 证书)。
+_hy2_cert_domain() {
+    local cert="$1" preferred="${2:-}" d=""
+    if [ -n "$preferred" ] && _hy2_cert_san_has "$cert" "$preferred"; then
+        printf '%s' "$preferred"; return 0
+    fi
+    d=$(_hy2_cert_san_names "$cert" | head -1)
+    if [ -z "$d" ] && command -v openssl >/dev/null 2>&1; then
+        d=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's|/.*||')
+    fi
+    printf '%s' "$d"
+}
+
+# ---------------------------------------------------------------------------
 # 生成 Hysteria2 自签 TLS 证书(EC-256, 10 年)
-# 用法:_gen_hy2_cert <tag>  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
+# 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
+# 前置: 调用方应先判 `_hy2_cert_reusable` —— 可复用则直接沿用, 不要调本函数。
+# 返回: 0 成功; 1 失败(已回到提交前状态, 或本就未改动); 2 失败且回滚未完成(需人工检查)。
+#
+# **证书必须带 SAN**: Xray 官方 tls.md 明言「serverName 对应的值必须存在于服务器证书的
+# SAN 中」; 只写 CN 的证书在现代 TLS 校验下会被拒(Go crypto/x509 报 "relies on legacy
+# Common Name field, use SANs instead"), 使"输入域名"形同虚设。故 openssl 分支显式写入
+# subjectAltName + serverAuth EKU —— 与官方 `hysteria cert` 产出的证书同构(实测其带
+# DNS SAN + Extended Key Usage: TLS Web Server Authentication + BasicConstraints CA:FALSE)。
+#
+# 复用语义(唯一判据, 调用方与生成方共用): 已存在证书时**校验其 SAN 是否覆盖本次域名** ——
+# 覆盖才复用; 不覆盖则重新生成。否则用户输入新域名却静默沿用旧证书, 是"输入了但没生效"的假成功。
+# 无 openssl 时无法读 SAN: 只能复用既有证书, 并如实报告(见 _hy2_cert_domain)。
+_hy2_cert_reusable() {
+    local cert="$1" key="$2" domain="$3"
+    [ -f "$cert" ] && [ -f "$key" ] || return 1
+    command -v openssl >/dev/null 2>&1 || return 0   # 读不到 SAN/无法校验, 只能信任既有证书
+    # SAN 必须覆盖本次域名, 且 cert/key 必须同属一个密钥对 —— 后者让历史遗留的错配对
+    # (旧版本失败路径可能留下)在下一次调用时被判为不可复用, 从而被重新生成(自愈)。
+    _hy2_cert_san_has "$cert" "$domain" || return 1
+    _hy2_cert_key_match "$cert" "$key" || return 1
+    return 0
+}
+
+# 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
 _gen_hy2_cert() {
-    local tag="$1"
+    local tag="$1" domain="${2:-build.nvidia.com}"
+    # 证书域名会写进 X.509 CN/SAN, 从输入侧拒绝非法值(仅 LDH 域名, 与 _validate_domain 同口径)
+    _validate_domain "$domain" || { _error "证书域名格式非法(仅字母/数字/连字符, 点分段): $domain"; return 1; }
     local cert_dir="$CERT_DIR/$tag"
     mkdir -p "$cert_dir"
     CERT_FILE_PATH="${cert_dir}/cert.pem"
     KEY_FILE_PATH="${cert_dir}/key.pem"
-    if [ -f "$CERT_FILE_PATH" ] && [ -f "$KEY_FILE_PATH" ]; then
-        _info "已有证书, 复用: $cert_dir"
-        return 0
-    fi
-    _info "生成 TLS 自签证书..."
+    # 已有证书复用与否, 由调用方按同一判据(_hy2_cert_reusable)先决定 —— 本函数只负责"生成",
+    # 不再自行 early-return 复用: 那样调用方无法得知该证书的真实身份(无 openssl 时读不出 SAN),
+    # 只能回退到硬编码默认 SNI, 与实际证书脱节。
+    _info "生成 TLS 自签证书 (CN=${domain}, SAN=DNS:${domain})..."
+    # ---------------------------------------------------------------------
+    # **事务式生成**: 先写临时文件, 全部校验通过后才原子替换正式路径。
+    # 为什么必须这样: 直接写正式路径时, 若"旧 cert.pem 在 / key.pem 缺失或损坏"(复用判据判
+    # 不可复用 ⇒ 进生成分支)且生成中途失败, 会留下 **旧 cert + 新 key** 的错配; 而后续校验
+    # 只看证书 SAN, 会把它判成"生成成功", 且下一次 _hy2_cert_reusable 仍返回可复用 ⇒ 持久
+    # 坏证书(实测复现: cert 指纹未变、key 已换新、函数却 rc=0 报成功)。
+    # 临时文件与目标同目录(rename 才原子), 命名以 XXXXXX 结尾(Alpine musl mktemp 要求)。
+    # 失败时删临时文件, **既有证书保持原样**。
+    # ---------------------------------------------------------------------
+    local tmp_cert tmp_key rc=1
+    tmp_cert=$(mktemp "${cert_dir}/.cert.tmp.XXXXXX") || return 1
+    tmp_key=$(mktemp "${cert_dir}/.key.tmp.XXXXXX") || { rm -f "$tmp_cert"; return 1; }
     if command -v openssl >/dev/null 2>&1; then
-        openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE_PATH" 2>/dev/null \
-            && openssl req -new -x509 -days 3650 -key "$KEY_FILE_PATH" \
-                -out "$CERT_FILE_PATH" -subj "/CN=build.nvidia.com" 2>/dev/null
+        # SAN 走 openssl.cnf(不用 OpenSSL 专有的命令行扩展参数): Alpine 的 LibreSSL 不认
+        # 后者, cnf 方式在 OpenSSL/LibreSSL 两边都可用。
+        local cnf
+        cnf=$(mktemp "${cert_dir}/openssl.XXXXXX")
+        if [ -n "$cnf" ]; then
+            cat > "$cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+[dn]
+CN = ${domain}
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:${domain}
+EOF
+            openssl ecparam -genkey -name prime256v1 -out "$tmp_key" 2>/dev/null \
+                && openssl req -new -x509 -days 3650 -key "$tmp_key" \
+                    -out "$tmp_cert" -config "$cnf" 2>/dev/null
+            rm -f "$cnf"
+        fi
     fi
     # 2026-09-12 三审(L8): openssl 缺失或执行失败(旧版/被裁剪)时回退 xray tls cert,
     # 而不是"openssl 存在但失败就直接报错"—— 报错文案明明写着"需安装 openssl 或使用 xray tls cert"。
-    if { [ ! -f "$CERT_FILE_PATH" ] || [ ! -f "$KEY_FILE_PATH" ]; } && [ -x "$XRAY_BIN" ]; then
+    if { [ ! -s "$tmp_cert" ] || [ ! -s "$tmp_key" ]; } && [ -x "$XRAY_BIN" ]; then
         # xray tls cert 的 --file 是"路径前缀", 实际产出 <前缀>.crt / <前缀>.key。
-        # 因此前缀必须落在 cert_dir 内部(传目录本身会在其父目录生成 <目录名>.crt/.key)。
-        XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain build.nvidia.com \
-            --file "${cert_dir}/cert" 2>/dev/null
-        [ -f "${cert_dir}/cert.crt" ] && mv -f "${cert_dir}/cert.crt" "$CERT_FILE_PATH"
-        [ -f "${cert_dir}/cert.key" ] && mv -f "${cert_dir}/cert.key" "$KEY_FILE_PATH"
+        # 前缀落在 cert_dir 内部(传目录本身会在其父目录生成 <目录名>.crt/.key), 仍写临时名,
+        # 待校验通过后再统一替换 —— 与 openssl 分支同一条提交路径。
+        local xpre="${cert_dir}/.xcert.$$"
+        XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain "$domain" --file "$xpre" 2>/dev/null
+        [ -s "${xpre}.crt" ] && mv -f "${xpre}.crt" "$tmp_cert"
+        [ -s "${xpre}.key" ] && mv -f "${xpre}.key" "$tmp_key"
+        rm -f "${xpre}.crt" "${xpre}.key" 2>/dev/null
         # 清理历史错误写法可能残留在父目录的 <tag>.crt/.key
         rm -f "${CERT_DIR}/${tag}.crt" "${CERT_DIR}/${tag}.key" 2>/dev/null
     fi
-    if [ ! -f "$CERT_FILE_PATH" ] || [ ! -f "$KEY_FILE_PATH" ]; then
-        _error "证书生成失败, 需安装 openssl 或使用 xray tls cert"
+    if [ -s "$tmp_cert" ] && [ -s "$tmp_key" ]; then
+        # 校验 1(有 openssl 时): 证书必须真的带本次域名的 SAN —— 否则静默退回 CN-only,
+        #   Xray 的 serverName 校验必失败。无 openssl 走 xray 分支, 其证书自带 SAN, 无从也无需读。
+        # 校验 2: cert 与 key 必须同属一个密钥对 —— 这是"旧 cert + 新 key"错配的防线。
+        # 两项都过才**提交**; 提交走 _hy2_cert_commit(可回滚的两步 mv), 任一步失败即还原既有文件,
+        # 绝不留"新 cert + 旧 key"这类半更新状态。
+        if { ! command -v openssl >/dev/null 2>&1 || _hy2_cert_san_has "$tmp_cert" "$domain"; } \
+           && _hy2_cert_key_match "$tmp_cert" "$tmp_key"; then
+            _hy2_cert_commit "$tmp_cert" "$tmp_key" "$CERT_FILE_PATH" "$KEY_FILE_PATH"
+            rc=$?
+        fi
+    fi
+    rm -f "$tmp_cert" "$tmp_key"
+    if [ "$rc" = 2 ]; then
+        # 提交失败且回滚未完成 —— 具体原因/备份路径已由 _hy2_cert_commit 打印, 此处不重复。
+        # 返回 2 而非 1: 让"回滚失败"这一状态在整条调用链上可区分(调用方只判非零, 行为不变)。
+        _error "证书提交失败且回滚未完成, 已中止(未继续创建节点)"
+        return 2
+    fi
+    if [ "$rc" != 0 ]; then
+        _error "证书生成失败(cert/key 不完整、SAN 不含 ${domain} 或二者不匹配); 既有证书保持原样, 需安装 openssl 或使用 xray tls cert"
         return 1
     fi
     _success "TLS 证书已生成: $cert_dir"
@@ -3024,7 +3234,7 @@ _add_hysteria2() {
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
-    local cert_file="" key_file="" self_signed="false" sni="build.nvidia.com"
+    local cert_file="" key_file="" self_signed="false" sni="build.nvidia.com" self_domain=""
     echo -e "  TLS 证书:"
     echo -e "  回车使用自签证书, 或输入证书文件路径"
     read -rp "  cert 路径 (回车自签): " custom_cert
@@ -3051,9 +3261,32 @@ _add_hysteria2() {
             sni=${custom_sni:-build.nvidia.com}
         fi
     else
-        _gen_hy2_cert "$tag" || return 1
-        cert_file="$CERT_FILE_PATH"; key_file="$KEY_FILE_PATH"
+        # 自签证书: 域名是客户端 SNI 的唯一来源, 必须可输入(不能写死) —— 与官方 Hysteria2
+        # 模块的「证书域名/SAN」口径一致。回车用默认 build.nvidia.com。
+        read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain
+        self_domain=${self_domain:-build.nvidia.com}
+        cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
         self_signed="true"
+        if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
+            # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
+            # 复用但如实报告, 不假装证书身份已与输入域名统一。
+            if ! command -v openssl >/dev/null 2>&1; then
+                _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${self_domain})"
+                _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
+            fi
+            _info "已有证书, 复用: $CERT_DIR/$tag"
+        else
+            [ -f "$cert_file" ] && [ -f "$key_file" ] && \
+                _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $CERT_DIR/$tag"
+            _gen_hy2_cert "$tag" "$self_domain" || return 1
+        fi
+        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
+        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
+        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
+        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
+        local self_cert_domain
+        self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
+        sni=${self_cert_domain:-$self_domain}
     fi
 
     # 认证密码
