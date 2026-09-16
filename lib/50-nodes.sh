@@ -3029,7 +3029,7 @@ _hy2_cert_key_match() {
 # "回滚失败"当成"已回滚"对外谎报一致(实测过该缺陷)。
 _hy2_cert_commit() {
     local tmp_cert="$1" tmp_key="$2" cert="$3" key="$4"
-    local bak_cert="" bak_key="" rc=1 rb_ok=1 post_ok=1
+    local bak_cert="" bak_key="" rc=1 post_ok=1
     # 备份既有文件(可能不存在 —— 首次生成时), 备份名以 XXXXXX 结尾满足 Alpine musl mktemp
     if [ -f "$cert" ]; then
         bak_cert=$(mktemp "${cert}.bak.XXXXXX") || return 1
@@ -3048,23 +3048,26 @@ _hy2_cert_commit() {
         # 回滚: 用备份还原; 原本不存在的文件则删除(回到"没有该文件"的提交前状态)。
         # **每一步都必须检查结果** —— 回滚自身也会失败(权限/只读/IO), 不检查就会把
         # "回滚失败"当成"已回滚", 对外谎报状态一致(实测: 回滚失败仍 rc=1 且报"已回滚")。
+        # 用**备份内容**还原(cp 而非 mv —— 备份要留到复核之后再删); 原本不存在的文件则删除。
+        if [ -n "$bak_cert" ]; then cp -p "$bak_cert" "$cert" 2>/dev/null; else rm -f "$cert" 2>/dev/null; fi
+        if [ -n "$bak_key" ]; then cp -p "$bak_key" "$key" 2>/dev/null; else rm -f "$key" 2>/dev/null; fi
+        # 回滚**后复核**正式路径是否真的回到了"提交前状态"。判据是**与备份内容一致**
+        # (有备份⇒存在且逐字节相同; 无备份⇒不存在), 而**不是**"cert/key 必须 MATCH" ——
+        # "回到提交前状态"与"提交前状态本身健康"是两件事: 若旧状态本就是错配
+        # (历史遗留, 正是 _hy2_cert_reusable 要识别并自愈的那种), 完整恢复旧状态后
+        # cert/key 仍不匹配, 用 MATCH 判会把**成功回滚**误报成"回滚未完成"(实测)。
+        # **以复核结果为准**, 而不是累加各步 mv 的返回值 —— 某步 mv 返回非 0 但目标已是
+        # 正确内容(如"该文件从未被替换")时状态其实是对的, 按返回值判会误报。
         if [ -n "$bak_cert" ]; then
-            mv -f "$bak_cert" "$cert" 2>/dev/null
+            if [ -f "$cert" ]; then cmp -s "$bak_cert" "$cert" || post_ok=0; else post_ok=0; fi
         else
-            rm -f "$cert" 2>/dev/null
+            [ ! -e "$cert" ] || post_ok=0
         fi
         if [ -n "$bak_key" ]; then
-            mv -f "$bak_key" "$key" 2>/dev/null
+            if [ -f "$key" ]; then cmp -s "$bak_key" "$key" || post_ok=0; else post_ok=0; fi
         else
-            rm -f "$key" 2>/dev/null
+            [ ! -e "$key" ] || post_ok=0
         fi
-        # 回滚**后复核**正式路径是否真的等于"提交前状态"(有备份⇒文件在; 无备份⇒文件不在),
-        # 且两者都在时必须匹配。**以复核结果为准**, 而不是以每一步 mv 的返回值累加为准 ——
-        # 某个 mv 返回非 0 但目标已是正确内容(如"提交从未替换过该文件")时, 状态其实是对的,
-        # 按 mv 返回值判会误报回滚失败。
-        if [ -n "$bak_cert" ]; then [ -f "$cert" ] || post_ok=0; else [ ! -e "$cert" ] || post_ok=0; fi
-        if [ -n "$bak_key" ];  then [ -f "$key" ]  || post_ok=0; else [ ! -e "$key" ]  || post_ok=0; fi
-        if [ -f "$cert" ] && [ -f "$key" ]; then _hy2_cert_key_match "$cert" "$key" || post_ok=0; fi
         if [ "$post_ok" = 0 ]; then
             # 回滚不完整: **保留**未被消费的备份(它们可能是旧文件的唯一副本), 报告路径供人工恢复
             _error "证书提交失败, 且回滚未完成; cert/key 可能处于不一致状态, 请人工检查"
@@ -3072,9 +3075,9 @@ _hy2_cert_commit() {
             [ -n "$bak_key" ] && [ -f "$bak_key" ] && _warn "旧 key 备份保留在: $bak_key"
             return 2
         fi
-        # 状态已确认回到提交前: 清掉因某步 mv 失败而未被消费的残留备份
-        [ -n "$bak_cert" ] && [ -f "$bak_cert" ] && rm -f "$bak_cert"
-        [ -n "$bak_key" ] && [ -f "$bak_key" ] && rm -f "$bak_key"
+        # 状态已确认回到提交前: 删掉备份
+        [ -n "$bak_cert" ] && rm -f "$bak_cert"
+        [ -n "$bak_key" ] && rm -f "$bak_key"
         return 1
     fi
     [ -n "$bak_cert" ] && rm -f "$bak_cert"
