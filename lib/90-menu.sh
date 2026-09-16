@@ -703,7 +703,7 @@ _hy2_toggle_brutal() {
     # 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived(50-nodes): gecko 节点的链接
     # 无法用官方 hy2 URI 表达, 此时必须清空旧链接并**继续**同步 clash(clash 是尺寸唯一载体),
     # 而不是在此以"重建失败"提前 return —— 那会把旧链接与旧 clash 条目一并留下(stale)。
-    _hy2_sync_derived "$meta" || _warn "派生状态同步失败, 请核对 ${meta} 与 ${CLASH_YAML}"
+    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     _press_any_key
 }
 
@@ -762,7 +762,7 @@ _hy2_adjust_bandwidth() {
     _meta_update "$meta" '.brutal_up=$up | .brutal_down=$down' --arg up "$new_up" --arg down "$new_down" || { _error "带宽元数据写入失败"; _press_any_key; return; }
     # 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived(50-nodes) —— 与拥塞切换同源:
     # 带宽变化会改变 clash 条目的 up/down 字段, gecko 节点则链接不可表达(清空 + 继续同步 clash)。
-    _hy2_sync_derived "$meta" || _warn "派生状态同步失败, 请核对 ${meta} 与 ${CLASH_YAML}"
+    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     _success "带宽已更新: 上传=${new_up:-不限}  下载=${new_down:-不限}"
     _press_any_key
 }
@@ -912,7 +912,7 @@ _hy2_obfs_menu() {
     # 与创建/改端口/拥塞切换/带宽调整同源。链接重建的两种失败在 helper 内区分 ——
     #   (a) gecko(带尺寸) ⇒ 官方 hy2 URI 无法表达: 清空旧链接 + **继续**同步 clash(尺寸唯一载体);
     #   (b) 元数据缺字段 ⇒ **保留**旧链接, 如实报告, 不做破坏性写入。
-    _hy2_sync_derived "$meta" || _warn "派生状态同步失败, 请核对 ${meta} 与 ${CLASH_YAML}"
+    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     _press_any_key
 }
 
