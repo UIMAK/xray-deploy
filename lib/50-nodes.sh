@@ -3021,6 +3021,7 @@ _hy2_cert_domain() {
 # ---------------------------------------------------------------------------
 # 生成 Hysteria2 自签 TLS 证书(EC-256, 10 年)
 # 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
+# 前置: 调用方应先判 `_hy2_cert_reusable` —— 可复用则直接沿用, 不要调本函数。
 #
 # **证书必须带 SAN**: Xray 官方 tls.md 明言「serverName 对应的值必须存在于服务器证书的
 # SAN 中」; 只写 CN 的证书在现代 TLS 校验下会被拒(Go crypto/x509 报 "relies on legacy
@@ -3028,8 +3029,17 @@ _hy2_cert_domain() {
 # subjectAltName + serverAuth EKU —— 与官方 `hysteria cert` 产出的证书同构(实测其带
 # DNS SAN + Extended Key Usage: TLS Web Server Authentication + BasicConstraints CA:FALSE)。
 #
-# 复用语义: 已存在证书时**校验其 SAN 是否覆盖本次域名** —— 覆盖才复用; 不覆盖则重新生成。
-# 否则用户输入新域名却静默沿用旧证书, 是"输入了但没生效"的假成功。
+# 复用语义(唯一判据, 调用方与生成方共用): 已存在证书时**校验其 SAN 是否覆盖本次域名** ——
+# 覆盖才复用; 不覆盖则重新生成。否则用户输入新域名却静默沿用旧证书, 是"输入了但没生效"的假成功。
+# 无 openssl 时无法读 SAN: 只能复用既有证书, 并如实报告(见 _hy2_cert_domain)。
+_hy2_cert_reusable() {
+    local cert="$1" key="$2" domain="$3"
+    [ -f "$cert" ] && [ -f "$key" ] || return 1
+    command -v openssl >/dev/null 2>&1 || return 0   # 读不到 SAN, 只能信任既有证书
+    _hy2_cert_san_has "$cert" "$domain"
+}
+
+# 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
 _gen_hy2_cert() {
     local tag="$1" domain="${2:-build.nvidia.com}"
     # 证书域名会写进 X.509 CN/SAN, 从输入侧拒绝非法值(仅 LDH 域名, 与 _validate_domain 同口径)
@@ -3038,23 +3048,9 @@ _gen_hy2_cert() {
     mkdir -p "$cert_dir"
     CERT_FILE_PATH="${cert_dir}/cert.pem"
     KEY_FILE_PATH="${cert_dir}/key.pem"
-    if [ -f "$CERT_FILE_PATH" ] && [ -f "$KEY_FILE_PATH" ]; then
-        if command -v openssl >/dev/null 2>&1; then
-            # 必须 SAN 覆盖本次域名, 否则重新生成(不静默沿用旧证书)
-            if _hy2_cert_san_has "$CERT_FILE_PATH" "$domain"; then
-                _info "已有证书, 复用: $cert_dir"
-                return 0
-            fi
-            _warn "已有证书的 SAN 不含本次域名 ${domain}, 重新生成: $cert_dir"
-        else
-            # 无 openssl: 无法读 SAN, 只能信任既有证书。若它来自旧版本(CN-only 无 SAN),
-            # 证书身份与本次输入域名并不一致 —— 如实提示, 不假装已统一。
-            _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${domain})"
-            _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
-            _info "已有证书, 复用: $cert_dir"
-            return 0
-        fi
-    fi
+    # 已有证书复用与否, 由调用方按同一判据(_hy2_cert_reusable)先决定 —— 本函数只负责"生成",
+    # 不再自行 early-return 复用: 那样调用方无法得知该证书的真实身份(无 openssl 时读不出 SAN),
+    # 只能回退到硬编码默认 SNI, 与实际证书脱节。
     _info "生成 TLS 自签证书 (CN=${domain}, SAN=DNS:${domain})..."
     if command -v openssl >/dev/null 2>&1; then
         # SAN 走 openssl.cnf(不用 OpenSSL 专有的命令行扩展参数): Alpine 的 LibreSSL 不认
@@ -3142,15 +3138,28 @@ _add_hysteria2() {
         # 模块的「证书域名/SAN」口径一致。回车用默认 build.nvidia.com。
         read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain
         self_domain=${self_domain:-build.nvidia.com}
-        _gen_hy2_cert "$tag" "$self_domain" || return 1
-        cert_file="$CERT_FILE_PATH"; key_file="$KEY_FILE_PATH"
+        cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
         self_signed="true"
+        if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
+            # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
+            # 复用但如实报告, 不假装证书身份已与输入域名统一。
+            if ! command -v openssl >/dev/null 2>&1; then
+                _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${self_domain})"
+                _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
+            fi
+            _info "已有证书, 复用: $CERT_DIR/$tag"
+        else
+            [ -f "$cert_file" ] && [ -f "$key_file" ] && \
+                _warn "已有证书的 SAN 不含本次域名 ${self_domain}, 重新生成: $CERT_DIR/$tag"
+            _gen_hy2_cert "$tag" "$self_domain" || return 1
+        fi
         # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
         # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
-        # 签发的 CN-only 证书)。证书复用/重生成后都读一次, 保证链接/clash 的 sni 与实际证书一致。
+        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
+        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
         local self_cert_domain
         self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
-        [ -n "$self_cert_domain" ] && sni="$self_cert_domain"
+        sni=${self_cert_domain:-$self_domain}
     fi
 
     # 认证密码
