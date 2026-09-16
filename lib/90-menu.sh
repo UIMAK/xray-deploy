@@ -700,21 +700,10 @@ _hy2_toggle_brutal() {
             [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
             ;;
     esac
-    # 重建分享链接
-    # R38(M10): 消费 rebuild 返回码 —— 元数据缺必填字段时不能把空/含 null 的链接写回去
-    local link
-    if ! link=$(_rebuild_hy2_link "$meta") || [ -z "$link" ]; then
-        _warn "拥塞控制已切换, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
-        _press_any_key; return
-    fi
-    _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
-    # clash.yaml 派生同步: 拥塞模式/带宽变化会改变条目的 up/down 字段
-    local nline nname
-    nname=$(jq -r '.name // empty' "$meta")
-    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
-        _replace_node_in_yaml "$nline" "$nname" || \
-            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
-    fi
+    # 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived(50-nodes): gecko 节点的链接
+    # 无法用官方 hy2 URI 表达, 此时必须清空旧链接并**继续**同步 clash(clash 能完整承载该尺寸),
+    # 而不是在此以"重建失败"提前 return —— 那会把旧链接与旧 clash 条目一并留下(stale)。
+    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     _press_any_key
 }
 
@@ -771,20 +760,9 @@ _hy2_adjust_bandwidth() {
         _error "带宽调整失败, 已回滚"; _press_any_key; return
     fi
     _meta_update "$meta" '.brutal_up=$up | .brutal_down=$down' --arg up "$new_up" --arg down "$new_down" || { _error "带宽元数据写入失败"; _press_any_key; return; }
-    # R38(M10): 消费 rebuild 返回码
-    local link
-    if ! link=$(_rebuild_hy2_link "$meta") || [ -z "$link" ]; then
-        _warn "带宽已更新, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
-        _press_any_key; return
-    fi
-    _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
-    # clash.yaml 派生同步: 带宽变化会改变条目的 up/down 字段
-    local nline nname
-    nname=$(jq -r '.name // empty' "$meta")
-    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
-        _replace_node_in_yaml "$nline" "$nname" || \
-            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
-    fi
+    # 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived(50-nodes) —— 与拥塞切换同源:
+    # 带宽变化会改变 clash 条目的 up/down 字段, gecko 节点则链接不可表达(清空 + 继续同步 clash)。
+    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     _success "带宽已更新: 上传=${new_up:-不限}  下载=${new_down:-不限}"
     _press_any_key
 }
@@ -930,27 +908,11 @@ _hy2_obfs_menu() {
             ;;
         *) _warn "无效选择"; _press_any_key; return ;;
     esac
-    # 服务器级变更 → 分享链接与 clash 条目必须同步。链接重建有两种失败, **不可混为一谈**:
-    #   (a) 该节点是 gecko(带尺寸) ⇒ 官方 hy2 URI 无法表达, 这是**刻意**不生成链接。
-    #       此时必须清空旧链接(否则它仍写着旧混淆), 并**继续**同步 clash(clash 是尺寸唯一载体)。
-    #   (b) 元数据缺字段 ⇒ 保留旧链接(它可能仍可用), 只如实报告, 不做任何破坏性写入。
-    local link nline nname
-    if link=$(_rebuild_hy2_link "$meta") && [ -n "$link" ]; then
-        _meta_update "$meta" '.share_link=$l' --arg l "$link" || { _error "分享链接写入失败"; _press_any_key; return; }
-    elif _hy2_link_unexpressible "$meta"; then
-        _meta_update "$meta" '.share_link=""' || { _error "分享链接清空失败"; _press_any_key; return; }
-        _warn "当前混淆(gecko 带自定义分片尺寸)无法用官方 hy2 链接表达, 已清空分享链接"
-        _tip "请用下方 Clash 条目(含 obfs-min/max-packet-size)导入客户端; 菜单 [2] 查看节点 不再显示链接"
-    else
-        _warn "分享链接重建失败(节点元数据缺少必要字段), 已保留原链接"
-    fi
-    nname=$(jq -r '.name // empty' "$meta")
-    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
-        _replace_node_in_yaml "$nline" "$nname" || \
-            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
-    else
-        _warn "Clash 条目生成失败(元数据不完整), 可手工编辑 ${CLASH_YAML}"
-    fi
+    # 服务器级变更 → 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived(50-nodes):
+    # 与创建/改端口/拥塞切换/带宽调整同源。链接重建的两种失败在 helper 内区分 ——
+    #   (a) gecko(带尺寸) ⇒ 官方 hy2 URI 无法表达: 清空旧链接 + **继续**同步 clash(能完整承载该尺寸);
+    #   (b) 元数据缺字段 ⇒ **保留**旧链接, 如实报告, 不做破坏性写入。
+    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     _press_any_key
 }
 
