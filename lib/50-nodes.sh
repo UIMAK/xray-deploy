@@ -3346,7 +3346,7 @@ _hy2_self_cert_dir() {
 # config 里被手工写成 `..` 形式的引用无法安全比较, 一律保守判定为"仍被引用"。
 _hy2_cert_dir_referenced() {
     local dir="$1" refs ref
-    refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]?.certificateFile // empty' "$CONFIG_FILE" 2>/dev/null)
+    refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]?.certificateFile // empty' "$CONFIG_FILE" 2>/dev/null) || return 0
     [ -n "$refs" ] || return 1
     case "$refs" in *".."*) return 0 ;; esac
     while IFS= read -r ref; do
