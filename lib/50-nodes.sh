@@ -3242,13 +3242,23 @@ _hy2_cert_path_inside() {
     for comp in $p; do
         [ "$comp" = ".." ] && return 1
     done
-    [ -e "$p" ] || return 0   # 不存在: 前缀 + 无 .. 已足够(后续动作也是 no-op)
+    # 悬浮符号链接也进入实体校验(见下), 故 -L 一并视为"存在"
+    [ -e "$p" ] || [ -L "$p" ] || return 0
     base=$(cd "$CERT_DIR" 2>/dev/null && pwd -P) || return 1
-    if [ -d "$p" ]; then
-        real=$(cd "$p" 2>/dev/null && pwd -P) || return 1
-    else
-        # 文件路径: cd 会失败 ⇒ 解析父目录真实路径后拼回文件名(父目录的符号链接同样被复核)
-        real=$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)/$(basename "$p") || return 1
+    # 必须对**目标自身**做 canonical 解析: 只解析父目录会让"文件本身是指向 CERT_DIR 之外的
+    # 符号链接"蒙混过关(certs/tag/cert.pem -> /outside/x.pem), 而后续 cp/rm 会落到目标上。
+    real=$(readlink -f "$p" 2>/dev/null)
+    if [ -z "$real" ]; then
+        # 无 readlink -f(极老 busybox)或解析失败: 非符号链接才可用"父目录 + 文件名"回退;
+        # 符号链接(含悬浮)无法证实落点 ⇒ fail-closed, 拒绝
+        if [ ! -L "$p" ]; then
+            if [ -d "$p" ]; then
+                real=$(cd "$p" 2>/dev/null && pwd -P)
+            else
+                real=$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)/$(basename "$p")
+            fi
+        fi
+        [ -n "$real" ] || return 1
     fi
     case "$real" in
         "$base"/?*) return 0 ;;
@@ -3348,10 +3358,23 @@ _hy2_cert_dir_referenced() {
     local dir="$1" refs ref
     refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]?.certificateFile // empty' "$CONFIG_FILE" 2>/dev/null) || return 0
     [ -n "$refs" ] || return 1
-    case "$refs" in *".."*) return 0 ;; esac
+    local dreal rdir rres
+    dreal=$(readlink -f "$dir" 2>/dev/null); [ -n "$dreal" ] || dreal="$dir"
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
+        # ① 词法前缀(覆盖文件已不存在/无法解析的 ref —— 它们不会被 rm, 但可能指向本目录)
         case "$ref" in "$dir"/?*) return 0 ;; esac
+        # ② canonical 等价: 同一目录的另一种书写形式(符号链接/相对段)也算引用。
+        #    归约成功即可下结论: 与本目录不同 ⇒ 该条确定为无关(不得再进 ③ 的保守分支,
+        #    否则一个无关的 "a/../elsewhere" 会把其它目录的清理整批卡住)。
+        rdir=$(dirname "$ref")
+        rres=$(readlink -f "$rdir" 2>/dev/null) || rres=""
+        if [ -n "$rres" ]; then
+            [ "$rres" = "$dreal" ] && return 0
+            continue
+        fi
+        # ③ 只有"该 ref 自身无法归约且含 .."时才保守(逐条判定)
+        case "$ref" in *".."*) return 0 ;; esac
     done <<< "$refs"
     return 1
 }
