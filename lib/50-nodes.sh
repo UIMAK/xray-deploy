@@ -3001,6 +3001,18 @@ _hy2_cert_san_has() {
     _hy2_cert_san_names "$cert" | grep -qxF "$domain"
 }
 
+# 证书与其私钥是否属于同一密钥对(cert 公钥 == key 公钥)
+# 用于生成后校验: 防止"旧 cert + 新 key"这类错配被当成有效证书对(见 _gen_hy2_cert)。
+# 无 openssl 时无从校验 ⇒ 返回 0(放行, 与 _hy2_cert_reusable 的无 openssl 口径一致)。
+_hy2_cert_key_match() {
+    local cert="$1" key="$2" cpub kpub
+    command -v openssl >/dev/null 2>&1 || return 0
+    [ -f "$cert" ] && [ -f "$key" ] || return 1
+    cpub=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null) || return 1
+    kpub=$(openssl pkey -in "$key" -pubout 2>/dev/null) || return 1
+    [ -n "$cpub" ] && [ "$cpub" = "$kpub" ]
+}
+
 # 证书可用于客户端 SNI 的域名
 # 用法:_hy2_cert_domain <cert> [preferred]
 #   preferred(通常=本次请求域名)在 SAN 中时优先返回它 —— 多 SAN 证书里"取排序后第一个"
@@ -3035,8 +3047,12 @@ _hy2_cert_domain() {
 _hy2_cert_reusable() {
     local cert="$1" key="$2" domain="$3"
     [ -f "$cert" ] && [ -f "$key" ] || return 1
-    command -v openssl >/dev/null 2>&1 || return 0   # 读不到 SAN, 只能信任既有证书
-    _hy2_cert_san_has "$cert" "$domain"
+    command -v openssl >/dev/null 2>&1 || return 0   # 读不到 SAN/无法校验, 只能信任既有证书
+    # SAN 必须覆盖本次域名, 且 cert/key 必须同属一个密钥对 —— 后者让历史遗留的错配对
+    # (旧版本失败路径可能留下)在下一次调用时被判为不可复用, 从而被重新生成(自愈)。
+    _hy2_cert_san_has "$cert" "$domain" || return 1
+    _hy2_cert_key_match "$cert" "$key" || return 1
+    return 0
 }
 
 # 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
@@ -3052,12 +3068,25 @@ _gen_hy2_cert() {
     # 不再自行 early-return 复用: 那样调用方无法得知该证书的真实身份(无 openssl 时读不出 SAN),
     # 只能回退到硬编码默认 SNI, 与实际证书脱节。
     _info "生成 TLS 自签证书 (CN=${domain}, SAN=DNS:${domain})..."
+    # ---------------------------------------------------------------------
+    # **事务式生成**: 先写临时文件, 全部校验通过后才原子替换正式路径。
+    # 为什么必须这样: 直接写正式路径时, 若"旧 cert.pem 在 / key.pem 缺失或损坏"(复用判据判
+    # 不可复用 ⇒ 进生成分支)且生成中途失败, 会留下 **旧 cert + 新 key** 的错配; 而后续校验
+    # 只看证书 SAN, 会把它判成"生成成功", 且下一次 _hy2_cert_reusable 仍返回可复用 ⇒ 持久
+    # 坏证书(实测复现: cert 指纹未变、key 已换新、函数却 rc=0 报成功)。
+    # 临时文件与目标同目录(rename 才原子), 命名以 XXXXXX 结尾(Alpine musl mktemp 要求)。
+    # 失败时删临时文件, **既有证书保持原样**。
+    # ---------------------------------------------------------------------
+    local tmp_cert tmp_key rc=1
+    tmp_cert=$(mktemp "${cert_dir}/.cert.tmp.XXXXXX") || return 1
+    tmp_key=$(mktemp "${cert_dir}/.key.tmp.XXXXXX") || { rm -f "$tmp_cert"; return 1; }
     if command -v openssl >/dev/null 2>&1; then
         # SAN 走 openssl.cnf(不用 OpenSSL 专有的命令行扩展参数): Alpine 的 LibreSSL 不认
         # 后者, cnf 方式在 OpenSSL/LibreSSL 两边都可用。
         local cnf
-        cnf=$(mktemp "${cert_dir}/openssl.XXXXXX") || return 1
-        cat > "$cnf" <<EOF
+        cnf=$(mktemp "${cert_dir}/openssl.XXXXXX")
+        if [ -n "$cnf" ]; then
+            cat > "$cnf" <<EOF
 [req]
 distinguished_name = dn
 x509_extensions = v3_req
@@ -3070,32 +3099,39 @@ keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = DNS:${domain}
 EOF
-        openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE_PATH" 2>/dev/null \
-            && openssl req -new -x509 -days 3650 -key "$KEY_FILE_PATH" \
-                -out "$CERT_FILE_PATH" -config "$cnf" 2>/dev/null
-        rm -f "$cnf"
+            openssl ecparam -genkey -name prime256v1 -out "$tmp_key" 2>/dev/null \
+                && openssl req -new -x509 -days 3650 -key "$tmp_key" \
+                    -out "$tmp_cert" -config "$cnf" 2>/dev/null
+            rm -f "$cnf"
+        fi
     fi
     # 2026-09-12 三审(L8): openssl 缺失或执行失败(旧版/被裁剪)时回退 xray tls cert,
     # 而不是"openssl 存在但失败就直接报错"—— 报错文案明明写着"需安装 openssl 或使用 xray tls cert"。
-    if { [ ! -f "$CERT_FILE_PATH" ] || [ ! -f "$KEY_FILE_PATH" ]; } && [ -x "$XRAY_BIN" ]; then
+    if { [ ! -s "$tmp_cert" ] || [ ! -s "$tmp_key" ]; } && [ -x "$XRAY_BIN" ]; then
         # xray tls cert 的 --file 是"路径前缀", 实际产出 <前缀>.crt / <前缀>.key。
-        # 因此前缀必须落在 cert_dir 内部(传目录本身会在其父目录生成 <目录名>.crt/.key)。
-        XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain "$domain" \
-            --file "${cert_dir}/cert" 2>/dev/null
-        [ -f "${cert_dir}/cert.crt" ] && mv -f "${cert_dir}/cert.crt" "$CERT_FILE_PATH"
-        [ -f "${cert_dir}/cert.key" ] && mv -f "${cert_dir}/cert.key" "$KEY_FILE_PATH"
+        # 前缀落在 cert_dir 内部(传目录本身会在其父目录生成 <目录名>.crt/.key), 仍写临时名,
+        # 待校验通过后再统一替换 —— 与 openssl 分支同一条提交路径。
+        local xpre="${cert_dir}/.xcert.$$"
+        XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain "$domain" --file "$xpre" 2>/dev/null
+        [ -s "${xpre}.crt" ] && mv -f "${xpre}.crt" "$tmp_cert"
+        [ -s "${xpre}.key" ] && mv -f "${xpre}.key" "$tmp_key"
+        rm -f "${xpre}.crt" "${xpre}.key" 2>/dev/null
         # 清理历史错误写法可能残留在父目录的 <tag>.crt/.key
         rm -f "${CERT_DIR}/${tag}.crt" "${CERT_DIR}/${tag}.key" 2>/dev/null
     fi
-    if [ ! -f "$CERT_FILE_PATH" ] || [ ! -f "$KEY_FILE_PATH" ]; then
-        _error "证书生成失败, 需安装 openssl 或使用 xray tls cert"
-        return 1
+    if [ -s "$tmp_cert" ] && [ -s "$tmp_key" ]; then
+        # 校验 1(有 openssl 时): 证书必须真的带本次域名的 SAN —— 否则静默退回 CN-only,
+        #   Xray 的 serverName 校验必失败。无 openssl 走 xray 分支, 其证书自带 SAN, 无从也无需读。
+        # 校验 2: cert 与 key 必须同属一个密钥对 —— 这是"旧 cert + 新 key"错配的唯一防线。
+        # 两项都过才提交; 提交是同目录两次 rename(相邻执行, 窗口极小), 失败则回滚为"不动"。
+        if { ! command -v openssl >/dev/null 2>&1 || _hy2_cert_san_has "$tmp_cert" "$domain"; } \
+           && _hy2_cert_key_match "$tmp_cert" "$tmp_key"; then
+            mv -f "$tmp_cert" "$CERT_FILE_PATH" && mv -f "$tmp_key" "$KEY_FILE_PATH" && rc=0
+        fi
     fi
-    # 生成后必须真的带 SAN: 否则静默退回 CN-only(Xray 的 serverName 校验必失败)。
-    # 仅在有 openssl 时校验(无 openssl 走的是 xray 分支, 其证书自带 SAN, 无从也无需读)。
-    if command -v openssl >/dev/null 2>&1 && ! _hy2_cert_san_has "$CERT_FILE_PATH" "$domain"; then
-        _error "证书生成后 SAN 仍不含 ${domain}(openssl 版本过旧?); 已删除不完整证书"
-        rm -f "$CERT_FILE_PATH" "$KEY_FILE_PATH"
+    rm -f "$tmp_cert" "$tmp_key"
+    if [ "$rc" != 0 ]; then
+        _error "证书生成失败(cert/key 不完整、SAN 不含 ${domain} 或二者不匹配); 既有证书未改动, 需安装 openssl 或使用 xray tls cert"
         return 1
     fi
     _success "TLS 证书已生成: $cert_dir"
@@ -3150,7 +3186,7 @@ _add_hysteria2() {
             _info "已有证书, 复用: $CERT_DIR/$tag"
         else
             [ -f "$cert_file" ] && [ -f "$key_file" ] && \
-                _warn "已有证书的 SAN 不含本次域名 ${self_domain}, 重新生成: $CERT_DIR/$tag"
+                _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $CERT_DIR/$tag"
             _gen_hy2_cert "$tag" "$self_domain" || return 1
         fi
         # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
