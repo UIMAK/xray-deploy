@@ -3013,6 +3013,18 @@ _hy2_cert_key_match() {
     [ -n "$cpub" ] && [ "$cpub" = "$kpub" ]
 }
 
+# 删除证书备份文件。删不掉**不算**事务失败(残留 .bak 不影响运行态), 但必须如实报告 ——
+# 项目原则: 文件操作失败不得静默吞掉(logrotate 的 `|| true` 洗返回码就是 P1 教训)。
+_hy2_cert_bak_rm() {
+    local f
+    for f in "$@"; do
+        [ -n "$f" ] || continue
+        rm -f "$f" 2>/dev/null
+        [ -e "$f" ] && _warn "证书备份删除失败, 已残留(不影响运行): $f"
+    done
+    return 0
+}
+
 # 把"已校验的临时 cert/key"提交到正式路径; 失败则把正式路径**还原为提交前状态**。
 # 用法:_hy2_cert_commit <tmp_cert> <tmp_key> <cert> <key>
 # 返回码是三态(调用方必须按码分流, 不能一律当成"已回滚"):
@@ -3033,11 +3045,11 @@ _hy2_cert_commit() {
     # 备份既有文件(可能不存在 —— 首次生成时), 备份名以 XXXXXX 结尾满足 Alpine musl mktemp
     if [ -f "$cert" ]; then
         bak_cert=$(mktemp "${cert}.bak.XXXXXX") || return 1
-        cp -p "$cert" "$bak_cert" 2>/dev/null || { rm -f "$bak_cert"; return 1; }
+        cp -p "$cert" "$bak_cert" 2>/dev/null || { _hy2_cert_bak_rm "$bak_cert"; return 1; }
     fi
     if [ -f "$key" ]; then
-        bak_key=$(mktemp "${key}.bak.XXXXXX") || { [ -n "$bak_cert" ] && rm -f "$bak_cert"; return 1; }
-        cp -p "$key" "$bak_key" 2>/dev/null || { rm -f "$bak_key" "$bak_cert"; return 1; }
+        bak_key=$(mktemp "${key}.bak.XXXXXX") || { _hy2_cert_bak_rm "$bak_cert"; return 1; }
+        cp -p "$key" "$bak_key" 2>/dev/null || { _hy2_cert_bak_rm "$bak_key" "$bak_cert"; return 1; }
     fi
     # 提交(两步)+ 提交后校验正式路径确为一对匹配的 cert/key(兜底 rename 语义异常/外部干扰)
     if mv -f "$tmp_cert" "$cert" 2>/dev/null && mv -f "$tmp_key" "$key" 2>/dev/null \
@@ -3075,13 +3087,11 @@ _hy2_cert_commit() {
             [ -n "$bak_key" ] && [ -f "$bak_key" ] && _warn "旧 key 备份保留在: $bak_key"
             return 2
         fi
-        # 状态已确认回到提交前: 删掉备份
-        [ -n "$bak_cert" ] && rm -f "$bak_cert"
-        [ -n "$bak_key" ] && rm -f "$bak_key"
+        # 状态已确认回到提交前: 删掉备份(删不掉只告警, 不改返回码)
+        _hy2_cert_bak_rm "$bak_cert" "$bak_key"
         return 1
     fi
-    [ -n "$bak_cert" ] && rm -f "$bak_cert"
-    [ -n "$bak_key" ] && rm -f "$bak_key"
+    _hy2_cert_bak_rm "$bak_cert" "$bak_key"
     return 0
 }
 
