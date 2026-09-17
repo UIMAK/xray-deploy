@@ -3228,18 +3228,138 @@ EOF
     _success "TLS 证书已生成: $cert_dir"
 }
 
-# 环境变量取值: **存在性**语义与 Xray 的 os.LookupEnv 一致 —— 变量"存在但值为空"也算已设置。
-# 变量名可含 '.', 故用 awk 精确比较而非正则。用法: _hy2_env_get <name>(存在则输出值, rc=0)
+# ---------------------------------------------------------------------------
+# env 取值链的**硬约束: 值只经全局变量返回, 绝不经过命令替换**。
+#
+# 为什么: bash 的命令替换会剥掉输出的**所有**结尾换行(GNU Bash 手册 §3.5.4), 内嵌换行才保留。
+# Xray 把 xray.location.cert 的值直接 filepath.Join 进证书路径, 所以脚本必须与它逐字节一致 ——
+# 只要值经过一次 $(...), "以 1 个/2 个换行结尾"的**合法**值就再也保不住, 脚本观察到的基准会
+# 变成另一个目录, 归属/引用判定随之与 Xray 的真实行为脱节(不必然误删, 但判定依据已错)。
+# 故本组函数: 结果写入 _HY2_ENV_VAL / _HY2_CERT_ROOT, 读取一律用 NUL 终止的 read -d '',
+# 全程不产生命令替换。**不要再把返回值 printf 出去** —— 那等于重新引入一条会被剥尾的通道。
+#
+# 取值来源(逐字节精确, 按优先级) —— **三者都必须是"当前环境"读取器**:
+#   ① printenv  ② env -0  ③ busybox printenv(applet 单独探测)
+#      · printenv / busybox printenv 总给值补一个结尾换行 ⇒ 只剥那**一个**(其余尾随换行属于值本身)
+#      · env -0 是 NUL 分隔且不补换行, 天然精确
+#   ④ 三者都不可用(极简 rootfs): 返回 2(UNKNOWN), 由上层走保守分支。
+# **绝不使用 /proc/self/environ**: 按 proc(5) 它是 execve() 时的 *initial environment* ——
+#   既不反映启动后新增的变量(未命中 ⇒ 不能判"不存在"), 也不反映启动后的 unset / 重新赋值
+#   (**命中 ⇒ 值可能陈旧**: 实测 unset 后它仍返回旧值、改值后它仍返回旧值)。命中与未命中都
+#   无法证明"当前"状态, 故它连兜底都不合格 —— 拿它当"当前环境"等于引入陈旧值污染 cert root。
+# **绝不回退到 env|awk**: 它按行解析, 值含换行即截断, 会把"无法判定"伪装成"基准已知"。
+#   宁可如实上报"无法判定"。
+# 返回: 0=存在(值可为空) 1=不存在 2=无法判定
+# ---------------------------------------------------------------------------
+_HY2_ENV_VAL=""
+# 注: 曾经用"流尾追加哨兵记录 + 退出码"把状态编码进环境数据流, 已废弃 ——
+# 环境条目的名字空间在内核层面只禁止 `=` 与 NUL(environ(7)), 不要求标识符形式,
+# 实测 `env $'\x01任何前缀=X'` 可构造出与哨兵同形的真实条目, 从而伪造通道结束
+# (本该取到的值被打成 UNKNOWN)。现在状态与数据各走独立通道, 见 _hy2_env_get 的 ②。
+# 从"补结尾换行"的工具(printenv / busybox printenv)取值: 只剥掉工具补的那**一个**换行。
+# **单次调用 = 一条数据通道**: 输出(值 + 补的 1 个换行) → NUL → 退出码, 一次读完。
+# 退出码语义(GNU/busybox printenv 一致): 0=找到 1=未找到 **其它=工具自身故障 ⇒ UNKNOWN**。
+# 切不可把 rc≠0,1 与"变量不存在"混为一谈: printenv 存在但执行失败(ELF 损坏/缺动态 loader/
+# 无执行权限 ⇒ 126/127)时若 return 1, 上层会继续猜归一化名乃至 XRAY_BIN 默认目录 —— 与
+# fail-closed 相悖。故探测与取值合并成同一条通道, 让 rc 与被读的值同源(三审指出的边界)。
+# 用法: _hy2_env_from_tool <name> <cmd...>  → 值写入 _HY2_ENV_VAL; rc 0/1/2(同 _hy2_env_get)
+_hy2_env_from_tool() {
+    local name="$1"; shift
+    local kv="" rcstr=""
+    {
+        IFS= read -r -d '' kv <&3 || return 2    # 通道里没有分隔符 ⇒ 通道异常, 不猜
+        IFS= read -r rcstr <&3     || return 2
+    } 3< <( { "$@" "$name" 2>/dev/null; trc=$?; printf '\0'; printf '%s\n' "$trc"; } )
+    case "$rcstr" in
+        0) _HY2_ENV_VAL=${kv%$'\n'}; return 0 ;;   # 值 = 输出减去工具补的那**一个**换行
+        1) return 1 ;;                             # 变量确实不存在
+        *) return 2 ;;                             # 工具自身故障 ⇒ 无法判定
+    esac
+}
+
 _hy2_env_get() {
-    local name="$1" out="" rc=0
+    local name="$1" kv="" rc=0
+    _HY2_ENV_VAL=""
     [ -n "$name" ] || return 1
-    out=$(env 2>/dev/null | awk -F= -v k="$name" '
-        $1 == k { sub(/^[^=]*=/, ""); print; found=1; exit }
-        END { exit(found ? 0 : 1) }')
-    rc=$?
-    [ "$rc" -eq 0 ] || return 1
-    printf '%s' "$out"
-    return 0
+    # ① printenv(首选: 读**当前**环境 —— 脚本自身 export 的变量同样可见)
+    #    rc=2 ⇒ **该读取器自身故障**(不是"不存在"), 换下一个读取器继续; 0/1 才是确定结论。
+    if command -v printenv >/dev/null 2>&1; then
+        _hy2_env_from_tool "$name" printenv; rc=$?
+        [ "$rc" -ne 2 ] && return "$rc"
+    fi
+    # ② env -0(NUL 分隔、不补换行 ⇒ 天然逐字节精确; 同样是当前环境)。
+    #    **状态与数据各走独立通道** —— 退出码绝不编码进环境数据流。
+    #    为什么不能把退出码写在流尾: 环境条目的名字空间在内核层面只禁止 `=` 与 NUL(environ(7)),
+    #    不要求标识符形式 —— 实测 `env $'\x01<任意前缀>=v'` 会被 env -0 原样输出, 于是**任何**
+    #    流内哨兵都能被真实条目伪造(命中被误判成通道结束, 本该取到的值被打成 UNKNOWN)。
+    #    做法: env 把整份环境写进一个 0600 临时文件, **先取它自己的退出码**; 只有 rc=0 才说明
+    #    这份快照完整, 此时才去读它 —— 数据里不可能混入协议标记。
+    #    **读取阶段也必须区分三态**(不能把"读失败"当成"读完没找到"): read -d '' 的返回码
+    #      0  = 读到一条完整记录
+    #      1  = 读到 EOF; 若变量里**仍有残留数据**, 说明末条缺 NUL = 文件被截断 ⇒ 不能当完整
+    #      其它 = 真的读错误(EBADF/EIO 等) ⇒ UNKNOWN
+    #    另有"文件打不开"(被删/被换/权限)与"不是普通文件"(如被替换成目录)同样 ⇒ UNKNOWN。
+    #    任一路径都不能落到"不存在"。已知残留: 普通文件上的**真实 I/O 错误**与正常 EOF 在
+    #    bash 的 read 里同形(都返回 1), 无法再区分 —— 该文件是我们刚写的 0600 临时文件,
+    #    这类失败等同于磁盘故障, 不在本函数的可判定范围内。
+    #    · mktemp 失败或 env 退出非 0(125/126/127/被信号杀) ⇒ 该读取器不可用 ⇒ 继续降级
+    #    · rc=0 且**确认读取正常结束**且未命中 ⇒ 确实不存在(1)
+    #    已知取舍(P3, 非阻塞): 整份环境会短暂落盘(0600)。所有分支都立即 rm -f; 仅 SIGKILL
+    #    等无法执行清理的极端情形可能残留 —— 换来的收益是"退出码天然不经过数据流"。
+    if command -v env >/dev/null 2>&1; then
+        local ef="" erc=125 erd=1 efd="" hit="" found=0
+        ef=$(mktemp 2>/dev/null) || ef=""
+        [ -n "$ef" ] && { env -0 > "$ef" 2>/dev/null; erc=$?; }
+        if [ "$erc" -eq 0 ]; then
+            erd=0
+            # 用 {var}< 取一个高位空闲 fd, 不动调用方可能正在用的 3/4
+            if exec {efd}< "$ef" 2>/dev/null; then
+                # **exec 成功 ≠ 目标是普通文件**: 目录同样能被成功打开, 而随后的 read 会以
+                # rc=1 且 kv 为空失败 —— 与"正常 EOF"完全同形, 无法靠返回码区分(实测)。
+                # 故读取前必须校验**已打开对象**的类型。
+                # **判定依据必须单一**: 有 /proc 时只信 /proc/self/fd/<n>(它描述的就是那个已
+                # 打开的 fd, 免 TOCTOU); 只有**确认 /proc 机制不可用**时才退回路径检查。
+                # 切不可写成 `[ -f /proc/self/fd/N ] || [ -f "$ef" ]` —— 那是"任一路径成立即
+                # 放行": fd 指向目录、而路径在 exec 之后被换回普通文件时, 后者会让一个指向
+                # 目录的 fd 通过校验, read 再以 rc=1/空值失败 ⇒ 重新落回"误报不存在"。
+                if [ -d /proc/self/fd ]; then
+                    [ -f "/proc/self/fd/$efd" ] || erd=2       # 机制可用 ⇒ 只信 fd
+                else
+                    [ -f "$ef" ] || erd=2                      # 无 /proc ⇒ 退回路径检查
+                fi
+                if [ "$erd" -eq 0 ]; then
+                    while :; do
+                        kv=""                              # 先清空: 使"EOF 后仍有残留"可判定
+                        IFS= read -r -d '' kv <&"$efd"; erd=$?
+                        [ "$erd" -ne 0 ] && break
+                        case "$kv" in
+                            "$name="*) hit="${kv#"$name="}"; found=1; break ;;
+                        esac
+                    done
+                fi
+                exec {efd}<&-
+            else
+                erd=2                                       # 打不开 ⇒ 无法确认完整性
+            fi
+            rm -f "$ef"
+            [ "$erd" -gt 1 ] && return 2                    # 读错误 ⇒ UNKNOWN
+            [ "$erd" -eq 1 ] && [ -n "$kv" ] && return 2    # 末条缺 NUL(截断) ⇒ UNKNOWN
+            if [ "$found" -eq 1 ]; then _HY2_ENV_VAL="$hit"; return 0; fi
+            return 1                                        # 读取正常结束且未命中 ⇒ 确实不存在
+        fi
+        [ -n "$ef" ] && rm -f "$ef"
+        # 该读取器不可用 ⇒ 落到 ③(busybox printenv); 全不可用才 UNKNOWN
+    fi
+    # ③ busybox printenv: `command -v printenv` 失败**不等于** busybox 没有该 applet ——
+    #    可能只是 applet 没建 symlink, 故显式走 `busybox printenv`(仍是当前环境)。
+    if command -v busybox >/dev/null 2>&1 && busybox printenv >/dev/null 2>&1; then
+        _hy2_env_from_tool "$name" busybox printenv; rc=$?
+        [ "$rc" -ne 2 ] && return "$rc"
+    fi
+    # ④ 没有任何"当前环境"读取器 ⇒ 无法判定。**绝不回退到 /proc 或 env|awk**:
+    #    /proc 是启动快照(命中可能陈旧), env|awk 按行解析会截断含换行的值 —— 两者都会把
+    #    "无法判定"伪装成一个看似合法的基准值, 正是本函数的原始缺陷形态。
+    return 2
 }
 
 # 单个环境标志名的**最终生效值**: config.env 里**同名 key** 覆盖进程环境(等价于 Xray 在
@@ -3247,7 +3367,8 @@ _hy2_env_get() {
 # 覆盖是**按 key 名逐条**发生的, 不是"整个 config.env 优先于进程环境" —— 后者会让 config 的
 # 归一化名顶掉进程环境里的 exact 名, 与 Xray 的 NewEnvFlag 查找顺序不一致。
 # 存在性按 os.LookupEnv 语义: 变量存在但值为空也算已设置。
-# 用法: _hy2_env_final <name>  → 存在则输出值(可为空)并 rc=0
+# 用法: _hy2_env_final <name>  → 值写入 _HY2_ENV_VAL; rc: 0=存在(值可为空) 1=不存在 2=无法判定
+# **不经 stdout 返回**: 出口若走命令替换, 值末尾的换行会被再剥一次(见上方"硬约束")。
 # config 的 .env 段是否可用于判定: 缺失 = 合法(无 env 段); 存在但非 object、object 内含非法
 # value 类型、键值内容无法被 Unix os.Setenv 应用, 或 config 无法解析 = 配置损坏 ⇒ 无法判定
 # 最终环境, 返回 2(UNKNOWN)。Xray 的 EnvConfig 是 map[string]string 且 Config.Build() 会逐个
@@ -3287,15 +3408,18 @@ _hy2_cert_env_ok() {
 }
 
 _hy2_env_final() {
-    local name="$1" v=""
+    local name="$1" kv=""
+    _HY2_ENV_VAL=""
     # 配置损坏(.env 类型非法 / config 无法解析)⇒ 未知, 不回落进程环境(返回 2)
     _hy2_cert_env_ok || return 2
     [ -n "$name" ] || return 1
     if [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] \
        && jq -e --arg k "$name" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
-        # `// ""`: value 为 null 时 Go 取 string 零值 —— 变量"存在但为空", 与 Xray 一致
-        v=$(jq -r --arg k "$name" '(.env // {}) | (.[$k] // "")' "$CONFIG_FILE" 2>/dev/null) || v=""
-        printf '%s' "$v"
+        # jq -j 输出裸字符串且不补结尾换行(jq -r 会补一个), 再用 NUL 终止读取进变量 ⇒ 逐字节精确。
+        # 这对"值本身以换行结尾"是必需的: jq -r + 命令替换会把那些换行全部吃掉。
+        # 其中值取 // "" —— value 为 null 时 Go 取 string 零值, 即"存在但为空", 与 Xray 一致。
+        IFS= read -r -d '' kv < <( { jq -j --arg k "$name" '(.env // {}) | (.[$k] // "")' "$CONFIG_FILE" 2>/dev/null; printf '\0'; } ) || return 2
+        _HY2_ENV_VAL="$kv"
         return 0
     fi
     _hy2_env_get "$name"
@@ -3303,16 +3427,17 @@ _hy2_env_final() {
 
 # envflag 取值, 与 Xray 的 NewEnvFlag 一致: 先查 **exact 名**(xray.location.cert), 命中即用;
 # 否则查**归一化名**(XRAY_LOCATION_CERT)。两者各自先做"config.env 同名覆盖"。
-# 用法: _hy2_envflag_get <exact> <normalized>  → 存在则输出值(可为空)并 rc=0
+# 用法: _hy2_envflag_get <exact> <normalized>  → 值留在 _HY2_ENV_VAL; rc: 0/1/2(同 _hy2_env_final)
+# **不经 stdout**: 出口若走命令替换, 值末尾的换行会被再剥一次。
 _hy2_envflag_get() {
-    local exact="$1" norm="$2" v="" rc=0
-    v=$(_hy2_env_final "$exact") || rc=$?
+    local exact="$1" norm="$2" rc=0
+    _hy2_env_final "$exact"; rc=$?
     [ "$rc" = 2 ] && return 2
-    if [ "$rc" = 0 ]; then printf '%s' "$v"; return 0; fi
-    rc=0
-    v=$(_hy2_env_final "$norm") || rc=$?
+    if [ "$rc" = 0 ]; then return 0; fi
+    _hy2_env_final "$norm"; rc=$?
     [ "$rc" = 2 ] && return 2
-    if [ "$rc" = 0 ]; then printf '%s' "$v"; return 0; fi
+    if [ "$rc" = 0 ]; then return 0; fi
+    _HY2_ENV_VAL=""
     return 1
 }
 
@@ -3324,21 +3449,21 @@ _hy2_envflag_get() {
 # 返回 1(未知), 由上层按"未知"保守处理; 绝不能拿 xd 的 cwd 去凑一个答案。
 # **决定删除目标时只准用它**(不能用候选并集)。
 _hy2_xray_cert_root() {
-    local b="" xb=""
-    local rc=0
-    b=$(_hy2_envflag_get "xray.location.cert" "XRAY_LOCATION_CERT") || rc=$?
+    local xb="" rc=0
+    _HY2_CERT_ROOT=""
+    _hy2_envflag_get "xray.location.cert" "XRAY_LOCATION_CERT"; rc=$?
     if [ "$rc" = 0 ]; then
-        case "$b" in
-            /*) printf '%s' "$b"; return 0 ;;
+        case "$_HY2_ENV_VAL" in
+            /*) _HY2_CERT_ROOT="$_HY2_ENV_VAL"; return 0 ;;
             *) return 1 ;;      # 空串/相对路径 ⇒ Xray 按自身 cwd 解析, 未知
         esac
     fi
-    [ "$rc" = 2 ] && return 1   # 配置损坏 ⇒ 未知(禁止据此判定删除目标)
+    [ "$rc" = 2 ] && return 1   # 无法判定/配置损坏 ⇒ 未知(禁止据此判定删除目标)
     xb="${XRAY_BIN:-}"
     [ -n "$xb" ] || return 1
-    b=$(dirname "$xb")
-    case "$b" in
-        /*) printf '%s' "$b"; return 0 ;;
+    xb=$(dirname "$xb")
+    case "$xb" in
+        /*) _HY2_CERT_ROOT="$xb"; return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -3348,30 +3473,41 @@ _hy2_xray_cert_root() {
 # 生效, stable 核心会忽略它, 故可执行文件目录必须留作候选。
 # **绝不能用它决定删除目标** —— 并集只扩大"保留"的范围, 用它推导"该删哪个目录"会在
 # config.env 与进程环境冲突时指向一个 Xray 实际并未使用的目录。
+# 用法: _hy2_xray_cert_bases  → 候选基准写入数组 _HY2_BASES(每项一个); 恒返回 0。
+# **不经 stdout / 不用换行分隔**: 基准本身可能以换行结尾, 用换行分隔会把它切成两个候选;
+# 数组元素之间是天然分隔的, 不依赖任何会被剥尾或按行拆分的通道。
 _hy2_xray_cert_bases() {
-    local b="" xb="" seen=""
-    b=$(_hy2_xray_cert_root) || b=""
-    if [ -n "$b" ]; then printf '%s\n' "$b"; seen="$b"; fi
+    local xb="" seen=""
+    _HY2_BASES=()
+    if _hy2_xray_cert_root; then
+        seen="$_HY2_CERT_ROOT"
+        [ -n "$seen" ] && _HY2_BASES+=("$seen")
+    fi
     xb="${XRAY_BIN:-}"
     if [ -n "$xb" ]; then
-        b=$(dirname "$xb")
-        [ "$b" != "$seen" ] && printf '%s\n' "$b"
+        xb=$(dirname "$xb")
+        [ "$xb" != "$seen" ] && _HY2_BASES+=("$xb")
     fi
     return 0
 }
 
 # 一条引用可能对应的全部绝对路径(去重): 绝对路径只有它自己; 相对路径 = 各候选基准 + ref。
 # **仅用于"引用保护"**(命中任一即判"仍被引用"); 删除目标只看生效基准(见 _hy2_xray_cert_root)。
+# 用法: _hy2_cert_ref_abspaths <ref>  → 候选写入数组 _HY2_ABSPATHS(恒返回 0, 无候选则空数组);
+# ref 为空时返回 1。**不经 stdout 的换行分隔列表** —— 基准可能以换行结尾, 按行读会被拆碎。
 _hy2_cert_ref_abspaths() {
     local ref="$1" base
+    _HY2_ABSPATHS=()
     [ -n "$ref" ] || return 1
     case "$ref" in
-        /*) printf '%s\n' "$ref"; return 0 ;;
+        /*) _HY2_ABSPATHS+=("$ref"); return 0 ;;
     esac
-    while IFS= read -r base; do
+    _hy2_xray_cert_bases
+    for base in "${_HY2_BASES[@]}"; do
         [ -n "$base" ] || continue
-        printf '%s/%s\n' "$base" "$ref"
-    done <<< "$(_hy2_xray_cert_bases)"
+        _HY2_ABSPATHS+=("$base/$ref")
+    done
+    return 0
 }
 
 # 与工作目录无关的 canonical 解析(统一入口)。
@@ -3562,7 +3698,8 @@ _hy2_self_cert_dir() {
     cbase=$(_hy2_realpath "$CERT_DIR") || cbase="$CERT_DIR"
     # 生效基准无法确定(envflag 为空串/相对路径 ⇒ Xray 按自身 cwd 解析, 我们无从得知)
     # ⇒ 无法判断证书是否真在本节点目录, 归属不明 ⇒ 拒绝 purge(朝保留侧失败)
-    _hy2_xray_cert_root >/dev/null || return 1
+    # 生效基准无法确定(envflag 缺失/相对/无法判定 ⇒ 落点取决于 Xray 自身 cwd)⇒ 归属不明
+    _hy2_xray_cert_root || return 1
     [ "$(jq -r '.self_signed // false' "$NODES_DIR/${tag}.json" 2>/dev/null)" = "true" ] || return 1
     _hy2_cert_path_inside "$cand" || return 1
     # 归属目录**恒为本项目布局 CERT_DIR/<tag>**(由 tag 直接构造, 不受 config 内容影响);
@@ -3579,7 +3716,8 @@ _hy2_self_cert_dir() {
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
         ours=0; foreign=0; unres=0; idx=0
-        while IFS= read -r aref; do
+        _hy2_cert_ref_abspaths "$ref"
+        for aref in "${_HY2_ABSPATHS[@]}"; do
             [ -n "$aref" ] || continue
             idx=$((idx + 1))
             # 第一个候选 = 实际生效基准: 只有它能决定"材料是否在 CERT_DIR 之外"(删除目标只看它);
@@ -3604,7 +3742,7 @@ _hy2_self_cert_dir() {
                 if [ "$lex_ours" = 1 ]; then ours=1; else unres=1; fi
             elif [ "$is_eff" = 1 ]; then foreign=1                             # 材料在 CERT_DIR 之外
             fi
-        done <<< "$(_hy2_cert_ref_abspaths "$ref")"
+        done
         # 归属成立、材料没落到 CERT_DIR 之外、且无归属不明候选 ⇒ 本节点
         [ "$ours" = 1 ] && [ "$foreign" = 0 ] && [ "$unres" = 0 ] && continue
         # 其余一律拒绝(冲突/归属不明/自定义证书), 朝保留侧失败
@@ -3638,7 +3776,7 @@ _hy2_cert_dir_referenced() {
     # 生效基准未知(envflag 为空串/相对路径 ⇒ 落点取决于 Xray 自身 cwd)时, 相对引用的真实
     # 位置无从判定 ⇒ 只要存在**相对**引用就保守视为"可能指向本目录"(朝保留侧失败)
     local root_known=0
-    _hy2_xray_cert_root >/dev/null 2>&1 && root_known=1
+    _hy2_xray_cert_root && root_known=1
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
         case "$ref" in
@@ -3648,7 +3786,8 @@ _hy2_cert_dir_referenced() {
         # 一条引用可能对应多个绝对路径(生效基准 + 可执行文件目录两个候选), **逐个**解析;
         # 任一命中即视为仍被引用(朝保留侧失败)。
         in_scope=0; elsewhere=0
-        while IFS= read -r aref; do
+        _hy2_cert_ref_abspaths "$ref"
+        for aref in "${_HY2_ABSPATHS[@]}"; do
             [ -n "$aref" ] || continue
             # ① canonical **先行**(真实路径是事实, 词法只作兜底): 只做词法 $CERT_DIR 过滤会漏掉
             #    "路径表面在外、经符号链接实际落入 CERT_DIR"的活引用
@@ -3665,7 +3804,7 @@ _hy2_cert_dir_referenced() {
             #    词法在 CERT_DIR 内 ⇒ 记入 in_scope(交由 ③ 保守处理)
             case "$aref" in "$dir"/?*) return 0 ;; esac
             case "$aref" in "$CERT_DIR"/?*) in_scope=1 ;; esac
-        done <<< "$(_hy2_cert_ref_abspaths "$ref")"
+        done
         # ③ 与本目录无关(不在 CERT_DIR 内, 或已归约到别处)⇒ 下一条
         [ "$in_scope" = 1 ] || continue
         [ "$elsewhere" = 1 ] && continue
@@ -3764,12 +3903,17 @@ _add_hysteria2() {
                 [ -n "$cert_cn" ] && _warn "证书只有 CN(${cert_cn}) 且无 SAN; 现代 TLS 主机名校验忽略 CN, 该证书可能无法通过客户端校验"
             fi
         fi
+        # RT-1/M1 同类: EOF(管道驱动/会话异常/stdin 耗尽)下 read 立即返回非 0 且 sni_in 恒空,
+        # 无守卫会无限刷"不能为空"(实测 1s 内 14 万+ 行, 进程不退出)。契约与 _ask_link_addr 一致:
+        # EOF 即无法再获得输入 ⇒ 显式 return 1 中止(此处尚未生成证书/提交配置, 中止无副作用)。
+        # 注意 **不得** 用 ${sni_in:-$cert_hint} 兜底 —— 在 cert_hint 为空的分支里那是恒空值,
+        # 兜不出非空输入, 反而会把"EOF 中止"退化成"死循环"。两处 read 都必须带守卫。
         while :; do
             if [ -n "$cert_hint" ]; then
-                read -rp "  SNI (默认 ${cert_hint}): " sni_in
+                read -rp "  SNI (默认 ${cert_hint}): " sni_in || return 1
                 sni_in=${sni_in:-$cert_hint}
             else
-                read -rp "  SNI (证书无可用 SAN, 请手动输入具体主机名): " sni_in
+                read -rp "  SNI (证书无可用 SAN, 请手动输入具体主机名): " sni_in || return 1
             fi
             [ "$sni_in" = "0" ] && { _info "已取消"; return 1; }
             if [ -z "$sni_in" ]; then
@@ -3785,7 +3929,10 @@ _add_hysteria2() {
         # **生成推迟到提交节点之前**(见下方 tls_mode=selfsigned 分支): 提前生成会让"中途
         # 放弃 / ^C"留下一个没有任何节点引用的证书目录(实测)。
         while :; do
-            read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain
+            # RT-1/M1 同类: EOF 下 read 失败、self_domain 为空 ⇒ ${self_domain:-build.nvidia.com}
+            # 兜出默认域名并 break —— 不会死循环, 但会在"用户根本没答完"时静默用默认值建节点。
+            # 故 EOF 一律显式中止(return 1), 与上方 SNI 循环同契约。
+            read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain || return 1
             [ "$self_domain" = "0" ] && { _info "已取消"; return 1; }
             self_domain=${self_domain:-build.nvidia.com}
             _validate_domain "$self_domain" && break
