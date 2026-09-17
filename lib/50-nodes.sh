@@ -3252,6 +3252,9 @@ EOF
 # 返回: 0=存在(值可为空) 1=不存在 2=无法判定
 # ---------------------------------------------------------------------------
 _HY2_ENV_VAL=""
+# env -0 通道的"结束记录"前缀: env 的条目恒为 NAME=VALUE, 名字不含控制字符 \x01,
+# 故以 \x01 开头的条目不可能是真实环境变量, 可用作哨兵。
+NUL_MARK=$'\x01ENVRC:'
 # 从"补结尾换行"的工具(printenv / busybox printenv)取值: 只剥掉工具补的那**一个**换行。
 # **单次调用 = 一条数据通道**: 输出(值 + 补的 1 个换行) → NUL → 退出码, 一次读完。
 # 退出码语义(GNU/busybox printenv 一致): 0=找到 1=未找到 **其它=工具自身故障 ⇒ UNKNOWN**。
@@ -3283,14 +3286,25 @@ _hy2_env_get() {
         _hy2_env_from_tool "$name" printenv; rc=$?
         [ "$rc" -ne 2 ] && return "$rc"
     fi
-    # ② env -0(NUL 分隔、不补换行 ⇒ 天然逐字节精确; 同样是当前环境)
-    if env -0 >/dev/null 2>&1; then
+    # ② env -0(NUL 分隔、不补换行 ⇒ 天然逐字节精确; 同样是当前环境)。
+    #    **必须单次调用**: 若先 probe 再执行第二次, 读取那一次的失败就无从得知 —— env 自身
+    #    故障(125/126/127)会被当成"枚举完成但没找到", 误报 return 1(不存在)。与上一轮 printenv
+    #    同形的边界。故把 env 输出与**该次调用的退出码**并入同一条通道: 先整份环境, 再补一条
+    #    以 $NUL_MARK 开头的"结束记录 + 退出码"; 逐条 NUL 读。
+    #    · 读不到结束记录 ⇒ 通道被截断/生产端被杀 ⇒ 无法判定(2), 不冒充"不存在"
+    #    · 读到但退出码非 0 ⇒ env 自身故障 ⇒ 无法判定(2)
+    #    · 只有"读到结束记录且退出码为 0"才说明**枚举完整**, 此时未命中才是真的不存在(1)
+    if command -v env >/dev/null 2>&1; then
+        local erc="" seen_end=0
         while IFS= read -r -d '' kv <&3; do
             case "$kv" in
+                "$NUL_MARK"*) erc="${kv#"$NUL_MARK"}"; seen_end=1; break ;;
                 "$name="*) _HY2_ENV_VAL="${kv#"$name="}"; return 0 ;;
             esac
-        done 3< <(env -0 2>/dev/null)
-        return 1   # 能枚举当前环境 ⇒ 未命中即确实不存在
+        done 3< <( { env -0 2>/dev/null; trc=$?; printf '%s%s\0' "$NUL_MARK" "$trc"; } )
+        [ "$seen_end" = 1 ] || return 2   # 结束记录缺失 ⇒ 通道异常
+        [ "$erc" = 0 ]      || return 2   # env 自身故障 ⇒ UNKNOWN, 不冒充"不存在"
+        return 1                          # 枚举完整且未命中 ⇒ 确实不存在
     fi
     # ③ busybox printenv: `command -v printenv` 失败**不等于** busybox 没有该 applet ——
     #    可能只是 applet 没建 symlink, 故显式走 `busybox printenv`(仍是当前环境)。
