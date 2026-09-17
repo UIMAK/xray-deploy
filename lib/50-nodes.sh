@@ -3261,7 +3261,10 @@ _hy2_env_get() {
         return 0
     fi
     # ② /proc/self/environ(无 printenv 的裁剪镜像): 内核给的 NUL 分隔原始环境, 不补换行, 天然精确。
-    #    注意它是**进程启动时**的快照, 启动后 export 的变量不在此列 —— 故只作兜底, 不首选。
+    #    **命中可以判"存在"; 未命中绝不能判"不存在"** —— 按 proc(5), 它保存的是 execve() 时的
+    #    *initial environment*, 进程启动后 export/setenv 产生的变量不会出现在这里。于是
+    #    "这里没有" 只说明"启动时没有", 不能推出"当前没有"(这正是 os.LookupEnv 问的问题)。
+    #    故未命中一律返回 2(UNKNOWN), 让上游走 fail-closed 分支, 而不是继续猜 XRAY_BIN 目录。
     if [ -r /proc/self/environ ]; then
         while IFS= read -r -d '' kv <&3; do
             case "$kv" in
@@ -3269,7 +3272,7 @@ _hy2_env_get() {
             esac
         done 3< /proc/self/environ
         [ "$found" = 1 ] && return 0
-        return 1
+        return 2
     fi
     # ③ 两者都不可用 ⇒ 无法判定。**绝不回退到 env|awk**: 它按行解析, 值含换行即被截断,
     #    会把"无法判定"伪装成一个看似合法的基准值(这正是本函数的原始缺陷形态)。
