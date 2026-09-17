@@ -3298,7 +3298,10 @@ _hy2_env_get() {
     #      0  = 读到一条完整记录
     #      1  = 读到 EOF; 若变量里**仍有残留数据**, 说明末条缺 NUL = 文件被截断 ⇒ 不能当完整
     #      其它 = 真的读错误(EBADF/EIO 等) ⇒ UNKNOWN
-    #    另有"文件打不开"(被删/被换/权限)同样 ⇒ UNKNOWN。任一路径都不能落到"不存在"。
+    #    另有"文件打不开"(被删/被换/权限)与"不是普通文件"(如被替换成目录)同样 ⇒ UNKNOWN。
+    #    任一路径都不能落到"不存在"。已知残留: 普通文件上的**真实 I/O 错误**与正常 EOF 在
+    #    bash 的 read 里同形(都返回 1), 无法再区分 —— 该文件是我们刚写的 0600 临时文件,
+    #    这类失败等同于磁盘故障, 不在本函数的可判定范围内。
     #    · mktemp 失败或 env 退出非 0(125/126/127/被信号杀) ⇒ 该读取器不可用 ⇒ 继续降级
     #    · rc=0 且**确认读取正常结束**且未命中 ⇒ 确实不存在(1)
     #    已知取舍(P3, 非阻塞): 整份环境会短暂落盘(0600)。所有分支都立即 rm -f; 仅 SIGKILL
@@ -3311,14 +3314,22 @@ _hy2_env_get() {
             erd=0
             # 用 {var}< 取一个高位空闲 fd, 不动调用方可能正在用的 3/4
             if exec {efd}< "$ef" 2>/dev/null; then
-                while :; do
-                    kv=""                                  # 先清空: 使"EOF 后仍有残留"可判定
-                    IFS= read -r -d '' kv <&"$efd"; erd=$?
-                    [ "$erd" -ne 0 ] && break
-                    case "$kv" in
-                        "$name="*) hit="${kv#"$name="}"; found=1; break ;;
-                    esac
-                done
+                # **exec 成功 ≠ 目标是普通文件**: 目录同样能被成功打开, 而随后的 read 会以
+                # rc=1 且 kv 为空失败 —— 与"正常 EOF"完全同形, 无法靠返回码区分(实测)。
+                # 故读取前必须校验**已打开对象**的类型: 首选 /proc/self/fd/<n>(校验的就是
+                # 那个 fd 指向的对象, 免 TOCTOU), 无 /proc 的极简环境退回路径检查。
+                if [ -f "/proc/self/fd/$efd" ] || [ -f "$ef" ]; then
+                    while :; do
+                        kv=""                              # 先清空: 使"EOF 后仍有残留"可判定
+                        IFS= read -r -d '' kv <&"$efd"; erd=$?
+                        [ "$erd" -ne 0 ] && break
+                        case "$kv" in
+                            "$name="*) hit="${kv#"$name="}"; found=1; break ;;
+                        esac
+                    done
+                else
+                    erd=2                                   # 非普通文件 ⇒ 无法确认完整性
+                fi
                 exec {efd}<&-
             else
                 erd=2                                       # 打不开 ⇒ 无法确认完整性
