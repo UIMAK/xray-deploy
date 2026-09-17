@@ -3316,11 +3316,15 @@ _hy2_cert_snapshot() {
 }
 
 # 丢弃证书快照(节点创建成功后调用 —— 本次改动已被节点引用, 不再需要回滚点)
+# 返回: 0 = 已删除(或本就无快照); 1 = 删除失败, 快照仍在(内含旧私钥副本, 调用方须如实报告)
 _hy2_cert_snapshot_drop() {
     local bak="$1"
     [ -n "$bak" ] || return 0
     rm -rf "$bak" 2>/dev/null
-    [ -e "$bak" ] && _warn "证书快照清理失败, 已残留: $bak"
+    if [ -e "$bak" ]; then
+        _warn "证书快照清理失败, 已残留(内含旧私钥副本): $bak"
+        return 1
+    fi
     return 0
 }
 
@@ -3357,9 +3361,34 @@ _hy2_cert_restore() {
         return 2
     fi
     # 清掉已空的目录(rmdir 仅在空目录成功 ⇒ 不会误删既有内容; 非空失败即静默保留)
-    [ "$ok" = 1 ] && [ -d "$cdir" ] && rmdir "$cdir" 2>/dev/null
-    _hy2_cert_snapshot_drop "$bak"
+    [ -d "$cdir" ] && rmdir "$cdir" 2>/dev/null
+    # 证书已恢复, 但快照删不掉 ⇒ 不能报"完整恢复": 快照里是旧私钥副本, 残留需人工处理
+    if ! _hy2_cert_snapshot_drop "$bak"; then
+        _warn "证书已恢复, 但快照未清理干净(内含旧私钥副本), 请手工删除: ${bak:-无}"
+        return 1
+    fi
     return 0
+}
+
+# 节点创建失败路径的统一收口(调用方不必各自解释 _hy2_cert_restore 的返回码)。
+# 用法: _hy2_cert_rollback <cert_dirty> <bak> <cert> <key> <cert_dir>
+# 返回: 0 = 无需回滚, 或证书已完整恢复; 2 = 回滚不完整(快照已保留, 需人工恢复)
+_hy2_cert_rollback() {
+    local dirty="$1" bak="$2" cert="$3" key="$4" cdir="$5" rc=0
+    [ "$dirty" = "true" ] || return 0
+    _hy2_cert_restore "$bak" "$cert" "$key" "$cdir"; rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1)
+            # 证书已恢复, 只是快照(旧私钥副本)没删掉 —— 不能报"回滚未完成"吓用户
+            _warn "证书已恢复; 快照未清理干净(内含旧私钥副本), 请手工删除: ${bak:-无}"
+            return 0
+            ;;
+        *)
+            _error "证书回滚未完成, 快照已保留待人工恢复: ${bak:-无}"
+            return 2
+            ;;
+    esac
 }
 # 节点正在使用的自签证书目录(仅 $CERT_DIR 之内)。返回 1 且无输出 = 该节点不是自签证书,
 # 或证书落在 CERT_DIR 之外(自定义证书永不删除)。
@@ -3380,22 +3409,34 @@ _hy2_self_cert_dir() {
 # config 里被手工写成 `..` 形式的引用无法安全比较, 一律保守判定为"仍被引用"。
 _hy2_cert_dir_referenced() {
     local dir="$1" refs ref
-    refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]?.certificateFile // empty' "$CONFIG_FILE" 2>/dev/null) || return 0
+    # certificateFile 与 keyFile **都要扫**: 引用模型是"证书目录是否仍被 config 使用",
+    # 而 Xray 的 CertificateObject 是 cert+key 两个文件, 只扫 cert 会漏掉
+    # "存活节点 B 的 keyFile 指向 A/key.pem" ⇒ rm -rf A 会删掉 B 正在用的私钥。
+    refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' "$CONFIG_FILE" 2>/dev/null) || return 0
     [ -n "$refs" ] || return 1
-    local dreal rreal rdir
-    dreal=$(readlink -f "$dir" 2>/dev/null); [ -n "$dreal" ] || dreal="$dir"
+    local dreal rreal
+    dreal=$(readlink -f "$dir" 2>/dev/null)
+    if [ -z "$dreal" ]; then
+        # 无法 canonicalize 待删目录 ⇒ fail-closed(与 jq 失败同口径): 目录存在就保守保留,
+        # 免得"解析失败 ⇒ 退回词法比较 ⇒ 误判无引用 ⇒ 删掉仍在用的证书"
+        if [ -e "$dir" ] || [ -L "$dir" ]; then
+            _warn "无法解析证书目录真实路径, 保守保留: $dir"
+            return 0
+        fi
+        dreal="$dir"
+    fi
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
         # ① 词法前缀(覆盖文件已不存在/无法解析的 ref —— 它们不会被 rm, 但可能指向本目录)
         case "$ref" in "$dir"/?*) return 0 ;; esac
-        # ② canonical 等价必须对 **ref 文件自身** 归约: 只归约 dirname 会漏掉
-        #    "certs/shared-cert.pem -> certs/A/cert.pem" 这类文件符号链接 —— 父目录是 certs,
-        #    与被删目录 A 不同, 于是误判为无引用而把 A 删掉(活着的 inbound 立刻失去证书)。
+        # ② canonical 判定: 必须对 **ref 文件自身** 归约, 且判据是"位于待删目录**之下**",
+        #    而不是"dirname 恰好等于待删目录" —— 后者漏掉 certs/A/sub/cert.pem 这类子目录引用
+        #    (dirname 是 A/sub ≠ A ⇒ 误判无引用 ⇒ rm -rf A 删掉仍在用的证书)。
+        #    对 ref 自身归约同时覆盖了文件符号链接(certs/shared.pem -> certs/A/cert.pem)。
         rreal=$(readlink -f "$ref" 2>/dev/null) || rreal=""
         if [ -n "$rreal" ]; then
-            rdir=$(dirname "$rreal")
-            [ "$rdir" = "$dreal" ] && return 0
-            continue          # 已归约且指向别处 ⇒ 确定为无关(不得落进 ③ 的保守分支)
+            case "$rreal" in "$dreal"/?*) return 0 ;; esac
+            continue          # 已归约且落在别处 ⇒ 确定为无关(不得落进 ③ 的保守分支)
         fi
         # ③ 无法归约: 符号链接(悬浮)或含 ".." 时无从证实落点 ⇒ 该条保守视为被引用
         [ -L "$ref" ] && return 0
@@ -3637,7 +3678,9 @@ _add_hysteria2() {
             if [ "$genrc" != 0 ]; then
                 # 生成失败: 证书已是提交前状态(生成器自带回滚), 丢掉快照即可;
                 # 目录是本次新建且已空 ⇒ 顺手清掉(rc=2 的备份必须保留, 绝不动)
-                _hy2_cert_snapshot_drop "$cert_bak"
+                if ! _hy2_cert_snapshot_drop "$cert_bak"; then
+                    _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
+                fi
                 [ "$genrc" = 1 ] && [ "$cert_dir_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
                 return 1
             fi
@@ -3659,23 +3702,18 @@ _add_hysteria2() {
     R_OBFS_MASK_BLOCK="$obfs_mask"
     local inbound
     if ! inbound=$(_render_template "$(_tpl_path hysteria2)"); then
-        # 回滚不完整时返回 2 并保留快照(不能静默丢弃唯一恢复副本)
-        if [ "$cert_dirty" = "true" ] && ! _hy2_cert_restore "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag"; then
-            _error "证书回滚未完成, 快照已保留待人工恢复: ${cert_bak:-无}"
-            return 2
-        fi
+        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
         return 1
     fi
 
     if ! _commit_inbound "$inbound"; then
-        if [ "$cert_dirty" = "true" ] && ! _hy2_cert_restore "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag"; then
-            _error "证书回滚未完成, 快照已保留待人工恢复: ${cert_bak:-无}"
-            return 2
-        fi
+        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
         return 1
     fi
-    # 配置已提交(节点已引用该证书) ⇒ 回滚点作废
-    [ "$cert_dirty" = "true" ] && _hy2_cert_snapshot_drop "$cert_bak"
+    # 配置已提交(节点已引用该证书) ⇒ 回滚点作废; 删不掉要如实报(快照内含旧私钥副本)
+    if [ "$cert_dirty" = "true" ] && ! _hy2_cert_snapshot_drop "$cert_bak"; then
+        _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
+    fi
 
     local addr
     addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
