@@ -3316,9 +3316,18 @@ _hy2_env_get() {
             if exec {efd}< "$ef" 2>/dev/null; then
                 # **exec 成功 ≠ 目标是普通文件**: 目录同样能被成功打开, 而随后的 read 会以
                 # rc=1 且 kv 为空失败 —— 与"正常 EOF"完全同形, 无法靠返回码区分(实测)。
-                # 故读取前必须校验**已打开对象**的类型: 首选 /proc/self/fd/<n>(校验的就是
-                # 那个 fd 指向的对象, 免 TOCTOU), 无 /proc 的极简环境退回路径检查。
-                if [ -f "/proc/self/fd/$efd" ] || [ -f "$ef" ]; then
+                # 故读取前必须校验**已打开对象**的类型。
+                # **判定依据必须单一**: 有 /proc 时只信 /proc/self/fd/<n>(它描述的就是那个已
+                # 打开的 fd, 免 TOCTOU); 只有**确认 /proc 机制不可用**时才退回路径检查。
+                # 切不可写成 `[ -f /proc/self/fd/N ] || [ -f "$ef" ]` —— 那是"任一路径成立即
+                # 放行": fd 指向目录、而路径在 exec 之后被换回普通文件时, 后者会让一个指向
+                # 目录的 fd 通过校验, read 再以 rc=1/空值失败 ⇒ 重新落回"误报不存在"。
+                if [ -d /proc/self/fd ]; then
+                    [ -f "/proc/self/fd/$efd" ] || erd=2       # 机制可用 ⇒ 只信 fd
+                else
+                    [ -f "$ef" ] || erd=2                      # 无 /proc ⇒ 退回路径检查
+                fi
+                if [ "$erd" -eq 0 ]; then
                     while :; do
                         kv=""                              # 先清空: 使"EOF 后仍有残留"可判定
                         IFS= read -r -d '' kv <&"$efd"; erd=$?
@@ -3327,8 +3336,6 @@ _hy2_env_get() {
                             "$name="*) hit="${kv#"$name="}"; found=1; break ;;
                         esac
                     done
-                else
-                    erd=2                                   # 非普通文件 ⇒ 无法确认完整性
                 fi
                 exec {efd}<&-
             else
