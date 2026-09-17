@@ -3254,7 +3254,9 @@ _hy2_env_get() {
 _hy2_cert_env_ok() {
     [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] || return 0
     local t
-    t=$(jq -r '(.env // null) | type' "$CONFIG_FILE" 2>/dev/null) || return 2
+    # 必须显式区分"没有 env 键"与"env 键存在但值为 false/null": jq 的 `//` 把 false 也当空值,
+    # 用 `(.env // null)` 会把 `"env": false` 折成 null ⇒ 误判"无 env 段", 正是本函数要堵的洞。
+    t=$(jq -r 'if has("env") then .env | type else "null" end' "$CONFIG_FILE" 2>/dev/null) || return 2
     case "$t" in
         null|object) return 0 ;;
         *) return 2 ;;
