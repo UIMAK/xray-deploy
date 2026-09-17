@@ -3229,15 +3229,34 @@ EOF
 }
 
 # 环境变量取值: **存在性**语义与 Xray 的 os.LookupEnv 一致 —— 变量"存在但值为空"也算已设置。
-# 变量名可含 '.', 故用 awk 精确比较而非正则。用法: _hy2_env_get <name>(存在则输出值, rc=0)
+# 值必须**逐字节原样**取出: Xray 把 xray.location.cert 的值直接 filepath.Join 进证书路径, 任何
+# 截断都会让"生效基准"指向**另一个目录**。旧写法 $(env | awk -F= ... {print}) 的 print 按 RS="\n"
+# 输出, **值内含换行时只输出首行**(实测 XRAY_LOCATION_CERT=$'/aa\nbb' 得 "/aa")。
+# 危害不在"未知变已知"(截断结果仍以 / 开头, 两种写法都判"基准已知"), 而在**基准值被静默换掉**:
+# 归属/引用判定于是针对一个 Xray 根本没用的目录进行 —— 例如值实为 "<CERT_DIR>\n" 时, 旧代码恰好
+# 把基准当成 CERT_DIR(而 Xray 用的是含换行的那个路径), 判定结论与 Xray 的真实行为脱节。
+# 改用 printenv 精确取名: 一次只取一个变量, 不解析整份环境列表, 值原样保留。变量名可含 '.',
+# 而 bash 无法把含 '.' 的名字导入成变量(${!n} / [ -v ] 都看不到它), 故只能走 printenv。
+# 用法: _hy2_env_get <name>(存在则输出值, rc=0)
 _hy2_env_get() {
-    local name="$1" out="" rc=0
+    local name="$1" out=""
     [ -n "$name" ] || return 1
+    if command -v printenv >/dev/null 2>&1; then
+        # 先判存在性: printenv 对"不存在"返回 1, 对"存在但为空"返回 0 且输出空行(与 LookupEnv 同语义)
+        printenv "$name" >/dev/null 2>&1 || return 1
+        # 取值要**逐字节精确**: printenv 总会给值补一个结尾换行, 而命令替换又会吃掉**所有**结尾换行。
+        # 两步都抵消: ① 追加哨兵字节 x 挡住命令替换的剥尾 ⇒ out = 值 + "\n" + "x"
+        # ② 剥掉哨兵 ⇒ 值 + "\n"; 再剥掉 printenv 补的那**一个** "\n" ⇒ 值(内嵌/尾随换行逐字节保留)
+        out=$(printenv "$name" 2>/dev/null; printf x)
+        out=${out%x}
+        out=${out%$'\n'}
+        printf '%s' "$out"
+        return 0
+    fi
+    # 兜底(无 printenv 的裁剪镜像, 实际不会走到): 保留旧实现 —— 值含换行会被截断
     out=$(env 2>/dev/null | awk -F= -v k="$name" '
         $1 == k { sub(/^[^=]*=/, ""); print; found=1; exit }
-        END { exit(found ? 0 : 1) }')
-    rc=$?
-    [ "$rc" -eq 0 ] || return 1
+        END { exit(found ? 0 : 1) }') || return 1
     printf '%s' "$out"
     return 0
 }
@@ -3764,12 +3783,17 @@ _add_hysteria2() {
                 [ -n "$cert_cn" ] && _warn "证书只有 CN(${cert_cn}) 且无 SAN; 现代 TLS 主机名校验忽略 CN, 该证书可能无法通过客户端校验"
             fi
         fi
+        # RT-1/M1 同类: EOF(管道驱动/会话异常/stdin 耗尽)下 read 立即返回非 0 且 sni_in 恒空,
+        # 无守卫会无限刷"不能为空"(实测 1s 内 14 万+ 行, 进程不退出)。契约与 _ask_link_addr 一致:
+        # EOF 即无法再获得输入 ⇒ 显式 return 1 中止(此处尚未生成证书/提交配置, 中止无副作用)。
+        # 注意 **不得** 用 ${sni_in:-$cert_hint} 兜底 —— 在 cert_hint 为空的分支里那是恒空值,
+        # 兜不出非空输入, 反而会把"EOF 中止"退化成"死循环"。两处 read 都必须带守卫。
         while :; do
             if [ -n "$cert_hint" ]; then
-                read -rp "  SNI (默认 ${cert_hint}): " sni_in
+                read -rp "  SNI (默认 ${cert_hint}): " sni_in || return 1
                 sni_in=${sni_in:-$cert_hint}
             else
-                read -rp "  SNI (证书无可用 SAN, 请手动输入具体主机名): " sni_in
+                read -rp "  SNI (证书无可用 SAN, 请手动输入具体主机名): " sni_in || return 1
             fi
             [ "$sni_in" = "0" ] && { _info "已取消"; return 1; }
             if [ -z "$sni_in" ]; then
@@ -3785,7 +3809,10 @@ _add_hysteria2() {
         # **生成推迟到提交节点之前**(见下方 tls_mode=selfsigned 分支): 提前生成会让"中途
         # 放弃 / ^C"留下一个没有任何节点引用的证书目录(实测)。
         while :; do
-            read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain
+            # RT-1/M1 同类: EOF 下 read 失败、self_domain 为空 ⇒ ${self_domain:-build.nvidia.com}
+            # 兜出默认域名并 break —— 不会死循环, 但会在"用户根本没答完"时静默用默认值建节点。
+            # 故 EOF 一律显式中止(return 1), 与上方 SNI 循环同契约。
+            read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain || return 1
             [ "$self_domain" = "0" ] && { _info "已取消"; return 1; }
             self_domain=${self_domain:-build.nvidia.com}
             _validate_domain "$self_domain" && break
