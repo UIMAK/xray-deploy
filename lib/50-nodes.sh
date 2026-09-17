@@ -3228,6 +3228,22 @@ EOF
     _success "TLS 证书已生成: $cert_dir"
 }
 
+# 与工作目录无关的 canonical 解析(统一入口)。
+# 为什么不用裸 readlink -f: busybox 的 readlink -f 对**相对**符号链接自 1.35 起有
+# workdir 相关的已知缺陷(Bug 16273), 而 Alpine 就是 busybox。做法是先 cd 进目标所在目录,
+# 再解析 basename —— 交给 readlink 的永远是"该目录内的名字", 结果与调用方 cwd 无关;
+# 用子 shell 保证不改变调用方 cwd。
+# 用法: _hy2_realpath <path>  → stdout 真实路径; 无法解析返回 1
+_hy2_realpath() {
+    local p="$1" dir base out
+    [ -n "$p" ] || return 1
+    dir=$(dirname "$p"); base=$(basename "$p")
+    [ -e "$dir" ] || [ -L "$dir" ] || return 1
+    out=$( ( cd "$dir" 2>/dev/null && readlink -f "$base" 2>/dev/null ) ) || return 1
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+}
+
 # 路径的**真实身份**是否在 $CERT_DIR 之内(删除/还原这类破坏性动作的前置闸门)。
 # 只做词面前缀匹配不够: "certs/tag/../../important" 同样满足 "$CERT_DIR"/*, 而 rm -rf 的
 # 落点在 CERT_DIR 之外。故三重校验: ① 词面前缀(且不能就是 CERT_DIR 自身) ② 逐段拒绝 ".."
@@ -3248,7 +3264,7 @@ _hy2_cert_path_inside() {
     if [ ! -e "$p" ] && [ ! -L "$p" ]; then
         local parent; parent=$(dirname "$p")
         [ -e "$parent" ] || [ -L "$parent" ] || return 0   # 父目录也不存在 ⇒ 无落点可言
-        real=$(readlink -f "$parent" 2>/dev/null) || return 1
+        real=$(_hy2_realpath "$parent") || return 1
         # 父目录归约后等于 base ⇒ 目标是 CERT_DIR 的直接子项(其自身已在上面通过词法校验)
         case "$real" in
             "$base"|"$base"/?*) return 0 ;;
@@ -3257,7 +3273,7 @@ _hy2_cert_path_inside() {
     fi
     # 必须对**目标自身**做 canonical 解析: 只解析父目录会让"文件本身是指向 CERT_DIR 之外的
     # 符号链接"蒙混过关(certs/tag/cert.pem -> /outside/x.pem), 而后续 cp/rm 会落到目标上。
-    real=$(readlink -f "$p" 2>/dev/null)
+    real=$(_hy2_realpath "$p") || real=""
     if [ -z "$real" ]; then
         # 无 readlink -f(极老 busybox)或解析失败: 非符号链接才可用"父目录 + 文件名"回退;
         # 符号链接(含悬浮)无法证实落点 ⇒ fail-closed, 拒绝
@@ -3395,14 +3411,46 @@ _hy2_cert_rollback() {
 # 交叉校验: metadata 声明 `self_signed=true`, config 里该入站的 certificateFile 是事实;
 # 事实缺失(入站已被外部删除)时回退按 tag 推导的固定目录 —— 与创建路径同源。
 _hy2_self_cert_dir() {
-    local tag="$1" d=""
+    local tag="$1" refs ref rreal cand cbase
+    cand="$CERT_DIR/$tag"
+    cbase=$(_hy2_realpath "$CERT_DIR") || cbase="$CERT_DIR"
     [ "$(jq -r '.self_signed // false' "$NODES_DIR/${tag}.json" 2>/dev/null)" = "true" ] || return 1
-    d=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[0].certificateFile // empty' "$CONFIG_FILE" 2>/dev/null | head -1)
-    [ -n "$d" ] || d="$CERT_DIR/$tag/cert.pem"
-    _hy2_cert_path_inside "$d" || return 1
-    d=$(dirname "$d")
-    _hy2_cert_path_inside "$d" || return 1
-    printf '%s' "$d"
+    _hy2_cert_path_inside "$cand" || return 1
+    # 归属目录**恒为本项目布局 CERT_DIR/<tag>**(由 tag 直接构造, 不受 config 内容影响);
+    # config 里的路径只作**交叉校验**, 绝不拿它反推目录再 rm -rf ——
+    # 反推会把 "certs/B/link.pem -> certs/A/cert.pem" 之类归属判成 A, 删掉别的节点的证书目录。
+    cand=$(_hy2_realpath "$cand") || cand="$CERT_DIR/$tag"
+    # 该入站引用的每个 cert/key 都必须 canonicalize 到 cand 之下(多证书/共享目录/外部链接
+    # 一律判为"归属不明确" ⇒ 返回 1, 不进入 purge)
+    refs=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' "$CONFIG_FILE" 2>/dev/null) || return 1
+    while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        case "$ref" in
+            "$CERT_DIR"/*) ;;
+            *) return 1 ;;   # 指向 CERT_DIR 之外 ⇒ 不是本项目的自签布局
+        esac
+        rreal=$(_hy2_realpath "$ref") || rreal=""
+        if [ -z "$rreal" ]; then
+            # 无法 canonicalize(文件已删除等): 只认**词法上**就在 cand 之下的引用,
+            # 其余判归属不明(绝不为了"能删"而放宽)
+            case "$ref" in
+                "$cand"/?*) ;;
+                *) return 1 ;;
+            esac
+            continue
+        fi
+        case "$rreal" in
+            "$cand"/?*) continue ;;      # 就在本节点目录里
+        esac
+        # 引用文件是"本节点目录内的链接 → CERT_DIR 内别处": 归属仍是本节点(cand),
+        # 删除 cand 只删掉这个链接, 不会碰到目标目录 —— 这正是**不能**按 canonical 目标反推
+        # 目录的原因(反推会去删别的节点正在用的目录)。
+        case "$rreal" in
+            "$cbase"/?*) continue ;;
+            *) return 1 ;;               # 材料在 CERT_DIR 之外 ⇒ 不是本项目自签布局, 拒绝
+        esac
+    done <<< "$refs"
+    printf '%s' "$cand"
 }
 
 # 证书目录是否仍被 config 里的入站引用(节点删除成功后才调用 ⇒ 命中的都是存活引用)。
@@ -3415,7 +3463,7 @@ _hy2_cert_dir_referenced() {
     refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' "$CONFIG_FILE" 2>/dev/null) || return 0
     [ -n "$refs" ] || return 1
     local dreal rreal
-    dreal=$(readlink -f "$dir" 2>/dev/null)
+    dreal=$(_hy2_realpath "$dir") || dreal=""
     if [ -z "$dreal" ]; then
         # 无法 canonicalize 待删目录 ⇒ fail-closed(与 jq 失败同口径): 目录存在就保守保留,
         # 免得"解析失败 ⇒ 退回词法比较 ⇒ 误判无引用 ⇒ 删掉仍在用的证书"
@@ -3433,7 +3481,7 @@ _hy2_cert_dir_referenced() {
         #    而不是"dirname 恰好等于待删目录" —— 后者漏掉 certs/A/sub/cert.pem 这类子目录引用
         #    (dirname 是 A/sub ≠ A ⇒ 误判无引用 ⇒ rm -rf A 删掉仍在用的证书)。
         #    对 ref 自身归约同时覆盖了文件符号链接(certs/shared.pem -> certs/A/cert.pem)。
-        rreal=$(readlink -f "$ref" 2>/dev/null) || rreal=""
+        rreal=$(_hy2_realpath "$ref") || rreal=""
         if [ -n "$rreal" ]; then
             case "$rreal" in "$dreal"/?*) return 0 ;; esac
             continue          # 已归约且落在别处 ⇒ 确定为无关(不得落进 ③ 的保守分支)
