@@ -3228,48 +3228,64 @@ EOF
     _success "TLS 证书已生成: $cert_dir"
 }
 
-# 环境变量精确取值(变量名可含 '.', 故用 awk 精确比较而非正则)
+# 环境变量取值: **存在性**语义与 Xray 的 os.LookupEnv 一致 —— 变量"存在但值为空"也算已设置。
+# 变量名可含 '.', 故用 awk 精确比较而非正则。用法: _hy2_env_get <name>(存在则输出值, rc=0)
 _hy2_env_get() {
-    local name="$1"
+    local name="$1" out="" rc=0
     [ -n "$name" ] || return 1
-    env 2>/dev/null | awk -F= -v k="$name" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'
+    out=$(env 2>/dev/null | awk -F= -v k="$name" '
+        $1 == k { sub(/^[^=]*=/, ""); print; found=1; exit }
+        END { exit(found ? 0 : 1) }')
+    rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    printf '%s' "$out"
+    return 0
 }
 
-# envflag 取值, 顺序与 Xray 的 envflag 一致: **先 exact 名**(xray.location.cert), 再归一化名
-# (XRAY_LOCATION_CERT); 且 **config.env 优先** —— Xray 在配置加载后把 env 段写入进程环境,
-# 同名项覆盖已有进程变量(docs/config/env.md)。env 段是按**实际 key** 写入的, 故不做 key 折叠
-# (两个别名同时出现时按上面的顺序取, 与 Xray 的查找顺序一致)。
-# 用法: _hy2_envflag_get <exact> <normalized>
+# envflag 取值, 顺序与 Xray 一致: **先 exact 名**(xray.location.cert), 再归一化名
+# (XRAY_LOCATION_CERT); 且 **config.env 优先**(Xray 在配置加载后把 env 段写入进程环境并覆盖同名
+# 进程变量)。env 段按**实际 key** 写入, 故不做 key 折叠。
+# **存在性优先于非空**: Xray 用 os.LookupEnv —— "存在但为空" 与 "不存在" 是两回事。
+# 用法: _hy2_envflag_get <exact> <normalized>  → 存在则输出值(可为空)并 rc=0
 _hy2_envflag_get() {
     local exact="$1" norm="$2" v=""
     if [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ]; then
-        v=$(jq -r --arg k "$exact" '(.env // {}) | .[$k] // empty' "$CONFIG_FILE" 2>/dev/null) || v=""
-        if [ -z "$v" ]; then
-            v=$(jq -r --arg k "$norm" '(.env // {}) | .[$k] // empty' "$CONFIG_FILE" 2>/dev/null) || v=""
+        if jq -e --arg k "$exact" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
+            v=$(jq -r --arg k "$exact" '(.env // {}) | .[$k]' "$CONFIG_FILE" 2>/dev/null) || v=""
+            printf '%s' "$v"; return 0
+        fi
+        if jq -e --arg k "$norm" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
+            v=$(jq -r --arg k "$norm" '(.env // {}) | .[$k]' "$CONFIG_FILE" 2>/dev/null) || v=""
+            printf '%s' "$v"; return 0
         fi
     fi
-    if [ -z "$v" ]; then
-        v=$(_hy2_env_get "$exact") || v=""
-        if [ -z "$v" ]; then v=$(_hy2_env_get "$norm") || v=""; fi
-    fi
-    [ -n "$v" ] || return 1
-    printf '%s' "$v"
+    if v=$(_hy2_env_get "$exact"); then printf '%s' "$v"; return 0; fi
+    if v=$(_hy2_env_get "$norm"); then printf '%s' "$v"; return 0; fi
+    return 1
 }
 
 # Xray 证书路径的**实际生效**基准(唯一): env 标志 xray.location.cert, 未设置 ⇒ 可执行文件目录。
 # 依据 Xray-core common/platform 的
 #   ReadCert(): filepath.IsAbs(file) ? ReadFile(file) : ReadFile(platform.GetCertLocation(file))
-# **绝不能用 xd 的 cwd**。**决定删除目标时只准用它**(不能用候选并集, 见下)。
+#   GetCertLocation(): filepath.Join(certPath, file)  —— **不把 certPath 绝对化**
+# 因此生效值为**空串或相对路径**时, 最终落点取决于 **Xray 进程自己的 cwd**(我们无从得知) ⇒
+# 返回 1(未知), 由上层按"未知"保守处理; 绝不能拿 xd 的 cwd 去凑一个答案。
+# **决定删除目标时只准用它**(不能用候选并集)。
 _hy2_xray_cert_root() {
     local b="" xb=""
-    b=$(_hy2_envflag_get "xray.location.cert" "XRAY_LOCATION_CERT") || b=""
-    if [ -z "$b" ]; then
-        xb="${XRAY_BIN:-}"
-        [ -n "$xb" ] || return 1
-        b=$(dirname "$xb")
+    if b=$(_hy2_envflag_get "xray.location.cert" "XRAY_LOCATION_CERT"); then
+        case "$b" in
+            /*) printf '%s' "$b"; return 0 ;;
+            *) return 1 ;;      # 空串/相对路径 ⇒ Xray 按自身 cwd 解析, 未知
+        esac
     fi
-    [ -n "$b" ] || return 1
-    printf '%s' "$b"
+    xb="${XRAY_BIN:-}"
+    [ -n "$xb" ] || return 1
+    b=$(dirname "$xb")
+    case "$b" in
+        /*) printf '%s' "$b"; return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # 相对路径的**全部候选**基准(去重): 实际生效基准 + 可执行文件目录。
@@ -3289,18 +3305,8 @@ _hy2_xray_cert_bases() {
     return 0
 }
 
-# 按**实际生效基准**把引用展开成绝对路径(删除目标/归属判定用)
-_hy2_cert_ref_effective() {
-    local ref="$1" root
-    [ -n "$ref" ] || return 1
-    case "$ref" in
-        /*) printf '%s' "$ref"; return 0 ;;
-    esac
-    root=$(_hy2_xray_cert_root) || return 1
-    printf '%s/%s' "$root" "$ref"
-}
-
-# 一条引用可能对应的全部绝对路径(去重): 绝对路径只有它自己; 相对路径 = 各候选基准 + ref
+# 一条引用可能对应的全部绝对路径(去重): 绝对路径只有它自己; 相对路径 = 各候选基准 + ref。
+# **仅用于"引用保护"**(命中任一即判"仍被引用"); 删除目标只看生效基准(见 _hy2_xray_cert_root)。
 _hy2_cert_ref_abspaths() {
     local ref="$1" base
     [ -n "$ref" ] || return 1
@@ -3499,6 +3505,9 @@ _hy2_self_cert_dir() {
     local tag="$1" refs ref rreal cand cbase
     cand="$CERT_DIR/$tag"
     cbase=$(_hy2_realpath "$CERT_DIR") || cbase="$CERT_DIR"
+    # 生效基准无法确定(envflag 为空串/相对路径 ⇒ Xray 按自身 cwd 解析, 我们无从得知)
+    # ⇒ 无法判断证书是否真在本节点目录, 归属不明 ⇒ 拒绝 purge(朝保留侧失败)
+    _hy2_xray_cert_root >/dev/null || return 1
     [ "$(jq -r '.self_signed // false' "$NODES_DIR/${tag}.json" 2>/dev/null)" = "true" ] || return 1
     _hy2_cert_path_inside "$cand" || return 1
     # 归属目录**恒为本项目布局 CERT_DIR/<tag>**(由 tag 直接构造, 不受 config 内容影响);
@@ -3571,8 +3580,16 @@ _hy2_cert_dir_referenced() {
         dreal="$dir"
     fi
     local ref aref rreal in_scope elsewhere
+    # 生效基准未知(envflag 为空串/相对路径 ⇒ 落点取决于 Xray 自身 cwd)时, 相对引用的真实
+    # 位置无从判定 ⇒ 只要存在**相对**引用就保守视为"可能指向本目录"(朝保留侧失败)
+    local root_known=0
+    _hy2_xray_cert_root >/dev/null 2>&1 && root_known=1
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
+        case "$ref" in
+            /*) ;;
+            *) [ "$root_known" = 0 ] && return 0 ;;
+        esac
         # 一条引用可能对应多个绝对路径(生效基准 + 可执行文件目录两个候选), **逐个**解析;
         # 任一命中即视为仍被引用(朝保留侧失败)。
         in_scope=0; elsewhere=0
