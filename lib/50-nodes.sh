@@ -3254,9 +3254,21 @@ _hy2_env_get() {
 _hy2_cert_env_ok() {
     [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] || return 0
     local t
-    # 必须显式区分"没有 env 键"与"env 键存在但值为 false/null": jq 的 `//` 把 false 也当空值,
-    # 用 `(.env // null)` 会把 `"env": false` 折成 null ⇒ 误判"无 env 段", 正是本函数要堵的洞。
-    t=$(jq -r 'if has("env") then .env | type else "null" end' "$CONFIG_FILE" 2>/dev/null) || return 2
+    # 三重校验, 缺一不可:
+    #  ① 必须用 `has("env")` 显式区分"键不存在"与 `"env": false` —— jq 的 `//` 把 false 也当
+    #     空值, `(.env // null)` 会把它折成 null ⇒ 误判"无 env 段", 正是本函数要堵的洞。
+    #  ② `.env` 必须是 object(非 object 一律损坏); `null` 例外 —— Go 把 JSON null 反序列化进
+    #     `map[string]string` 得 nil map 且不报错, 等价于"无 env 段"。
+    #  ③ object 的 **每个 value** 必须是 string 或 null —— Xray 的 EnvConfig 是
+    #     `map[string]string`, 数字/布尔/数组/对象 value 会让 Go 解析失败(配置根本起不来),
+    #     此时"生效基准未知"必须成立, 否则会拿一个猜出来的 root 去判定删除目标。
+    #     null value 合法: Go 对 string 的 null 取其零值 ""(等价于"设为空串")。
+    t=$(jq -r 'if has("env") then
+            if .env == null then "null"
+            elif (.env | type) != "object" then "invalid"
+            elif (.env | all(.[]; (type == "string") or (type == "null"))) then "object"
+            else "invalid" end
+        else "null" end' "$CONFIG_FILE" 2>/dev/null) || return 2
     case "$t" in
         null|object) return 0 ;;
         *) return 2 ;;
@@ -3270,7 +3282,8 @@ _hy2_env_final() {
     [ -n "$name" ] || return 1
     if [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] \
        && jq -e --arg k "$name" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
-        v=$(jq -r --arg k "$name" '(.env // {}) | .[$k]' "$CONFIG_FILE" 2>/dev/null) || v=""
+        # `// ""`: value 为 null 时 Go 取 string 零值 —— 变量"存在但为空", 与 Xray 一致
+        v=$(jq -r --arg k "$name" '(.env // {}) | (.[$k] // "")' "$CONFIG_FILE" 2>/dev/null) || v=""
         printf '%s' "$v"
         return 0
     fi
