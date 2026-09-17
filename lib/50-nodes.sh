@@ -3242,25 +3242,31 @@ _hy2_env_get() {
     return 0
 }
 
-# envflag 取值, 顺序与 Xray 一致: **先 exact 名**(xray.location.cert), 再归一化名
-# (XRAY_LOCATION_CERT); 且 **config.env 优先**(Xray 在配置加载后把 env 段写入进程环境并覆盖同名
-# 进程变量)。env 段按**实际 key** 写入, 故不做 key 折叠。
-# **存在性优先于非空**: Xray 用 os.LookupEnv —— "存在但为空" 与 "不存在" 是两回事。
+# 单个环境标志名的**最终生效值**: config.env 里**同名 key** 覆盖进程环境(等价于 Xray 在
+# 配置加载后对该 key 执行 os.Setenv), 否则用进程环境里的同名变量。
+# 覆盖是**按 key 名逐条**发生的, 不是"整个 config.env 优先于进程环境" —— 后者会让 config 的
+# 归一化名顶掉进程环境里的 exact 名, 与 Xray 的 NewEnvFlag 查找顺序不一致。
+# 存在性按 os.LookupEnv 语义: 变量存在但值为空也算已设置。
+# 用法: _hy2_env_final <name>  → 存在则输出值(可为空)并 rc=0
+_hy2_env_final() {
+    local name="$1" v=""
+    [ -n "$name" ] || return 1
+    if [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] \
+       && jq -e --arg k "$name" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
+        v=$(jq -r --arg k "$name" '(.env // {}) | .[$k]' "$CONFIG_FILE" 2>/dev/null) || v=""
+        printf '%s' "$v"
+        return 0
+    fi
+    _hy2_env_get "$name"
+}
+
+# envflag 取值, 与 Xray 的 NewEnvFlag 一致: 先查 **exact 名**(xray.location.cert), 命中即用;
+# 否则查**归一化名**(XRAY_LOCATION_CERT)。两者各自先做"config.env 同名覆盖"。
 # 用法: _hy2_envflag_get <exact> <normalized>  → 存在则输出值(可为空)并 rc=0
 _hy2_envflag_get() {
     local exact="$1" norm="$2" v=""
-    if [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ]; then
-        if jq -e --arg k "$exact" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
-            v=$(jq -r --arg k "$exact" '(.env // {}) | .[$k]' "$CONFIG_FILE" 2>/dev/null) || v=""
-            printf '%s' "$v"; return 0
-        fi
-        if jq -e --arg k "$norm" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
-            v=$(jq -r --arg k "$norm" '(.env // {}) | .[$k]' "$CONFIG_FILE" 2>/dev/null) || v=""
-            printf '%s' "$v"; return 0
-        fi
-    fi
-    if v=$(_hy2_env_get "$exact"); then printf '%s' "$v"; return 0; fi
-    if v=$(_hy2_env_get "$norm"); then printf '%s' "$v"; return 0; fi
+    if v=$(_hy2_env_final "$exact"); then printf '%s' "$v"; return 0; fi
+    if v=$(_hy2_env_final "$norm"); then printf '%s' "$v"; return 0; fi
     return 1
 }
 
