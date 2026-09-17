@@ -3248,8 +3248,23 @@ _hy2_env_get() {
 # 归一化名顶掉进程环境里的 exact 名, 与 Xray 的 NewEnvFlag 查找顺序不一致。
 # 存在性按 os.LookupEnv 语义: 变量存在但值为空也算已设置。
 # 用法: _hy2_env_final <name>  → 存在则输出值(可为空)并 rc=0
+# config 的 .env 段是否可用于判定: 缺失 = 合法(无 env 段); 存在但非 object, 或 config 无法解析
+# = 配置损坏 ⇒ 无法判定最终环境, 返回 2(UNKNOWN)。Xray 的 EnvConfig 是 map[string]string,
+# 类型不对的配置 Xray 本身就起不来; 此时"未知 ⇒ 禁止 purge"比"回落 shell env 猜一个"安全。
+_hy2_cert_env_ok() {
+    [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] || return 0
+    local t
+    t=$(jq -r '(.env // null) | type' "$CONFIG_FILE" 2>/dev/null) || return 2
+    case "$t" in
+        null|object) return 0 ;;
+        *) return 2 ;;
+    esac
+}
+
 _hy2_env_final() {
     local name="$1" v=""
+    # 配置损坏(.env 类型非法 / config 无法解析)⇒ 未知, 不回落进程环境(返回 2)
+    _hy2_cert_env_ok || return 2
     [ -n "$name" ] || return 1
     if [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] \
        && jq -e --arg k "$name" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -3264,9 +3279,14 @@ _hy2_env_final() {
 # 否则查**归一化名**(XRAY_LOCATION_CERT)。两者各自先做"config.env 同名覆盖"。
 # 用法: _hy2_envflag_get <exact> <normalized>  → 存在则输出值(可为空)并 rc=0
 _hy2_envflag_get() {
-    local exact="$1" norm="$2" v=""
-    if v=$(_hy2_env_final "$exact"); then printf '%s' "$v"; return 0; fi
-    if v=$(_hy2_env_final "$norm"); then printf '%s' "$v"; return 0; fi
+    local exact="$1" norm="$2" v="" rc=0
+    v=$(_hy2_env_final "$exact") || rc=$?
+    [ "$rc" = 2 ] && return 2
+    if [ "$rc" = 0 ]; then printf '%s' "$v"; return 0; fi
+    rc=0
+    v=$(_hy2_env_final "$norm") || rc=$?
+    [ "$rc" = 2 ] && return 2
+    if [ "$rc" = 0 ]; then printf '%s' "$v"; return 0; fi
     return 1
 }
 
@@ -3279,12 +3299,15 @@ _hy2_envflag_get() {
 # **决定删除目标时只准用它**(不能用候选并集)。
 _hy2_xray_cert_root() {
     local b="" xb=""
-    if b=$(_hy2_envflag_get "xray.location.cert" "XRAY_LOCATION_CERT"); then
+    local rc=0
+    b=$(_hy2_envflag_get "xray.location.cert" "XRAY_LOCATION_CERT") || rc=$?
+    if [ "$rc" = 0 ]; then
         case "$b" in
             /*) printf '%s' "$b"; return 0 ;;
             *) return 1 ;;      # 空串/相对路径 ⇒ Xray 按自身 cwd 解析, 未知
         esac
     fi
+    [ "$rc" = 2 ] && return 1   # 配置损坏 ⇒ 未知(禁止据此判定删除目标)
     xb="${XRAY_BIN:-}"
     [ -n "$xb" ] || return 1
     b=$(dirname "$xb")
