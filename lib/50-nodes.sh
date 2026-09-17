@@ -3228,6 +3228,36 @@ EOF
     _success "TLS 证书已生成: $cert_dir"
 }
 
+# Xray 的证书路径解析根: 环境标志 xray.location.cert(env XRAY_LOCATION_CERT),
+# 未设置时默认 = **可执行文件所在目录**。依据 Xray-core common/platform 的
+# ReadCert(): filepath.IsAbs(file) ? ReadFile(file) : ReadFile(platform.GetCertLocation(file)),
+# 其中 CertLocation 走 NewEnvFlag(CertLocation).GetValue(getExecutableDir)。
+# **绝不能用 xd 的 cwd** —— Xray 不从 cwd 解析相对证书路径。
+_hy2_xray_cert_base() {
+    local b="${XRAY_LOCATION_CERT:-}"
+    if [ -z "$b" ]; then
+        local xb="${XRAY_BIN:-}"
+        [ -n "$xb" ] || return 1
+        b=$(dirname "$xb")
+    fi
+    [ -n "$b" ] || return 1
+    printf '%s' "$b"
+}
+
+# 把 config 里的 certificateFile/keyFile 解析为"Xray 实际会打开的那个路径":
+# 绝对路径原样; 相对路径按 _hy2_xray_cert_base 拼接(Xray 语义), 与调用方 cwd 无关。
+_hy2_cert_ref_abspath() {
+    local ref="$1" base
+    [ -n "$ref" ] || return 1
+    case "$ref" in
+        /*) printf '%s' "$ref" ;;
+        *)
+            base=$(_hy2_xray_cert_base) || return 1
+            printf '%s/%s' "$base" "$ref"
+            ;;
+    esac
+}
+
 # 与工作目录无关的 canonical 解析(统一入口)。
 # 为什么不用裸 readlink -f: busybox 的 readlink -f 对**相对**符号链接自 1.35 起有
 # workdir 相关的已知缺陷(Bug 16273), 而 Alpine 就是 busybox。做法是先 cd 进目标所在目录,
@@ -3425,15 +3455,17 @@ _hy2_self_cert_dir() {
     refs=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' "$CONFIG_FILE" 2>/dev/null) || return 1
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
-        case "$ref" in
+        # 与引用检查同一入口: 先按 Xray 语义把相对路径落到它实际打开的位置
+        local aref; aref=$(_hy2_cert_ref_abspath "$ref") || aref="$ref"
+        case "$aref" in
             "$CERT_DIR"/*) ;;
             *) return 1 ;;   # 指向 CERT_DIR 之外 ⇒ 不是本项目的自签布局
         esac
-        rreal=$(_hy2_realpath "$ref") || rreal=""
+        rreal=$(_hy2_realpath "$aref") || rreal=""
         if [ -z "$rreal" ]; then
-            # 无法 canonicalize(文件已删除等): 只认**词法上**就在 cand 之下的引用,
-            # 其余判归属不明(绝不为了"能删"而放宽)
-            case "$ref" in
+            # 无法 canonicalize(文件已删除等): 只认**词法上**(Xray 语义解析后)就在 cand
+            # 之下的引用, 其余判归属不明(绝不为了"能删"而放宽)
+            case "$aref" in
                 "$cand"/?*) ;;
                 *) return 1 ;;
             esac
@@ -3475,13 +3507,18 @@ _hy2_cert_dir_referenced() {
     fi
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
+        # 0) 先按 **Xray 语义**把 ref 变成它实际会打开的绝对路径: 相对路径的基准是
+        #    xray.location.cert(默认=可执行文件目录), **不是 xd 的 cwd**。漏了这一步会把
+        #    "A/cert.pem"(相对) 当成无关引用 ⇒ 删掉仍在用的证书目录。
+        local aref; aref=$(_hy2_cert_ref_abspath "$ref") || aref="$ref"
         # ① 词法前缀(覆盖文件已不存在/无法解析的 ref —— 它们不会被 rm, 但可能指向本目录)
-        case "$ref" in "$dir"/?*) return 0 ;; esac
+        case "$aref" in "$dir"/?*) return 0 ;; esac
+        case "$aref" in "$CERT_DIR"/?*) ;; *) continue ;; esac   # 不在 CERT_DIR 内 ⇒ 与本目录无关
         # ② canonical 判定: 必须对 **ref 文件自身** 归约, 且判据是"位于待删目录**之下**",
         #    而不是"dirname 恰好等于待删目录" —— 后者漏掉 certs/A/sub/cert.pem 这类子目录引用
         #    (dirname 是 A/sub ≠ A ⇒ 误判无引用 ⇒ rm -rf A 删掉仍在用的证书)。
         #    对 ref 自身归约同时覆盖了文件符号链接(certs/shared.pem -> certs/A/cert.pem)。
-        rreal=$(_hy2_realpath "$ref") || rreal=""
+        rreal=$(_hy2_realpath "$aref") || rreal=""
         if [ -n "$rreal" ]; then
             case "$rreal" in "$dreal"/?*) return 0 ;; esac
             continue          # 已归约且落在别处 ⇒ 确定为无关(不得落进 ③ 的保守分支)
