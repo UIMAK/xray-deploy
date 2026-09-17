@@ -3253,23 +3253,35 @@ EOF
 # ---------------------------------------------------------------------------
 _HY2_ENV_VAL=""
 # 从"补结尾换行"的工具(printenv / busybox printenv)取值: 只剥掉工具补的那**一个**换行。
+# **单次调用 = 一条数据通道**: 输出(值 + 补的 1 个换行) → NUL → 退出码, 一次读完。
+# 退出码语义(GNU/busybox printenv 一致): 0=找到 1=未找到 **其它=工具自身故障 ⇒ UNKNOWN**。
+# 切不可把 rc≠0,1 与"变量不存在"混为一谈: printenv 存在但执行失败(ELF 损坏/缺动态 loader/
+# 无执行权限 ⇒ 126/127)时若 return 1, 上层会继续猜归一化名乃至 XRAY_BIN 默认目录 —— 与
+# fail-closed 相悖。故探测与取值合并成同一条通道, 让 rc 与被读的值同源(三审指出的边界)。
 # 用法: _hy2_env_from_tool <name> <cmd...>  → 值写入 _HY2_ENV_VAL; rc 0/1/2(同 _hy2_env_get)
 _hy2_env_from_tool() {
     local name="$1"; shift
-    local kv=""
-    "$@" "$name" >/dev/null 2>&1 || return 1   # 1=不存在; "存在但为空" ⇒ 0 且输出一个空行
-    IFS= read -r -d '' kv < <( { "$@" "$name" 2>/dev/null; printf '\0'; } ) || return 2
-    _HY2_ENV_VAL=${kv%$'\n'}
-    return 0
+    local kv="" rcstr=""
+    {
+        IFS= read -r -d '' kv <&3 || return 2    # 通道里没有分隔符 ⇒ 通道异常, 不猜
+        IFS= read -r rcstr <&3     || return 2
+    } 3< <( { "$@" "$name" 2>/dev/null; trc=$?; printf '\0'; printf '%s\n' "$trc"; } )
+    case "$rcstr" in
+        0) _HY2_ENV_VAL=${kv%$'\n'}; return 0 ;;   # 值 = 输出减去工具补的那**一个**换行
+        1) return 1 ;;                             # 变量确实不存在
+        *) return 2 ;;                             # 工具自身故障 ⇒ 无法判定
+    esac
 }
 
 _hy2_env_get() {
-    local name="$1" kv=""
+    local name="$1" kv="" rc=0
     _HY2_ENV_VAL=""
     [ -n "$name" ] || return 1
     # ① printenv(首选: 读**当前**环境 —— 脚本自身 export 的变量同样可见)
+    #    rc=2 ⇒ **该读取器自身故障**(不是"不存在"), 换下一个读取器继续; 0/1 才是确定结论。
     if command -v printenv >/dev/null 2>&1; then
-        _hy2_env_from_tool "$name" printenv; return $?
+        _hy2_env_from_tool "$name" printenv; rc=$?
+        [ "$rc" -ne 2 ] && return "$rc"
     fi
     # ② env -0(NUL 分隔、不补换行 ⇒ 天然逐字节精确; 同样是当前环境)
     if env -0 >/dev/null 2>&1; then
@@ -3283,7 +3295,8 @@ _hy2_env_get() {
     # ③ busybox printenv: `command -v printenv` 失败**不等于** busybox 没有该 applet ——
     #    可能只是 applet 没建 symlink, 故显式走 `busybox printenv`(仍是当前环境)。
     if command -v busybox >/dev/null 2>&1 && busybox printenv >/dev/null 2>&1; then
-        _hy2_env_from_tool "$name" busybox printenv; return $?
+        _hy2_env_from_tool "$name" busybox printenv; rc=$?
+        [ "$rc" -ne 2 ] && return "$rc"
     fi
     # ④ 没有任何"当前环境"读取器 ⇒ 无法判定。**绝不回退到 /proc 或 env|awk**:
     #    /proc 是启动快照(命中可能陈旧), env|awk 按行解析会截断含换行的值 —— 两者都会把
