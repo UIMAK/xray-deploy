@@ -3242,9 +3242,19 @@ _hy2_cert_path_inside() {
     for comp in $p; do
         [ "$comp" = ".." ] && return 1
     done
-    # 悬浮符号链接也进入实体校验(见下), 故 -L 一并视为"存在"
-    [ -e "$p" ] || [ -L "$p" ] || return 0
     base=$(cd "$CERT_DIR" 2>/dev/null && pwd -P) || return 1
+    # 目标不存在(且不是符号链接): 不能直接放行 —— 父目录若是指向 CERT_DIR 之外的符号链接,
+    # 目标一旦被创建就落在外面(certs/linkdir -> /outside 下的 new.pem)。故此时解析父目录。
+    if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+        local parent; parent=$(dirname "$p")
+        [ -e "$parent" ] || [ -L "$parent" ] || return 0   # 父目录也不存在 ⇒ 无落点可言
+        real=$(readlink -f "$parent" 2>/dev/null) || return 1
+        # 父目录归约后等于 base ⇒ 目标是 CERT_DIR 的直接子项(其自身已在上面通过词法校验)
+        case "$real" in
+            "$base"|"$base"/?*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
     # 必须对**目标自身**做 canonical 解析: 只解析父目录会让"文件本身是指向 CERT_DIR 之外的
     # 符号链接"蒙混过关(certs/tag/cert.pem -> /outside/x.pem), 而后续 cp/rm 会落到目标上。
     real=$(readlink -f "$p" 2>/dev/null)
@@ -3318,14 +3328,18 @@ _hy2_cert_snapshot_drop() {
 # 会让节点不可用)。语义: 快照里有 cert/key ⇒ 还原; 没有 ⇒ 本次是新建, 删掉这些文件。
 # 用法: _hy2_cert_restore <快照目录> <cert> <key> <证书目录>
 # 调用方负责只在"自签且本次真的生成过"时调用; 本函数再用路径闸门兜底。
+# **返回码与 _gen_hy2_cert 同一套语义**: 0 = 已完整恢复(快照已消费); 2 = 无法安全恢复
+# (快照**保留** + 报路径, 供人工恢复)。绝不能"回滚失败还销毁唯一快照" —— 那会把
+# "节点没创建成功 + 新证书留下 + 旧证书唯一副本被删"这个最坏的残局重新造出来。
 _hy2_cert_restore() {
     local bak="$1" cert="$2" key="$3" cdir="$4" ok=1
     # cert 与 key **都要**过闸门: 只查 cert 时, key 若是指向目录外的符号链接, 下面的 cp
     # 会跟随它写到外部(路径闸门的契约是"两个目标都在 CERT_DIR 内")
     if ! _hy2_cert_path_inside "$cert" || ! _hy2_cert_path_inside "$key"; then
         _warn "证书回滚跳过(路径不在 ${CERT_DIR} 内或为指向外部的符号链接): $cert / $key"
-        _hy2_cert_snapshot_drop "$bak"
-        return 0
+        _error "证书回滚未完成: 回滚目标不安全; 快照已保留, 请人工恢复"
+        [ -n "$bak" ] && _warn "旧证书快照保留在: $bak"
+        return 2
     fi
     if [ -n "$bak" ] && [ -f "$bak/cert.pem" ]; then
         cp -p "$bak/cert.pem" "$cert" 2>/dev/null || ok=0
@@ -3337,7 +3351,11 @@ _hy2_cert_restore() {
     else
         rm -f "$key" 2>/dev/null || ok=0
     fi
-    [ "$ok" = 1 ] || _warn "证书回滚未完整完成, 请检查: $cdir"
+    if [ "$ok" != 1 ]; then
+        _error "证书回滚未完成(cert/key 可能不一致); 快照已保留, 请人工恢复"
+        [ -n "$bak" ] && _warn "旧证书快照保留在: $bak"
+        return 2
+    fi
     # 清掉已空的目录(rmdir 仅在空目录成功 ⇒ 不会误删既有内容; 非空失败即静默保留)
     [ "$ok" = 1 ] && [ -d "$cdir" ] && rmdir "$cdir" 2>/dev/null
     _hy2_cert_snapshot_drop "$bak"
@@ -3364,22 +3382,23 @@ _hy2_cert_dir_referenced() {
     local dir="$1" refs ref
     refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]?.certificateFile // empty' "$CONFIG_FILE" 2>/dev/null) || return 0
     [ -n "$refs" ] || return 1
-    local dreal rdir rres
+    local dreal rreal rdir
     dreal=$(readlink -f "$dir" 2>/dev/null); [ -n "$dreal" ] || dreal="$dir"
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
         # ① 词法前缀(覆盖文件已不存在/无法解析的 ref —— 它们不会被 rm, 但可能指向本目录)
         case "$ref" in "$dir"/?*) return 0 ;; esac
-        # ② canonical 等价: 同一目录的另一种书写形式(符号链接/相对段)也算引用。
-        #    归约成功即可下结论: 与本目录不同 ⇒ 该条确定为无关(不得再进 ③ 的保守分支,
-        #    否则一个无关的 "a/../elsewhere" 会把其它目录的清理整批卡住)。
-        rdir=$(dirname "$ref")
-        rres=$(readlink -f "$rdir" 2>/dev/null) || rres=""
-        if [ -n "$rres" ]; then
-            [ "$rres" = "$dreal" ] && return 0
-            continue
+        # ② canonical 等价必须对 **ref 文件自身** 归约: 只归约 dirname 会漏掉
+        #    "certs/shared-cert.pem -> certs/A/cert.pem" 这类文件符号链接 —— 父目录是 certs,
+        #    与被删目录 A 不同, 于是误判为无引用而把 A 删掉(活着的 inbound 立刻失去证书)。
+        rreal=$(readlink -f "$ref" 2>/dev/null) || rreal=""
+        if [ -n "$rreal" ]; then
+            rdir=$(dirname "$rreal")
+            [ "$rdir" = "$dreal" ] && return 0
+            continue          # 已归约且指向别处 ⇒ 确定为无关(不得落进 ③ 的保守分支)
         fi
-        # ③ 只有"该 ref 自身无法归约且含 .."时才保守(逐条判定)
+        # ③ 无法归约: 符号链接(悬浮)或含 ".." 时无从证实落点 ⇒ 该条保守视为被引用
+        [ -L "$ref" ] && return 0
         case "$ref" in *".."*) return 0 ;; esac
     done <<< "$refs"
     return 1
@@ -3640,12 +3659,19 @@ _add_hysteria2() {
     R_OBFS_MASK_BLOCK="$obfs_mask"
     local inbound
     if ! inbound=$(_render_template "$(_tpl_path hysteria2)"); then
-        [ "$cert_dirty" = "true" ] && _hy2_cert_restore "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag"
+        # 回滚不完整时返回 2 并保留快照(不能静默丢弃唯一恢复副本)
+        if [ "$cert_dirty" = "true" ] && ! _hy2_cert_restore "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag"; then
+            _error "证书回滚未完成, 快照已保留待人工恢复: ${cert_bak:-无}"
+            return 2
+        fi
         return 1
     fi
 
     if ! _commit_inbound "$inbound"; then
-        [ "$cert_dirty" = "true" ] && _hy2_cert_restore "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag"
+        if [ "$cert_dirty" = "true" ] && ! _hy2_cert_restore "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag"; then
+            _error "证书回滚未完成, 快照已保留待人工恢复: ${cert_bak:-无}"
+            return 2
+        fi
         return 1
     fi
     # 配置已提交(节点已引用该证书) ⇒ 回滚点作废
