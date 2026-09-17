@@ -3228,29 +3228,41 @@ EOF
     _success "TLS 证书已生成: $cert_dir"
 }
 
-# Xray 的证书路径解析根: 环境标志 xray.location.cert(env XRAY_LOCATION_CERT),
-# 未设置时默认 = **可执行文件所在目录**。依据 Xray-core common/platform 的
-# ReadCert(): filepath.IsAbs(file) ? ReadFile(file) : ReadFile(platform.GetCertLocation(file)),
-# 其中 CertLocation 走 NewEnvFlag(CertLocation).GetValue(getExecutableDir)。
-# **绝不能用 xd 的 cwd** —— Xray 不从 cwd 解析相对证书路径。
-_hy2_xray_cert_base() {
-    local b="" xb="" cfg=""
-    # ① config.env **优先**: Xray 在配置加载后把 env 段写入进程环境, 且同名项**覆盖**已有进程
-    #    变量(docs/config/env.md) —— 所以 `xd` 的 shell 环境与 Xray 最终生效值可能不同, 必须
-    #    以 config 为准。键名按 envflag 规则归一化比较(大写 + '.'→'_'), 因此
-    #    `XRAY_LOCATION_CERT` 与 `xray.location.cert` 等价。
+# 环境变量精确取值(变量名可含 '.', 故用 awk 精确比较而非正则)
+_hy2_env_get() {
+    local name="$1"
+    [ -n "$name" ] || return 1
+    env 2>/dev/null | awk -F= -v k="$name" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+# envflag 取值, 顺序与 Xray 的 envflag 一致: **先 exact 名**(xray.location.cert), 再归一化名
+# (XRAY_LOCATION_CERT); 且 **config.env 优先** —— Xray 在配置加载后把 env 段写入进程环境,
+# 同名项覆盖已有进程变量(docs/config/env.md)。env 段是按**实际 key** 写入的, 故不做 key 折叠
+# (两个别名同时出现时按上面的顺序取, 与 Xray 的查找顺序一致)。
+# 用法: _hy2_envflag_get <exact> <normalized>
+_hy2_envflag_get() {
+    local exact="$1" norm="$2" v=""
     if [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ]; then
-        cfg=$(jq -r '(.env // {}) | with_entries(.key |= (ascii_upcase | gsub("[.]"; "_"))) | .XRAY_LOCATION_CERT // empty' "$CONFIG_FILE" 2>/dev/null) || cfg=""
-        [ -n "$cfg" ] && b="$cfg"
-    fi
-    # ② 进程环境(下划线写法与点号别名都认)
-    if [ -z "$b" ]; then
-        b="${XRAY_LOCATION_CERT:-}"
-        if [ -z "$b" ]; then
-            b=$(env 2>/dev/null | sed -n 's/^xray\.location\.cert=//p' | head -1)
+        v=$(jq -r --arg k "$exact" '(.env // {}) | .[$k] // empty' "$CONFIG_FILE" 2>/dev/null) || v=""
+        if [ -z "$v" ]; then
+            v=$(jq -r --arg k "$norm" '(.env // {}) | .[$k] // empty' "$CONFIG_FILE" 2>/dev/null) || v=""
         fi
     fi
-    # ③ Xray 默认: 可执行文件所在目录
+    if [ -z "$v" ]; then
+        v=$(_hy2_env_get "$exact") || v=""
+        if [ -z "$v" ]; then v=$(_hy2_env_get "$norm") || v=""; fi
+    fi
+    [ -n "$v" ] || return 1
+    printf '%s' "$v"
+}
+
+# Xray 证书路径的**实际生效**基准(唯一): env 标志 xray.location.cert, 未设置 ⇒ 可执行文件目录。
+# 依据 Xray-core common/platform 的
+#   ReadCert(): filepath.IsAbs(file) ? ReadFile(file) : ReadFile(platform.GetCertLocation(file))
+# **绝不能用 xd 的 cwd**。**决定删除目标时只准用它**(不能用候选并集, 见下)。
+_hy2_xray_cert_root() {
+    local b="" xb=""
+    b=$(_hy2_envflag_get "xray.location.cert" "XRAY_LOCATION_CERT") || b=""
     if [ -z "$b" ]; then
         xb="${XRAY_BIN:-}"
         [ -n "$xb" ] || return 1
@@ -3260,44 +3272,32 @@ _hy2_xray_cert_base() {
     printf '%s' "$b"
 }
 
-# 把 config 里的 certificateFile/keyFile 解析为"Xray 实际会打开的那个路径":
-# 绝对路径原样; 相对路径按 _hy2_xray_cert_base 拼接(Xray 语义), 与调用方 cwd 无关。
-_hy2_cert_ref_abspath() {
-    local ref="$1" base
-    [ -n "$ref" ] || return 1
-    case "$ref" in
-        /*) printf '%s' "$ref" ;;
-        *)
-            base=$(_hy2_xray_cert_base) || return 1
-            printf '%s/%s' "$base" "$ref"
-            ;;
-    esac
-}
-
-# config.env 里的 XRAY_LOCATION_CERT(键名归一化: 大写 + '.'→'_', 故 xray.location.cert 等价)
-_hy2_cert_env_from_config() {
-    [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] || return 1
-    jq -r '(.env // {}) | with_entries(.key |= (ascii_upcase | gsub("[.]"; "_"))) | .XRAY_LOCATION_CERT // empty' "$CONFIG_FILE" 2>/dev/null
-}
-
-# 相对路径的**全部候选基准**(去重; 优先级: config.env → 进程环境 → 可执行文件目录)。
-# 为什么要多个: config.env 仅核心 >= v26.7.11 生效, stable 核心会**忽略**它。只按 config.env
-# 解析会让旧核心上"实际由可执行文件目录解析的活引用"被误判为无关 ⇒ 误删活证书; 只按进程环境
-# 解析又会在新核心上漏掉 config.env 的覆盖。故两者都作候选, 命中任一即视为"仍被引用"
-# (朝保留侧失败)。
+# 相对路径的**全部候选**基准(去重): 实际生效基准 + 可执行文件目录。
+# **只用于"引用保护"**(命中任一即判"仍被引用", 朝保留侧失败): config.env 仅核心 >= v26.7.11
+# 生效, stable 核心会忽略它, 故可执行文件目录必须留作候选。
+# **绝不能用它决定删除目标** —— 并集只扩大"保留"的范围, 用它推导"该删哪个目录"会在
+# config.env 与进程环境冲突时指向一个 Xray 实际并未使用的目录。
 _hy2_xray_cert_bases() {
     local b="" xb="" seen=""
-    b=$(_hy2_cert_env_from_config) || b=""
+    b=$(_hy2_xray_cert_root) || b=""
     if [ -n "$b" ]; then printf '%s\n' "$b"; seen="$b"; fi
-    b="${XRAY_LOCATION_CERT:-}"
-    [ -z "$b" ] && b=$(env 2>/dev/null | sed -n 's/^xray\.location\.cert=//p' | head -1)
-    if [ -n "$b" ] && [ "$b" != "$seen" ]; then printf '%s\n' "$b"; seen="$b"; fi
     xb="${XRAY_BIN:-}"
     if [ -n "$xb" ]; then
         b=$(dirname "$xb")
         [ "$b" != "$seen" ] && printf '%s\n' "$b"
     fi
     return 0
+}
+
+# 按**实际生效基准**把引用展开成绝对路径(删除目标/归属判定用)
+_hy2_cert_ref_effective() {
+    local ref="$1" root
+    [ -n "$ref" ] || return 1
+    case "$ref" in
+        /*) printf '%s' "$ref"; return 0 ;;
+    esac
+    root=$(_hy2_xray_cert_root) || return 1
+    printf '%s/%s' "$root" "$ref"
 }
 
 # 一条引用可能对应的全部绝对路径(去重): 绝对路径只有它自己; 相对路径 = 各候选基准 + ref
@@ -3508,37 +3508,43 @@ _hy2_self_cert_dir() {
     # 该入站引用的每个 cert/key 都必须 canonicalize 到 cand 之下(多证书/共享目录/外部链接
     # 一律判为"归属不明确" ⇒ 返回 1, 不进入 purge)
     refs=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' "$CONFIG_FILE" 2>/dev/null) || return 1
-    local ref aref rreal in_cert ours
+    # 引用按候选基准展开, 但**删除目标只由实际生效基准(及本节点目录)决定** —— 并集只扩大
+    # "保留"范围, 拿它决定"该删哪个目录"会在 config.env 与进程环境冲突时指向 Xray 实际并未
+    # 使用的目录。候选间结论冲突(有的说"是本节点目录", 有的说"材料在 CERT_DIR 之外")⇒ 拒绝。
+    local ref aref rreal lex_ours ours foreign unres
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
-        # 与引用检查同一入口: 每个候选基准(Xray 语义)都要看 —— 命中本节点目录即可
-        in_cert=0; ours=0
+        ours=0; foreign=0; unres=0; idx=0
         while IFS= read -r aref; do
             [ -n "$aref" ] || continue
-            case "$aref" in
-                "$CERT_DIR"/*) in_cert=1 ;;
-                *) continue ;;
-            esac
+            idx=$((idx + 1))
+            # 第一个候选 = 实际生效基准: 只有它能决定"材料是否在 CERT_DIR 之外"(删除目标只看它);
+            # 额外候选(可执行文件目录)仅用于**保留**判断(命中本节点目录即可), 不作冲突来源。
+            is_eff=0; [ "$idx" = 1 ] && is_eff=1
+            lex_ours=0
+            case "$aref" in "$cand"/?*) lex_ours=1 ;; esac
             rreal=$(_hy2_realpath "$aref") || rreal=""
             if [ -z "$rreal" ]; then
-                # 无法 canonicalize(文件已删除等): 只认**词法上**(Xray 语义解析后)就在 cand 之下的
-                case "$aref" in
-                    "$cand"/?*) ours=1 ;;
-                esac
+                # 无法 canonicalize(文件已删除等): 词法兜底
+                if [ "$lex_ours" = 1 ]; then ours=1
+                elif [ "${aref#"$CERT_DIR"/}" != "$aref" ]; then unres=1
+                elif [ "$is_eff" = 1 ]; then foreign=1
+                fi
                 continue
             fi
-            # 就在本节点目录里, 或"本节点目录内的链接 → CERT_DIR 内别处"(删除 cand 只删链接,
-            # 不会碰到目标目录 —— 这正是**不能**按 canonical 目标反推目录的原因)
-            case "$rreal" in
-                "$cand"/?*) ours=1 ;;
-                "$cbase"/?*) ours=1 ;;
-            esac
+            if [ "${rreal#"$cand"/}" != "$rreal" ]; then ours=1          # 落点在本节点目录
+            elif [ "${rreal#"$cbase"/}" != "$rreal" ]; then
+                # 落点在 CERT_DIR 内但不在本节点目录: 若引用**词法上**在本节点目录内, 那只是
+                # "本节点目录内的链接 → CERT_DIR 内别处"(删 cand 只删链接, 安全) ⇒ 算本节点;
+                # 否则归属不明 ⇒ 拒绝
+                if [ "$lex_ours" = 1 ]; then ours=1; else unres=1; fi
+            elif [ "$is_eff" = 1 ]; then foreign=1                             # 材料在 CERT_DIR 之外
+            fi
         done <<< "$(_hy2_cert_ref_abspaths "$ref")"
-        # 候选基准全都不在 CERT_DIR 内 ⇒ 该节点用的是 CERT_DIR 之外的自定义证书,
-        # 不是本项目的自签布局 ⇒ 不进入 purge(与"自定义证书不提示也不删"一致)
-        [ "$in_cert" = 1 ] || return 1
-        # 在 CERT_DIR 内却哪个候选都落不到本节点目录 ⇒ 归属不明, 拒绝
-        [ "$ours" = 1 ] || return 1
+        # 归属成立、材料没落到 CERT_DIR 之外、且无归属不明候选 ⇒ 本节点
+        [ "$ours" = 1 ] && [ "$foreign" = 0 ] && [ "$unres" = 0 ] && continue
+        # 其余一律拒绝(冲突/归属不明/自定义证书), 朝保留侧失败
+        return 1
     done <<< "$refs"
     printf '%s' "$cand"
 }
@@ -3552,8 +3558,9 @@ _hy2_cert_dir_referenced() {
     # "存活节点 B 的 keyFile 指向 A/key.pem" ⇒ rm -rf A 会删掉 B 正在用的私钥。
     refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' "$CONFIG_FILE" 2>/dev/null) || return 0
     [ -n "$refs" ] || return 1
-    local dreal
+    local dreal cbase_real
     dreal=$(_hy2_realpath "$dir") || dreal=""
+    cbase_real=$(_hy2_realpath "$CERT_DIR") || cbase_real="$CERT_DIR"
     if [ -z "$dreal" ]; then
         # 无法 canonicalize 待删目录 ⇒ fail-closed(与 jq 失败同口径): 目录存在就保守保留,
         # 免得"解析失败 ⇒ 退回词法比较 ⇒ 误判无引用 ⇒ 删掉仍在用的证书"
@@ -3563,31 +3570,34 @@ _hy2_cert_dir_referenced() {
         fi
         dreal="$dir"
     fi
-    local ref aref rreal in_cert elsewhere
+    local ref aref rreal in_scope elsewhere
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
-        # 一条引用可能对应多个绝对路径(config.env / 进程环境 / 可执行文件目录三种基准),
-        # **逐个**按 Xray 语义解析; 任一命中即视为仍被引用(朝保留侧失败)。
-        in_cert=0; elsewhere=0
+        # 一条引用可能对应多个绝对路径(生效基准 + 可执行文件目录两个候选), **逐个**解析;
+        # 任一命中即视为仍被引用(朝保留侧失败)。
+        in_scope=0; elsewhere=0
         while IFS= read -r aref; do
             [ -n "$aref" ] || continue
-            # ① 词法前缀(覆盖文件已不存在/无法解析的 ref —— 它们不会被 rm, 但可能指向本目录)
-            case "$aref" in "$dir"/?*) return 0 ;; esac
-            case "$aref" in "$CERT_DIR"/?*) in_cert=1 ;; *) continue ;; esac
-            # ② canonical 判定: 必须对 **ref 文件自身** 归约, 且判据是"位于待删目录**之下**",
-            #    而不是"dirname 恰好等于待删目录" —— 后者漏掉 certs/A/sub/cert.pem 这类子目录引用
-            #    (dirname 是 A/sub ≠ A ⇒ 误判无引用 ⇒ rm -rf A 删掉仍在用的证书)。
-            #    对 ref 自身归约同时覆盖了文件符号链接(certs/shared.pem -> certs/A/cert.pem)。
+            # ① canonical **先行**(真实路径是事实, 词法只作兜底): 只做词法 $CERT_DIR 过滤会漏掉
+            #    "路径表面在外、经符号链接实际落入 CERT_DIR"的活引用
+            #    (如 /srv/link-to-certs -> $CERT_DIR), 从而误删仍在用的证书目录。
             rreal=$(_hy2_realpath "$aref") || rreal=""
             if [ -n "$rreal" ]; then
-                case "$rreal" in "$dreal"/?*) return 0 ;; esac
-                elsewhere=1          # 已归约且落在别处 ⇒ 该候选确定为无关
+                case "$rreal" in "$dreal"/?*) return 0 ;; esac     # 归约后位于待删目录之下
+                # 归约成功即**确定**落点: 不在待删目录之下 ⇒ 该候选与本目录无关(即便它落在
+                # CERT_DIR 内的别处, 也只是"指向别处的文件", 与本目录无关)
+                elsewhere=1
+                continue
             fi
+            # ② 无法 canonicalize: 词法兜底 —— 词法就在待删目录下 ⇒ 直接算被引用;
+            #    词法在 CERT_DIR 内 ⇒ 记入 in_scope(交由 ③ 保守处理)
+            case "$aref" in "$dir"/?*) return 0 ;; esac
+            case "$aref" in "$CERT_DIR"/?*) in_scope=1 ;; esac
         done <<< "$(_hy2_cert_ref_abspaths "$ref")"
-        # ③ 该引用不在 CERT_DIR 内, 或已归约到别处 ⇒ 与本目录无关, 看下一条
-        [ "$in_cert" = 1 ] || continue
+        # ③ 与本目录无关(不在 CERT_DIR 内, 或已归约到别处)⇒ 下一条
+        [ "$in_scope" = 1 ] || continue
         [ "$elsewhere" = 1 ] && continue
-        # ④ 落在 CERT_DIR 内但解析不出落点: 只有"含 .."或"是符号链接"时无从排除它指向本目录,
+        # ④ 确实在 CERT_DIR 内却解析不出落点: 只有"含 .."或"是符号链接"时无从排除它指向本目录,
         #    才保守视为被引用; 否则(普通文件已删除等)判定无关 —— 不做无差别保守, 免得一个
         #    无关目录的残留引用把其它目录的清理永久卡住
         case "$ref" in *".."*) return 0 ;; esac
