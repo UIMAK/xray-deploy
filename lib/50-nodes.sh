@@ -3238,44 +3238,56 @@ EOF
 # 故本组函数: 结果写入 _HY2_ENV_VAL / _HY2_CERT_ROOT, 读取一律用 NUL 终止的 read -d '',
 # 全程不产生命令替换。**不要再把返回值 printf 出去** —— 那等于重新引入一条会被剥尾的通道。
 #
-# 取值来源(逐字节精确, 按优先级):
-#   ① printenv: 读的是"当前"环境(脚本自身 export 的变量同样可见, 与旧 env 实现语义一致);
-#      它总给值补一个结尾换行, 故读进来后剥掉那**一个**(其余尾随换行属于值本身, 必须保留)
-#   ② /proc/self/environ(无 printenv 的裁剪镜像): 内核给的 NUL 分隔原始环境, 不补换行, 天然精确;
-#      但它是**进程启动时**的快照, 启动后 export 的变量不在此列, 故只作兜底、不首选
-#   ③ 两者都不可用(极简 rootfs): 返回 2(UNKNOWN), 由上层走保守分支。
-#      **绝不回退到 env|awk** —— 它按行解析, 值含换行即截断, 会把"基准未知"伪装成"基准已知";
-#      宁可如实上报"无法判定"。
+# 取值来源(逐字节精确, 按优先级) —— **三者都必须是"当前环境"读取器**:
+#   ① printenv  ② env -0  ③ busybox printenv(applet 单独探测)
+#      · printenv / busybox printenv 总给值补一个结尾换行 ⇒ 只剥那**一个**(其余尾随换行属于值本身)
+#      · env -0 是 NUL 分隔且不补换行, 天然精确
+#   ④ 三者都不可用(极简 rootfs): 返回 2(UNKNOWN), 由上层走保守分支。
+# **绝不使用 /proc/self/environ**: 按 proc(5) 它是 execve() 时的 *initial environment* ——
+#   既不反映启动后新增的变量(未命中 ⇒ 不能判"不存在"), 也不反映启动后的 unset / 重新赋值
+#   (**命中 ⇒ 值可能陈旧**: 实测 unset 后它仍返回旧值、改值后它仍返回旧值)。命中与未命中都
+#   无法证明"当前"状态, 故它连兜底都不合格 —— 拿它当"当前环境"等于引入陈旧值污染 cert root。
+# **绝不回退到 env|awk**: 它按行解析, 值含换行即截断, 会把"无法判定"伪装成"基准已知"。
+#   宁可如实上报"无法判定"。
 # 返回: 0=存在(值可为空) 1=不存在 2=无法判定
 # ---------------------------------------------------------------------------
 _HY2_ENV_VAL=""
+# 从"补结尾换行"的工具(printenv / busybox printenv)取值: 只剥掉工具补的那**一个**换行。
+# 用法: _hy2_env_from_tool <name> <cmd...>  → 值写入 _HY2_ENV_VAL; rc 0/1/2(同 _hy2_env_get)
+_hy2_env_from_tool() {
+    local name="$1"; shift
+    local kv=""
+    "$@" "$name" >/dev/null 2>&1 || return 1   # 1=不存在; "存在但为空" ⇒ 0 且输出一个空行
+    IFS= read -r -d '' kv < <( { "$@" "$name" 2>/dev/null; printf '\0'; } ) || return 2
+    _HY2_ENV_VAL=${kv%$'\n'}
+    return 0
+}
+
 _hy2_env_get() {
-    local name="$1" kv="" found=0
+    local name="$1" kv=""
     _HY2_ENV_VAL=""
     [ -n "$name" ] || return 1
-    # ① printenv(首选: 读的是**当前**环境, 与旧 env 实现语义一致 —— 脚本自身 export 的变量同样可见)
+    # ① printenv(首选: 读**当前**环境 —— 脚本自身 export 的变量同样可见)
     if command -v printenv >/dev/null 2>&1; then
-        printenv "$name" >/dev/null 2>&1 || return 1   # 1=不存在; "存在但为空" ⇒ 0 且输出一个空行
-        IFS= read -r -d '' kv < <( { printenv "$name" 2>/dev/null; printf '\0'; } ) || return 2
-        _HY2_ENV_VAL=${kv%$'\n'}   # 只剥 printenv 补的那**一个**换行, 其余尾随换行属于值本身
-        return 0
+        _hy2_env_from_tool "$name" printenv; return $?
     fi
-    # ② /proc/self/environ(无 printenv 的裁剪镜像): 内核给的 NUL 分隔原始环境, 不补换行, 天然精确。
-    #    **命中可以判"存在"; 未命中绝不能判"不存在"** —— 按 proc(5), 它保存的是 execve() 时的
-    #    *initial environment*, 进程启动后 export/setenv 产生的变量不会出现在这里。于是
-    #    "这里没有" 只说明"启动时没有", 不能推出"当前没有"(这正是 os.LookupEnv 问的问题)。
-    #    故未命中一律返回 2(UNKNOWN), 让上游走 fail-closed 分支, 而不是继续猜 XRAY_BIN 目录。
-    if [ -r /proc/self/environ ]; then
+    # ② env -0(NUL 分隔、不补换行 ⇒ 天然逐字节精确; 同样是当前环境)
+    if env -0 >/dev/null 2>&1; then
         while IFS= read -r -d '' kv <&3; do
             case "$kv" in
-                "$name="*) _HY2_ENV_VAL="${kv#"$name="}"; found=1; break ;;
+                "$name="*) _HY2_ENV_VAL="${kv#"$name="}"; return 0 ;;
             esac
-        done 3< /proc/self/environ
-        [ "$found" = 1 ] && return 0
-        return 2
+        done 3< <(env -0 2>/dev/null)
+        return 1   # 能枚举当前环境 ⇒ 未命中即确实不存在
     fi
-    # ③ 两者都不可用 ⇒ 无法判定。**绝不回退到 env|awk**: 它按行解析, 值含换行即被截断,
-    #    会把"无法判定"伪装成一个看似合法的基准值(这正是本函数的原始缺陷形态)。
+    # ③ busybox printenv: `command -v printenv` 失败**不等于** busybox 没有该 applet ——
+    #    可能只是 applet 没建 symlink, 故显式走 `busybox printenv`(仍是当前环境)。
+    if command -v busybox >/dev/null 2>&1 && busybox printenv >/dev/null 2>&1; then
+        _hy2_env_from_tool "$name" busybox printenv; return $?
+    fi
+    # ④ 没有任何"当前环境"读取器 ⇒ 无法判定。**绝不回退到 /proc 或 env|awk**:
+    #    /proc 是启动快照(命中可能陈旧), env|awk 按行解析会截断含换行的值 —— 两者都会把
+    #    "无法判定"伪装成一个看似合法的基准值, 正是本函数的原始缺陷形态。
     return 2
 }
 
