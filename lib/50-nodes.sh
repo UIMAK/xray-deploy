@@ -3294,20 +3294,40 @@ _hy2_env_get() {
     #    流内哨兵都能被真实条目伪造(命中被误判成通道结束, 本该取到的值被打成 UNKNOWN)。
     #    做法: env 把整份环境写进一个 0600 临时文件, **先取它自己的退出码**; 只有 rc=0 才说明
     #    这份快照完整, 此时才去读它 —— 数据里不可能混入协议标记。
+    #    **读取阶段也必须区分三态**(不能把"读失败"当成"读完没找到"): read -d '' 的返回码
+    #      0  = 读到一条完整记录
+    #      1  = 读到 EOF; 若变量里**仍有残留数据**, 说明末条缺 NUL = 文件被截断 ⇒ 不能当完整
+    #      其它 = 真的读错误(EBADF/EIO 等) ⇒ UNKNOWN
+    #    另有"文件打不开"(被删/被换/权限)同样 ⇒ UNKNOWN。任一路径都不能落到"不存在"。
     #    · mktemp 失败或 env 退出非 0(125/126/127/被信号杀) ⇒ 该读取器不可用 ⇒ 继续降级
-    #    · rc=0 且未命中 ⇒ 枚举完整, 确实不存在(1)
+    #    · rc=0 且**确认读取正常结束**且未命中 ⇒ 确实不存在(1)
+    #    已知取舍(P3, 非阻塞): 整份环境会短暂落盘(0600)。所有分支都立即 rm -f; 仅 SIGKILL
+    #    等无法执行清理的极端情形可能残留 —— 换来的收益是"退出码天然不经过数据流"。
     if command -v env >/dev/null 2>&1; then
-        local ef="" erc=125
+        local ef="" erc=125 erd=1 efd="" hit="" found=0
         ef=$(mktemp 2>/dev/null) || ef=""
         [ -n "$ef" ] && { env -0 > "$ef" 2>/dev/null; erc=$?; }
         if [ "$erc" -eq 0 ]; then
-            while IFS= read -r -d '' kv <&3; do
-                case "$kv" in
-                    "$name="*) _HY2_ENV_VAL="${kv#"$name="}"; rm -f "$ef"; return 0 ;;
-                esac
-            done 3< "$ef"
+            erd=0
+            # 用 {var}< 取一个高位空闲 fd, 不动调用方可能正在用的 3/4
+            if exec {efd}< "$ef" 2>/dev/null; then
+                while :; do
+                    kv=""                                  # 先清空: 使"EOF 后仍有残留"可判定
+                    IFS= read -r -d '' kv <&"$efd"; erd=$?
+                    [ "$erd" -ne 0 ] && break
+                    case "$kv" in
+                        "$name="*) hit="${kv#"$name="}"; found=1; break ;;
+                    esac
+                done
+                exec {efd}<&-
+            else
+                erd=2                                       # 打不开 ⇒ 无法确认完整性
+            fi
             rm -f "$ef"
-            return 1                    # 枚举完整(rc=0)且未命中 ⇒ 确实不存在
+            [ "$erd" -gt 1 ] && return 2                    # 读错误 ⇒ UNKNOWN
+            [ "$erd" -eq 1 ] && [ -n "$kv" ] && return 2    # 末条缺 NUL(截断) ⇒ UNKNOWN
+            if [ "$found" -eq 1 ]; then _HY2_ENV_VAL="$hit"; return 0; fi
+            return 1                                        # 读取正常结束且未命中 ⇒ 确实不存在
         fi
         [ -n "$ef" ] && rm -f "$ef"
         # 该读取器不可用 ⇒ 落到 ③(busybox printenv); 全不可用才 UNKNOWN
