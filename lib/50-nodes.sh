@@ -3248,25 +3248,36 @@ _hy2_env_get() {
 # 归一化名顶掉进程环境里的 exact 名, 与 Xray 的 NewEnvFlag 查找顺序不一致。
 # 存在性按 os.LookupEnv 语义: 变量存在但值为空也算已设置。
 # 用法: _hy2_env_final <name>  → 存在则输出值(可为空)并 rc=0
-# config 的 .env 段是否可用于判定: 缺失 = 合法(无 env 段); 存在但非 object, 或 config 无法解析
-# = 配置损坏 ⇒ 无法判定最终环境, 返回 2(UNKNOWN)。Xray 的 EnvConfig 是 map[string]string,
-# 类型不对的配置 Xray 本身就起不来; 此时"未知 ⇒ 禁止 purge"比"回落 shell env 猜一个"安全。
+# config 的 .env 段是否可用于判定: 缺失 = 合法(无 env 段); 存在但非 object、object 内含非法
+# value 类型、键值内容无法被 Unix os.Setenv 应用, 或 config 无法解析 = 配置损坏 ⇒ 无法判定
+# 最终环境, 返回 2(UNKNOWN)。Xray 的 EnvConfig 是 map[string]string 且 Config.Build() 会逐个
+# os.Setenv, 任一失败配置即构建失败; 此时"未知 ⇒ 禁止 purge"比"回落 shell env 猜一个"安全。
 _hy2_cert_env_ok() {
     [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] || return 0
     local t
-    # 三重校验, 缺一不可:
+    # 四重校验, 缺一不可(JSON 类型 → Go 反序列化 → os.Setenv 可应用, 逐层收窄):
     #  ① 必须用 `has("env")` 显式区分"键不存在"与 `"env": false` —— jq 的 `//` 把 false 也当
     #     空值, `(.env // null)` 会把它折成 null ⇒ 误判"无 env 段", 正是本函数要堵的洞。
     #  ② `.env` 必须是 object(非 object 一律损坏); `null` 例外 —— Go 把 JSON null 反序列化进
     #     `map[string]string` 得 nil map 且不报错, 等价于"无 env 段"。
-    #  ③ object 的 **每个 value** 必须是 string 或 null —— Xray 的 EnvConfig 是
-    #     `map[string]string`, 数字/布尔/数组/对象 value 会让 Go 解析失败(配置根本起不来),
-    #     此时"生效基准未知"必须成立, 否则会拿一个猜出来的 root 去判定删除目标。
-    #     null value 合法: Go 对 string 的 null 取其零值 ""(等价于"设为空串")。
+    #  ③ 每个 value 必须是 string 或 null —— EnvConfig 是 `map[string]string`, 数字/布尔/数组/
+    #     对象 value 会让 Go 反序列化失败。null value 合法: Go 对 string 的 null 取其零值 ""。
+    #  ④ 键值内容必须是 Unix `os.Setenv` 可接受的: Xray `Config.Build()` 逐个 `os.Setenv(key,
+    #     value)`, 任一失败即 `failed to apply environment configuration` 让配置整体构建失败
+    #     (main 分支实测)。Go 的 unix 规则: key **非空**且**不含 `=`、不含 NUL**; value 不得含 NUL。
+    #     ⇒ 空 key / 含 `=` 的 key / 含 NUL 的 key 或 value 一律按"配置损坏"处理, 否则会拿一个
+    #     Xray 实际应用不了的 env 去推 cert root。空 value 合法(等价"设为空串")。
     t=$(jq -r 'if has("env") then
             if .env == null then "null"
             elif (.env | type) != "object" then "invalid"
-            elif (.env | all(.[]; (type == "string") or (type == "null"))) then "object"
+            elif (.env | all(to_entries[];
+                    (.key | (length > 0)
+                           and ((contains("\u0000")) | not)
+                           and ((contains("=")) | not))
+                    and (.value | if . == null then true
+                                   elif type == "string" then ((contains("\u0000")) | not)
+                                   else false end)
+                 )) then "object"
             else "invalid" end
         else "null" end' "$CONFIG_FILE" 2>/dev/null) || return 2
     case "$t" in
