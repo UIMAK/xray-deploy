@@ -5202,7 +5202,13 @@ _ptx_journal_ok() {
       def port_ok: (type == "number") and (. >= 1) and (. <= 65535) and (. == floor);
       def ranges_ok:
         (type == "string") and (. == "")
-        or ((test("^[0-9]{1,5}(:[0-9]{1,5})?([,][0-9]{1,5}(:[0-9]{1,5})?)*$"))
+        # 分隔符集必须与下面 splits() 及各路径的**实际写入口径**一致: _read_hop_ranges 把
+        # metadata 的 hop_ranges 规范化成 "20000:30000 40000:50000"(逗号转空格、连字符转冒号),
+        # _hy2_port_txn_locked 再以 ranges="$*" 逐词透传 ⇒ journal 里是**空格**分隔。
+        # 原正则只认逗号, 于是多段跳跃节点的 journal 一律判 schema 不合法被隔离, 崩溃恢复
+        # 静默失效(config 旧 / metadata 新 / DNAT 新 三方永久分裂)。空格与逗号在此都合法:
+        # 逗号是 metadata 的存储形态, 空格是 _read_hop_ranges 的规范形态。
+        or ((test("^[0-9]{1,5}(:[0-9]{1,5})?([,[:space:]]+[0-9]{1,5}(:[0-9]{1,5})?)*$"))
             and ([ splits("[,\\s]+") ] | map(select(length > 0)) | length > 0)
             and ([ splits("[,\\s]+") | select(length > 0) |
                    if test(":") then
