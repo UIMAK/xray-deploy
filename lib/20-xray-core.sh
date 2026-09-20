@@ -74,6 +74,12 @@ _xray_version_ge() {
     local min="$1" cur i x y
     cur=$(_xray_current_version 2>/dev/null)
     [ -n "$cur" ] || return 1
+    # 两侧都可能带 "v" 前缀(如 XRAY_VERSION 常量的 "v26.6.1" 形态)。不剥掉时 "v26" 会落进
+    # 下面的非数字分支被当成 0, 比较退化成**恒真** —— 实测: 26.2.6 也被判为 >= v26.6.1,
+    # 于是门控形同虚设, 旧核心照旧接收它不认识的字段(Go JSON 静默忽略 = 静默失效)。
+    # 这是本函数唯一存在的意义, 故在入口统一剥前缀, 使带不带 v 都按同一语义比较。
+    cur="${cur#v}"; cur="${cur#V}"
+    min="${min#v}"; min="${min#V}"
     local -a a b
     IFS='.' read -ra a <<< "$cur"
     IFS='.' read -ra b <<< "$min"
