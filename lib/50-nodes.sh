@@ -323,6 +323,11 @@ _hy2_masq_unix_supported() {
 # 已知字段全集(与**目标核心版本**的 Masquerade 结构体 json tag 逐字对应)。集合写入以此为准:
 # 先整体替换, 再把**非本脚本管理**的未知键原样搬回(用户或将来核心手工加过的字段不被吃掉),
 # 同时让上一形态的残留字段(proxy 切到 string 后遗留的 url 等)不再留在配置里 ——
+#
+# **source 层与 docs 层的字段数不同, 不要混说(2026-09-20 实测)**:
+#   Xray-core 源码 `Masquerade` struct: 9 个(含 xForwarded);
+#   Xray-docs-next 三语的 `MasqObject`: **8 个, 未列出 xForwarded**(文档尚未跟上源码)。
+# 本脚本以**源码**为准(功能由核心决定, 不由文档决定), 故用 9 个。
 # 残留不是无害噪声: 切回该形态时它会以旧值复活。
 XD_MASQ_KNOWN_KEYS_JSON='["type","dir","url","rewriteHost","xForwarded","insecure","content","headers","statusCode"]'
 
@@ -366,7 +371,7 @@ _hy2_masq_trim() {
 }
 
 # 读取选中节点的伪装字段。未配置/形态不符(非对象)一律输出空串, 菜单据此显示"默认 404"。
-# 用法: _hy2_masq_get <tag> <type|dir|url|rewriteHost|insecure|content|statusCode>
+# 用法: _hy2_masq_get <tag> <type|dir|url|rewriteHost|xForwarded|insecure|content|statusCode>
 _hy2_masq_get() {
     local tag="$1" field="$2"
     [ -f "$CONFIG_FILE" ] || return 0
@@ -425,10 +430,16 @@ _hy2_masq_url_invalid() {
     case "$u" in
         *[[:space:]]*) printf '%s' "URL 不能含空格/制表符(空格需写成 %20)"; return ;;
     esac
-    # 支持范围对齐**目标核心版本**(hub.go 的 "proxy" 分支 switch u.Scheme):
-    #   http / https         => 普通反代(>= v26.3.23)
-    #   ""(裸绝对路径) / unix => Unix socket(>= v26.9.8, 核心用 DialContext 连 unix)
-    # v26.3.23 起对**其它** scheme 会启动即失败(unknown scheme), 故只放这三类。
+    # 支持范围对齐**目标核心版本**, 依据是 hub.go 的 "proxy" 分支:
+    #   http / https          => 普通反代(masquerade 本体自 v26.3.23 起存在)
+    #   ""(裸绝对路径) / unix => Unix socket(v26.9.8 起, 核心用 DialContext 连 unix)
+    #
+    # **版本行为务必分清(早期注释在这里写错过)**: `switch u.Scheme` 是 **v26.9.8 才加入**的。
+    # v26.3.23 ~ v26.7.28 的 hub.go **没有** scheme 分支 —— 任何 scheme 都被原样交给
+    # http.Transport, 所以非法 scheme 的失败会**推迟到实际代理请求时**, 而不是"启动即失败"。
+    # v26.9.8+ 才有 switch 并在 default 返回 "unknown scheme"(启动即失败)。
+    # 故这里只放这三类, 不是因为"核心会启动即拒绝", 而是因为**只有这三类是有意义的输入**;
+    # 真正决定能否用 unix 的是下面 _hy2_masq_unix_supported 的独立版本门控。
     scheme="${u%%://*}"
     case "$u" in
         http://*|https://*)
