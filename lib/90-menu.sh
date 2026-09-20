@@ -592,6 +592,9 @@ _hy2_manage_menu() {
         echo -e "  ${GREEN}[3]${NC} 端口跳跃 (iptables)"
         echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
         echo -e "  ${GREEN}[5]${NC} 混淆 salamander / gecko (FinalMask.udp)"
+        # masquerade 是**另一个机制**(HTTP 页面), 不能与 [5] 的链路混淆混为一谈标为"伪装":
+        # 菜单标签必须各自点出所属配置路径, 否则用户会以为 [5] 就是伪装页面的开关。
+        echo -e "  ${GREEN}[6]${NC} HTTP/3 伪装 masquerade (非 Hysteria 请求的 HTTP 页面)"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
@@ -601,10 +604,206 @@ _hy2_manage_menu() {
             3) _hy2_toggle_hop ;;
             4) _hy2_view_hop ;;
             5) _hy2_obfs_menu ;;
+            6) _hy2_masq_menu ;;
             0) return ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
     done
+}
+
+# ---------------------------------------------------------------------------
+# [6] HTTP/3 页面伪装 masquerade(hysteriaSettings.masquerade)
+#
+# **本项与 [5] 混淆(FinalMask.udp)是两个独立机制** —— 菜单文案必须点明, 否则用户会把
+# "伪装"理解成混淆的别名(两者都叫"伪装"但改的是完全不同的东西):
+#   [5] finalmask.udp → 改变链路上的 QUIC 字节(抗特征识别)
+#   [6] masquerade    → 非 Hysteria 客户端连上端口时回什么 HTTP 页面(抗主动探测)
+# 用户可以只开其一, 也可以都开。
+#
+# 节点选择与 [5] 同口径: 多节点时必须先选节点(要求 7 —— 绝不能改错节点), 且提交前校验
+# 该入站**真实存在于 config.json**: 元数据在而 config 被手工改过时, jq 会匹配 0 条路径并
+# 返回 0, _mutate_config 重启成功却什么都没改, 菜单却报"已设置"。
+# ---------------------------------------------------------------------------
+_hy2_masq_menu() {
+    local choice
+    clear
+    _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+    # 版本门控(要求 1 的兼容性硬约束): 核心 < v26.3.23 不认该字段, Go JSON 静默忽略 ⇒
+    # 写进去也不生效, 只有被主动探测时才暴露。故在这里就拒绝, 并说清为什么。
+    if ! _hy2_masq_supported; then
+        _error "当前核心不支持 masquerade 页面伪装(需 Xray >= v${_HY2_MASQ_MIN_VER})"
+        _tip "旧核心会静默忽略该字段(伪装不生效且无任何报错); 请先升级/切换 Xray 核心"
+        _press_any_key; return
+    fi
+    echo; echo -e "  ${CYAN}【HTTP/3 页面伪装 masquerade】${NC}"
+    echo -e "  ${YELLOW}作用: 非 Hysteria 客户端(普通浏览器/扫描器)连上本端口时返回什么 HTTP 页面${NC}"
+    echo -e "  ${YELLOW}与 [5] 混淆(FinalMask.udp)是两个独立机制 —— 混淆改链路上的 QUIC 字节, 本项改 HTTP 页面${NC}"
+    local tags=() i=1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        local tag name desc
+        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
+        desc=$(_hy2_masq_desc "$tag")
+        tags+=("$tag")
+        printf "  ${GREEN}[%d]${NC} %-20s 当前: %s\n" "$i" "$name" "${desc:-默认 404 页面}"
+        i=$((i+1))
+    done
+    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    read -rp "  选择节点: " choice || return 1
+    [ "$choice" = "0" ] && return
+    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
+    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+
+    # 入站必须真实存在于 config(见文件头注释: 否则 jq 0 命中而菜单报成功)
+    jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
+        || { _error "config.json 中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
+
+    while true; do
+        local cur_desc
+        cur_desc=$(_hy2_masq_desc "$tag")
+        echo
+        echo -e "  节点 ${CYAN}${tag}${NC} 当前: ${GREEN}${cur_desc:-默认 404 页面}${NC}"
+        echo
+        echo -e "  ${GREEN}[1]${NC} 默认 404 (移除伪装段, 官方默认行为)"
+        echo -e "  ${GREEN}[2]${NC} 文件伪装 (file: 从本地目录提供静态页面)"
+        echo -e "  ${GREEN}[3]${NC} 反向代理到网站 (proxy)"
+        echo -e "  ${GREEN}[4]${NC} 固定字符串 / HTML (string)"
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  请选择: " choice || return 1
+        case "${choice:-0}" in
+            0) return 0 ;;
+            1)
+                if ! _hy2_masq_apply "$tag" ""; then
+                    _error "恢复默认 404 失败, 已回滚原配置"; _press_any_key; continue
+                fi
+                _success "已恢复官方默认 404 页面"
+                _press_any_key; return 0 ;;
+            2) _hy2_masq_set_file "$tag" && return 0 ;;
+            3) _hy2_masq_set_proxy "$tag" && return 0 ;;
+            4) _hy2_masq_set_string "$tag" && return 0 ;;
+            *) _warn "无效选择"; _press_any_key ;;
+        esac
+    done
+}
+
+# 文件伪装: type=file + dir(核心 http.FileServer(http.Dir(dir)))。
+# 每个字段都是"只重问当前字段"的循环(要求 3): 输入非法时已确认的节点选择与其它字段
+# 全部保留; EOF(read 失败)一律 return 1 中止, 绝不空转、也不兜默认值。
+_hy2_masq_set_file() {
+    local tag="$1" dir why payload
+    echo
+    echo -e "  ${CYAN}文件伪装${NC}: 核心以 ${CYAN}http.FileServer${NC} 从该目录提供静态文件"
+    echo -e "  ${YELLOW}请求路径直接映射到目录内文件(如 / → index.html, /a.css → <目录>/a.css)${NC}"
+    echo -e "  ${YELLOW}输入 0 可取消${NC}"
+    while true; do
+        read -rp "  静态文件目录 (绝对路径, 如 /var/www/html): " dir || return 1
+        [ "$dir" = "0" ] && { _info "已取消"; return 1; }
+        why=$(_hy2_masq_dir_invalid "$dir")
+        [ -z "$why" ] && break
+        _error "目录非法: ${why}"
+    done
+    if [ ! -d "$dir" ]; then
+        # 警告而非拒绝: 目录可以稍后创建, 且核心只在实际收到请求时才读它。
+        _warn "目录当前不存在: ${dir}(请自行创建并放入 index.html, 否则请求会得到 404/403)"
+    fi
+    payload=$(_hy2_masq_json_file "$dir") || { _error "伪装参数构造失败"; _press_any_key; return 1; }
+    if ! _hy2_masq_apply "$tag" "$payload"; then
+        _error "文件伪装设置失败, 已回滚原配置"; _press_any_key; return 1
+    fi
+    _success "已启用文件伪装: ${dir}"
+    _tip "请确认 xray 进程对该目录有读权限(建议 chmod 755), 否则请求会返回 403"
+    _press_any_key
+    return 0
+}
+
+# 反向代理: type=proxy + url / rewriteHost / insecure。
+# 这三项都要问, 是因为它们的取值决定了"回源时 Host 头是什么"与"是否校验证书",
+# 而这两个语义用户无法从别处推断 —— 与 official Hysteria 侧形状不同, 不能互抄。
+_hy2_masq_set_proxy() {
+    local tag="$1" url why ans rh="true" ins="false" payload
+    echo
+    echo -e "  ${CYAN}反向代理${NC}: 把非 Hysteria 请求转发到目标站点(核心 httputil.ReverseProxy)"
+    echo -e "  ${YELLOW}仅支持 http:// 与 https:// (核心对其余 scheme 会拒绝启动)${NC}"
+    echo -e "  ${YELLOW}输入 0 可取消${NC}"
+    while true; do
+        read -rp "  目标网站 URL (如 https://example.com): " url || return 1
+        [ "$url" = "0" ] && { _info "已取消"; return 1; }
+        why=$(_hy2_masq_url_invalid "$url")
+        [ -z "$why" ] && break
+        _error "URL 非法: ${why}"
+    done
+    read -rp "  转发时用目标站点的 Host 头? [Y/n]: " ans || return 1
+    case "$ans" in n|N) rh="false" ;; *) rh="true" ;; esac
+    if [ "$rh" = "false" ]; then
+        _tip "保留原始 Host: 目标站点看到的是你的域名/IP 而非它自己的(虚拟主机可能不匹配)"
+    fi
+    if [ "${url#https://}" != "$url" ]; then
+        read -rp "  跳过目标站点证书校验(insecure)? [y/N]: " ans || return 1
+        case "$ans" in y|Y) ins="true" ;; *) ins="false" ;; esac
+        [ "$ins" = "true" ] && _warn "已跳过证书校验: 中间人可替换回源内容(仅在自签/证书不匹配时需要)"
+    fi
+    payload=$(_hy2_masq_json_proxy "$url" "$rh" "$ins") || { _error "伪装参数构造失败"; _press_any_key; return 1; }
+    if ! _hy2_masq_apply "$tag" "$payload"; then
+        _error "反向代理设置失败, 已回滚原配置"; _press_any_key; return 1
+    fi
+    _success "已启用反向代理: ${url}"
+    _press_any_key
+    return 0
+}
+
+# 固定字符串: type=string + content / headers / statusCode。
+# content 逐行收集(单独一行 "." 结束): 真实伪装页多是多行 HTML, 单行 read 表达不了。
+# EOF 语义在这里**有意区分**两种情况(与"必答字段 EOF 即中止"不同):
+#   - 已有内容时收到 EOF: 输入完成(与 cat 一致), 提交 —— 丢弃用户刚敲进去的 HTML 更糟;
+#   - 没有任何内容时收到 EOF: 中止本项(不写配置)。
+# 两种都不会空转。headers 逐行收集(见 _hy2_masq_headers_merge: 不能按逗号切)。
+_hy2_masq_set_string() {
+    local tag="$1" content="" line why sc hdr_json='{}' merged payload nl got_dot
+    nl=$'\n'
+    echo
+    echo -e "  ${CYAN}固定字符串${NC}: 对任意请求返回同一份内容(适合放一段伪装的 HTML)"
+    echo -e "  ${YELLOW}逐行输入内容(可多行), 单独一行输入 . 表示结束${NC}"
+    while true; do
+        content=""; got_dot=0
+        while IFS= read -r line; do
+            [ "$line" = "." ] && { got_dot=1; break; }
+            content="${content}${line}${nl}"
+        done
+        content="${content%${nl}}"
+        [ -n "$content" ] && break
+        if [ "$got_dot" -eq 0 ]; then
+            _error "未收到任何内容(输入已结束), 已取消本项"
+            return 1
+        fi
+        _error "内容不能为空(至少输入一行, 再用单独一行 . 结束)"
+    done
+    while true; do
+        read -rp "  HTTP 状态码 (3 位, 回车用核心默认 200): " sc || return 1
+        why=$(_hy2_masq_status_invalid "$sc")
+        [ -z "$why" ] && break
+        _error "状态码非法: ${why}"
+    done
+    echo -e "  ${YELLOW}响应头(可选): 每行一条 名称: 值; 直接回车结束${NC}"
+    while true; do
+        read -rp "    响应头 (如 Content-Type: text/html; charset=utf-8): " line || break
+        [ -z "$line" ] && break
+        if ! merged=$(_hy2_masq_headers_merge "$hdr_json" "$line"); then
+            _error "响应头非法: ${merged}"
+            continue
+        fi
+        hdr_json="$merged"
+    done
+    payload=$(_hy2_masq_json_string "$content" "$sc" "$hdr_json") || { _error "伪装参数构造失败"; _press_any_key; return 1; }
+    if ! _hy2_masq_apply "$tag" "$payload"; then
+        _error "固定字符串设置失败, 已回滚原配置"; _press_any_key; return 1
+    fi
+    _success "已启用固定字符串伪装(${#content} 字符, HTTP ${sc:-200})"
+    _press_any_key
+    return 0
 }
 
 # ---------------------------------------------------------------------------

@@ -1467,20 +1467,40 @@ _hysteria_cert_pin() {
 # 输出全局: HY_TLS_JSON(jq -n 片段字符串) HY_TLS_MODE HY_TLS_SNI HY_TLS_PIN
 # 用户取消 → 返回 1
 _hysteria_prompt_tls() {
+    # arr/first/doms/d 原为 ACME 分支内的 local; 现该分支被重问循环包裹, 循环体内不能声明
+    # (每次迭代重新 local 会遮蔽外层, 且 do 块里的 local 在部分 shell 下语义不一致),
+    # 故统一提升到函数级声明 —— 与 why/ans2 同口径。
     local choice cert_file key_file acme_domains acme_email host pin cn=""
+    local arr first acme_bad why ans2
+    local -a doms
+    local d
     echo; echo -e "  ${CYAN}【TLS 设置】${NC}"
     echo -e "  ${GREEN}[1]${NC} 自签证书 (官方 hysteria cert 生成, 客户端 insecure+pinSHA256)"
     echo -e "  ${GREEN}[2]${NC} 使用已有证书 (证书+私钥路径)"
     echo -e "  ${GREEN}[3]${NC} ACME 自动证书 (本向导用 HTTP/TLS 质询; DNS 质询请手工编辑 hysteria.json)"
     echo -e "  ${GREEN}[0]${NC} 取消"
-    read -rp "  请选择: " choice || return 1
+    # 无效选择属可恢复输入 ⇒ 重问(不再 return 1 中止整段向导; 取消仍走 0)。
+    while true; do
+        read -rp "  请选择: " choice || return 1
+        case "${choice:-0}" in
+            0|1|2|3) break ;;
+            *) _error "无效选择: ${choice}(可选 0-3)" ;;
+        esac
+    done
     case "${choice:-0}" in
         0) return 1 ;;
         1)
             _hysteria_installed || { _error "官方核心未安装, 无法生成自签证书"; return 1; }
             mkdir -p "$HYSTERIA_CERT_DIR" || return 1
-            read -rp "  证书域名/SAN (回车默认 example.com): " host
-            host=${host:-example.com}
+            # 域名格式非法属**可恢复的输入错误** ⇒ 原地重问本字段(要求 3), 不再中止整段
+            # 向导。证书**生成失败**是环境类错误(二进制/权限), 仍 return 1。
+            while true; do
+                read -rp "  证书域名/SAN (回车默认 example.com): " host || return 1
+                host=${host:-example.com}
+                why=$(_hysteria_domain_reason "$host")
+                [ -z "$why" ] && break
+                _error "$why"
+            done
             if ! "$HYSTERIA_BIN" cert --host "$host" \
                  --cert "$HYSTERIA_CERT_DIR/cert.pem" --key "$HYSTERIA_CERT_DIR/key.pem" \
                  --overwrite >/dev/null 2>&1; then
@@ -1496,38 +1516,72 @@ _hysteria_prompt_tls() {
             return 0
             ;;
         2)
-            read -rp "  cert 文件路径: " cert_file
-            read -rp "  key  文件路径: " key_file
-            _validate_json_text "$cert_file" || { _error "cert 路径含非法字符"; return 1; }
-            _validate_json_text "$key_file" || { _error "key 路径含非法字符"; return 1; }
-            [ -f "$cert_file" ] && [ -f "$key_file" ] || { _error "证书文件不存在"; return 1; }
+            # 路径含非法字符 / 文件不存在都是**可恢复的输入错误** ⇒ 原地重问(要求 3),
+            # 不再中止整段向导。证书内容本身不在此校验(交给核心启动时判定)。
+            while true; do
+                read -rp "  cert 文件路径: " cert_file || return 1
+                _validate_json_text "$cert_file" || { _error "cert 路径含非法字符(双引号/反斜杠/换行/制表符或 {{)"; continue; }
+                break
+            done
+            while true; do
+                read -rp "  key  文件路径: " key_file || return 1
+                _validate_json_text "$key_file" || { _error "key 路径含非法字符(双引号/反斜杠/换行/制表符或 {{)"; continue; }
+                break
+            done
+            while [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; do
+                _error "证书文件不存在: cert=${cert_file} key=${key_file}"
+                read -rp "  重新输入 cert 路径 (回车保持当前): " ans2 || return 1
+                [ -n "$ans2" ] && cert_file="$ans2"
+                read -rp "  重新输入 key  路径 (回车保持当前): " ans2 || return 1
+                [ -n "$ans2" ] && key_file="$ans2"
+            done
             if command -v openssl >/dev/null 2>&1; then
                 cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN *= *//' | sed 's/\/.*//')
             fi
-            read -rp "  客户端 SNI (回车默认 ${cn:-需手动填}): " host
-            host=${host:-$cn}
+            # SNI 可留空(核心按证书自身的 SAN 匹配); 非空则必须格式合法, 否则原地重问
+            while true; do
+                read -rp "  客户端 SNI (回车默认 ${cn:-需手动填}): " host || return 1
+                host=${host:-$cn}
+                [ -z "$host" ] && break
+                why=$(_hysteria_domain_reason "$host")
+                [ -z "$why" ] && break
+                _error "$why"
+            done
             HY_TLS_JSON=$(jq -n --arg c "$cert_file" --arg k "$key_file" '{tls: {cert: $c, key: $k}}')
             HY_TLS_MODE="custom"; HY_TLS_SNI="$host"; HY_TLS_PIN=""
             return 0
             ;;
         3)
-            read -rp "  ACME 域名(多个用逗号分隔): " acme_domains
-            [ -z "$acme_domains" ] && { _warn "域名不能为空"; return 1; }
-            read -rp "  邮箱: " acme_email
-            [ -z "$acme_email" ] && { _warn "邮箱不能为空"; return 1; }
-            local d arr="[" first=1
-            local -a doms
-            # IFS 只作用于这一次 read(项目规约: local IFS 会残留整个函数)
-            IFS=',' read -ra doms <<< "$acme_domains"
-            for d in "${doms[@]}"; do
-                d=$(printf '%s' "$d" | tr -d ' ')
-                [ -z "$d" ] && continue
-                _validate_domain "$d" || { _error "域名格式非法: $d"; return 1; }
-                [ "$first" -eq 1 ] && first=0 || arr="${arr},"
-                arr="${arr}\"$d\""
+            # 域名列表/邮箱的格式问题都是**可恢复的输入错误** ⇒ 原地重问本字段(要求 3),
+            # 不再中止整段向导。域名列表整体重问(逐条重问难以表达"第几条错了")。
+            while true; do
+                read -rp "  ACME 域名(多个用逗号分隔): " acme_domains || return 1
+                arr="["; first=1; acme_bad=""
+                # IFS 只作用于这一次 read(项目规约: local IFS 会残留整个函数)
+                IFS=',' read -ra doms <<< "$acme_domains"
+                for d in "${doms[@]}"; do
+                    d=$(printf '%s' "$d" | tr -d ' ')
+                    [ -z "$d" ] && continue
+                    if ! _validate_domain "$d"; then
+                        acme_bad="$d"
+                        break
+                    fi
+                    [ "$first" -eq 1 ] && first=0 || arr="${arr},"
+                    arr="${arr}\"$d\""
+                done
+                if [ -n "$acme_bad" ]; then
+                    _error "域名格式非法: ${acme_bad}(仅字母/数字/连字符, 点分段)"
+                    continue
+                fi
+                arr="${arr}]"
+                [ "$arr" = "[]" ] || break
+                _error "至少需要一个有效域名"
             done
-            arr="${arr}]"
-            [ "$arr" = "[]" ] && { _warn "无有效域名"; return 1; }
+            while true; do
+                read -rp "  邮箱: " acme_email || return 1
+                [ -n "$acme_email" ] && break
+                _error "邮箱不能为空(ACME 注册与到期通知需要, 如 admin@example.com)"
+            done
             # HTTP 质询要占 80/TLS-ALPN 占 443: 与 Xray 同机时大概率冲突, 提前讲清
             if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
                 if jq -e '[.inbounds[]?.port] | index(80) or index(443)' "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -2476,6 +2530,189 @@ _hysteria_default_name_for_listen() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# 向导输入的"只重问当前字段"
+#
+# 问题: 官方 Hy2 添加节点向导里, 任何**可恢复的用户输入错误**(URL 少 scheme、域名格式非法、
+# 跳跃范围写错、名称重名…)都是 `_error …; return 1` —— 一路冒泡出 _hysteria_bootstrap,
+# 于是用户被扔回【Hysteria2 管理 — 官方核心】主菜单, 前面 10 项输入全部作废。一个字符打错
+# 的代价是整段重来。
+#
+# 契约(硬要求, 不是风格偏好):
+#   (1) 只重问**当前字段**, 已确认的其它字段一概不动(不重算随机密码/端口/证书);
+#   (2) **绝不吞错**: 不把 example.com 悄悄补成 https://example.com, 不把非法值当默认值,
+#       必须回显原因再问。自动纠错会让用户以为配置就是他填的那样;
+#   (3) EOF(read 失败)一律返回 1: 无输入可读时继续循环 = 无限空转(项目已有 140k 行/秒的
+#       实测事故); 调用方据此中止并走既有回滚;
+#   (4) 空值是否合法由各字段自己的判据决定, 不在此统一兜默认(空 != 默认值)。
+#
+# helper 经由**全局变量**回传(变量名由调用方给出): read 循环必须能回传原样输入, 而
+# 命令替换会吞掉末尾换行, 故不用 $(...) 返回。
+# ---------------------------------------------------------------------------
+
+# 取校验函数的"原因"文本(校验函数输出原因; 无输出时给一句兜底, 避免"失败"却不说为什么)
+_hysteria_ask_why() {
+    local fn="$1" val="$2" why=""
+    why=$("$fn" "$val" 2>/dev/null) || why=""
+    [ -n "$why" ] || why="取值非法"
+    printf '%s' "$why"
+}
+
+# 用法: _hysteria_ask_value <提示> <reply变量名> <允许空值 0|1> <校验函数名>
+# 校验函数接收候选值, 返回 0 表示合法; 非 0 时其 stdout 作为原因回显。
+_hysteria_ask_value() {
+    local prompt="$1" reply_var="$2" allow_empty="$3" validator="$4" val="" why
+    while true; do
+        read -rp "$prompt" val || return 1
+        if [ -z "$val" ]; then
+            if [ "$allow_empty" = "1" ]; then
+                printf -v "$reply_var" '%s' ""
+                return 0
+            fi
+            _error "不能为空"
+            continue
+        fi
+        if "$validator" "$val"; then
+            printf -v "$reply_var" '%s' "$val"
+            return 0
+        fi
+        why=$(_hysteria_ask_why "$validator" "$val")
+        _error "$why"
+    done
+}
+
+# 同上, 但校验函数是"值 -> 原因文本"(空串 = 合法), 与 Xray 侧 _hy2_masq_*_invalid 同口径:
+# 校验逻辑可被单测直接断言原因文本, 不必从退出码反推。
+_hysteria_ask_value_reason() {
+    local prompt="$1" reply_var="$2" allow_empty="$3" reason_fn="$4" val="" why
+    while true; do
+        read -rp "$prompt" val || return 1
+        if [ -z "$val" ]; then
+            if [ "$allow_empty" = "1" ]; then
+                printf -v "$reply_var" '%s' ""
+                return 0
+            fi
+            _error "不能为空"
+            continue
+        fi
+        why=$("$reason_fn" "$val" 2>/dev/null) || why="取值非法"
+        [ -z "$why" ] || { _error "$why"; continue; }
+        printf -v "$reply_var" '%s' "$val"
+        return 0
+    done
+}
+
+# 枚举问答: 输入必须落在白名单内, 否则重问 —— 取代 `*) _warn "无效选择, 按默认处理"`
+# 这种"吞掉非法输入并替用户做决定"的写法(用户明确反对: 非法输入不得被静默当作默认值)。
+# 用法: _hysteria_ask_choice <提示> <reply变量名> <默认值, 可为空> <"合法值1 合法值2 …">
+#   空输入 → 默认值(默认值为空串时表示"空也合法", 直接回传空串)。
+_hysteria_ask_choice() {
+    local prompt="$1" reply_var="$2" default="$3" allowed="$4" val="" ok a
+    while true; do
+        read -rp "$prompt" val || return 1
+        if [ -z "$val" ]; then
+            printf -v "$reply_var" '%s' "$default"
+            return 0
+        fi
+        ok=""
+        for a in $allowed; do
+            [ "$val" = "$a" ] && { ok=1; break; }
+        done
+        [ -n "$ok" ] && { printf -v "$reply_var" '%s' "$val"; return 0; }
+        _error "无效选择: ${val}(可选: ${allowed// /, })"
+    done
+}
+
+# 跳跃范围校验(值 -> 原因)。只表达"官方 listen 能接受的单段连续范围":
+# 官方 listen 写的是一个范围(如 :20000-50000), 不支持逗号分隔多段 —— 多段是 Xray 侧
+# iptables 端口跳跃的方案, 两者不可混用。
+_hysteria_hop_reason() {
+    local hop="$1" parsed lo hi st en
+    [ -n "$hop" ] || { printf '%s' ""; return; }
+    case "$hop" in
+        *","*) printf '%s' "官方 listen 仅支持单段连续范围(如 20000-50000), 不接受逗号分隔的多段"; return ;;
+    esac
+    # 先自己拆一次: 把"起始 > 结束"与"端口越界"判成各自具体的原因, 而不是一律"格式非法"
+    # (_parse_hop_ranges 把两者都归成一个非零返回码, 直接透传会让用户不知道要改哪里)。
+    # _parse_hop_ranges 内部会把空格去掉(tr -d ' '), 这里对齐后再判: 否则 " 20000 - 30000 "
+    # 会被前置判成"端口非法", 而实际解析器是接受的(不一致会把合法输入挡在门外)。
+    hop=$(printf '%s' "$hop" | tr -d ' ')
+    [ -n "$hop" ] || { printf '%s' ""; return; }
+    case "$hop" in
+        *","*) printf '%s' "官方 listen 仅支持单段连续范围(如 20000-50000), 不接受逗号分隔的多段"; return ;;
+    esac
+    st="${hop%%-*}"; en="${hop##*-}"
+    if [ "$st" = "$hop" ]; then
+        printf '%s' "跳跃范围需要写成 起始-结束(如 20000-50000); 只填了单个端口 ${hop} —— 单端口不构成跳跃, 直接留空即可"
+        return
+    fi
+    if ! _validate_port "$st" || ! _validate_port "$en"; then
+        printf '%s' "端口非法或越界(须为 1-65535): ${hop}"
+        return
+    fi
+    if [ "$st" -gt "$en" ]; then
+        printf '%s' "起始端口大于结束端口: ${st} > ${en}(请写成 小-大, 如 ${en}-${st})"
+        return
+    fi
+    if [ "$st" -eq "$en" ]; then
+        printf '%s' "跳跃范围至少需要两个端口(${st}-${en} 只有一个端口, 不构成跳跃; 请留空表示不启用)"
+        return
+    fi
+    parsed=$(_parse_hop_ranges "$hop" 2>/dev/null) || { printf '%s' "范围格式非法: ${hop}"; return; }
+    lo="${parsed%%:*}"; hi="${parsed##*:}"
+    [ -n "$lo" ] && [ -n "$hi" ] || { printf '%s' "范围解析失败, 请写成 起始-结束(如 20000-50000)"; return; }
+    printf '%s' ""
+}
+
+# 域名校验(值 -> 原因), 供自签证书域名/ACME 域名的重问循环使用。
+_hysteria_domain_reason() {
+    local d="$1"
+    [ -n "$d" ] || { printf '%s' "域名不能为空"; return; }
+    _validate_domain "$d" && { printf '%s' ""; return; }
+    printf '%s' "域名格式非法(仅字母/数字/连字符, 点分段): ${d}"
+}
+
+# 官方带宽值校验(值 -> 原因)。依据 [Hysteria 官方源码] app/internal/utils/bpsconv.go 的
+# StringToBps: 数字 + 单位, 单位只认 b/bps/k/kb/kbps/m/mb/mbps/g/gb/gbps/t/tb/tbps
+# (大小写不敏感、允许空格、**不允许小数**), 且 core/server/config.go 要求非得 0 时
+# >= 65536 字节/秒。
+# **为什么必须在这里挡**: 带宽写错不会在向导里报错, 而是写入配置后由官方 binary 在**启动**时
+# 拒绝, 触发 bootstrap 的整段回滚 —— 用户看到的是一次"莫名其妙全部作废"。提前挡下并说清原因,
+# 才是把"可恢复的用户输入错误"留在原地重问。
+_hysteria_bandwidth_reason() {
+    local v="$1" num unit lunit bps
+    [ -n "$v" ] || { printf '%s' ""; return; }
+    # 官方 StringToBps 先 TrimSpace 再解析, 这里对齐 —— 否则 " 5m" 会被判成"缺少数值",
+    # 而官方其实接受(从文档复制粘贴带空格是常见情形)。
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    [ -n "$v" ] || { printf '%s' ""; return; }
+    case "$v" in
+        *[!0-9A-Za-z[:space:]]*) printf '%s' "带宽只能由数字+单位组成(如 100 mbps / 1g); 不支持小数与其它字符"; return ;;
+    esac
+    num="${v%%[!0-9]*}"
+    unit="${v#"$num"}"
+    unit="${unit// /}"
+    [ -n "$num" ] || { printf '%s' "带宽缺少数值(如 100 mbps); 纯单位不可用"; return; }
+    lunit=$(printf '%s' "$unit" | tr 'A-Z' 'a-z')
+    case "$lunit" in
+        b|bps|k|kb|kbps|m|mb|mbps|g|gb|gbps|t|tb|tbps) ;;
+        "") printf '%s' "带宽缺少单位(官方会报 invalid format); 请写成 100 mbps / 100m 这类形式"; return ;;
+        *) printf '%s' "不支持的单位: ${unit}(官方仅认 b/kb/mb/gb/tb 及其 bps 形式)"; return ;;
+    esac
+    case "$lunit" in
+        b|bps) bps=$((num / 8)) ;;
+        k|kb|kbps) bps=$((num * 1000 / 8)) ;;
+        m|mb|mbps) bps=$((num * 1000000 / 8)) ;;
+        g|gb|gbps) bps=$((num * 1000000000 / 8)) ;;
+        t|tb|tbps) bps=$((num * 1000000000000 / 8)) ;;
+    esac
+    if [ "$bps" -lt 65536 ]; then
+        printf '%s' "带宽过小(官方要求 >= 65536 字节/秒, 约 524 kbps); 请填 1 mbps 以上或留空表示不限速"
+        return
+    fi
+    printf '%s' ""
+}
+
 # 服务器初始化向导(bootstrap): 仅由 [添加节点] 在未初始化时触发, 单一入口避免双路径漂移。
 # 实测约束(2.12.2): 官方 binary 对缺 auth 段 / 空密码 FATAL
 # ("empty auth type" / "empty auth password"), 因此**认证密码必须与配置同时落地**
@@ -2485,6 +2722,8 @@ _hysteria_bootstrap() {
     local port hop parsed lo hi listen tls_json tls_mode tls_sni tls_pin
     local obfs_pw="" obfs_type="" masq_url="" up="" down="" addr
     local auth name def_name cc_type cc_profile
+    # 重问循环里使用的中间变量(why = 校验原因, ans = 各种 y/N 与重填输入)
+    local why ans
     echo; echo -e "  ${CYAN}=== 初始化官方 Hysteria2 服务器 ===${NC}"
     _tip "官方架构: 单服务单密码; 以下为服务器级设置, 认证密码即客户端唯一凭据"
 
@@ -2523,26 +2762,51 @@ _hysteria_bootstrap() {
         _check_port_in_config "$port" && { _warn "端口 $port 已被 Xray 节点使用, 换一个"; def_port=$(_gen_random_port); continue; }
         break
     done
-    read -rp "  端口跳跃范围 (如 20000-50000, 回车不启用): " hop
-    if [ -n "$hop" ]; then
-        [[ "$hop" == *","* ]] && { _warn "官方 listen 仅支持单段连续范围"; return 1; }
-        parsed=$(_parse_hop_ranges "$hop") || return 1
+    # 跳跃范围: 用户输入错误(格式/顺序/多段)属**可恢复**错误 —— 原地重问本字段, 不再
+    # return 1 把用户扔回主菜单(要求 3)。mimic 冲突与端口冲突不是输入格式问题, 但同样
+    # "改一下就能过", 故也留在本字段循环里重问; 真正的环境类失败(核心下载/写配置/启动)
+    # 仍然 return 1 走既有回滚。
+    while true; do
+        read -rp "  端口跳跃范围 (如 20000-50000, 回车不启用): " hop || return 1
+        [ -z "$hop" ] && break
+        why=$(_hysteria_hop_reason "$hop")
+        [ -z "$why" ] || { _error "$why"; continue; }
+        hop=$(printf '%s' "$hop" | tr -d ' ')
+        parsed=$(_parse_hop_ranges "$hop" 2>/dev/null) || { _error "范围解析失败: $hop"; continue; }
         lo="${parsed%%:*}"; hi="${parsed##*:}"
-        [ "$lo" = "$hi" ] && { _warn "跳跃范围至少两个端口"; return 1; }
-        # 官方禁止 mimic + 端口跳跃组合(启动即拒绝)
+        # 官方禁止 mimic + 端口跳跃组合(启动即拒绝)。这是配置冲突而非格式错误,
+        # 用户改不了本字段使其通过 —— 但可以重填一个不启用跳跃的空值, 故仍在循环内。
         if _hysteria_mimic_enabled; then
-            _error "配置已启用 mimic, 官方不允许 mimic 与端口跳跃同时启用"
-            _tip "请先关闭 hysteria.json 的 mimic.enabled"
-            return 1
+            _error "配置已启用 mimic, 官方不允许 mimic 与端口跳跃同时启用(请先关闭 hysteria.json 的 mimic.enabled, 或留空不启用跳跃)"
+            continue
         fi
-        [ "$lo" -le "$port" ] && [ "$port" -le "$hi" ] || {
-            # 官方机制: 范围首端口即监听端口; 允许把监听端口并进范围首端
-            _warn "官方机制下监听端口=范围首端口(${lo}), 输入的 $port 将被范围取代"
-            read -rp "  使用范围 ${lo}-${hi} (监听 ${lo})? [y/N]: " ans
-            case "$ans" in y|Y) port="$lo" ;; *) _info "已取消"; return 1 ;; esac
-        }
-        _hysteria_check_hop_conflicts "$lo" "$hi" || return 1
-        listen=":${lo}-${hi}"
+        if [ "$lo" -le "$port" ] && [ "$port" -le "$hi" ]; then
+            break
+        fi
+        # 官方机制: 范围首端口即监听端口; 允许把监听端口并进范围首端
+        _warn "官方机制下监听端口=范围首端口(${lo}), 输入的 $port 将被范围取代"
+        read -rp "  使用范围 ${lo}-${hi} (监听 ${lo})? [y/N]: " ans || return 1
+        case "$ans" in
+            y|Y) port="$lo"; break ;;
+            *) _error "已放弃该范围, 请重新输入跳跃范围(留空 = 不启用跳跃)"; continue ;;
+        esac
+    done
+    if [ -n "$hop" ]; then
+        # 与本机监听/Xray 入站端口冲突: 属"换个范围就能过", 故回到范围字段重问
+        while ! _hysteria_check_hop_conflicts "$lo" "$hi"; do
+            read -rp "  端口跳跃范围 (回车不启用跳跃): " hop || return 1
+            [ -z "$hop" ] && { hop=""; break; }
+            why=$(_hysteria_hop_reason "$hop")
+            [ -z "$why" ] || { _error "$why"; continue; }
+            hop=$(printf '%s' "$hop" | tr -d ' ')
+            parsed=$(_parse_hop_ranges "$hop" 2>/dev/null) || { _error "范围解析失败: $hop"; continue; }
+            lo="${parsed%%:*}"; hi="${parsed##*:}"
+        done
+        if [ -n "$hop" ]; then
+            listen=":${lo}-${hi}"
+        else
+            listen=":${port}"
+        fi
     else
         listen=":${port}"
     fi
@@ -2557,25 +2821,39 @@ _hysteria_bootstrap() {
     # 版本兼容性说明改在 [9] 混淆菜单里给出(用户主动进入, 有空间讲清代价);
     # 补 [3] 显式"不启用", 回车 = 不启用(默认项与用户预期一致)。
     local ans2=""
-    read -rp "  启用混淆? [1] salamander [2] gecko [3] 不启用 (回车不启用): " ans2
-    case "$ans2" in
-        1) obfs_type="salamander" ;;
-        2) obfs_type="gecko" ;;
-        # y/Y 保留旧语义(= salamander), 3/空 均为不启用
-        y|Y) obfs_type="salamander" ;;
-        3|"") obfs_type="" ;;
-        *) _warn "无效选择, 按不启用处理" ; obfs_type="" ;;
-    esac
+    # 非法输入**不再静默按"不启用"处理**(要求 4): 那会让用户以为开了混淆而实际没开,
+    # 客户端按混淆连、服务端不要求混淆 —— 又一处"界面与事实不符"。改为回显原因后重问。
+    # 允许值含 y/Y(旧脚本语义 = salamander), 空值 = 不启用(默认项)。
+    while true; do
+        read -rp "  启用混淆? [1] salamander [2] gecko [3] 不启用 (回车不启用): " ans2 || return 1
+        case "$ans2" in
+            # y/Y 与 n/N 是历史语义(y = salamander, n = 不启用), 也是用户对"要不要开"
+            # 的自然回答 —— 它们**明确**表达了意图, 不属于"被吞掉的非法输入", 故保留;
+            # 真正无法理解的值(如 "abc"/"9")才重问, 不再一律当"不启用"。
+            1|y|Y) obfs_type="salamander"; break ;;
+            2) obfs_type="gecko"; break ;;
+            3|n|N|"") obfs_type=""; break ;;
+            *) _error "无效选择: ${ans2}(可选 1/2/3, 回车或 n 表示不启用)" ;;
+        esac
+    done
     if [ -n "$obfs_type" ]; then
+        # 随机密码在**用户确认前**生成一次即可; 密码字段重问不重新生成(要求 5:
+        # 已确认的随机值不得因另一个字段出错而被换掉)。
         obfs_pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
-        read -rp "  混淆密码 (回车随机): " ans2
-        obfs_pw=${ans2:-$obfs_pw}
-        _validate_json_text "$obfs_pw" || { _error "混淆密码含非法字符"; return 1; }
+        while true; do
+            read -rp "  混淆密码 (回车随机): " ans2 || return 1
+            [ -n "$ans2" ] && obfs_pw="$ans2"
+            _validate_json_text "$obfs_pw" && break
+            _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"
+            obfs_pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
+        done
     fi
 
     # 4) 带宽(可选, 仅限速语义)
-    read -rp "  上行限速 (如 100 mbps, 回车不限): " up
-    read -rp "  下行限速 (如 100 mbps, 回车不限): " down
+    # 带宽写错的后果是"配置写入后启动被官方 binary 拒绝 → 整段回滚", 故在输入侧就用
+    # 官方 bpsconv.go 的语法 + config.go 的下限校验挡下, 并原地重问(要求 3/4)。
+    _hysteria_ask_value_reason "  上行限速 (如 100 mbps / 1g, 回车不限): " up 1 _hysteria_bandwidth_reason || return 1
+    _hysteria_ask_value_reason "  下行限速 (如 100 mbps / 1g, 回车不限): " down 1 _hysteria_bandwidth_reason || return 1
     up=$(_normalize_bandwidth "$up"); down=$(_normalize_bandwidth "$down")
 
     # 4.5) 拥塞控制(可选, 官方 congestion 段)。只有该方向未使用 Brutal 时才生效
@@ -2583,27 +2861,46 @@ _hysteria_bootstrap() {
     # 才是真正生效的控制器选择, 故此处如实提示。
     # 回车 = 官方默认(bbr/standard), 此时**不写** congestion 段(与官方缺省等价)。
     echo -e "  拥塞控制 (非 Brutal 方向生效; 回车用官方默认 bbr/standard):"
-    read -rp "  类型 [1] bbr [2] reno (回车 bbr): " cc_type
-    case "$cc_type" in
-        2) cc_type="reno" ;;
-        *) cc_type="bbr" ;;
-    esac
+    # 非法输入不再落进 case 的 *) 分支被静默当成默认值(要求 4): "填错了"与"选了默认"
+    # 是两件事, 前者必须重问。回车才是官方默认(bbr/standard)。
+    while true; do
+        read -rp "  类型 [1] bbr [2] reno (回车 bbr): " cc_type || return 1
+        case "$cc_type" in
+            ""|1) cc_type="bbr"; break ;;
+            2) cc_type="reno"; break ;;
+            *) _error "无效选择: ${cc_type}(可选 1/2, 回车用官方默认 bbr)" ;;
+        esac
+    done
     cc_profile=""
     if [ "$cc_type" = "bbr" ]; then
-        read -rp "  BBR 预设 [1] standard [2] conservative [3] aggressive (回车 standard): " cc_profile
-        case "$cc_profile" in
-            2) cc_profile="conservative" ;;
-            3) cc_profile="aggressive" ;;
-            *) cc_profile="standard" ;;
-        esac
+        while true; do
+            read -rp "  BBR 预设 [1] standard [2] conservative [3] aggressive (回车 standard): " cc_profile || return 1
+            case "$cc_profile" in
+                ""|1) cc_profile="standard"; break ;;
+                2) cc_profile="conservative"; break ;;
+                3) cc_profile="aggressive"; break ;;
+                *) _error "无效选择: ${cc_profile}(可选 1-3, 回车用官方默认 standard)" ;;
+            esac
+        done
     fi
 
     # 5) 伪装(可选, 默认官方 404)
-    read -rp "  伪装站 URL (回车用官方默认 404): " masq_url
-    if [ -n "$masq_url" ]; then
-        _validate_json_text "$masq_url" || { _error "URL 含非法字符"; return 1; }
-        [[ "$masq_url" == https://* || "$masq_url" == http://* ]] || { _error "URL 须以 http(s):// 开头"; return 1; }
-    fi
+    # 提示必须写明"必须包含 http(s)://"(用户实测: 只写"伪装站 URL"时大家都填 example.com,
+    # 然后被校验拦下 —— 提示本身没把要求说清)。回车语义保持官方默认 404 不变。
+    # 格式错误一律原地重问本字段, 不 return 1 丢弃整段向导(要求 2/3); 且**不做任何自动
+    # 补全**(绝不把 example.com 悄悄补成 https://example.com, 要求 4)。
+    while true; do
+        read -rp "  伪装站 URL (必须包含 http:// 或 https://; 如 https://example.com, 回车用官方默认 404): " masq_url || return 1
+        [ -z "$masq_url" ] && break
+        if ! _validate_json_text "$masq_url"; then
+            _error "URL 含非法字符(双引号/反斜杠/换行/制表符或 {{)"
+            continue
+        fi
+        case "$masq_url" in
+            https://*|http://*) break ;;
+            *) _error "URL 须以 http:// 或 https:// 开头(不能只填 example.com); 如 https://example.com" ;;
+        esac
+    done
 
     # 6) 客户端连接地址(与其他协议共用同一问法/兜底)
     addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址, 已取消初始化"; return 1; }
@@ -2612,19 +2909,37 @@ _hysteria_bootstrap() {
     # 用户明确要求: 不提示用户名 —— userpass 的 "用户名:密码" 客户端(Xray/sing-box)不认,
     # 手填 user:pass 才能连上, 这正是"都不支持连接"的根因(见文件头)。
     auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
-    read -rp "  认证密码 (回车随机): " ans2
-    auth=${ans2:-$auth}
-    _validate_json_text "$auth" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; return 1; }
+    # 密码含非法字符属可恢复输入错误 ⇒ 重问本字段; 随机值只在用户确认前生成一次,
+    # 重问不重新掷(否则"改一下再试"会把已看过的密码换掉)。
+    while true; do
+        read -rp "  认证密码 (回车随机): " ans2 || return 1
+        [ -n "$ans2" ] && auth="$ans2"
+        _validate_json_text "$auth" && break
+        _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"
+        auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
+    done
     # 节点名 = 协议+端口(与原脚本命名规则一致), 端口取 listen 实际端口(跳跃下为首端口)
     def_name=$(_hysteria_default_name_for_listen "$listen")
-    read -rp "  节点名称 (回车默认 ${def_name}): " ans2
-    name=${ans2:-$def_name}
-    _validate_json_text "$name" || { _error "名称含非法字符"; return 1; }
-    if _hysteria_name_taken "$name"; then
-        [ "$name" = "$def_name" ] || { _error "节点名称已存在: ${name}"; return 1; }
-        name=$(_hysteria_autofill_name "$def_name")
-        _tip "默认名已被占用, 自动命名为 ${name}"
-    fi
+    # 名称非法/重名都是**可恢复的用户输入错误**: 原地重问本字段(要求 3), 不再把用户
+    # 扔回主菜单。注意保留既有语义 —— 回车用默认名, 且默认名被占时自动补序号。
+    while true; do
+        read -rp "  节点名称 (回车默认 ${def_name}): " ans2 || return 1
+        name=${ans2:-$def_name}
+        if ! _validate_json_text "$name"; then
+            _error "名称含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"
+            continue
+        fi
+        if _hysteria_name_taken "$name"; then
+            if [ "$name" = "$def_name" ]; then
+                name=$(_hysteria_autofill_name "$def_name")
+                _tip "默认名已被占用, 自动命名为 ${name}"
+                break
+            fi
+            _error "节点名称已存在: ${name}(请换一个名字)"
+            continue
+        fi
+        break
+    done
 
     # 7) 组装官方配置并落地(失败即中止, 未触碰服务)
     local config_json
