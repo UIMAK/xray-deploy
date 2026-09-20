@@ -1471,7 +1471,7 @@ _hysteria_prompt_tls() {
     # (每次迭代重新 local 会遮蔽外层, 且 do 块里的 local 在部分 shell 下语义不一致),
     # 故统一提升到函数级声明 —— 与 why/ans2 同口径。
     local choice cert_file key_file acme_domains acme_email host pin cn=""
-    local arr first acme_bad why ans2
+    local arr first acme_bad acme_first why ans2
     local -a doms
     local d
     echo; echo -e "  ${CYAN}【TLS 设置】${NC}"
@@ -1556,7 +1556,7 @@ _hysteria_prompt_tls() {
             # 不再中止整段向导。域名列表整体重问(逐条重问难以表达"第几条错了")。
             while true; do
                 read -rp "  ACME 域名(多个用逗号分隔): " acme_domains || return 1
-                arr="["; first=1; acme_bad=""
+                arr="["; first=1; acme_bad=""; acme_first=""
                 # IFS 只作用于这一次 read(项目规约: local IFS 会残留整个函数)
                 IFS=',' read -ra doms <<< "$acme_domains"
                 for d in "${doms[@]}"; do
@@ -1566,6 +1566,9 @@ _hysteria_prompt_tls() {
                         acme_bad="$d"
                         break
                     fi
+                    # 第一个**通过校验**的域名记下来, 供 SNI 使用 —— 必须是规范化后的值,
+                    # 不能事后从 $acme_domains 截取(那会带前导空格/空串, 见下)。
+                    [ -n "$acme_first" ] || acme_first="$d"
                     [ "$first" -eq 1 ] && first=0 || arr="${arr},"
                     arr="${arr}\"$d\""
                 done
@@ -1591,7 +1594,11 @@ _hysteria_prompt_tls() {
             _warn "HTTP/TLS 质询需要 80/443 可达(NAT VPS 通常不满足); DNS 质询不依赖 80/443, 请手工在 hysteria.json 的 acme 段配置 type: dns"
             HY_TLS_JSON=$(jq -n --argjson d "$arr" --arg e "$acme_email" --arg dir "$HYSTERIA_ACME_DIR" \
                 '{acme: {domains: $d, email: $e, dir: $dir}}')
-            HY_TLS_MODE="acme"; HY_TLS_SNI="${acme_domains%%,*}"; HY_TLS_PIN=""
+            # SNI 必须取**已规范化并通过校验的第一个域名**, 不能从原始输入里截取:
+            #   " foo.example.com,bar…"  => 原写法会带上前导空格;
+            #   ",foo.example.com"       => 原写法得到空串(loop 会跳过空元素, 但截取不会)。
+            # $doms 是上面 loop 实际写入 acme.domains 的同一份数组, 故用它才是"事实"。
+            HY_TLS_MODE="acme"; HY_TLS_SNI="${acme_first}"; HY_TLS_PIN=""
             return 0
             ;;
         *) _warn "无效选择"; return 1 ;;
@@ -2691,7 +2698,11 @@ _hysteria_bandwidth_reason() {
     esac
     num="${v%%[!0-9]*}"
     unit="${v#"$num"}"
-    unit="${unit// /}"
+    # 官方是 `unit := strings.TrimSpace(s[spl:])` —— **只去首尾**空白, 不删内部空白。
+    # 原写法 ${unit// /} 会删掉所有空格, 于是 "100 m bps" 被拼成 "100mbps" 判为合法,
+    # 而官方会把它当作不支持的 unit 拒掉 —— 正是本校验器要提前挡下的那类输入
+    # (放行后在 hysteria.json 里才会被 binary 于启动时拒绝, 触发整段回滚)。
+    unit="${unit#"${unit%%[![:space:]]*}"}"; unit="${unit%"${unit##*[![:space:]]}"}"
     [ -n "$num" ] || { printf '%s' "带宽缺少数值(如 100 mbps); 纯单位不可用"; return; }
     lunit=$(printf '%s' "$unit" | tr 'A-Z' 'a-z')
     case "$lunit" in
@@ -2752,7 +2763,9 @@ _hysteria_bootstrap() {
     local def_port
     def_port=$(_gen_random_port)
     while true; do
-        read -rp "  监听端口 (回车随机生成): " port
+        # EOF 必须中止: 否则 stdin 耗尽时 $port 为空, 会被下面的空值分支当成"用户回车",
+        # 静默分配一个随机端口并继续向导 —— 与本文件其它循环的 EOF 契约不一致。
+        read -rp "  监听端口 (回车随机生成): " port || return 1
         if [ -z "$port" ]; then
             port="$def_port"
             _info "已随机分配监听端口: ${port}"
