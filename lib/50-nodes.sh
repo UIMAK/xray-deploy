@@ -273,6 +273,294 @@ _hy2_gecko_supported() {
 }
 
 # ---------------------------------------------------------------------------
+# Hysteria2 HTTP/3 页面伪装(hysteriaSettings.masquerade)
+#
+# **与 finalmask.udp(salamander/gecko 混淆)是两个独立机制, 互不读写**:
+#   finalmask.udp → 改变**链路上的 QUIC 字节**(抗特征识别);
+#   masquerade    → 定义"非 Hysteria 客户端连上本端口"时回什么 HTTP 页面(抗主动探测)。
+# 两者可同时启用; 本组函数只碰 .streamSettings.hysteriaSettings.masquerade 这一个路径。
+#
+# **字段是扁平的, 不是按 type 嵌套**: 依据 [Xray 官方源码] infra/conf/transport_method.go
+# (v26.7.11 之前为 infra/conf/transport_internet.go)的 Masquerade 结构体逐字段核对 json tag
+# (v26.3.23 / v26.3.27 / v26.9.9 三处一致)。**Xray 官方文档(Xray-docs-next 的
+# docs/{,en/,ru/}config/transports/hysteria.md)与源码一致, 也是扁平** —— 早期版本的注释曾
+# 声称"docs 写的是嵌套", 经 2026-09-20 复核(本地克隆全历史 + 当前上游 raw)确认**不成立**:
+# 该文件自 2026-01 引入以来从未出现嵌套形态(全历史 grep `"proxy": {` 为 0 命中)。
+#
+# **嵌套形态属于另一个项目**: official Hysteria(HyNetworks)的 hysteria.json 才是
+# masquerade.file.dir / .proxy.url(见 app/cmd/server_test.yaml), 见 55-hysteria, 那边才是嵌套。
+# 两套实现不可互抄 —— 但理由是"两个不同的软件", 而不是"Xray 文档写错了"。
+#
+# 真机 v26.9.9 双向实测(证明扁平才是 Xray 要的形态):
+#     扁平 + url "ftp://bad"  → 启动即失败 "unknown scheme"(核心确实读了 url);
+#     嵌套 + url "ftp://bad"  → 正常启动(嵌套对象被 Go JSON 静默忽略 = 伪装静默失效)。
+#
+# 版本门控**分三段**(逐 tag 核对 infra/conf/transport_method.go 的 Masquerade 结构体 json tag
+# 与 transport/internet/hysteria/hub.go 的 scheme 分支。docs 与源码对 masquerade 的**字段形状**
+# 是一致的, 但**能力范围**随版本增长, 故门控依据必须是目标 tag 的源码, 不能只看 docs):
+#   >= v26.3.23  masquerade 本体(type/dir/url/rewriteHost/insecure/content/headers/statusCode)
+#                 —— v26.3.10 及更早无此字段; 该版本**没有 scheme 分支**, 故非 http(s) 的 url
+#                 会在**请求时**才失败(不阻断启动)
+#   >= v26.9.8   + unix socket(``case "", "unix":`` 走 DialContext)与 xForwarded 字段
+#                 —— 两者同 tag 引入(v26.7.28 及更早: 字段 8 个、无 unix 分支)
+# 本脚本按"核心支持到什么就开放到什么"分层开放: unix/xForwarded 只在其门控通过时可选,
+# 不把支持范围硬编码得过窄(当前核心已支持的形态不该被 UI 阻断)。
+_HY2_MASQ_MIN_VER="26.3.23"
+_HY2_MASQ_UNIX_MIN_VER="26.9.8"
+_hy2_masq_supported() {
+    [ -x "$XRAY_BIN" ] || return 1
+    declare -F _xray_version_ge >/dev/null 2>&1 || return 1
+    _xray_version_ge "$_HY2_MASQ_MIN_VER"
+}
+
+# unix socket / xForwarded 的可用性(比 masquerade 本体更晚引入)
+_hy2_masq_unix_supported() {
+    [ -x "$XRAY_BIN" ] || return 1
+    declare -F _xray_version_ge >/dev/null 2>&1 || return 1
+    _xray_version_ge "$_HY2_MASQ_UNIX_MIN_VER"
+}
+
+# 已知字段全集(与**目标核心版本**的 Masquerade 结构体 json tag 逐字对应)。集合写入以此为准:
+# 先整体替换, 再把**非本脚本管理**的未知键原样搬回(用户或将来核心手工加过的字段不被吃掉),
+# 同时让上一形态的残留字段(proxy 切到 string 后遗留的 url 等)不再留在配置里 ——
+#
+# **source 层与 docs 层的字段数不同, 不要混说(2026-09-20 实测)**:
+#   Xray-core 源码 `Masquerade` struct: 9 个(含 xForwarded);
+#   Xray-docs-next 三语的 `MasqObject`: **8 个, 未列出 xForwarded**(文档尚未跟上源码)。
+# 本脚本以**源码**为准(功能由核心决定, 不由文档决定), 故用 9 个。
+# 残留不是无害噪声: 切回该形态时它会以旧值复活。
+XD_MASQ_KNOWN_KEYS_JSON='["type","dir","url","rewriteHost","xForwarded","insecure","content","headers","statusCode"]'
+
+# **本机核心实际支持**的已知字段表 —— 与常量表**故意不同**。
+#
+# 为什么必须按版本裁剪(而不是恒用全集): xForwarded 只有 >= v26.9.8 认。若在旧核心上仍把它当
+# "已知字段", 那么"集合替换"会拿 payload 里的 xForwarded:false 覆盖掉用户既有配置里的 true
+# (在旧核心上 UI 不会问它, 所以 payload 恒为 false)。残局:
+#
+#   v26.9.9 配好 xForwarded=true
+#     -> 用户切回旧核心(项目支持 stable/preview 通道切换, 切核心不动配置)
+#     -> 在旧核心上改一次 proxy 的其它参数
+#     -> xForwarded 被静默写成 false(永久丢失, 再升核心也不会自己回来)
+#
+# 这与本脚本"未管理字段原样保留"的承诺冲突。故旧核心上把它**从已知表里剔除**:
+# 它就成了 unknown key, 被原样搬回 —— 旧核心不消费它(写了也被 Go 静默忽略),
+# 而升级回新核心后用户原来的设置仍在。
+XD_MASQ_KNOWN_KEYS_BASE_JSON='["type","dir","url","rewriteHost","insecure","content","headers","statusCode"]'
+_hy2_masq_known_keys_json() {
+    if _hy2_masq_unix_supported; then
+        printf '%s' "$XD_MASQ_KNOWN_KEYS_JSON"
+    else
+        printf '%s' "$XD_MASQ_KNOWN_KEYS_BASE_JSON"
+    fi
+}
+
+# 集合写入(唯一入口)。$m = 新 masquerade 对象, $known = 已知字段表。
+# 只命中选中 tag 的那一个入站; 路径不存在时 jq 会自动补齐 streamSettings/hysteriaSettings。
+XD_MASQ_JQ_SET='(.inbounds[] | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade) |= ($m + (if ((. // {}) | type) == "object" then (. // {}) else {} end | with_entries(select(.key as $k | ($known | index($k)) | not))))'
+
+# 清除伪装段(= 官方默认 404)。用 del 而不是写 {"type":""}: "默认 404"的唯一表示就是
+# **该段不存在**(官方 docs: 不填为默认的 404 页面), 少一个形态就少一处"两个值表达同一件事"。
+XD_MASQ_JQ_CLEAR='del(.inbounds[] | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade)'
+
+# 去掉首尾空白: read 会保留用户输入的空格, 响应头行 "  Server: x" 不去掉就是非法字段名。
+_hy2_masq_trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# 读取选中节点的伪装字段。未配置/形态不符(非对象)一律输出空串, 菜单据此显示"默认 404"。
+# 用法: _hy2_masq_get <tag> <type|dir|url|rewriteHost|xForwarded|insecure|content|statusCode>
+_hy2_masq_get() {
+    local tag="$1" field="$2"
+    [ -f "$CONFIG_FILE" ] || return 0
+    jq -r --arg t "$tag" --arg k "$field" '
+        (.inbounds[]? | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade) as $m
+        | if ($m | type) != "object" then ""
+          else (if $k == "type" then ($m.type // "")
+                elif $k == "dir" then ($m.dir // "")
+                elif $k == "url" then ($m.url // "")
+                elif $k == "content" then ($m.content // "")
+                elif $k == "statusCode" then (($m.statusCode // 0) | tostring)
+                elif $k == "rewriteHost" then (($m.rewriteHost // false) | tostring)
+                elif $k == "insecure" then (($m.insecure // false) | tostring)
+                elif $k == "xForwarded" then (($m.xForwarded // false) | tostring)
+                else "" end) | tostring
+          end' "$CONFIG_FILE" 2>/dev/null
+}
+
+# 当前伪装的一句话描述(菜单唯一展示入口; 单次 jq, 避免"同一状态两处各自解释")。
+# type 按核心口径**不区分大小写**(hub.go: strings.ToLower(config.MasqType))。
+_hy2_masq_desc() {
+    local tag="$1"
+    [ -f "$CONFIG_FILE" ] || return 0
+    jq -r --arg t "$tag" '
+        (.inbounds[]? | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade) as $m
+        | if ($m | type) != "object" then "默认 404 页面"
+          else
+            (($m.type // "") | tostring | ascii_downcase) as $ty
+            | if $ty == "" or $ty == "404" then "默认 404 页面"
+              elif $ty == "file" then "文件伪装: \($m.dir // "")"
+              elif $ty == "proxy" then "反向代理: \($m.url // "")"
+                   + (if ($m.rewriteHost // false) then " (改写 Host)" else "" end)
+                   + (if ($m.insecure // false) then " (跳过证书校验)" else "" end)
+                   + (if ($m.xForwarded // false) then " (X-Forwarded)" else "" end)
+              elif $ty == "string" then "固定字符串: \(($m.content // "") | length) 字符, HTTP \(if (($m.statusCode // 0) | tostring) != "0" then (($m.statusCode) | tostring) else "200" end)"
+                   + (if (($m.headers // {}) | length) > 0 then ", \((($m.headers) | length) | tostring) 个响应头" else "" end)
+              else "未知类型 \($ty) —— 核心会拒绝启动, 请改正或改回默认 404" end
+          end' "$CONFIG_FILE" 2>/dev/null
+}
+
+# 三个输入校验器: 输出**原因文本**(空串 = 合法), 与 _hy2_obfs_size_invalid 同口径 ——
+# 调用方只需判断"非空即非法", 原因原样回显, 不必各自猜原因。
+#
+# **边界声明(有意为之)**: _hy2_masq_url_invalid 只做**最小结构校验**(scheme / 主机名 /
+# unix 绝对路径), **不是完整 URI 语法验证器** —— 不在 shell 里重写 RFC 3986。
+# 形如 "https://", "https://?x", "https://a.com:99999", "https://[bad" 之类的输入可能通过本层,
+# 由核心的 url.Parse 与 HTTP transport 在真实请求/启动时暴露(有 _mutate_config 的启动回滚兜底)。
+# 这样取舍是因为: 手写 parser 的误拒风险高于收益, 且这里只需挡住用户最常犯的错(漏 scheme、
+# 打错 scheme、unix 路径写成相对)。
+# 注意: 这些值最终经 jq --arg / --argjson 注入 config, JSON 转义由 jq 负责, 故**不**套用
+# _validate_json_text: 那会连 HTML 里的 class="x" 引号一起拒绝, 而"固定字符串"伪装恰恰
+# 最可能是 HTML。这里只做语义校验。
+_hy2_masq_url_invalid() {
+    local u="$1" scheme host sock
+    [ -n "$u" ] || { printf '%s' "URL 不能为空"; return; }
+    case "$u" in
+        *[[:space:]]*) printf '%s' "URL 不能含空格/制表符(空格需写成 %20)"; return ;;
+    esac
+    # 支持范围对齐**目标核心版本**, 依据是 hub.go 的 "proxy" 分支:
+    #   http / https          => 普通反代(masquerade 本体自 v26.3.23 起存在)
+    #   ""(裸绝对路径) / unix => Unix socket(v26.9.8 起, 核心用 DialContext 连 unix)
+    #
+    # **版本行为务必分清(早期注释在这里写错过)**: `switch u.Scheme` 是 **v26.9.8 才加入**的。
+    # v26.3.23 ~ v26.7.28 的 hub.go **没有** scheme 分支 —— 任何 scheme 都被原样交给
+    # http.Transport, 所以非法 scheme 的失败会**推迟到实际代理请求时**, 而不是"启动即失败"。
+    # v26.9.8+ 才有 switch 并在 default 返回 "unknown scheme"(启动即失败)。
+    # 故这里只放这三类, 不是因为"核心会启动即拒绝", 而是因为**只有这三类是有意义的输入**;
+    # 真正决定能否用 unix 的是下面 _hy2_masq_unix_supported 的独立版本门控。
+    scheme="${u%%://*}"
+    case "$u" in
+        http://*|https://*)
+            host="${u#*://}"; host="${host%%/*}"
+            [ -n "$host" ] || { printf '%s' "URL 缺少主机名(形如 https://example.com)"; return; }
+            printf '%s' ""
+            return ;;
+        unix://*)
+            _hy2_masq_unix_supported || { printf '%s' "Unix socket 伪装需要 Xray >= v${_HY2_MASQ_UNIX_MIN_VER}(当前核心不支持, 写入会被静默忽略)"; return; }
+            sock="${u#unix://}"
+            case "$sock" in
+                /*) printf '%s' "" ;;
+                *) printf '%s' "unix:// 之后必须是绝对路径(如 unix:///run/site.sock)" ;;
+            esac
+            return ;;
+        /*)
+            # 裸绝对路径等价 unix(核心 case "", "unix" 取 u.Path 作 socket 路径)
+            _hy2_masq_unix_supported || { printf '%s' "Unix socket 伪装需要 Xray >= v${_HY2_MASQ_UNIX_MIN_VER}(当前核心不支持, 写入会被静默忽略)"; return; }
+            printf '%s' ""
+            return ;;
+    esac
+    case "$scheme" in
+        "") printf '%s' "URL 缺少 scheme: 请写 http(s)://… 或 unix:///绝对路径"; return ;;
+    esac
+    printf '%s' "不支持的 scheme ${scheme%%:*}(核心仅认 http / https / unix)"
+}
+
+_hy2_masq_dir_invalid() {
+    local d="$1"
+    [ -n "$d" ] || { printf '%s' "目录不能为空"; return; }
+    case "$d" in
+        /*) ;;
+        *) printf '%s' "请填绝对路径(相对路径会被核心按服务进程的工作目录解析, 结果不可预期)"; return ;;
+    esac
+    printf '%s' ""
+}
+
+_hy2_masq_status_invalid() {
+    local s="$1"
+    [ -z "$s" ] && { printf '%s' ""; return; }
+    [[ "$s" =~ ^[0-9]{3}$ ]] || { printf '%s' "HTTP 状态码必须是 3 位数字(如 200), 留空用 200"; return; }
+    [ "$s" -ge 100 ] && [ "$s" -le 599 ] || { printf '%s' "HTTP 状态码须为 100-599(本脚本限制; 越界值核心写响应头时会 panic 并断开连接)"; return; }
+    printf '%s' ""
+}
+
+# 解析一行 "名称: 值" 并合并进已累积的 headers JSON(参数 1)。
+# 成功: 输出**合并后**的 compact JSON; 失败: 输出原因文本并返回 1。
+# 用"逐行一条 + 空行结束"而不是逗号分隔: 响应头值本身可以含逗号
+# (如 Cache-Control: no-cache, no-store), 按逗号切会把它拆成两条非法头。
+_hy2_masq_headers_merge() {
+    local h="$1" line="$2" name value
+    case "$line" in
+        *:*) ;;
+        *) printf '%s' "格式应为 名称: 值(缺少冒号)"; return 1 ;;
+    esac
+    name=$(_hy2_masq_trim "${line%%:*}")
+    value=$(_hy2_masq_trim "${line#*:}")
+    [ -n "$name" ] || { printf '%s' "响应头名称不能为空"; return 1; }
+    case "$name" in
+        *[[:space:]]*) printf '%s' "响应头名称不能含空白(名称与冒号之间不要留空格)"; return 1 ;;
+        *[![:print:]]*) printf '%s' "响应头名称含不可打印字符"; return 1 ;;
+    esac
+    jq -nc --argjson h "$h" --arg n "$name" --arg v "$value" '$h + {($n): $v}'
+}
+
+# 三个形态的 payload 构造器(唯一入口)。全部用 jq -n --arg 拼装: 值里的引号/反斜杠/
+# 百分号由 jq 负责转义, 绝不手工拼串(手拼在 HTML 内容上必然出错)。
+# 只写该形态**用得上的**字段: type 之外的字段核心按 switch 分支各取所需, 写上无关字段
+# 只会让配置里的"上一形态残留"复活(见 XD_MASQ_JQ_SET 的注释)。
+_hy2_masq_json_file() {
+    jq -nc --arg d "$1" '{type: "file", dir: $d}'
+}
+
+# $2/$3/$4 = rewriteHost / insecure / xForwarded(jq 布尔字面量 true|false)
+# xForwarded 只有 >= v26.9.8 的核心认(写入前有门控)。**只在核心支持时才写该键**:
+# 旧核心上写 xForwarded:false 会把用户既有的 true 覆盖掉(见 _hy2_masq_known_keys_json 的说明),
+# 而该字段在旧核心上本就被 Go 静默忽略 —— 不写它才既不丢数据又不改变行为。
+_hy2_masq_json_proxy() {
+    local xf="${4:-}"
+    if _hy2_masq_unix_supported; then
+        jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" --argjson xf "${xf:-false}" \
+            '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins, xForwarded: $xf}'
+    else
+        jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" \
+            '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins}'
+    fi
+}
+
+# $2 = 状态码字符串(空 = 用核心默认 200); $3 = headers JSON 对象
+_hy2_masq_json_string() {
+    local c="$1" sc="$2" h=""
+    # 不能用 h="${3:-{}}" —— 默认值里的 '}' 会提前结束参数展开, 实参存在时会多出一个 '}'
+    # (实测 "{"a":"b"}}"), jq 随即报 invalid JSON。测试套件里已有同款坑的记录。
+    h="${3:-}"
+    [ -n "$h" ] || h='{}'
+    jq -nc --arg c "$c" --arg sc "$sc" --argjson h "$h" \
+        '{type: "string", content: $c}
+         + (if $sc == "" then {} else {statusCode: ($sc | tonumber)} end)
+         + (if ($h | length) == 0 then {} else {headers: $h} end)'
+}
+
+# 提交伪装变更。空 payload = 清除(默认 404)。
+# 备份 → jq → 原子替换 → verified-restart → 失败还原, 全部复用 _mutate_config 的既有
+# 事务机制(要求 6: 不另建第二条提交路径)。伪装是**单入站**属性, 不进 metadata、不影响
+# 分享链接与 clash 条目(客户端不关心服务端伪装), 故没有派生状态需要同步 —— 也因此
+# 不存在"元数据写失败要回滚 config"的第二阶段。
+# 用法: _hy2_masq_apply <tag> <payload_json 或 "">
+_hy2_masq_apply() {
+    local tag="$1" payload="${2:-}"
+    if [ -z "$payload" ]; then
+        _mutate_config --arg t "$tag" "$XD_MASQ_JQ_CLEAR"
+    else
+        # known 表必须按**本机核心能力**取: 旧核心上把 xForwarded 排除在"已知"之外,
+        # 它才会作为 unknown key 被原样保留(而不是被 payload 的缺省值覆盖)。
+        local known
+        known=$(_hy2_masq_known_keys_json)
+        _mutate_config --arg t "$tag" --argjson m "$payload" --argjson known "$known" "$XD_MASQ_JQ_SET"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # iptables / 端口跳跃辅助(Hysteria2 端口跳跃用)
 # 原理: iptables nat PREROUTING DNAT 把 UDP 端口范围转发到 hy2 监听端口
 # 支持格式: "3010-3020" / "3050" / "3010-3020,3050,3100-3110" (逗号分隔混合)
