@@ -291,21 +291,37 @@ _hy2_gecko_supported() {
 # 嵌套形态正是 official Hysteria(HyNetworks)hysteria.json 的形态(见 55-hysteria, 那边才是
 # 嵌套), 两套实现不可互抄 —— 抄过来就是"配了不生效"。
 #
-# 版本门控: Masquerade 首次出现在 v26.3.23(v26.3.10 及更早无此字段)。旧核心对未知字段
-# **静默忽略** ⇒ 伪装写了不生效, 只有被主动探测时才暴露。故 fail-closed: 核心过低时拒绝
-# 写入并如实告知, 不写一份"看起来成功"的配置。
+# 版本门控**分三段**(逐 tag 核对 infra/conf/transport_method.go 的 Masquerade 结构体 json tag
+# 与 transport/internet/hysteria/hub.go 的 scheme 分支, 官方 docs 只描述 main, 不可直接照抄):
+#   >= v26.3.23  masquerade 本体(type/dir/url/rewriteHost/insecure/content/headers/statusCode)
+#                 —— v26.3.10 及更早无此字段; 该版本**没有 scheme 分支**, 故非 http(s) 的 url
+#                 会在**请求时**才失败(不阻断启动)
+#   >= v26.9.8   + unix socket(``case "", "unix":`` 走 DialContext)与 xForwarded 字段
+#                 —— 两者同 tag 引入(v26.7.28 及更早: 字段 8 个、无 unix 分支)
+# 本脚本按"核心支持到什么就开放到什么"分层开放: unix/xForwarded 只在其门控通过时可选,
+# 不把支持范围硬编码得过窄(当前核心已支持的形态不该被 UI 阻断)。
 _HY2_MASQ_MIN_VER="26.3.23"
+_HY2_MASQ_UNIX_MIN_VER="26.9.8"
 _hy2_masq_supported() {
     [ -x "$XRAY_BIN" ] || return 1
     declare -F _xray_version_ge >/dev/null 2>&1 || return 1
     _xray_version_ge "$_HY2_MASQ_MIN_VER"
 }
 
-# 已知字段全集(与 Masquerade 结构体的 json tag 逐字对应)。集合写入以此为准:
+# unix socket / xForwarded 的可用性(比 masquerade 本体更晚引入)
+_hy2_masq_unix_supported() {
+    [ -x "$XRAY_BIN" ] || return 1
+    declare -F _xray_version_ge >/dev/null 2>&1 || return 1
+    _xray_version_ge "$_HY2_MASQ_UNIX_MIN_VER"
+}
+
+# 已知字段全集(与**目标核心版本**的 Masquerade 结构体 json tag 逐字对应)。集合写入以此为准:
 # 先整体替换, 再把**非本脚本管理**的未知键原样搬回(用户或将来核心手工加过的字段不被吃掉),
 # 同时让上一形态的残留字段(proxy 切到 string 后遗留的 url 等)不再留在配置里 ——
 # 残留不是无害噪声: 切回该形态时它会以旧值复活。
-XD_MASQ_KNOWN_KEYS_JSON='["type","dir","url","rewriteHost","insecure","content","headers","statusCode"]'
+# xForwarded 在列表内: 它是 v26.9.8+ 的**已知**字段, 相对本脚本管理(有 UI 开关)。
+# 注意: 在更低核心上写它同样会被静默忽略, 故写入前有 unix/xForwarded 门控。
+XD_MASQ_KNOWN_KEYS_JSON='["type","dir","url","rewriteHost","xForwarded","insecure","content","headers","statusCode"]'
 
 # 集合写入(唯一入口)。$m = 新 masquerade 对象, $known = 已知字段表。
 # 只命中选中 tag 的那一个入站; 路径不存在时 jq 会自动补齐 streamSettings/hysteriaSettings。
@@ -369,18 +385,40 @@ _hy2_masq_desc() {
 # _validate_json_text: 那会连 HTML 里的 class="x" 引号一起拒绝, 而"固定字符串"伪装恰恰
 # 最可能是 HTML。这里只做语义校验。
 _hy2_masq_url_invalid() {
-    local u="$1" host
+    local u="$1" scheme host sock
     [ -n "$u" ] || { printf '%s' "URL 不能为空"; return; }
-    case "$u" in
-        http://*|https://*) ;;
-        *) printf '%s' "URL 必须以 http:// 或 https:// 开头(核心对其它 scheme 会拒绝启动)"; return ;;
-    esac
     case "$u" in
         *[[:space:]]*) printf '%s' "URL 不能含空格/制表符(空格需写成 %20)"; return ;;
     esac
-    host="${u#*://}"; host="${host%%/*}"
-    [ -n "$host" ] || { printf '%s' "URL 缺少主机名(形如 https://example.com)"; return; }
-    printf '%s' ""
+    # 支持范围对齐**目标核心版本**(hub.go 的 "proxy" 分支 switch u.Scheme):
+    #   http / https         => 普通反代(>= v26.3.23)
+    #   ""(裸绝对路径) / unix => Unix socket(>= v26.9.8, 核心用 DialContext 连 unix)
+    # v26.3.23 起对**其它** scheme 会启动即失败(unknown scheme), 故只放这三类。
+    scheme="${u%%://*}"
+    case "$u" in
+        http://*|https://*)
+            host="${u#*://}"; host="${host%%/*}"
+            [ -n "$host" ] || { printf '%s' "URL 缺少主机名(形如 https://example.com)"; return; }
+            printf '%s' ""
+            return ;;
+        unix://*)
+            _hy2_masq_unix_supported || { printf '%s' "Unix socket 伪装需要 Xray >= v${_HY2_MASQ_UNIX_MIN_VER}(当前核心不支持, 写入会被静默忽略)"; return; }
+            sock="${u#unix://}"
+            case "$sock" in
+                /*) printf '%s' "" ;;
+                *) printf '%s' "unix:// 之后必须是绝对路径(如 unix:///run/site.sock)" ;;
+            esac
+            return ;;
+        /*)
+            # 裸绝对路径等价 unix(核心 case "", "unix" 取 u.Path 作 socket 路径)
+            _hy2_masq_unix_supported || { printf '%s' "Unix socket 伪装需要 Xray >= v${_HY2_MASQ_UNIX_MIN_VER}(当前核心不支持, 写入会被静默忽略)"; return; }
+            printf '%s' ""
+            return ;;
+    esac
+    case "$scheme" in
+        "") printf '%s' "URL 缺少 scheme: 请写 http(s)://… 或 unix:///绝对路径"; return ;;
+    esac
+    printf '%s' "不支持的 scheme ${scheme%%:*}(核心仅认 http / https / unix)"
 }
 
 _hy2_masq_dir_invalid() {
@@ -429,10 +467,12 @@ _hy2_masq_json_file() {
     jq -nc --arg d "$1" '{type: "file", dir: $d}'
 }
 
-# $2/$3 = rewriteHost / insecure(jq 布尔字面量 true|false)
+# $2/$3/$4 = rewriteHost / insecure / xForwarded(jq 布尔字面量 true|false)
+# xForwarded 只有 >= v26.9.8 的核心认(写入前有门控); 仍**总是**写该键: 与官方缺省
+# (false)语义一致, 且字段显式可读, 不靠"缺键=默认"推断。
 _hy2_masq_json_proxy() {
-    jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" \
-        '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins}'
+    jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" --argjson xf "${4:-false}" \
+        '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins, xForwarded: $xf}'
 }
 
 # $2 = 状态码字符串(空 = 用核心默认 200); $3 = headers JSON 对象
