@@ -1560,7 +1560,13 @@ _hysteria_prompt_tls() {
                 # IFS 只作用于这一次 read(项目规约: local IFS 会残留整个函数)
                 IFS=',' read -ra doms <<< "$acme_domains"
                 for d in "${doms[@]}"; do
-                    d=$(printf '%s' "$d" | tr -d ' ')
+                    # 只 trim **首尾**空白(逗号分隔的常见书写: "a.com, b.com")。
+                    # 绝不能用 tr -d ' ' 删掉**全部**空格: 那会把 "foo bar.example.com" 静默
+                    # 变成 "foobar.example.com" 并通过校验 —— 用户以为申请的是 A, 实际拿到 B,
+                    # 且 A/B 会一路写进 acme.domains / acme_first / HY_TLS_SNI。
+                    # 内部空白必须留给 _validate_domain 判非法并重问(本文件的核心契约:
+                    # 绝不自动修正用户输入)。
+                    d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"
                     [ -z "$d" ] && continue
                     if ! _validate_domain "$d"; then
                         acme_bad="$d"

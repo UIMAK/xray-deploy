@@ -281,18 +281,23 @@ _hy2_gecko_supported() {
 # 两者可同时启用; 本组函数只碰 .streamSettings.hysteriaSettings.masquerade 这一个路径。
 #
 # **字段是扁平的, 不是按 type 嵌套**: 依据 [Xray 官方源码] infra/conf/transport_method.go
-# (旧版为 infra/conf/transport_internet.go)的 Masquerade 结构体逐字段核对 json tag
-# (v26.3.23 / v26.3.27 / main 三处一致):
-#     type / dir / url / rewriteHost / insecure / content / headers / statusCode
-# 注意: **Xray-docs-next 的 transports/hysteria.md 与本实现不一致** —— 它写的是嵌套形态
-# (file.dir / proxy.url / string.content)。真机 v26.9.9 双向实测:
+# (v26.7.11 之前为 infra/conf/transport_internet.go)的 Masquerade 结构体逐字段核对 json tag
+# (v26.3.23 / v26.3.27 / v26.9.9 三处一致)。**Xray 官方文档(Xray-docs-next 的
+# docs/{,en/,ru/}config/transports/hysteria.md)与源码一致, 也是扁平** —— 早期版本的注释曾
+# 声称"docs 写的是嵌套", 经 2026-09-20 复核(本地克隆全历史 + 当前上游 raw)确认**不成立**:
+# 该文件自 2026-01 引入以来从未出现嵌套形态(全历史 grep `"proxy": {` 为 0 命中)。
+#
+# **嵌套形态属于另一个项目**: official Hysteria(HyNetworks)的 hysteria.json 才是
+# masquerade.file.dir / .proxy.url(见 app/cmd/server_test.yaml), 见 55-hysteria, 那边才是嵌套。
+# 两套实现不可互抄 —— 但理由是"两个不同的软件", 而不是"Xray 文档写错了"。
+#
+# 真机 v26.9.9 双向实测(证明扁平才是 Xray 要的形态):
 #     扁平 + url "ftp://bad"  → 启动即失败 "unknown scheme"(核心确实读了 url);
 #     嵌套 + url "ftp://bad"  → 正常启动(嵌套对象被 Go JSON 静默忽略 = 伪装静默失效)。
-# 嵌套形态正是 official Hysteria(HyNetworks)hysteria.json 的形态(见 55-hysteria, 那边才是
-# 嵌套), 两套实现不可互抄 —— 抄过来就是"配了不生效"。
 #
 # 版本门控**分三段**(逐 tag 核对 infra/conf/transport_method.go 的 Masquerade 结构体 json tag
-# 与 transport/internet/hysteria/hub.go 的 scheme 分支, 官方 docs 只描述 main, 不可直接照抄):
+# 与 transport/internet/hysteria/hub.go 的 scheme 分支。docs 与源码对 masquerade 的**字段形状**
+# 是一致的, 但**能力范围**随版本增长, 故门控依据必须是目标 tag 的源码, 不能只看 docs):
 #   >= v26.3.23  masquerade 本体(type/dir/url/rewriteHost/insecure/content/headers/statusCode)
 #                 —— v26.3.10 及更早无此字段; 该版本**没有 scheme 分支**, 故非 http(s) 的 url
 #                 会在**请求时**才失败(不阻断启动)
@@ -319,9 +324,30 @@ _hy2_masq_unix_supported() {
 # 先整体替换, 再把**非本脚本管理**的未知键原样搬回(用户或将来核心手工加过的字段不被吃掉),
 # 同时让上一形态的残留字段(proxy 切到 string 后遗留的 url 等)不再留在配置里 ——
 # 残留不是无害噪声: 切回该形态时它会以旧值复活。
-# xForwarded 在列表内: 它是 v26.9.8+ 的**已知**字段, 相对本脚本管理(有 UI 开关)。
-# 注意: 在更低核心上写它同样会被静默忽略, 故写入前有 unix/xForwarded 门控。
 XD_MASQ_KNOWN_KEYS_JSON='["type","dir","url","rewriteHost","xForwarded","insecure","content","headers","statusCode"]'
+
+# **本机核心实际支持**的已知字段表 —— 与常量表**故意不同**。
+#
+# 为什么必须按版本裁剪(而不是恒用全集): xForwarded 只有 >= v26.9.8 认。若在旧核心上仍把它当
+# "已知字段", 那么"集合替换"会拿 payload 里的 xForwarded:false 覆盖掉用户既有配置里的 true
+# (在旧核心上 UI 不会问它, 所以 payload 恒为 false)。残局:
+#
+#   v26.9.9 配好 xForwarded=true
+#     -> 用户切回旧核心(项目支持 stable/preview 通道切换, 切核心不动配置)
+#     -> 在旧核心上改一次 proxy 的其它参数
+#     -> xForwarded 被静默写成 false(永久丢失, 再升核心也不会自己回来)
+#
+# 这与本脚本"未管理字段原样保留"的承诺冲突。故旧核心上把它**从已知表里剔除**:
+# 它就成了 unknown key, 被原样搬回 —— 旧核心不消费它(写了也被 Go 静默忽略),
+# 而升级回新核心后用户原来的设置仍在。
+XD_MASQ_KNOWN_KEYS_BASE_JSON='["type","dir","url","rewriteHost","insecure","content","headers","statusCode"]'
+_hy2_masq_known_keys_json() {
+    if _hy2_masq_unix_supported; then
+        printf '%s' "$XD_MASQ_KNOWN_KEYS_JSON"
+    else
+        printf '%s' "$XD_MASQ_KNOWN_KEYS_BASE_JSON"
+    fi
+}
 
 # 集合写入(唯一入口)。$m = 新 masquerade 对象, $known = 已知字段表。
 # 只命中选中 tag 的那一个入站; 路径不存在时 jq 会自动补齐 streamSettings/hysteriaSettings。
@@ -354,6 +380,7 @@ _hy2_masq_get() {
                 elif $k == "statusCode" then (($m.statusCode // 0) | tostring)
                 elif $k == "rewriteHost" then (($m.rewriteHost // false) | tostring)
                 elif $k == "insecure" then (($m.insecure // false) | tostring)
+                elif $k == "xForwarded" then (($m.xForwarded // false) | tostring)
                 else "" end) | tostring
           end' "$CONFIG_FILE" 2>/dev/null
 }
@@ -373,6 +400,7 @@ _hy2_masq_desc() {
               elif $ty == "proxy" then "反向代理: \($m.url // "")"
                    + (if ($m.rewriteHost // false) then " (改写 Host)" else "" end)
                    + (if ($m.insecure // false) then " (跳过证书校验)" else "" end)
+                   + (if ($m.xForwarded // false) then " (X-Forwarded)" else "" end)
               elif $ty == "string" then "固定字符串: \(($m.content // "") | length) 字符, HTTP \(if (($m.statusCode // 0) | tostring) != "0" then (($m.statusCode) | tostring) else "200" end)"
                    + (if (($m.headers // {}) | length) > 0 then ", \((($m.headers) | length) | tostring) 个响应头" else "" end)
               else "未知类型 \($ty) —— 核心会拒绝启动, 请改正或改回默认 404" end
@@ -381,6 +409,13 @@ _hy2_masq_desc() {
 
 # 三个输入校验器: 输出**原因文本**(空串 = 合法), 与 _hy2_obfs_size_invalid 同口径 ——
 # 调用方只需判断"非空即非法", 原因原样回显, 不必各自猜原因。
+#
+# **边界声明(有意为之)**: _hy2_masq_url_invalid 只做**最小结构校验**(scheme / 主机名 /
+# unix 绝对路径), **不是完整 URI 语法验证器** —— 不在 shell 里重写 RFC 3986。
+# 形如 "https://", "https://?x", "https://a.com:99999", "https://[bad" 之类的输入可能通过本层,
+# 由核心的 url.Parse 与 HTTP transport 在真实请求/启动时暴露(有 _mutate_config 的启动回滚兜底)。
+# 这样取舍是因为: 手写 parser 的误拒风险高于收益, 且这里只需挡住用户最常犯的错(漏 scheme、
+# 打错 scheme、unix 路径写成相对)。
 # 注意: 这些值最终经 jq --arg / --argjson 注入 config, JSON 转义由 jq 负责, 故**不**套用
 # _validate_json_text: 那会连 HTML 里的 class="x" 引号一起拒绝, 而"固定字符串"伪装恰恰
 # 最可能是 HTML。这里只做语义校验。
@@ -468,11 +503,18 @@ _hy2_masq_json_file() {
 }
 
 # $2/$3/$4 = rewriteHost / insecure / xForwarded(jq 布尔字面量 true|false)
-# xForwarded 只有 >= v26.9.8 的核心认(写入前有门控); 仍**总是**写该键: 与官方缺省
-# (false)语义一致, 且字段显式可读, 不靠"缺键=默认"推断。
+# xForwarded 只有 >= v26.9.8 的核心认(写入前有门控)。**只在核心支持时才写该键**:
+# 旧核心上写 xForwarded:false 会把用户既有的 true 覆盖掉(见 _hy2_masq_known_keys_json 的说明),
+# 而该字段在旧核心上本就被 Go 静默忽略 —— 不写它才既不丢数据又不改变行为。
 _hy2_masq_json_proxy() {
-    jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" --argjson xf "${4:-false}" \
-        '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins, xForwarded: $xf}'
+    local xf="${4:-}"
+    if _hy2_masq_unix_supported; then
+        jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" --argjson xf "${xf:-false}" \
+            '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins, xForwarded: $xf}'
+    else
+        jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" \
+            '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins}'
+    fi
 }
 
 # $2 = 状态码字符串(空 = 用核心默认 200); $3 = headers JSON 对象
@@ -499,7 +541,11 @@ _hy2_masq_apply() {
     if [ -z "$payload" ]; then
         _mutate_config --arg t "$tag" "$XD_MASQ_JQ_CLEAR"
     else
-        _mutate_config --arg t "$tag" --argjson m "$payload" --argjson known "$XD_MASQ_KNOWN_KEYS_JSON" "$XD_MASQ_JQ_SET"
+        # known 表必须按**本机核心能力**取: 旧核心上把 xForwarded 排除在"已知"之外,
+        # 它才会作为 unknown key 被原样保留(而不是被 payload 的缺省值覆盖)。
+        local known
+        known=$(_hy2_masq_known_keys_json)
+        _mutate_config --arg t "$tag" --argjson m "$payload" --argjson known "$known" "$XD_MASQ_JQ_SET"
     fi
 }
 
