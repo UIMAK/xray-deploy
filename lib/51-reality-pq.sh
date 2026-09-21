@@ -10,15 +10,27 @@
 # 参照实现:mack-a/v2ray-agent install.sh L9590-9627
 # ============================================================================
 
+# 有界执行的"基础设施失败"标志(见 _pq_run_bounded 的契约)。模块级默认值:
+# 调用方在 set -u 下读它时**必须**有定义 —— 混装旧 lib(51 是新版而调用方被旧桩替换)
+# 或测试桩不走真实实现时, 裸引用会直接 unbound 崩溃。
+_PQ_RUN_INFRA=""
+
 # ---------------------------------------------------------------------------
 # 有界执行: 优先用 coreutils/busybox 的 timeout; 缺失时用"后台 + 看门狗"兜底。
 # 为什么不能"没有 timeout 就裸跑": xray tls ping / mldsa65 都无内建超时, 目标网络
 # 黑洞时会把整个菜单永久挂起 —— 这正是当初引入 timeout 要消除的危害, 裸跑等于
 # 在最需要兜底的机器(裁剪版 busybox)上把危害原样留下。
 # 用法:_pq_run_bounded <秒> <命令...>; stdout 同命令, 返回码同命令(超时=124)
+#
+# **基础设施失败走独立通道, 不靠返回码**(2026-09-21 复审 P3): mktemp 失败时旧实现返回 125
+# 让调用方据此报"无法创建临时文件", 但被包裹的命令自身返回 125 时同样命中 —— 一个真实的
+# xray 失败会被误报成磁盘问题, 排障方向直接跑偏。改为: 基础设施失败置全局 _PQ_RUN_INFRA=1
+# (并仍返回 125 以示"这不是命令的正常结果"), 调用方**查标志**而不是比 125。
+# 每次进入都先清标志, 避免上一次调用的残值污染这一次。
 # ---------------------------------------------------------------------------
 _pq_run_bounded() {
     local secs="$1"; shift
+    _PQ_RUN_INFRA=""
     if command -v timeout >/dev/null 2>&1; then
         # -k <grace>: 先 TERM, grace 秒后 KILL。**没有 -k 时 timeout 并不"有界"** —— 子进程
         # 忽略/延迟处理 TERM 时它会一直等到对方自己退出(实测: 忽略 TERM 的子进程让
@@ -37,7 +49,7 @@ _pq_run_bounded() {
     local tmp rc
     # mktemp 失败必须与"被包裹的命令失败"区分开(125): 否则调用方只会报
     # "xray tls ping 失败", 真正的原因(无法建临时文件)被掩盖, 排障时白绕一圈。
-    tmp=$(mktemp) || { _warn "无法创建临时文件(磁盘满/只读?), 无法有界执行"; return 125; }
+    tmp=$(mktemp) || { _PQ_RUN_INFRA=1; _warn "无法创建临时文件(磁盘满/只读?), 无法有界执行"; return 125; }
     # 放进独立进程组再后台执行: 被包裹的是 env + xray, 若 env 未 exec(部分精简
     # busybox)或命令自身 fork 子进程, 只 kill 直接子进程会留下孙进程继续占用资源。
     # **进程组隔离必须用 setsid --wait。**裸 `setsid cmd &` 不可用** —— setsid 只在自身不是
@@ -132,9 +144,10 @@ _detect_reality_pq() {
     # 故统一走 _pq_run_bounded; 退出码也要看 —— 失败时可能仍有半截 stdout, 不能当成可达。
     ping_out=$(_pq_run_bounded 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" tls ping "$target" 2>/dev/null) || ping_rc=$?
 
-    if [ "$ping_rc" -eq 125 ]; then
-        # 125 = 无法创建临时文件(磁盘满/只读), 与"目标不可达"是两类问题, 必须分开报,
-        # 否则排障者会朝网络方向白查(这正是 _pq_run_bounded 特意区分 125 的目的)。
+    if [ -n "${_PQ_RUN_INFRA:-}" ]; then
+        # 判据是**标志**而不是 125: xray 自己返回 125 时同样会命中 rc==125, 那会被误报成
+        # 磁盘问题(2026-09-21 复审 P3)。标志由 _pq_run_bounded 只在"有界执行根本没起来"
+        # (mktemp 失败)时置位, 与命令自身的返回码无关。
         PQ_REASON="无法创建临时文件(磁盘满/只读?), 未能执行 tls ping"
         _warn "$PQ_REASON"        # 与其它失败分支一致: 两个调用方都只看返回码, 不读 PQ_REASON
         return 1
@@ -173,8 +186,8 @@ _detect_reality_pq() {
     _info "目标支持后量子(证书长度 ${length} > 3500),生成 ML-DSA-65 密钥对..."
     local mldsa_out mldsa_rc=0
     mldsa_out=$(_pq_run_bounded 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" mldsa65 2>/dev/null) || mldsa_rc=$?
-    if [ "$mldsa_rc" -eq 125 ]; then
-        # 与 tls ping 侧同一口径: 125 是"有界执行根本没起来"(磁盘满/只读), 不是生成器失败。
+    if [ -n "${_PQ_RUN_INFRA:-}" ]; then
+        # 与 tls ping 侧同一口径: 查标志而不是比 125(见 _pq_run_bounded 的说明)。
         PQ_REASON="无法创建临时文件(磁盘满/只读?), 未能执行 mldsa65"
         _warn "$PQ_REASON"
         return 1
