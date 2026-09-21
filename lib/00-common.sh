@@ -250,6 +250,58 @@ _url_encode() {
 }
 
 # ---------------------------------------------------------------------------
+# IPv6 字面量校验(严格到足以拦住 xray 启动才报错的畸形输入)
+# 旧实现只要求"全是 hex/冒号且含冒号", 于是 1::2::3 / ::::: / abc:def 全部放行 ——
+# 用户拿到"配置已写入"后 xray 启动失败, 报错指向 core 而不是我们的输入校验。
+# 规则: 至多一个 "::"(至多 2 个空字段); 有 "::" 时非空段 ≤7, 无 "::" 时恰好 8 段;
+# 每段 1-4 位 hex; 允许尾部内嵌 IPv4(::ffff:1.2.3.4), 但纯 IPv4 不算 IPv6。
+# ---------------------------------------------------------------------------
+_is_ipv6_literal() {
+    local a="$1" tail head
+    [ -n "$a" ] || return 1
+    case "$a" in
+        *"."*)
+            tail="${a##*:}"; head="${a%:*}"
+            [[ "$tail" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+            (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) || return 1
+            [ "$head" = "$a" ] && return 1     # 纯 IPv4 由 IPv4 分支处理
+            a="${head}:0:0"                     # 内嵌 IPv4 占两段, 参与结构校验
+            ;;
+    esac
+    # 连续 3 个及以上冒号一律非法。**必须先拦这一条**: 下面用 ${a//::/} 数 "::" 次数时,
+    # "1:::2" 只会被消掉一个 "::"(dbl=1 通过), 而按段切分只产生 2 个空字段(empty=2 通过) ——
+    # 两条守卫各自都看不出它是畸形输入。这正是"至多一个 ::"的规则没有被真正执行的原因。
+    case "$a" in *:::* ) return 1 ;; esac
+    # 单个前导/尾随冒号也必须拒绝: 它只贡献 1 个空字段(在 empty<=2 预算内), 且不产生 "::"
+    # (dbl 仍为 0), 于是 "1:2:3:4:5:6:7:8:" / ":1:2:3:4:5:6:7:8" 两条守卫都放行 ——
+    # 实测这两个畸形地址曾被 _validate_listen 接受, xray 启动时才报错。
+    # 判据: 以单个 ':' 开头(后一个字符不是 ':')或以单个 ':' 结尾(前一个字符不是 ':')。
+    # '::1' / '1::' 前后都是 ':' , 不受影响。
+    case "$a" in
+        :[!:]*|*[!:]:) return 1 ;;
+    esac
+    # 统计非重叠 "::" 出现次数(此时已保证不存在 ":::")
+    local stripped="${a//::/}"
+    local dbl=$(( (${#a} - ${#stripped}) / 2 ))
+    [ "$dbl" -le 1 ] || return 1
+    local IFS=':' seg count=0 empty=0
+    local -a parts
+    read -ra parts <<< "$a"
+    for seg in "${parts[@]}"; do
+        if [ -z "$seg" ]; then empty=$((empty+1)); continue; fi
+        [[ "$seg" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+        count=$((count+1))
+    done
+    [ "$empty" -le 2 ] || return 1
+    if [ "$dbl" -eq 1 ]; then
+        [ "$count" -le 7 ] || return 1
+    else
+        [ "$count" -eq 8 ] || return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 监听地址合法性校验(R7)
 # 接受 ::、0.0.0.0、127.0.0.1、::1、具体 IPv4/IPv6;非法返回非 0
 # ---------------------------------------------------------------------------
@@ -264,10 +316,8 @@ _validate_listen() {
         (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && return 0
         return 1
     fi
-    # IPv6 字面量(简单校验:含多个冒号且字符合法)
-    if [[ "$addr" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$addr" == *:* ]]; then
-        return 0
-    fi
+    # IPv6 字面量(严格校验, 见 _is_ipv6_literal)
+    _is_ipv6_literal "$addr" && return 0
     return 1
 }
 
@@ -310,8 +360,15 @@ _validate_domain() {
 _validate_json_text() {
     case "$1" in
         *'"'*|*'\'*|*$'\n'*|*$'\r'*|*$'\t'*|*"{{"*) return 1 ;;
-        *) return 0 ;;
     esac
+    # 其余控制字符(0x01-0x1F 中未被上面覆盖的)与 DEL(0x7F): 它们不是合法 JSON 字符串
+    # 字面量, 会被 _render_template 原样拼进模板产出非法 JSON, 用户只看到含混的
+    # "渲染后 JSON 不合法"。NUL 无法存在于 bash 变量, 故区间从 0x01 起。
+    # shellcheck disable=SC1010
+    case "$1" in
+        *[$'\x01'-$'\x1f'$'\x7f']*) return 1 ;;
+    esac
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -358,9 +415,6 @@ _yaml_dq() {
     printf '%s' "$s"
 }
 
-# ---------------------------------------------------------------------------
-# 端口占用检测(复用 singbox-lite 思路)
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # 端口占用检测(复用 singbox-lite 思路)
 # 2026-09-13(0.16.2 评审轮) 实测修正: ss 数据行的本机监听在 $4(Local Address:Port),
@@ -471,16 +525,90 @@ _state_set() {
     local key="$1" val="$2" tmp
     # 严格半事务(R14): mkdir/printf/mv 任一步失败都返回 1 并清理 tmp,
     # 避免"业务成功但 state 写失败被调用方忽略"导致 service/config 与 state 状态分裂
+    #
+    # 临时名必须唯一(mktemp), 不能是固定的 ${key}.tmp: 两个并发 _state_set 写同一个键时
+    # 会往同一文件里交错写, 先到的 mv 会把后者的半截缓冲一并发布出去, 最终 state 内容
+    # 损坏。state 键里含 cf_token 这类凭据, 故写完立即 chmod 600 —— umask 不可依赖
+    # (调用方可能带任意 umask, 且 _ensure_dirs 只收紧它自己创建的那批文件)。
     mkdir -p "$STATE_DIR" || return 1
-    tmp="$STATE_DIR/${key}.tmp"
+    tmp=$(mktemp "$STATE_DIR/${key}.tmp.XXXXXX") || return 1
     if ! printf '%s' "$val" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
+    chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     if ! mv -f "$tmp" "$STATE_DIR/$key"; then
         rm -f "$tmp"
         return 1
     fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# crontab 读取/改写(30-geo 与 90-menu 共用, 避免两处各自演化)
+#
+# 为什么必须封装: `crontab -l 2>/dev/null | grep -v MARKER | crontab -` 在 `crontab -l`
+# 失败时会把**空输入**写回, 等于清空用户的全部定时任务(含与项目无关的任务); 而管道的
+# 退出码取自最后的 `crontab -`, 仍是 0, 调用方据此认为"删除成功"。已实测复现:
+# 令 `crontab -l` 返回 1, 用户的备份任务随之消失。
+#
+# 契约:
+#   _crontab_read                → stdout = 现有内容; "本来没有 crontab" 视为空且返回 0;
+#                                  真读不到(权限/瞬时 I/O)返回 1 且不输出任何内容
+#   _crontab_replace <marker> [newline]
+#                                → 按**字面**删除含 marker 的行(marker 里的 . - 不当正则),
+#                                  可选追加 newline; 读或写任一步失败都返回 1 且不改动 crontab
+# ---------------------------------------------------------------------------
+_crontab_read() {
+    local cur rc err
+    err=$(mktemp) || return 1
+    cur=$(crontab -l 2>"$err"); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        local errtext; errtext=$(cat "$err" 2>/dev/null)
+        rm -f "$err"
+        # "没有 crontab" 是正常空态(首次使用/被删空), 不是故障 —— 此时写回空内容是正确行为。
+        # 其余错误(权限被 /etc/cron.allow 拒、SUID 异常、瞬时 I/O)必须 fail-closed:
+        # 把它们当成空态会让调用方用空内容覆盖, 清空用户全部定时任务。
+        # 只认"确实没有 crontab"这一种正常空态。**不能把 can't open/cannot open 一并
+        # 当作空态** —— 它们同样出现在权限失败(如 cron.allow 拒绝、busybox
+        # `crontab: can't open 'root': Permission denied`)上, 而那正是必须 fail-closed 的
+        # 情形: 当成空态会让调用方用空内容覆盖, 清掉用户全部定时任务。
+        # 只认规范的"确实没有 crontab"文案(Vixie/cronie/busybox 都用这句)。
+        # **不能把 `No such file or directory` 也算进来**: 该串不只出现在"spool 文件缺失",
+        # 也会出现在 crontab 包装器缺失/损坏、spool 路径权限异常等场景 —— 那些都必须
+        # fail-closed, 否则 _crontab_read 返回 0+空输出, _crontab_replace 就会用空内容
+        # 覆盖, 清掉用户全部定时任务(本 helper 存在的唯一理由就是防这个)。
+        case "$errtext" in
+            *"no crontab"*)
+                return 0 ;;
+        esac
+        _error "读取 crontab 失败, 已中止(避免覆盖并清空现有定时任务): ${errtext:-未知错误}"
+        return 1
+    fi
+    rm -f "$err"
+    printf '%s' "$cur"
+    return 0
+}
+
+_crontab_replace() {
+    local marker="$1" newline="${2:-}" cur filtered grc
+    [ -n "$marker" ] || return 1
+    cur=$(_crontab_read) || return 1
+    # -F: marker 含 "." "-" 等正则元字符, 按字面匹配才不会误删无关行。
+    # **必须检查 grep 的退出码**: 命令替换的退出码不影响赋值语句, 所以 grep 真出错
+    # (rc>=2, 二进制缺失/读错误)时 filtered 会是空串, 我们随即把**空内容**写回 ——
+    # 又回到"清空用户全部 crontab"的灾难。注意 grep -v 在"所有行都被过滤掉"时**合法地**
+    # 返回 1, 因此只有 rc>=2 才算错误。
+    filtered=$(printf '%s\n' "$cur" | grep -vF "$marker"); grc=$?
+    if [ "$grc" -ge 2 ]; then
+        _error "过滤 crontab 失败(grep 返回 ${grc}), 已中止(避免覆盖并清空现有定时任务)"
+        return 1
+    fi
+    if [ -n "$newline" ]; then
+        filtered="${filtered:+${filtered}
+}${newline}"
+    fi
+    printf '%s\n' "$filtered" | crontab - 2>/dev/null || return 1
     return 0
 }
 
@@ -509,12 +637,17 @@ _backup_config() {
     chmod 600 "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     mv -f "$last_tmp" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     # 轮转历史快照: 仅保留最新 10 份随机备份(回滚只用 lastbak, 其余仅作人工追溯)
-    local old i=0
-    # ls -1t 按修改时间新→旧(busybox/coreutils 均支持), 跳过 lastbak
-    for old in $(ls -1t "$BACKUP_DIR" 2>/dev/null | grep '^config.json.bak.'); do
+    # 用 while read 逐行消费 ls -1t 的输出, 不用 `for old in $(ls ...)` 词分割:
+    # 后者在文件名含空白时会拆成多个不存在的路径, rm -f 静默失败 → 目录无界增长。
+    # 只对确实是普通文件的条目计数(避免把目录/断链算进保留额度)。
+    # (不用 find -printf: busybox 的 find 未必编译了该特性。)
+    local i=0 old
+    while IFS= read -r old; do
+        [ -n "$old" ] || continue
+        [ -f "$BACKUP_DIR/$old" ] || continue
         i=$((i+1))
         [ "$i" -gt 10 ] && rm -f "$BACKUP_DIR/$old"
-    done
+    done <<< "$(ls -1t "$BACKUP_DIR" 2>/dev/null | grep '^config\.json\.bak\.')"
     return 0
 }
 
@@ -543,14 +676,23 @@ _restore_config() {
 # 随机生成(无需 Date.now/Math.random —— 用系统源)
 # ---------------------------------------------------------------------------
 _gen_uuid() {
+    local u=""
     if [ -x "$XRAY_BIN" ]; then
-        "$XRAY_BIN" uuid 2>/dev/null
+        u=$("$XRAY_BIN" uuid 2>/dev/null)
     elif command -v uuidgen >/dev/null 2>&1; then
-        uuidgen
+        u=$(uuidgen)
     else
         # 兜底:从 /proc/sys/kernel/random/uuid(Linux)
-        cat /proc/sys/kernel/random/uuid 2>/dev/null
+        u=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
     fi
+    # 形状校验: 三个来源都可能失败(非 Linux 无 /proc、uuidgen 缺、xray 版本不支持 uuid),
+    # 或把告警行混进 stdout。返回空串会让调用方把空 UUID 写进配置 —— 节点看似建好,
+    # 客户端永远连不上, 且排查时很难想到是 UUID 为空。故这里 fail-closed。
+    if [[ "$u" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        printf '%s\n' "$u"
+        return 0
+    fi
+    return 1
 }
 
 _gen_short_id() {
@@ -612,6 +754,29 @@ _proc_ppid() {
     set -- $line
     [ -n "${2:-}" ] || return 1
     printf '%s' "$2"
+}
+
+# 严格版 exe 归属判定 —— **杀进程专用**。与 _proc_exe_is 的唯一差别: exe 读不到时**拒绝**。
+#
+# 为什么必须分开: _proc_exe_is 的"读不到就放行"是为**判活**设计的(CLAUDE.md: 假阴性会让
+# 调用方重复启动实例, 比多算更糟)。把同一宽松语义用在**杀进程**上是反向危害 —— 读不到 exe
+# 时所有同名进程都被判成"我们的", 于是限定 exe 的杀进程扫描退化成它本该取代的全机 comm
+# 扫描, 可能 SIGKILL 掉用户自己装的 cloudflared。
+# 同理, 凡"凭 exe 归属决定是否 kill"的地方都必须用本函数: 55-hysteria 的
+# _hysteria_proc_tree_has_bin(杀 supervisor 前的归属闸门)与 _hysteria_stop_and_verify 的
+# 强杀循环都是 fail-closed 契约, 也都已改用它。
+_proc_exe_is_strict() {
+    local pid="${1:-}" want="${2:-}" got rw
+    [ -n "$want" ] || return 1                  # 没有期望路径 => 无法证明归属 => 拒绝
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    got=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1   # 读不到 => 拒绝
+    [ -n "$got" ] || return 1
+    got="${got% (deleted)}"
+    [ "$got" = "$want" ] && return 0
+    rw=$(readlink -f "$want" 2>/dev/null) || return 1
+    [ -n "$rw" ] || return 1
+    [ "$got" = "$rw" ] && return 0
+    return 1
 }
 
 # 判断"以 anchor_pid 为祖先(含自身)的进程里, 是否存在 comm == name 的进程"。
@@ -801,7 +966,9 @@ _rewrite_link_addr() {
         host_part="${after_at%%[:/?#]*}"
     fi
     local new_host="$newaddr"
-    if [[ "$newaddr" == *":"* && "$newaddr" != *"["* ]]; then
+    # 前缀判断, 不是"包含"判断: 旧写法 `!= *"["*` 会把任何含 "[" 的地址都当成已加括号
+    # (如 "a[bc"), 于是不做包裹。正常地址不含 "[" , 这里收紧只为让判定与意图一致。
+    if [[ "$newaddr" == *":"* && "$newaddr" != "["* ]]; then
         new_host="[${newaddr}]"
     fi
     printf '%s' "${before_at}@${new_host}${after_at#"$host_part"}"

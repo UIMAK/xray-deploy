@@ -44,9 +44,40 @@ _xray_fetch_tag() {
             [ -z "$body" ] && return 1
             # 优先 jq: 第一个 prerelease==true 的 tag_name
             tag=$(echo "$body" | jq -r '[.[] | select(.prerelease == true)] | .[0].tag_name // empty' 2>/dev/null)
-            # 兜底: 用 grep 找 prerelease 行, 取对应 tag_name(busybox 友好)
+            # 兜底(无 jq): 记住"最近一次出现的 tag_name", 遇到 "prerelease": true 就输出它。
+            # 旧的 `grep -B5` 把窗口写死成 5 行 —— 一旦 API 在 tag_name 与 prerelease 之间
+            # 多插几个字段(或改成紧凑输出), 就会取到隔壁 release 的 tag 或取不到, 用户被装上
+            # 错误版本却毫无提示。按"最近一个 tag_name"取值只依赖对象内的字段先后(GitHub 的
+            # 稳定顺序), 不依赖行距。
             if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-                tag=$(echo "$body" | grep '"prerelease": true' -B5 | grep '"tag_name"' | head -1 | sed 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/')
+                # 先按对象边界把每个 release 拆到独立行, 否则紧凑单行 JSON 会被当成一行:
+                # 贪婪的 sub(/.*"tag_name".../) 只保留**最后一个** tag_name, 于是第一个
+                # prerelease:true 会拿到错误(但非空)的 tag, 通过末尾的 [ -n ] 守卫, 静默装错版本。
+                tag=$(printf '%s' "$body" | awk '
+                    # 先按对象边界把每个 release 拆成独立记录, 再逐记录扫描。
+                    # 用 awk 的 gsub+split 而不是 sed: sed 的替换串里带换行在不同实现上
+                    # 行为不一致(实测 GNU sed 直接报 unterminated substitution), 且 busybox
+                    # 的 sed 也不保证支持这种写法。POSIX awk 的 gsub/split 到处都有。
+                    {
+                        gsub(/\},\{/, "}\n{")
+                        n = split($0, _rec, "\n")
+                        for (_i = 1; _i <= n; _i++) {
+                            # rec 保留原始记录; 标签抽取必须写到**另一个**变量 —— 就地改写
+                            # rec 会把 "prerelease" 文本一起抹掉, 后面的判定就永远不成立
+                            # (实测: 取到了 tag 却一个都没输出, 整个兜底静默失效)。
+                            rec = _rec[_i]
+                            if (rec ~ /"tag_name"[[:space:]]*:/) {
+                                tag = rec
+                                sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
+                                sub(/".*/, "", tag)
+                                last = tag
+                            }
+                            if (rec ~ /"prerelease"[[:space:]]*:[[:space:]]*true/) {
+                                print last; exit
+                            }
+                        }
+                    }
+                ')
             fi
             ;;
         *) return 1 ;;
@@ -226,6 +257,11 @@ _xray_download_replace() {
         if [ -f "$XRAY_BIN.bak" ]; then
             mv -f "$XRAY_BIN.bak" "$XRAY_BIN" 2>/dev/null
             chmod +x "$XRAY_BIN" 2>/dev/null
+        else
+            # 首次安装且无备份可回滚: 删掉这个不可执行的新二进制, 回到"未安装"的干净状态。
+            # 留着它会让调用方的 [ -x "$XRAY_BIN" ] 恢复检查失败、而菜单却把它当成"已安装"
+            # (_xray_current_version 读不出东西), 用户面对一个装不上的幽灵核心。
+            rm -f "$XRAY_BIN" 2>/dev/null
         fi
         rm -rf "$tmp_dir"
         return 1
@@ -324,6 +360,10 @@ _install_or_switch_xray() {
 
     local cur=""
     cur=$(_xray_current_version 2>/dev/null)
+    # 切换前的通道(state/channel)。回滚到旧二进制时必须还原它, 否则 state 描述的是
+    # "新通道 + 旧二进制"这个不存在的组合(见下面失败分支的说明)。
+    local prev_channel=""
+    prev_channel=$(_state_get channel 2>/dev/null)
     local cur_tag="v${cur}"
     if [ -n "$cur" ] && [ "$cur_tag" = "$tag" ]; then
         _info "当前已是该版本 (v${cur}),仍重新下载替换以确保最新"
@@ -371,7 +411,6 @@ _install_or_switch_xray() {
     # "替换后"只探测一次(旧代码替换后还连探两次: _state_set 内一次 + newv 一次, 已合并)。
     local newv
     newv=$(_xray_current_version 2>/dev/null)
-    _state_set channel "$channel" || _warn "状态持久化失败(channel)"
 
     if [ "$started_ok" -ne 1 ]; then
         # 新二进制可执行但无法稳定运行(如当前配置与新版本不兼容): 回滚到替换前的旧二进制并重新拉起,
@@ -395,11 +434,30 @@ _install_or_switch_xray() {
         recv=$(_xray_current_version 2>/dev/null)
         [ -n "$recv" ] || { [ "$rolled_back" -eq 1 ] && recv="$cur" || recv="$newv"; }
         [ -n "$recv" ] && { _state_set version "$recv" || _warn "状态持久化失败(version)"; }
+        # channel 与 version 同源: 它也必须描述"磁盘上实际的那个二进制"。原实现在
+        # 重启确认**之前**就无条件写入新通道, 于是回滚到旧二进制后 state/channel 仍指向
+        # 新通道 —— 与 version 分裂的是同一类问题(菜单 [核心管理] 会显示错误通道)。
+        # 只有真正回滚成功才需要还原; 回滚失败/首次安装时磁盘上就是新二进制, 新通道是准确的。
+        if [ "$rolled_back" -eq 1 ]; then
+            if [ -n "${prev_channel:-}" ]; then
+                _state_set channel "$prev_channel" || _warn "状态持久化失败(channel)"
+            else
+                rm -f "$STATE_DIR/channel" 2>/dev/null
+            fi
+        else
+            _state_set channel "$channel" || _warn "状态持久化失败(channel)"
+        fi
         _error "Xray 二进制已替换, 但服务未能稳定运行, 请检查配置"
         return 1
     fi
+    # version 与 channel 必须**同进同退**: 只写其一会让 state 描述"新通道+旧版本"这种
+    # 不存在的组合(菜单 [核心管理] 会显示与 version 不匹配的通道)。_xray_current_version
+    # 读不出东西(二进制能跑但 version 输出无法解析)时, 两个都不写, 保持旧的一致状态。
     if [ -n "$newv" ]; then
         _state_set version "$newv" || _warn "状态持久化失败(version)"
+        _state_set channel "$channel" || _warn "状态持久化失败(channel)"
+    else
+        _warn "无法读取新核心版本, 跳过 version/channel 记录(保持原值以免状态分裂)"
     fi
     # verified 稳定运行后才丢弃旧二进制备份
     rm -f "$XRAY_BIN.bak"
@@ -417,8 +475,16 @@ _install_or_switch_xray() {
 # ---------------------------------------------------------------------------
 # 配置文件初始化(空 inbounds + freedom/blackhole + log)
 # 仅在 config.json 不存在或为空时写
+#
+# 并发(F5): 与项目里所有其他 config 写路径一样在 _with_config_lock 内执行 —— 这是
+# 一次 read-decide-write(先判空再写), 与并发的 geo 更新/节点事务交叠时会互相覆盖。
+# _with_config_lock 经 XRAY_DEPLOY_LOCK_HELD 可重入, 故被 _mutate_config 调用时不会自锁死。
 # ---------------------------------------------------------------------------
 _init_config_if_empty() {
+    _with_config_lock _init_config_if_empty_locked "$@"
+}
+
+_init_config_if_empty_locked() {
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
         return 0
     fi
@@ -896,8 +962,21 @@ _uninstall_xray() {
             rm -f /etc/init.d/xray
             ;;
     esac
-    # 清 crontab 的 geo 自动更新任务 + 定时重启任务
-    crontab -l 2>/dev/null | grep -v "$GEO_CRON_MARKER" 2>/dev/null | grep -v "# xray-deploy-timed-restart" 2>/dev/null | crontab - 2>/dev/null || true
+    # 清 crontab 的 geo 自动更新任务 + 定时重启任务。
+    # 必须走 _crontab_replace(读失败即中止且不改动), 不能用 `crontab -l | grep -v | crontab -`:
+    # 后者在 `crontab -l` 失败时会用空内容覆盖, 把用户**全部**定时任务一起清掉(且 `|| true`
+    # 让失败无声无息)。declare -F 守卫兼容混装旧 lib: 旧版没有该函数时**宁可不动** crontab
+    # 也不能退回破坏性写法 —— 卸载已删掉我们的文件, 残留的 cron 行只会报"命令不存在"。
+    if declare -F _crontab_replace >/dev/null 2>&1; then
+        # ${VAR:-字面量} 兜底: 30-geo 在加载顺序上晚于本模块, 且混装旧 lib 时该常量可能缺失
+        # (set -u 下裸用会崩)。marker 值是稳定契约, 字面量兜底与 30-geo 的常量同源。
+        _crontab_replace "${GEO_CRON_MARKER:-# xray-deploy-geo-update}" >/dev/null 2>&1 || \
+            _warn "未能移除 geo 定时任务, 请手动检查 crontab"
+        _crontab_replace "# xray-deploy-timed-restart" >/dev/null 2>&1 || \
+            _warn "未能移除定时重启任务, 请手动检查 crontab"
+    else
+        _warn "lib 版本过旧(缺 _crontab_replace), 已跳过 crontab 清理, 请手动检查项目定时任务"
+    fi
     # 删快捷命令(xd) + xray symlink
     rm -f /usr/local/bin/"$CMD_NAME"
     [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ] && rm -f /usr/local/bin/xray
