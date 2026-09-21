@@ -121,6 +121,13 @@ _logrotate_render_config() {
     # 验证 ret 为数字 1-30
     : "${ret:=7}"
     [[ "$ret" =~ ^[0-9]+$ ]] || ret=7
+    # 归一化为十进制再比较/渲染。前导零值("08"/"09"/"099")有两个独立危害:
+    #   1) 算术比较把它们当八进制 → "08" 直接报 "value too great for base", 比较失败,
+    #      夹取分支不执行, 前导零原样留到下面的渲染;
+    #   2) logrotate 拒绝解析带前导零的份数(实测 "bad rotation count '08'") ——
+    #      写一次就永久破坏轮换, 而 _logrotate_config_in_sync 用同一份渲染比对, 仍报"已同步",
+    #      状态页显示健康。故归一化必须发生在比较与渲染这两个出口之前。
+    ret=$((10#$ret))
     [ "$ret" -lt 1 ] && ret=1
     [ "$ret" -gt 30 ] && ret=30
 
@@ -178,9 +185,13 @@ _logrotate_write_config() {
         rm -f "$LOGROTATE_CONF" 2>/dev/null
         return 1
     fi
-    # 磁盘满时写入可能返回 0 却只落地 0 字节; 空配置对 logrotate 无意义, 视为失败
-    if [ ! -s "$LOGROTATE_CONF" ]; then
-        _error "logrotate 配置内容为空(磁盘空间?), 已删除: $LOGROTATE_CONF"
+    # 磁盘满时写入可能返回 0 却只落地 0 字节**或被截断**; 空配置对 logrotate 无意义,
+    # 截断配置更糟 —— 它是"非空但解析失败", logrotate 会拒绝整份文件(轮换永久失效),
+    # 而本函数却返回 0、state 记成 on、状态页显示健康。故回读比对, 不一致一律视为失败。
+    local landed
+    landed=$(cat "$LOGROTATE_CONF" 2>/dev/null)
+    if [ "$landed" != "$content" ]; then
+        _error "logrotate 配置写入不完整(磁盘空间?), 已删除: $LOGROTATE_CONF"
         rm -f "$LOGROTATE_CONF" 2>/dev/null
         return 1
     fi
@@ -318,7 +329,16 @@ _logrotate_status() {
     # 那正是复审 P2 的残局(实际在轮换但 state 里没有记录), 静默显示"未配置"
     # 会让用户以为轮换没开而不去处理。
     case "$enabled" in
-        on)  echo -e "  状态: ${GREEN}on${NC}" ;;
+        on)
+            # state=on 但配置文件不在 = 轮换实际已死。必须与 "unset + 文件存在" 对称地
+            # 显式点出来: 否则状态页显示健康的 on, 用户以为日志在轮换而磁盘被慢慢撑满。
+            if [ -f "$LOGROTATE_CONF" ]; then
+                echo -e "  状态: ${GREEN}on${NC}"
+            else
+                echo -e "  状态: ${YELLOW}on${NC} (${RED}但配置文件 ${LOGROTATE_CONF} 不存在, 轮换实际未生效${NC})"
+                echo -e "  ${SKYBLUE}(在 [1] 里重新启用即可重写配置)${NC}"
+            fi
+            ;;
         off) echo -e "  状态: ${RED}off${NC}" ;;
         *)
             if [ -f "$LOGROTATE_CONF" ]; then
@@ -644,6 +664,10 @@ _logrotate_menu() {
                 [ -z "$new_ret" ] && { _info "已取消"; _press_any_key; continue; }
                 : "${new_ret:=7}"
                 [[ "$new_ret" =~ ^[0-9]+$ ]] || { _warn "请输入有效数字"; _press_any_key; continue; }
+                # 先归一化为十进制: 前导零在算术比较里会被当八进制("08" 报 value too great
+                # for base), 且归一化后的值才是要落进 state/配置的值 —— 否则 "08" 会被原样
+                # 写入, logrotate 拒绝解析, 轮换永久失效。
+                new_ret=$((10#$new_ret))
                 [ "$new_ret" -lt 1 ] && { _warn "最少保留 1 份"; _press_any_key; continue; }
                 [ "$new_ret" -gt 30 ] && { _warn "最多保留 30 份"; _press_any_key; continue; }
                 # 同上: 同值跳过必须以"文件也已同步"为前提, 否则写失败后无法直接重试
