@@ -236,9 +236,23 @@ _manifest_write() {
 
 _install_cleanup_stale() {
     # SIGKILL 残留的回滚目录(SIGKILL 时回滚代码没机会执行): 内容是旧文件的副本, 无害但会堆积。
-    local d
+    #
+    # **绝不能删正在并发安装的那个** —— 那个安装的进程还活着, 其 _install_rollback 正要靠这份
+    # 备份恢复; 备份被删后, 回滚循环对每个条目都读到"备份里没有", 于是误判成"本次新建"而
+    # **删除既有文件**。实测复现: 安装 A 备份完 -> 安装 B 启动调本函数 -> A 落地后失败触发回滚
+    # -> 一份健康的 5 文件安装被清成 0 文件(数据全丢)。
+    #
+    # 判据: 目录名后缀就是创建它的安装进程 PID, `kill -0` 能证明那个进程还活着 => 跳过。
+    # 代价是 PID 复用可能让我们**少删**一次(残留多留一会儿, 无害); 反方向才是数据丢失,
+    # 所以这个方向是刻意选的。`$$` 只保证路径不互相覆盖, 保护不了被**别人**的清理 glob 扫到。
+    local d pid
     for d in "$DEPLOY_DIR"/.install-rollback.*; do
         [ -e "$d" ] || continue
+        pid="${d##*.install-rollback.}"
+        case "$pid" in
+            ''|*[!0-9]*) ;;                                  # 无数字后缀: 非本函数创建, 不动
+            *) kill -0 "$pid" 2>/dev/null && continue ;;      # 安装进程仍活着 => 并发安装的备份
+        esac
         rm -rf "$d" 2>/dev/null || true
     done
 }
@@ -336,8 +350,15 @@ download_all() {
     # 点名不一致的文件并返回 1, 这里把两个失败事实都报出来。
     if [ "$copy_ok" -ne 1 ] || ! _verify_installed; then
         echo "[错误] 文件落地/复核失败, 正在回滚到更新前状态..."
-        _install_rollback || echo "[错误] 回滚未完全成功, 请按上方提示人工核对"
-        rm -rf "$ROLLBACK_DIR" 2>/dev/null
+        # 回滚失败时**必须保留** $ROLLBACK_DIR —— 它是唯一的恢复源, 里面装的是更新前的
+        # 原始字节。删掉它就等于"回滚失败还销毁唯一副本"(项目在 hysteria 证书快照上有同款
+        # 明文契约)。成功路径才清理。
+        if _install_rollback; then
+            rm -rf "$ROLLBACK_DIR" 2>/dev/null
+        else
+            echo "[错误] 回滚未完全成功, 已保留备份目录: $ROLLBACK_DIR"
+            echo "       请人工从该目录恢复, 或重跑 install.sh --update"
+        fi
         return 1
     fi
     rm -rf "$ROLLBACK_DIR" 2>/dev/null
@@ -479,8 +500,13 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     done
     if [ "$local_ok" -ne 1 ] || ! _verify_installed; then
         echo "[错误] 本地源落地/复核失败, 正在回滚到更新前状态..."
-        _install_rollback || echo "[错误] 回滚未完全成功, 请按上方提示人工核对"
-        rm -rf "$ROLLBACK_DIR" 2>/dev/null
+        # 与远程路径同口径: 回滚失败保留备份目录(唯一恢复源), 成功才清理。
+        if _install_rollback; then
+            rm -rf "$ROLLBACK_DIR" 2>/dev/null
+        else
+            echo "[错误] 回滚未完全成功, 已保留备份目录: $ROLLBACK_DIR"
+            echo "       请人工从该目录恢复, 或重跑 install.sh --update"
+        fi
         exit 1
     fi
     rm -rf "$ROLLBACK_DIR" 2>/dev/null
