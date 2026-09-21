@@ -574,7 +574,19 @@ _cf_first_bin_word() {
             sh|bash|dash|ash|ksh|zsh)
                 _next="${_w[$((_i+1))]:-}"
                 if [ "$depth" -lt 2 ] && [ "$_next" = "-c" ] && [ -n "${_w[$((_i+2))]:-}" ]; then
-                    inner="${_w[$((_i+2))]}"
+                    # 必须取**整段**命令串(数组切片), 不能只取第 _i+2 个词。
+                    # 根因: `read -ra` 的 IFS 切分**不感知引号** —— shell 的引号规则只在真正
+                    # 解析命令时生效。实测 `sh -c "exec /opt/custom/cloudflared tunnel run"`
+                    # 被切成 6 个词: sh | -c | "exec | /opt/custom/cloudflared | tunnel | run,
+                    # 只取第 3 个词会拿到未闭合引号的 `"exec`, 递归词法解析失败 =>
+                    # _cf_service_bin 回退 $CF_BIN => 我们自己的实例被判成"别人家"而永不杀
+                    # = 静默双实例(本函数族存在的唯一理由)。
+                    # 切片保留内层引号(实测), 递归里的逐词剥引号逻辑因此照常工作; 从 _i+2 起算
+                    # (而非固定 2)使 `env sh -c "..."` 这类前置包装器也能正确定位。
+                    # 边界(有意不修): 嵌套转义(`sh -c 'sh -c "..."'`)、变量展开、eval 等仍走
+                    # "解析失败 => 回退 $CF_BIN" 的安全分支 —— 这些形态无法用词法解析正确处理,
+                    # 而回退路径本身安全(不会把 /bin/sh 或 env 当二进制)。
+                    inner="${_w[*]:$((_i+2))}"
                     _cf_first_bin_word "$inner" $((depth+1))
                     return $?
                 fi
@@ -639,13 +651,24 @@ _cf_pids_owned() {
 # _proc_exe_is 的 fail-open 是给**判活**的(见 00-common 的说明), 直接拿来杀进程会让
 # "读不到 exe"时所有同名进程都被判成我们的 —— 限定 exe 的杀进程扫描就退化成它本该取代的
 # 全机 comm 扫描, 可能 SIGKILL 掉用户自己装的 cloudflared。
-# 旧 lib 混装时(没有严格版)退回 _proc_exe_is, 并在调用点告警说明降级。
+#
+# 三态返回码(2026-09-21 复审, 与 55-hysteria.sh 的 `_hysteria_proc_tree_has_bin` 同口径):
+#   0 = 确认属于我们(exe 指向期望二进制)      => 可 kill
+#   1 = **确认不属于**我们(exe 可读且不同)     => 不 kill, 归"他人"
+#   2 = **无法确认**(严格版缺失, 即混装旧 lib) => 不 kill, 归"归属不明" + 告警
+#
+# 为什么必须是三态而非布尔: 第 4 步的三分类(确认我们的 / 确认他人的 / 归属不明)要求区分
+# `1` 与 `2`。若把"无法确认"折进 `1`, 混装旧 lib 时会把**可能属于我们**的进程报成
+# "非本脚本管理的 cloudflared 进程(未触碰)" —— 一句我们并不知道真假的断言, 正是该三分类
+# 要消灭的错误信息。(项目已有同类先例: `_crontab_has_marker` 的 0/1/2。)
 _cf_exe_owned() {
     if declare -F _proc_exe_is_strict >/dev/null 2>&1; then
         _proc_exe_is_strict "$1" "$2"
-    else
-        _proc_exe_is "$1" "$2"
+        return $?
     fi
+    # 旧 lib 混装: 严格版不存在。**绝不退回宽松版** —— 那会让归属判定在杀进程路径上失效。
+    _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认进程归属, 跳过"
+    return 2
 }
 
 # ---------------------------------------------------------------------------
@@ -654,6 +677,9 @@ _cf_exe_owned() {
 # ---------------------------------------------------------------------------
 _cf_kill_all() {
     local pids="" pid i
+    # 严格归属判定不可用(混装旧 lib)的标志: 此时我们**无法确认**任何进程的归属,
+    # 进程状态未被确认清理, 最终必须 return 1 —— 不能对调用方谎报"已清理干净"。
+    local _cf_strict_missing=0
 
     # 1. 按实际 init 系统走正确的 stop，并等待进程真正退出
     case "$INIT_SYSTEM" in
@@ -694,12 +720,19 @@ _cf_kill_all() {
                 # comm 预筛只是"看起来像"的快速过滤(避免对每个无关 PID 都去读 exe);
                 # **决定权在 exe 归属判定**, 不能止步于 comm。
                 if [ "$(cat "/proc/$_pf_pid/comm" 2>/dev/null)" = "cloudflared" ]; then
-                    if _cf_exe_owned "$_pf_pid" "$_cf_pf_want"; then
-                        kill "$_pf_pid" 2>/dev/null || true
-                    else
-                        _warn "pidfile 记录的 PID $_pf_pid 同名但归属无法确认(非本脚本的 cloudflared?), 未发送信号"
-                        _tip "若该进程确实属于本服务, 请手动检查后处理"
-                    fi
+                    # 三态: 0=我们的(可 kill) / 1=确属他人 / 2=归属无法确认(严格版缺失)。
+                    # 两种非 0 的处置不同 —— 2 必须与 1 分开报, 否则混装旧 lib 时会把
+                    # "可能属于我们"的进程断言成"非本脚本管理的 cloudflared"。
+                    local _cf_own_rc=0
+                    _cf_exe_owned "$_pf_pid" "$_cf_pf_want" || _cf_own_rc=$?
+                    case "$_cf_own_rc" in
+                        0) kill "$_pf_pid" 2>/dev/null || true ;;
+                        2) _cf_strict_missing=1
+                           _warn "pidfile 记录的 PID $_pf_pid 归属无法确认(lib 版本过旧), 未发送信号"
+                           _tip "请重跑 install.sh --update 同步模块后重试" ;;
+                        *) _warn "pidfile 记录的 PID $_pf_pid 同名但归属无法确认(非本脚本的 cloudflared?), 未发送信号"
+                           _tip "若该进程确实属于本服务, 请手动检查后处理" ;;
+                    esac
                 fi ;;
         esac
         rm -f "$pf" 2>/dev/null
@@ -732,6 +765,9 @@ _cf_kill_all() {
         _tip "若隧道行为异常, 请手动确认这些进程是否应当存在"
         return 1
     fi
+    # 严格归属判定不可用时 _cf_pids_owned 恒为空(它只认 rc=0), 上面这条"无残留"因此是
+    # **假的**: 我们根本没能判定任何进程。这里显式复核一次, 并把标志置位以便最终 return 1。
+    declare -F _proc_exe_is_strict >/dev/null 2>&1 || _cf_strict_missing=1
     # 有同名的**别人家**进程时只提示不报错: 它不是残留, 更不该被我们杀。
     local p others="" unclear="" _cf_want
     # 期望路径只解析一次: 旧写法在循环里每次都重读 unit 文件(_cf_service_bin 会打开并
@@ -753,11 +789,17 @@ _cf_kill_all() {
             unclear="$unclear $p"          # exe 读不到 => 归属无法确认
             continue
         fi
-        # exe 可读: 走归属判定(经 _cf_exe_owned 以兼容混装旧 lib)
-        if _cf_exe_owned "$p" "$_cf_want"; then
-            continue                        # 确认是我们的
-        fi
-        others="$others $p"                 # exe 可读但不匹配 => 确属他人
+        # exe 可读: 走归属判定(三态)。**必须用 case 区分 1 与 2** —— 旧实现用 `if ...; then
+        # continue; fi; others=...`, 把"无法确认"(2, 混装旧 lib)与"确属他人"(1)压成同一
+        # 结论, 于是把**可能属于我们**的进程断言成"非本脚本管理的 cloudflared(未触碰)"。
+        local _cf_own_rc=0
+        _cf_exe_owned "$p" "$_cf_want" || _cf_own_rc=$?
+        case "$_cf_own_rc" in
+            0) continue ;;                  # 确认是我们的
+            2) unclear="$unclear $p"        # 归属无法确认(严格版缺失)
+               _cf_strict_missing=1 ;;
+            *) others="$others $p" ;;       # exe 可读但不匹配 => 确属他人
+        esac
     done <<< "$(_cf_pids)"
     if [ -n "$others" ]; then
         _tip "检测到非本脚本管理的 cloudflared 进程:${others}(未触碰)"
@@ -765,8 +807,15 @@ _cf_kill_all() {
     if [ -n "$unclear" ]; then
         # 这些进程可能是我们自己的(只是 /proc/<pid>/exe 读不到, 如加固的 /proc 挂载),
         # 不能宣称"已清理干净"。
-        _warn "以下 cloudflared 进程归属无法确认(exe 不可读):${unclear}"
+        _warn "以下 cloudflared 进程归属无法确认(exe 不可读或 lib 版本过旧):${unclear}"
         _tip "它们可能仍属于本服务; 若隧道行为异常, 请手动确认"
+    fi
+    if [ "$_cf_strict_missing" -eq 1 ]; then
+        # 归属判定降级: 进程状态**未被确认清理**, 不能对调用方谎报干净(_cf_restart 的
+        # `|| _warn` 与 _uninstall_cloudflared 的 kill_rc 契约都依赖这个返回码的真实性)。
+        _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认 cloudflared 进程归属"
+        _tip "请重跑 install.sh --update 同步模块后重试"
+        return 1
     fi
     _info "cloudflared 所有进程已清理"
     return 0

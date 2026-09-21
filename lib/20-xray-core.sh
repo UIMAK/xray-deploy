@@ -203,7 +203,10 @@ _xray_download_replace() {
     command -v unzip >/dev/null 2>&1 || _pkg_install unzip || return 1
 
     local dl_url="https://github.com/XTLS/Xray-core/releases/download/${tag}/${asset}"
-    tmp_dir=$(mktemp -d)
+    # mktemp -d 失败必须中止 —— 与 30-geo.sh 的 Geo 更新同款: tmp_dir="" 会让
+    # tmp_zip="/xray.zip" 落到系统根目录, 且后续 [ ! -f "/xray" ] / mv -f "/xray" "$XRAY_BIN"
+    # 可能把根目录下恰好同名的文件当成新核心搬走。磁盘满/只读/inode 耗尽正是本 PR 关注的场景。
+    tmp_dir=$(mktemp -d) || { _error "无法创建临时目录(/tmp 写满或只读?), 核心替换中止"; return 1; }
     tmp_zip="${tmp_dir}/xray.zip"
 
     _info "下载 Xray-core ${tag} (${asset})"

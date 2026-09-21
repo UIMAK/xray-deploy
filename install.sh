@@ -17,6 +17,12 @@ DEPLOY_DIR="/opt/xray-deploy"
 INSTALL_LIB_DIR="$DEPLOY_DIR/lib"
 INSTALL_TPL_DIR="$DEPLOY_DIR/templates"
 
+# 整版本原子更新用的路径(见 _install_backup/_install_rollback 上方的设计说明)。
+# MANIFEST: 安装成功后生成的版本一致性清单(每行 `<sha256>  <relpath>`), 由 xray-deploy.sh
+#   在 source 之前独立校验(只告警不阻断)。ROLLBACK_DIR: 本次安装的备份目录, 带 $$ 防并发覆盖。
+MANIFEST="$DEPLOY_DIR/.manifest"
+ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.$$"
+
 # 模块与模板完整列表。
 #
 # **LIB_MODULES 与 xray-deploy.sh 里的同名变量必须逐字一致** —— 远程安装路径无法从磁盘
@@ -139,12 +145,118 @@ _verify_installed() {
 }
 
 # ---------------------------------------------------------------------------
+# 整版本原子更新(2026-09-21 复审 P1 收口)
+#
+# 逐文件 tmp→mv 只保证**单个文件**不半截, 不保证**整版本**一致: 10 个 lib + 10 个模板 +
+# 主脚本 + VERSION 逐个落地, 中途失败(磁盘满/IO)会留下"一半新一半旧"的部署目录, 而旧代码
+# 只看 copy_ok 就报成功。这里把落地升级为四段式:
+#
+#   1. 备份: 对清单里**每个已存在**的目标先 cp 到 $ROLLBACK_DIR/<relpath>;
+#            任一步失败立即 return 1 —— 此时目标一个字节都没动。
+#   2. 落地: 逐文件 _install_file(tmp→mv), 失败只置 copy_ok=0, 不中断。
+#   3. 复核: _verify_installed(存在且非空)。
+#   4. 回滚: 2/3 任一步失败 => 用 $ROLLBACK_DIR 把**全部**目标恢复到第 1 步之前:
+#            备份里有 => cp 回去; 备份里没有(本次新建) => rm -f 掉。
+#            回滚自身失败 => 如实报"降级状态 + 需人工核对的路径", 返回 1。
+#
+# 为什么是"备份后整体还原"而不是"失败时逐项重下": 失败时网络/磁盘状态与落地时可能不同
+# (且重下可能再次失败); 备份是本机既有的、已验证可读的字节, 是唯一可靠的回滚源。
+#
+# $ROLLBACK_DIR 位置 = $DEPLOY_DIR/.install-rollback.$$ —— 三个约束:
+#   · 同文件系统 => cp 不跨 fs, 不受 /tmp 容量影响;
+#   · 以 `.` 开头 => 不被 nodes/*.json、templates/*.jsonc 之类的 glob 命中(本项目无 dotglob);
+#   · `$$` 后缀 => 并发安装不互相覆盖; 所有 return 路径前 rm -rf, 入口顺手清理 SIGKILL 残留。
+#
+# 为什么不做 releases/<version> + current 软链切换: 主程序运行期**就在**目标目录内
+# (LIB_DIR="$SCRIPT_DIR/lib"), 换不掉正在执行的脚本自身; 改造入口解析/service ExecStart/
+# 卸载路径的触及面远大于收益。本函数已直接满足"部分更新失败不留混合版本"。
+# ---------------------------------------------------------------------------
+_manifest_relpaths() {
+    local m t
+    printf '%s\n' 'xray-deploy.sh' 'VERSION'
+    for m in $LIB_MODULES; do printf 'lib/%s.sh\n' "$m"; done
+    for t in $TPL_NAMES; do printf 'templates/%s.server.jsonc\n' "$t"; done
+}
+
+_install_backup() {
+    local rel dest bak
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        dest="$DEPLOY_DIR/$rel"
+        [ -e "$dest" ] || continue          # 本次新建的, 回滚时删掉即可
+        bak="$ROLLBACK_DIR/$rel"
+        mkdir -p "$(dirname "$bak")" 2>/dev/null || return 1
+        cp -f "$dest" "$bak" 2>/dev/null || return 1
+    done <<< "$(_manifest_relpaths)"
+    return 0
+}
+
+_install_rollback() {
+    local rel dest bak bad=""
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        dest="$DEPLOY_DIR/$rel"
+        bak="$ROLLBACK_DIR/$rel"
+        if [ -e "$bak" ]; then
+            cp -f "$bak" "$dest" 2>/dev/null || bad="$bad $rel"
+        else
+            # 备份里没有 => 本次新建的, 删掉即回到"未安装"
+            [ -e "$dest" ] || continue
+            rm -f "$dest" 2>/dev/null || bad="$bad $rel"
+        fi
+    done <<< "$(_manifest_relpaths)"
+    if [ -n "$bad" ]; then
+        # 回滚**不提前 return**, 逐项尽力恢复后汇总(见上方设计说明)。失败项必须点名 ——
+        # 只说"回滚失败"会让用户不知道该核对哪些文件。
+        echo "[错误] 回滚未完成, 以下文件可能处于不一致状态:${bad}"
+        echo "       请人工核对 $DEPLOY_DIR 或重跑 install.sh --update"
+        return 1
+    fi
+    return 0
+}
+
+_manifest_write() {
+    # sha256sum 缺失(极简 busybox)时静默跳过 —— 旧装机(无清单)行为不变, 只少一层保护。
+    command -v sha256sum >/dev/null 2>&1 || return 0
+    local rel h tmp="$MANIFEST.tmp.$$"
+    : > "$tmp" 2>/dev/null || { echo "[警告] 无法写入安装清单: $MANIFEST"; return 1; }
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        h=$(sha256sum "$DEPLOY_DIR/$rel" 2>/dev/null | awk '{print $1}')
+        if [ -z "$h" ]; then
+            rm -f "$tmp" 2>/dev/null
+            echo "[警告] 安装清单生成失败: $rel"
+            return 1
+        fi
+        printf '%s  %s\n' "$h" "$rel" >> "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+    done <<< "$(_manifest_relpaths)"
+    mv -f "$tmp" "$MANIFEST" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; echo "[警告] 安装清单落盘失败"; return 1; }
+    return 0
+}
+
+_install_cleanup_stale() {
+    # SIGKILL 残留的回滚目录(SIGKILL 时回滚代码没机会执行): 内容是旧文件的副本, 无害但会堆积。
+    local d
+    for d in "$DEPLOY_DIR"/.install-rollback.*; do
+        [ -e "$d" ] || continue
+        rm -rf "$d" 2>/dev/null || true
+    done
+}
+
+# ---------------------------------------------------------------------------
 # 下载主脚本 + lib + templates 并汇报结果
 # ---------------------------------------------------------------------------
 download_all() {
     local ok=0 fail=0
     # 下载到临时 staging 目录, 全部成功后再 atomic 复制到目标路径 (S7)
-    local stage; stage=$(mktemp -d)
+    #
+    # mktemp 失败必须**立即中止**: stage 为空串时下面所有路径拼接都会退化成绝对根路径 ——
+    # "$stage/xray-deploy.sh" 变成 "/xray-deploy.sh"、"$stage/lib" 变成 "/lib"、
+    # "$stage/templates" 变成 "/templates", 于是下载产物被直接写到系统根目录, 且末尾
+    # rm -rf "$stage" 变成 rm -rf ""(空操作)让垃圾永久残留。磁盘满/只读/inode 耗尽正是
+    # 本 PR 关注的低配 VPS 场景。
+    local stage
+    stage=$(mktemp -d) || { echo "[错误] 无法创建临时目录(/tmp 写满或只读?), 安装中止"; return 1; }
     local stage_lib="$stage/lib" stage_tpl="$stage/templates"
     mkdir -p "$stage_lib" "$stage_tpl"
 
@@ -198,7 +310,16 @@ download_all() {
     # 现在逐**文件**落地, 且每个文件都走 tmp → mv: rename 在同一目录内是原子的, 于是每个
     # 模块要么是完整的旧版、要么是完整的新版, 永远不会出现半截文件。
     # (不做目录级 rename 切换: 运行期 manager 自己就在目标目录内。)
+    #
+    # 2026-09-21 五轮复审(P1): 逐文件原子 ≠ 整版本原子。落地段升级为"备份 → 落地 → 复核 →
+    # 失败整体回滚"四段式(见 _install_backup 上方说明), 保证结果只有"全部新"或"全部旧"。
     mkdir -p "$DEPLOY_DIR" "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR"
+    rm -rf "$ROLLBACK_DIR" 2>/dev/null
+    if ! _install_backup; then
+        rm -rf "$stage" "$ROLLBACK_DIR" 2>/dev/null
+        echo "[错误] 备份现有安装失败(磁盘空间/权限?), 未改动任何文件"
+        return 1
+    fi
     local copy_ok=1 m
     _install_file "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || copy_ok=0
     chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || copy_ok=0
@@ -211,12 +332,17 @@ download_all() {
         _install_file "$stage_tpl/${t}.server.jsonc" "$INSTALL_TPL_DIR/${t}.server.jsonc" || copy_ok=0
     done
     rm -rf "$stage"
-    if [ "$copy_ok" -ne 1 ]; then
-        echo "[错误] 文件落地失败(磁盘空间/权限/IO?), 目标可能不完整, 请清理后重试"
+    # 落地或复核任一失败 => 整体回滚到第 1 步之前。回滚失败时 _install_rollback 自己会
+    # 点名不一致的文件并返回 1, 这里把两个失败事实都报出来。
+    if [ "$copy_ok" -ne 1 ] || ! _verify_installed; then
+        echo "[错误] 文件落地/复核失败, 正在回滚到更新前状态..."
+        _install_rollback || echo "[错误] 回滚未完全成功, 请按上方提示人工核对"
+        rm -rf "$ROLLBACK_DIR" 2>/dev/null
         return 1
     fi
-    # 落地后**逐项复核**: cp 返回 0 但落地 0 字节(磁盘满)时上面的检查看不出来。
-    _verify_installed || return 1
+    rm -rf "$ROLLBACK_DIR" 2>/dev/null
+    # 清单在**全部落地并复核通过之后**生成; 失败路径不写(与其余文件同一批被回滚覆盖)。
+    _manifest_write || true
     return 0
 }
 
@@ -252,6 +378,10 @@ if [ "$IS_UPDATE" -eq 1 ] && [ "$ALLOW_LOCAL" -eq 1 ]; then
     echo "       本地源请直接运行: bash install.sh [--no-start]"
     exit 2
 fi
+
+# 清理 SIGKILL 残留的回滚目录(进程被强杀时回滚代码没机会执行, 备份会一直堆积)。
+# 放在两个安装分支之前, 使 update 与首次安装都受益。
+_install_cleanup_stale
 
 # ---------------------------------------------------------------------------
 # 更新模式: 强制下载覆盖所有文件
@@ -301,15 +431,10 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     # lib/模板拷贝失败仍报"安装完成", 用户执行 xd 时才会以"source 失败"的形式暴露。
     # 2026-09-21: 本地路径也走逐文件原子落地(tmp→mv), 与远程路径同一口径 ——
     # 目录级 cp 中途失败会留下"一半新一半旧"的 lib/, 主脚本启动时才以 source 失败暴露。
-    if ! _install_file "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"; then
-        echo "[错误] 本地源拷贝失败: xray-deploy.sh(磁盘空间/权限?)"; exit 1
-    fi
-    chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || true
-    if [ -f "${LOCAL_DIR}/VERSION" ]; then
-        _install_file "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" || { echo "[错误] 本地源拷贝失败: VERSION"; exit 1; }
-    else
-        echo "[警告] 本地源缺少 VERSION, 更新检查将显示未知版本"
-    fi
+    # 2026-09-21 五轮复审(P1): 与远程路径同样升级为"备份 → 落地 → 复核 → 失败整体回滚"
+    # (见 _install_backup 上方说明), 保证本地安装也不留混合版本。
+    #
+    # 源清单预检放在备份之前: 本地源缺文件时目标目录一个字节都不该动(备份阶段无意义)。
     if [ ! -d "${LOCAL_DIR}/lib" ]; then
         echo "[错误] 本地源缺少 lib/ 目录, 安装中止"; exit 1
     fi
@@ -322,9 +447,6 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     if [ -n "$local_missing" ]; then
         echo "[错误] 本地源 lib/ 缺少模块:${local_missing}"; exit 1
     fi
-    for m in $LIB_MODULES; do
-        _install_file "${LOCAL_DIR}/lib/${m}.sh" "$INSTALL_LIB_DIR/${m}.sh" || { echo "[错误] 本地源拷贝失败: lib/${m}.sh"; exit 1; }
-    done
     if [ ! -d "${LOCAL_DIR}/templates" ]; then
         echo "[错误] 本地源缺少 templates/ 目录, 安装中止"; exit 1
     fi
@@ -335,10 +457,34 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     if [ -n "$tpl_missing" ]; then
         echo "[错误] 本地源 templates/ 缺少:${tpl_missing}"; exit 1
     fi
-    for t in $TPL_NAMES; do
-        _install_file "${LOCAL_DIR}/templates/${t}.server.jsonc" "$INSTALL_TPL_DIR/${t}.server.jsonc" || { echo "[错误] 本地源拷贝失败: templates/${t}.server.jsonc"; exit 1; }
+
+    rm -rf "$ROLLBACK_DIR" 2>/dev/null
+    if ! _install_backup; then
+        rm -rf "$ROLLBACK_DIR" 2>/dev/null
+        echo "[错误] 备份现有安装失败(磁盘空间/权限?), 未改动任何文件"; exit 1
+    fi
+    local_ok=1
+    _install_file "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || local_ok=0
+    chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || true
+    if [ -f "${LOCAL_DIR}/VERSION" ]; then
+        _install_file "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" || local_ok=0
+    else
+        echo "[警告] 本地源缺少 VERSION, 更新检查将显示未知版本"
+    fi
+    for m in $LIB_MODULES; do
+        _install_file "${LOCAL_DIR}/lib/${m}.sh" "$INSTALL_LIB_DIR/${m}.sh" || local_ok=0
     done
-    _verify_installed || exit 1
+    for t in $TPL_NAMES; do
+        _install_file "${LOCAL_DIR}/templates/${t}.server.jsonc" "$INSTALL_TPL_DIR/${t}.server.jsonc" || local_ok=0
+    done
+    if [ "$local_ok" -ne 1 ] || ! _verify_installed; then
+        echo "[错误] 本地源落地/复核失败, 正在回滚到更新前状态..."
+        _install_rollback || echo "[错误] 回滚未完全成功, 请按上方提示人工核对"
+        rm -rf "$ROLLBACK_DIR" 2>/dev/null
+        exit 1
+    fi
+    rm -rf "$ROLLBACK_DIR" 2>/dev/null
+    _manifest_write || true
 else
     # 用户**显式**要求本地安装却没有本地源时, 必须硬失败而不是静默拉网络 ——
     # 那正是"以为在用本地源、实际在装网络版"的误导(与上面的 --update/--local 互斥同一动机)。

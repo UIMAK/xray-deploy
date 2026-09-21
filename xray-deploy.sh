@@ -33,6 +33,37 @@ for _m in $LIB_MODULES; do
     fi
 done
 
+# 安装清单一致性校验(2026-09-21 五轮复审 P1 收尾)。
+# 逐文件原子 + 安装器整体回滚覆盖"安装中途失败", 但覆盖不了**进程被 SIGKILL**(回滚代码没机会
+# 执行) —— 此时磁盘上就是混合版本, 而上面那条检查只看"存在且可读", 会放行。
+# 安装成功后由 install.sh 生成 <部署根>/.manifest(每行 `<sha256>  <relpath>`), 这里独立校验。
+#
+# 三条硬约束:
+#   · **不得调用任何 lib 函数** —— 要校验的正是 lib 是否可信, 用 lib 函数去校验是循环论证;
+#     因此只用 POSIX 工具 + sha256sum。也**不能**用 $DEPLOY_DIR: 它由 00-common 定义, 而本段
+#     必须跑在 source 之前(那时它还是未定义, set -u 会直接中止脚本)。
+#   · **只告警不阻断**: 手工热修一个 lib 文件会让 hash 不匹配, 据此 exit 1 等于把用户锁在门外。
+#     项目取向是"数据安全 fail-closed, 可用性 fail-open"(同 _proc_exe_is 的注释推理)。
+#   · `.manifest` 缺失(旧装机)/ sha256sum 缺失 => 静默跳过, 行为与今天一致。
+# 部署根与 LIB_DIR 同源(上面刚解析): 用 SCRIPT_DIR/lib 则根为 SCRIPT_DIR, 用
+# /opt/xray-deploy/lib 则根为 /opt/xray-deploy —— 与 install.sh 写入清单的位置一致。
+_DEPLOY_ROOT="$(dirname "$LIB_DIR")"
+if [ -f "$_DEPLOY_ROOT/.manifest" ] && command -v sha256sum >/dev/null 2>&1; then
+    _manifest_bad=""
+    while read -r _mh _mp; do
+        [ -n "$_mh" ] || continue
+        [ -n "$_mp" ] || continue
+        _mgot=$(sha256sum "$_DEPLOY_ROOT/$_mp" 2>/dev/null | awk '{print $1}')
+        [ "$_mgot" = "$_mh" ] || _manifest_bad="$_manifest_bad $_mp"
+    done < "$_DEPLOY_ROOT/.manifest"
+    if [ -n "$_manifest_bad" ]; then
+        echo "[警告] 以下模块与安装清单不一致(可能安装中断或被手工修改):${_manifest_bad}" >&2
+        echo "       建议重跑 install.sh --update 同步全部模块" >&2
+    fi
+    unset _manifest_bad _mh _mp _mgot
+fi
+unset _DEPLOY_ROOT
+
 # source 公共层(定义所有常量与 DEPLOY_DIR 等)
 for _m in $LIB_MODULES; do
     # shellcheck disable=SC1090
