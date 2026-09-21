@@ -425,19 +425,40 @@ _timed_restart_disable() {
         _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
         return 1
     fi
-    if crontab -l 2>/dev/null | grep -qF "$marker"; then
-        # 删除失败必须暴露: 否则 state 记成 off 而 cron 行仍在(无人值守地重启服务)。
-        # **这里必须提前 return, 不能继续往下写 state=off** —— 否则就是"UI 说已关、cron 还在跑"
-        # 的分裂状态, 而且下次用户看到"未启用"就不会再处理。
-        if ! _crontab_replace "$marker"; then
-            _warn "定时重启任务未能移除, 请手动检查 crontab (${marker})"
-            _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
-            return 1
-        fi
-        _success "定时重启已禁用"
+    # 2026-09-21 复审(P1): 这里原本是裸管道 `crontab -l 2>/dev/null | grep -qF "$marker"`,
+    # 把"读成功但确实没这行"(该记账)与"crontab -l 读失败"(行可能仍在, 绝不能记账)压成
+    # 同一个退出码 1。实测: 令 crontab -l 返回 2 并输出 "cannot open spool: Input/output
+    # error", 本函数报"定时重启未启用"并写下 state=off —— cron 行仍在无人值守地重启服务。
+    # _crontab_has_marker 就是为这个三态判据而存在的(00-common)。
+    local has_rc=0
+    if declare -F _crontab_has_marker >/dev/null 2>&1; then
+        _crontab_has_marker "$marker" || has_rc=$?
     else
-        _info "定时重启未启用"
+        # 混装旧 lib(00-common 是旧版): 没有三态判据可用。**绝不能退回裸管道** —— 那正是
+        # 上面刚修掉的分裂形态。宁可不改 state 并如实告警, 也不猜。
+        _error "lib 版本过旧(00-common 缺 _crontab_has_marker), 无法确认定时任务状态"
+        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+        return 1
     fi
+    case "$has_rc" in
+        2)
+            # 读不到 crontab => 行可能仍在。此时**不能**写 state=off, 否则就是
+            # "UI 说已关、cron 还在跑"的分裂状态, 而且下次用户看到"未启用"就不会再处理。
+            _warn "无法读取 crontab, 定时重启任务是否仍在无法确认"
+            _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
+            return 1 ;;
+        0)
+            # 删除失败必须暴露: 否则 state 记成 off 而 cron 行仍在(无人值守地重启服务)。
+            # **这里必须提前 return, 不能继续往下写 state=off**。
+            if ! _crontab_replace "$marker"; then
+                _warn "定时重启任务未能移除, 请手动检查 crontab (${marker})"
+                _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
+                return 1
+            fi
+            _success "定时重启已禁用" ;;
+        *)
+            _info "定时重启未启用" ;;
+    esac
     # 只有"cron 行确实不在了"才记账(动作先、记账后)
     _state_set timed_restart "off"
 }

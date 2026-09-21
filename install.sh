@@ -90,6 +90,55 @@ dl() {
 }
 
 # ---------------------------------------------------------------------------
+# 单文件原子落地 + 落地后复核
+#
+# _install_file: cp 到同目录的临时名, 再 mv 覆盖目标。同目录 rename 是原子的, 因此
+# 每个文件只有"完整的旧内容"和"完整的新内容"两种可见状态 —— 目录级 cp 中途失败留下的
+# "一半新一半旧"的 lib/ 会让主脚本以 source 失败/怪异报错的形式暴露(见 download_all)。
+# 临时名带 $$ 避免并发安装互相覆盖; 任一步失败都清理临时文件, 不留垃圾。
+# _verify_installed: 复核每一个 LIB_MODULES/TPL_NAMES 条目都**存在且非空**。cp 返回 0
+# 却只落地 0 字节(磁盘满)是真实场景, 只看 cp 退出码看不出来。
+# ---------------------------------------------------------------------------
+_install_file() { # <src> <dest>
+    local src="$1" dest="$2" tmp
+    [ -f "$src" ] || { echo "[错误] 暂存文件缺失: $src"; return 1; }
+    tmp="${dest}.tmp.$$"
+    if ! cp -f "$src" "$tmp" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null
+        echo "[错误] 文件落地失败: $dest(磁盘空间/权限/IO?)"
+        return 1
+    fi
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp" 2>/dev/null
+        echo "[错误] 文件落地为空: $dest(磁盘空间?)"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$dest" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null
+        echo "[错误] 文件替换失败: $dest"
+        return 1
+    fi
+    return 0
+}
+
+_verify_installed() {
+    local m bad=""
+    for m in $LIB_MODULES; do
+        [ -s "$INSTALL_LIB_DIR/${m}.sh" ] || bad="$bad lib/${m}.sh"
+    done
+    for m in $TPL_NAMES; do
+        [ -s "$INSTALL_TPL_DIR/${m}.server.jsonc" ] || bad="$bad templates/${m}.server.jsonc"
+    done
+    [ -s "$DEPLOY_DIR/xray-deploy.sh" ] || bad="$bad xray-deploy.sh"
+    if [ -n "$bad" ]; then
+        echo "[错误] 安装后复核失败, 以下文件缺失或为空:${bad}"
+        echo "       请清理 $DEPLOY_DIR 后重试"
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 下载主脚本 + lib + templates 并汇报结果
 # ---------------------------------------------------------------------------
 download_all() {
@@ -140,20 +189,34 @@ download_all() {
         return 1
     fi
 
-    # 全部成功 → 复制到最终路径。逐份检查 cp 返回值: 磁盘满/IO 错误时不得只落地一半文件却报成功。
-    # (下载已在独立 staging 完成; 此处不做目录级 rename 原子切换, 因运行期 manager 就在目标目录内。)
+    # 全部成功 → 复制到最终路径。
+    #
+    # 2026-09-21 复审(P2): 旧写法是 5 条**逐目录** cp(cp -f "$stage_lib"/*.sh "$INSTALL_LIB_DIR/")。
+    # 目录级 cp 中途失败(磁盘满/IO)会在目标目录里留下"一半新、一半旧"的 lib/ —— 正是
+    # xray-deploy.sh 启动时那条"模块缺失/版本不一致"检查要防的状态, 而旧代码只看 cp 的
+    # 退出码就报成功, 用户直到下次 xd 才以怪异报错暴露。
+    # 现在逐**文件**落地, 且每个文件都走 tmp → mv: rename 在同一目录内是原子的, 于是每个
+    # 模块要么是完整的旧版、要么是完整的新版, 永远不会出现半截文件。
+    # (不做目录级 rename 切换: 运行期 manager 自己就在目标目录内。)
     mkdir -p "$DEPLOY_DIR" "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR"
-    local copy_ok=1
-    cp -f "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || copy_ok=0
+    local copy_ok=1 m
+    _install_file "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || copy_ok=0
     chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || copy_ok=0
-    cp -f "$stage/VERSION" "$DEPLOY_DIR/VERSION" || copy_ok=0
-    cp -f "$stage_lib"/*.sh "$INSTALL_LIB_DIR/" || copy_ok=0
-    cp -f "$stage_tpl"/*.jsonc "$INSTALL_TPL_DIR/" || copy_ok=0
+    _install_file "$stage/VERSION" "$DEPLOY_DIR/VERSION" || copy_ok=0
+    for m in $LIB_MODULES; do
+        _install_file "$stage_lib/${m}.sh" "$INSTALL_LIB_DIR/${m}.sh" || copy_ok=0
+    done
+    local t
+    for t in $TPL_NAMES; do
+        _install_file "$stage_tpl/${t}.server.jsonc" "$INSTALL_TPL_DIR/${t}.server.jsonc" || copy_ok=0
+    done
     rm -rf "$stage"
     if [ "$copy_ok" -ne 1 ]; then
         echo "[错误] 文件落地失败(磁盘空间/权限/IO?), 目标可能不完整, 请清理后重试"
         return 1
     fi
+    # 落地后**逐项复核**: cp 返回 0 但落地 0 字节(磁盘满)时上面的检查看不出来。
+    _verify_installed || return 1
     return 0
 }
 
@@ -204,8 +267,11 @@ if [ "$IS_UPDATE" -eq 1 ]; then
         if [ ! -e /usr/local/bin/xray ] || [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$DEPLOY_DIR/bin/xray" ]; then
             ln -sf "$DEPLOY_DIR/bin/xray" /usr/local/bin/xray
         fi
-        local_ver=$(cat "$DEPLOY_DIR/VERSION" 2>/dev/null || echo "?")
-        echo "[成功] 更新完成 (版本 ${local_ver})"
+        # 变量名不能叫 local_ver 之外还带 local 前缀 —— 这里在函数外, 旧写法的
+        # \`local local_ver=...\` 会让 bash 打印 "local: can only be used in a function"
+        # 到 stderr(不影响功能, 但用户会看到一行莫名其妙的报错)。
+        inst_ver=$(cat "$DEPLOY_DIR/VERSION" 2>/dev/null || echo "?")
+        echo "[成功] 更新完成 (版本 ${inst_ver})"
     else
         echo "[警告] 部分文件下载失败, 请检查网络后重试"
         exit 1
@@ -233,11 +299,14 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     echo "[信息] 检测到本地源, 从本地拷贝"
     # 2026-09-12 三审(M4): 拷贝失败(磁盘满/权限)必须中止 —— 原写法全部 2>/dev/null 吞掉,
     # lib/模板拷贝失败仍报"安装完成", 用户执行 xd 时才会以"source 失败"的形式暴露。
-    if ! cp -f "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"; then
+    # 2026-09-21: 本地路径也走逐文件原子落地(tmp→mv), 与远程路径同一口径 ——
+    # 目录级 cp 中途失败会留下"一半新一半旧"的 lib/, 主脚本启动时才以 source 失败暴露。
+    if ! _install_file "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh"; then
         echo "[错误] 本地源拷贝失败: xray-deploy.sh(磁盘空间/权限?)"; exit 1
     fi
+    chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || true
     if [ -f "${LOCAL_DIR}/VERSION" ]; then
-        cp -f "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" || { echo "[错误] 本地源拷贝失败: VERSION"; exit 1; }
+        _install_file "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" || { echo "[错误] 本地源拷贝失败: VERSION"; exit 1; }
     else
         echo "[警告] 本地源缺少 VERSION, 更新检查将显示未知版本"
     fi
@@ -253,7 +322,9 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     if [ -n "$local_missing" ]; then
         echo "[错误] 本地源 lib/ 缺少模块:${local_missing}"; exit 1
     fi
-    cp -f "${LOCAL_DIR}"/lib/*.sh "$INSTALL_LIB_DIR/" || { echo "[错误] 本地源拷贝失败: lib/"; exit 1; }
+    for m in $LIB_MODULES; do
+        _install_file "${LOCAL_DIR}/lib/${m}.sh" "$INSTALL_LIB_DIR/${m}.sh" || { echo "[错误] 本地源拷贝失败: lib/${m}.sh"; exit 1; }
+    done
     if [ ! -d "${LOCAL_DIR}/templates" ]; then
         echo "[错误] 本地源缺少 templates/ 目录, 安装中止"; exit 1
     fi
@@ -264,7 +335,10 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     if [ -n "$tpl_missing" ]; then
         echo "[错误] 本地源 templates/ 缺少:${tpl_missing}"; exit 1
     fi
-    cp -f "${LOCAL_DIR}"/templates/*.jsonc "$INSTALL_TPL_DIR/" || { echo "[错误] 本地源拷贝失败: templates/"; exit 1; }
+    for t in $TPL_NAMES; do
+        _install_file "${LOCAL_DIR}/templates/${t}.server.jsonc" "$INSTALL_TPL_DIR/${t}.server.jsonc" || { echo "[错误] 本地源拷贝失败: templates/${t}.server.jsonc"; exit 1; }
+    done
+    _verify_installed || exit 1
 else
     # 用户**显式**要求本地安装却没有本地源时, 必须硬失败而不是静默拉网络 ——
     # 那正是"以为在用本地源、实际在装网络版"的误导(与上面的 --update/--local 互斥同一动机)。

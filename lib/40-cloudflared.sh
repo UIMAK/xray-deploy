@@ -502,15 +502,26 @@ _cf_replace_token_in_service() {
 # 输出: 每行一个 PID(可能为空)
 # ---------------------------------------------------------------------------
 _cf_pids() {
-    local pids p c
-    pids=$(pidof cloudflared 2>/dev/null | tr ' ' '\n' | grep -e '^[0-9][0-9]*$')
-    if [ -n "$pids" ]; then
-        printf '%s\n' "$pids"
-        return 0
-    fi
+    local p c seen=" "
+    # 2026-09-21 复审(P1): pidof 与 /proc 扫描必须**都跑并取并集**。旧写法"pidof 有输出就
+    # 直接 return"假定 pidof 的结果是超集 —— 但 busybox 的 pidof 在容器里会**漏报**(H3),
+    # 漏掉的恰恰可能是我们自己的残留进程, 于是 _cf_kill_all 第 4 步认为"已清理干净"并返回 0,
+    # 把真正活着的孤儿进程留给用户(隧道连接数持续增长)。
+    # 两条路径会重复列出同一 PID, 故用 seen 去重(重复项会让"仍有残留"的告警与 others
+    # 列表失真)。
+    for p in $(pidof cloudflared 2>/dev/null); do
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        case "$seen" in *" $p "*) continue ;; esac
+        seen="$seen$p "
+        printf '%s\n' "$p"
+    done
     for p in /proc/[0-9]*; do
-        read -r c 2>/dev/null < "$p/comm" || continue
-        [ "$c" = "cloudflared" ] && printf '%s\n' "${p#/proc/}"
+        p="${p#/proc/}"
+        case "$seen" in *" $p "*) continue ;; esac
+        read -r c 2>/dev/null < "/proc/$p/comm" || continue
+        [ "$c" = "cloudflared" ] || continue
+        seen="$seen$p "
+        printf '%s\n' "$p"
     done
 }
 
@@ -536,51 +547,73 @@ _cf_unit_path() {
 }
 
 # ---------------------------------------------------------------------------
+# 从一段命令行文本里取出第一个"看起来是二进制"的词; 找不到返回 1。
+#
+# 三类东西必须跳过, 否则期望路径会指向包装器而不是我们真正的二进制, 于是 _cf_pids_owned
+# 把我们**自己**的运行实例判成"别人家"而永不杀 —— 静默双实例(本函数族存在的唯一理由):
+#   1. 包装器本身: env/nice/ionice/setpriv/timeout/chrt/taskset/busybox/nohup/setsid/stdbuf/exec
+#      (发行版生成的单元常写 ExecStart=/usr/bin/env cloudflared ...)
+#   2. 包装器的参数: 以 - 开头, 或纯数字(nice 的优先级 / timeout 的秒数)
+#   3. 环境赋值 NAME=value —— 2026-09-21 复审实测: `/usr/bin/env FOO=bar cloudflared tunnel run`
+#      下旧实现返回 FOO=bar(它含非数字, 被判成二进制), 期望路径随即变成 FOO=bar。
+# `sh -c '命令串'` 再往命令串里解析一次(限深度): 旧实现返回 /bin/sh, 同样导致双实例。
+# 每个词都剥一层成对引号, 这样 command="..." 与 sh -c "..." 两种写法都不必特殊处理。
+_cf_first_bin_word() {
+    local text="$1" depth="${2:-0}" tok inner
+    local -a _w
+    read -ra _w <<< "$text"
+    local _i _next
+    for ((_i=0; _i<${#_w[@]}; _i++)); do
+        tok="${_w[$_i]}"
+        tok="${tok#\"}"; tok="${tok%\"}"
+        tok="${tok#\'}"; tok="${tok%\'}"
+        [ -n "$tok" ] || continue
+        case "${tok##*/}" in
+            env|nice|ionice|setpriv|timeout|chrt|taskset|busybox|nohup|setsid|stdbuf|exec)
+                continue ;;
+            sh|bash|dash|ash|ksh|zsh)
+                _next="${_w[$((_i+1))]:-}"
+                if [ "$depth" -lt 2 ] && [ "$_next" = "-c" ] && [ -n "${_w[$((_i+2))]:-}" ]; then
+                    inner="${_w[$((_i+2))]}"
+                    _cf_first_bin_word "$inner" $((depth+1))
+                    return $?
+                fi
+                printf '%s' "$tok"; return 0 ;;
+        esac
+        case "$tok" in
+            -*) continue ;;
+            [A-Za-z_]*=*) continue ;;   # NAME=value => 环境赋值
+            *[!0-9]*) printf '%s' "$tok"; return 0 ;;   # 含非数字 => 这就是二进制
+            *) continue ;;                              # 纯数字 => 包装器的参数
+        esac
+    done
+    return 1
+}
+
 _cf_service_bin() {
-    local svcfile="$1" ln t
+    local svcfile="$1" ln t bin
     [ -f "$svcfile" ] || { printf '%s' "$CF_BIN"; return 0; }
     while IFS= read -r ln || [ -n "$ln" ]; do
         t="${ln#"${ln%%[![:space:]]*}"}"
         case "$t" in
             ExecStart=*|cmd=*|command=*)
                 t="${t#*=}"
-                t="${t#\"}"; t="${t%%\"*}"
-                # 取第一个词 = 二进制路径, 但跳过常见包装器(env/nice/ionice/setpriv/
-                # timeout/chrt/taskset): 手改或发行版生成的单元常写
-                # ExecStart=/usr/bin/env cloudflared ... —— 把 /usr/bin/env 当二进制会让
-                # **我们自己**的运行实例被误判成"别人家", 于是第 3 步不杀它, 启动第二个
-                # 实例(正是本函数要防的失败形态)。
-                local -a _w
-                read -ra _w <<< "$t"
-                local _i=0 _tok="" _found=0
-                for ((_i=0; _i<${#_w[@]}; _i++)); do
-                    _tok="${_w[$_i]}"
-                    case "${_tok##*/}" in
-                        env|nice|ionice|setpriv|timeout|chrt|taskset)
-                            # 包装器本身: 继续往后找真正的二进制
-                            continue ;;
-                    esac
-                    # 包装器的参数(-n / 5 / -- / -i 等)一并跳过。判据是"以 - 开头"或
-                    # "纯数字"(nice 的优先级、timeout 的秒数都是裸数字)。
-                    case "$_tok" in
-                        -*) continue ;;
-                        *[!0-9]*) _found=1 ;;   # 含非数字 => 这就是二进制
-                        *) continue ;;           # 纯数字 => 参数
-                    esac
-                    break
-                done
-                # 必须**确实**看到过二进制词才输出。否则 `ExecStart="env" cloudflared ...` 这种
-                # 被引号截断/畸形写法会让我们把 _tok 的残留值(env/nice)当二进制, 于是
-                # _cf_pids_owned 的期望路径变成 env, 我们**自己**的进程被判成"别人家"而永不
-                # 被杀 —— 静默双实例(正是本函数要防的失败形态)。找不到就落到文件末尾的
-                # $CF_BIN 兜底。
-                if [ "$_found" -eq 1 ]; then
+                # 引号剥离交给 _cf_first_bin_word 逐词处理。**不能**在这里用
+                # ${t%%\"*} 截断: 那会在第一个引号处砍掉整段命令串,
+                # `sh -c "/usr/local/bin/cloudflared ..."` 于是只剩 `/bin/sh -c `,
+                # 期望路径变成 /bin/sh => 静默双实例。
+                bin=$(_cf_first_bin_word "$t") || bin=""
+                if [ -n "$bin" ]; then
                     # 相对名(如 env cloudflared 里的 cloudflared)必须解析成绝对路径: 调用方
                     # 拿它比对 readlink /proc/<pid>/exe(恒为绝对路径), 裸名永远不匹配, 于是
                     # 我们自己的实例被判成"别人家"而永不杀 => 静默双实例。
-                    case "$_tok" in
-                        /*) printf '%s' "$_tok" ;;
-                        *)  printf '%s' "$(command -v -- "$_tok" 2>/dev/null || printf '%s' "$_tok")" ;;
+                    # **解析不出来就回退 $CF_BIN, 绝不把裸名原样返回** —— 裸名同样永远
+                    # 匹配不上 exe, 返回值等于"一个谁也匹配不到的期望路径", 比 CF_BIN 兜底
+                    # 更糟(CF_BIN 至少是项目自己的安装点)。契约: 本函数只输出绝对路径或
+                    # $CF_BIN。
+                    case "$bin" in
+                        /*) printf '%s' "$bin" ;;
+                        *)  printf '%s' "$(command -v -- "$bin" 2>/dev/null || printf '%s' "$CF_BIN")" ;;
                     esac
                     return 0
                 fi
@@ -591,26 +624,15 @@ _cf_service_bin() {
 }
 
 _cf_pids_owned() {
-    local want pids p c
+    local want p
     want=$(_cf_service_bin "$(_cf_unit_path)")
     [ -n "$want" ] || want="$CF_BIN"
-    # 与 _cf_pids 同族: pidof 成功就**不再**补 /proc 扫描。两条路径都跑会把同一个 PID
-    # 输出两次, 重复项会出现在"仍有残留进程"的告警里, 也会被重复加进 others 列表。
-    # (kill 本身幂等, 但重复输出会让诊断信息失真。)
-    pids=$(pidof cloudflared 2>/dev/null | tr ' ' '\n' | grep -e '^[0-9][0-9]*$')
-    if [ -n "$pids" ]; then
-        while IFS= read -r p; do
-            [ -n "$p" ] || continue
-            _cf_exe_owned "$p" "$want" && printf '%s\n' "$p"
-        done <<< "$pids"
-        return 0
-    fi
-    # pidof 在容器内会漏报(H3), 此时才补 /proc 扫描
-    for p in /proc/[0-9]*; do
-        read -r c 2>/dev/null < "$p/comm" || continue
-        [ "$c" = "cloudflared" ] || continue
-        _cf_exe_owned "${p#/proc/}" "$want" && printf '%s\n' "${p#/proc/}"
-    done
+    # 判据与 _cf_pids 同源(它就是 _cf_pids 加一层 exe 归属过滤), 避免两处各自演化出
+    # "哪套扫描更全"的差异。
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        _cf_exe_owned "$p" "$want" && printf '%s\n' "$p"
+    done <<< "$(_cf_pids)"
 }
 
 # 杀进程专用归属判定: 优先用严格版(读不到 exe => 拒绝)。
@@ -649,13 +671,37 @@ _cf_kill_all() {
             ;;
     esac
 
-    # 2. 杀 PID 文件里的残留(PID reuse 防护: 只对 comm 确为 cloudflared 的 pidfile PID 发信号,
-    #    避免 cloudflared 退出后 PID 被其他进程复用而误杀 nginx/sshd 等)
+    # 2. 杀 PID 文件里的残留(PID reuse 防护: 只对**确属我们**的 pidfile PID 发信号)
+    #
+    # 2026-09-21 复审(P1): 这里的判据原本只有 `comm == cloudflared`, 而 comm 是**进程自报的
+    # 名字**, 任何同名程序都能满足 —— 用户自己装的 cloudflared(发行版包)、另一个 x-ui 之类
+    # 留下的实例, 只要 PID 被 pidfile 复用就会被我们 SIGTERM 掉。第 3 步(扫描)已经改用
+    # exe 限定的 _cf_pids_owned, 唯独这条 pidfile 路径绕过了它, 于是"exe 限定"的防护在
+    # 这条路径上形同不存在。实测复现: comm=cloudflared 但 exe=/usr/bin/bash 的进程被本分支
+    # 杀掉。
+    #
+    # 归属判定统一走 _cf_exe_owned(优先严格版: 读不到 exe 一律拒绝), 拿不到确切归属就
+    # 只告警、不发信号 —— 杀错一个别人的进程是不可逆的, 而 pidfile 残留最坏只是多告警一次。
+    # pidfile 本身仍然照删: 它记录的是"上一次由我们写的 PID", 对调用方没有保留价值。
+    local _cf_pf_want
+    _cf_pf_want=$(_cf_service_bin "$(_cf_unit_path)")
+    [ -n "$_cf_pf_want" ] || _cf_pf_want="$CF_BIN"
     for pf in /run/cloudflared.pid /var/run/cloudflared.pid; do
         local _pf_pid; _pf_pid=$(cat "$pf" 2>/dev/null)
-        if [ -n "$_pf_pid" ] && [ "$(cat "/proc/$_pf_pid/comm" 2>/dev/null)" = "cloudflared" ]; then
-            kill "$_pf_pid" 2>/dev/null || true
-        fi
+        case "$_pf_pid" in
+            ''|*[!0-9]*) ;;   # 空/非数字: 不是有效 PID, 只删文件
+            *)
+                # comm 预筛只是"看起来像"的快速过滤(避免对每个无关 PID 都去读 exe);
+                # **决定权在 exe 归属判定**, 不能止步于 comm。
+                if [ "$(cat "/proc/$_pf_pid/comm" 2>/dev/null)" = "cloudflared" ]; then
+                    if _cf_exe_owned "$_pf_pid" "$_cf_pf_want"; then
+                        kill "$_pf_pid" 2>/dev/null || true
+                    else
+                        _warn "pidfile 记录的 PID $_pf_pid 同名但归属无法确认(非本脚本的 cloudflared?), 未发送信号"
+                        _tip "若该进程确实属于本服务, 请手动检查后处理"
+                    fi
+                fi ;;
+        esac
         rm -f "$pf" 2>/dev/null
     done
 
@@ -897,7 +943,15 @@ _uninstall_cloudflared() {
     else
         _warn "cloudflared 二进制不存在(仅清理残留配置)"
     fi
-    _cf_kill_all   # 确保进程彻底死掉再删文件（替换原来的裸 stop）
+    # 确保进程彻底死掉再删文件（替换原来的裸 stop）。
+    # 2026-09-21 复审(P1): 返回值原本被丢弃 —— _cf_kill_all 在"仍有残留进程"时返回 1,
+    # 而本函数随后照样删二进制/unit 并报"已卸载"并返回 0。这直接违反 _uninstall_menu [3] 的
+    # 契约(它消费 cf_rc 并据此提示"卸载未完全成功"), 用户会看到"卸载完成"而进程还活着。
+    # 实测: 把 _cf_kill_all 打桩成 return 1, 本函数仍返回 0。
+    # 残留进程仍必须继续走完文件清理(半途 return 会留下指向已删二进制的孤儿 unit), 但
+    # 最终返回值要如实反映"进程没清干净"。
+    local kill_rc=0
+    _cf_kill_all || kill_rc=$?
     # service 单元/pidfile 的清理**必须无条件执行**: 二进制缺失时提前 return 会留下一份
     # 指向不存在二进制的孤儿 unit(systemd 每次开机都会尝试拉起并失败)。
     case "$INIT_SYSTEM" in
@@ -914,6 +968,11 @@ _uninstall_cloudflared() {
     rm -f /run/cloudflared.pid /var/run/cloudflared.pid 2>/dev/null
     rm -f "$CF_BIN"
     rm -f "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6"
+    if [ "$kill_rc" -ne 0 ]; then
+        _error "cloudflared 文件与状态已清除, 但仍有残留进程未能停止"
+        _tip "请用 ps 确认 cloudflared 进程并手动结束, 否则它仍占用隧道连接"
+        return 1
+    fi
     _success "cloudflared 已卸载(二进制/服务/状态已清除)"
 }
 

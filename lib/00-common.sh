@@ -558,6 +558,9 @@ _state_set() {
 #   _crontab_replace <marker> [newline]
 #                                → 按**字面**删除含 marker 的行(marker 里的 . - 不当正则),
 #                                  可选追加 newline; 读或写任一步失败都返回 1 且不改动 crontab
+#   _crontab_has_marker <marker> → 0 = 该行存在; 1 = 读到了且确实没有; 2 = 读取失败(未知)
+#                                  三态而非布尔: "读失败"与"没启用"的处置相反, 合并会把
+#                                  读失败当成没启用(见函数注释)
 # ---------------------------------------------------------------------------
 _crontab_read() {
     local cur rc err
@@ -610,6 +613,33 @@ _crontab_replace() {
     fi
     printf '%s\n' "$filtered" | crontab - 2>/dev/null || return 1
     return 0
+}
+
+# 判断某条项目定时任务是否还在 —— **必须走 _crontab_read, 不能用裸管道**。
+#
+# 为什么不能写 `crontab -l 2>/dev/null | grep -qF "$marker"`: 那条管道的退出码把两种
+# 完全相反的事实压成同一个 1 ——
+#   (a) 读成功, 确实没有这行          => 应继续把 state 记为 off
+#   (b) crontab -l 失败(权限/瞬时 I/O) => 行**可能仍在**, 绝不能记 off
+# 实测复现(2026-09-21): 令 crontab -l 输出 "cannot open spool: Input/output error" 并
+# 返回 2, 调用方(定时重启禁用)报"定时重启未启用"并写下 state=off —— 而 cron 行仍在,
+# 于是进入"UI 说已关、cron 仍在无人值守地重启服务"的分裂状态, 用户下次看到"未启用"
+# 也就不会再处理。这正是 _crontab_read 存在的理由, 该处却绕过了它。
+#
+# 返回码刻意是三态(而不是布尔): 两种"非 0"的处置完全相反 —— (a) 该记账, (b) 该拒绝记账
+# 并告警。压成布尔就必然有一方被误判。
+_crontab_has_marker() {
+    local marker="$1" cur rc
+    [ -n "$marker" ] || return 2
+    cur=$(_crontab_read) || return 2      # 读失败: 不输出内容, 上层按"未知"处理
+    printf '%s\n' "$cur" | grep -qF -- "$marker"; rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1) return 1 ;;
+    esac
+    # grep 真出错(rc>=2, 二进制缺失等): 同样属于"未知", 不能报"没有"
+    _error "检查 crontab 内容失败(grep 返回 $rc)"
+    return 2
 }
 
 # ---------------------------------------------------------------------------
