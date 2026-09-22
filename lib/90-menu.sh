@@ -1386,6 +1386,41 @@ _hy2_obfs_rollback() {
             "$XD_UDP_JQ_UPSERT"
     fi
 }
+# ---------------------------------------------------------------------------
+# Reality 域名切换的**后置步骤失败回滚**(2026-09-22 九轮 OCR #43)。
+#
+# `_mutate_config` 提交之后还有三步: metadata 写入 → 分享链接重建 → clash 派生缓存同步。
+# 旧写法在这三步失败时只 `_error`/`_warn` + `continue`, 于是残局是
+# **config 已是新 SNI, 而 metadata/链接仍是旧的** —— config 是"事实"、metadata 是"声明",
+# 两者分裂后, 节点列表/分享链接/改端口/域名切换全都按 metadata 走, 用户看到的是一个
+# 与服务器实际行为不符的节点。同项目的 `_port_txn`/`_hy2_port_txn` 对同类窗口都是回滚语义。
+#
+# 还原源:
+#   · config —— `_mutate_config` 在改动前自己调过 `_backup_config`, 故
+#     `$BACKUP_DIR/config.json.lastbak` 正是切换前那一份, 直接用 `_restore_config`。
+#   · metadata —— 调用方在提交前把原文读进 `_reality_meta_prev`(节点元数据很小, 不必落盘)。
+# 还原后必须重新确认服务稳定(`_restart_xray_verified`), 因为它才是我方"新配置可用"的判据。
+#
+# 参数: <meta 路径> <metadata 原文>
+# ---------------------------------------------------------------------------
+_reality_switch_rollback() {
+    local meta="$1" meta_prev="${2:-}"
+    if _restore_config; then
+        _restart_xray_verified >/dev/null 2>&1 || \
+            _warn "配置已还原, 但 xray 未能稳定重启, 请查看状态"
+        if [ -n "$meta_prev" ]; then
+            _atomic_write_json "$meta" "$meta_prev" 2>/dev/null || \
+                _warn "元数据还原失败, 请手动核对: $meta"
+        else
+            _warn "没有元数据快照可还原, 请手动核对: $meta"
+        fi
+        _error "域名切换未完成(后置步骤失败), 配置与元数据已还原到切换前"
+    else
+        _error "后置步骤失败, 且配置回滚失败 —— 请手动核对 $CONFIG_FILE 与 $meta"
+        _tip "可用备份: $BACKUP_DIR/config.json.lastbak"
+    fi
+}
+
 _reality_domain_menu() {
     local choice
     _has_reality_nodes || { _warn "暂无 Reality 节点"; _press_any_key; return; }
@@ -1463,6 +1498,10 @@ _reality_domain_menu() {
             new_tunnel_tag=$(_gen_tunnel_tag "$new_sni" "$tunnel_port" "$node_port")
         fi
     fi
+    # 提交前留住 metadata 原文: 后置步骤失败时要连同 config 一起还原(#43)
+    local _reality_meta_prev=""
+    _reality_meta_prev=$(cat "$meta" 2>/dev/null) || _reality_meta_prev=""
+
     if [ -n "$pq_seed" ]; then
         if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
              --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
@@ -1516,13 +1555,16 @@ _reality_domain_menu() {
     # 更新元数据 + 分享链接(R42: 同时回填 reality_mode, 使旧节点元数据自描述)
     if [ -n "$new_tunnel_tag" ]; then
         _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$_reality_meta_prev"; _press_any_key; continue; }
     elif [ "$rmode" = "direct" ]; then
         _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | del(.tunnel_port) | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$_reality_meta_prev"; _press_any_key; continue; }
     else
         _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$_reality_meta_prev"; _press_any_key; continue; }
     fi
     # R38(M10): 消费 rebuild 返回码 —— SNI 已改, 但链接重建失败时不能写入空/坏链接
     local newlink
@@ -1531,9 +1573,15 @@ _reality_domain_menu() {
         _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
         _press_any_key; continue
     fi
-    _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || { _error "分享链接写入失败"; _press_any_key; continue; }
-    # F1: servername(域名)变化需同步 clash 派生缓存, 否则订阅仍指向旧伪装域名
-    _sync_node_clash "$meta"
+    _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || {
+        _reality_switch_rollback "$meta" "$_reality_meta_prev"; _press_any_key; continue; }
+    # F1: servername(域名)变化需同步 clash 派生缓存, 否则订阅仍指向旧伪装域名。
+    # **返回值必须消费**(2026-09-22 九轮 OCR #45): clash 是可再生的派生缓存, 失败**不回滚**
+    # 权威状态(与 hy2 侧同口径), 但"报成功却仍指向旧域名"必须让用户看见。
+    if ! _sync_node_clash "$meta"; then
+        _warn "clash 派生缓存同步失败, 订阅里的条目仍是旧伪装域名"
+        _tip "可重新执行一次本操作, 或删除后重建该节点以重建 clash 条目"
+    fi
 
     _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"
     if [ "$rmode" = "direct" ]; then
