@@ -55,17 +55,22 @@ _pq_run_bounded() {
         # -k <grace>: 先 TERM, grace 秒后 KILL。**没有 -k 时 timeout 并不"有界"** —— 子进程
         # 忽略/延迟处理 TERM 时它会一直等到对方自己退出(实测: 忽略 TERM 的子进程让
         # `timeout 1` 实际耗时 47s), 于是"有界执行"在最需要它的场景下失效。
-        # busybox 的 timeout 不支持 -k, 故先探测再用, 不支持则退回单参数形式。
+        # busybox 的 timeout 不支持 -k, 故先探测再用; 不支持则**落到下面的 setsid 看门狗路径**。
         # 探测必须用**宽松**的超时: 0.1s 在负载高的机器上连 `true` 都跑不完, timeout 会
         # 合法地返回 124, 于是我们误判"不支持 -k"并退回无 -k 形式 —— 恰好在最需要它的
         # 机器上丢掉有界保护。这里只问"这个 timeout 认不认 -k", 不问"机器快不快"。
+        # **不支持 -k 时不退回"没有硬杀"的 `timeout "$secs"`**(2026-09-22 十轮 P2)。
+        # 那样写等于在最需要兜底的机器(BusyBox 版本较旧)上把"有界"降级成"等对方自己退出" ——
+        # 而下面基于 setsid + 看门狗的兜底路径本来就为这种情况存在, 且它是真硬杀(-9)。
+        # 宁可走一条更啰嗦但确实有界的路, 也不要留一条名义上有界、实际会被忽略 TERM 的子进程
+        # 拖到天荒地老的 fast path。
         if timeout -k 1 5 true >/dev/null 2>&1; then
             timeout -k 2 "$secs" "$@"
-        else
-            timeout "$secs" "$@"
+            return $?
         fi
-        return $?
     fi
+    # 走到这里有两种原因: 机器上没有 timeout, 或者有但不支持 -k(旧 busybox)。两条都需要
+    # 真硬杀, 故共用下面的看门狗 —— 它的 kill -9 是不依赖 timeout 能力的。
     local tmp rc
     # mktemp 失败必须与"被包裹的命令失败"区分开(125): 否则调用方只会报
     # "xray tls ping 失败", 真正的原因(无法建临时文件)被掩盖, 排障时白绕一圈。

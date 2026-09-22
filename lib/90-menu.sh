@@ -1402,9 +1402,14 @@ _hy2_obfs_rollback() {
 # 还原后必须重新确认服务稳定(`_restart_xray_verified`), 因为它才是我方"新配置可用"的判据。
 #
 # 参数: <meta 路径> <metadata 原文>
+# 调用者: **必须**在 `_reality_domain_txn_locked` 的锁域内(见下面"锁域"一节)。
 # ---------------------------------------------------------------------------
 _reality_switch_rollback() {
     local meta="$1" meta_prev="${2:-}"
+    # 锁域是这里的前提: `_restore_config` 读的是**共享**的 `config.json.lastbak`, 而它由
+    # `_backup_config` 在每次 config 写入前覆盖。锁外调用时, 另一会话只要在"`_mutate_config`
+    # 返回"与"后置步骤失败"之间改过 config, `lastbak` 就已经不是本次事务前的那一份, 回滚会把
+    # 别人**已提交**的改动一起抹掉(十轮 P1-③)。锁域内则保证该快照自始至终属于本次事务。
     if _restore_config; then
         _restart_xray_verified >/dev/null 2>&1 || \
             _warn "配置已还原, 但 xray 未能稳定重启, 请查看状态"
@@ -1415,10 +1420,122 @@ _reality_switch_rollback() {
             _warn "没有元数据快照可还原, 请手动核对: $meta"
         fi
         _error "域名切换未完成(后置步骤失败), 配置与元数据已还原到切换前"
+        return 0
     else
         _error "后置步骤失败, 且配置回滚失败 —— 请手动核对 $CONFIG_FILE 与 $meta"
         _tip "可用备份: $BACKUP_DIR/config.json.lastbak"
+        return 1
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Reality 域名切换的**整个提交事务**(2026-09-22 十轮 P1-③)。
+#
+# 九轮把"后置失败回滚"做出来了, 但回滚源是**共享的** `config.json.lastbak`, 而该文件只在
+# `_mutate_config` 内部被锁保护 —— 事务的其余部分(metadata 写入、链接重建、失败回滚)都在
+# 锁**外**。于是并发场景: A 的 `_mutate_config` 提交并释放锁 → B 修改 config(覆盖 lastbak)
+# → A 的后置步骤失败 → A 用 **B 的快照**回滚, 把 B 已提交的改动静默抹掉(丢失更新)。
+# 同文件的 `_reality_port_txn` / `_hy2_port_txn` 早已是"整个事务在锁内"的形态 —— 这条路径
+# 漏了同一层保护。
+#
+# 锁域范围: config 提交 → metadata → 链接重建 → 失败回滚, 全部在 `_with_config_lock` 内。
+# **网络步骤(后量子检测)刻意留在锁外** —— 它可能耗时十几秒, 拿它占着全局 config 锁会让
+# 并发的另一会话全部撞 15s 锁超时。锁内只有本地文件写入与一次服务重启确认, 与端口事务同量级。
+# `_mutate_config` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 不会自锁死(与 _reality_port_txn 同款)。
+#
+# 参数: <tag> <meta> <new_sni> <pq_seed> <pq_verify> <rmode> <tunnel_tag>
+#       <new_tunnel_tag> <reality_target> <meta_prev>
+# 返回: 0 = 提交成功;
+#       1 = 失败但已完整回滚(原因已打印, 调用方无需再回滚);
+#       2 = 失败且回滚不完整(原因与人工核对点已打印);
+#       3 = 权威状态已提交, 仅分享链接未更新(见下, **刻意不回滚**)。
+#
+# 为什么"链接重建失败"不与另外四处后置写失败同待遇: 那一刻 config 与 metadata **都**已经是
+# 新 SNI(两者一致), 不一致的只有 metadata 里的 `.share_link` 这个**派生字段**; 而重建失败的
+# 根因是元数据本来就缺必填字段(不是本次改动造成的), 回滚并不会把它变好, 只会让这类节点永远
+# 切不了域名。九轮把"消费返回值并如实告警"作为这条路径的终态, 本轮回滚只针对**权威状态之间**
+# 的分裂, 故保持该口径(行为与改动前逐字一致)。
+# 新分享链接不回传: 锁体在**子 shell** 里跑, 变量带不出去, 而 stdout 又会被 direct 后端
+# 启动路径的 "running" 污染。成功路径直接回读 metadata 的 `.share_link` —— 它就是本事务
+# 刚刚原子写入的那个值, 比另开一条回传通道更少活动部件。
+# ---------------------------------------------------------------------------
+_reality_domain_txn() {
+    _with_config_lock _reality_domain_txn_locked "$@"
+}
+
+_reality_domain_txn_locked() {
+    local tag="$1" meta="$2" new_sni="$3" pq_seed="$4" pq_verify="$5" rmode="$6" \
+          tunnel_tag="$7" new_tunnel_tag="$8" reality_target="$9" meta_prev="${10}"
+    # 提交 config。失败时 `_mutate_config` 已自行回滚并重启, metadata 尚未改动 ⇒ 无需额外回滚。
+    if [ -n "$pq_seed" ]; then
+        _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
+             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
+             --arg newtgt "$reality_target" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+              (.serverNames = [$sni] | .mldsa65Seed = $seed
+               | if $newtgt != "" then .target = $newtgt else . end)
+              | if $tg != "" then
+                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
+                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
+                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
+                       | (if has("address") then .address = $dom else . end))
+                  | .routing.rules |= map(
+                      (if .inboundTag != null and (.inboundTag | type) == "array"
+                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                       else . end)
+                      | if .inboundTag != null and (.inboundTag | type) == "array"
+                           and (.inboundTag | index($new_tg)) != null
+                           and .domain != null
+                        then .domain = [$dom]
+                        else . end)
+                else . end' || return 1
+    else
+        _mutate_config --arg t "$tag" --arg sni "$new_sni" \
+             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
+             --arg newtgt "$reality_target" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+              (.serverNames = [$sni] | del(.mldsa65Seed)
+               | if $newtgt != "" then .target = $newtgt else . end)
+              | if $tg != "" then
+                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
+                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
+                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
+                       | (if has("address") then .address = $dom else . end))
+                  | .routing.rules |= map(
+                      (if .inboundTag != null and (.inboundTag | type) == "array"
+                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                       else . end)
+                      | if .inboundTag != null and (.inboundTag | type) == "array"
+                           and (.inboundTag | index($new_tg)) != null
+                           and .domain != null
+                        then .domain = [$dom]
+                        else . end)
+                else . end' || return 1
+    fi
+    # 更新元数据(R42: 同时回填 reality_mode, 使旧节点元数据自描述)
+    if [ -n "$new_tunnel_tag" ]; then
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
+    elif [ "$rmode" = "direct" ]; then
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | del(.tunnel_port) | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
+    else
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
+    fi
+    # R38(M10): 消费 rebuild 返回码 —— SNI 已改, 但链接重建失败时不能写入空/坏链接
+    local newlink=""
+    if ! newlink=$(_rebuild_reality_link "$meta") || [ -z "$newlink" ]; then
+        _warn "域名已切换为 ${new_sni}, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
+        _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
+        return 3
+    fi
+    _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || {
+        _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
+    return 0
 }
 
 _reality_domain_menu() {
@@ -1502,79 +1619,22 @@ _reality_domain_menu() {
     local _reality_meta_prev=""
     _reality_meta_prev=$(cat "$meta" 2>/dev/null) || _reality_meta_prev=""
 
-    if [ -n "$pq_seed" ]; then
-        if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
-             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
-             --arg newtgt "$reality_target" \
-             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-              (.serverNames = [$sni] | .mldsa65Seed = $seed
-               | if $newtgt != "" then .target = $newtgt else . end)
-              | if $tg != "" then
-                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
-                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
-                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
-                       | (if has("address") then .address = $dom else . end))
-                  | .routing.rules |= map(
-                      (if .inboundTag != null and (.inboundTag | type) == "array"
-                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
-                       else . end)
-                      | if .inboundTag != null and (.inboundTag | type) == "array"
-                           and (.inboundTag | index($new_tg)) != null
-                           and .domain != null
-                        then .domain = [$dom]
-                        else . end)
-                else . end'; then
-            _error "域名切换失败, 已回滚"; _press_any_key; continue
-        fi
-    else
-        if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" \
-             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
-             --arg newtgt "$reality_target" \
-             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-              (.serverNames = [$sni] | del(.mldsa65Seed)
-               | if $newtgt != "" then .target = $newtgt else . end)
-              | if $tg != "" then
-                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
-                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
-                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
-                       | (if has("address") then .address = $dom else . end))
-                  | .routing.rules |= map(
-                      (if .inboundTag != null and (.inboundTag | type) == "array"
-                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
-                       else . end)
-                      | if .inboundTag != null and (.inboundTag | type) == "array"
-                           and (.inboundTag | index($new_tg)) != null
-                           and .domain != null
-                        then .domain = [$dom]
-                        else . end)
-                else . end'; then
-            _error "域名切换失败, 已回滚"; _press_any_key; continue
-        fi
-    fi
-
-    # 更新元数据 + 分享链接(R42: 同时回填 reality_mode, 使旧节点元数据自描述)
-    if [ -n "$new_tunnel_tag" ]; then
-        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" --arg rm "$rmode" || {
-                _reality_switch_rollback "$meta" "$_reality_meta_prev"; _press_any_key; continue; }
-    elif [ "$rmode" = "direct" ]; then
-        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | del(.tunnel_port) | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
-                _reality_switch_rollback "$meta" "$_reality_meta_prev"; _press_any_key; continue; }
-    else
-        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
-                _reality_switch_rollback "$meta" "$_reality_meta_prev"; _press_any_key; continue; }
-    fi
-    # R38(M10): 消费 rebuild 返回码 —— SNI 已改, 但链接重建失败时不能写入空/坏链接
-    local newlink
-    if ! newlink=$(_rebuild_reality_link "$meta") || [ -z "$newlink" ]; then
-        _warn "域名已切换为 ${new_sni}, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
-        _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
+    # config 提交 + metadata + 链接重建 + 失败回滚 —— 一个整体事务, 全程持 config 锁(十轮 P1-③)。
+    # 旧写法只有中间那一次 `_mutate_config` 在锁内, 后置步骤失败时的回滚读的是**共享**的
+    # lastbak, 可能已被并发会话覆盖 ⇒ 回滚会抹掉别人已提交的改动。
+    _reality_domain_txn "$tag" "$meta" "$new_sni" "$pq_seed" "$pq_verify" "$rmode" \
+        "$tunnel_tag" "$new_tunnel_tag" "$reality_target" "$_reality_meta_prev"
+    local txn_rc=$?
+    if [ "$txn_rc" -ne 0 ]; then
+        # 1 = 失败但已完整回滚 / 2 = 回滚不完整 / 3 = 权威状态已提交但链接未更新。
+        # 三种都由事务体自己打印了原因与后续动作, 这里只补一句"改动未完成"的总括。
+        [ "$txn_rc" -eq 2 ] && _tip "本次改动未完成, 请按上方提示人工核对后重试"
         _press_any_key; continue
     fi
-    _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || {
-        _reality_switch_rollback "$meta" "$_reality_meta_prev"; _press_any_key; continue; }
+    # 成功路径: 分享链接即 metadata 里刚原子提交的那一份
+    local newlink=""
+    newlink=$(jq -r '.share_link // empty' "$meta" 2>/dev/null)
+    [ -n "$newlink" ] || _warn "未能读回新分享链接, 请用 [查看节点] 查看: $meta"
     # F1: servername(域名)变化需同步 clash 派生缓存, 否则订阅仍指向旧伪装域名。
     # **返回值必须消费**(2026-09-22 九轮 OCR #45): clash 是可再生的派生缓存, 失败**不回滚**
     # 权威状态(与 hy2 侧同口径), 但"报成功却仍指向旧域名"必须让用户看见。

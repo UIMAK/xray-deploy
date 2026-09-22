@@ -123,10 +123,18 @@ _logrotate_write_config() {
         return 1
     fi
     # 上一版完整内容(可能为空 = 本次是新建)。**必须在写之前读**, 写失败后再读就只剩半截。
+    # **读失败必须中止, 不能降级成"旧配置为空"**(2026-09-22 十轮 P2)。旧写法 `|| prev=""`
+    # 把读取失败(权限/IO/文件被删)静默变成空串, 而 had_prev 仍记 1; 于是后面只要写新配置
+    # 失败, `_logrotate_restore_prev` 就会拿这个空串去"还原上一版", 把**原本可用的配置写成
+    # 空文件** —— 正是这条路径本身要防的事(九轮 #32)。前提是"文件存在": 存在却读不出来,
+    # 任何一种原因都不等于"没有旧配置", 故中止比猜安全。
     local prev="" had_prev=0
     if [ -f "$LOGROTATE_CONF" ]; then
+        if ! prev=$(cat "$LOGROTATE_CONF" 2>/dev/null); then
+            _error "无法读取现有 logrotate 配置, 为免破坏它已取消本次修改: $LOGROTATE_CONF"
+            return 1
+        fi
         had_prev=1
-        prev=$(cat "$LOGROTATE_CONF" 2>/dev/null) || prev=""
     fi
     # 重定向失败(只读 fs / 磁盘满 / 目录缺失)必须显式判定 —— 裸 `cat > f` 之后若紧跟
     # `chmod ... || true`, 函数返回码会被洗成 0, 调用方据此把 state 置为"已启用"却没有
