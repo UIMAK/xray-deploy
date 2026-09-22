@@ -109,6 +109,11 @@ _ensure_cron_running() {
             fi
             return 1
             ;;
+        # 兜底: INIT_SYSTEM 为空/未知(探测失败或未来新增 init 类型)时**必须返回 1**。
+        # 没有这个分支时, case 无匹配 → 函数隐式返回 case 的退出码 0 → 调用方当作
+        # "cron 已就绪", 写入 crontab 并把 state 标成 on, 而实际没有任何守护进程在跑
+        # (显示已开启但永不执行的静默失败)。
+        *) return 1 ;;
     esac
 }
 
@@ -117,9 +122,20 @@ _ensure_cron_running() {
 # ---------------------------------------------------------------------------
 _geo_update() {
     _ensure_dirs || return 1
-    # M26: cron 环境下 _info/_warn 输出到 stdout 会产生噪音邮件, 重定向到日志
+    # M26: cron 环境下 _info/_warn 输出到 stdout 会产生噪音邮件, 重定向到日志。
+    # 日志目录必须先建好: `exec >> file` 在目录缺失时会让**整个函数后续输出**丢失或被
+    # bash 拒绝重定向 —— 更新过程的诊断信息全没了, 且这个失败发生在最需要日志的 cron 场景。
+    # 重定向失败时降级继续(日志问题不该中断更新)。
     if [ ! -t 0 ]; then
-        exec >> "$GEO_LOG" 2>&1
+        # 先**探测可写性**再重定向: `exec` 是特殊内建, 重定向失败在非交互 shell 里会直接
+        # 终止 shell(bash posix 模式 rc=1 / dash rc=2), 于是 `|| _warn` 分支永远不会执行,
+        # "降级继续"的意图落空, 更新被日志问题打断。
+        mkdir -p "$LOG_DIR" 2>/dev/null
+        if ( : >> "$GEO_LOG" ) 2>/dev/null; then
+            exec >> "$GEO_LOG" 2>&1
+        else
+            _warn "无法写入日志 $GEO_LOG, 本次输出未落盘"
+        fi
     fi
     # R38(M5): mktemp -d 失败必须中止 —— 否则 tmp="" 会让 t="/geosite.dat", 两个 20MB+
     # 的 dat 被下载到根目录, 且末尾 rm -rf "$tmp" 变成 rm -rf "" 空操作, 文件永久残留。
@@ -147,9 +163,19 @@ _geo_update() {
         # 覆盖前备份旧 dat (S9: 运行期校验失败或部分下载失败时可回退)。
         # 备份必须真正成功才允许覆盖: 磁盘满/IO 错误导致 cp 失败时, 若继续 mv 会让旧 dat
         # 无备份可回滚 → 数据集不一致。备份失败则保留旧文件、本次不替换。
+        # 除 cp 的返回码外还要验**体积一致**: 磁盘满时 cp 可能返回 0 却只落地半截文件,
+        # 之后回滚流程会把这份损坏备份 mv 回 $ASSET_DIR, 覆盖掉唯一可用的旧 dat。
         if [ -f "$dest" ]; then
             if ! cp -f "$dest" "$dest.bak"; then
                 _warn "$f 旧文件备份失败(磁盘空间/IO?), 保留旧文件, 跳过本次替换"
+                ok=0; rm -f "$t"; continue
+            fi
+            local _osz _bsz
+            _osz=$(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest" 2>/dev/null || echo 0)
+            _bsz=$(stat -c%s "$dest.bak" 2>/dev/null || stat -f%z "$dest.bak" 2>/dev/null || echo 0)
+            if [ "$_osz" -le 0 ] || [ "$_bsz" != "$_osz" ]; then
+                _warn "$f 旧文件备份不完整(${_bsz}B != ${_osz}B), 保留旧文件, 跳过本次替换"
+                rm -f "$dest.bak"
                 ok=0; rm -f "$t"; continue
             fi
             backed+=("$dest")
@@ -257,9 +283,14 @@ _geo_set_auto_update() {
                 local gd
                 gd=$(_geo_geodata_json) || { _error "生成 geodata 配置失败"; return 1; }
                 if _mutate_config --argjson gd "$gd" '.geodata = $gd'; then
-                    # 清理旧 cron 机制(幂等), 旧 state 一并清掉 —— 新机制以 config 为真相
-                    _geo_remove_cron_line >/dev/null 2>&1
-                    _state_set geo_cron "off" 2>/dev/null || true
+                    # 清理旧 cron 机制(幂等), 旧 state 一并清掉 —— 新机制以 config 为真相。
+                    # 两条清理路径失败只告警: 此处 config 已是真相, 残留的 cron 行/state 是
+                    # 冗余而非分裂(_geo_auto_mechanism 先读 config)。但必须说出来 —— 静默吞掉
+                    # 会让用户以为旧机制已拆干净。
+                    _geo_remove_cron_line >/dev/null 2>&1 || \
+                        _warn "旧系统 cron 行未能移除, 请手动检查 crontab (${GEO_CRON_MARKER})"
+                    _state_set geo_cron "off" 2>/dev/null || \
+                        _warn "旧 geo_cron 状态未能清除(内置定时已生效, 不影响功能)"
                     _success "Geo 自动更新已开启 (Xray 内置: $GEO_CRON_EXPR, 热重载, 无需系统 cron)"
                     return 0
                 fi
@@ -270,19 +301,28 @@ _geo_set_auto_update() {
             _geo_set_auto_update_cron on
             ;;
         off)
-            # 先移除 config geodata(若有), 再清旧 cron 行与旧 state —— 两条路径都关干净
-            local has_gd=0
+            # 先移除 config geodata(若有), 再清旧 cron 行与旧 state —— 两条路径都关干净。
+            # 注意顺序与失败处理: config 删除失败时 _mutate_config 已回滚(geodata 仍在),
+            # 但**仍要继续清 cron 行/state** —— 否则用户被告知"关闭失败"却留下一份仍在跑的
+            # 系统 cron 任务(无人值守地每月执行本脚本), 与"关干净"的承诺相反。
+            local has_gd=0 off_failed=0
             if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
                 has_gd=$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null || echo 0)
             fi
             if [ "$has_gd" = "1" ]; then
                 if ! _mutate_config 'del(.geodata)'; then
-                    _error "移除 geodata 配置失败(配置已回滚)"
-                    return 1
+                    _error "移除 geodata 配置失败(配置已回滚), 继续清理系统 cron 任务"
+                    off_failed=1
                 fi
             fi
-            _geo_remove_cron_line >/dev/null 2>&1
-            _state_set geo_cron "off" 2>/dev/null || true
+            _geo_remove_cron_line >/dev/null 2>&1 || {
+                _warn "系统 cron 行未能移除, 请手动检查 crontab (${GEO_CRON_MARKER})"
+                off_failed=1
+            }
+            _state_set geo_cron "off" 2>/dev/null || _warn "geo_cron 状态写入失败, 状态显示可能不准"
+            if [ "$off_failed" -eq 1 ]; then
+                return 1
+            fi
             _success "Geo 自动更新已关闭"
             ;;
         *) _warn "未知动作: $action"; return 1 ;;
@@ -303,11 +343,18 @@ _geo_set_auto_update_cron() {
 
     case "$action" in
         on)
-            # 先去重: 移除已有 marker 行
-            _geo_remove_cron_line >/dev/null 2>&1
-            ( crontab -l 2>/dev/null; echo "$cron_line" ) | crontab - 2>/dev/null || {
+            # 去重 + 写入一次完成。读 crontab 失败时 _crontab_replace 返回 1 且**不改动**
+            # 现有 crontab —— 旧的 `(crontab -l; echo) | crontab -` 在读失败时会把用户的
+            # 全部定时任务覆盖成只剩我们这一行。
+            # 混装旧 lib 时该函数不存在: 写路径必须响亮拒绝(见 _geo_remove_cron_line 的说明)。
+            if ! declare -F _crontab_replace >/dev/null 2>&1; then
+                _error "lib 版本过旧(00-common 缺 _crontab_replace), 无法写入 crontab"
+                _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+                return 1
+            fi
+            if ! _crontab_replace "$GEO_CRON_MARKER" "$cron_line"; then
                 _error "写入 crontab 失败"; return 1
-            }
+            fi
             # 确保 cron 服务运行; 失败时回滚刚写入的 crontab 行, 保证
             # state=off ⇔ 项目 cron entry 不存在, 避免 daemon 恢复后无状态执行。
             if _ensure_cron_running; then
@@ -368,7 +415,16 @@ _auto_migrate_geo_autoupdate() {
 }
 
 _geo_remove_cron_line() {
-    crontab -l 2>/dev/null | grep -v "$GEO_CRON_MARKER" | crontab - 2>/dev/null
+    # 混装旧 lib(00-common 是旧版)时该函数不存在 —— 这是**写路径**, 按项目契约必须
+    # 响亮拒绝并给出可执行提示, 而不是让 set -u/command-not-found 抛出晦涩错误,
+    # 也绝不能退回旧的裸管道写法(读失败会清空用户全部 crontab)。
+    if ! declare -F _crontab_replace >/dev/null 2>&1; then
+        _error "lib 版本过旧(00-common 缺 _crontab_replace), 已跳过 crontab 清理"
+        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+        return 1
+    fi
+    # 读失败 → 返回 1 且不改动 crontab(旧实现会清空用户全部定时任务, 详见 00-common 注释)
+    _crontab_replace "$GEO_CRON_MARKER"
 }
 
 # ---------------------------------------------------------------------------

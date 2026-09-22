@@ -552,7 +552,17 @@ _hysteria_proc_tree_has_bin() {
     local depth=4   # 见上方契约说明: 实现假设, 超出即返回 1(fail-closed)
     [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
     [ "$anchor" != "0" ] || return 1
-    _proc_exe_is "$anchor" "$HYSTERIA_BIN" && return 0
+    # **必须用严格版**: 本函数的契约是 fail-closed(见上方说明), 而 _proc_exe_is 在读不到
+    # /proc/<pid>/exe 时**放行**(那是为判活设计的语义)。用宽松版会让"看不清"被当成"确认
+    # 归属", 于是下面去 kill 一个可能属于他方的 supervisor —— 与本函数声明的保证相反。
+    # 混装旧 lib(00-common 是旧版)时严格版不存在: 按项目惯例用 declare -F 守卫, 此时**拒绝**
+    # (即 fail-closed —— 与契约一致, 而不是 command-not-found 噪声后碰巧返回 1)。
+    if declare -F _proc_exe_is_strict >/dev/null 2>&1; then
+        _proc_exe_is_strict "$anchor" "$HYSTERIA_BIN" && return 0
+    else
+        _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认进程归属, 跳过"
+        return 1
+    fi
     for p in /proc/[0-9]*; do
         c="${p#/proc/}"
         cur="$c"
@@ -560,7 +570,7 @@ _hysteria_proc_tree_has_bin() {
         while [ "$i" -lt "$depth" ]; do
             cur=$(_proc_ppid "$cur") || break
             if [ "$cur" = "$anchor" ]; then
-                _proc_exe_is "$c" "$HYSTERIA_BIN" && return 0
+                _proc_exe_is_strict "$c" "$HYSTERIA_BIN" && return 0
                 break
             fi
             if [ "$cur" = "1" ] || [ "$cur" = "0" ]; then break; fi

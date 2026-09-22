@@ -41,8 +41,13 @@ _detect_os_family() {
                 *)
                     # 衍生版(Mint/Kali/Raspbian/Devuan/Pop!_OS 等)通过 ID_LIKE 归类
                     # R38(M2): 同时覆盖 alpine 系衍生版(postmarketOS 等), 否则它们会落到
-                    # echo "$ID" 而被 _pkg_install 判为"不支持的系统"
-                    case " ${ID_LIKE:-} " in
+                    # echo "$ID" 而被 _pkg_install 判为"不支持的系统"。
+                    # ID_LIKE 的官方格式是空格分隔, 但实际发行版也出现过逗号/制表符分隔
+                    # (如 ID_LIKE=debian,ubuntu)。先归一化分隔符, 否则这类衍生版会掉进
+                    # 兜底分支被误判为"不支持的系统"。
+                    local _like
+                    _like=$(printf '%s' "${ID_LIKE:-}" | tr ',\t' '  ')
+                    case " ${_like} " in
                         *" debian "*|*" ubuntu "*) echo "debian" ;;
                         *" alpine "*)              echo "alpine" ;;
                         *) echo "${ID:-unknown}" ;;
@@ -74,23 +79,41 @@ _detect_arch() {
 # 用法:_pkg_install <pkg1> [pkg2 ...]
 # ---------------------------------------------------------------------------
 _pkg_install() {
-    local fam pkgs="$*"
+    local fam pkgs="$*" p
+    # 选项注入防护: $pkgs 故意不加引号(需要按空白拆成多参数), 于是以 "-" 开头的名字会被
+    # apt/apk 当成选项(如 --assume-yes)。调用方目前都传字面量, 但这是公共 helper
+    # (50-nodes/20-xray-core/45-logrotate 都在用), 故在入口拒绝。
+    for p in "$@"; do
+        case "$p" in
+            -*) _error "非法包名(不得以 - 开头): $p"; return 1 ;;
+        esac
+    done
     fam=$(_detect_os_family)
     _info "安装依赖: $pkgs"
     case "$fam" in
         alpine)
+            command -v apk >/dev/null 2>&1 || { _error "apk 不可用, 无法安装: $pkgs"; return 1; }
             apk add --no-cache $pkgs >/dev/null 2>&1 || {
                 _error "apk 安装失败: $pkgs"
                 return 1
             }
             ;;
         debian)
+            command -v apt-get >/dev/null 2>&1 || { _error "apt-get 不可用, 无法安装: $pkgs"; return 1; }
             # DEBIAN_FRONTEND=noninteractive 防交互卡住(时区/服务重启提示)
             # --no-install-recommends 省空间(小机器友好)
+            # DPkg::Lock::Timeout: 另一个 apt/unattended-upgrades 持锁时等待而非立即失败
+            #   (旧行为只报一句无信息的"apt 安装失败"); -- 终止选项解析(双保险)。
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq >/dev/null 2>&1
-            apt-get install -y -qq --no-install-recommends $pkgs >/dev/null 2>&1 || {
-                _error "apt 安装失败: $pkgs"
+            # update 失败/超时不再被无视: 无网络或源坏时 install 必然失败, 这里先给出原因;
+            # 加 timeout 避免挂死的镜像源永久阻塞启动。
+            if command -v timeout >/dev/null 2>&1; then
+                timeout 120 apt-get update -qq >/dev/null 2>&1 || _warn "apt-get update 失败或超时(继续尝试安装)"
+            else
+                apt-get update -qq >/dev/null 2>&1 || _warn "apt-get update 失败(继续尝试安装)"
+            fi
+            apt-get -o DPkg::Lock::Timeout=60 install -y -qq --no-install-recommends -- $pkgs >/dev/null 2>&1 || {
+                _error "apt 安装失败: $pkgs (网络/软件源/磁盘空间或 dpkg 被占用?)"
                 return 1
             }
             ;;
