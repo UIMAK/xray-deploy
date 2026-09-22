@@ -547,29 +547,114 @@ _cf_unit_path() {
 }
 
 # ---------------------------------------------------------------------------
+# 包装器的"取参选项"表 + 前置位置参数个数(2026-09-21 七轮复审 P2)。
+#
+# 为什么需要: 旧实现纯靠"词法外观"判断 —— `-*` 跳过、NAME=value 跳过、纯数字跳过、其余
+# 含非数字的词即视为二进制。而包装器的**选项取值**恰好长得像个路径(含非数字、不以 `-` 开头),
+# 于是被当成二进制。实测: `env -u FOO /opt/custom/cloudflared` → 返回 `FOO`;
+# `setpriv --reuid root ...` → `root`; `timeout --signal TERM 5 ...` → `TERM`;
+# `taskset -c 0x1 ...` → `0x1`。期望路径随即变成一个**不存在的词**, `command -v` 失败 =>
+# 回退 `$CF_BIN` => 我们自己的实例被判成"别人家"而永不杀 = 静默双实例。
+# **更危险的一支**: 当被吞掉的取值本身是**已存在的绝对路径**时(实测 `env -C /tmp` → `/tmp`),
+# `command -v /tmp` 成功 => 连 `$CF_BIN` 回退都不触发, 返回一个**确定的错路径**。
+#
+# 表内容**逐条来自 `--help` 实测**(coreutils 9.x), 不是猜的。两个陷阱项按实测处理:
+#   · `env --ignore-signal/--default-signal/--block-signal` 是**可选参数**(`[=<SIG>]`):
+#     实测 `env --ignore-signal TERM cmd` 会把 TERM 当成要执行的命令(rc=127), 只有
+#     `=TERM` 形态才吃参数 ⇒ **不得**列进表里, 否则会吞掉真二进制。
+#   · `taskset -c/--cpu-list` 是 **flag 而非取参选项**: 实测 `taskset --cpu-list=0-3` 报
+#     "option '--cpu-list' doesn't allow an argument" ⇒ mask 是**前置位置参数**。
+# 只匹配**完整 token**(用 `case " $tbl "` 精确匹配), 因此粘连形态(`-n5`/`-oL`/`-uFOO`/
+# `--signal=TERM`)天然不命中、不消费下一个词 —— 它们本就自带取值。
+# ---------------------------------------------------------------------------
+_cf_opt_takes_value() { # <包装器名> <token> ; 0 = 该 token 的取值是下一个词
+    local w="$1" t="$2" tbl=""
+    case "$w" in
+        env)     tbl='-C --chdir -f --file -u --unset -S --split-string -a --argv0' ;;
+        nice)    tbl='-n --adjustment' ;;
+        ionice)  tbl='-c --class -n --classdata -p --pid -P --pgid -u --uid' ;;
+        setpriv) tbl='--ambient-caps --inh-caps --bounding-set --ruid --euid --rgid --egid --reuid --regid --groups --securebits --pdeathsig --ptracer --selinux-label --apparmor-profile --landlock-access --landlock-rule --seccomp-filter' ;;
+        timeout) tbl='-k --kill-after -s --signal' ;;
+        chrt)    tbl='-T --sched-runtime -P --sched-period -D --sched-deadline' ;;
+        stdbuf)  tbl='-i --input -o --output -e --error' ;;
+        exec)    tbl='-a' ;;
+        *)       return 1 ;;
+    esac
+    case " $tbl " in
+        *" $t "*) return 0 ;;
+    esac
+    return 1
+}
+
+# 链式包装器下必须按"**已见过的所有**包装器"判定取参选项, 不能只看当前这一个。
+#
+# 根因(2026-09-22 七轮复审实测): `_wrap` 若只记最新者, 则 `nohup env -C /tmp <bin>` 里
+# `-C` 是 env 的取参选项, 但当前包装器是 `nohup`(表里没有 `-C`) => `/tmp` 被当成二进制返回。
+# 反之若只记首个, 则 `nohup env -C /tmp <bin>` 里 `_wrap=nohup` 同样漏掉 `-C`。
+# 两种"只记一个"都错, 故取并集: 任一已见包装器把该 token 当取参选项, 就消费它的取值。
+# 实测(`.scratch` 驱动, 68 条用例): 并集版"第三值"(既非真二进制也非 $CF_BIN)为 0,
+# 而只记首个/只记最新者各有残留。
+_cf_opt_seen_takes_value() { # <已见包装器串> <token>
+    local w
+    for w in $1; do
+        _cf_opt_takes_value "$w" "$2" && return 0
+    done
+    return 1
+}
+
+_cf_wrap_pos_count() { # <包装器名> -> 该包装器在真命令前有几个"前置位置参数"
+    case "$1" in
+        timeout|chrt|taskset) printf '%s' 1 ;;   # DURATION / PRIORITY / MASK
+        *)                    printf '%s' 0 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # 从一段命令行文本里取出第一个"看起来是二进制"的词; 找不到返回 1。
 #
-# 三类东西必须跳过, 否则期望路径会指向包装器而不是我们真正的二进制, 于是 _cf_pids_owned
-# 把我们**自己**的运行实例判成"别人家"而永不杀 —— 静默双实例(本函数族存在的唯一理由):
+# 四类东西必须跳过, 否则期望路径会指向包装器(或它的选项取值)而不是我们真正的二进制, 于是
+# _cf_pids_owned 把我们**自己**的运行实例判成"别人家"而永不杀 —— 静默双实例(本函数族存在的
+# 唯一理由):
 #   1. 包装器本身: env/nice/ionice/setpriv/timeout/chrt/taskset/busybox/nohup/setsid/stdbuf/exec
 #      (发行版生成的单元常写 ExecStart=/usr/bin/env cloudflared ...)
-#   2. 包装器的参数: 以 - 开头, 或纯数字(nice 的优先级 / timeout 的秒数)
-#   3. 环境赋值 NAME=value —— 2026-09-21 复审实测: `/usr/bin/env FOO=bar cloudflared tunnel run`
+#   2. 包装器的**取参选项的取值**(`env -u FOO` 的 FOO)与**前置位置参数**
+#      (`timeout 30` 的 30 / `taskset 0x1` 的 0x1)—— 见上方 _cf_opt_takes_value
+#   3. 以 - 开头的选项本身, 或纯数字(nice 的优先级 / timeout 的秒数)
+#   4. 环境赋值 NAME=value —— 2026-09-21 复审实测: `/usr/bin/env FOO=bar cloudflared tunnel run`
 #      下旧实现返回 FOO=bar(它含非数字, 被判成二进制), 期望路径随即变成 FOO=bar。
 # `sh -c '命令串'` 再往命令串里解析一次(限深度): 旧实现返回 /bin/sh, 同样导致双实例。
 # 每个词都剥一层成对引号, 这样 command="..." 与 sh -c "..." 两种写法都不必特殊处理。
+#
+# 结构保持 2026-09-21 之前的形态(包装器白名单 + sh -c 数组切片递归 + NAME=value/纯数字跳过),
+# 只在上面**叠加**选项感知, 不做整体重写 —— 实测把本函数重写成"包装器分支吞掉一切"的状态机
+# 会让 `env sh -c "exec ..."` / `busybox sh -c "..."` / `nice -n 5 sh -c "..."` 返回 `sh`,
+# 而 `command -v sh` 成功 => `$CF_BIN` 回退不触发 => 恰好制造本函数要防的静默双实例。
 _cf_first_bin_word() {
     local text="$1" depth="${2:-0}" tok inner
     local -a _w
     read -ra _w <<< "$text"
-    local _i _next
+    local _i _next _wrap="" _seen="" _wantarg=0 _pos=0
     for ((_i=0; _i<${#_w[@]}; _i++)); do
         tok="${_w[$_i]}"
         tok="${tok#\"}"; tok="${tok%\"}"
         tok="${tok#\'}"; tok="${tok%\'}"
         [ -n "$tok" ] || continue
+        # 上一轮判定"这个选项的取值是下一个词" => 消费掉它, 不做任何判断
+        if [ "$_wantarg" -eq 1 ]; then _wantarg=0; continue; fi
         case "${tok##*/}" in
             env|nice|ionice|setpriv|timeout|chrt|taskset|busybox|nohup|setsid|stdbuf|exec)
+                # 链式包装器(`nohup env ...` / `timeout 30 env ...` / `busybox taskset ...`)下:
+                #   · `_seen` 累积**每一个**已见包装器 —— 取参选项的判定取并集(见
+                #     _cf_opt_seen_takes_value 上方的说明);
+                #   · `_wrap` 记**最新**者, `_pos` 随它重算 —— 位置参数属于最近那个包装器
+                #     (`timeout 30 env <bin>` 的 30 是 timeout 的, env 没有)。
+                # 两者都不可退化为"只记一个": 只记首个会让 `nohup env -C /tmp <bin>` 漏判
+                # `-C`(nohup 表里没有) => 返回 /tmp 这个**确定错路径**; 只记最新者会让
+                # `nohup env -C /tmp <bin>` 同样漏判(最新者是 env, 但 `-C` 要靠 env 的表 ——
+                # 实测该形态两者皆错, 故必须并集)。取 basename 是因为单元里常写绝对路径。
+                _wrap="${tok##*/}"
+                _seen="$_seen $_wrap"
+                _pos=$(_cf_wrap_pos_count "$_wrap")
                 continue ;;
             sh|bash|dash|ash|ksh|zsh)
                 _next="${_w[$((_i+1))]:-}"
@@ -592,8 +677,30 @@ _cf_first_bin_word() {
                 fi
                 printf '%s' "$tok"; return 0 ;;
         esac
+        # 选项: 若任一**已见**包装器把它当取参选项, 则它的取值是下一个词。
+        # 只在见过包装器之后才判定, 使本改动的影响面严格限于包装器命令行。
+        if [ -n "$_seen" ] && [ "${tok#-}" != "$tok" ] && _cf_opt_seen_takes_value "$_seen" "$tok"; then
+            # `env -S/--split-string` 的取值**本身就是一条命令串**(与 `sh -c` 同构, 空格分隔的
+            # 一个词), 必须递归解析 —— 否则整串被当作"选项取值"吞掉, 函数返回 1,
+            # `_cf_service_bin` 回退 `$CF_BIN`(二进制在非默认路径时归属判定即失效)。
+            # 实测: 加此分支前 `env -S "<bin> tunnel run"` 返回 $CF_BIN, 加后返回 <bin>。
+            case "${tok##*/}" in
+                -S|--split-string)
+                    if [ "$depth" -lt 2 ] && [ -n "${_w[$((_i+1))]:-}" ]; then
+                        inner="${_w[*]:$((_i+1))}"
+                        _cf_first_bin_word "$inner" $((depth+1))
+                        return $?
+                    fi ;;
+            esac
+            _wantarg=1
+            continue
+        fi
         case "$tok" in
             -*) continue ;;
+        esac
+        # 包装器在真命令前的前置位置参数(如 `timeout 30` 的 30)
+        if [ "$_pos" -gt 0 ]; then _pos=$((_pos-1)); continue; fi
+        case "$tok" in
             [A-Za-z_]*=*) continue ;;   # NAME=value => 环境赋值
             *[!0-9]*) printf '%s' "$tok"; return 0 ;;   # 含非数字 => 这就是二进制
             *) continue ;;                              # 纯数字 => 包装器的参数
