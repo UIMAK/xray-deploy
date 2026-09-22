@@ -35,7 +35,9 @@ _print_status_bar() {
         local ver=""
         ver=$(_xray_cached_version 2>/dev/null)
         [ -n "$ver" ] && xver=" v${ver}"
-        xchannel=$(_state_get channel 2>/dev/null); [ -z "$xchannel" ] && xchannel="?"
+        # 通道名来自 state 文件(可被本地写坏/篡改), 且会被 echo -e 打屏 —— 先净化,
+        # 只保留版本号类安全字符, 避免转义序列注入管理员终端。
+        xchannel=$(_sanitize_token "$(_state_get channel 2>/dev/null)") || xchannel="?"
         local st; st=$(_manage_xray status 2>/dev/null)
         if [ "$st" = "running" ]; then
             xstatus="${GREEN}● 运行中${NC}"
@@ -289,6 +291,31 @@ _check_config() {
 # ---------------------------------------------------------------------------
 # 定时重启 菜单
 # ---------------------------------------------------------------------------
+# cron 单字段结构校验(比"字符集 + 含数字或 *"严格得多)。
+# 旧写法 ^[0-9*,/-]*[0-9*][0-9*,/-]*$ 只保证"含数字或 *", 于是 */ 、1- 、-1 、1--2 、1,2, 这些
+# 结构畸形字段照样放行 —— 用户看到"已设置", 直到 cron 运行才报解析错误, 正是该处注释声称
+# 要消除的失败形态。现在按 cron 的真实语法逐项校验: 逗号列表的每一项必须是
+# * | N | N-M | */S | N-M/S, 且逗号不得出现在首尾或连续出现。
+# 只做结构校验, 不硬编码"分 0-59 / 时 0-23"的取值范围 —— 取值范围交给 cron,
+# 在这里写死会让合法的自定义表达式被误拒。
+_cron_field_valid() {
+    local f="$1" x
+    [ -n "$f" ] || return 1
+    case "$f" in ,*|*,|*,,*) return 1 ;; esac
+    local -a _parts
+    IFS=',' read -ra _parts <<< "$f"
+    for x in "${_parts[@]}"; do
+        [[ "$x" =~ ^(\*|[0-9]+)(-[0-9]+)?(/[0-9]+)?$ ]] || return 1
+        # 步长为 0 是**结构非法**(cron 直接报解析错误), 不属于"取值范围交给 cron"的范畴:
+        # */0 / 0-30/0 都能通过上面的正则, 却让用户看到"已设置"后运行时才失败。
+        case "$x" in
+            */0) return 1 ;;
+            */0[0-9]*) return 1 ;;
+        esac
+    done
+    return 0
+}
+
 _timed_restart_menu() {
     local choice
     clear
@@ -328,10 +355,15 @@ _timed_restart_menu() {
                 _warn "cron 表达式须为 5 个字段(分 时 日 月 周), 已取消"
                 _press_any_key; return
             fi
-            local _cw
+            local _cw _bad=""
             for _cw in "${_ce[@]}"; do
-                [[ "$_cw" =~ ^[0-9*,/-]+$ ]] || { _warn "cron 字段含非法字符: ${_cw}"; _press_any_key; return; }
+                _cron_field_valid "$_cw" || _bad="$_cw"
             done
+            if [ -n "$_bad" ]; then
+                _warn "cron 字段无效: ${_bad}"
+                _tip "每字段形如 * | N | N-M | */S | N-M/S | 逗号列表; 例如 0 */3 * * *"
+                _press_any_key; return
+            fi
             ;;
         5)
             _timed_restart_disable
@@ -345,11 +377,22 @@ _timed_restart_menu() {
     esac
     [ -z "$cron_expr" ] && { _press_any_key; return; }
     cron_line="${cron_expr} ${cmd_path} timed-restart ${marker}"
+    # 混装旧 lib(00-common 是旧版)时 _crontab_replace 不存在: 这是写路径, 必须响亮拒绝并
+    # 给出可执行提示, 绝不能退回旧的裸管道写法(读失败会清空用户全部 crontab)。
+    if ! declare -F _crontab_replace >/dev/null 2>&1; then
+        _error "lib 版本过旧(00-common 缺 _crontab_replace), 无法写入 crontab"
+        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+        _press_any_key; return
+    fi
     # 先确保 cron 服务运行(M20: 无 cron 的全新 Alpine 上先装 cron 再写 crontab)
     local cron_ok=0
     _ensure_cron_running && cron_ok=1
-    # 删除旧行 + 写入新行
-    (crontab -l 2>/dev/null | grep -v "$marker"; echo "$cron_line") | crontab - 2>/dev/null || { _error "写入 crontab 失败"; _press_any_key; return; }
+    # 删除旧行 + 写入新行。读 crontab 失败时 _crontab_replace 返回 1 且不改动现有内容 ——
+    # 旧的 `(crontab -l; echo) | crontab -` 在读失败时会把用户的全部定时任务覆盖掉。
+    if ! _crontab_replace "$marker" "$cron_line"; then
+        _error "写入 crontab 失败"
+        _press_any_key; return
+    fi
     mkdir -p "$STATE_DIR"
     if [ "$cron_ok" -eq 1 ]; then
         _state_set timed_restart "$cron_expr"
@@ -357,8 +400,13 @@ _timed_restart_menu() {
     else
         # 回滚刚写入的 crontab 行, 保证 state=off ⇔ 项目 cron entry 不存在;
         # 回滚失败要暴露, 不能静默。
-        if ! (crontab -l 2>/dev/null | grep -v "$marker") | crontab - 2>/dev/null; then
+        if ! _crontab_replace "$marker"; then
+            # 回滚失败 => cron 行可能仍在。此时**不能**写 state=off, 否则就是"UI 说已关、
+            # cron 还在跑"的分裂状态(与 _timed_restart_disable 同一口径)。
             _warn "crontab 回滚失败, 请手动检查项目定时任务 (${marker})"
+            _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
+            _warn "cron 守护进程未能启动, 定时重启可能未完全取消"
+            _press_any_key; return
         fi
         _warn "cron 守护进程未能启动, 定时重启已取消"
         _tip "请确保系统中有 cron 守护进程, 安装后重试"
@@ -372,12 +420,46 @@ _timed_restart_menu() {
 # ---------------------------------------------------------------------------
 _timed_restart_disable() {
     local marker="# xray-deploy-timed-restart"
-    if crontab -l 2>/dev/null | grep -q "$marker"; then
-        crontab -l 2>/dev/null | grep -v "$marker" | crontab - 2>/dev/null
-        _success "定时重启已禁用"
-    else
-        _info "定时重启未启用"
+    if ! declare -F _crontab_replace >/dev/null 2>&1; then
+        _error "lib 版本过旧(00-common 缺 _crontab_replace), 无法清理 crontab"
+        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+        return 1
     fi
+    # 2026-09-21 复审(P1): 这里原本是裸管道 `crontab -l 2>/dev/null | grep -qF "$marker"`,
+    # 把"读成功但确实没这行"(该记账)与"crontab -l 读失败"(行可能仍在, 绝不能记账)压成
+    # 同一个退出码 1。实测: 令 crontab -l 返回 2 并输出 "cannot open spool: Input/output
+    # error", 本函数报"定时重启未启用"并写下 state=off —— cron 行仍在无人值守地重启服务。
+    # _crontab_has_marker 就是为这个三态判据而存在的(00-common)。
+    local has_rc=0
+    if declare -F _crontab_has_marker >/dev/null 2>&1; then
+        _crontab_has_marker "$marker" || has_rc=$?
+    else
+        # 混装旧 lib(00-common 是旧版): 没有三态判据可用。**绝不能退回裸管道** —— 那正是
+        # 上面刚修掉的分裂形态。宁可不改 state 并如实告警, 也不猜。
+        _error "lib 版本过旧(00-common 缺 _crontab_has_marker), 无法确认定时任务状态"
+        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+        return 1
+    fi
+    case "$has_rc" in
+        2)
+            # 读不到 crontab => 行可能仍在。此时**不能**写 state=off, 否则就是
+            # "UI 说已关、cron 还在跑"的分裂状态, 而且下次用户看到"未启用"就不会再处理。
+            _warn "无法读取 crontab, 定时重启任务是否仍在无法确认"
+            _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
+            return 1 ;;
+        0)
+            # 删除失败必须暴露: 否则 state 记成 off 而 cron 行仍在(无人值守地重启服务)。
+            # **这里必须提前 return, 不能继续往下写 state=off**。
+            if ! _crontab_replace "$marker"; then
+                _warn "定时重启任务未能移除, 请手动检查 crontab (${marker})"
+                _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
+                return 1
+            fi
+            _success "定时重启已禁用" ;;
+        *)
+            _info "定时重启未启用" ;;
+    esac
+    # 只有"cron 行确实不在了"才记账(动作先、记账后)
     _state_set timed_restart "off"
 }
 
@@ -395,14 +477,39 @@ _timed_restart_view_log() {
     fi
 }
 
+# 兜底卸载专用的进程发现(bash 无函数局部作用域, 嵌套定义会泄漏到全局并每次重定义 ——
+# 项目惯例是这类 helper 一律放顶层, 与 40-cloudflared.sh 的 _cf_pids/_cf_pids_owned 一致)。
+# **不能只靠 pidof**: 容器内 busybox pidof/pgrep 会假阴性(H3), 漏报时 kill 块被整段跳过、
+# 事后校验也判"无残留", 于是进程还活着却报卸载成功。pidof 优先, 再补 /proc/<pid>/comm
+# 精确扫描(容器内可靠)。
+_cf_fb_pids() {
+    local pids p c
+    pids=$(pidof cloudflared 2>/dev/null | tr ' ' '\n' | grep -e '^[0-9][0-9]*$')
+    [ -n "$pids" ] && printf '%s\n' "$pids"
+    for p in /proc/[0-9]*; do
+        read -r c 2>/dev/null < "$p/comm" || continue
+        [ "$c" = "cloudflared" ] && printf '%s\n' "${p#/proc/}"
+    done
+}
+
 # 兜底卸载 cloudflared（当 VPS 上的 lib/40-cloudflared.sh 是旧版、缺少 _uninstall_cloudflared 时用）
+# 只用于混装旧 lib 的机器, 故不复用 40 的 _cf_kill_all(可能根本不存在)。
+# 注意 pgrep 在容器内会假阴性(H3), 因此**成功与否以事后的文件/进程事实为准**,
+# 不以命令退出码为准 —— 原实现无条件打印"已卸载", 即便二进制仍在也报成功。
 _uninstall_cloudflared_fallback() {
     if [ -x /usr/local/bin/cloudflared ]; then
         _info "卸载 cloudflared (fallback)..."
         /usr/local/bin/cloudflared service uninstall 2>/dev/null || true
-        pgrep -x cloudflared 2>/dev/null | while read -r pid; do kill -15 "$pid" 2>/dev/null; done || true
-        sleep 2
-        pgrep -x cloudflared 2>/dev/null | while read -r pid; do kill -9 "$pid" 2>/dev/null; done || true
+        local pids
+        pids=$(_cf_fb_pids)
+        if [ -n "$pids" ]; then
+            local pid
+            for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
+            sleep 2
+            pids=$(_cf_fb_pids)
+            for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+            sleep 1
+        fi
         case "$INIT_SYSTEM" in
             systemd)
                 systemctl disable cloudflared 2>/dev/null || true
@@ -414,6 +521,17 @@ _uninstall_cloudflared_fallback() {
         esac
         rm -f /usr/local/bin/cloudflared
         rm -f "$STATE_DIR"/cf_*
+        # 事后校验: 二进制必须真的消失, 且没有残留进程(容器内 pidof 可能漏报,
+        # 故两者都看; 任一不满足就如实报失败而不是宣称已卸载)
+        if [ -e /usr/local/bin/cloudflared ]; then
+            _error "cloudflared 二进制删除失败, 请手动检查 /usr/local/bin/cloudflared"
+            return 1
+        fi
+        # 事后校验同样用 /proc 兜底扫描(只信 pidof 会在容器内漏报, 见上)
+        if [ -n "$(_cf_fb_pids)" ]; then
+            _warn "cloudflared 文件已删除, 但仍有残留进程, 请手动确认"
+            return 1
+        fi
         _success "cloudflared 已卸载 (fallback)"
     else
         _warn "cloudflared 未安装"
@@ -445,8 +563,25 @@ _uninstall_menu() {
             read -rp "  确认卸载 Xray + cloudflared(删除全部数据与隧道, 不可恢复)? [y/N]: " ans
             case "$ans" in
                 y|Y)
-                    _uninstall_xray
-                    if declare -F _uninstall_cloudflared >/dev/null 2>&1; then _uninstall_cloudflared; else _uninstall_cloudflared_fallback; fi
+                    # _uninstall_xray 会在官方 Hysteria2 进程停不掉时中途 return 1(文件未删),
+                    # 此前返回值被忽略、用户仍看到"卸载完成"。如实报告: 失败时明确告知数据
+                    # 可能残留, 但仍继续卸 cloudflared(独立子系统, 用户确实要求两个都卸)。
+                    local xray_rc=0
+                    _uninstall_xray || xray_rc=$?
+                    if [ "$xray_rc" -ne 0 ]; then
+                        _error "Xray 卸载未完成(见上方原因), 部署目录可能仍然存在, 请处理后重试"
+                    fi
+                    # 返回值必须消费: 两个实现都会在"文件已删但进程仍在"时返回 1,
+                    # 忽略它会让用户看到"卸载完成"而实际上进程还活着。
+                    local cf_rc=0
+                    if declare -F _uninstall_cloudflared >/dev/null 2>&1; then
+                        _uninstall_cloudflared || cf_rc=$?
+                    else
+                        _uninstall_cloudflared_fallback || cf_rc=$?
+                    fi
+                    if [ "$cf_rc" -ne 0 ]; then
+                        _error "cloudflared 卸载未完全成功(见上方原因), 请手动确认进程与文件已清理"
+                    fi
                     ;;
                 *) _info "已取消" ;;
             esac
@@ -512,8 +647,32 @@ _reset_config() {
 # 本地版本从 $DEPLOY_DIR/VERSION 文件读取, 远程从 GitHub raw 拉取
 # 以后只需改 VERSION 文件, 不用动代码
 # 可通过环境变量 XRAY_DEPLOY_RAW 覆盖上游 raw URL（如自建镜像/私有 fork）
+#
+# **信任模型(必须明示)**: 自更新会把下载到的 install.sh 以 root 执行。当前校验只有
+# "非空 + bash -n 语法检查" —— 二者都挡不住**恶意但语法合法**的内容。因此:
+#   * `XRAY_DEPLOY_RAW` 指向的源被视为**受信源**(自建镜像/私有 fork 由用户自己负责);
+#     该变量来自调用者环境, 若脚本被以被污染的环境拉起, 攻击者可控制下载内容。
+#   * 要真正做到来源可信, 需要上游发布**签名或校验和**并与脚本一同验证 —— 本项目尚未
+#     建立该发布流程, 故不做"假装校验"的假动作(如只比长度/前缀)。
+# 这条注释就是该取舍的显式声明; 引入校验和发布流程前, 不要移除它。
 # ---------------------------------------------------------------------------
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
+
+# ---------------------------------------------------------------------------
+# 终端安全显示: 把来自外部(state 文件 / 远端 HTTP 响应)的短字符串限制在安全字符集内。
+# 这些值会被 echo -e 直接打屏, 而 echo -e 会解释 ANSI 转义 —— 一个被劫持的响应或被写坏
+# 的 state 文件就能向管理员的终端注入转义序列(改标题、伪造输出、清屏)。
+# 允许集刻意保守: 版本号/通道名只需 [0-9A-Za-z._-]。
+# ---------------------------------------------------------------------------
+# 校验 + 净化: 含任何非安全字符时**返回 1**(调用方拒绝该值), 否则原样输出。
+# 为什么不能"静默剥掉非法字符": 被劫持/损坏的响应 `v1.2.3<!--x` 会被剥成 `v1.2.3`,
+# 看起来完全合法并被当作权威版本号去比对, 从而给出"已是最新"的错误结论。
+_sanitize_token() {
+    case "$1" in
+        ''|*[!0-9A-Za-z._-]*) return 1 ;;
+    esac
+    printf '%s' "$1"
+}
 
 _check_script_update() {
     clear
@@ -532,6 +691,12 @@ _check_script_update() {
         _press_any_key; return
     fi
     remote=$(echo "$remote" | tr -d '[:space:]')
+    # 远端响应是外部输入: 必须**整体合法**才接受(既防 ANSI 转义注入终端, 也防
+    # "截断后看起来合法"导致的错误"已是最新"结论)。
+    if ! remote=$(_sanitize_token "$remote"); then
+        _warn "远程版本内容异常(含非预期字符), 已忽略"
+        _press_any_key; return
+    fi
     echo -e "  远程版本: ${CYAN}${remote}${NC}"
     if [ "$remote" = "$local_ver" ]; then
         _success "已是最新版本"
