@@ -835,6 +835,19 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     if [ -n "$tpl_missing" ]; then
         echo "[错误] 本地源 templates/ 缺少:${tpl_missing}"; exit 1
     fi
+    # VERSION 与 VERSION 之外的清单同口径(**2026-09-22 open-code-review #05**)。
+    # 旧写法在拷贝阶段打一句"[警告] 本地源缺少 VERSION, 更新检查将显示未知版本"然后**继续装**,
+    # 而该说法有两个错: (1) `_verify_installed` 根本**不检查** VERSION(它只校验 LIB_MODULES /
+    # TPL_NAMES / 主脚本), 所以"照装不误"成立; (2) 但部署目录里**上一版的 VERSION 会原样留着**
+    # ⇒ 更新检查永远拿旧版本号跟远端比, 结论是"已是最新"而实际装的是新代码 —— 比"显示未知"
+    # 危险得多。实测(部署目录预置 0.99.0, 本地源无 VERSION): 安装报成功, VERSION 仍是 0.99.0。
+    # 远程路径把 VERSION 下载失败计入 `fail` 并中止(`fail>0` 分支), 本地路径不该对同一文件
+    # 放宽 —— 预检统一拒绝, 且**在备份之前**, 目标目录一个字节都不动。
+    if [ ! -s "${LOCAL_DIR}/VERSION" ]; then
+        echo "[错误] 本地源缺少 VERSION(或为空), 安装中止"
+        echo "       更新检查以它为本地真相源, 缺失会让部署目录保留旧版本号"
+        exit 1
+    fi
 
     # 与远程路径同口径: **不得**在备份前无条件 `rm -rf "$ROLLBACK_DIR"`(见 download_all
     # 同处的说明)。.KEEP 判定在 `_install_backup` 内部, 返回 2 = 恢复目录被标记占用。
@@ -849,12 +862,12 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     fi
     local_ok=1
     _install_file "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || local_ok=0
-    chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || true
-    if [ -f "${LOCAL_DIR}/VERSION" ]; then
-        _install_file "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" || local_ok=0
-    else
-        echo "[警告] 本地源缺少 VERSION, 更新检查将显示未知版本"
-    fi
+    # 与远程路径逐字同口径: 执行位设置失败必须走回滚(远程侧是 `chmod +x ... || copy_ok=0`)。
+    # 旧写法 `2>/dev/null || true` 会让"主脚本落地了但不可执行"照样报"安装完成" ——
+    # 用户执行 xd 时看到的是许可错误(open-code-review #02/#04; 顺手与本处 #05 同批修)。
+    chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || local_ok=0
+    # 预检已保证 `${LOCAL_DIR}/VERSION` 存在且非空, 这里不再有 else 分支(#05)。
+    _install_file "${LOCAL_DIR}/VERSION" "$DEPLOY_DIR/VERSION" || local_ok=0
     for m in $LIB_MODULES; do
         _install_file "${LOCAL_DIR}/lib/${m}.sh" "$INSTALL_LIB_DIR/${m}.sh" || local_ok=0
     done
@@ -892,11 +905,22 @@ else
     fi
 fi
 
-ln -sf "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN"
-chmod +x "$INSTALL_BIN"
+# 快捷命令与 xray 符号链接。**每一项都必须检查结果**(open-code-review #02):
+# 这里是"安装完成"之前的最后两步, 旧写法不看出错就报 `[成功] 安装完成`, 而 `/usr/local/bin/xd`
+# 可能根本没建出来 —— 用户拿到一条不存在的命令。注意 xd 的链接是**指向部署目录的符号链接**,
+# 它丢了不影响 `bash install.sh` 重跑(重跑即重建), 故这里报错即可, 不回滚已落地的文件。
+if ! ln -sf "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN"; then
+    echo "[错误] 创建快捷命令失败: $INSTALL_BIN(权限? /usr/local/bin 只读?)"
+    exit 1
+fi
+if ! chmod +x "$INSTALL_BIN"; then
+    echo "[错误] 设置快捷命令执行权限失败: $INSTALL_BIN"
+    exit 1
+fi
 # xray 命令 symlink（检测已有安装不覆盖）
 if [ ! -e /usr/local/bin/xray ] || [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$DEPLOY_DIR/bin/xray" ]; then
-    ln -sf "$DEPLOY_DIR/bin/xray" /usr/local/bin/xray
+    ln -sf "$DEPLOY_DIR/bin/xray" /usr/local/bin/xray || \
+        echo "[警告] 创建 /usr/local/bin/xray 符号链接失败(不影响本部署, 可稍后手动补)"
 fi
 
 echo "[成功] xray-deploy 安装完成"
