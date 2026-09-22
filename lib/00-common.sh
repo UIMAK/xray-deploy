@@ -191,9 +191,10 @@ _get_public_ip() {
         (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && \
         echo "$ip" && return 0
     done
-    # IPv6 兜底
+    # IPv6 兜底 —— **必须校验字面量**(#06)。旧写法只判 `[ -n "$ip" ]`, 源返回错误页/
+    # 代理提示时那段文本会被当成服务器地址写进分享链接(实测复现见 implement.md)。
     for url in "https://api64.ipify.org" "https://6.ipw.cn" "https://ipv6.icanhazip.com"; do
-        ip=$(curl -s6 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
+        ip=$(curl -s6 --max-time 6 "$url" 2>/dev/null) && _is_ipv6_literal "$ip" && echo "$ip" && return 0
     done
     return 1
 }
