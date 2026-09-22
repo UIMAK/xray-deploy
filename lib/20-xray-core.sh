@@ -203,10 +203,20 @@ _xray_download_replace() {
     command -v unzip >/dev/null 2>&1 || _pkg_install unzip || return 1
 
     local dl_url="https://github.com/XTLS/Xray-core/releases/download/${tag}/${asset}"
+    # 临时目录必须与目标二进制**同一文件系统**(2026-09-22 十轮 P1-②)。默认的 /tmp 常与
+    # /opt 分属不同挂载, 而跨文件系统的 `mv` 会退化成"拷贝 + unlink": 中途 ENOSPC/IO 错误时
+    # 目标已被**截断**, 下面那句"mv 失败 ⇒ 旧二进制仍在原位 ⇒ .bak 可以删"的前提就不成立,
+    # 于是唯一的旧核心备份被删掉、盘上留半截新二进制。实测(写限额触发 ENOSPC): 跨 fs 的
+    # `mv` 把 8MB 目标截成 2048B 后才报错, 源文件仍在 —— 即失败后**新旧都不可用**。
+    # 放进 $BIN_DIR 后 mv 走 rename(2): 失败时旧文件要么原样、要么已完整替换, 无中间态。
+    # 不自动清理历史残留目录: 并发会话正在下载的 staging 与 SIGKILL 残留无法区分,
+    # 误删会让对方的替换凭空失败(install.sh 的 .install-rollback 同款取舍, 见 CLAUDE.md)。
     # mktemp -d 失败必须中止 —— 与 30-geo.sh 的 Geo 更新同款: tmp_dir="" 会让
     # tmp_zip="/xray.zip" 落到系统根目录, 且后续 [ ! -f "/xray" ] / mv -f "/xray" "$XRAY_BIN"
     # 可能把根目录下恰好同名的文件当成新核心搬走。磁盘满/只读/inode 耗尽正是本 PR 关注的场景。
-    tmp_dir=$(mktemp -d) || { _error "无法创建临时目录(/tmp 写满或只读?), 核心替换中止"; return 1; }
+    mkdir -p "$BIN_DIR" || { _error "无法创建 $BIN_DIR, 核心替换中止"; return 1; }
+    tmp_dir=$(mktemp -d "${BIN_DIR}/.xray-dl.XXXXXX") \
+        || { _error "无法在 $BIN_DIR 创建临时目录(磁盘满/只读/inode 耗尽?), 核心替换中止"; return 1; }
     tmp_zip="${tmp_dir}/xray.zip"
 
     _info "下载 Xray-core ${tag} (${asset})"
@@ -226,7 +236,7 @@ _xray_download_replace() {
         rm -rf "$tmp_dir"
         return 1
     fi
-    # 立即删除 zip 文件(低内存 VPS 上 tmpfs 中的 20MB zip 是压垮骆驼的最后一根稻草)
+    # 立即删除 zip 文件(低内存 VPS 上, 多余的 20MB 无论是占 tmpfs 还是占磁盘都该立刻还回去)
     rm -f "$tmp_zip"
     if [ ! -f "${tmp_dir}/xray" ]; then
         _error "压缩包内未找到 xray 二进制"
@@ -236,7 +246,6 @@ _xray_download_replace() {
 
     # 停服务 -> 备份旧二进制 -> 替换二进制 -> 校验可执行
     _manage_xray stop >/dev/null 2>&1 || true
-    mkdir -p "$BIN_DIR"
     # 覆盖前备份旧二进制(校验失败/运行期不稳定可回滚)。备份必须真正成功才允许替换:
     # 磁盘满/IO 错误导致 cp 失败时, 若继续 mv 会让旧二进制无 .bak 可回滚(与 Geo 备份同一事务原则)。
     if [ -f "$XRAY_BIN" ]; then
@@ -347,8 +356,11 @@ _ensure_xray_symlink() {
 # 旧的那个只存在于 `$XRAY_BIN.bak`。于是"替换之后、提交之前"的任何一步失败(配置初始化 /
 # service 文件生成 / 稳定运行确认)都必须把三者一起还原:
 #   1. `$XRAY_BIN.bak` → `$XRAY_BIN`(磁盘上是旧核心)
-#   2. 重启(尽力; 失败只告警 —— 此时正确性优先于可用性)
-#   3. state 的 version/channel 写回**替换前**的值, 描述"磁盘上实际那个二进制"
+#   2. service 文件写回替换前的那一份(十轮 P1-④) —— 否则"旧核心 + 半截/多余注入的 unit"
+#      仍是坏组合: 例如旧核心需要 `Environment=XRAY_LOCATION_ASSET`, 而被写坏的新 unit 没有,
+#      还原了二进制也起不来
+#   3. 重启(尽力; 失败只告警 —— 此时正确性优先于可用性)
+#   4. state 的 version/channel 写回**替换前**的值, 描述"磁盘上实际那个二进制"
 #
 # 为什么做成函数而不是在三处各写一遍: 三段的判据必须逐字一致(有无 `.bak`、要不要重启、
 # state 写什么), 而项目里"同一条件在各调用点各自解释"已被反复证明会漂移(见 _rename_node_*
@@ -364,15 +376,21 @@ _xray_restore_prev_bin() {
         # 首次安装: 没有旧二进制可回。**不删**刚落地的新二进制 —— 用户可能仍可用它,
         # 删掉只会把"核心能跑但 service 没建好"变成"完全没核心"。
         _warn "无旧核心备份可还原, 保留已落地的二进制 v${cur:-?}(service/config 可能未就绪)"
+        # unit 是**独立于二进制**的一侧: 即使没有旧二进制可回, 本次新建/写坏的 unit 也必须
+        # 复原到事务前的状态, 否则"没有核心 + 半截 unit"比现状更难恢复(P1-④)。
+        _xray_service_restore_prev || true
         local keepv; keepv=$(_xray_current_version 2>/dev/null)
         [ -n "$keepv" ] && { _state_set version "$keepv" || _warn "状态持久化失败(version)"; }
         return 1
     fi
     if ! mv -f "$XRAY_BIN.bak" "$XRAY_BIN"; then
         _error "旧二进制还原失败, 请手动处理 $XRAY_BIN(备份仍在 $XRAY_BIN.bak)"
+        # 二进制没还原成功, 但 unit 仍要尽量复原 —— 两个失败互不依赖, 不做"先回滚谁"的取舍
+        _xray_service_restore_prev || true
         return 1
     fi
     chmod +x "$XRAY_BIN" 2>/dev/null || _warn "还原后的二进制执行位设置失败: $XRAY_BIN"
+    _xray_service_restore_prev || true
     _manage_xray restart >/dev/null 2>&1 || _manage_xray start >/dev/null 2>&1 || \
         _warn "还原旧核心后服务未能拉起, 请手动检查: xd 菜单 [核心管理]"
     local recv; recv=$(_xray_current_version 2>/dev/null)
@@ -425,8 +443,17 @@ _install_or_switch_xray() {
         _error "配置备份失败, 取消核心切换"
         return 1
     fi
-
+    # service 文件同样要在**动二进制之前**进事务(十轮 P1-④)。放在这里而不是
+    # `_create_xray_service` 之前: 快照失败时盘上还什么都没改, 直接中止即可, 连回滚都不需要;
+    # 而 unit 从此刻起到提交为止不会再被别处改动(_init_config_if_empty 只碰 config)。
+    if ! _xray_service_snapshot; then
+        _error "service 文件快照失败(磁盘空间/权限?), 取消本次安装/切换(未做任何改动)"
+        return 1
+    fi
     if ! _xray_download_replace "$tag"; then
+        # 这条路径没碰过 unit(二进制都没换), 快照直接作废 —— 快照只对本次事务有效,
+        # 残留下来只会成为下次排障时说不清的噪声。
+        _xray_service_snapshot_drop
         # 下载失败:若有旧二进制,尝试恢复服务
         if [ -x "$XRAY_BIN" ]; then
             _warn "切换失败,保留当前二进制 v${cur}"
@@ -483,12 +510,27 @@ _install_or_switch_xray() {
         if [ -f "$XRAY_BIN.bak" ]; then
             if mv -f "$XRAY_BIN.bak" "$XRAY_BIN"; then
                 chmod +x "$XRAY_BIN"
+                # unit 必须与二进制**同时**回到改动前(十轮 P1-④)。这不是洁癖: unit 里的
+                # `Environment=XRAY_LOCATION_ASSET` 按 v26.7.11 门控注入, 新核心写的是"不含注入"
+                # 的那一版; 若只回滚二进制, 还原后的旧核心在新的 unit 下找不到 geo dat 起不来 ——
+                # 回滚动作本身制造了新的故障。
+                _xray_service_restore_prev || true
                 _manage_xray restart >/dev/null 2>&1 || _manage_xray start >/dev/null 2>&1 || true
                 rolled_back=1
                 _warn "新核心 v${newv:-?} 未能稳定运行, 已回滚到旧二进制 v${cur:-?}"
             else
                 _error "旧二进制回滚失败, 请手动处理 $XRAY_BIN"
+                # 二进制没回成功, unit 仍尽力复原到改动前(两个失败互不依赖)
+                _xray_service_restore_prev || true
             fi
+        else
+            # 首次安装(无 .bak): 与 `_xray_restore_prev_bin` 同一口径 —— 保留已落地的二进制,
+            # 也就一并保留刚建好的 unit, 让用户还能用 `systemctl status xray` 排障。
+            # 此时没有"改动前状态"可谈, 强行删 unit 只会把可诊断的失败变成不可诊断的。
+            _warn "无旧核心可回滚(首次安装), 保留已落地的二进制与 service 文件供排障"
+            # 既然 unit 留着, 那条"事务之前没有 unit"的标志就必须一并清掉, 否则它会作为
+            # 陈旧状态留在 $BACKUP_DIR 里(下一次事务会先清它, 故只是噪声, 但噪声也会误导排障)。
+            _xray_service_snapshot_drop
         fi
         # 回滚成功 → state 记旧版本; 回滚失败/首次安装 → 磁盘上是新二进制, 记新版本
         local recv
@@ -543,6 +585,7 @@ _install_or_switch_xray() {
     fi
     # verified 稳定运行后才丢弃旧二进制备份
     rm -f "$XRAY_BIN.bak"
+    _xray_service_snapshot_drop
     _success "Xray-core 已切换到 v${newv} (${channel})"
     _tip "配置与节点保持不变"
 
@@ -754,6 +797,86 @@ _safe_nofile() {
 }
 
 # ---------------------------------------------------------------------------
+# service 文件(unit)的事务快照 —— 2026-09-22 十轮 P1-①/④。
+#
+# 为什么 unit 也要进回滚事务: `_create_xray_service` 是在**新二进制已落地之后**重写生产
+# unit 的, 而 unit 内容与核心版本相关(env 注入按 v26.7.11 门控)。写坏/写残 unit 之后只还原
+# 二进制的"部分回滚"会留下两种残局: "旧核心 + 半截 unit", 或者"旧核心 + 不含 env 注入的
+# unit"(后者会让旧核心找不到 geo dat 而起不来)。故与 $XRAY_BIN.bak 对称地留一份 unit 快照:
+#   · 原本有 unit ⇒ 存内容, 失败时写回(含 openrc 必需的 +x 位)
+#   · 原本没有   ⇒ 存 .absent 标志, 失败时删掉本次新建的那个
+# 快照落 $BACKUP_DIR 而不是 /etc: unit 目录里多出的文件没有任何好处, 反而可能被
+# daemon-reload 扫到。$BACKUP_DIR 的轮转只清 ^config\.json\.bak\. 前缀, 不会碰它。
+# ---------------------------------------------------------------------------
+# 当前 init 后端对应的 unit 路径(direct 后端无 unit ⇒ 返回 1)
+_xray_service_unit_path() {
+    case "${INIT_SYSTEM:-}" in
+        systemd) printf '%s' '/etc/systemd/system/xray.service' ;;
+        openrc)  printf '%s' '/etc/init.d/xray' ;;
+        *) return 1 ;;
+    esac
+}
+
+_xray_service_prev_path() { printf '%s' "$BACKUP_DIR/xray-service.prev"; }
+
+# 重写 unit 之前留快照。返回 1 = 快照没做成功(调用方必须中止事务, 不能带着"无快照"继续)。
+_xray_service_snapshot() {
+    local unit prev
+    unit=$(_xray_service_unit_path) || return 0    # direct 后端: 无 unit 可写, 无需快照
+    prev=$(_xray_service_prev_path)
+    mkdir -p "$BACKUP_DIR" || return 1
+    rm -f "$prev" "${prev}.absent" 2>/dev/null
+    if [ ! -e "$unit" ]; then
+        # 原本没有 unit: 用一个标志文件记住"本次事务之前它不存在"
+        : > "${prev}.absent" || return 1
+        return 0
+    fi
+    cp -f "$unit" "$prev" 2>/dev/null || { rm -f "$prev"; return 1; }
+    # 0 字节快照不可用(R38 同类口径: 空备份比没有备份更危险 —— 写回去就是个空 unit)
+    [ -s "$prev" ] || { rm -f "$prev"; return 1; }
+    return 0
+}
+
+# 回滚时把 unit 恢复到快照状态(只在快照存在时动手; 无快照 = 本次事务没碰过 unit)。
+_xray_service_restore_prev() {
+    local unit prev
+    unit=$(_xray_service_unit_path) || return 0
+    prev=$(_xray_service_prev_path)
+    if [ -f "${prev}.absent" ]; then
+        # 事务之前没有 unit ⇒ 把本次新建的那个删掉, 回到"本来就没有"
+        rm -f "$unit" 2>/dev/null
+        rm -f "${prev}.absent" 2>/dev/null
+        _warn "已撤销本次新建的 service 文件(事务之前不存在): $unit"
+        return 0
+    fi
+    [ -f "$prev" ] || return 0
+    if ! cp -f "$prev" "$unit" 2>/dev/null; then
+        _error "service 文件还原失败, 请手动核对: $unit (备份: $prev)"
+        return 1
+    fi
+    # openrc 的 init 脚本必须可执行; systemd 的 unit 按 644 惯例(它以 root 读)
+    case "${INIT_SYSTEM:-}" in
+        openrc) chmod +x "$unit" 2>/dev/null || _warn "还原后的 service 文件执行位设置失败: $unit" ;;
+        systemd)
+            chmod 644 "$unit" 2>/dev/null || true
+            # 半截 unit 可能已被 daemon-reload 载入内存, 还原后让它重新读盘(best-effort)
+            systemctl daemon-reload 2>/dev/null || \
+                _warn "服务配置重载失败(daemon-reload), 请手动执行: systemctl daemon-reload"
+            ;;
+    esac
+    rm -f "$prev" 2>/dev/null
+    _warn "已还原 service 文件到本次改动前的内容: $unit"
+    return 0
+}
+
+# 事务成功提交: 丢弃 unit 快照(与 rm -f "$XRAY_BIN.bak" 同一步)
+_xray_service_snapshot_drop() {
+    local prev; prev=$(_xray_service_prev_path)
+    rm -f "$prev" "${prev}.absent" 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 生成 service 文件
 # R45: XRAY_LOCATION_ASSET 优先走 config.json 的 env 段(docs/config/env.md, 核心 ≥
 # v26.7.11 在构建模块前应用该段并替换同名进程变量)。仅当已安装核心 < v26.7.11(不识别
@@ -829,7 +952,11 @@ _create_xray_openrc_service() {
     if ! _xray_version_ge "26.7.11"; then
         sd_env_line="supervise_daemon_args=\"--env XRAY_LOCATION_ASSET=${ASSET_DIR}\""
     fi
-    cat > /etc/init.d/xray <<EOF
+    # init 脚本写入必须**检查结果**(2026-09-22 十轮 P1-①)。与 systemd 分支同一形态:
+    # 旧写法把 `cat > ... <<EOF` 的返回码丢在地上, 磁盘满/只读/权限异常时原文件已被**截断**,
+    # 而随后的 `chmod +x` 与 `rc-update add` 仍可能成功 ⇒ 函数返回 0, 调用方认定"service 就绪",
+    # 二进制回滚也不会被触发(它只在函数返回非 0 时发生) ⇒ 残局是"旧二进制 + 损坏的 init 脚本"。
+    if ! cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
 
 name="Xray Daemon"
@@ -857,7 +984,11 @@ depend() {
     after firewall
 }
 EOF
-    chmod +x /etc/init.d/xray || return 1
+    then
+        _error "service 文件写入失败(只读文件系统/磁盘空间/权限?): /etc/init.d/xray"
+        return 1
+    fi
+    chmod +x /etc/init.d/xray || { _error "service 文件执行位设置失败: /etc/init.d/xray"; return 1; }
     # enable 失败只影响开机自启, 不中止安装(与 systemd 分支同一口径, 2026-09-12 三审 M3)
     rc-update add xray default 2>/dev/null || _warn "xray 开机自启设置失败(可手动: rc-update add xray default)"
     return 0

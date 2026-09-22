@@ -4705,30 +4705,42 @@ _rebuild_clash_line() {
 # 把节点 metadata 的当前状态同步进 clash.yaml 派生缓存(F1 的统一入口)。
 # 用法: _sync_node_clash <meta_file> [old_name]
 #   old_name 非空且与现名不同(改端口会连带改名)时先删旧行, 避免残留幽灵条目。
-# best-effort: builder 失败(被采纳节点缺字段)或文件写失败只告警, 不阻断主流程 ——
-# clash.yaml 是可再生派生导出, 权威身份始终是 tag/config/metadata。
+# best-effort **语义**不变: 任何失败都不回滚权威状态(config/metadata 始终是事实), 调用方
+# 也从不因为本函数的失败而中止事务。但**返回值必须如实**(2026-09-22 十轮 P1-⑤):
+# 旧实现每条失败路径都"告警 + return 0", 于是返回码恒为 0 —— 九轮 OCR #45 给域名切换加的
+# `if ! _sync_node_clash "$meta"; then ...` 是一句**永远不成立的条件**, 那条"clash 未同步"
+# 的告警从未打印过(实测三种失败输入全部 rc=0)。同项目的官方 Hysteria 侧
+# (`_hysteria_sync_clash`, 0.16.10 P2-1)早已改成"失败 return 1 并在本函数内告警",
+# 这里补齐同一契约。告警文本留在本函数内 —— 有调用点是事务回滚路径的 `|| true`。
 # ---------------------------------------------------------------------------
 _sync_node_clash() {
-    local meta="$1" old_name="${2:-}" line name key
-    line=$(_rebuild_clash_line "$meta") || {
+    local meta="$1" old_name="${2:-}" line name key crc=0
+    # 元数据缺必填字段时保留 clash 旧行(它可能仍指向一个可用的旧配置), 但如实返回失败
+    if ! line=$(_rebuild_clash_line "$meta"); then
         _warn "Clash 条目重建失败(元数据缺少必要字段), clash.yaml 未同步: $meta"
-        return 0
-    }
+        return 1
+    fi
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
-    [ -n "$name" ] || return 0
+    [ -n "$name" ] || return 1
     if [ -n "$old_name" ] && [ "$old_name" != "$name" ]; then
-        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || \
+        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || {
+            crc=1
             _warn "Clash YAML 旧条目删除失败(${old_name}), 可手工编辑 ${CLASH_YAML}"
+        }
     fi
     key=$(_yaml_dq "$name")
     if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
-        _replace_node_in_yaml "$line" "$name" || \
+        _replace_node_in_yaml "$line" "$name" || {
+            crc=1
             _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+        }
     else
-        _add_node_to_yaml "$line" "$name" || \
+        _add_node_to_yaml "$line" "$name" || {
+            crc=1
             _warn "Clash YAML 条目追加失败, 可手工编辑 ${CLASH_YAML}"
+        }
     fi
-    return 0
+    return "$crc"
 }
 
 # 重建 vless:// reality 分享链接(从元数据读参数)
@@ -5355,8 +5367,12 @@ _reality_port_txn_locked() {
     else
         _success "端口已改为 ${newport}(直连模式, 标签已同步更新)"
     fi
-    # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
-    _sync_node_clash "$meta" "$old_name"
+    # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)。
+    # 十轮 P1-⑤ 后本函数**如实返回**失败: 派生缓存同步失败不回滚已提交的端口事务(节点本体
+    # 是权威状态), 但必须消费返回码, 否则"报成功而订阅仍指向旧端口"无人知晓 —— 与九轮给
+    # 域名切换补 #45 是同一契约。告警文本由函数内部给出, 这里只补可操作提示。
+    _sync_node_clash "$meta" "$old_name" || \
+        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
 }
 
 # ---------------------------------------------------------------------------
@@ -5801,7 +5817,8 @@ _modify_port() {
         _press_any_key; return 1
     fi
     # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
-    _sync_node_clash "$meta" "$old_name"
+    _sync_node_clash "$meta" "$old_name" || \
+        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
     _success "端口已改为 ${newport}"
     _press_any_key
 }
@@ -5896,8 +5913,9 @@ _update_listen() {
             | (if has("preferred_addr") then .preferred_addr=$a else . end)' \
             --arg l "$newlisten" --arg a "$newaddr" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
     fi
-    # F1: 监听/链接地址变化需同步 clash 条目的 server 字段
-    _sync_node_clash "$meta"
+    # F1: 监听/链接地址变化需同步 clash 条目的 server 字段(失败只提示, 不回滚权威状态)
+    _sync_node_clash "$meta" || \
+        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
 
     _success "监听已更新为 ${newlisten}, 链接地址更新为 ${newaddr}"
     _press_any_key
