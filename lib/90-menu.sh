@@ -116,6 +116,10 @@ _main_menu() {
     _auto_adopt_orphans
     # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
     if declare -F _port_txn_recover >/dev/null 2>&1; then _port_txn_recover; fi
+    # 核心切换的崩溃恢复(十一轮 P1-②): 进程在"二进制已换 / unit 已重写"之后被杀(断电/OOM/
+    # kill -9)时没有任何函数会被调用, 只能靠启动期按 state/coretxn.json 收敛。
+    # 放在 config 相关操作之前 —— 它可能重启服务, 先让服务回到已知状态再谈配置。
+    if declare -F _xray_core_txn_recover >/dev/null 2>&1; then _xray_core_txn_recover; fi
     if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
     if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
     _normalize_config_format
