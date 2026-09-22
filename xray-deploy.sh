@@ -11,6 +11,17 @@ set -u
 # 部署目录含私钥/密码/隧道 token, 默认 077 使新建文件仅 root 可读(可执行位由 chmod +x 单独授予)
 umask 077
 
+# PATH 加固必须在**本脚本的第一个外部命令之前**(2026-09-22 open-code-review #46)。
+# 旧写法只在 `main()` 里前置了一次, 而 `readlink`/`dirname`(下面两行)与 manifest 段的
+# `sha256sum`/`awk` 都跑在它**之前** —— 以 root 被调用时(菜单、以及 cron 触发的
+# `xd geo-update`)调用方 PATH 里的同名命令会在加固生效前先执行。
+# 口径与 `main()` 里那行**逐字一致**(前置固定目录, **保留**调用方尾缀):
+#   · 前置是必需的 —— 系统目录必须优先于调用方 PATH, 否则可被非 root 写入的目录里的同名
+#     curl/jq/systemctl 会劫持 root 操作;
+#   · 尾缀**不能删** —— 非标准前缀安装(工具不在这些目录里)会让脚本连 `readlink` 都找不到,
+#     而前置已消除上面那条真实劫持路径。两处都保留尾缀是为了两条代码路径行为一致。
+export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH"
+
 # 定位脚本与 lib 目录(支持从 /usr/local/bin 软链运行 + 直接运行两种)
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(dirname "$SELF_PATH")"
@@ -53,6 +64,21 @@ if [ -f "$_DEPLOY_ROOT/.manifest" ] && command -v sha256sum >/dev/null 2>&1; the
     while read -r _mh _mp; do
         [ -n "$_mh" ] || continue
         [ -n "$_mp" ] || continue
+        # 清单解析必须**健壮**(2026-09-22 open-code-review #47)。旧写法把任何非空的两字段
+        # 行都当成合法条目, 实测两个后果:
+        #   · `deadbeef…  ../../etc/hostname` 会让校验去读**部署根之外**的文件 ——
+        #     用形如 `/tmp/xxx` 的路径会被判为 path traversal 而拒绝(与审查项同源);
+        #   · 非 64 位 hex 的"哈希"永远不匹配, 于是**每一条**都报"不一致", 把真正的
+        #     不一致淹没在噪声里(实测 4 行畸形清单报出 3 条假项, 只有 1 条是真的)。
+        # **只告警不阻断的口径不变**(见上方第 2 条硬约束): 这里只决定"要不要去读这个路径",
+        # 违规条目记一条"格式错误"就够, 绝不 exit。
+        case "$_mp" in
+            /*|..|../*|*/../*|*/..) _manifest_bad="$_manifest_bad [不安全路径:$_mp]"; continue ;;
+        esac
+        case "$_mh" in
+            *[!0-9a-f]*) _manifest_bad="$_manifest_bad [格式错误:$_mp]"; continue ;;
+        esac
+        [ "${#_mh}" -eq 64 ] || { _manifest_bad="$_manifest_bad [格式错误:$_mp]"; continue; }
         _mgot=$(sha256sum "$_DEPLOY_ROOT/$_mp" 2>/dev/null | awk '{print $1}')
         [ "$_mgot" = "$_mh" ] || _manifest_bad="$_manifest_bad $_mp"
     done < "$_DEPLOY_ROOT/.manifest"
