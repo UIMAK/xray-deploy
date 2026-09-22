@@ -221,10 +221,15 @@ _view_status() {
     local st; st=$(_manage_xray status 2>/dev/null)
     echo -e "  Xray: $([ "$st" = "running" ] && echo "${GREEN}运行中${NC}" || echo "${RED}已停止${NC}")"
     if [ -x "$XRAY_BIN" ]; then
-        local ver=""
+        local ver="" ch
         ver=$(_xray_cached_version 2>/dev/null)
         [ -z "$ver" ] && ver="未知"
-        echo -e "  版本: $([ "$ver" = "未知" ] && echo "$ver" || echo "v${ver}")  通道: $(_state_get channel 2>/dev/null)"
+        # 通道名来自 state 文件(可被本地写坏/篡改), 且会进 `echo -e` —— **必须与
+        # `_print_status_bar` 同一口径净化**(2026-09-22 九轮 OCR #40)。同一个键在两个读点
+        # 一处净化一处不净化, 是项目反复踩过的"同一条件各调用点各自解释"形状; 未净化的那个
+        # 会把 ANSI/控制序列原样打给管理员终端。
+        ch=$(_sanitize_token "$(_state_get channel 2>/dev/null)") || ch="?"
+        echo -e "  版本: $([ "$ver" = "未知" ] && echo "$ver" || echo "v${ver}")  通道: ${ch}"
     fi
     echo -e "  节点数: $(_node_count)"
     case "$INIT_SYSTEM" in
@@ -623,10 +628,24 @@ _reset_config() {
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
         _hy2_cleanup_all_hops
     fi
-    # 删掉 config 让 _init_config_if_empty 重建
+    # 删掉 config 让 _init_config_if_empty 重建。
+    # **重建失败必须回滚, 且回滚要在清元数据之前**(2026-09-22 九轮 OCR #41)。
+    # 旧写法 `rm -f "$CONFIG_FILE"; _init_config_if_empty`(返回值丢弃)随后**无条件**清空
+    # `nodes/*.json` —— 于是"重建失败(只读/磁盘满/jq 异常)"的残局是**既没有配置、也没有
+    # 节点元数据**, 而上面那段刚花力气做的备份只保护了 config 一侧。
+    # 处置: 消费返回码, 失败走 `_restore_config`(它读的是 `_backup_config` 刚写的 lastbak)
+    # 并立即返回 —— 元数据与 clash 只有在配置确实重建成功之后才允许被清。
     rm -f "$CONFIG_FILE"
-    _init_config_if_empty
-    # 清空节点元数据 + clash.yaml
+    if ! _init_config_if_empty; then
+        _error "重建默认配置失败(只读/磁盘空间/jq 异常?), 正在回滚到重置前的配置"
+        if _restore_config; then
+            _warn "已回滚, 重置未生效: 配置与节点数据均保持原样"
+        else
+            _error "回滚失败, 请手动从 $BACKUP_DIR/config.json.lastbak 恢复"
+        fi
+        return
+    fi
+    # 清空节点元数据 + clash.yaml(只有配置确认重建成功才会走到这里)
     if [ -d "$NODES_DIR" ]; then
         rm -f "$NODES_DIR"/*.json 2>/dev/null
     fi

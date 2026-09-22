@@ -373,8 +373,22 @@ _geo_set_auto_update_cron() {
             fi
             ;;
         off)
-            _geo_remove_cron_line
-            _state_set geo_cron "off"
+            # 移除失败**不得报成功**(2026-09-22 九轮 OCR #25)。
+            # 旧写法忽略 `_geo_remove_cron_line` 的返回码就 `_state_set geo_cron "off"` +
+            # `_success "已关闭"` —— 而这与同函数 `on)` 分支**自己**的回滚契约直接相反:
+            # 那里在 `_ensure_cron_running` 失败时会先把 cron 行撤掉再置 off, 目的正是维持
+            # `state=off ⇔ 项目 cron entry 不存在`。读不到/写不了 crontab 时旧写法会造出
+            # "cron 行还在跑 + UI 说已关闭"的分裂, 而 cron 会在无人值守时继续执行本脚本。
+            #
+            # 处置与 `_geo_set_auto_update` 的 `off)` 分支**刻意不同**: 那里 config 才是真相源,
+            # 残留 cron 行只是冗余清理, 失败只告警; 而**旧核心路径上 cron 行就是机制本身**,
+            # 移除失败必须 fail 且**不**改 state(保持 on —— 那才是磁盘上的事实)。
+            if ! _geo_remove_cron_line; then
+                _error "移除 geo 定时任务失败(crontab 不可读/不可写?), 自动更新仍是开启状态"
+                _tip "请手动检查 crontab 中的 ${GEO_CRON_MARKER} 行, 或修复 crontab 权限后重试"
+                return 1
+            fi
+            _state_set geo_cron "off" || _warn "geo_cron 状态写入失败, 状态显示可能不准"
             _success "Geo 自动更新已关闭"
             ;;
     esac

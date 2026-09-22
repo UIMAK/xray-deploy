@@ -341,6 +341,54 @@ _ensure_xray_symlink() {
 }
 
 # ---------------------------------------------------------------------------
+# 核心切换失败时的**统一还原入口**(2026-09-22 九轮 OCR #15)。
+#
+# 背景: `_xray_download_replace` 在**校验第 2..N 步之前**就把 $XRAY_BIN 换成了新二进制,
+# 旧的那个只存在于 `$XRAY_BIN.bak`。于是"替换之后、提交之前"的任何一步失败(配置初始化 /
+# service 文件生成 / 稳定运行确认)都必须把三者一起还原:
+#   1. `$XRAY_BIN.bak` → `$XRAY_BIN`(磁盘上是旧核心)
+#   2. 重启(尽力; 失败只告警 —— 此时正确性优先于可用性)
+#   3. state 的 version/channel 写回**替换前**的值, 描述"磁盘上实际那个二进制"
+#
+# 为什么做成函数而不是在三处各写一遍: 三段的判据必须逐字一致(有无 `.bak`、要不要重启、
+# state 写什么), 而项目里"同一条件在各调用点各自解释"已被反复证明会漂移(见 _rename_node_*
+# 与 _reality_node_mode 的取舍)。差异部分由参数表达: `$3=binary_kept` 表示"无 .bak 可还原,
+# 新二进制保留在盘上", 此时 state 记新版本是**准确的**。
+#
+# 用法: _xray_restore_prev_bin <旧版本号> <旧通道> [binary_kept]
+#   返回 0 = 已还原到旧核心; 1 = 无 .bak(新二进制保留) 或还原动作本身失败。
+# ---------------------------------------------------------------------------
+_xray_restore_prev_bin() {
+    local cur="$1" prev_channel="${2:-}" binary_kept="${3:-}"
+    if [ ! -f "$XRAY_BIN.bak" ]; then
+        # 首次安装: 没有旧二进制可回。**不删**刚落地的新二进制 —— 用户可能仍可用它,
+        # 删掉只会把"核心能跑但 service 没建好"变成"完全没核心"。
+        _warn "无旧核心备份可还原, 保留已落地的二进制 v${cur:-?}(service/config 可能未就绪)"
+        local keepv; keepv=$(_xray_current_version 2>/dev/null)
+        [ -n "$keepv" ] && { _state_set version "$keepv" || _warn "状态持久化失败(version)"; }
+        return 1
+    fi
+    if ! mv -f "$XRAY_BIN.bak" "$XRAY_BIN"; then
+        _error "旧二进制还原失败, 请手动处理 $XRAY_BIN(备份仍在 $XRAY_BIN.bak)"
+        return 1
+    fi
+    chmod +x "$XRAY_BIN" 2>/dev/null || _warn "还原后的二进制执行位设置失败: $XRAY_BIN"
+    _manage_xray restart >/dev/null 2>&1 || _manage_xray start >/dev/null 2>&1 || \
+        _warn "还原旧核心后服务未能拉起, 请手动检查: xd 菜单 [核心管理]"
+    local recv; recv=$(_xray_current_version 2>/dev/null)
+    [ -n "$recv" ] || recv="$cur"
+    [ -n "$recv" ] && { _state_set version "$recv" || _warn "状态持久化失败(version)"; }
+    if [ -n "$prev_channel" ]; then
+        _state_set channel "$prev_channel" || _warn "状态持久化失败(channel)"
+    else
+        # 替换前没有 channel 记录 => 磁盘上也不该有(保持"两键同进退")
+        rm -f "$STATE_DIR/channel" 2>/dev/null
+    fi
+    _warn "已还原到旧核心 v${recv:-?}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 安装或切换 Xray 核心(R3)
 # 用法:_install_or_switch_xray <channel>
 #   未安装 -> 安装该通道最新版
@@ -389,19 +437,29 @@ _install_or_switch_xray() {
 
     # 确保配置与 service 存在(首次安装)。2026-09-12 三审(M3): 两者失败都显式中止 ——
     # 原写法不检查返回值, 配置初始化失败(jq 缺失/磁盘满)时仍写出指向不存在配置的 unit 并
-    # 强行重启, 把"配置没建好"伪装成"新核心起不来", 误导排障方向。失败时尝试拉起旧服务。
+    # 确保配置与 service 存在(首次安装)。2026-09-12 三审(M3): 两者失败都显式中止 ——
+    # 原写法不检查返回值, 配置初始化失败(jq 缺失/磁盘满)时仍写出指向不存在配置的 unit 并
+    # 强行重启, 把"配置没建好"伪装成"新核心起不来", 误导排障方向。
+    #
+    # **失败时不能只 start**(2026-09-22 九轮 OCR #15 修)。`_xray_download_replace` 已经把
+    # 二进制**换成新的**并留下 `$XRAY_BIN.bak`(旧的那个), 所以这两条路径上的失败残局是
+    # "磁盘上是未提交的新核心 + 一个旧核心备份", 而旧写法只 `_manage_xray start` 就 return:
+    #   · 服务其实能起来(新二进制可执行, 只是配置/service 没就绪), 用户看到"运行中";
+    #   · 无人消费的 `.bak` 会被**下一次**切换的备份步骤 `cp -f "$XRAY_BIN" "$XRAY_BIN.bak"`
+    #     覆盖 —— 旧二进制就此永久丢失, 而 state 里的 version/channel 仍描述旧核心。
+    # 实测复现(见 .trellis/tasks/09-22-ocr-fullreview 的 implement.md): 失败后 `$XRAY_BIN`
+    # 内容 == 新二进制、`.bak` == 旧二进制; 再走一次备份步骤后 `.bak` 变成新二进制。
+    # 现在与下方 `started_ok` 分支**逐字同一形态**地还原: mv 回旧二进制 + chmod + 重启 +
+    # 把 version/channel 写回"磁盘上实际那个二进制"。首次安装无 `.bak` 时不还原, 但**保留**
+    # 刚落地的新二进制(删掉会把"能跑的机器"变成"完全没核心"), 只如实报告。
     if ! _init_config_if_empty; then
         _error "配置初始化失败, 中止安装/切换"
-        if [ -x "$XRAY_BIN" ]; then
-            _manage_xray start >/dev/null 2>&1 || true
-        fi
+        _xray_restore_prev_bin "${cur:-}" "${prev_channel:-}"
         return 1
     fi
     if ! _create_xray_service; then
         _error "service 文件创建失败, 中止安装/切换"
-        if [ -x "$XRAY_BIN" ]; then
-            _manage_xray start >/dev/null 2>&1 || true
-        fi
+        _xray_restore_prev_bin "${cur:-}" "${prev_channel:-}"
         return 1
     fi
 
@@ -453,12 +511,33 @@ _install_or_switch_xray() {
         _error "Xray 二进制已替换, 但服务未能稳定运行, 请检查配置"
         return 1
     fi
-    # version 与 channel 必须**同进同退**: 只写其一会让 state 描述"新通道+旧版本"这种
+    # version 与 channel 必须**同进同退**: 只写其一会让 state 描述"新版本+旧通道"这种
     # 不存在的组合(菜单 [核心管理] 会显示与 version 不匹配的通道)。_xray_current_version
     # 读不出东西(二进制能跑但 version 输出无法解析)时, 两个都不写, 保持旧的一致状态。
+    #
+    # **两次 _state_set 不是原子的**(2026-09-22 九轮 OCR #16)。state 落在磁盘上, 第二次写
+    # 完全可能因为 ENOSPC / 只读重挂 / 配额而失败 —— 实测(见 implement.md) 那时的残局是
+    # `state/version` 已是**新版本**而 `state/channel` 仍是**旧通道**(或压根不存在),
+    # 菜单就长期显示一个磁盘上从没存在过的组合。
+    # 处置: **先写 channel(非主键, 失败更不可见), 再写 version(主键)**; channel 失败则
+    # 回滚 —— 把 version 也写回改动前的值。两次都成功才算记账成功。
+    # 顺序不能反: 先写 version 而 channel 失败时, "已经写好的新版本号"必须被回滚, 而
+    # 回滚需要旧值 —— 拿旧值与拿新值一样都要一次读, 但把**主键**放在最后写能让"只成功一次"
+    # 的窗口落在 channel 上, 而 channel 的错值只影响一行展示文案, 不会误导版本判断。
+    prev_ver=$(_state_get version 2>/dev/null)
     if [ -n "$newv" ]; then
-        _state_set version "$newv" || _warn "状态持久化失败(version)"
-        _state_set channel "$channel" || _warn "状态持久化失败(channel)"
+        if ! _state_set channel "$channel"; then
+            _warn "状态持久化失败(channel), 本次不记录 version/channel(保持旧的一致状态)"
+        elif ! _state_set version "$newv"; then
+            # channel 已写入 => 回滚它, 使两键一起停在改动前
+            _warn "状态持久化失败(version), 正在回滚 channel 记录"
+            if [ -n "$prev_ver" ]; then
+                _state_set channel "$prev_channel" 2>/dev/null || \
+                    _warn "channel 回滚失败, 状态可能显示旧版本+新通道, 请重跑一次切换"
+            else
+                rm -f "$STATE_DIR/channel" 2>/dev/null
+            fi
+        fi
     else
         _warn "无法读取新核心版本, 跳过 version/channel 记录(保持原值以免状态分裂)"
     fi
@@ -565,8 +644,14 @@ _init_config_if_empty_locked() {
 # 幂等: 仅当 env.XRAY_LOCATION_ASSET 缺失时注入; 用户手改的值不被覆盖。不重启服务
 # (与 _normalize_config_format 同级), 只保证磁盘上的 config 自描述, 下次重启生效。
 # 失败静默(启动路径不阻塞), 由下次启动重试。
+#
+# **读-改-写必须在 _with_config_lock 内**(2026-09-22 九轮 OCR #17)。旧写法直接读 config
+# 再 `_atomic_write_json` 覆盖 —— 而 `_atomic_write_json` 是 rename 语义, 会把**整份文件**
+# 换成它读到的旧快照 + env。若这中间另有写者提交了改动(另一会话的节点操作、cron 的
+# geo-update 后重启、或 `_mutate_config` 的事务体), 那些改动会被这份旧快照**静默丢弃**。
+# 同文件的 `_init_config_if_empty` 早已是这个 wrapper 形态(见它的 `_locked`), 这里补齐口径。
 # ---------------------------------------------------------------------------
-_auto_ensure_config_env() {
+_auto_ensure_config_env_locked() {
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
     local need
@@ -581,6 +666,13 @@ _auto_ensure_config_env() {
     [ -n "$content" ] || return 0
     _atomic_write_json "$CONFIG_FILE" "$content" 2>/dev/null || return 0
     _info "已注入 config env: XRAY_LOCATION_ASSET=$ASSET_DIR"
+}
+
+# 对外入口: 整段读-改-写在同一把配置锁内(与 _init_config_if_empty / _mutate_config 同款
+# wrapper + locked 形态)。`_with_config_lock` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 故被
+# `_mutate_config` 的事务体间接调用时不会自锁死。
+_auto_ensure_config_env() {
+    _with_config_lock _auto_ensure_config_env_locked "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -675,7 +767,14 @@ _create_xray_systemd_service() {
     if ! _xray_version_ge "26.7.11"; then
         env_line="Environment=XRAY_LOCATION_ASSET=${ASSET_DIR}"
     fi
-    cat > /etc/systemd/system/xray.service <<EOF
+    # unit 写入必须**检查结果**(2026-09-22 九轮 OCR #18 的 systemd 分支)。旧写法把
+    # `cat > 文件` 的返回码丢在地上, 磁盘满/只读/权限异常时会留下**半截或陈旧的 unit**,
+    # 而后面的 daemon-reload 可能照样成功 ⇒ 函数返回 0, 调用方据此认定"切换已提交"。
+    # 校验方式与 logrotate 同思路: 重定向失败即失败(不必回读比对 —— unit 内容由本函数
+    # 现算, 不存在并发写者, 而 systemd 会自己解析语法)。
+    # **不改成 mv**: openrc 侧需要 `chmod +x` 后的 init.d 脚本, 而 systemd 侧的 644 由下面
+    # 的 chmod 显式给 —— 保留 `cat` 提交是项目已验证的形态(见 CLAUDE.md 的同类取舍)。
+    if ! cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service (xray-deploy)
 Wants=network-online.target
@@ -701,10 +800,16 @@ ${nofile_line}
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        _error "service 文件写入失败(只读文件系统/磁盘空间/权限?): /etc/systemd/system/xray.service"
+        return 1
+    fi
     # R38(M14): umask 077 会让 unit 文件生成为 0600, systemd 会记 "marked
     # world-inaccessible" 告警。unit 不含机密(token 在 cloudflared 侧, 且那本就是既有形态),
-    # 显式给 644 以符合系统集成惯例。
-    chmod 644 /etc/systemd/system/xray.service 2>/dev/null || true
+    # 显式给 644 以符合系统集成惯例。chmod 失败只告警 —— 权限不影响 systemd 读取(它以 root
+    # 读), 为权限回滚会丢掉用户真正要的结果(与 logrotate / cloudflared 同一取舍)。
+    chmod 644 /etc/systemd/system/xray.service 2>/dev/null || \
+        _warn "service 文件权限设置失败(不影响 systemd 读取): /etc/systemd/system/xray.service"
     # 2026-09-12 三审(M3): 返回值现在被 _install_or_switch_xray 消费 —— daemon-reload 失败
     # 说明 service 文件根本没被 systemd 识别, 必须 fail; enable 失败只影响开机自启, 不中止安装。
     if ! systemctl daemon-reload; then
@@ -950,10 +1055,46 @@ _restart_xray_verified() {
 }
 
 # ---------------------------------------------------------------------------
+# 卸载前的"停止并验证"入口(2026-09-22 九轮 OCR #19)。
+#
+# 与 55-hysteria 的 `_hysteria_stop_and_verify` **同一契约**: 先停, 再**轮询确认进程真的
+# 退出**, 只有确认成功才返回 0。为什么不能只 `_manage_xray stop || true`:
+#   · `systemctl stop` 返回 0 不等于进程已退出(Type=simple 下 systemd 可能仍在收尾);
+#   · 停失败时旧实现照样继续删 unit 与部署目录 —— 残局是"进程仍监听端口 + 二进制/配置已删",
+#     用户既停不掉也起不来(实测复现见 implement.md)。
+# 判活用 `_xray_is_running`(R40 统一入口), **不用**裸 `systemctl is-active`/`rc-service status`
+# —— 那两者在崩溃窗口里都会说谎(见 CLAUDE.md 的"Unified liveness"段)。
+# `_xray_is_running` 缺失(混装旧 lib)时按 declare -F 守卫回退为"停一次即认为成功"并告警,
+# 绝不因此把卸载卡死。
+# ---------------------------------------------------------------------------
+_xray_stop_and_verify() {
+    if ! declare -F _xray_is_running >/dev/null 2>&1; then
+        _warn "lib 版本过旧(缺 _xray_is_running), 无法确认进程是否退出, 仅执行停止"
+        _manage_xray stop >/dev/null 2>&1 || true
+        return 0
+    fi
+    _manage_xray stop >/dev/null 2>&1 || true
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        _xray_is_running || return 0
+        sleep 1
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # 卸载 Xray(停服务 + 删 service + 删部署目录 + 清快捷命令 + 清 crontab)
 # ---------------------------------------------------------------------------
 _uninstall_xray() {
-    _manage_xray stop 2>/dev/null || true
+    # 停止必须**确认进程真的退出**再动文件(2026-09-22 九轮 OCR #19)。旧写法
+    # `_manage_xray stop 2>/dev/null || true` 忽略一切结果 —— 进程还在时照样删 unit 与部署目录,
+    # 留下"孤儿进程占着端口 + 没有 unit/配置可管理"的残局(与官方 Hysteria2 侧的
+    # `_hysteria_cleanup_before_uninstall` 是同一类保护, 那条早已是这个形态)。
+    if ! _xray_stop_and_verify; then
+        _error "xray 进程未能停止, 已中止卸载(文件未删除), 请手动处理后重试"
+        _tip "可先查看: xd 主菜单 [核心管理] → 服务状态"
+        return 1
+    fi
     case "$INIT_SYSTEM" in
         systemd)
             systemctl disable xray 2>/dev/null
