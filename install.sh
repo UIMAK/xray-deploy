@@ -694,16 +694,17 @@ _install_lock_mkdir_release() {   # <锁目录>; 归属校验后才删
 # 确认"我们持有的旧版安装锁 fd"仍指向**路径上那个文件**(十六轮 P2-②)。获取顺序是
 # "主锁 → mkdir 部署目录 → flock 旧版锁文件"; 旧版卸载者若在中间 `rm -rf` 掉整棵树, 我们
 # 打开的锁文件会被解除链接, 之后 flock 成功却落在无目录项的 inode 上, 而新来的旧版进程能在
-# 同一路径重建文件并同时加锁。复核失败即拒绝(宁可拒绝, 不做双重放行); 读不到 /proc 时不阻断。
+# 同一路径重建文件并同时加锁。复核失败即拒绝(宁可拒绝, 不做双重放行); fd 目标无法读取时
+# 同样拒绝，不能把"无法确认仍指向原路径"当成安全。
 _install_lock_inode_ok() {   # <fd> <path>
     local fd="$1" p="$2" t
     [ -n "$fd" ] && [ -n "$p" ] || return 0
     [ -e "$p" ] || return 1
-    t=$(readlink "/proc/self/fd/$fd" 2>/dev/null) || return 0
+    t=$(readlink "/proc/self/fd/$fd" 2>/dev/null) || return 1
     case "$t" in
         "$p") return 0 ;;
         *" (deleted)") return 1 ;;
-        *) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
