@@ -257,6 +257,13 @@ _xray_stage_release() {
 # 阶段二(锁内): 用 staging 里的产物**提交**这次替换。所有共享状态改动都在这里。
 # 返回 0 = 二进制已就位(还没验证服务); 1 = 失败(调用方按既有回滚路径处理)。
 # 用法: _xray_commit_staged <staging目录>
+# 返回三态(十三轮 P1-②)。**调用方必须按码分流, 不能把非 0 一律当成"没动过"**:
+#   0 = 提交成功(binary/geo 已就位, 尚未验证服务; 账本 phase 由调用方推进)
+#   1 = **真实状态完全没动**(可以安全丢弃账本与快照)
+#   2 = 动过, 且已完整回滚到改动前(可以丢弃账本与快照)
+#   3 = 动过, 但回滚**不完整**(账本必须保留, 交给恢复端/人工)
+# 旧实现只有 0/1 两态, 而 1 里混着"已换 binary 但 chmod 失败且回滚失败"这类**动过**的情形;
+# 调用方据 1 无条件 drop 账本 ⇒ 现场从此无人知晓(P1-② 的核心)。
 _xray_commit_staged() {
     local tmp_dir="$1"
     [ -d "$tmp_dir" ] && [ -f "${tmp_dir}/xray" ] || {
@@ -268,7 +275,7 @@ _xray_commit_staged() {
     if [ -f "$XRAY_BIN" ]; then
         if ! cp -f "$XRAY_BIN" "$XRAY_BIN.bak"; then
             _error "旧二进制备份失败(磁盘空间/IO?), 取消替换, 保留旧版本"
-            return 1
+            return 1   # 真实状态没动
         fi
     fi
     # 替换必须真正成功: mv 失败(磁盘满/IO/只读)时旧二进制仍在原位, 若放行则后续 "$XRAY_BIN"
@@ -276,27 +283,40 @@ _xray_commit_staged() {
     if ! mv -f "${tmp_dir}/xray" "$XRAY_BIN"; then
         _error "新二进制替换失败(磁盘空间/IO/只读?), 保留旧版本"
         rm -f "$XRAY_BIN.bak" 2>/dev/null   # 旧二进制仍在原位, 无需保留多余备份
-        return 1
+        return 1   # 真实状态没动(rename 原子: 失败即目标未变)
     fi
     # 执行位必须真正设置成功, 否则新二进制不可执行, 后续 version 校验/启动都会失败
     if ! chmod +x "$XRAY_BIN" 2>/dev/null; then
         _error "新二进制设置执行权限失败, 回滚旧版本"
+        # 此刻**新二进制已经在 $XRAY_BIN 上**(动过), 故回滚结果决定返回码
         if [ -f "$XRAY_BIN.bak" ]; then
-            mv -f "$XRAY_BIN.bak" "$XRAY_BIN" 2>/dev/null
-            chmod +x "$XRAY_BIN" 2>/dev/null
-        else
-            # 首次安装且无备份可回滚: 删掉这个不可执行的新二进制, 回到"未安装"的干净状态。
-            # 留着它会让调用方的 [ -x "$XRAY_BIN" ] 恢复检查失败、而菜单却把它当成"已安装"
-            # (_xray_current_version 读不出东西), 用户面对一个装不上的幽灵核心。
-            rm -f "$XRAY_BIN" 2>/dev/null
+            # **判定只看 mv 是否成功**: chmod 在本次事务里刚刚失败过(很可能整个环境下
+            # chmod 就是坏的), 用它当判据会把"已经换回旧二进制"误报成"回滚失败" ⇒ 返回 3
+            # 保留账本, 而其实现场已收敛。执行位单独尽力补, 失败只告警(与更下方
+            # _xray_restore_prev_bin 对 chmod 的处置同口径)。
+            if mv -f "$XRAY_BIN.bak" "$XRAY_BIN" 2>/dev/null; then
+                chmod +x "$XRAY_BIN" 2>/dev/null || \
+                    _warn "回滚后执行位设置失败, 请手动执行: chmod +x $XRAY_BIN"
+                _warn "已回滚到旧二进制"
+                return 2
+            fi
+            _error "旧二进制回滚失败, 请手动处理: $XRAY_BIN"
+            return 3
         fi
-        return 1
+        # 首次安装且无备份可回滚: 删掉这个不可执行的新二进制, 回到"未安装"的干净状态。
+        # 留着它会让调用方的 [ -x "$XRAY_BIN" ] 恢复检查失败、而菜单却把它当成"已安装"
+        # (_xray_current_version 读不出东西), 用户面对一个装不上的幽灵核心。
+        if rm -f "$XRAY_BIN" 2>/dev/null; then
+            return 2   # 动过(曾放上去), 但已回到"未安装"的改动前状态
+        fi
+        _error "无法删除残留的不可执行二进制: $XRAY_BIN"
+        return 3
     fi
 
     # release 自带的 geoip/geosite 放进 assets: **带快照**(十二轮 P2-②)。它虽是资源文件,
     # 但属于核心运行依赖 —— 新核心 + 半截/不匹配的 dat 同样会起不来。快照与还原复用
     # 二进制那一套(.bak), 由事务提交/回滚统一处置。
-    local gd
+    local gd geo_bad=0
     for gd in geoip.dat geosite.dat; do
         [ -f "${tmp_dir}/${gd}" ] || continue
         if [ -f "${ASSET_DIR}/${gd}" ]; then
@@ -305,9 +325,16 @@ _xray_commit_staged() {
             [ -f "${ASSET_DIR}/${gd}.coretxn.bak" ] || continue
         fi
         if ! cp -f "${tmp_dir}/${gd}" "${ASSET_DIR}/${gd}" 2>/dev/null; then
-            _warn "${gd} 替换失败(磁盘空间/IO?), 保留旧文件"
-            [ -f "${ASSET_DIR}/${gd}.coretxn.bak" ] && \
-                mv -f "${ASSET_DIR}/${gd}.coretxn.bak" "${ASSET_DIR}/${gd}" 2>/dev/null
+            if [ -f "${ASSET_DIR}/${gd}.coretxn.bak" ]; then
+                if mv -f "${ASSET_DIR}/${gd}.coretxn.bak" "${ASSET_DIR}/${gd}" 2>/dev/null; then
+                    _warn "${gd} 替换失败(磁盘空间/IO?), 已还原旧文件"
+                else
+                    _error "${gd} 替换失败且旧文件还原失败, 请手动核对 ${ASSET_DIR}/${gd}"
+                    geo_bad=1
+                fi
+            else
+                _warn "${gd} 替换失败(磁盘空间/IO?), 无旧文件可还原(首次下载)"
+            fi
         fi
     done
 
@@ -318,17 +345,24 @@ _xray_commit_staged() {
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
         _error "新二进制无法执行,可能架构不匹配"
         # 恢复旧二进制(mv 失败时旧二进制仍原位, 显式提示而非静默)
+        local bin_back=1
         if [ -f "$XRAY_BIN.bak" ]; then
-            if mv -f "$XRAY_BIN.bak" "$XRAY_BIN"; then
-                chmod +x "$XRAY_BIN"
+            # 同样只看 mv(理由见 chmod 失败分支的注释)
+            if mv -f "$XRAY_BIN.bak" "$XRAY_BIN" 2>/dev/null; then
+                chmod +x "$XRAY_BIN" 2>/dev/null || \
+                    _warn "回滚后执行位设置失败, 请手动执行: chmod +x $XRAY_BIN"
                 _info "已回滚到旧二进制"
             else
-                _warn "旧二进制回滚失败, 请手动检查 $XRAY_BIN"
+                bin_back=0
+                _error "旧二进制回滚失败, 请手动检查 $XRAY_BIN"
             fi
         fi
-        _xref_restore_geo_dats
-        return 1
+        _xref_restore_geo_dats || geo_bad=1
+        [ "$bin_back" -eq 1 ] && [ "$geo_bad" -eq 0 ] && return 2
+        return 3
     fi
+    # geo 有坏项时同样不能算成功(即使 binary 是好的)
+    [ "$geo_bad" -eq 0 ] || return 3
     # 注意: 此处先不删 $XRAY_BIN.bak —— 二进制 version 成功但可能与当前配置不兼容,
     # 交由调用方 _install_or_switch_xray 在 verified-restart 成功后才删除、失败则回滚。
     # 创建 xray 命令 symlink（检测已有安装不覆盖）
@@ -344,17 +378,22 @@ _xray_commit_staged() {
 # 而是两个阶段共用的收尾动作, 只在事务边界被调用。
 # ---------------------------------------------------------------------------
 _xref_restore_geo_dats() {
-    local gd rolled=0
+    local gd rolled=0 failed=0
     for gd in geoip.dat geosite.dat; do
         if [ -f "${ASSET_DIR}/${gd}.coretxn.bak" ]; then
             if mv -f "${ASSET_DIR}/${gd}.coretxn.bak" "${ASSET_DIR}/${gd}" 2>/dev/null; then
                 rolled=$((rolled+1))
             else
-                _warn "回滚 ${gd} 失败, 请手动核对 ${ASSET_DIR}/${gd}"
+                failed=$((failed+1))
+                _error "回滚 ${gd} 失败, 请手动核对 ${ASSET_DIR}/${gd}"
             fi
         fi
     done
     [ "$rolled" -gt 0 ] && _warn "已回滚 ${rolled} 个 geo dat 到切换前版本"
+    # **必须如实返回**(十三轮 P1-③): 旧实现无论 mv 成败都 return 0, 于是调用点的
+    # `|| disk_ok=0` 是死代码 —— geo 没恢复却照样宣布收敛、删账本。而版本校验只看 binary,
+    # 所以"旧 binary + 新/半截 geo dat"这种残局能同时通过 disk_ok 与 run_ok。
+    [ "$failed" -eq 0 ] || return 1
     return 0
 }
 
@@ -559,7 +598,17 @@ _with_core_lock() {
 # 同项目的 `_port_txn` 早已用"先落 journal → 启动期按事实收敛"处理这类窗口。
 #
 # 阶段转移(**单向, 只允许向后推进**):
-#   snapshot → binary_replaced → service_replaced → restart_verified → committed → (cleanup) → 删账本
+#   prepared → snapshotted → binary_replaced → service_replaced → restart_verified
+#            → committed → (cleanup) → 删账本
+#
+# **每个 phase 只能有一种现实解释**(十三轮 P1-①, 这是协议层的要求):
+#   prepared     = 账本已建, 恢复源**未**就绪。真实状态从未被触碰
+#                  ⇒ 崩溃后只清理中间产物, 绝不回滚(快照可能半截, 不能当恢复源)
+#   snapshotted  = 恢复源(binary .bak / unit 快照 / geo 快照)全部就绪, 真实状态仍未动
+#                  ⇒ 崩溃后同样只清理(没有需要恢复的东西)
+#   binary_replaced / service_replaced / restart_verified
+#                = 真实状态已被改动 ⇒ 崩溃后**回滚**
+#   committed    = 永不回滚, 只允许 cleanup
 #
 # 两条闭环各自要成立(十二轮复审指出的正是它们没成立):
 #   · **提交闭环**: `committed` 必须先于清理备份落盘。否则"已删 .bak、账本还写着可回滚"的
@@ -586,7 +635,7 @@ _xray_core_journal_write() {  # <旧版本> <旧通道> <新tag> <channel>
         --arg bin "$XRAY_BIN" --arg bak "${XRAY_BIN}.bak" \
         --arg unit "$(_xray_service_unit_path 2>/dev/null || echo '')" \
         --arg sprev "$(_xray_service_prev_path)" \
-        '{phase:"snapshot", old_version:$ov, old_channel:$oc, new_tag:$nt, channel:$nc,
+        '{phase:"prepared", old_version:$ov, old_channel:$oc, new_tag:$nt, channel:$nc,
           binary:$bin, binary_backup:$bak, unit:$unit, service_prev:$sprev}') || return 1
     _atomic_write_json "$(_xray_core_journal_path)" "$payload"
 }
@@ -603,6 +652,29 @@ _xray_core_journal_phase() {
     return 0
 }
 
+# phase 是否已经越过"真实状态尚未被触碰"的边界。**唯一入口**, 供失败分支决定账本去留:
+# 越过之后必须让恢复端接手, 绝不能在失败路径上直接 drop 账本(那会把"已改过"变成"查无此事")。
+_xray_core_txn_mutated() {
+    local j; j=$(_xray_core_journal_path)
+    [ -f "$j" ] || return 1
+    _xray_core_journal_ok "$j" || return 1
+    case "$(jq -r '.phase' "$j" 2>/dev/null)" in
+        binary_replaced|service_replaced|restart_verified) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 快照是否已全部就绪(prepared 之后的边界)。恢复端据此判断"能不能把快照当恢复源"。
+_xray_core_txn_snapshotted() {
+    local j; j=$(_xray_core_journal_path)
+    [ -f "$j" ] || return 1
+    _xray_core_journal_ok "$j" || return 1
+    case "$(jq -r '.phase' "$j" 2>/dev/null)" in
+        prepared) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 _xray_core_journal_drop() {
     rm -f "$(_xray_core_journal_path)" 2>/dev/null
     return 0
@@ -612,8 +684,15 @@ _xray_core_journal_drop() {
 # **fail-closed**: 账本存在但不可解析 / schema 不合法时同样算"有未收敛事务" —— 那种账本
 # 说不清现场, 绝不能因为"读不懂"就放行新事务去覆盖它(恢复流程会先把它隔离, 隔离后本函数
 # 自然返回"无待处理")。
+# 隔离(quarantine)标志: 账本损坏 ⇒ 现场未知 ⇒ **BLOCKED**, 不等同于"没有事务"。
+# 只保留 `.corrupt` 证据是不够的 —— 那样 `_xray_core_txn_pending` 会因为主账本已挪走而返回
+# "无事发生", 用户随即可以开新事务, 覆盖掉那份未知现场(十三轮 P2-②)。
+_xray_core_blocked_path() { printf '%s' "$STATE_DIR/coretxn.blocked"; }
+
 _xray_core_txn_pending() {
     local j; j=$(_xray_core_journal_path)
+    # 损坏账本留下的 BLOCKED 标记优先: 在人工清理之前, 一律视为有未收敛事务
+    [ -f "$(_xray_core_blocked_path)" ] && return 0
     [ -f "$j" ] || return 1
     _xray_core_journal_ok "$j" || return 0
     [ "$(jq -r '.phase' "$j" 2>/dev/null)" != "committed" ]
@@ -622,7 +701,7 @@ _xray_core_txn_pending() {
 _xray_core_journal_ok() {  # <journal> —— schema 合法性(只认我们写的形状)
     jq -e '
         (.phase | type == "string") and
-        (.phase | test("^(snapshot|binary_replaced|service_replaced|restart_verified|committed)$")) and
+        (.phase | test("^(prepared|snapshotted|binary_replaced|service_replaced|restart_verified|committed)$")) and
         (.old_version | type == "string") and
         (.old_channel | type == "string") and
         (.channel | type == "string") and
@@ -635,19 +714,37 @@ _xray_core_journal_ok() {  # <journal> —— schema 合法性(只认我们写�
 
 _xray_core_journal_quarantine() {  # <journal> <原因>
     local j="$1" why="$2"
-    _warn "核心事务日志不可用($why), 已隔离待人工核对: $j"
-    mv -f "$j" "${j}.corrupt" 2>/dev/null || \
-        _warn "隔离核心事务日志失败, 请手动检查: $j"
+    _error "核心事务日志不可用($why), 已隔离: $j"
+    if ! mv -f "$j" "${j}.corrupt" 2>/dev/null; then
+        _warn "隔离核心事务日志失败(文件无法移动), 请手动检查: $j"
+        return 1
+    fi
+    # 留下 BLOCKED 标记: 隔离只保全了证据, **没有**确定事务状态 ⇒ 新事务一律拒绝,
+    # 直到人工核对后显式清除(与 _xray_core_txn_pending 的 fail-closed 口径配套)。
+    : > "$(_xray_core_blocked_path)" 2>/dev/null || \
+        _warn "无法创建 BLOCKED 标记, 新事务门禁将依赖 .corrupt 人工判断"
+    _tip "现场状态未知, 已阻止新的核心切换; 核对后请删除:"
+    _tip "  $(_xray_core_blocked_path)  ${j}.corrupt"
+    return 0
 }
 
 # committed 之后的**清理**(幂等, 可重复执行): 只删源与账本, 绝不回滚。
 # 单独成函数是因为两条路径都要用它 —— 正常提交, 以及"上次已 committed 但清理没跑完"的恢复。
 _xray_core_cleanup_after_commit() {  # <journal路径> <二进制备份路径> <service快照路径>
-    local j="$1" bak="$2" sprev="$3"
+    local j="$1" bak="$2" sprev="$3" left=0
     rm -f "$bak" 2>/dev/null
     rm -f "$sprev" "${sprev}.absent" "${sprev}.enabled" 2>/dev/null
-    # geo dat 快照同属"本次切换的恢复源", 提交后一并丢弃(P2-②)
+    # geo dat 快照同属"本次切换的恢复源", 提交后一并丢弃
     if declare -F _xref_drop_geo_snapshots >/dev/null 2>&1; then _xref_drop_geo_snapshots; fi
+    # **清理没做完就不删账本**(十三轮 P2-①): committed 账本本身就是"继续清理"的凭据 ——
+    # 删掉它会让残留备份永远无人回收。实测 rm 失败极罕见, 但代价只是留一个文件,
+    # 而漏掉的代价是垃圾永久堆积, 所以按"残留即保留账本"处理。
+    [ -e "$bak" ] && left=1
+    [ -e "$sprev" ] && left=1
+    if [ "$left" -eq 1 ]; then
+        _warn "提交后清理未完成(仍有备份残留), 保留事务账本供下次启动继续清理"
+        return 1
+    fi
     rm -f "$j" 2>/dev/null
     return 0
 }
@@ -663,6 +760,13 @@ _xray_core_txn_recover() {
 
 _xray_core_txn_recover_locked() {
     local j; j=$(_xray_core_journal_path)
+    # BLOCKED 标记(账本曾损坏): 报告但**不自动放行** —— 状态未知时唯一正确的动作是让人
+    # 来处理。返回非 0 使调用方(菜单)知道这门禁仍然生效(与 _xray_core_txn_pending 同口径)。
+    if [ -f "$(_xray_core_blocked_path)" ]; then
+        _error "核心事务处于 BLOCKED(账本损坏, 现场未知): 请人工核对后清理"
+        _tip "  $(_xray_core_blocked_path)  ${j}.corrupt"
+        return 1
+    fi
     [ -f "$j" ] || return 0
     if ! jq -e . "$j" >/dev/null 2>&1; then
         _xray_core_journal_quarantine "$j" "无法解析"
@@ -686,6 +790,25 @@ _xray_core_txn_recover_locked() {
         return 0
     fi
 
+    # ---- prepared / snapshotted: **真实状态尚未被触碰** ⇒ 不需要回滚, 只清理 ----
+    # 这是十三轮 P1-① 的核心修正。旧实现把"账本已写但快照没做完"与"快照做完、甚至二进制
+    # 已换"都记成同一个 `snapshot`, 于是恢复端只能猜: 既可能把一份**半截快照**当正式恢复源,
+    # 也可能在什么都没动的情况下判"回滚失败"而永久保留账本。
+    # 现在这两个 phase 的含义是唯一且可判定的:
+    #   prepared    = 账本已建, 恢复源未就绪 ⇒ 之后崩溃**无需回滚**(没动过真实状态)
+    #   snapshotted = 恢复源已就绪, 但真实状态仍未动 ⇒ 同样无需回滚
+    # 因此两者都只做"丢弃本次事务的中间产物", 绝不拿快照往生产文件上写。
+    if [ "$phase" = "prepared" ] || [ "$phase" = "snapshotted" ]; then
+        # 注意: 这里的快照可能是**半截**的(崩溃点可能落在 cp/cmp 之间), 正因如此才不能
+        # 把它当恢复源 —— 直接删掉是唯一安全的处置(真实状态没动, 没有需要恢复的东西)。
+        [ -n "$bak" ] && rm -f "$bak" 2>/dev/null
+        [ -n "$sprev" ] && rm -f "$sprev" "${sprev}.absent" "${sprev}.enabled" 2>/dev/null
+        if declare -F _xref_drop_geo_snapshots >/dev/null 2>&1; then _xref_drop_geo_snapshots; fi
+        rm -f "$j" 2>/dev/null
+        _warn "检测到未完成的核心切换事务(阶段: ${phase}, 真实状态未改动), 已清理中间产物"
+        return 0
+    fi
+
     _warn "检测到未完成的核心切换事务(阶段: ${phase}), 正在回滚到切换前的状态..."
     # 回滚源只认账本里记的路径, 不读当下环境 —— 账本说什么就恢复什么, 避免"恢复时用的常量"
     # 与"当时写入的路径"漂移(与 _port_txn_recover 同一取向)。
@@ -705,7 +828,16 @@ _xray_core_txn_recover_locked() {
             _error "二进制还原失败, 请手动处理: ${bak%.bak}(备份仍在 $bak)"
         fi
     else
-        _warn "账本记录的二进制备份已不存在($bak), 跳过二进制还原"
+        # **升级事务**里 .bak 是唯一的旧二进制来源; 它不在 ⇒ 无法证明能回滚(十三轮 P1-④)。
+        # 两种情况必须区分: 首次安装本来就没有旧二进制(journal 的 old_version 为空)不算丢证据;
+        # 升级则一律判定为"恢复源丢失" ⇒ disk_ok=0, 不许宣布收敛。
+        if [ -n "$old_ver" ]; then
+            disk_ok=0
+            _error "账本记录的旧二进制备份已丢失($bak), 无法回滚到 v${old_ver}"
+            _tip "请人工确认 $XRAY_BIN 的版本, 并删除账本后重装对应通道"
+        else
+            _warn "首次安装事务无旧二进制备份(符合预期), 跳过二进制还原"
+        fi
     fi
     # service 快照: 与 _xray_service_restore_prev 同一口径, 但路径取自账本
     if [ -f "${sprev}.absent" ]; then
@@ -765,6 +897,11 @@ _xray_core_txn_recover_locked() {
             if [ -n "$old_ver" ] && [ -n "$runv" ] && [ "$runv" != "$old_ver" ]; then
                 run_ok=0
                 _error "服务已拉起但版本不符(期望 ${old_ver}, 实际 ${runv})"
+                # **必须把错误的运行实例停掉**(十三轮 P1-④): 留着"新 core 正在跑 + 旧 service
+                # + 旧 state + 保留的账本"是最糟的组合 —— 现场既不一致, 又在对外服务。
+                # 保持停止, 让人工处理有一个确定的起点。
+                _manage_xray stop >/dev/null 2>&1 || true
+                _tip "已停止服务, 避免运行实例与恢复后的持久状态继续分裂"
             else
                 _warn "已重启并确认运行在恢复后的核心上(v${runv:-?})"
             fi
@@ -814,7 +951,12 @@ _install_or_switch_xray() {
     # 真正的门禁仍在锁内那一次(两次检查之间可能有另一个会话产生账本)。
     if _xray_core_txn_pending; then
         _error "存在未完成的核心切换事务, 已拒绝开始新的切换"
-        _tip "请先按提示处理并删除账本: $(_xray_core_journal_path)"
+        if [ -f "$(_xray_core_blocked_path)" ]; then
+            _tip "事务账本已损坏或状态未知(BLOCKED): 请人工核对现场后删除"
+            _tip "  $(_xray_core_blocked_path)  $(_xray_core_journal_path).corrupt"
+        else
+            _tip "请先按提示处理并删除账本: $(_xray_core_journal_path)"
+        fi
         return 1
     fi
     tag=$(_xray_fetch_tag "$channel") || {
@@ -879,14 +1021,33 @@ _install_or_switch_xray_locked() {
         _xray_core_journal_drop
         return 1
     fi
-    if ! _xray_commit_staged "$staged"; then
-        # 这条路径没碰过 unit(二进制都没换), 快照直接作废 —— 快照只对本次事务有效,
-        # 残留下来只会成为下次排障时说不清的噪声。
+    # 快照全部就绪之后才推 snapshotted(P1-①): 这个 phase 的含义是"恢复源已完备, 但真实
+    # 状态仍未动"。此后任何崩溃都允许回滚, 而此之前(prepared)崩溃只需清理。
+    if ! _xray_core_journal_phase "snapshotted"; then
+        _error "核心事务阶段推进失败(snapshotted), 未做任何改动即中止"
         _xray_service_snapshot_drop
         _xray_core_journal_drop
-        # 下载失败:若有旧二进制,尝试恢复服务
+        return 1
+    fi
+    _xray_commit_staged "$staged"; local crc=$?
+    if [ "$crc" -ne 0 ]; then
+        # **按码分流**(P1-②): 1=没动过 / 2=动过但已完整回滚 ⇒ 可以丢弃账本与快照;
+        # 3=动过且回滚不完整 ⇒ 账本必须保留, 否则现场从此无人知晓。
+        if [ "$crc" -eq 3 ]; then
+            _error "核心替换失败且回滚不完整, 已保留事务账本待处理"
+            _tip "下次启动 xd 会自动尝试恢复; 也可手动核对 $(_xray_core_journal_path)"
+            return 1
+        fi
+        # 1/2: 真实状态已是改动前(或从未改动), 本次事务作废 —— 中间产物一并清掉。
+        _xray_service_snapshot_drop
+        _xray_core_journal_drop
+        if [ "$crc" -eq 2 ]; then
+            _warn "核心替换失败, 已回滚到改动前状态(v${cur})"
+        else
+            _warn "核心替换未开始(真实状态未改动)"
+        fi
+        # 服务在 commit 阶段被停过, 这里把它拉回原状
         if [ -x "$XRAY_BIN" ]; then
-            _warn "切换失败,保留当前二进制 v${cur}"
             _manage_xray start >/dev/null 2>&1 || true
         fi
         return 1
@@ -1076,8 +1237,11 @@ _install_or_switch_xray_locked() {
         return 1
     fi
     # committed 已落盘 ⇒ 从此只前进不回头: 清理是幂等的, 断了也没关系。
+    # 清理失败**不影响本次切换的成功结论**(新核心确实已提交并验证), 但会保留账本,
+    # 由下次启动接着清 —— 所以这里只告警不返回失败(P2-①)。
     _xray_core_cleanup_after_commit "$(_xray_core_journal_path)" \
-        "$XRAY_BIN.bak" "$(_xray_service_prev_path)"
+        "$XRAY_BIN.bak" "$(_xray_service_prev_path)" || \
+        _warn "备份清理未完成(不影响本次切换结果), 账本已保留供下次启动继续清理"
     _success "Xray-core 已切换到 v${newv} (${channel})"
     _tip "配置与节点保持不变"
 
