@@ -604,6 +604,9 @@ _uninstall_menu() {
 # ---------------------------------------------------------------------------
 # 重置 config.json 为默认(含 routing 规则, 清空节点); 保留 Xray 二进制
 # ---------------------------------------------------------------------------
+# 破坏性部分必须整体位于 config lock 内: backup、hop 清理、config 替换、metadata 清理和
+# restart 之间不能让普通节点事务插入, 否则并发创建的节点会被 reset 在 rm config/nodes 时抹掉。
+# 提问留在锁外, 避免用户思考时长期占住配置锁; wrapper 只负责前置检查/确认和取锁。
 _reset_config() {
     echo
     # F10: 重建默认配置依赖 jq —— 先删后建, jq 缺失会留下"无 config + xray 起不来"的残局,
@@ -611,21 +614,30 @@ _reset_config() {
     if ! command -v jq >/dev/null 2>&1; then
         _error "jq 不可用, 无法重建默认配置, 已取消重置"
         _tip "请先安装 jq(主菜单启动时也会自动尝试安装), 再执行重置"
-        return
+        return 1
     fi
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
-        local ncount; ncount=$(_node_count 2>/dev/null)
+        local ncount ans
+        ncount=$(_node_count 2>/dev/null)
         echo -e "  ${YELLOW}当前有 ${ncount} 个节点, 重置将清空所有节点配置${NC}"
         read -rp "  确认清空并重置 config.json? [y/N]: " ans
         case "$ans" in
             y|Y) ;;
-            *) _info "已取消"; return ;;
+            *) _info "已取消"; return 0 ;;
         esac
+    fi
+    _with_config_lock _reset_config_locked
+}
+
+_reset_config_locked() {
+    local had_config=0
+    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
+        had_config=1
         # 2026-09-12 三审(M1): 重置是清空全部节点数据的破坏性操作, 备份失败(磁盘满/IO 错误)
         # 必须中止 —— 原写法忽略返回值, 备份失败仍 rm config, 用户在无备份情况下丢失全部节点。
         if ! _backup_config; then
             _error "配置备份失败(磁盘空间/IO?), 已取消重置以保护现有数据"
-            return
+            return 1
         fi
     fi
     # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)
@@ -642,15 +654,20 @@ _reset_config() {
     # 节点元数据**, 而上面那段刚花力气做的备份只保护了 config 一侧。
     # 处置: 消费返回码, 失败走 `_restore_config`(它读的是 `_backup_config` 刚写的 lastbak)
     # 并立即返回 —— 元数据与 clash 只有在配置确实重建成功之后才允许被清。
-    rm -f "$CONFIG_FILE"
+    if ! rm -f "$CONFIG_FILE" 2>/dev/null; then
+        _error "无法删除旧 config.json, 已取消重置以保护现有数据"
+        return 1
+    fi
     if ! _init_config_if_empty; then
         _error "重建默认配置失败(只读/磁盘空间/jq 异常?), 正在回滚到重置前的配置"
-        if _restore_config; then
+        if [ "$had_config" -eq 1 ] && _restore_config; then
             _warn "已回滚, 重置未生效: 配置与节点数据均保持原样"
-        else
+        elif [ "$had_config" -eq 1 ]; then
             _error "回滚失败, 请手动从 $BACKUP_DIR/config.json.lastbak 恢复"
+        else
+            _error "重置前没有可恢复的旧配置, 请检查磁盘空间/权限后重试"
         fi
-        return
+        return 1
     fi
     # 清空节点元数据 + clash.yaml(只有配置确认重建成功才会走到这里)
     if [ -d "$NODES_DIR" ]; then
