@@ -439,8 +439,28 @@ _check_port_occupied() {
 }
 
 # ---------------------------------------------------------------------------
-# 原子写 JSON:临时文件写 + 校验 + mv(配合 xray -test)
+# 持久化屏障(十六轮 P1-③)。`mv` 只保证 rename **原子**(读不到半份文件), **不等于掉电持久**:
+# 数据可能仍在页缓存里。事务账本的 phase barrier 声称 durable, 就必须刷两次 —— 先刷临时文件
+# (数据块落盘), rename 之后再刷**父目录**(新目录项落盘; 只刷文件不足以让 rename 持久)。
+# 只刷文件不刷目录时, 断电后目录项可能仍是旧的 ⇒ 读到旧 phase, 而真实现场已完成 mutation。
+# 手段按平台级联(覆盖面递减): `sync <path>`(coreutils ≥8.24 / busybox ≥1.31)按路径刷 →
+# `sync -f <path>`(GNU)刷该路径所在文件系统 → 退回**全系统 sync**(更重但语义更强, 永远正确)。
+# 尽力而为: 任一步成功即返回 0, 全部失败才告警 —— 不改变调用方对"写入成功"的判定。
+# ---------------------------------------------------------------------------
+_fsync_path() {   # <path>
+    local p="$1"
+    [ -n "$p" ] || return 0
+    sync "$p" >/dev/null 2>&1 && return 0
+    sync -f "$p" >/dev/null 2>&1 && return 0
+    sync >/dev/null 2>&1 && return 0
+    _warn "无法把 $p 刷入持久存储(平台不支持按路径 fsync), 掉电一致性降级"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# 原子写 JSON:临时文件写 + 校验 + fsync + mv + 目录 fsync(配合 xray -test)
 # 用法:_atomic_write_json <目标文件> <内容>
+# 事务账本(phase barrier)、config 与节点元数据的**唯一**提交点, 故持久化屏障只加在这一处。
 # ---------------------------------------------------------------------------
 _atomic_write_json() {
     local target="$1" content="$2" tmp
@@ -469,11 +489,16 @@ _atomic_write_json() {
             return 1
         fi
     fi
+    # 校验全部通过后才刷: 刷一个马上要丢弃的临时文件是白等。数据块必须先于 rename 落盘,
+    # 否则 rename 后断电可能留下"新名字 + 空内容"(比旧内容更糟)。
+    _fsync_path "$tmp"
     if ! mv -f "$tmp" "$target"; then
         rm -f "$tmp"
         _error "替换 JSON 文件失败: $target"
         return 1
     fi
+    # rename 之后刷**父目录**: 让新目录项本身落盘。
+    _fsync_path "$(dirname "$target")"
     return 0
 }
 
