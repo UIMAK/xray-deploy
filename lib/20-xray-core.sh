@@ -534,7 +534,23 @@ _xray_restore_prev_bin() {
 # 因此 `_manage_xray` 派生守护进程时用 `$` 一并关闭: 未持锁时它退化为
 # 关掉那个同样没在用的 fd 9(实测 no-op 且 rc=0), 持锁时则精确关掉锁 fd。
 # ---------------------------------------------------------------------------
-export CORE_LOCK_FD=9      # 未持锁时的默认值: 9 在本模块只用于关闭服务进程继承的 fd
+# 未持锁时的默认值: 9 只用于关闭"服务进程继承的 fd"(该 fd 本就不存在, no-op)。
+# **释放后必须复位成 9**(十六轮 P2-①): `exec {CORE_LOCK_FD}>>` 会把动态分配的真实 fd 号写进这个
+# **全局**变量, 关闭 fd 并不会把它改回来。若不复位, 之后任何**未持锁**的调用者(如 _manage_xray
+# 派生守护进程时按 `${CORE_LOCK_FD:-9}` 关 fd)就会拿着上个事务残留的号去关一个**与本项目无关**
+# 的 fd —— 那个号可能已被无关代码占用。锁内使用真实号、锁外恒为 9, 才能让"关错 fd"在结构上
+# 不可能发生。复位点与 fd 关闭点成对出现(见下方四处 `_xray_core_lock_fd_reset`)。
+# ---------------------------------------------------------------------------
+export CORE_LOCK_FD=9      # 未持锁时恒为 9: 只用于关闭服务进程继承的 fd(no-op)
+# 关闭核心锁 fd 并把全局复位到 9。**每次关闭都必须调用它**, 否则动态号会残留到下次未持锁的调用。
+_xray_core_lock_fd_reset() {
+    eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+    CORE_LOCK_FD=9
+    export CORE_LOCK_FD
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 卸载侧对**旧版锁路径**的跨版本协调(2026-09-23 十五轮)。
 #
 # 旧版(0.17.11 / PR #48 早期 HEAD)把核心锁与安装锁都放在 `$DEPLOY_DIR` **内**
@@ -592,6 +608,25 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
     fi
     eval "$dirvar=\"\$ldir\""
     return 0
+}
+
+# 确认"我们持有的旧版锁"仍**就是路径上那个文件**(十六轮 P2-②)。
+# 为什么必须查: 旧版协调的顺序是"先拿主锁 → mkdir -p 部署目录 → 再 flock 旧版锁文件"。若旧版
+# 卸载者此刻正持旧版锁并执行 `rm -rf $DEPLOY_DIR`, 它会连同我们刚打开的锁文件一起删掉 —— 我们
+# 的 fd 随后 flock 成功, 但那把锁落在**已解除链接的 inode** 上: 路径上已经没有它的目录项, 任何
+# 新来的旧版进程都会在**同一个路径**上创建新文件并成功加锁 ⇒ 两个持有者同时进场。
+# 故拿到锁后必须复核 inode 身份, 不一致一律 fail-closed (宁可拒绝, 不做双重放行)。
+# 读不到 /proc(少数容器)时**不阻断**: 这条是加固, 不是新的一票否决点。
+_xray_legacy_lock_inode_ok() {   # <fd> <path>; 0 = 我们持有的 fd 仍指向该路径上的文件
+    local fd="$1" p="$2" t
+    [ -n "$fd" ] && [ -n "$p" ] || return 0
+    [ -e "$p" ] || return 1
+    t=$(readlink "/proc/self/fd/$fd" 2>/dev/null) || return 0
+    case "$t" in
+        "$p") return 0 ;;
+        *" (deleted)") return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
 _xray_legacy_lock_release() {   # <fd变量名> <mkdir变量名>
@@ -657,8 +692,8 @@ _with_core_lock() {
         if [ "$locked" -ne 1 ]; then
             _error "等待核心锁超时(15s), 可能有其他 xd 会话正在切换核心"
             # 超时路径同样要关掉刚打开的 fd: 菜单是长驻循环, 漏掉会让每次失败都泄漏一个 fd,
-            # 最终撞上 ulimit 后连 _state_set 的 mktemp 都开始失败。
-            eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+            # 最终撞上 ulimit 后连 _state_set 的 mktemp 都开始失败。复位全局见 helper。
+            _xray_core_lock_fd_reset
             return 1
         fi
         # 目录存在性检查放在**拿到锁之后**: 卸载期间到达的竞争者应当先排队、再按锁内的真实
@@ -667,13 +702,20 @@ _with_core_lock() {
         # 路径在目录内, 重建会留下"空目录 + 新锁"的假现场。
         if [ ! -d "$deploy_path" ]; then
             _error "部署目录不存在, 放弃本次操作: $deploy_path"
-            eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+            _xray_core_lock_fd_reset
             return 1
         fi
         # 再取旧版 flock 核心锁(跨版本互斥)。取不到 = 仍有旧版会话, fail-closed。
         if ! _xray_legacy_lock_name XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR \
             "$legacy_lockf" "$legacy_fallback_dir" "核心锁"; then
-            eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+            _xray_core_lock_fd_reset
+            return 1
+        fi
+        # 同 install 锁: 旧版会话/卸载可能在打开后删掉该文件, 复核 inode 身份(P2-②)。
+        if ! _xray_legacy_lock_inode_ok "${XD_CORE_LEGACY_FLOCK_FD:-}" "$legacy_lockf"; then
+            _error "旧版核心锁文件在获取后被替换/删除: $legacy_lockf"
+            _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
+            _xray_core_lock_fd_reset
             return 1
         fi
         # 子 shell 内执行: 使 CORE_LOCK_FD 与 HELD 标记的作用域跟着这次加锁一起消失,
@@ -685,7 +727,7 @@ _with_core_lock() {
         )
         rc=$?
         _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
-        eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+        _xray_core_lock_fd_reset
         return "$rc"
     fi
 
@@ -795,6 +837,15 @@ _with_deploy_install_lock() {
         # 同一种手段再取一次旧版锁, 否则旧版 install.sh 会与新版各持一把锁同时落地。
         if ! _xray_legacy_lock_name XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR \
             "$legacy_lock_file" "$legacy_lock_dir" "安装锁"; then
+            eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+            return 1
+        fi
+        # 旧版卸载者可能在我们打开锁文件之后 `rm -rf` 掉整棵树并删掉该锁文件: 那样我们握着的
+        # 是已解除链接的 inode, 路径上换成了新文件 ⇒ 再复核一次身份, 不一致就拒绝(P2-②)。
+        if ! _xray_legacy_lock_inode_ok "${XD_INSTALL_LEGACY_FLOCK_FD:-}" "$legacy_lock_file"; then
+            _error "旧版安装锁文件在获取后被替换/删除(部署目录正被卸载?): $legacy_lock_file"
+            _tip "等对方结束后重试; 本次不做任何落地"
+            _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
@@ -1019,8 +1070,9 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
 
 # 最终验证全体恢复源后才能进入 snapshotted。单个 snapshot helper 的 cmp 保证写入当时完整;
 # 这里再验证 journal 中已 durable 记录的 hash 与全部 sidecar, 让该 phase 成为可依赖的屏障。
+#
 _xray_core_snapshots_ok() {  # <journal>
-    local j="$1" bin bak pre hash got gd src unit sprev service_pre service_hash flag want
+    local j="$1" bin bak pre got hash gd src unit sprev service_pre service_hash flag want operation
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
@@ -1077,6 +1129,10 @@ _xray_core_snapshots_ok() {  # <journal>
     local stage operation hash expected f
     stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
     operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || operation=core
+    # staging 在这里**无条件**要求存在: 本函数只在进入 snapshotted 那一次被调用
+    # (合法转移只有 prepared:snapshotted), 即"新数据尚未落地、staging 就是恢复源"的时刻。
+    # 十六轮复核: `journal_ok` 本身**不碰文件系统**(只做 schema/字段校验), 所以"staging 缺失
+    # 导致账本被判损坏"这条路径不存在 —— 该检查只在 snapshots_ok, 不要按"应该在哪"推断。
     [ -d "$stage" ] || { _error "staging source 缺失: $stage"; return 1; }
     case "$operation" in
         core)
@@ -1374,8 +1430,34 @@ _xray_core_recover_rollback_locked() {
         return 1
     fi
 
+    # 0. 本事务是否真的改过 binary/service?(十六轮 P2-③ 的落地)
+    #    **geo 事务在任何 phase 都不碰 binary/service**: 它的 mutation 只有 geoip/geosite 两个
+    #    dat(它之所以快照 binary/service, 是为了统一恢复路径并能校验完整 pre-state —— 见
+    #    _xray_core_geo_update_locked 顶部的 ownership 说明)。故按 **operation 单独判定**,
+    #    不再按 phase 细分: 用旧快照去"还原"一个本事务从未改过的 live binary/service, 只会把
+    #    "绕过 core lock 的外部改动"静默回退掉。此时只**校验**快照完整性(缺失/损坏仍要报错并
+    #    保留账本), 不写回。
+    #    core 事务在跨过 replacing 之后确实会改 binary, 那些 phase 保持原样的重放语义。
+    local txn_touched_binary=1 txn_touched_service=1
+    if [ "$(jq -r '.operation // "core"' "$j" 2>/dev/null)" = geo ]; then
+        txn_touched_binary=0; txn_touched_service=0
+    fi
+
     # 1. binary pre-state 由**显式布尔值**描述, 绝不从 old_version 是否为空推断(十三轮 P2-③)。
-    if [ "$pre" = true ]; then
+    if [ "$txn_touched_binary" -eq 0 ]; then
+        # 只验证恢复源可用(缺失/损坏仍要报错并保留 journal), 不写回 live binary。
+        if [ "$pre" = true ]; then
+            if [ ! -f "$bak" ] || [ -L "$bak" ]; then
+                disk_ok=0
+                _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
+            else
+                got_hash=$(_xray_core_sha256_file "$bak") || got_hash=""
+                [ -n "$got_hash" ] && [ "$got_hash" = "$old_hash" ] || {
+                    disk_ok=0; _error "事务旧 binary 恢复源 hash 不符: $bak"; }
+            fi
+            _warn "本次为 Geo 事务且未跨过替换点, binary 按未变更处理(不重放旧快照)"
+        fi
+    elif [ "$pre" = true ]; then
         if [ ! -f "$bak" ] || [ -L "$bak" ]; then
             disk_ok=0
             _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
@@ -1406,7 +1488,21 @@ _xray_core_recover_rollback_locked() {
 
     # 3. service: hash 与显式 pre-existence 都由 journal 绑定。快照损坏或两种状态标记
     # 同时存在时拒绝写回/删除, 保留 journal 和恢复源等待人工处理。
-    if [ -n "$unit" ]; then
+    #    **Geo 事务未跨过替换点时只校验、不写回**(见上方 P2-③ 说明): 该事务从未创建/改写 unit,
+    #    用快照覆盖 live unit 只会把"绕过 core lock 的外部改动"静默回退。
+    if [ -n "$unit" ] && [ "$txn_touched_service" -eq 0 ]; then
+        if [ "$service_pre" = true ]; then
+            if [ -f "$sprev" ] && [ ! -L "$sprev" ] && ! _xray_core_path_present "${sprev}.absent"; then
+                service_got=$(_xray_core_sha256_file "$sprev") || service_got=""
+                [ -n "$service_got" ] && [ "$service_got" = "$service_hash" ] || {
+                    disk_ok=0; _error "service 恢复源 hash 不符: $sprev"; }
+                _warn "本次为 Geo 事务且未跨过替换点, service 按未变更处理(不重放旧快照)"
+            else
+                disk_ok=0
+                _error "service pre-existing 快照缺失/含糊, 保留 journal: $sprev"
+            fi
+        fi
+    elif [ -n "$unit" ]; then
         if [ "$service_pre" = true ]; then
             if [ -f "$sprev" ] && [ ! -L "$sprev" ] && ! _xray_core_path_present "${sprev}.absent"; then
                 service_got=$(_xray_core_sha256_file "$sprev") || service_got=""
@@ -1552,6 +1648,13 @@ _xray_core_abort_locked() {  # <用户可读原因>
 
 # 独立 Geo 更新也复用 coretxn: 共享同一把锁、同一份 transaction-unique 快照与恢复状态机。
 # 下载已在锁外完成; 此处先 durable 建 journal, 再准备 stage/snapshots, 最后跨过 replacing 屏障。
+#
+# **rollback ownership 的边界(十六轮 P2-③)**: 本事务只 mutation geo dat, 却按统一事务契约
+# 一并快照 binary/service。这**不是**让它拥有 binary/service 的回滚权 —— 快照存在的意义是
+# "回滚时能验证完整 pre-state 并保持恢复路径统一", 而不是"geo 事务可以重放 binary/service"。
+# 风险是维护层面的: 任何绕过 core lock 改 binary/service 的外部动作, 都可能被 geo recovery
+# 覆盖。因此这里显式声明该边界(下方 _xray_core_recover_rollback_locked 对 geo 只验证不重放
+# 未变更的 binary/service), 并把"所有 binary/service 变更都必须持 core lock"写成硬前提。
 _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
     local download_dir="$1" ts="$2" downloads_ok="$3"
     local j stage old_ver old_channel runtime f src staged dest size hash expected gi_hash="" gs_hash=""
@@ -1722,6 +1825,10 @@ _install_or_switch_xray() {
     fi
     # ---- 阶段二(锁内): 提交(把 staging 路径与已解析的 tag 交给提交体) ----
     _with_core_lock _install_or_switch_xray_locked "$channel" "$staged" "$tag" || rc=$?
+    # 无条件回收 staging 是**安全**的(十六轮复核结论, 不要改成"看账本再删"): 恢复端从不需要
+    # staging 的内容 —— core 回滚一律从 .bak 快照重放, geo 从各自的 dat 备份重放; 而
+    # _xray_core_cleanup_sources 对 staging 的判据是"**必须已不存在**"(存在才报失败)。
+    # 因此提前删掉只是在替它把这一步做完, 不会让任何 phase 的恢复失去依据。
     rm -rf "$staged" 2>/dev/null
     return $rc
 }
@@ -1848,6 +1955,20 @@ _install_or_switch_xray_locked() {
 # _with_config_lock 经 XRAY_DEPLOY_LOCK_HELD 可重入, 故被 _mutate_config 调用时不会自锁死。
 # ---------------------------------------------------------------------------
 _init_config_if_empty() {
+    # **锁序: core → config 只能由核心事务这一侧走(十六轮 P1-①)。** 核心事务已持 core lock,
+    # 此时再去取 config lock 就构成 core → config; 而配置事务(config lock)会调用
+    # _restart_xray_verified → _with_core_lock, 即 config → core。两条边同时存在 ⇒ 两个会话
+    # 各自持锁等对方, 15s 后双双超时失败(还会触发各自的回滚)。
+    # 声明式的持锁标记使本函数在核心事务内**不再自取 config lock**。正确性依据(已核对):
+    # 本函数**只在 config 缺失/空时写**, 入口先判 `[ -f ] && [ -s ]` 即返回; 而并发的
+    # _mutate_config_locked 是对**已存在**的 config 做 jq 变换, 不可能在"空配置"上写。
+    # 两条写路径因此不落在同一个状态上: 核心事务走 init 时, config 要么已存在(直接返回,
+    # 不写), 要么确实空(此时没有任何 config 事务能持有它)。两个写者都通过 _atomic_write_json
+    # 提交(rename 原子), 故不存在交错半写。
+    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" = "1" ]; then
+        _init_config_if_empty_locked "$@"
+        return $?
+    fi
     _with_config_lock _init_config_if_empty_locked "$@"
 }
 

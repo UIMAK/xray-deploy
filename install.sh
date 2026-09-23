@@ -691,6 +691,22 @@ _install_lock_mkdir_release() {   # <锁目录>; 归属校验后才删
     return 0
 }
 
+# 确认"我们持有的旧版安装锁 fd"仍指向**路径上那个文件**(十六轮 P2-②)。获取顺序是
+# "主锁 → mkdir 部署目录 → flock 旧版锁文件"; 旧版卸载者若在中间 `rm -rf` 掉整棵树, 我们
+# 打开的锁文件会被解除链接, 之后 flock 成功却落在无目录项的 inode 上, 而新来的旧版进程能在
+# 同一路径重建文件并同时加锁。复核失败即拒绝(宁可拒绝, 不做双重放行); 读不到 /proc 时不阻断。
+_install_lock_inode_ok() {   # <fd> <path>
+    local fd="$1" p="$2" t
+    [ -n "$fd" ] && [ -n "$p" ] || return 0
+    [ -e "$p" ] || return 1
+    t=$(readlink "/proc/self/fd/$fd" 2>/dev/null) || return 0
+    case "$t" in
+        "$p") return 0 ;;
+        *" (deleted)") return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 _install_lock_acquire() {
     local install_lock_parent="${DEPLOY_DIR%/*}"
     [ -n "$install_lock_parent" ] || install_lock_parent="/"
@@ -724,6 +740,13 @@ _install_lock_acquire() {
             if ! flock -n "$INSTALL_LEGACY_LOCK_FD" 2>/dev/null; then
                 echo "[错误] 旧版安装/卸载仍在运行(持有 $INSTALL_LEGACY_LOCK_FILE), 本次中止"
                 echo "       以免两棵树互相覆盖; 等它退出后重试(内核会在持有进程退出时自动释放)"
+                _install_lock_release
+                return 1
+            fi
+            # 旧版卸载者可能在我们打开锁文件后 `rm -rf` 掉整棵树: 复核 inode 身份(P2-②),
+            # 否则我们握着的是已解除链接的 inode, 与"路径上新建文件的旧版进程"会同时放行。
+            if ! _install_lock_inode_ok "${INSTALL_LEGACY_LOCK_FD:-}" "$INSTALL_LEGACY_LOCK_FILE"; then
+                echo "[错误] 旧版安装锁文件在获取后被替换/删除(部署目录正被卸载?), 本次中止"
                 _install_lock_release
                 return 1
             fi
