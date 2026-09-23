@@ -708,6 +708,33 @@ _install_lock_inode_ok() {   # <fd> <path>
     esac
 }
 
+# 旧版安装器不认识部署目录外的新锁。若旧版已拿到目录内锁并在卸载时删掉整棵树,
+# 新版随后重建同名目录/锁路径会得到全新的 inode, 与旧进程手里的已删除 fd 不互斥。
+# 在重建旧路径前扫描仍持有已删除部署文件的进程并 fail-closed。该检查只能缩小窗口;
+# 旧版的 mkdir 锁在整棵树删除后没有可追踪 fd 时, 仍需等所有旧版进程退出后再重试。
+_install_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持有已删除树中的 fd
+    local root="${1%/}" p pid target prefix matches find_rc
+    [ -n "$root" ] || return 1
+    prefix="${root}/"
+    if command -v find >/dev/null 2>&1; then
+        matches=$(find /proc/[0-9]*/fd -type l -lname "${prefix}* (deleted)" -print -quit 2>/dev/null)
+        find_rc=$?
+        if [ "$find_rc" -eq 0 ]; then
+            [ -n "$matches" ] && return 0
+            return 1
+        fi
+    fi
+    for p in /proc/[0-9]*/fd/*; do
+        pid=${p#/proc/}; pid=${pid%%/*}
+        [ "$pid" = "$$" ] && continue
+        target=$(readlink "$p" 2>/dev/null) || continue
+        case "$target" in
+            "$prefix"*" (deleted)") return 0 ;;
+        esac
+    done
+    return 1
+}
+
 _install_lock_acquire() {
     local install_lock_parent="${DEPLOY_DIR%/*}"
     [ -n "$install_lock_parent" ] || install_lock_parent="/"
@@ -732,6 +759,11 @@ _install_lock_acquire() {
                 _install_lock_release
                 return 1
             fi
+            if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+                echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
+                _install_lock_release
+                return 1
+            fi
             # 旧版同为 flock 路径(`.install.lock.fd`): 拿不到就说明旧版安装/卸载仍在跑。
             exec {INSTALL_LEGACY_LOCK_FD}>>"$INSTALL_LEGACY_LOCK_FILE" 2>/dev/null || {
                 INSTALL_LEGACY_LOCK_FD=""
@@ -751,6 +783,11 @@ _install_lock_acquire() {
                 _install_lock_release
                 return 1
             fi
+            if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+                echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
+                _install_lock_release
+                return 1
+            fi
             return 0
         fi
         eval "exec ${INSTALL_LOCK_FD}>&-" 2>/dev/null
@@ -765,6 +802,11 @@ _install_lock_acquire() {
     INSTALL_LOCK_HELD=1
     if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
         echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
+        _install_lock_release
+        return 1
+    fi
+    if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+        echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
         _install_lock_release
         return 1
     fi

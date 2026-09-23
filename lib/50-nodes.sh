@@ -835,8 +835,8 @@ _hy2_persist_iptables() {
     # 否则 metadata 提交 hop=enabled, 重启后 runtime DNAT 全丢, 直接违反
     # "runtime/metadata 不分裂"原则。_ensure_iptables 只保证 iptables 存在,
     # 不保证 iptables-save, 故必须在此显式 fail-closed。正常 enable/disable/
-    # retarget/delete 的事务都会因 rc1 回滚 runtime 且不提交 metadata; reset
-    # 路径由调用方保持 best-effort + warn。
+    # retarget/delete 的事务都会因 rc1 回滚 runtime 且不提交 metadata; reset/uninstall
+    # 路径也必须保留现场并返回失败。
     if ! command -v iptables-save >/dev/null 2>&1; then
         _error "iptables-save 不可用, 无法安全持久化端口跳跃规则(重启后规则会丢失)"
         return 1
@@ -1402,37 +1402,46 @@ _hy2_list_all_hop_rules() {
 
 # 清理所有节点的端口跳跃 iptables 规则
 _hy2_cleanup_all_hops() {
-    [ -d "$NODES_DIR" ] || return 0
-    if ! command -v iptables >/dev/null 2>&1; then
-        # reset/uninstall 都会随后丢弃 metadata; 有 hop metadata 却无法访问 iptables 时必须
-        # 保留现场并失败返回, 否则 DNAT 会残留而失去可追溯的清理依据。
-        if grep -lq 'hop_ranges\|udp_hop_ports' "$NODES_DIR"/*.json 2>/dev/null; then
-            _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
-            return 1
-        fi
-        return 0
+    local found=0 residual=0 metadata_hop=0
+    if [ -d "$NODES_DIR" ] && grep -lq 'hop_ranges\|udp_hop_ports\|hop_start\|hop_end' \
+        "$NODES_DIR"/*.json 2>/dev/null; then
+        metadata_hop=1
     fi
-    local found=0 residual=0
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        [ "$proto" = "hysteria2" ] || continue
-        local port ranges
-        port=$(jq -r '.port' "$f" 2>/dev/null)
-        ranges=$(_read_hop_ranges "$f")
-        if [ -n "$ranges" ] && [ -n "$port" ]; then
-            # R17: 全量重置场景 metadata 整体丢弃, 清理为 best-effort; 但残留必须显式报告, 不静默
-            # shellcheck disable=SC2086
-            _hy2_remove_hop_rules "$port" $ranges || residual=1
-            found=1
-        fi
-    done
+    if [ "$metadata_hop" -eq 1 ] && ! command -v iptables >/dev/null 2>&1; then
+        # metadata says this deployment owns hop rules, but there is no way to issue the
+        # precise -D commands or verify runtime state. Preserve the deployment tree.
+        _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
+        return 1
+    fi
+    if command -v iptables >/dev/null 2>&1 && [ -d "$NODES_DIR" ]; then
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            [ "$proto" = "hysteria2" ] || continue
+            local port ranges
+            port=$(jq -r '.port' "$f" 2>/dev/null)
+            ranges=$(_read_hop_ranges "$f")
+            if [ -n "$ranges" ] && [ -n "$port" ]; then
+                # R17: 全量重置场景 metadata 整体丢弃, 清理为 best-effort; 但残留必须显式报告, 不静默
+                # shellcheck disable=SC2086
+                _hy2_remove_hop_rules "$port" $ranges || residual=1
+                found=1
+            fi
+        done
+    fi
     if [ "$found" -eq 1 ] && ! _hy2_persist_iptables; then
         _error "iptables 规则持久化失败, 端口跳跃清理未完成"
         residual=1
     fi
+    # metadata 可能已经丢失/损坏, 不能因为没有可遍历的节点文件就报告清理成功。
+    # 事务调用方随后会删除 deployment tree, 所以最终判据必须是 runtime + 持久化文件中已经
+    # 没有任何本项目拥有的规则; 发现孤儿规则时只能 fail-closed, 不能猜测 dport/target 去删。
+    if ! declare -F _hy2_no_hop_rules_at_all >/dev/null 2>&1 || ! _hy2_no_hop_rules_at_all; then
+        _error "无法证明端口跳跃规则已清空, 或仍存在孤儿规则; 已保留现场, 请手动检查 iptables -t nat -S PREROUTING"
+        residual=1
+    fi
     if [ "$residual" -ne 0 ]; then
-        _error "部分端口跳跃规则清理后仍有残留, 请手动检查 iptables -t nat -S PREROUTING"
+        _error "端口跳跃规则清理未完成, 请手动检查 iptables -t nat -S PREROUTING"
         return 1
     fi
     return 0
