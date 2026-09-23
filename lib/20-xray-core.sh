@@ -135,8 +135,8 @@ _xray_cached_version() {
 }
 
 # ---------------------------------------------------------------------------
-# 下载并替换 Xray 二进制(不缓存旧版,直接覆盖)
-# 用法:_xray_download_replace <tag>
+# 下载 Xray 二进制到 staging(不缓存旧版; 真正的替换在 _xray_commit_staged)
+# 用法: _xray_stage_release <tag>   → stdout = staging 目录(失败时非 0, 无输出)
 # ---------------------------------------------------------------------------
 
 # 低内存机器(可用内存<384MB)释放页缓存; 内存充足的机器跳过以避免性能损失
@@ -191,7 +191,11 @@ _xray_verify_sha256() {
     return 0
 }
 
-_xray_download_replace() {
+# 阶段一(十二轮 P2-③): **只做取件, 不碰任何共享状态** —— 下载/校验/解压全部落在自己独有的
+# staging 目录里, 因此**不需要核心锁**。锁只包住第二阶段(_xray_commit_staged), 于是
+# "另一个会话在下载 40s"不会把本会话拖成 15s 锁超时。
+# 成功时把 staging 目录路径打到 stdout(调用方持有它直到提交或放弃)。
+_xray_stage_release() {
     local tag="$1"
     local asset tmp_dir tmp_zip
     asset=$(_xray_arch_asset)
@@ -244,6 +248,19 @@ _xray_download_replace() {
         return 1
     fi
 
+    # 取件阶段到此为止 —— 共享状态(二进制/服务/geo dat)一律留到第二阶段的锁内处理。
+    # geo dat 从 staging 里就位, 由第二阶段带快照地提交(P2-②)。
+    printf '%s' "$tmp_dir"
+    return 0
+}
+
+# 阶段二(锁内): 用 staging 里的产物**提交**这次替换。所有共享状态改动都在这里。
+# 返回 0 = 二进制已就位(还没验证服务); 1 = 失败(调用方按既有回滚路径处理)。
+# 用法: _xray_commit_staged <staging目录>
+_xray_commit_staged() {
+    local tmp_dir="$1"
+    [ -d "$tmp_dir" ] && [ -f "${tmp_dir}/xray" ] || {
+        _error "staging 目录不可用: ${tmp_dir:-（空）}"; return 1; }
     # 停服务 -> 备份旧二进制 -> 替换二进制 -> 校验可执行
     _manage_xray stop >/dev/null 2>&1 || true
     # 覆盖前备份旧二进制(校验失败/运行期不稳定可回滚)。备份必须真正成功才允许替换:
@@ -251,7 +268,6 @@ _xray_download_replace() {
     if [ -f "$XRAY_BIN" ]; then
         if ! cp -f "$XRAY_BIN" "$XRAY_BIN.bak"; then
             _error "旧二进制备份失败(磁盘空间/IO?), 取消替换, 保留旧版本"
-            rm -rf "$tmp_dir"
             return 1
         fi
     fi
@@ -260,7 +276,6 @@ _xray_download_replace() {
     if ! mv -f "${tmp_dir}/xray" "$XRAY_BIN"; then
         _error "新二进制替换失败(磁盘空间/IO/只读?), 保留旧版本"
         rm -f "$XRAY_BIN.bak" 2>/dev/null   # 旧二进制仍在原位, 无需保留多余备份
-        rm -rf "$tmp_dir"
         return 1
     fi
     # 执行位必须真正设置成功, 否则新二进制不可执行, 后续 version 校验/启动都会失败
@@ -275,15 +290,26 @@ _xray_download_replace() {
             # (_xray_current_version 读不出东西), 用户面对一个装不上的幽灵核心。
             rm -f "$XRAY_BIN" 2>/dev/null
         fi
-        rm -rf "$tmp_dir"
         return 1
     fi
 
-    # 顺带把 release 自带的 geoip/geosite 放进 assets(若无则跳过;R4 的自动更新会覆盖)
-    [ -f "${tmp_dir}/geoip.dat" ]   && cp -f "${tmp_dir}/geoip.dat"   "$ASSET_DIR/" 2>/dev/null || true
-    [ -f "${tmp_dir}/geosite.dat" ] && cp -f "${tmp_dir}/geosite.dat" "$ASSET_DIR/" 2>/dev/null || true
-
-    rm -rf "$tmp_dir"
+    # release 自带的 geoip/geosite 放进 assets: **带快照**(十二轮 P2-②)。它虽是资源文件,
+    # 但属于核心运行依赖 —— 新核心 + 半截/不匹配的 dat 同样会起不来。快照与还原复用
+    # 二进制那一套(.bak), 由事务提交/回滚统一处置。
+    local gd
+    for gd in geoip.dat geosite.dat; do
+        [ -f "${tmp_dir}/${gd}" ] || continue
+        if [ -f "${ASSET_DIR}/${gd}" ]; then
+            cp -f "${ASSET_DIR}/${gd}" "${ASSET_DIR}/${gd}.coretxn.bak" 2>/dev/null || \
+                _warn "${gd} 旧文件备份失败(磁盘空间?), 跳过本次替换"
+            [ -f "${ASSET_DIR}/${gd}.coretxn.bak" ] || continue
+        fi
+        if ! cp -f "${tmp_dir}/${gd}" "${ASSET_DIR}/${gd}" 2>/dev/null; then
+            _warn "${gd} 替换失败(磁盘空间/IO?), 保留旧文件"
+            [ -f "${ASSET_DIR}/${gd}.coretxn.bak" ] && \
+                mv -f "${ASSET_DIR}/${gd}.coretxn.bak" "${ASSET_DIR}/${gd}" 2>/dev/null
+        fi
+    done
 
     # 低内存机器: 下载/解压/cp 产生大量页缓存, xray version 前释放以避 OOM
     _maybe_drop_caches
@@ -300,12 +326,43 @@ _xray_download_replace() {
                 _warn "旧二进制回滚失败, 请手动检查 $XRAY_BIN"
             fi
         fi
+        _xref_restore_geo_dats
         return 1
     fi
     # 注意: 此处先不删 $XRAY_BIN.bak —— 二进制 version 成功但可能与当前配置不兼容,
     # 交由调用方 _install_or_switch_xray 在 verified-restart 成功后才删除、失败则回滚。
     # 创建 xray 命令 symlink（检测已有安装不覆盖）
     _ensure_xray_symlink
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# geo dat 的事务侧收尾(十二轮 P2-②)。两个方向, 都幂等:
+#   · `_xref_restore_geo_dats`: 回滚 —— 把 .coretxn.bak 换回原位(提交前/失败路径用)
+#   · `_xref_drop_geo_snapshots` : 提交 —— 丢弃快照(verified-restart 通过后才调)
+# 命名刻意带 `xref` 前缀(而不是并入 _xray_* 命名空间): 它不是"取件"也不是"提交"的一环,
+# 而是两个阶段共用的收尾动作, 只在事务边界被调用。
+# ---------------------------------------------------------------------------
+_xref_restore_geo_dats() {
+    local gd rolled=0
+    for gd in geoip.dat geosite.dat; do
+        if [ -f "${ASSET_DIR}/${gd}.coretxn.bak" ]; then
+            if mv -f "${ASSET_DIR}/${gd}.coretxn.bak" "${ASSET_DIR}/${gd}" 2>/dev/null; then
+                rolled=$((rolled+1))
+            else
+                _warn "回滚 ${gd} 失败, 请手动核对 ${ASSET_DIR}/${gd}"
+            fi
+        fi
+    done
+    [ "$rolled" -gt 0 ] && _warn "已回滚 ${rolled} 个 geo dat 到切换前版本"
+    return 0
+}
+
+_xref_drop_geo_snapshots() {
+    local gd
+    for gd in geoip.dat geosite.dat; do
+        rm -f "${ASSET_DIR}/${gd}.coretxn.bak" 2>/dev/null
+    done
     return 0
 }
 
@@ -352,7 +409,7 @@ _ensure_xray_symlink() {
 # ---------------------------------------------------------------------------
 # 核心切换失败时的**统一还原入口**(2026-09-22 九轮 OCR #15)。
 #
-# 背景: `_xray_download_replace` 在**校验第 2..N 步之前**就把 $XRAY_BIN 换成了新二进制,
+# 背景: `_xray_commit_staged` 在**校验第 2..N 步之前**就把 $XRAY_BIN 换成了新二进制,
 # 旧的那个只存在于 `$XRAY_BIN.bak`。于是"替换之后、提交之前"的任何一步失败(配置初始化 /
 # service 文件生成 / 稳定运行确认)都必须把三者一起还原:
 #   1. `$XRAY_BIN.bak` → `$XRAY_BIN`(磁盘上是旧核心)
@@ -382,6 +439,11 @@ _ensure_xray_symlink() {
 _xray_restore_prev_bin() {
     local cur="$1" prev_channel="${2:-}" binary_kept="${3:-}"
     local svc_ok=1
+    # geo dat 与二进制同属"核心运行依赖", 回滚时一并换回(P2-②)。放在最前: 它不依赖其它
+    # 步骤的结论, 失败只影响 disk 判据(下面按 svc_ok 汇总)。
+    if declare -F _xref_restore_geo_dats >/dev/null 2>&1; then
+        _xref_restore_geo_dats || svc_ok=0
+    fi
     if [ ! -f "$XRAY_BIN.bak" ]; then
         # 首次安装: 没有旧二进制可回。**不删**刚落地的新二进制 —— 用户可能仍可用它,
         # 删掉只会把"核心能跑但 service 没建好"变成"完全没核心"。
@@ -490,28 +552,33 @@ _with_core_lock() {
 }
 
 # ---------------------------------------------------------------------------
-# 核心切换事务日志 + 崩溃恢复(2026-09-22 十一轮 P1-②)。
+# 核心切换事务的**状态机 + 崩溃恢复**(2026-09-22 十二轮; 十一轮建立, 本轮补齐两次闭环)。
 #
-# 十轮把"函数返回失败"这条路径闭上了(二进制/unit/state 三件套一起回滚), 但**进程被杀**
-# 这条路径仍然敞着: 下载完成 → 旧二进制进了 `.bak` → 新二进制已替换 → unit 已重写 →
-# SIGKILL / OOM / 掉电。此时没有任何函数会被调用, 机器上留下"新二进制 + 旧备份 + 新 unit"
-# 的中间态, 而下次开机**无人判断**这是一次没做完的切换。
+# 为什么要有账本: 函数返回失败这条路径可以靠 `|| 回滚` 覆盖, 但**进程被杀**(SIGKILL / OOM /
+# 掉电)时没有任何函数会被调用, 盘上留"新二进制 + 旧 .bak + 新 unit"而下次开机无人判断。
+# 同项目的 `_port_txn` 早已用"先落 journal → 启动期按事实收敛"处理这类窗口。
 #
-# 同项目的端口修改 (_port_txn) 早已用"先落 journal → 启动期按事实收敛"处理这一类窗口;
-# 本函数把同一模型补到核心切换上:
-#   · journal 在**动任何真实状态之前**原子落盘(state/coretxn.json)
-#   · 每个关键阶段推进 phase(binary_replaced → service_replaced → restart_verified)
-#   · 提交成功才删 journal; 失败回滚完也删
-#   · 启动期 `_xray_core_txn_recover` 发现 phase != committed 的 journal 即**回滚**到旧核心
-#     (核心切换是"可放弃"的事务: 新核心没验证过就不该留在盘上)
+# 阶段转移(**单向, 只允许向后推进**):
+#   snapshot → binary_replaced → service_replaced → restart_verified → committed → (cleanup) → 删账本
 #
-# 幂等与 fail-closed: journal 不可解析 / schema 不合法 ⇒ **隔离**(改名 .corrupt)并告警,
-# 绝不按猜测动作 —— 与 `_ptx_journal_quarantine` 同策。
-# 为啥落在 $STATE_DIR 而不是 $BIN_DIR: 它是账本不是产物, 且 $STATE_DIR 已 chmod 700。
+# 两条闭环各自要成立(十二轮复审指出的正是它们没成立):
+#   · **提交闭环**: `committed` 必须先于清理备份落盘。否则"已删 .bak、账本还写着可回滚"的
+#     窗口会让恢复无源可回(旧顺序就是这样: 先 rm .bak 再删账本)。
+#     落盘 committed 之后**永不再回滚**, 只继续清理 —— 清理中断也只是残留备份, 下次看到
+#     committed 就把清理做完。所以"清理"是幂等的、可重复执行的。
+#   · **恢复闭环**: 恢复必须把"磁盘 + **运行实例**"一起收敛。只改文件不重启会让
+#     "磁盘=旧核心 / 内存里跑着新核心"长期并存(十一轮的实现只改文件)。
+#
+# 判据三态, 任一为 0 即**不完整**: disk_ok(二进制+service 落盘)、run_ok(服务真的跑起来
+# 且版本正确)。不完整时账本**保留**、返回 1, 并拒绝开启新事务(P1-⑤: 否则新事务会覆盖
+# 上一次未收敛事务的唯一证据)。
+#
+# fail-closed: 账本不可解析 / schema 不合法 ⇒ **隔离**(改名 .corrupt)并告警, 绝不按猜测动作
+# ——与 `_ptx_journal_quarantine` 同策。账本落 $STATE_DIR(已 chmod 700), 它是账本不是产物。
 # ---------------------------------------------------------------------------
 _xray_core_journal_path() { printf '%s' "$STATE_DIR/coretxn.json"; }
 
-# 写 journal。返回 1 = 未落盘(调用方必须中止, 不能带着"没有账本"继续改真实状态)。
+# 写 journal(新事务起点)。返回 1 = 未落盘 ⇒ 调用方必须中止, 不能带着"没有账本"改真实状态。
 _xray_core_journal_write() {  # <旧版本> <旧通道> <新tag> <channel>
     local old_ver="$1" old_ch="$2" new_tag="$3" new_ch="$4" payload
     mkdir -p "$STATE_DIR" || return 1
@@ -524,18 +591,32 @@ _xray_core_journal_write() {  # <旧版本> <旧通道> <新tag> <channel>
     _atomic_write_json "$(_xray_core_journal_path)" "$payload"
 }
 
-# 推进 phase(其余字段保持不动)。失败只告警: journal 停在更早的 phase 会让恢复走**更保守**的
-# "回滚"分支, 而回滚本身是幂等的 —— 宁可多回滚一次, 不可漏回滚。
+# 推进阶段。**返回码必须被消费**(十二轮 P1-④): 旧实现 `|| _warn` 后恒 `return 0`, 于是
+# "phase 没写进去"时调用方照样进入下一步 —— 最终账本与现实对不上(比如账本还停在
+# service_replaced 而备份已经删了)。现在失败即返回 1, 由调用方决定"中止并回滚"。
 _xray_core_journal_phase() {
     local ph="$1"
-    _meta_update "$(_xray_core_journal_path)" '.phase=$p' --arg p "$ph" 2>/dev/null || \
-        _warn "核心事务日志阶段推进失败($ph), 崩溃恢复将按更保守的'回滚'处理"
+    if ! _meta_update "$(_xray_core_journal_path)" '.phase=$p' --arg p "$ph" 2>/dev/null; then
+        _error "核心事务阶段推进失败: ${ph}(磁盘空间/IO?), 账本与现场可能不一致"
+        return 1
+    fi
     return 0
 }
 
 _xray_core_journal_drop() {
     rm -f "$(_xray_core_journal_path)" 2>/dev/null
     return 0
+}
+
+# 账本存在且阶段不是 committed ⇒ 有未收敛事务。供"新事务硬门禁"与菜单提示共用。
+# **fail-closed**: 账本存在但不可解析 / schema 不合法时同样算"有未收敛事务" —— 那种账本
+# 说不清现场, 绝不能因为"读不懂"就放行新事务去覆盖它(恢复流程会先把它隔离, 隔离后本函数
+# 自然返回"无待处理")。
+_xray_core_txn_pending() {
+    local j; j=$(_xray_core_journal_path)
+    [ -f "$j" ] || return 1
+    _xray_core_journal_ok "$j" || return 0
+    [ "$(jq -r '.phase' "$j" 2>/dev/null)" != "committed" ]
 }
 
 _xray_core_journal_ok() {  # <journal> —— schema 合法性(只认我们写的形状)
@@ -559,8 +640,28 @@ _xray_core_journal_quarantine() {  # <journal> <原因>
         _warn "隔离核心事务日志失败, 请手动检查: $j"
 }
 
-# 启动期恢复入口(供 _main_menu 调用)。返回 0 = 无待处理事务或已收敛。
+# committed 之后的**清理**(幂等, 可重复执行): 只删源与账本, 绝不回滚。
+# 单独成函数是因为两条路径都要用它 —— 正常提交, 以及"上次已 committed 但清理没跑完"的恢复。
+_xray_core_cleanup_after_commit() {  # <journal路径> <二进制备份路径> <service快照路径>
+    local j="$1" bak="$2" sprev="$3"
+    rm -f "$bak" 2>/dev/null
+    rm -f "$sprev" "${sprev}.absent" "${sprev}.enabled" 2>/dev/null
+    # geo dat 快照同属"本次切换的恢复源", 提交后一并丢弃(P2-②)
+    if declare -F _xref_drop_geo_snapshots >/dev/null 2>&1; then _xref_drop_geo_snapshots; fi
+    rm -f "$j" 2>/dev/null
+    return 0
+}
+
+# 启动期恢复入口。返回 0 = 无待处理事务 / 已收敛; 1 = 有**未收敛**事务(调用方应阻止新事务)。
+#
+# **必须在核心锁内执行**(十二轮 P1-②): 它操作的是与 _install_or_switch_xray 完全相同的一组
+# 文件(xray / .bak / unit 快照 / state / 账本)。十一轮漏了这层, 于是"A 正在切换 + B 进菜单
+# 触发恢复"会并发改同一套东西 —— 而这恰恰是加 .core.lock 要防的那件事。
 _xray_core_txn_recover() {
+    _with_core_lock _xray_core_txn_recover_locked "$@"
+}
+
+_xray_core_txn_recover_locked() {
     local j; j=$(_xray_core_journal_path)
     [ -f "$j" ] || return 0
     if ! jq -e . "$j" >/dev/null 2>&1; then
@@ -578,41 +679,69 @@ _xray_core_txn_recover() {
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null)
     unit=$(jq -r '.unit' "$j" 2>/dev/null)
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null)
-    # phase=committed 不该留(提交时会删), 但真留着就只是账本残留, 直接清掉
+
+    # ---- 已提交: 永不回滚, 只把清理做完(幂等) ----
     if [ "$phase" = "committed" ]; then
-        rm -f "$j" 2>/dev/null
+        _xray_core_cleanup_after_commit "$j" "$bak" "$sprev"
         return 0
     fi
+
     _warn "检测到未完成的核心切换事务(阶段: ${phase}), 正在回滚到切换前的状态..."
-    # 回滚源只认 journal 自己记的路径, 不读当下环境 —— 账本说什么就恢复什么, 避免
-    # "恢复时用的常量"与"当时写入的路径"漂移(与 _port_txn_recover 同一取向)。
-    local svc_ok=1
+    # 回滚源只认账本里记的路径, 不读当下环境 —— 账本说什么就恢复什么, 避免"恢复时用的常量"
+    # 与"当时写入的路径"漂移(与 _port_txn_recover 同一取向)。
+    local disk_ok=1 run_ok=1
+    # geo dat 也是核心运行依赖: 回滚时一并换回旧版本(P2-②)。放在最前面是因为它不需要
+    # 等待其它步骤的结论, 且失败也要计入 disk_ok。
+    if declare -F _xref_restore_geo_dats >/dev/null 2>&1; then
+        _xref_restore_geo_dats || disk_ok=0
+    fi
     if [ -f "$bak" ]; then
         if mv -f "$bak" "${bak%.bak}"; then
             chmod +x "${bak%.bak}" 2>/dev/null || \
                 _warn "还原后的二进制执行位设置失败: ${bak%.bak}"
             _warn "已还原切换前的二进制"
         else
+            disk_ok=0
             _error "二进制还原失败, 请手动处理: ${bak%.bak}(备份仍在 $bak)"
         fi
     else
-        _warn "journal 记录的二进制备份已不存在($bak), 跳过二进制还原"
+        _warn "账本记录的二进制备份已不存在($bak), 跳过二进制还原"
     fi
-    # service 快照: 与 _xray_service_restore_prev 同一口径, 但路径取自 journal
+    # service 快照: 与 _xray_service_restore_prev 同一口径, 但路径取自账本
     if [ -f "${sprev}.absent" ]; then
-        [ -n "$unit" ] && rm -f "$unit" 2>/dev/null
-        rm -f "${sprev}.absent" 2>/dev/null
-        _warn "已撤销本次切换新建的 service 文件: ${unit:-（无）}"
-    elif [ -f "$sprev" ] && [ -n "$unit" ]; then
-        # 与正常回滚共用同一个原子替换实现(P2-②): 恢复途中的 ENOSPC/EIO 不得留下半截 unit。
-        # 权限/重载口径由 helper 按目标路径自己判定, 恢复路径不再重复一套。
-        if _xray_service_restore_file "$sprev" "$unit"; then
-            rm -f "$sprev" 2>/dev/null
-            _warn "已还原切换前的 service 文件: $unit"
+        if [ -n "$unit" ] && ! rm -f "$unit" 2>/dev/null; then
+            disk_ok=0
+            _error "新建的 service 文件删除失败, 请手动核对: $unit"
         else
-            svc_ok=0
+            rm -f "${sprev}.absent" 2>/dev/null
+            # 开机自启是独立的一维, 一并还原(十二轮 P2-①)。失败**不计入 disk_ok** ——
+            # 它不影响核心能否运行, 而计入会让收敛永久失败(账本永留 ⇒ 新切换被门禁拒绝),
+            # 那是用一个更坏的失效模式换一个更轻的差异。
+            _xray_service_restore_enable "${sprev}.enabled" || \
+                _warn "service 开机自启状态未还原(不影响当前运行)"
+            _warn "已撤销本次切换新建的 service 文件: ${unit:-（无）}"
+        fi
+    elif [ -f "$sprev" ]; then
+        # 与正常回滚共用同一个原子替换实现(P2-②): 恢复途中的 ENOSPC/EIO 不得留下半截 unit。
+        if [ -n "$unit" ] && _xray_service_restore_file "$sprev" "$unit"; then
+            rm -f "$sprev" 2>/dev/null
+            _xray_service_restore_enable "${sprev}.enabled" || \
+                _warn "service 开机自启状态未还原(不影响当前运行)"
+            _warn "已还原切换前的 service 文件: $unit"
+        elif [ -z "$unit" ]; then
+            _warn "账本未记录 unit 路径(direct 后端), 跳过 service 还原(仍恢复自启状态)"
+            _xray_service_restore_enable "${sprev}.enabled" || \
+                _warn "service 开机自启状态未还原(不影响当前运行)"
+        else
+            disk_ok=0
             _error "service 文件还原失败, 请手动核对: $unit(备份: $sprev)"
         fi
+    else
+        # 事务开始时**强制**做过快照(见 _install_or_switch_xray_locked), 所以"既没有 prev 也
+        # 没有 .absent"意味着**事务证据丢失**(十二轮 P1-③) —— 绝不等于"无需恢复"。
+        disk_ok=0
+        _error "service 快照已丢失($sprev 与 .absent 都不在), 无法确认 service 已回到切换前状态"
+        _tip "请人工核对 $unit 是否为切换前的内容"
     fi
     # state 写回"磁盘上实际那个二进制"的版本/通道
     local recv
@@ -624,15 +753,40 @@ _xray_core_txn_recover() {
     else
         rm -f "$STATE_DIR/channel" 2>/dev/null
     fi
-    # 收敛完成才删 journal; service 没还原成功则保留, 让用户/下次启动还能看到这条线索
-    if [ "$svc_ok" -eq 1 ]; then
-        rm -f "$j" 2>/dev/null
-        _warn "核心切换事务已回滚收敛(恢复到 v${recv:-?})"
+
+    # ---- 运行实例必须与磁盘一起收敛(十二轮 P1-①) ----
+    # 只改文件不重启会留下"磁盘=旧核心 / 内存里跑着新核心"的长期并存; 掉电重启后 systemd 更可能
+    # 已按**新** unit 把新核心拉起来, 恢复函数却只改盘。故这里必须以"服务真的在跑且版本正确"
+    # 为收敛判据, 而不是以文件写完为准。
+    _manage_xray stop >/dev/null 2>&1 || true
+    if [ "$disk_ok" -eq 1 ]; then
+        if _restart_xray_verified; then
+            local runv; runv=$(_xray_current_version 2>/dev/null)
+            if [ -n "$old_ver" ] && [ -n "$runv" ] && [ "$runv" != "$old_ver" ]; then
+                run_ok=0
+                _error "服务已拉起但版本不符(期望 ${old_ver}, 实际 ${runv})"
+            else
+                _warn "已重启并确认运行在恢复后的核心上(v${runv:-?})"
+            fi
+        else
+            run_ok=0
+            _error "恢复后服务未能稳定运行, 请手动检查: xd 菜单 [核心管理]"
+        fi
     else
-        _error "核心切换事务回滚**不完整**: 二进制已还原但 service 未还原"
-        _tip "保留事务日志待人工核对: $j(核对后手动删除)"
+        # 磁盘没回到旧态就不重启: 用一个"半旧半新"的组合去拉服务只会制造更难排查的现场。
+        # 保持停止态, 让人工处理有一个确定的起点。
+        run_ok=0
+        _tip "磁盘未回到切换前状态, 已保持服务停止以免运行态与持久态继续分裂"
     fi
-    return 0
+
+    if [ "$disk_ok" -eq 1 ] && [ "$run_ok" -eq 1 ]; then
+        rm -f "$j" 2>/dev/null
+        _warn "核心切换事务已回滚收敛(磁盘与运行实例均为 v${recv:-?})"
+        return 0
+    fi
+    _error "核心切换事务回滚**不完整**(磁盘:$([ "$disk_ok" -eq 1 ] && echo ok || echo 失败) 运行:$([ "$run_ok" -eq 1 ] && echo ok || echo 失败))"
+    _tip "保留事务账本待人工核对: $j(处理完再手动删除它)"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -640,30 +794,60 @@ _xray_core_txn_recover() {
 # 用法:_install_or_switch_xray <channel>
 #   未安装 -> 安装该通道最新版
 #   已安装 -> 切换到该通道最新版(配置与节点不动)
-# 并发: 整个切换在 `_with_core_lock` 内(十一轮 P2-③), 嵌套的 `_mutate_config` 会再取 config
-# 锁。两把锁的文件不同(`.core.lock` / `.config.lock`), 但**加锁方向恒定**: 永远是
-# core → config, 因为只有本函数会先持 core 锁(A/B 两处 config 写者都不取 core 锁),
-# 单向的锁序不可能成环 ⇒ 无死锁。两个包装器各自可重入, 不存在自锁。
+# 并发模型(十二轮 P2-③ 收窄锁域):
+#   · 阶段一 `_xray_stage_release` **在锁外** —— 它只写下自己独有的 staging 目录, 不碰任何
+#     共享状态, 所以网络等待/下载/解压(可能 40s+)不需要互斥, 也就不会把另一个会话拖成
+#     15s 锁超时。
+#   · 阶段二 `_xray_commit_staged` **在锁内** —— 快照/账本/替换/重启全部在这里, 与
+#     _xray_core_txn_recover 同一把 .core.lock。
+# 两把锁(.core.lock / .config.lock)的加锁方向恒定 core → config(只有本模块会先持 core 锁),
+# 单向不成环 ⇒ 无死锁; 两个包装器各自可重入, 故不自锁。
 # ---------------------------------------------------------------------------
 _install_or_switch_xray() {
-    _with_core_lock _install_or_switch_xray_locked "$@"
-}
-
-_install_or_switch_xray_locked() {
-    local channel="$1"
+    local channel="$1" tag staged rc=0
     case "$channel" in
         stable|preview) ;;
         *) _error "未知通道: $channel"; return 1 ;;
     esac
-
     _ensure_dirs || return 1
-    local tag
+    # 在取件**之前**先看一眼门禁: 明知有未收敛事务就不该白下载一遍(几十 MB)。
+    # 真正的门禁仍在锁内那一次(两次检查之间可能有另一个会话产生账本)。
+    if _xray_core_txn_pending; then
+        _error "存在未完成的核心切换事务, 已拒绝开始新的切换"
+        _tip "请先按提示处理并删除账本: $(_xray_core_journal_path)"
+        return 1
+    fi
     tag=$(_xray_fetch_tag "$channel") || {
         _error "无法获取 ${channel} 通道最新版本(网络?)"
         return 1
     }
     _info "${channel} 通道最新版本: ${tag}"
+    # ---- 阶段一(锁外): 下载/校验/解压到自有 staging ----
+    staged=$(_xray_stage_release "$tag")
+    if [ -z "$staged" ] || [ ! -f "${staged}/xray" ]; then
+        _error "获取 ${channel} 版本失败(网络/校验/解压?), 未做任何改动"
+        [ -n "$staged" ] && rm -rf "$staged" 2>/dev/null
+        return 1
+    fi
+    # ---- 阶段二(锁内): 提交(把 staging 路径与已解析的 tag 交给提交体) ----
+    _with_core_lock _install_or_switch_xray_locked "$channel" "$staged" "$tag" || rc=$?
+    rm -rf "$staged" 2>/dev/null
+    return $rc
+}
 
+_install_or_switch_xray_locked() {
+    # $1=通道 $2=staging 目录(锁外已下载校验) $3=目标 tag(锁外已解析, 避免在锁内再打一次 API)
+    local channel="$1" staged="$2" tag="$3"
+    # **未收敛事务硬门禁**(十二轮 P1-⑤): 上一次事务没能收敛时, 账本 + `.bak` +
+    # unit 快照是它唯一的恢复证据。直接开新事务会 overwrite 这三样(journal_write 覆盖账本、
+    # backup 步骤覆盖 .bak、snapshot 覆盖快照)⇒ 上一次的恢复能力被彻底抹掉。
+    # 故此处**拒绝继续**, 让用户先处理(菜单会提示)。这是**锁内**的第二次检查:
+    # 锁外的检查只为了避免白下载, 两次之间可能有别的会话产生账本。
+    if _xray_core_txn_pending; then
+        _error "存在未完成的核心切换事务, 已拒绝开始新的切换"
+        _tip "请先按提示处理并删除账本: $(_xray_core_journal_path)"
+        return 1
+    fi
     local cur=""
     cur=$(_xray_current_version 2>/dev/null)
     # 切换前的通道(state/channel)。回滚到旧二进制时必须还原它, 否则 state 描述的是
@@ -695,7 +879,7 @@ _install_or_switch_xray_locked() {
         _xray_core_journal_drop
         return 1
     fi
-    if ! _xray_download_replace "$tag"; then
+    if ! _xray_commit_staged "$staged"; then
         # 这条路径没碰过 unit(二进制都没换), 快照直接作废 —— 快照只对本次事务有效,
         # 残留下来只会成为下次排障时说不清的噪声。
         _xray_service_snapshot_drop
@@ -716,7 +900,7 @@ _install_or_switch_xray_locked() {
     # 原写法不检查返回值, 配置初始化失败(jq 缺失/磁盘满)时仍写出指向不存在配置的 unit 并
     # 强行重启, 把"配置没建好"伪装成"新核心起不来", 误导排障方向。
     #
-    # **失败时不能只 start**(2026-09-22 九轮 OCR #15 修)。`_xray_download_replace` 已经把
+    # **失败时不能只 start**(2026-09-22 九轮 OCR #15 修)。`_xray_commit_staged` 已经把
     # 二进制**换成新的**并留下 `$XRAY_BIN.bak`(旧的那个), 所以这两条路径上的失败残局是
     # "磁盘上是未提交的新核心 + 一个旧核心备份", 而旧写法只 `_manage_xray start` 就 return:
     #   · 服务其实能起来(新二进制可执行, 只是配置/service 没就绪), 用户看到"运行中";
@@ -867,15 +1051,33 @@ _install_or_switch_xray_locked() {
     else
         _warn "无法读取新核心版本, 跳过 version/channel 记录(保持原值以免状态分裂)"
     fi
-    # 到这里新核心已被确认"稳定运行"—— 事务到达提交点。先推进 phase 再清理备份:
-    # 反过来的顺序会在"phase 还停在 restart_verified 而备份已删"的窗口里让崩溃恢复抓不到
-    # 备份, 白白报一次"备份已不存在"(虽然结果无害, 但那是账本与现实不一致)。
-    _xray_core_journal_phase "restart_verified"
-    # verified 稳定运行后才丢弃旧二进制备份
-    rm -f "$XRAY_BIN.bak"
-    _xray_service_snapshot_drop
-    # 事务真正提交: 账本最后删(它是"未完成"的唯一判据)
-    _xray_core_journal_drop
+    # ----------------------------------------------------------------------
+    # 提交协议(十二轮 P1-④ 重排)。顺序**不可交换**:
+    #   1. restart_verified → 2. committed(**先落盘**) → 3. 才允许清理备份 → 4. 删账本
+    # 十一轮是 "restart_verified → 删 .bak → 删账本": 机器若死在删完 .bak 之后,
+    # 盘上是"账本还写着可回滚 + 回滚源已不存在" —— 账本在撒谎, 恢复无源可回。
+    # 现在只要 `committed` 落盘, 恢复端就**永不再回滚**, 只继续做清理(幂等);
+    # 于是"清理中途掉电"最多留下一份多余的 .bak, 下次启动自动清掉, 不存在危险窗口。
+    # ----------------------------------------------------------------------
+    if ! _xray_core_journal_phase "restart_verified"; then
+        # 账本推进失败 ⇒ 无法确认提交。此时**什么都不要删**: 账本停在更早的阶段, 下次启动
+        # 会按"未提交"回滚, 而回滚源(.bak 与 unit 快照)必须还在。删掉任何一样都会把
+        # "可回滚"变成"无源可回"——那正是本轮 P1-④ 要消灭的形状。
+        # 方向选择: 新核心虽然已验证可用, 但"没法记账"就不能宣布成功; 回滚是安全方向。
+        _error "核心事务账本推进失败, 无法确认提交(磁盘空间/IO?)"
+        _tip "已保留账本与备份; 下次启动 xd 会回滚到 v${cur:-?}, 或手动检查 $(_xray_core_journal_path)"
+        return 1
+    fi
+    if ! _xray_core_journal_phase "committed"; then
+        # 到不了 committed 就不能删备份(否则又回到"账本说可回滚但无源可回")。保留一切,
+        # 让下次启动按 restart_verified 回滚 —— 这是**安全方向**: 新核心还没被宣布提交。
+        _error "核心事务提交阶段落盘失败(磁盘空间/IO?), 已保留账本与备份待下次启动收敛"
+        _tip "下次启动 xd 会自动回滚到 v${cur:-?}; 也可手动检查 $(_xray_core_journal_path)"
+        return 1
+    fi
+    # committed 已落盘 ⇒ 从此只前进不回头: 清理是幂等的, 断了也没关系。
+    _xray_core_cleanup_after_commit "$(_xray_core_journal_path)" \
+        "$XRAY_BIN.bak" "$(_xray_service_prev_path)"
     _success "Xray-core 已切换到 v${newv} (${channel})"
     _tip "配置与节点保持不变"
 
@@ -1109,6 +1311,63 @@ _xray_service_unit_path() {
 
 _xray_service_prev_path() { printf '%s' "$BACKUP_DIR/xray-service.prev"; }
 
+# enable/disable 状态的快照载体。系统命令不可用/状态读不出时**不写标志文件** —— 那意味着
+# "这一维无法快照", 恢复时就不会去动它(绝不猜)。内容为 systemd 是 enabled/disabled,
+# openrc 是 default 运行级里在/不在。
+_xray_service_snapshot_enable() {  # <unit路径> <标志文件路径>
+    local unit="$1" flag="$2" st=""
+    case "${INIT_SYSTEM:-}" in
+        systemd)
+            command -v systemctl >/dev/null 2>&1 || return 0
+            st=$(systemctl is-enabled xray 2>/dev/null) || true
+            case "$st" in
+                enabled|enabled-runtime|static|indirect) printf 'enabled' ;;
+                disabled|masked|masked-runtime)          printf 'disabled' ;;
+                *) return 0 ;;   # 读不出/未知 => 不快照, 恢复时不动它
+            esac > "$flag" 2>/dev/null || { rm -f "$flag"; return 0; }
+            ;;
+        openrc)
+            command -v rc-update >/dev/null 2>&1 || return 0
+            if rc-update show default 2>/dev/null | grep -qE '(^|[[:space:]])xray([[:space:]]|$)'; then
+                printf 'enabled' > "$flag" 2>/dev/null || { rm -f "$flag"; return 0; }
+            else
+                printf 'disabled' > "$flag" 2>/dev/null || { rm -f "$flag"; return 0; }
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# 恢复 enable 状态。只在快照存在时动手(见上: 无快照 = 该维未快照, 不猜)。
+# 返回 1 = 恢复动作失败(调用方据此判定"回滚不完整")。
+_xray_service_restore_enable() {  # <标志文件路径>
+    local flag="$1" want
+    [ -f "$flag" ] || return 0
+    want=$(cat "$flag" 2>/dev/null) || { rm -f "$flag" 2>/dev/null; return 0; }
+    case "${INIT_SYSTEM:-}:${want}" in
+        systemd:enabled)
+            systemctl enable xray >/dev/null 2>&1 || {
+                _error "恢复 xray 开机自启失败(应为 enabled), 请手动执行: systemctl enable xray"
+                return 1; } ;;
+        systemd:disabled)
+            systemctl disable xray >/dev/null 2>&1 || {
+                _error "取消 xray 开机自启失败(应为 disabled), 请手动执行: systemctl disable xray"
+                return 1; } ;;
+        openrc:enabled)
+            rc-update add xray default >/dev/null 2>&1 || {
+                _error "恢复 xray 开机自启失败(应为 enabled), 请手动执行: rc-update add xray default"
+                return 1; } ;;
+        openrc:disabled)
+            rc-update del xray default >/dev/null 2>&1 || {
+                _error "取消 xray 开机自启失败(应为 disabled), 请手动执行: rc-update del xray default"
+                return 1; } ;;
+        *) : ;;
+    esac
+    rm -f "$flag" 2>/dev/null
+    _warn "已恢复 service 开机自启状态(${want})"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # 把快照写回 unit —— **原子替换**(十一轮 P2-②)。
 #
@@ -1152,9 +1411,15 @@ _xray_service_restore_file() {
     fi
     case "${INIT_SYSTEM:-}" in
         systemd)
-            # 半截/旧 unit 可能已被 daemon-reload 载入内存, 还原后让它重新读盘(best-effort)
-            systemctl daemon-reload 2>/dev/null || \
-                _warn "服务配置重载失败(daemon-reload), 请手动执行: systemctl daemon-reload"
+            # 磁盘上的 unit 已换回旧内容, 但 systemd 内存里可能仍是**新/半截**那一份 ——
+            # 必须 daemon-reload 才算真正还原(十二轮 P1-③: 旧实现只告警就 return 0, 于是
+            # "文件对了、systemd 仍在用错的 unit"被当成恢复成功)。reload 失败时如实返回非 0,
+            # 让调用方保留账本/不宣布收敛。
+            if ! systemctl daemon-reload; then
+                _error "服务配置重载失败(daemon-reload): systemd 可能仍在使用旧的 unit"
+                _tip "请手动执行: systemctl daemon-reload"
+                return 1
+            fi
             ;;
     esac
     return 0
@@ -1166,7 +1431,11 @@ _xray_service_snapshot() {
     unit=$(_xray_service_unit_path) || return 0    # direct 后端: 无 unit 可写, 无需快照
     prev=$(_xray_service_prev_path)
     mkdir -p "$BACKUP_DIR" || return 1
-    rm -f "$prev" "${prev}.absent" 2>/dev/null
+    rm -f "$prev" "${prev}.absent" "${prev}.enabled" 2>/dev/null
+    # enable/disable 是**独立于 unit 文件**的一维状态(十二轮 P2-①): `_create_xray_service`
+    # 每次都会 `systemctl enable` / `rc-update add`, 若原来用户是**手动 disabled** 的,
+    # 只还原文件内容会留下"文件=旧 / 开机策略=新" —— 事务没真正回到改动前。
+    _xray_service_snapshot_enable "$unit" "${prev}.enabled"
     if [ ! -e "$unit" ]; then
         # 原本没有 unit: 用一个标志文件记住"本次事务之前它不存在"
         : > "${prev}.absent" || return 1
@@ -1192,25 +1461,48 @@ _xray_service_restore_prev() {
     prev=$(_xray_service_prev_path)
     if [ -f "${prev}.absent" ]; then
         # 事务之前没有 unit ⇒ 把本次新建的那个删掉, 回到"本来就没有"
-        rm -f "$unit" 2>/dev/null
-        rm -f "${prev}.absent" 2>/dev/null
+        # **rm 失败必须报出来**(十二轮 P1-③): 旧写法无条件 `return 0`, 于是"旧二进制 +
+        # 残留新 unit"被当成恢复成功 —— 而 unit 存不存在恰恰决定旧核心能否找到 geo dat。
+        if ! rm -f "$unit" 2>/dev/null; then
+            _error "撤销新建 service 文件失败, 请手动删除: $unit"
+            return 1
+        fi
+        rm -f "${prev}.absent" 2>/dev/null || \
+            _warn "service 快照标志删除失败(不影响 service 状态): ${prev}.absent"
+        # 事务之前连 unit 都不存在 ⇒ 那时也不可能处于"已 enable"的合理状态; 若本次
+        # 顺带 enable 了, 撤销它(仅在快照存在时动)。
+        # **失败只告警**: 它只影响下次开机的自启策略, 不影响核心本身能否运行; 计入失败会让
+        # "启用态恢复失败"永久阻塞收敛 ⇒ 账本永不被删 ⇒ 新切换被门禁永久拒绝。用一个更坏的
+        # 失效模式去换一个更轻的差异不划算(与权限设置失败只告警同一取舍)。
+        _xray_service_restore_enable "${prev}.enabled" || \
+            _warn "service 开机自启状态未能还原(不影响当前运行), 请按上方提示手动执行"
         _warn "已撤销本次新建的 service 文件(事务之前不存在): $unit"
         return 0
     fi
-    [ -f "$prev" ] || return 0
+    # 快照缺失 ⇒ **不是"无需恢复"**(十二轮 P1-③)。事务开始时强制做过快照, 所以走到这里
+    # 说明证据丢了; 报失败让调用方保留账本/不宣布成功, 而不是静默返回 0 让"新 unit"留在盘上。
+    if [ ! -f "$prev" ]; then
+        # direct 后端本就没有 unit, 谈不上快照 —— 那种情况由 _xray_service_unit_path 提前返回
+        _error "service 快照缺失, 无法确认 service 已回到切换前状态: $prev"
+        _tip "请人工核对 service 内容: $unit"
+        return 1
+    fi
     if ! _xray_service_restore_file "$prev" "$unit"; then
         _error "service 文件还原失败, 请手动核对: $unit (备份: $prev)"
         return 1
     fi
     rm -f "$prev" 2>/dev/null
     _warn "已还原 service 文件到本次改动前的内容: $unit"
+    # 开机自启是独立的另一维, 一并还原(十二轮 P2-①)。失败只告警并返回失败**仅用于提示**,
+    # 但调用方不把它计入"回滚完整性"(见上: 那会造成永久锁死)。
+    _xray_service_restore_enable "${prev}.enabled" || return 1
     return 0
 }
 
 # 事务成功提交: 丢弃 unit 快照(与 rm -f "$XRAY_BIN.bak" 同一步)
 _xray_service_snapshot_drop() {
     local prev; prev=$(_xray_service_prev_path)
-    rm -f "$prev" "${prev}.absent" 2>/dev/null
+    rm -f "$prev" "${prev}.absent" "${prev}.enabled" 2>/dev/null
     return 0
 }
 
