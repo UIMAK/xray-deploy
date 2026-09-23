@@ -11,13 +11,13 @@ Thumbs.db
 .idea/
 
 # 开发工具
+# 注: .trellis/ 与 .scratch/ 已于十六轮移除 —— 两者不再使用。曾因它们不在版本控制里却
+# 被 tracked 文件(.gitattributes)与测试断言引用, 导致"任何克隆仓库的人跑套件必红"。
 .claude/
 .opencode/
-.trellis/
 .agents/
 .dsh/
 .mimosa/
-.scratch/
 .zcode/
 AGENTS.md
 CLAUDE.md
