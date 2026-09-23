@@ -600,19 +600,36 @@ download_all() {
 # 仍是比 mkdir 退路好的地方 —— 后者必须人工 `rm -rf`, 不会自愈。
 # 有意不为此改成"不继承 fd": 那要引入 CLOEXEC, bash 无可移植写法, 而收益只是把 30s 缩短到 0。
 #
-# `$DEPLOY_DIR` 在本段尚未创建(两个分支各自到后面才 mkdir -p), 故先 mkdir -p。
+# 锁文件/退路目录放在 `$DEPLOY_DIR` 的父目录, 不随整站卸载而被删。安装锁获取成功后才创建
+# `$DEPLOY_DIR`, 并在其下清理/暂存/落地, 使 `_uninstall_xray` 能用同一把稳定锁排斥并发卸载。
 # ---------------------------------------------------------------------------
-INSTALL_LOCK_DIR="$DEPLOY_DIR/.install.lock"
+INSTALL_LOCK_PARENT="${DEPLOY_DIR%/*}"
+INSTALL_LOCK_NAME="${DEPLOY_DIR##*/}"
+[ -n "$INSTALL_LOCK_PARENT" ] || INSTALL_LOCK_PARENT="/"
+INSTALL_LOCK_DIR="${INSTALL_LOCK_PARENT}/.${INSTALL_LOCK_NAME}.install.lock"
 # flock 用的**文件**与 mkdir 退路用的**目录**必须是两个不同路径: 旧版本(以及本版本的
 # mkdir 退路)在 `.install.lock` 上放的是**目录**, 而 `exec 9>>` 需要的是文件 —— 复用同一
-# 路径会让升级后的第一次安装直接报 "Is a directory" 而**完全无法运行**(实测)。
-INSTALL_LOCK_FILE="$DEPLOY_DIR/.install.lock.fd"
+# 路径会让升级后的第一次安装直接报 "Is a directory" 而**完全无法运行**(实测)。这两个路径
+# 都在部署目录外, 后者是兄弟文件而非锁目录内的文件。
+INSTALL_LOCK_FILE="${INSTALL_LOCK_DIR}.fd"
+# **跨版本协调**(2026-09-23 十五轮): 0.17.11 与 PR #48 早期 HEAD 的两条锁路径都在
+# `$DEPLOY_DIR` **内**(flock 文件 `.install.lock.fd` / mkdir 退路目录 `.install.lock`),
+# 而新版主锁已移到目录外 —— 只拿新锁**排斥不了仍在运行的旧版安装**: 旧版只认它自己的路径,
+# 于是 A(旧)与 B(新)会各自持一把不同的锁同时落地。故新版在拿到主锁后, 再按**同一种手段**
+# 取一次旧版锁: 有 flock 就 flock 旧文件(旧版的 `flock -n` 必然失败), 没有 flock 就把旧
+# mkdir 目录也 mkdir 下来(旧版读到活 pid 会等待/拒绝)。取不到一律 fail-closed, 绝不删或
+# 接管别人的锁。**残局(未闭环)**: 旧版进程若在本安装释放之后才启动、或在部署目录被删除后
+# 重建旧路径, 新版无从协调 —— 旧版只认目录内的路径, 新版不能为一个已卸载的目录保留占位。
+INSTALL_LEGACY_LOCK_FILE="$DEPLOY_DIR/.install.lock.fd"
+INSTALL_LEGACY_LOCK_DIR="$DEPLOY_DIR/.install.lock"
 INSTALL_LOCK_HELD=0
 INSTALL_LOCK_FD=""
+INSTALL_LEGACY_LOCK_FD=""
+INSTALL_LEGACY_LOCK_DIR_HELD=0
 
-_install_lock_owner_pid() {   # 输出持有者 PID; 非数字/空/**数值为 0** 一律输出空(视为"无法判定")
-    local p
-    p=$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null)
+_install_lock_owner_pid() {   # [锁目录]; 输出持有者 PID; 非数字/空/**数值为 0** 一律输出空(视为"无法判定")
+    local d="${1:-$INSTALL_LOCK_DIR}" p
+    p=$(cat "$d/pid" 2>/dev/null)
     case "$p" in
         ''|*[!0-9]*) printf '%s' '' ;;
         # `kill -0 0` 与 `kill -0 00` 在 GNU 与 busybox 上都返回 0(永远"存活"), 故凡是
@@ -623,15 +640,64 @@ _install_lock_owner_pid() {   # 输出持有者 PID; 非数字/空/**数值为 0
     esac
 }
 
-_install_lock_write_pid() {   # 同目录 rename 原子写入, 避免半写
-    local t="$INSTALL_LOCK_DIR/.pid.$$"
+_install_lock_write_pid() {   # [锁目录]; 同目录 rename 原子写入, 避免半写
+    local d="${1:-$INSTALL_LOCK_DIR}" t
+    t="$d/.pid.$$"
     printf '%s\n' "$$" > "$t" 2>/dev/null || return 1
-    mv -f "$t" "$INSTALL_LOCK_DIR/pid" 2>/dev/null || { rm -f "$t" 2>/dev/null; return 1; }
+    mv -f "$t" "$d/pid" 2>/dev/null || { rm -f "$t" 2>/dev/null; return 1; }
+    return 0
+}
+
+# mkdir 锁的取用(主锁与旧版锁共用同一实现, 避免"同一条件在各调用点各自解释"):
+# **永不自动接管** —— 残留锁目录一律拒绝并要求人工清理, 只删本进程自己创建的锁。
+_install_lock_mkdir_take() {   # <锁目录> <显示名>; 复用同一实现, 无隐藏全局状态
+    local d="$1" label="$2" i pid
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+        if mkdir "$d" 2>/dev/null; then
+            if _install_lock_write_pid "$d"; then return 0; fi
+            rm -rf "$d" 2>/dev/null
+            echo "[错误] 无法写入${label} $d/pid(磁盘空间/权限?), 安装中止"
+            return 1
+        fi
+        # 路径存在但不是目录 => 明确报错, 不 rm、不等待(等待不会让它变成目录)
+        if [ ! -d "$d" ]; then
+            echo "[错误] ${label}路径存在但不是目录: $d"
+            echo "       请手动处理该路径后重试"
+            return 1
+        fi
+        pid=$(_install_lock_owner_pid "$d")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            [ "$i" -eq 14 ] && {
+                echo "[错误] 另一个安装正在运行(pid $pid), 本次中止以免两棵树互相覆盖"
+                echo "       若确认该进程已不存在, 请手动删除: $d"
+                return 1; }
+            sleep 1; continue
+        fi
+        # 陈旧或无法判定: 本实现**不接管**(见上方实测结论), 但立刻给出可执行的处置办法,
+        # 而不是让用户干等 14 秒后才看到同一句话。
+        echo "[错误] 检测到无人持有的${label}(pid ${pid:-未知}): $d"
+        echo "       该目录可能是上次被强杀(SIGKILL)留下的; 确认无其他安装正在运行后,"
+        echo "       请手动删除该目录后重试"
+        return 1
+    done
+    echo "[错误] 等待${label}超时: $d"
+    return 1
+}
+
+_install_lock_mkdir_release() {   # <锁目录>; 归属校验后才删
+    local d="$1" p
+    p=$(_install_lock_owner_pid "$d")
+    [ "$p" = "$$" ] && rm -rf "$d" 2>/dev/null
     return 0
 }
 
 _install_lock_acquire() {
-    mkdir -p "$DEPLOY_DIR" 2>/dev/null
+    local install_lock_parent="${DEPLOY_DIR%/*}"
+    [ -n "$install_lock_parent" ] || install_lock_parent="/"
+    mkdir -p "$install_lock_parent" 2>/dev/null || {
+        echo "[错误] 无法创建安装锁父目录 $install_lock_parent(权限/只读文件系统?), 安装中止"
+        return 1
+    }
     # ---- 首选: flock(内核持有, 进程退出即释放, 无陈旧锁/无接管竞态) ----
     if command -v flock >/dev/null 2>&1; then
         # **动态分配 fd, 不要写死 9**: `lib/00-common.sh` 的 `_with_config_lock` 用
@@ -644,6 +710,23 @@ _install_lock_acquire() {
         if flock -n "$INSTALL_LOCK_FD" 2>/dev/null; then
             INSTALL_LOCK_HELD=1
             printf '%s\n' "$$" >&"$INSTALL_LOCK_FD" 2>/dev/null || true   # 仅供诊断, 权威在 fd
+            if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
+                echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
+                _install_lock_release
+                return 1
+            fi
+            # 旧版同为 flock 路径(`.install.lock.fd`): 拿不到就说明旧版安装/卸载仍在跑。
+            exec {INSTALL_LEGACY_LOCK_FD}>>"$INSTALL_LEGACY_LOCK_FILE" 2>/dev/null || {
+                INSTALL_LEGACY_LOCK_FD=""
+                echo "[错误] 无法打开旧版安装锁文件 $INSTALL_LEGACY_LOCK_FILE(权限/只读文件系统?), 安装中止"
+                _install_lock_release
+                return 1; }
+            if ! flock -n "$INSTALL_LEGACY_LOCK_FD" 2>/dev/null; then
+                echo "[错误] 旧版安装/卸载仍在运行(持有 $INSTALL_LEGACY_LOCK_FILE), 本次中止"
+                echo "       以免两棵树互相覆盖; 等它退出后重试(内核会在持有进程退出时自动释放)"
+                _install_lock_release
+                return 1
+            fi
             return 0
         fi
         eval "exec ${INSTALL_LOCK_FD}>&-" 2>/dev/null
@@ -653,37 +736,22 @@ _install_lock_acquire() {
         return 1
     fi
     # ---- 退路: mkdir-only(无 flock 的裁剪版 busybox), **永不自动接管** ----
-    local i pid
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        if mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
-            if _install_lock_write_pid; then INSTALL_LOCK_HELD=1; return 0; fi
-            rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null
-            echo "[错误] 无法写入安装锁 $INSTALL_LOCK_DIR/pid(磁盘空间/权限?), 安装中止"
-            return 1
-        fi
-        # 路径存在但不是目录 => 明确报错, 不 rm、不等待(等待不会让它变成目录)
-        if [ ! -d "$INSTALL_LOCK_DIR" ]; then
-            echo "[错误] 安装锁路径存在但不是目录: $INSTALL_LOCK_DIR"
-            echo "       请手动处理该路径后重试"
-            return 1
-        fi
-        pid=$(_install_lock_owner_pid)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            [ "$i" -eq 14 ] && {
-                echo "[错误] 另一个安装正在运行(pid $pid), 本次中止以免两棵树互相覆盖"
-                echo "       若确认该进程已不存在, 请手动删除: $INSTALL_LOCK_DIR"
-                return 1; }
-            sleep 1; continue
-        fi
-        # 陈旧或无法判定: 本实现**不接管**(见上方实测结论), 但立刻给出可执行的处置办法,
-        # 而不是让用户干等 14 秒后才看到同一句话。
-        echo "[错误] 检测到无人持有的安装锁(pid ${pid:-未知}): $INSTALL_LOCK_DIR"
-        echo "       该目录可能是上次被强杀(SIGKILL)留下的; 确认无其他安装正在运行后,"
-        echo "       请手动删除该目录后重试"
+    # 主锁取到**之后**才创建部署目录: 旧版锁路径就在该目录内, 必须等目录可写再取第二把。
+    _install_lock_mkdir_take "$INSTALL_LOCK_DIR" "安装锁" || return 1
+    INSTALL_LOCK_HELD=1
+    if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
+        echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
+        _install_lock_release
         return 1
-    done
-    echo "[错误] 等待安装锁超时: $INSTALL_LOCK_DIR"
-    return 1
+    fi
+    # 旧版无 flock 时用的是 `$DEPLOY_DIR/.install.lock` 目录锁: 这里同样 mkdir 下来,
+    # 旧版读到活 pid 会等待/拒绝; 我们读不到活 pid 时也一律拒绝, 不接管别人的现场。
+    _install_lock_mkdir_take "$INSTALL_LEGACY_LOCK_DIR" "旧版安装锁" || {
+        _install_lock_release
+        return 1
+    }
+    INSTALL_LEGACY_LOCK_DIR_HELD=1
+    return 0
 }
 
 _install_lock_release() {
@@ -691,13 +759,21 @@ _install_lock_release() {
     if [ -n "${INSTALL_LOCK_FD:-}" ]; then
         # flock 路径: 释放由 fd 承担。**不删锁文件** —— 删了会让"路径不存在"与"仍有进程
         # 持有 fd"并存, 造成诊断混乱; 文件留着无副作用, 下次 `exec {var}>>` 复用它。
+        if [ -n "${INSTALL_LEGACY_LOCK_FD:-}" ]; then
+            flock -u "$INSTALL_LEGACY_LOCK_FD" 2>/dev/null
+            eval "exec ${INSTALL_LEGACY_LOCK_FD}>&-" 2>/dev/null
+            INSTALL_LEGACY_LOCK_FD=""
+        fi
         flock -u "$INSTALL_LOCK_FD" 2>/dev/null
         eval "exec ${INSTALL_LOCK_FD}>&-" 2>/dev/null
         INSTALL_LOCK_FD=""
     else
-        # mkdir 路径: 归属校验后才删 —— 绝不删别人的锁
-        local p; p=$(_install_lock_owner_pid)
-        [ "$p" = "$$" ] && rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null
+        # mkdir 路径: 归属校验后才删 —— 绝不删别人的锁(旧版锁目录同样)
+        if [ "${INSTALL_LEGACY_LOCK_DIR_HELD:-0}" = "1" ]; then
+            _install_lock_mkdir_release "$INSTALL_LEGACY_LOCK_DIR"
+            INSTALL_LEGACY_LOCK_DIR_HELD=0
+        fi
+        _install_lock_mkdir_release "$INSTALL_LOCK_DIR"
     fi
     INSTALL_LOCK_HELD=0
     return 0

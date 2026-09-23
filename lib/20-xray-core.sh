@@ -512,65 +512,366 @@ _xray_restore_prev_bin() {
 }
 
 # ---------------------------------------------------------------------------
-# 核心切换的**互斥锁**(2026-09-22 十一轮 P2-③)。
+# 核心与运行实例的**互斥锁**(2026-09-22 十一轮 P2-③, 本轮纳入 Geo 与 service control)。
 #
-# config 修改 / Reality 事务 / Hy2 端口事务都在 `_with_config_lock` 里, 唯独核心切换没有
-# 任何互斥: 两个 `xd` 会话同时切核心时会并发操作同一组文件 —— `$XRAY_BIN` + `.bak` +
-# unit 快照(`xray-service.prev`, 路径固定!) + state/version+channel。单次事务各自的
-# 内部一致性都对, 但两次事务之间会互相覆盖彼此的**快照**, 于是回滚用的可能不是自己那份源。
-# TUI 是单管理员的, 所以这属于并发边界而非高频路径(定 P2), 但既然其它三个事务都有锁,
-# 这里缺一把就是"同一契约在一条路径上没落实"。
+# 同一把锁串行化核心 binary/service 事务、独立 Geo dat commit, 以及 start/stop/restart 和
+# 完整的 restart/stop liveness 观察。否则普通服务控制可穿插在 rollback 的 stop→restore→start
+# 中间, 让 recovery 失去对运行实例的独占控制。下载与网络等待仍在锁外。
 #
-# 与 config 锁的关系: 两把**独立的**锁(`.core.lock` / `.config.lock`)。嵌套时加锁方向恒定
-# (core → config): 只有本模块会先持 core 锁再进 config 事务, 而 config 侧的写者都不取
-# core 锁 ⇒ 单向锁序不成环, 无死锁。两个包装器各自可重入, 故不自锁。
+# 与 config 锁的关系: 两把**独立的**锁(`.<deploy-name>.core.lock` / `.config.lock`)。核心锁
+# 放在部署目录的父目录, 不随部署目录卸载而消失。config 事务会在持
+# config lock 时调用 `_restart_xray_verified`, 因而实际嵌套方向是 config → core; 核心事务
+# 路径不获取 config lock, 没有反向边, 所以不会成环。两个包装器各自可重入, 故不自锁。
+# `_uninstall_xray` 按 install → core 顺序同时持有两把稳定锁直到部署目录删除完成; install.sh
+# 更新与核心安装/服务操作都要等, 不会因 `rm -rf $DEPLOY_DIR` 删除锁文件而分裂 inode。
 #
-# 锁 fd 必须动态分配并**在派生服务进程时关闭**(`{fd}>&-`): 写死 fd 会与 _with_config_lock
+# flock 锁 fd 必须动态分配并**在派生服务进程时关闭**(`{fd}>&-`): 写死 fd 会与 _with_config_lock
 # 的 fd 9 相撞(install.sh 实测过这类相撞会静默释放锁); 不关闭则被 supervise-daemon/nohup
 # 起的 xray 进程继承 —— 守护进程不退, 锁永不释放, 后续所有切换白等 15s 超时。
+# 无 flock 的裁剪版 BusyBox 使用同级 `.core.lock.d` mkdir 锁, 发现残留立即拒绝并要求人工清理;
+# 不自动接管, 避免并发读写 PID 与删除目录造成双重放行。
 # 实测: `sleep 30 {fd}>&- &` 后父进程退出, 锁立即免费; 不关闭则被子进程持有。
-# 因此 `_manage_xray` 派生守护进程时用 `${CORE_LOCK_FD:-9}>&-` 一并关闭: 未持锁时它退化为
+# 因此 `_manage_xray` 派生守护进程时用 `$` 一并关闭: 未持锁时它退化为
 # 关掉那个同样没在用的 fd 9(实测 no-op 且 rc=0), 持锁时则精确关掉锁 fd。
 # ---------------------------------------------------------------------------
 export CORE_LOCK_FD=9      # 未持锁时的默认值: 9 在本模块只用于关闭服务进程继承的 fd
-_with_core_lock() {
-    local lockf="$DEPLOY_DIR/.core.lock"
-    # 已是持锁状态(嵌套调用) ⇒ 直接跑, 不再重复加锁
-    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" = "1" ]; then
-        "$@"     # 与 _with_config_lock 同一降级口径: 无 flock 时放行(已声明, 非静默吞错)
-        return $?
+# 卸载侧对**旧版锁路径**的跨版本协调(2026-09-23 十五轮)。
+#
+# 旧版(0.17.11 / PR #48 早期 HEAD)把核心锁与安装锁都放在 `$DEPLOY_DIR` **内**
+# (`$DEPLOY_DIR/.core.lock` + `.install.lock.fd` / `.install.lock`); 新版主锁移到了父目录
+# (卸载 `rm -rf` 不会把锁文件拆成新旧 inode)。只持新锁**排斥不了旧版进程** —— 旧版只认它
+# 自己那条路径。故取到主锁后必须再按同一种手段取一次旧路径:
+#   · 有 flock ⇒ 也 flock 旧文件(与旧版 `flock -n` 直接互斥);
+#   · 无 flock ⇒ 也 mkdir 旧目录(旧版读到活 pid 会等待/拒绝)。
+# 取不到一律 fail-closed。**不删别人的锁**: 旧路径下的残留是别人的现场, 只提示人工清理。
+#
+# **未闭环的残局(必须如实说明, 不当作已消失)**: 旧版进程若在我们释放锁之后才启动, 或在
+# `$DEPLOY_DIR` 已被删除后重建目录内的旧锁路径, 新版无从协调 —— 新版不能为一个已卸载的目录
+# 永久保留占位锁(那会让"卸载后重装"永远拒绝)。跨版本竞态因此是"窗口大幅收窄 + fail-closed",
+# 不是"结构性消除"; 结构性消除只存在于同版本(全部进程都走父目录稳定锁)之后。
+_xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkdir目录> <显示名>
+    local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i owner="" ef
+    # **变量名按锁家族分开**: 卸载要同时持 install 锁与 core 锁, 两者都要协调各自的旧路径;
+    # 共用一个全局会让后取的覆盖先取的, 先取那把 fd 再也没人关闭/解锁(锁泄漏到进程退出)。
+    eval "$fdvar=\"\""
+    eval "$dirvar=\"\""
+    if command -v flock >/dev/null 2>&1; then
+        if ! eval "exec {${fdvar}}>>\"\$lfile\""; then
+            _error "无法打开旧版${label} $lfile, 放弃本次操作"
+            return 1
+        fi
+        eval "ef=\${${fdvar}}"
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+            if flock -n "$ef" 2>/dev/null; then return 0; fi
+            sleep 1
+        done
+        _error "旧版${label}仍被占用(15s), 可能仍有旧版会话在操作: $lfile"
+        _tip "等旧版会话退出后重试(内核会在持有进程退出时自动释放该锁)"
+        eval "exec ${ef}>&-" 2>/dev/null
+        eval "$fdvar=\"\""
+        return 1
     fi
-    if ! command -v flock >/dev/null 2>&1; then
+    # 无 flock: 旧版走的是 mkdir 目录锁。活持有者/残留一律拒绝, 绝不删除别人的锁目录。
+    if ! mkdir "$ldir" 2>/dev/null; then
+        if [ -d "$ldir" ]; then
+            owner=$(cat "$ldir/pid" 2>/dev/null)
+            case "$owner" in
+                ''|*[!0-9]*) owner="" ;;
+                *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
+            esac
+        fi
+        _error "旧版${label}不可用(持有者 pid ${owner:-未知}): $ldir"
+        _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+        return 1
+    fi
+    if ! printf '%s\n' "$$" > "$ldir/pid" 2>/dev/null; then
+        rm -f "$ldir/pid" 2>/dev/null
+        rmdir "$ldir" 2>/dev/null
+        _error "无法写入旧版${label}持有者记录 $ldir/pid, 放弃本次操作"
+        return 1
+    fi
+    eval "$dirvar=\"\$ldir\""
+    return 0
+}
+
+_xray_legacy_lock_release() {   # <fd变量名> <mkdir变量名>
+    local fdvar="$1" dirvar="$2" ef d
+    eval "ef=\${${fdvar}:-}"
+    if [ -n "$ef" ]; then
+        flock -u "$ef" 2>/dev/null
+        eval "exec ${ef}>&-" 2>/dev/null
+        eval "$fdvar=\"\""
+    fi
+    eval "d=\${${dirvar}:-}"
+    if [ -n "$d" ]; then
+        if [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ]; then
+            rm -f "$d/pid" 2>/dev/null
+            rmdir "$d" 2>/dev/null
+        fi
+        eval "$dirvar=\"\""
+    fi
+    return 0
+}
+
+_with_core_lock() {
+    local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lockf fallback_dir
+    local legacy_lockf legacy_fallback_dir i locked=0 rc owner
+    local XD_CORE_LEGACY_FLOCK_FD="" XD_CORE_LEGACY_DIR=""
+    case "$deploy_path" in
+        /*) ;;
+        *) _error "部署目录必须是绝对路径, 无法建立核心锁: $DEPLOY_DIR"; return 1 ;;
+    esac
+    if [ -z "$deploy_path" ] || [ "$deploy_path" = "/" ]; then
+        _error "部署目录路径无效, 无法建立核心锁: $DEPLOY_DIR"
+        return 1
+    fi
+    deploy_parent="${deploy_path%/*}"
+    deploy_name="${deploy_path##*/}"
+    [ -n "$deploy_parent" ] || deploy_parent="/"
+    lockf="${deploy_parent}/.${deploy_name}.core.lock"
+    fallback_dir="${lockf}.d"
+    legacy_lockf="$deploy_path/.core.lock"
+    legacy_fallback_dir="$deploy_path/.core.lock.d"
+    # 已是持锁状态(嵌套调用) ⇒ 直接跑, 不再重复加锁。
+    # 嵌套判定必须放在 `$DEPLOY_DIR` 存在性检查**之前**: 卸载主体(持锁中)会走到
+    # `rm -rf "$DEPLOY_DIR"`, 之后仍可能有嵌套调用(收尾/提示), 那些调用不该因为目录已被
+    # 删除而报错 —— 它们在外层事务的锁保护下。
+    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" = "1" ]; then
         "$@"
         return $?
     fi
-    mkdir -p "$DEPLOY_DIR" 2>/dev/null
-    if ! eval "exec {CORE_LOCK_FD}>>\"\$lockf\""; then
-        _error "无法创建核心锁文件 $lockf(目录不可写?), 放弃本次操作"
+    if ! mkdir -p "$deploy_parent" 2>/dev/null; then
+        _error "无法创建核心锁目录 $deploy_parent, 放弃本次操作"
         return 1
     fi
-    local i
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        flock -n "$CORE_LOCK_FD" 2>/dev/null && break
-        sleep 1
-    done
-    if ! flock -n "$CORE_LOCK_FD" 2>/dev/null; then
-        _error "等待核心锁超时(15s), 可能有其他 xd 会话正在切换核心"
-        # 超时路径同样要关掉刚打开的 fd: 菜单是长驻循环, 漏掉会让每次失败都泄漏一个 fd,
-        # 最终撞上 ulimit 后连 _state_set 的 mktemp 都开始失败。
+
+    if command -v flock >/dev/null 2>&1; then
+        if ! eval "exec {CORE_LOCK_FD}>>\"\$lockf\""; then
+            _error "无法创建核心锁文件 $lockf(目录不可写?), 放弃本次操作"
+            return 1
+        fi
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+            if flock -n "$CORE_LOCK_FD" 2>/dev/null; then locked=1; break; fi
+            sleep 1
+        done
+        if [ "$locked" -ne 1 ]; then
+            _error "等待核心锁超时(15s), 可能有其他 xd 会话正在切换核心"
+            # 超时路径同样要关掉刚打开的 fd: 菜单是长驻循环, 漏掉会让每次失败都泄漏一个 fd,
+            # 最终撞上 ulimit 后连 _state_set 的 mktemp 都开始失败。
+            eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+            return 1
+        fi
+        # 目录存在性检查放在**拿到锁之后**: 卸载期间到达的竞争者应当先排队、再按锁内的真实
+        # 状态判断, 而不是在锁外看一眼"目录恰好不存在"就立刻失败(那是锁外读共享状态的经典
+        # 竞态)。锁内仍不存在 ⇒ 确实没有部署, fail-closed 退出, 且**不重建**目录 —— 旧版锁
+        # 路径在目录内, 重建会留下"空目录 + 新锁"的假现场。
+        if [ ! -d "$deploy_path" ]; then
+            _error "部署目录不存在, 放弃本次操作: $deploy_path"
+            eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+            return 1
+        fi
+        # 再取旧版 flock 核心锁(跨版本互斥)。取不到 = 仍有旧版会话, fail-closed。
+        if ! _xray_legacy_lock_name XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR \
+            "$legacy_lockf" "$legacy_fallback_dir" "核心锁"; then
+            eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+            return 1
+        fi
+        # 子 shell 内执行: 使 CORE_LOCK_FD 与 HELD 标记的作用域跟着这次加锁一起消失,
+        # 调用方不必手工回滚环境(与 _with_config_lock 同款做法)。
+        (
+            XRAY_DEPLOY_CORE_LOCK_HELD=1
+            export XRAY_DEPLOY_CORE_LOCK_HELD
+            "$@"
+        )
+        rc=$?
+        _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
         eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
+        return "$rc"
+    fi
+
+    # 裁剪版 BusyBox 可能没有 flock。使用独立 mkdir 锁目录并**永不自动接管**: SIGKILL 后
+    # 的残留锁宁可要求人工确认/清理, 也不能用 read→rm→mkdir 的竞态冒险地双重放行。
+    if ! mkdir "$fallback_dir" 2>/dev/null; then
+        if [ -d "$fallback_dir" ]; then
+            _error "核心锁目录已存在(可能有其他会话运行, 或上次被强制终止): $fallback_dir"
+        else
+            _error "核心锁路径已被非目录对象占用: $fallback_dir"
+        fi
+        _tip "确认没有核心安装、卸载或服务操作后, 请手动删除锁目录: rm -rf -- '$fallback_dir'"
         return 1
     fi
-    # 子 shell 内执行: 使 CORE_LOCK_FD 与 HELD 标记的作用域跟着这次加锁一起消失,
-    # 调用方不必手工回滚环境(与 _with_config_lock 同款做法)。
+    if ! printf '%s\n' "$$" > "$fallback_dir/pid" 2>/dev/null; then
+        rm -f "$fallback_dir/pid" 2>/dev/null
+        rmdir "$fallback_dir" 2>/dev/null
+        _error "无法写入核心锁持有者记录 $fallback_dir/pid, 放弃本次操作"
+        return 1
+    fi
+    # 同 flock 路径: 目录存在性在**锁内**判定(锁外判断会与并发卸载竞态), 锁内不存在则
+    # fail-closed 退出且不重建目录。
+    if [ ! -d "$deploy_path" ]; then
+        _error "部署目录不存在, 放弃本次操作: $deploy_path"
+        rm -f "$fallback_dir/pid" 2>/dev/null
+        rmdir "$fallback_dir" 2>/dev/null
+        return 1
+    fi
+    if ! _xray_legacy_lock_name XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR \
+            "$legacy_lockf" "$legacy_fallback_dir" "核心锁"; then
+        rm -f "$fallback_dir/pid" 2>/dev/null
+        rmdir "$fallback_dir" 2>/dev/null
+        return 1
+    fi
     (
         XRAY_DEPLOY_CORE_LOCK_HELD=1
         export XRAY_DEPLOY_CORE_LOCK_HELD
         "$@"
     )
-    local rc=$?
-    eval "exec ${CORE_LOCK_FD}>&-" 2>/dev/null
-    return $rc
+    rc=$?
+    _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
+    owner=$(cat "$fallback_dir/pid" 2>/dev/null)
+    if [ "$owner" != "$$" ] || ! rm -f "$fallback_dir/pid" 2>/dev/null || ! rmdir "$fallback_dir" 2>/dev/null; then
+        _error "核心锁释放失败或所有权记录不匹配, 锁目录保留: $fallback_dir"
+        _tip "确认没有核心操作仍在运行后, 请手动检查并清理该锁目录"
+        return 1
+    fi
+    return "$rc"
+}
+
+# 与 install.sh 使用同一把、位于 DEPLOY_DIR 外的安装锁。普通 install.sh 只取此锁;
+# Xray 卸载按 install → core 的固定顺序同时取得两把锁, 既等整站更新完成, 也排斥核心事务。
+# flock 文件和 mkdir 退路必须与 install.sh 的路径/语义保持一致(含旧版锁路径协调)。
+_with_deploy_install_lock() {
+    local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lock_dir lock_file
+    local legacy_lock_file legacy_lock_dir DEPLOY_INSTALL_LOCK_FD="" i locked=0 owner tmp rc
+    local XD_INSTALL_LEGACY_FLOCK_FD="" XD_INSTALL_LEGACY_DIR=""
+    case "$deploy_path" in
+        /*) ;;
+        *) _error "部署目录必须是绝对路径, 无法建立安装锁: $DEPLOY_DIR"; return 1 ;;
+    esac
+    if [ -z "$deploy_path" ] || [ "$deploy_path" = "/" ]; then
+        _error "部署目录路径无效, 无法建立安装锁: $DEPLOY_DIR"
+        return 1
+    fi
+    deploy_parent="${deploy_path%/*}"
+    deploy_name="${deploy_path##*/}"
+    [ -n "$deploy_parent" ] || deploy_parent="/"
+    lock_dir="${deploy_parent}/.${deploy_name}.install.lock"
+    lock_file="${lock_dir}.fd"
+    legacy_lock_file="$deploy_path/.install.lock.fd"
+    legacy_lock_dir="$deploy_path/.install.lock"
+    if [ "${XRAY_DEPLOY_INSTALL_LOCK_HELD:-0}" = "1" ]; then
+        "$@"
+        return $?
+    fi
+    mkdir -p "$deploy_parent" 2>/dev/null || {
+        _error "无法创建安装锁父目录 $deploy_parent, 放弃本次卸载"
+        return 1
+    }
+    # 主锁文件在目录外, 竞争者不会被卸载的 `rm -rf` 拆成新旧 inode; 目录本身不在这里创建 ——
+    # 旧版锁路径在目录内, "先拿主锁再建目录再取旧锁"的顺序见下面 flock/mkdir 两条分支。
+
+    if command -v flock >/dev/null 2>&1; then
+        if ! eval "exec {DEPLOY_INSTALL_LOCK_FD}>>\"\$lock_file\""; then
+            _error "无法创建安装锁文件 $lock_file, 放弃本次卸载"
+            return 1
+        fi
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+            if flock -n "$DEPLOY_INSTALL_LOCK_FD" 2>/dev/null; then locked=1; break; fi
+            sleep 1
+        done
+        if [ "$locked" -ne 1 ]; then
+            _error "等待部署安装锁超时(15s), 可能有 install.sh 正在更新"
+            eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+            return 1
+        fi
+        # 主锁已在手, 再确保部署目录存在 —— 旧版(0.17.11 / PR #48 早期 HEAD)的安装锁文件在
+        # **目录内**, 而旧版进程也必须先建目录才能取它; 故"先拿主锁, 再建目录, 再取旧锁"这条
+        # 顺序不存在"目录刚被卸载删掉 / 旧进程刚建好目录"的漏网窗口。等待者(卸载期间才启动)
+        # 因此会在卸载释放主锁后照常继续, 而不是因为目录一度不存在而直接失败。
+        if ! mkdir -p "$deploy_path" 2>/dev/null; then
+            _error "无法创建部署目录 $deploy_path, 放弃本次操作"
+            eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+            return 1
+        fi
+        # 同一种手段再取一次旧版锁, 否则旧版 install.sh 会与新版各持一把锁同时落地。
+        if ! _xray_legacy_lock_name XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR \
+            "$legacy_lock_file" "$legacy_lock_dir" "安装锁"; then
+            eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+            return 1
+        fi
+        (
+            XRAY_DEPLOY_INSTALL_LOCK_HELD=1
+            export XRAY_DEPLOY_INSTALL_LOCK_HELD
+            "$@"
+        )
+        rc=$?
+        _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
+        eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+        return "$rc"
+    fi
+
+    # 与 install.sh 相同: 无 flock 时 mkdir 锁按 PID 有界等待活持有者, 对死锁/未知锁立即
+    # fail-closed, 绝不自动接管。SIGKILL 残留需人工确认后清理。
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+        if mkdir "$lock_dir" 2>/dev/null; then
+            tmp="$lock_dir/.pid.$$"
+            if ! printf '%s\n' "$$" > "$tmp" 2>/dev/null || ! mv -f "$tmp" "$lock_dir/pid" 2>/dev/null; then
+                rm -f "$tmp" "$lock_dir/pid" 2>/dev/null
+                rmdir "$lock_dir" 2>/dev/null
+                _error "无法写入安装锁持有者记录 $lock_dir/pid, 放弃本次卸载"
+                return 1
+            fi
+            if ! mkdir -p "$deploy_path" 2>/dev/null; then
+                _error "无法创建部署目录 $deploy_path, 放弃本次操作"
+                rm -f "$lock_dir/pid" 2>/dev/null
+                rmdir "$lock_dir" 2>/dev/null
+                return 1
+            fi
+            if ! _xray_legacy_lock_name XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR \
+                "$legacy_lock_file" "$legacy_lock_dir" "安装锁"; then
+                rm -f "$lock_dir/pid" 2>/dev/null
+                rmdir "$lock_dir" 2>/dev/null
+                return 1
+            fi
+            (
+                XRAY_DEPLOY_INSTALL_LOCK_HELD=1
+                export XRAY_DEPLOY_INSTALL_LOCK_HELD
+                "$@"
+            )
+            rc=$?
+            _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
+            owner=$(cat "$lock_dir/pid" 2>/dev/null)
+            if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
+                _error "安装锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
+                _tip "确认没有安装/卸载操作仍在运行后, 请手动检查该锁目录"
+                return 1
+            fi
+            return "$rc"
+        fi
+        if [ ! -d "$lock_dir" ]; then
+            _error "安装锁路径被非目录对象占用: $lock_dir"
+            _tip "请手动检查该路径后重试本次卸载"
+            return 1
+        fi
+        owner=$(cat "$lock_dir/pid" 2>/dev/null)
+        case "$owner" in
+            ''|*[!0-9]*) owner="" ;;
+            *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
+        esac
+        if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+            if [ "$i" -eq 14 ]; then
+                _error "另一个 install.sh 正在运行(pid $owner), 本次卸载中止"
+                _tip "若确认进程已退出, 请先人工检查并清理: $lock_dir"
+                return 1
+            fi
+            sleep 1
+            continue
+        fi
+        _error "检测到无人持有或无法判定的安装锁: $lock_dir"
+        _tip "确认没有 install.sh 正在运行后, 请手动检查并清理该锁目录"
+        return 1
+    done
+    _error "等待部署安装锁超时, 本次卸载中止: $lock_dir"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -581,17 +882,23 @@ _with_core_lock() {
 # 同项目的 `_port_txn` 早已用"先落 journal → 启动期按事实收敛"处理这类窗口。
 #
 # 阶段转移(**单向, 只允许向后推进**):
-#   prepared → snapshotted → binary_replaced → service_replaced → restart_verified
-#            → committed → (cleanup) → 删账本
+#   core: prepared → snapshotted → replacing → binary_replaced → service_replaced
+#         → restart_verified → committed → (cleanup) → 删账本
+#   geo:  prepared → snapshotted → replacing → geo_replaced → restart_verified
+#         → committed → (cleanup) → 删账本
+#   rollback: replacing / 各 mutation 后置 phase → rolled_back → (cleanup) → 删账本
 #
-# **每个 phase 只能有一种现实解释**(十三轮 P1-①, 这是协议层的要求):
+# **每个 phase 只能有一种现实解释**(十四轮 P1-①):
 #   prepared     = 账本已建, 恢复源**未**就绪。真实状态从未被触碰
 #                  ⇒ 崩溃后只清理中间产物, 绝不回滚(快照可能半截, 不能当恢复源)
-#   snapshotted  = 恢复源(binary .bak / unit 快照 / geo 快照)全部就绪, 真实状态仍未动
+#   snapshotted  = 恢复源(binary / service / geo)全部就绪, 真实状态仍未动
 #                  ⇒ 崩溃后同样只清理(没有需要恢复的东西)
-#   binary_replaced / service_replaced / restart_verified
-#                = 真实状态已被改动 ⇒ 崩溃后**回滚**
+#   replacing    = durable mutation barrier; 后续任何生产状态都可能已被部分改动
+#                  ⇒ 崩溃后按快照回滚。core 与 geo operation 都使用这一入口
+#   binary_replaced / service_replaced / geo_replaced / restart_verified
+#                = 对应 mutation 已完成或 runtime 已验证 ⇒ 尚未 committed 时崩溃都回滚
 #   committed    = 永不回滚, 只允许 cleanup
+#   rolled_back  = rollback 已收敛, 永不重放 mutation, 只允许 cleanup
 #
 # 两条闭环各自要成立(十二轮复审指出的正是它们没成立):
 #   · **提交闭环**: `committed` 必须先于清理备份落盘。否则"已删 .bak、账本还写着可回滚"的
@@ -637,10 +944,11 @@ _xray_core_journal_set_hash() {  # <journal> <hash-field> <snapshot-file>
 
 # 写新账本。调用前必须已过 core lock + pending gate。账本写入拒绝覆盖任何旧 journal。
 # 参数: <old_version> <old_channel> <new_tag> <channel> <staging_dir>
-_xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> <staging_dir>
-    local old_ver="$1" old_ch="$2" new_tag="$3" new_ch="$4" stage="$5"
+_xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> <staging_dir> [core|geo]
+    local old_ver="$1" old_ch="$2" new_tag="$3" new_ch="$4" stage="$5" operation="${6:-core}"
     local j payload txn_id binary_preexisting runtime_was_running=false old_state_ver old_hash unit sprev
     local geoip_pre geosite_pre service_pre=false
+    case "$operation" in core|geo) ;; *) _error "未知核心事务 operation: $operation"; return 1 ;; esac
     j=$(_xray_core_journal_path)
     _xray_core_path_present "$j" && { _error "核心事务账本已存在, 拒绝覆盖: $j"; return 1; }
     _xray_core_path_present "$(_xray_core_blocked_path)" && { _error "核心事务处于 BLOCKED, 拒绝新建账本"; return 1; }
@@ -652,6 +960,10 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
 
     txn_id="$(date +%s).$$.${RANDOM}"
     XRAY_CORE_TXN_ID="$txn_id"; export XRAY_CORE_TXN_ID
+    if [ "$operation" = geo ]; then
+        stage="$ASSET_DIR/.xray-geo-txn.${txn_id}"
+        ! _xray_core_path_present "$stage" || { _error "Geo 事务暂存目录已存在, 拒绝覆盖: $stage"; return 1; }
+    fi
     sprev=$(_xray_service_prev_path)
     unit=$(_xray_service_unit_path 2>/dev/null || printf '')
     if [ -n "$unit" ] && _xray_core_path_present "$unit"; then service_pre=true; fi
@@ -695,11 +1007,12 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
         --arg shash "" --arg ghash "" --arg gshash "" \
         --argjson bp "$binary_preexisting" --argjson runtime "$runtime_was_running" \
         --argjson gipre "$geoip_pre" --argjson gspre "$geosite_pre" --argjson spre "$service_pre" \
-        '{phase:"prepared", txn_id:$id, old_version:$ov, old_state_version:$osv, old_channel:$oc,
+        --arg op "$operation" --arg gi_new "" --arg gs_new "" \
+        '{phase:"prepared", operation:$op, txn_id:$id, old_version:$ov, old_state_version:$osv, old_channel:$oc,
           new_tag:$nt, channel:$nc, binary:$bin, binary_preexisted:$bp, binary_sha256:$bh,
           runtime_was_running:$runtime, binary_backup:$bak, unit:$unit, service_prev:$sprev, staging_dir:$stage,
-          geoip_preexisted:$gipre, geoip_backup:$gip, geoip_sha256:$ghash,
-          geosite_preexisted:$gspre, geosite_backup:$gsp, geosite_sha256:$gshash,
+          geoip_preexisted:$gipre, geoip_backup:$gip, geoip_sha256:$ghash, geoip_new_sha256:$gi_new,
+          geosite_preexisted:$gspre, geosite_backup:$gsp, geosite_sha256:$gshash, geosite_new_sha256:$gs_new,
           service_preexisted:$spre, service_sha256:$shash}') || return 1
     _atomic_write_json "$j" "$payload"
 }
@@ -761,8 +1074,25 @@ _xray_core_snapshots_ok() {  # <journal>
         [ "$service_pre" = false ] && [ -z "$service_hash" ] || return 1
     fi
 
-    local stage; stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
-    [ -d "$stage" ] && [ -f "$stage/xray" ] || { _error "staging source 缺失: $stage"; return 1; }
+    local stage operation hash expected f
+    stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
+    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || operation=core
+    [ -d "$stage" ] || { _error "staging source 缺失: $stage"; return 1; }
+    case "$operation" in
+        core)
+            [ -f "$stage/xray" ] || { _error "core staging binary 缺失: $stage/xray"; return 1; }
+            ;;
+        geo)
+            for f in geoip geosite; do
+                expected=$(jq -r --arg g "$f" '.[$g + "_new_sha256"] // empty' "$j" 2>/dev/null) || return 1
+                [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || { _error "$f.dat 新数据 hash 缺失/非法"; return 1; }
+                [ -f "$stage/$f.dat" ] && [ ! -L "$stage/$f.dat" ] || { _error "$f.dat Geo staging 缺失"; return 1; }
+                hash=$(_xray_core_sha256_file "$stage/$f.dat") || hash=""
+                [ -n "$hash" ] && [ "$hash" = "$expected" ] || { _error "$f.dat Geo staging hash 不符"; return 1; }
+            done
+            ;;
+        *) return 1 ;;
+    esac
     return 0
 }
 
@@ -774,9 +1104,10 @@ _xray_core_journal_phase() {
     cur=$(jq -r '.phase // empty' "$j" 2>/dev/null) || cur=""
     case "$cur:$next" in
         prepared:snapshotted|snapshotted:replacing|replacing:binary_replaced|\
-        binary_replaced:service_replaced|service_replaced:restart_verified|\
-        restart_verified:committed|replacing:rolled_back|binary_replaced:rolled_back|\
-        service_replaced:rolled_back|restart_verified:rolled_back) allowed=1 ;;
+        replacing:geo_replaced|binary_replaced:service_replaced|service_replaced:restart_verified|\
+        geo_replaced:restart_verified|restart_verified:committed|replacing:rolled_back|\
+        binary_replaced:rolled_back|service_replaced:rolled_back|geo_replaced:rolled_back|\
+        restart_verified:rolled_back) allowed=1 ;;
     esac
     [ "$allowed" -eq 1 ] || { _error "非法核心事务 phase 转移: ${cur:-?} → $next"; return 1; }
     if [ "$next" = snapshotted ]; then
@@ -808,10 +1139,11 @@ _xray_core_txn_pending() {
     _xray_core_path_present "$j"
 }
 _xray_core_journal_ok() {
-    local j="$1" id bin binbak pre hash runtime unit sprev stage gip gsp stage_name phase
-    local gipre gspre service_pre giphash gsphash service_hash
+    local j="$1" id bin binbak pre hash binary_hash runtime unit sprev stage stage_name phase operation
+    local gipre gspre service_pre giphash gsphash service_hash gi_new_hash gs_new_hash
     jq -e '
-      (.phase | type == "string" and test("^(prepared|snapshotted|replacing|binary_replaced|service_replaced|restart_verified|committed|rolled_back)$")) and
+      (.phase | type == "string" and test("^(prepared|snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)$")) and
+      ((.operation // "core") | (type == "string" and test("^(core|geo)$"))) and
       (.txn_id | type == "string" and length > 0 and test("^[A-Za-z0-9._-]+$")) and
       (.old_version | type == "string") and (.old_state_version | type == "string") and
       (.old_channel | type == "string") and (.channel | type == "string") and
@@ -823,9 +1155,9 @@ _xray_core_journal_ok() {
       (.unit | type == "string") and (.service_prev | type == "string" and length > 0) and
       (.staging_dir | type == "string" and length > 0) and
       (.geoip_preexisted | type == "boolean") and (.geoip_backup | type == "string" and length > 0) and
-      (.geoip_sha256 | type == "string") and
+      (.geoip_sha256 | type == "string") and (.geoip_new_sha256 // "" | type == "string") and
       (.geosite_preexisted | type == "boolean") and (.geosite_backup | type == "string" and length > 0) and
-      (.geosite_sha256 | type == "string") and
+      (.geosite_sha256 | type == "string") and (.geosite_new_sha256 // "" | type == "string") and
       (.service_preexisted | type == "boolean") and (.service_sha256 | type == "string")
     ' "$j" >/dev/null 2>&1 || return 1
     phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
@@ -833,11 +1165,14 @@ _xray_core_journal_ok() {
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
-    hash=$(jq -r '.binary_sha256' "$j" 2>/dev/null) || return 1
+    binary_hash=$(jq -r '.binary_sha256' "$j" 2>/dev/null) || return 1
     runtime=$(jq -r '.runtime_was_running' "$j" 2>/dev/null) || return 1
     unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
+    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || operation=core
+    gi_new_hash=$(jq -r '.geoip_new_sha256 // empty' "$j" 2>/dev/null) || return 1
+    gs_new_hash=$(jq -r '.geosite_new_sha256 // empty' "$j" 2>/dev/null) || return 1
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
     gipre=$(jq -r '.geoip_preexisted' "$j" 2>/dev/null) || return 1
@@ -860,17 +1195,35 @@ _xray_core_journal_ok() {
     elif [ "$service_pre" = false ]; then
         [ -z "$service_hash" ] || return 1
     fi
-    case "$stage" in
-        "$BIN_DIR"/.xray-dl.*)
-            stage_name=${stage#"$BIN_DIR"/}
-            case "$stage_name" in .xray-dl.*) case "$stage_name" in */*) return 1 ;; esac ;; *) return 1 ;; esac
+    case "$operation" in
+        core)
+            case "$stage" in
+                "$BIN_DIR"/.xray-dl.*)
+                    stage_name=${stage#"$BIN_DIR"/}
+                    case "$stage_name" in .xray-dl.*) case "$stage_name" in */*) return 1 ;; esac ;; *) return 1 ;; esac
+                    ;;
+                *) return 1 ;;
+            esac
+            [ -z "$gi_new_hash" ] && [ -z "$gs_new_hash" ] || return 1
+            ;;
+        geo)
+            case "$stage" in
+                "$ASSET_DIR"/.xray-geo-txn.*)
+                    stage_name=${stage#"$ASSET_DIR"/}
+                    case "$stage_name" in .xray-geo-txn.*) case "$stage_name" in */*) return 1 ;; esac ;; *) return 1 ;; esac
+                    ;;
+                *) return 1 ;;
+            esac
+            for hash in "$gi_new_hash" "$gs_new_hash"; do
+                [ -z "$hash" ] || [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+            done
             ;;
         *) return 1 ;;
     esac
     if [ "$pre" = true ]; then
-        [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+        [[ "$binary_hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
     else
-        [ -z "$hash" ] && [ "$runtime" = false ] || return 1
+        [ -z "$binary_hash" ] && [ "$runtime" = false ] || return 1
     fi
     for hash in "$giphash" "$gsphash" "$service_hash"; do
         [ -z "$hash" ] || [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
@@ -878,10 +1231,13 @@ _xray_core_journal_ok() {
     [ "$gipre" = true ] || [ -z "$giphash" ] || return 1
     [ "$gspre" = true ] || [ -z "$gsphash" ] || return 1
     case "$phase" in
-        snapshotted|replacing|binary_replaced|service_replaced|restart_verified|committed|rolled_back)
+        snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)
             [ "$gipre" = false ] || [ -n "$giphash" ] || return 1
             [ "$gspre" = false ] || [ -n "$gsphash" ] || return 1
             [ "$service_pre" = false ] || [ -n "$service_hash" ] || return 1
+            if [ "$operation" = geo ]; then
+                [[ "$gi_new_hash" =~ ^[[:xdigit:]]{64}$ ]] && [[ "$gs_new_hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+            fi
             ;;
     esac
     return 0
@@ -986,7 +1342,7 @@ _xray_core_txn_recover_locked() {
             _xray_core_journal_drop || return 1
             return 0
             ;;
-        replacing|binary_replaced|service_replaced|restart_verified) ;;
+        replacing|binary_replaced|service_replaced|geo_replaced|restart_verified) ;;
         *) _xray_core_journal_quarantine "$j" "未知 phase=$phase"; return 1 ;;
     esac
     _xray_core_recover_rollback_locked "$j"
@@ -1069,10 +1425,10 @@ _xray_core_recover_rollback_locked() {
                 _error "service pre-existing 快照缺失/含糊, 保留 journal: $sprev"
             fi
             if [ -f "${sprev}.enabled" ] && [ ! -L "${sprev}.enabled" ]; then
-                if ! _xray_service_restore_enable "${sprev}.enabled" keep; then
-                    disk_ok=0
-                    _error "service 开机自启状态未恢复, journal 与恢复源保留供重试"
-                fi
+                # enable/disable 是下次启动策略, 不是当前 runtime 收敛条件。快照必须存在且可读,
+                # 但恢复命令失败沿用同步 rollback 的 warning-only 契约, 不把核心永久卡在 pending。
+                _xray_service_restore_enable "${sprev}.enabled" keep || \
+                    _warn "service 开机自启状态未恢复(不阻塞核心回滚), 请按上方提示手动处理"
             else
                 disk_ok=0
                 _error "service 开机自启快照缺失或无效, 保留 journal: ${sprev}.enabled"
@@ -1080,12 +1436,11 @@ _xray_core_recover_rollback_locked() {
         elif [ -f "${sprev}.absent" ] && [ ! -L "${sprev}.absent" ] && \
              ! _xray_core_path_present "$sprev" && \
              [ -f "${sprev}.enabled" ] && [ ! -L "${sprev}.enabled" ]; then
-            # 先移除 enable/link, 再删新 unit; 这样 systemd/OpenRC 仍能解析该服务名。
-            # 必须保留 unit, 直到 enable state 确认恢复; 否则失败后的重试可能已无可操作目标。
-            if ! _xray_service_restore_enable "${sprev}.enabled" keep; then
-                disk_ok=0
-                _error "新建 service 的开机自启状态未恢复, 保留 unit 与恢复账本供重试"
-            elif ! rm -f "$unit" 2>/dev/null || _xray_core_path_present "$unit"; then
+            # enable/link 恢复只影响下次启动策略: 尽力恢复并告警, 但不阻塞 essential rollback。
+            # 随后仍必须撤销本次新建的 unit; 文件删除/daemon-reload 失败才保留 journal 重试。
+            _xray_service_restore_enable "${sprev}.enabled" keep || \
+                _warn "新建 service 的开机自启状态未恢复(不阻塞核心回滚), 继续撤销 unit"
+            if ! rm -f "$unit" 2>/dev/null || _xray_core_path_present "$unit"; then
                 disk_ok=0
                 _error "事务中新建的 service 无法撤销: $unit"
             elif [ "${INIT_SYSTEM:-}" = systemd ] && ! systemctl daemon-reload; then
@@ -1195,6 +1550,125 @@ _xray_core_abort_locked() {  # <用户可读原因>
     return 1
 }
 
+# 独立 Geo 更新也复用 coretxn: 共享同一把锁、同一份 transaction-unique 快照与恢复状态机。
+# 下载已在锁外完成; 此处先 durable 建 journal, 再准备 stage/snapshots, 最后跨过 replacing 屏障。
+_xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
+    local download_dir="$1" ts="$2" downloads_ok="$3"
+    local j stage old_ver old_channel runtime f src staged dest size hash expected gi_hash="" gs_hash=""
+    if ! _xray_core_txn_recover_locked; then
+        _error "核心事务尚未收敛, 拒绝提交 Geo 数据"
+        return 1
+    fi
+    if _xray_core_txn_pending; then
+        _error "核心事务仍待处理, 拒绝提交 Geo 数据"
+        return 1
+    fi
+    if [ "$downloads_ok" != 1 ]; then
+        _warn "Geo 数据未全部下载/校验成功, 不修改 live dat"
+        echo "[$ts] PARTIAL 下载不完整, live dat 未修改" >> "$GEO_LOG"
+        return 1
+    fi
+    for f in geoip geosite; do
+        src="$download_dir/$f.dat"
+        [ -f "$src" ] && [ ! -L "$src" ] || {
+            _error "$f.dat 下载暂存缺失或不是普通文件, 不提交 Geo 更新"
+            return 1
+        }
+        size=$(stat -c%s "$src" 2>/dev/null || stat -f%z "$src" 2>/dev/null || echo 0)
+        [ "$size" -ge 1024 ] || { _error "$f.dat 下载暂存体积异常(${size}B), 不提交 Geo 更新"; return 1; }
+    done
+
+    old_ver=$(_xray_current_version 2>/dev/null) || old_ver=""
+    old_channel=$(_state_get channel 2>/dev/null) || old_channel=""
+    # _xray_core_journal_write 用 operation=geo 分配 ASSET_DIR 下的同盘 staging 路径。
+    # journal 先于 mkdir/copy, 因而 prepared 崩溃也能由 recovery 清掉 staging。
+    if ! _xray_core_journal_write "$old_ver" "$old_channel" "geo-update" "$old_channel" "" geo; then
+        _error "无法建立 Geo coretxn journal, 未修改 live dat"
+        return 1
+    fi
+    j=$(_xray_core_journal_path)
+    stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || stage=""
+    [ -n "$stage" ] || { _xray_core_abort_locked "Geo journal 缺少 staging 路径"; return 1; }
+    if ! mkdir "$stage" 2>/dev/null; then
+        _xray_core_abort_locked "无法创建 Geo transaction staging: $stage"
+        return 1
+    fi
+
+    # 新 dat 先写入同盘 transaction stage; 对源、落地副本与 journal hash 三方逐字节/哈希校验。
+    for f in geoip geosite; do
+        src="$download_dir/$f.dat"
+        staged="$stage/$f.dat"
+        if ! cp -p "$src" "$staged" 2>/dev/null || ! cmp -s "$src" "$staged" 2>/dev/null; then
+            _xray_core_abort_locked "$f.dat Geo staging 复制/逐字节校验失败"
+            return 1
+        fi
+        hash=$(_xray_core_sha256_file "$staged") || hash=""
+        [ -n "$hash" ] || { _xray_core_abort_locked "$f.dat Geo staging SHA256 计算失败"; return 1; }
+        if [ "$f" = geoip ]; then gi_hash="$hash"; else gs_hash="$hash"; fi
+    done
+    if ! _meta_update "$j" '.geoip_new_sha256=$gi | .geosite_new_sha256=$gs' \
+        --arg gi "$gi_hash" --arg gs "$gs_hash"; then
+        _xray_core_abort_locked "无法记录 Geo 新数据 hash"
+        return 1
+    fi
+
+    # 恢复 binary/service 与旧 geo 一起纳入事务; 即使本操作只改 dat, recovery 仍能验证完整 pre-state。
+    if ! _xray_service_snapshot || ! _xray_core_snapshot_binary "$j" || ! _xref_snapshot_geo_dats "$j"; then
+        _xray_core_abort_locked "Geo transaction rollback source 快照失败"
+        return 1
+    fi
+    if ! _xray_core_journal_phase snapshotted; then
+        _xray_core_abort_locked "Geo transaction 无法 durable 进入 snapshotted"
+        return 1
+    fi
+    if ! _xray_core_journal_phase replacing; then
+        _xray_core_abort_locked "Geo transaction 无法 durable 进入 replacing, live dat 未触碰"
+        return 1
+    fi
+
+    for f in geoip geosite; do
+        staged="$stage/$f.dat"
+        dest="$ASSET_DIR/$f.dat"
+        if ! mv -f "$staged" "$dest"; then
+            _xray_core_abort_locked "$f.dat Geo 原子替换失败"
+            return 1
+        fi
+        hash=$(_xray_core_sha256_file "$dest") || hash=""
+        if [ "$f" = geoip ]; then expected="$gi_hash"; else expected="$gs_hash"; fi
+        if [ -z "$hash" ] || [ "$hash" != "$expected" ]; then
+            _xray_core_abort_locked "$f.dat Geo 替换后 SHA256 不符"
+            return 1
+        fi
+    done
+    if ! _xray_core_journal_phase geo_replaced; then
+        _xray_core_abort_locked "Geo dat 已替换但无法推进 geo_replaced phase"
+        return 1
+    fi
+    runtime=$(jq -r '.runtime_was_running' "$j" 2>/dev/null) || runtime=false
+    if [ "$runtime" = true ] && ! _restart_xray_verified; then
+        _xray_core_abort_locked "新 Geo 数据导致 Xray 未能稳定运行, 正在恢复旧 dat"
+        return 1
+    fi
+    if ! _xray_core_journal_phase restart_verified; then
+        _xray_core_abort_locked "Geo 已提交但 runtime phase 推进失败"
+        return 1
+    fi
+    if ! _xray_core_journal_phase committed; then
+        _xray_core_abort_locked "Geo 已验证但 committed phase 未落盘"
+        return 1
+    fi
+    if ! _xray_core_cleanup_after_commit "$j"; then
+        _warn "Geo 数据已提交并验证, 但 transaction cleanup 未完成; journal 保留供下次恢复重试"
+    fi
+    if [ "$runtime" = true ]; then
+        echo "[$ts] OK Geo 更新成功, Xray 重启稳定" >> "$GEO_LOG"
+    else
+        echo "[$ts] OK Geo 更新成功(xray 未运行, 已跳过重启)" >> "$GEO_LOG"
+    fi
+    _success "Geo 数据更新成功"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # 安装或切换 Xray 核心(R3)
 # 用法:_install_or_switch_xray <channel>
@@ -1205,9 +1679,9 @@ _xray_core_abort_locked() {  # <用户可读原因>
 #     共享状态, 所以网络等待/下载/解压(可能 40s+)不需要互斥, 也就不会把另一个会话拖成
 #     15s 锁超时。
 #   · 阶段二 `_xray_commit_staged` **在锁内** —— 快照/账本/替换/重启全部在这里, 与
-#     _xray_core_txn_recover 同一把 .core.lock。
-# 两把锁(.core.lock / .config.lock)的加锁方向恒定 core → config(只有本模块会先持 core 锁),
-# 单向不成环 ⇒ 无死锁; 两个包装器各自可重入, 故不自锁。
+#     _xray_core_txn_recover 同一把部署目录外的稳定 core lock。
+# core lock 与 `.config.lock` 实际嵌套方向是 config → core(配置事务的 verified restart);
+# 核心事务不获取 config lock, 因而没有反向边, 两个包装器也各自可重入。
 # ---------------------------------------------------------------------------
 _install_or_switch_xray() {
     local channel="$1" tag staged rc=0
@@ -1216,8 +1690,14 @@ _install_or_switch_xray() {
         *) _error "未知通道: $channel"; return 1 ;;
     esac
     _ensure_dirs || return 1
+    # 同一长驻菜单会话里的上次 committed/rolled_back cleanup 失败也要重试, 不能只等下次 xd 启动。
+    # 若是未收敛 mutation, recovery 会回滚; 若 BLOCKED/损坏则仍由 pending gate fail closed。
+    if ! _xray_core_txn_recover; then
+        _error "核心事务恢复/清理未能完成, 拒绝开始新的切换"
+        return 1
+    fi
     # 在取件**之前**先看一眼门禁: 明知有未收敛事务就不该白下载一遍(几十 MB)。
-    # 真正的门禁仍在锁内那一次(两次检查之间可能有另一个会话产生账本)。
+    # 真正的门禁仍在锁内那一次(锁外取件期间可能有另一个会话产生账本)。
     if _xray_core_txn_pending; then
         _error "存在未完成的核心切换事务, 已拒绝开始新的切换"
         if [ -f "$(_xray_core_blocked_path)" ]; then
@@ -1252,7 +1732,11 @@ _install_or_switch_xray_locked() {
     case "$channel" in stable|preview) ;; *) _error "未知通道: $channel"; return 1 ;; esac
     _ensure_dirs || return 1
 
-    # 锁内第二道门禁: 锁外取件后可能有别的会话产生/隔离事务账本。
+    # 锁内先重试 terminal cleanup / 收敛中断事务, 再执行第二道门禁。
+    if ! _xray_core_txn_recover_locked; then
+        _error "核心事务恢复/清理未能完成, 已拒绝新的切换"
+        return 1
+    fi
     if _xray_core_txn_pending; then
         _error "存在未完成或 BLOCKED 的核心事务, 已拒绝开始新的切换"
         _tip "请先按提示处理: $(_xray_core_journal_path) / $(_xray_core_blocked_path)"
@@ -1640,7 +2124,7 @@ _xray_service_snapshot_enable() {  # <unit路径> <标志文件路径>
 }
 
 # 恢复 enable 状态。只在快照存在时动手(见上: 无快照 = 该维未快照, 不猜)。
-# 返回 1 = 恢复动作失败(调用方据此判定"回滚不完整")。
+# 返回 1 = 自启策略未恢复; 同步 rollback 与 crash recovery 只告警, 不阻塞核心事务收敛。
 _xray_service_restore_enable() {  # <标志文件路径> [keep_snapshot]
     local flag="$1" keep="${2:-}" want current action_rc=0
     [ -f "$flag" ] || return 0
@@ -2025,16 +2509,46 @@ _xray_is_running() {
 # ---------------------------------------------------------------------------
 _manage_xray() {
     local action="$1"
+    # 所有 start/stop/restart 都与核心替换/Geo commit 共用 .core.lock。锁持有标志由
+    # _with_core_lock 的子 shell 继承, 所以事务内部的嵌套调用直接落到下方实现, 不会自锁。
+    # status 是只读观察, 不取锁。缺 flock 时由 _with_core_lock 使用拒绝接管的 mkdir 退路。
+    case "$action" in
+        start|stop|restart)
+            if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
+               declare -F _with_core_lock >/dev/null 2>&1; then
+                _with_core_lock _manage_xray "$@"
+                return $?
+            fi
+            ;;
+    esac
     # fd9 关闭(9>&-, 2026-09-13 Alpine 实测): 本函数会在 _with_config_lock 的锁子 shell
     # 内被调用(config 事务), openrc supervise-daemon / direct 模式 nohup 会继承打开的 fd ——
     # 守护进程持有 fd9 = flock 永远被持有, 之后所有 _mutate_config 15s 超时静默失败。
     # systemd 不继承业务 fd(Ubuntu 无感), openrc/direct 必须关闭; 对齐 singbox-lite 同类修复。
+    # start/restart 会派生守护进程, 因此把**本函数可能持有的全部锁 fd** 一并关掉: 主核心锁、
+    # 主安装锁, 以及跨版本协调用的两把旧版锁。少关一把 = 守护进程不退则那把锁永不释放。
+    #
+    # **为什么必须写成 local V="${V:-9}" + {V}>&-, 而不是 "${V:-9}>&-"(十五轮实测 P1)**:
+    # bash **不会**把 `${V:-9}>&-` 解析成重定向 —— 词法上它是"一个参数 + >&- "两个词, 参数是
+    # 展开后的数字, 于是重定向作用于**可变 fd 的控制台**(实测 `echo X ${V:-9}>&-` 报
+    # write error: Bad file descriptor), 而那个数字作为**位置参数**传给被调命令。后果实测:
+    #   · 被调命令多出 9(未持锁)或真实 fd 号(已持锁): `systemctl stop xray 10` 会去操作
+    #     不存在的 10.service 并以 rc=5 失败 —— 调用方看到的是"停服务失败";
+    #   · 锁 fd **照旧被守护进程继承**: 实测子进程 inherited_core_lock_fds=1, 它不死 flock 就
+    #     永不释放 —— 这正是这段代码要防的事, 却因为写法失效而没防住。
+    # `{V}>&-` 才是真正的重定向(只作用于该命令, 父进程 fd 保留)。四个变量先用
+    # `local V="${V:-9}"` 归一成数字: 既保证 `{V}` 恒有值(否则 set -u 下报 ambiguous
+    # redirect), 又让未持锁时的默认值 9 参与, 与字面 9>&- 重复关闭同一个 fd 是幂等 no-op。
+    local CORE_LOCK_FD="${CORE_LOCK_FD:-9}"
+    local DEPLOY_INSTALL_LOCK_FD="${DEPLOY_INSTALL_LOCK_FD:-9}"
+    local XD_CORE_LEGACY_FLOCK_FD="${XD_CORE_LEGACY_FLOCK_FD:-9}"
+    local XD_INSTALL_LEGACY_FLOCK_FD="${XD_INSTALL_LEGACY_FLOCK_FD:-9}"
     case "$INIT_SYSTEM" in
         systemd)
             case "$action" in
-                start)   systemctl start xray 2>/dev/null 9>&- ${CORE_LOCK_FD:-9}>&- ;;
-                stop)    systemctl stop xray 2>/dev/null 9>&- ${CORE_LOCK_FD:-9}>&- ;;
-                restart) systemctl restart xray 2>/dev/null 9>&- ${CORE_LOCK_FD:-9}>&- ;;
+                start)   systemctl start xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- ;;
+                stop)    systemctl stop xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
+                restart) systemctl restart xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- ;;
                 # R40: 与 openrc/direct 一致地走 _xray_is_running(绑定到 unit MainPID 的
                 # 真实主进程), 不再用裸 is-active —— 后者在主进程已死、systemd 尚未把 unit
                 # 迁出 active 的窗口内会报 running(详见 _xray_is_running 注释)。
@@ -2047,12 +2561,12 @@ _manage_xray() {
                 # 会被拒; 仅在"确无真实 xray 业务进程"时 zap 复位状态机(健康运行时绝不 zap,
                 # 否则 OpenRC 误判 stopped 会再起一个实例造成端口冲突)。
                 start)
-                    _xray_is_running || rc-service xray zap >/dev/null 2>&1 9>&- ${CORE_LOCK_FD:-9}>&-
-                    rc-service xray start 2>/dev/null 9>&- ${CORE_LOCK_FD:-9}>&- ;;
-                stop)    rc-service xray stop 2>/dev/null 9>&- ${CORE_LOCK_FD:-9}>&- ;;
+                    _xray_is_running || rc-service xray zap >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&-
+                    rc-service xray start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- ;;
+                stop)    rc-service xray stop 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 restart)
-                    _xray_is_running || rc-service xray zap >/dev/null 2>&1 9>&- ${CORE_LOCK_FD:-9}>&-
-                    rc-service xray restart 2>/dev/null 9>&- ${CORE_LOCK_FD:-9}>&- ;;
+                    _xray_is_running || rc-service xray zap >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&-
+                    rc-service xray restart 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- ;;
                 status)
                     # 只认真实 xray 业务进程, 不认 supervise-daemon 父进程(否则崩溃循环被误报 running)
                     if _xray_is_running; then echo "running"; else echo "stopped"; fi
@@ -2070,7 +2584,7 @@ _manage_xray() {
                         echo "running"
                     else
                         rm -f /run/xray.pid
-                        XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG_FILE" >/dev/null 2>&1 9>&- ${CORE_LOCK_FD:-9}>&- &
+                        XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG_FILE" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- &
                         echo $! > /run/xray.pid
                         sleep 1
                         if [ "$(cat /proc/$(cat /run/xray.pid 2>/dev/null)/comm 2>/dev/null)" != "xray" ]; then
@@ -2113,6 +2627,12 @@ _manage_xray() {
 # 坏配置/被 OOM 进不了持续 running 态 → 返回 1 触发上层回滚。
 # ---------------------------------------------------------------------------
 _restart_xray_verified() {
+    # restart + 8 秒健康观察作为一个不可穿插的 runtime mutation 临界区。
+    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
+       declare -F _with_core_lock >/dev/null 2>&1; then
+        _with_core_lock _restart_xray_verified
+        return $?
+    fi
     # 成败判定以 8s 轮询为准, 服务命令 rc 仅决定是否补一次 start(2026-09-13 Alpine 实测):
     # openrc+supervise-daemon 下 restart/start 的 rc 不可靠 —— 子进程 FATAL 进入
     # respawn-wait 后 openrc 标 stopped 而 supervisor 存活, 随后 start 被
@@ -2144,6 +2664,12 @@ _restart_xray_verified() {
 # 绝不因此把卸载卡死。
 # ---------------------------------------------------------------------------
 _xray_stop_and_verify() {
+    # stop 与完整 liveness 确认不可被核心 transaction 的 restart 插入。
+    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
+       declare -F _with_core_lock >/dev/null 2>&1; then
+        _with_core_lock _xray_stop_and_verify
+        return $?
+    fi
     if ! declare -F _xray_is_running >/dev/null 2>&1; then
         _warn "lib 版本过旧(缺 _xray_is_running), 无法确认进程是否退出, 仅执行停止"
         _manage_xray stop >/dev/null 2>&1 || true
@@ -2162,6 +2688,16 @@ _xray_stop_and_verify() {
 # 卸载 Xray(停服务 + 删 service + 删部署目录 + 清快捷命令 + 清 crontab)
 # ---------------------------------------------------------------------------
 _uninstall_xray() {
+    # 锁序 install → core。install.sh 只取 install 锁, 核心事务只取 core 锁, 无反向嵌套边。
+    # 两把锁都在 DEPLOY_DIR 外, 卸载不会删除锁路径或让等待者打开新 inode。
+    _with_deploy_install_lock _uninstall_xray_core_locked "$@"
+}
+
+_uninstall_xray_core_locked() {
+    _with_core_lock _uninstall_xray_locked "$@"
+}
+
+_uninstall_xray_locked() {
     # 停止必须**确认进程真的退出**再动文件(2026-09-22 九轮 OCR #19)。旧写法
     # `_manage_xray stop 2>/dev/null || true` 忽略一切结果 —— 进程还在时照样删 unit 与部署目录,
     # 留下"孤儿进程占着端口 + 没有 unit/配置可管理"的残局(与官方 Hysteria2 侧的
