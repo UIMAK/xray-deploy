@@ -616,16 +616,16 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
 # 的 fd 随后 flock 成功, 但那把锁落在**已解除链接的 inode** 上: 路径上已经没有它的目录项, 任何
 # 新来的旧版进程都会在**同一个路径**上创建新文件并成功加锁 ⇒ 两个持有者同时进场。
 # 故拿到锁后必须复核 inode 身份, 不一致一律 fail-closed (宁可拒绝, 不做双重放行)。
-# 读不到 /proc(少数容器)时**不阻断**: 这条是加固, 不是新的一票否决点。
+# fd 目标无法读取时也必须拒绝: 无法确认仍指向原路径, 不能按安全放行处理。
 _xray_legacy_lock_inode_ok() {   # <fd> <path>; 0 = 我们持有的 fd 仍指向该路径上的文件
     local fd="$1" p="$2" t
     [ -n "$fd" ] && [ -n "$p" ] || return 0
     [ -e "$p" ] || return 1
-    t=$(readlink "/proc/self/fd/$fd" 2>/dev/null) || return 0
+    t=$(readlink "/proc/self/fd/$fd" 2>/dev/null) || return 1
     case "$t" in
         "$p") return 0 ;;
         *" (deleted)") return 1 ;;
-        *) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -1852,11 +1852,6 @@ _install_or_switch_xray_locked() {
     cur=$(_xray_current_version 2>/dev/null) || cur=""
     prev_channel=$(_state_get channel 2>/dev/null) || prev_channel=""
 
-    # 配置只读快照(核心切换不改 config, 但保留历史备份)。此动作不属于 core mutation。
-    if ! _backup_config; then
-        _error "配置备份失败, 取消核心切换"
-        return 1
-    fi
     # 账本先落盘; phase=prepared 的唯一含义是"journal 已建, 真实状态未动, snapshots 尚未就绪"。
     if ! _xray_core_journal_write "${cur:-}" "${prev_channel:-}" "$tag" "$channel" "$staged"; then
         _error "核心事务日志写入失败(磁盘空间/权限?), 取消本次安装/切换(未做任何改动)"
@@ -1912,22 +1907,21 @@ _install_or_switch_xray_locked() {
         return 1
     fi
 
-    # version/channel 仍为两个独立 display state; 写失败告警但不反向回滚已验证运行的核心。
-    # 恢复路径仅在成功收敛后恢复 old_state_version/old_channel, 不会在失败现场记录当前错误值。
-    if [ -n "$newv" ]; then
-        if ! _state_set channel "$channel"; then
-            _warn "状态持久化失败(channel), 本次核心已运行但 channel 显示可能滞后"
-        elif ! _state_set version "$newv"; then
-            _warn "状态持久化失败(version), 正在尽力恢复 channel 记录"
-            if [ -n "$prev_channel" ]; then
-                _state_set channel "$prev_channel" 2>/dev/null || \
-                    _warn "channel 恢复失败, 状态显示可能不准"
-            else
-                rm -f "$STATE_DIR/channel" 2>/dev/null || true
-            fi
-        fi
-    else
-        _warn "无法读取新核心版本, 跳过 version/channel 记录"
+    # version/channel 是一组 display state, 两份文件不能只提交其中一份。两步之间若有
+    # 任一步失败, 账本仍处于 restart_verified, 统一走 recovery: 它会停止新实例、恢复
+    # binary/service/runtime, 并按 journal 中的 old_state_version/old_channel 恢复两份旧状态。
+    # 不能把已写入一份 state 的现场标成 committed, 否则磁盘核心与显示状态永久分裂。
+    if [ -z "$newv" ]; then
+        _xray_core_abort_locked "无法读取新核心版本, 拒绝提交 version/channel 状态"
+        return 1
+    fi
+    if ! _state_set channel "$channel" || [ "$(_state_get channel 2>/dev/null)" != "$channel" ]; then
+        _xray_core_abort_locked "channel 状态提交失败, 正在回滚核心切换"
+        return 1
+    fi
+    if ! _state_set version "$newv" || [ "$(_state_get version 2>/dev/null)" != "$newv" ]; then
+        _xray_core_abort_locked "version 状态提交失败, 正在回滚核心切换"
+        return 1
     fi
 
     # COMMIT: restart 已验证, 只有 committed phase durable 后恢复端才转入 cleanup-only。
@@ -2828,6 +2822,14 @@ _uninstall_xray_locked() {
         _tip "可先查看: xd 主菜单 [核心管理] → 服务状态"
         return 1
     fi
+    # 清理端口跳跃 iptables 规则必须在任何外部卸载动作之前: 失败时保留部署树和
+    # metadata, 同时避免留下已失去管理入口的 DNAT 规则。
+    if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
+        if ! _hy2_cleanup_all_hops; then
+            _error "端口跳跃规则清理失败, 已中止卸载(部署目录与节点元数据保留), 请处理后重试"
+            return 1
+        fi
+    fi
     case "$INIT_SYSTEM" in
         systemd)
             systemctl disable xray 2>/dev/null
@@ -2857,10 +2859,6 @@ _uninstall_xray_locked() {
     # 删快捷命令(xd) + xray symlink
     rm -f /usr/local/bin/"$CMD_NAME"
     [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ] && rm -f /usr/local/bin/xray
-    # 清理端口跳跃 iptables 规则(必须在删除部署目录之前)
-    if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        _hy2_cleanup_all_hops
-    fi
     # 官方 Hysteria2 前置清理(其数据目录随 DEPLOY_DIR 一并删除, 但 service 定义在系统目录,
     # 不先停服删 unit 会留下指向已删 binary 的孤儿服务; declare -F 守卫兼容混装旧版)。
     # 0.16.3: 停止必须确认进程真正退出 —— 仍存活时中止整个卸载(防孤儿进程), 由用户处理。
@@ -2874,8 +2872,13 @@ _uninstall_xray_locked() {
     if declare -F _logrotate_cleanup >/dev/null 2>&1; then
         _logrotate_cleanup
     fi
-    # 删部署目录(含 config/nodes/assets/logs/state/lib/templates)
-    rm -rf "$DEPLOY_DIR"
+    # 删部署目录(含 config/nodes/assets/logs/state/lib/templates)。rm -rf 的 rc 不能吞掉;
+    # 部分删除失败时必须报告未完成, 不能把残留安装报成已卸载。
+    if ! rm -rf "$DEPLOY_DIR" 2>/dev/null || [ -e "$DEPLOY_DIR" ] || [ -L "$DEPLOY_DIR" ]; then
+        _error "部署目录删除失败, 卸载未完成: $DEPLOY_DIR"
+        _tip "请检查权限/只读文件系统后重试"
+        return 1
+    fi
     _success "Xray 已卸载干净(/opt/xray-deploy、xd 命令、系统 cron 已清除)"
 }
 

@@ -1404,10 +1404,11 @@ _hy2_list_all_hop_rules() {
 _hy2_cleanup_all_hops() {
     [ -d "$NODES_DIR" ] || return 0
     if ! command -v iptables >/dev/null 2>&1; then
-        # R33(P2): iptables 不可用时不阻塞 reset, 但存在 hop metadata 时必须显式提示——
-        # 否则 metadata 随 reset 删除后, DNAT 可能残留且无法追溯
+        # reset/uninstall 都会随后丢弃 metadata; 有 hop metadata 却无法访问 iptables 时必须
+        # 保留现场并失败返回, 否则 DNAT 会残留而失去可追溯的清理依据。
         if grep -lq 'hop_ranges\|udp_hop_ports' "$NODES_DIR"/*.json 2>/dev/null; then
-            _warn "iptables 不可用, 无法验证/清理端口跳跃规则(存在 hop metadata), 请手动检查 iptables -t nat -S PREROUTING"
+            _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
+            return 1
         fi
         return 0
     fi
@@ -1426,10 +1427,15 @@ _hy2_cleanup_all_hops() {
             found=1
         fi
     done
-    if [ "$found" -eq 1 ]; then
-        _hy2_persist_iptables || _warn "iptables 规则持久化失败, 重启后可能丢失"
+    if [ "$found" -eq 1 ] && ! _hy2_persist_iptables; then
+        _error "iptables 规则持久化失败, 端口跳跃清理未完成"
+        residual=1
     fi
-    [ "$residual" -eq 0 ] || _warn "部分端口跳跃规则清理后仍有残留, 请手动检查 iptables -t nat -S PREROUTING"
+    if [ "$residual" -ne 0 ]; then
+        _error "部分端口跳跃规则清理后仍有残留, 请手动检查 iptables -t nat -S PREROUTING"
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------

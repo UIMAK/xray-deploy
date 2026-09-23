@@ -630,7 +630,10 @@ _reset_config() {
     fi
     # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        _hy2_cleanup_all_hops
+        if ! _hy2_cleanup_all_hops; then
+            _error "端口跳跃规则清理失败, 已取消重置(配置与节点数据保留), 请处理后重试"
+            return 1
+        fi
     fi
     # 删掉 config 让 _init_config_if_empty 重建。
     # **重建失败必须回滚, 且回滚要在清元数据之前**(2026-09-22 九轮 OCR #41)。
