@@ -733,7 +733,7 @@ _xray_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持有
 
 _with_core_lock() {
     local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lockf fallback_dir
-    local legacy_lockf legacy_fallback_dir i locked=0 rc owner
+    local legacy_lockf legacy_fallback_dir legacy_fresh=0 i locked=0 rc owner
     local XD_CORE_LEGACY_FLOCK_FD="" XD_CORE_LEGACY_DIR=""
     case "$deploy_path" in
         /*) ;;
@@ -750,6 +750,12 @@ _with_core_lock() {
     fallback_dir="${lockf}.d"
     legacy_lockf="$deploy_path/.core.lock"
     legacy_fallback_dir="$deploy_path/.core.lock.d"
+    # 只有当旧锁路径**尚不存在**(本次将新建 inode)时才需要 /proc 扫描: 旧持有者的锁文件
+    # 若随整棵树被删除, 我们在同一路径重建的将是新 inode, 与旧 fd 不互斥。路径已存在时
+    # 我们打开的正是旧 inode, 后续 flock/inode 复核足以覆盖(且扫描每个 fd 在繁忙主机上
+    # 可能耗秒级, 不能放进每次服务操作的常路径)。
+    legacy_fresh=0
+    [ -e "$legacy_lockf" ] || [ -e "$legacy_fallback_dir" ] || legacy_fresh=1
     # 已是持锁状态(嵌套调用) ⇒ 直接跑, 不再重复加锁。
     # 嵌套判定必须放在 `$DEPLOY_DIR` 存在性检查**之前**: 卸载主体(持锁中)会走到
     # `rm -rf "$DEPLOY_DIR"`, 之后仍可能有嵌套调用(收尾/提示), 那些调用不该因为目录已被
@@ -788,7 +794,8 @@ _with_core_lock() {
             _xray_core_lock_fd_reset
             return 1
         fi
-        if declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
+        if [ "$legacy_fresh" -eq 1 ] && \
+           declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
            _xray_legacy_deleted_tree_active "$deploy_path"; then
             _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝获取旧版核心锁: $deploy_path"
             _xray_core_lock_fd_reset
@@ -807,7 +814,8 @@ _with_core_lock() {
             _xray_core_lock_fd_reset
             return 1
         fi
-        if declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
+        if [ "$legacy_fresh" -eq 1 ] && \
+           declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
            _xray_legacy_deleted_tree_active "$deploy_path"; then
             _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝进入核心事务: $deploy_path"
             _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
@@ -852,7 +860,8 @@ _with_core_lock() {
         rmdir "$fallback_dir" 2>/dev/null
         return 1
     fi
-    if declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
+    if [ "$legacy_fresh" -eq 1 ] && \
+       declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
        _xray_legacy_deleted_tree_active "$deploy_path"; then
         _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝获取旧版核心锁: $deploy_path"
         rm -f "$fallback_dir/pid" 2>/dev/null
@@ -886,7 +895,7 @@ _with_core_lock() {
 # flock 文件和 mkdir 退路必须与 install.sh 的路径/语义保持一致(含旧版锁路径协调)。
 _with_deploy_install_lock() {
     local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lock_dir lock_file
-    local legacy_lock_file legacy_lock_dir DEPLOY_INSTALL_LOCK_FD="" i locked=0 owner tmp rc
+    local legacy_lock_file legacy_lock_dir legacy_fresh=0 DEPLOY_INSTALL_LOCK_FD="" i locked=0 owner tmp rc
     local XD_INSTALL_LEGACY_FLOCK_FD="" XD_INSTALL_LEGACY_DIR=""
     case "$deploy_path" in
         /*) ;;
@@ -903,6 +912,8 @@ _with_deploy_install_lock() {
     lock_file="${lock_dir}.fd"
     legacy_lock_file="$deploy_path/.install.lock.fd"
     legacy_lock_dir="$deploy_path/.install.lock"
+    # 同 `_with_core_lock`: 仅在旧锁路径不存在(本次新建 inode)时才需要 /proc 扫描。
+    [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ] || legacy_fresh=1
     if [ "${XRAY_DEPLOY_INSTALL_LOCK_HELD:-0}" = "1" ]; then
         "$@"
         return $?
@@ -937,7 +948,8 @@ _with_deploy_install_lock() {
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
-        if declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
+        if [ "$legacy_fresh" -eq 1 ] && \
+           declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
            _xray_legacy_deleted_tree_active "$deploy_path"; then
             _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝获取旧版安装锁: $deploy_path"
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
@@ -958,7 +970,8 @@ _with_deploy_install_lock() {
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
-        if declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
+        if [ "$legacy_fresh" -eq 1 ] && \
+           declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
            _xray_legacy_deleted_tree_active "$deploy_path"; then
             _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝进入安装/卸载事务: $deploy_path"
             _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
@@ -993,7 +1006,8 @@ _with_deploy_install_lock() {
                 rmdir "$lock_dir" 2>/dev/null
                 return 1
             fi
-            if declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
+            if [ "$legacy_fresh" -eq 1 ] && \
+               declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
                _xray_legacy_deleted_tree_active "$deploy_path"; then
                 _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝获取旧版安装锁: $deploy_path"
                 rm -f "$lock_dir/pid" 2>/dev/null

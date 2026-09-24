@@ -852,11 +852,23 @@ _reset_config_locked() {
     fi
     # hop 清理会删除 iptables 规则, 属于"真实状态改动": 候选 spec 必须先写进账本,
     # 崩溃时由启动恢复回补(见 `_reset_config_replay_hop_specs_locked`)。
-    local specs_json="[]" hop_specs=""
+    # **恢复源获取失败一律 fail-closed**(二十一轮 P1-1): 存在真实 hop 节点却枚举不出 spec 时
+    # 继续清理, 崩溃后会留下"metadata 有 hop / runtime 无 hop"且无账本可回补 —— 恰恰是本轮
+    # 要消灭的分裂。空数组只允许出现在"确实没有会被删除的节点"时(helper 返回 0 且输出为空)。
+    local specs_json="[]" hop_specs="" cand_rc=0
     if declare -F _hy2_hop_cleanup_candidates >/dev/null 2>&1; then
-        hop_specs=$(_hy2_hop_cleanup_candidates 2>/dev/null || true)
+        hop_specs=$(_hy2_hop_cleanup_candidates 2>/dev/null) || cand_rc=$?
+        if [ "$cand_rc" -ne 0 ]; then
+            _error "无法枚举待清理的端口跳跃规则(恢复源获取失败), 已取消重置以保护 metadata/runtime 一致性"
+            rm -rf "$snapshot" 2>/dev/null
+            return 1
+        fi
         if [ -n "$hop_specs" ]; then
-            specs_json=$(printf '%s\n' "$hop_specs" | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null) || specs_json="[]"
+            if ! specs_json=$(printf '%s\n' "$hop_specs" | jq -R -s 'split("\n") | map(select(length > 0)) | unique' 2>/dev/null); then
+                _error "无法序列化端口跳跃恢复源, 已取消重置以保护 metadata/runtime 一致性"
+                rm -rf "$snapshot" 2>/dev/null
+                return 1
+            fi
         fi
     fi
     if ! _reset_journal_write "$journal" "$snapshot" "prepared" "$had_json" "$specs_json"; then

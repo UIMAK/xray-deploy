@@ -1455,11 +1455,29 @@ _hy2_list_all_hop_rules() {
 
 # 打印"当前会被 `_hy2_cleanup_all_hops` 删除"的 IPv4 规则 spec(每行一个, `-A PREROUTING ...`)。
 # 单一来源: 清理函数用它做失败回滚的 `saved` 集合, reset 用它把恢复源写进 journal,
-# 两处不得各自再写一份(否则必然漂移)。只读; iptables 不可用/查询失败时输出空并返回 1。
+# 两处不得各自再写一份(否则必然漂移)。
+# **契约(二十一轮 P1-1)**: `0` = 已枚举(可能为空 —— 没有任何会被删除的节点时不必碰 iptables);
+# `1` = **存在**会被删除的 hop 节点却无法枚举(缺 iptables / `-S` 失败)。调用方在拿到 1 时
+# 必须 fail-closed: 恢复源建不起来就绝不允许继续删除 runtime 状态。
 _hy2_hop_cleanup_candidates() {
-    command -v iptables >/dev/null 2>&1 || return 1
     [ -d "$NODES_DIR" ] || return 0
-    local q f proto port ranges
+    local f proto port ranges any=0
+    # 先判"是否真有会被删除的节点": 没有 hop 的机器不因 iptables 缺失而阻塞 reset/uninstall。
+    # 谓词与下面清理循环一致(protocol=hysteria2 + 非空 ranges + 非空 port)。
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        port=$(jq -r '.port' "$f" 2>/dev/null)
+        [ -n "$port" ] || continue
+        ranges=$(_read_hop_ranges "$f")
+        [ -n "$ranges" ] || continue
+        any=1
+        break
+    done
+    [ "$any" -eq 1 ] || return 0
+    command -v iptables >/dev/null 2>&1 || return 1
+    local q
     q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
@@ -1476,6 +1494,8 @@ _hy2_hop_cleanup_candidates() {
 }
 
 # 恢复被删除的 IPv4 规则: **只补当前不存在的 spec**, 已存在的不重复添加。0=全部就位; 1=有失败。
+# 每次成功添加后刷新规则快照(二十一轮 P2): 否则重复的 spec 在第二次判定时仍被当作"不存在"
+# 而重复执行 `-A`; 刷新后重复项自然被跳过。
 _hy2_restore_hop_rules() {
     local q line ok=0
     [ "$#" -gt 0 ] || return 0
@@ -1486,12 +1506,19 @@ _hy2_restore_hop_rules() {
         printf '%s\n' "$q" | grep -qF -- "$line" && continue
         # spec 来自 `iptables -S`(`-A PREROUTING ...`, 无引号空白), 直接作为命令回放。
         # shellcheck disable=SC2086
-        iptables -t nat $line 2>/dev/null || ok=1
+        if iptables -t nat $line 2>/dev/null; then
+            q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
+        else
+            ok=1
+        fi
     done
     return "$ok"
 }
 
-# 回滚 + 重新持久化。0=规则已全部恢复(或无需恢复); 1=恢复不完整, 调用方必须如实报告并保留现场。
+# 回滚 + 重新持久化。0=规则已恢复**且**持久化已刷新; 1=回滚未完整收敛, 调用方必须保留现场。
+# **持久化失败不是 warning 而是失败**(二十一轮 P1-2): IPv4 持久化在本项目是 authoritative,
+# "runtime 恢复但磁盘仍是删除后状态"会在重启后再次丢失规则; 返回 0 会让 reset/恢复把
+# journal 删掉, 从此失去唯一的恢复源。返回 1 时 journal 会保留, 下次启动继续重试。
 _hy2_restore_hop_rules_checked() {
     [ "$#" -gt 0 ] || return 0
     if ! _hy2_restore_hop_rules "$@"; then
@@ -1499,7 +1526,8 @@ _hy2_restore_hop_rules_checked() {
         return 1
     fi
     if ! _hy2_persist_iptables; then
-        _warn "端口跳跃规则已恢复, 但持久化刷新失败: 重启后规则可能丢失"
+        _error "端口跳跃规则已恢复到 runtime, 但持久化刷新失败: 重启后状态可能不一致, 现场已保留待重试"
+        return 1
     fi
     return 0
 }
@@ -1525,10 +1553,15 @@ _hy2_cleanup_all_hops() {
         return 1
     fi
     if command -v iptables >/dev/null 2>&1 && [ -d "$NODES_DIR" ]; then
-        local _cand
+        local _cand_all _cand
+        # 恢复源建不起来就绝不动 runtime(否则失败后无法回补, 直接造成 metadata/runtime 分裂)。
+        if ! _cand_all=$(_hy2_hop_cleanup_candidates 2>/dev/null); then
+            _error "无法枚举待清理的端口跳跃规则(恢复源获取失败), 已中止清理以避免 metadata/runtime 分裂"
+            return 1
+        fi
         while IFS= read -r _cand; do
             [ -n "$_cand" ] && saved+=("$_cand")
-        done <<< "$(_hy2_hop_cleanup_candidates 2>/dev/null || true)"
+        done <<< "$_cand_all"
         for f in "$NODES_DIR"/*.json; do
             [ -f "$f" ] || continue
             local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
@@ -1559,6 +1592,8 @@ _hy2_cleanup_all_hops() {
             _error "端口跳跃清理未完成, 正在回滚本次已删除的规则, 使 metadata 与 runtime 保持一致..."
             if _hy2_restore_hop_rules_checked "${saved[@]}"; then
                 _error "已回滚到清理前状态; 节点数据保留, 请处理后重试"
+            else
+                _error "回滚未完整收敛(见上), 请手动检查 iptables 与持久化文件后重试"
             fi
         else
             _error "端口跳跃规则清理未完成, 请手动检查 iptables -t nat -S PREROUTING"
