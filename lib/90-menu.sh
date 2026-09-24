@@ -742,10 +742,14 @@ _reset_config_abort_locked() {   # <stage> <nodes_moved> <clash_moved> <had_conf
 }
 
 # 运行态已收敛后的收尾: 先 durable 记 runtime_verified, 再清快照与账本。
-# 快照清理失败只告警并保留 runtime_verified 账本(下次启动只需再清一次, 不再回滚/重启)。
+# **runtime_verified 落盘失败时必须中止清理并返回 1**(二十七轮 P1): 它是"清理之前必须先 durable"
+# 的检查点 —— 写不进去就继续 rm 快照/账本, 等于把最后的恢复证据毁掉, 协议自相矛盾。此时磁盘上
+# 仍是 committed 账本, 下次启动会重跑一次(幂等)restart+收敛并重试写入。快照清理失败则保留
+# runtime_verified 账本(下次只需继续清理)。
 _reset_config_commit_finish_locked() {   # <journal> <snapshot> <had_json> <specs_json>
     if ! _reset_journal_write "$1" "$2" "runtime_verified" "$3" "$4"; then
-        _warn "运行态已收敛, 但 runtime_verified 账本写入失败; 下次启动会重复一次收敛(无害)"
+        _warn "运行态已收敛, 但 runtime_verified 账本写入失败; 已保留 committed 账本与快照, 下次启动重试收敛"
+        return 1
     fi
     if ! rm -rf "$2" 2>/dev/null || [ -e "$2" ]; then
         _warn "重置已应用且运行态已收敛, 但旧快照清理失败(下次启动会重试): $2"
@@ -825,10 +829,12 @@ _reset_config_recover_locked() {
                 _info "上次 reset 的运行态已收敛(已按已提交配置重启)"
             fi
         fi
-        # 收敛后写 runtime_verified 再清理; 清理失败保留账本, 下次只需继续清理。
-        if _reset_config_commit_finish_locked "$journal" "$snapshot" "$had_json2" "$specs_json2"; then
-            [ "$phase" = "runtime_verified" ] && _info "上次 reset 已收敛, 已清理残留快照"
+        # 收敛后写 runtime_verified 再清理; 写入或清理失败都保留账本供下次重试。
+        if ! _reset_config_commit_finish_locked "$journal" "$snapshot" "$had_json2" "$specs_json2"; then
+            _warn "reset 收尾未完成(runtime_verified 写入失败), 账本与快照保留: $journal"
+            return 1
         fi
+        [ "$phase" = "runtime_verified" ] && _info "上次 reset 已收敛, 已清理残留快照"
         return 0
     fi
     # (1) 先回补本次 reset 已删除的端口跳跃规则(幂等; 失败保留现场下次重试)。
@@ -985,7 +991,11 @@ _reset_config_locked() {
         fi
         _tip "xray 已使用新配置重启"
     fi
-    _reset_config_commit_finish_locked "$journal" "$snapshot" "$had_json" "$specs_json"
+    if ! _reset_config_commit_finish_locked "$journal" "$snapshot" "$had_json" "$specs_json"; then
+        # 运行态已收敛但账本未能推进: 保留 committed 账本与快照, 下次启动幂等重试。
+        _warn "重置已应用且运行态已收敛, 但事务收尾未完成(runtime_verified 写入失败); 现场已保留"
+        return 1
+    fi
     _success "config.json 已重置(含 routing 规则), 节点已清空"
 }
 
