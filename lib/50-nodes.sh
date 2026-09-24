@@ -5232,6 +5232,11 @@ _view_nodes() {
 # ---------------------------------------------------------------------------
 # 删除节点
 # ---------------------------------------------------------------------------
+# 删除节点: 交互选择/确认在锁外; **破坏性阶段(iptables teardown + config + metadata/YAML)
+# 整体进入 `_with_config_lock`(二十九轮 P1)**。旧写法先删 DNAT 规则、之后才取 config lock:
+# 与 reset/并发删除竞态时 runtime 先被改而恢复源后录, reset 回滚可能重建出
+# "metadata 有 hop / runtime 无 hop" 的分裂, 且完全绕过 reset journal 的保护。
+# 三个 apply 函数在锁内执行, 只返回状态(不等待按键), 交互提示由本函数在锁外统一处理。
 _delete_node() {
     clear
     local count; count=$(_node_count)
@@ -5259,75 +5264,11 @@ _delete_node() {
             y|Y) ;;
             *) _info "已取消"; _press_any_key; return ;;
         esac
-        # R17: 先清理所有端口跳跃 iptables 规则(teardown 事务)
-        # R33(P1): 无条件调用 teardown_all——iptables 不可用但存在 hop 规则时由其内部 fail-closed
-        # (不能因 command -v iptables 为假就跳过, 否则删 config/metadata 后留下孤儿 DNAT)
-        # R38(P1): teardown_all 现在逐项判定, 无法安全清理的节点进 _HY2_HOP_SKIP 并被保留,
-        # 不再因一个损坏节点让"全部删除"整体不可用。
-        if ! _hy2_hop_teardown_all "${tags[@]}"; then
-            _error "所有节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
-            _press_any_key; return
-        fi
-        _hy2_filter_skipped "${tags[@]}"
-        local del_all=("${_HY2_DEL_KEEP[@]}")
-        if [ ${#del_all[@]} -eq 0 ]; then
-            _error "没有可安全删除的节点"
-            _press_any_key; return
-        fi
-        # 自签证书: 只对 metadata 声明 self_signed=true 的节点提示(自定义证书不提示、不删除),
-        # 且在节点删除**成功后**才落地删除
-        _hy2_ask_purge_self_certs "${del_all[@]}"
-        # 无排除项: 沿用原语义(清空 inbounds, 连手工添加的入站一并清掉)
-        # 有排除项: 只删可安全删除的 tag(含其 tunnel_tag), 保留被排除节点的入站
-        # (M2 同口径: 非对象规则元素保留, 避免 jq 整体报错)
-        local all_filter='.inbounds = [] | .routing.rules |= map(select((type != "object") or .inboundTag == null or ((.inboundTag | type) == "array" and (.inboundTag | length) == 0)))'
-        local all_ok=0
-        if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ]; then
-            _mutate_config "$all_filter" && all_ok=1
-        else
-            local keep_tags=() kt ktt
-            for kt in "${del_all[@]}"; do
-                keep_tags+=("$kt")
-                ktt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${kt}.json" 2>/dev/null)
-                [ -n "$ktt" ] && keep_tags+=("$ktt")
-            done
-            local rm_json
-            rm_json=$(printf '%s\n' "${keep_tags[@]}" | jq -R . | jq -c -s .) || rm_json=""
-            if [ -z "$rm_json" ]; then
-                _error "生成移除集合失败"
-                _hy2_hop_restore_after_teardown
-                _press_any_key; return
-            fi
-            _mutate_config --argjson rm "$rm_json" \
-                '.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
-                 | .routing.rules |= map(select((type != "object") or .inboundTag == null
-                       or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))' && all_ok=1
-        fi
-        if [ "$all_ok" -eq 1 ]; then
-            for tag in "${del_all[@]}"; do
-                # R38(P1): 先删 metadata 再删 YAML 会读不到 name; 但 YAML 删除失败不阻断,
-                # 顺序仍是"先 YAML(读 json 的 name) 后 json"
-                _remove_node_from_yaml_by_tag "$tag" || \
-                    _warn "Clash YAML 同步删除失败($tag), 可手工编辑 ${CLASH_YAML} 清除该行"
-                rm -f "$NODES_DIR/${tag}.json"
-            done
-            # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
-            _HY2_HOP_TD=()
-            # 仅在"确实全删干净"时才截断 clash.yaml; 有保留节点时不能清空
-            if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ] && [ -f "$CLASH_YAML" ]; then
-                printf 'proxies:\n' > "$CLASH_YAML"
-            fi
-            _success "已删除 ${#del_all[@]} 个节点"
-            _hy2_purge_self_certs
-        else
-            # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
-            _hy2_hop_restore_after_teardown
-            _error "删除失败, 已回滚"
-        fi
+        _with_config_lock _delete_node_apply_all "${tags[@]}"
         _press_any_key; return
     fi
 
-    # 多选删除:逗号分隔(如 1,3,5)
+    # 多选删除:逗号分隔(如1,3,5)
     if [[ "$choice" == *","* ]]; then
         IFS=',' read -ra nums <<< "$choice"
         local del_tags=()
@@ -5352,58 +5293,7 @@ _delete_node() {
         read -rp "  继续? [y/N]: " ans
         case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; return ;; esac
 
-        # R17: 先清理端口跳跃 iptables 规则(teardown 事务)
-        # R33(P1): 无条件调用 teardown_all——iptables 不可用但存在 hop 规则时由其内部 fail-closed
-        # R38(P1): 逐项判定, 无法安全清理的节点被排除而不是整批取消; 删除集合(含 tunnel_tag)
-        # 必须在 teardown 之后按剩余项重算, 否则会把被排除节点的入站一起删掉。
-        if ! _hy2_hop_teardown_all "${del_tags[@]}"; then
-            _error "所选节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
-            _press_any_key; return
-        fi
-        _hy2_filter_skipped "${del_tags[@]}"
-        del_tags=("${_HY2_DEL_KEEP[@]}")
-        if [ ${#del_tags[@]} -eq 0 ]; then
-            _error "没有可安全删除的节点"
-            _press_any_key; return
-        fi
-        _hy2_ask_purge_self_certs "${del_tags[@]}"
-        local del_ttags=()
-        for dt in "${del_tags[@]}"; do
-            local dtt; dtt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${dt}.json" 2>/dev/null)
-            [ -n "$dtt" ] && del_ttags+=("$dtt")
-        done
-
-        local tun_json='[]'
-        [ ${#del_ttags[@]} -gt 0 ] && tun_json=$(printf '%s\n' "${del_ttags[@]}" | jq -R . | jq -s .)
-        local all_json; all_json=$(printf '%s\n' "${del_tags[@]}" "${del_ttags[@]}" | jq -R . | jq -s .)
-
-        # M2 同口径: type 守卫防止非对象规则/入站元素让 jq 整体报错。
-        # tag 同样需 as 绑定后再 index(index 参数以 $all_tags 为输入求值, 见 _remove_orphan_inbounds 注)
-        local jq_multi='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($all_tags | index($tg)) == null)))'
-        if [ ${#del_ttags[@]} -gt 0 ]; then
-            jq_multi="$jq_multi | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag as \$it | \$tun_tags | index(\$it)) == null)))"
-        fi
-
-        if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
-            # R19: 消费 YAML 删除返回值, 失败则累计并显式告警(不静默; clash.yaml 属派生导出)
-            local yaml_fail=0
-            for dt in "${del_tags[@]}"; do
-                # R18: 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
-                _remove_node_from_yaml_by_tag "$dt" || yaml_fail=1
-                rm -f "$NODES_DIR/${dt}.json"
-            done
-            # R38(P1): 不再指向不存在的"重新生成 Clash 配置"功能, 给出真实可执行的路径
-            [ "$yaml_fail" -eq 1 ] && \
-                _warn "部分节点 Clash YAML 同步删除失败, 已从 Xray 删除; 可手工编辑 ${CLASH_YAML} 删除对应行"
-            # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
-            _HY2_HOP_TD=()
-            _success "已删除 ${#del_tags[@]} 个节点"
-            _hy2_purge_self_certs
-        else
-            # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
-            _hy2_hop_restore_after_teardown
-            _error "删除失败, 已回滚"
-        fi
+        _with_config_lock _delete_node_apply_multi "${del_tags[@]}"
         _press_any_key; return
     fi
 
@@ -5411,6 +5301,137 @@ _delete_node() {
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
+    _with_config_lock _delete_node_apply_single "$tag"
+    _press_any_key
+}
+
+# 破坏性阶段(调用方必须已持 config lock)。返回 0=已提交, 1=失败/取消(原因已打印)。
+# **绝不在此等待按键**(避免持锁阻塞在其他交互路径上)。
+_delete_node_apply_all() {
+    local tags=("$@") tag
+    # R17: 先清理所有端口跳跃 iptables 规则(teardown 事务)
+    # R33(P1): 无条件调用 teardown_all——iptables 不可用但存在 hop 规则时由其内部 fail-closed
+    # (不能因 command -v iptables 为假就跳过, 否则删 config/metadata 后留下孤儿 DNAT)
+    # R38(P1): teardown_all 逐项判定, 无法安全清理的节点进 _HY2_HOP_SKIP 并被保留。
+    if ! _hy2_hop_teardown_all "${tags[@]}"; then
+        _error "所有节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
+        return 1
+    fi
+    _hy2_filter_skipped "${tags[@]}"
+    local del_all=("${_HY2_DEL_KEEP[@]}")
+    if [ ${#del_all[@]} -eq 0 ]; then
+        _error "没有可安全删除的节点"
+        return 1
+    fi
+    # 自签证书: 只对 metadata 声明 self_signed=true 的节点提示(自定义证书不提示、不删除),
+    # 且在节点删除**成功后**才落地删除
+    _hy2_ask_purge_self_certs "${del_all[@]}"
+    # 无排除项: 沿用原语义(清空 inbounds, 连手工添加的入站一并清掉)
+    # 有排除项: 只删可安全删除的 tag(含其 tunnel_tag), 保留被排除节点的入站
+    # (M2 同口径: 非对象规则元素保留, 避免 jq 整体报错)
+    local all_filter='.inbounds = [] | .routing.rules |= map(select((type != "object") or .inboundTag == null or ((.inboundTag | type) == "array" and (.inboundTag | length) == 0)))'
+    local all_ok=0
+    if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ]; then
+        _mutate_config "$all_filter" && all_ok=1
+    else
+        local keep_tags=() kt ktt
+        for kt in "${del_all[@]}"; do
+            keep_tags+=("$kt")
+            ktt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${kt}.json" 2>/dev/null)
+            [ -n "$ktt" ] && keep_tags+=("$ktt")
+        done
+        local rm_json
+        rm_json=$(printf '%s\n' "${keep_tags[@]}" | jq -R . | jq -c -s .) || rm_json=""
+        if [ -z "$rm_json" ]; then
+            _error "生成移除集合失败"
+            _hy2_hop_restore_after_teardown
+            return 1
+        fi
+        _mutate_config --argjson rm "$rm_json" \
+            '.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
+             | .routing.rules |= map(select((type != "object") or .inboundTag == null
+                   or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))' && all_ok=1
+    fi
+    if [ "$all_ok" -eq 1 ]; then
+        for tag in "${del_all[@]}"; do
+            # R38(P1): 先删 metadata 再删 YAML 会读不到 name; 但 YAML 删除失败不阻断,
+            # 顺序仍是"先 YAML(读 json 的 name) 后 json"
+            _remove_node_from_yaml_by_tag "$tag" || \
+                _warn "Clash YAML 同步删除失败($tag), 可手工编辑 ${CLASH_YAML} 清除该行"
+            rm -f "$NODES_DIR/${tag}.json"
+        done
+        # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
+        _HY2_HOP_TD=()
+        # 仅在"确实全删干净"时才截断 clash.yaml; 有保留节点时不能清空
+        if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ] && [ -f "$CLASH_YAML" ]; then
+            printf 'proxies:\n' > "$CLASH_YAML"
+        fi
+        _success "已删除 ${#del_all[@]} 个节点"
+        _hy2_purge_self_certs
+        return 0
+    fi
+    # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
+    _hy2_hop_restore_after_teardown
+    _error "删除失败, 已回滚"
+    return 1
+}
+
+_delete_node_apply_multi() {
+    local del_tags=("$@") dt
+    # R17/R33(P1)/R38(P1): 同 _delete_node_apply_all —— teardown 在锁内, 逐项判定。
+    if ! _hy2_hop_teardown_all "${del_tags[@]}"; then
+        _error "所选节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
+        return 1
+    fi
+    _hy2_filter_skipped "${del_tags[@]}"
+    del_tags=("${_HY2_DEL_KEEP[@]}")
+    if [ ${#del_tags[@]} -eq 0 ]; then
+        _error "没有可安全删除的节点"
+        return 1
+    fi
+    _hy2_ask_purge_self_certs "${del_tags[@]}"
+    local del_ttags=() dtt
+    for dt in "${del_tags[@]}"; do
+        dtt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${dt}.json" 2>/dev/null)
+        [ -n "$dtt" ] && del_ttags+=("$dtt")
+    done
+
+    local tun_json='[]'
+    [ ${#del_ttags[@]} -gt 0 ] && tun_json=$(printf '%s\n' "${del_ttags[@]}" | jq -R . | jq -s .)
+    local all_json; all_json=$(printf '%s\n' "${del_tags[@]}" "${del_ttags[@]}" | jq -R . | jq -s .)
+
+    # M2 同口径: type 守卫防止非对象规则/入站元素让 jq 整体报错。
+    # tag 同样需 as 绑定后再 index(index 参数以 $all_tags 为输入求值, 见 _remove_orphan_inbounds 注)
+    local jq_multi='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($all_tags | index($tg)) == null)))'
+    if [ ${#del_ttags[@]} -gt 0 ]; then
+        jq_multi="$jq_multi | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag as \$it | \$tun_tags | index(\$it)) == null)))"
+    fi
+
+    if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
+        # R19: 消费 YAML 删除返回值, 失败则累计并显式告警(不静默; clash.yaml 属派生导出)
+        local yaml_fail=0
+        for dt in "${del_tags[@]}"; do
+            # R18: 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
+            _remove_node_from_yaml_by_tag "$dt" || yaml_fail=1
+            rm -f "$NODES_DIR/${dt}.json"
+        done
+        # R38(P1): 不再指向不存在的"重新生成 Clash 配置"功能, 给出真实可执行的路径
+        [ "$yaml_fail" -eq 1 ] && \
+            _warn "部分节点 Clash YAML 同步删除失败, 已从 Xray 删除; 可手工编辑 ${CLASH_YAML} 删除对应行"
+        # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
+        _HY2_HOP_TD=()
+        _success "已删除 ${#del_tags[@]} 个节点"
+        _hy2_purge_self_certs
+        return 0
+    fi
+    # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
+    _hy2_hop_restore_after_teardown
+    _error "删除失败, 已回滚"
+    return 1
+}
+
+_delete_node_apply_single() {
+    local tag="$1"
     # 读取 tunnel_tag, 一次性删除 tunnel + reality + 路由(原子操作)
     # M2 同口径: type 守卫防止非对象入站/规则元素让 jq 整体报错(手改 config 时删除被拒绝服务)
     local tunnel_tag
@@ -5420,31 +5441,28 @@ _delete_node() {
         jq_filter="$jq_filter | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag | index(\$tg)) == null)))
             | .inbounds |= map(select((type != \"object\") or ((.tag // \"\") != \$tg)))"
     fi
-    # R17: 先清理端口跳跃规则(teardown 事务; 失败则取消删除, 节点整体保持原状)
-    # R30(P1): fail-closed——metadata 损坏/缺 protocol 不能当"非 HY2"跳过 teardown,
-    # 否则删节点后 hop DNAT 永久残留(孤儿防火墙规则)
+    # R17/R30(P1)/R31(P1): hop 校验与 teardown 都在锁内完成; 任一失败即取消删除, 节点保持原状。
     local proto hop_port ranges=""
     if ! proto=$(_node_protocol_safe "$tag"); then
-        _press_any_key; return
+        return 1
     fi
     if [ "$proto" = "hysteria2" ]; then
-        # R31(P1): hop 范围字段存在但无法解析 → 拒绝删除(不当作"无 hop"跳过 teardown)
-        _hy2_hop_meta_ok "$tag" || { _press_any_key; return; }
+        _hy2_hop_meta_ok "$tag" || return 1
         ranges=$(_read_hop_ranges "$NODES_DIR/${tag}.json")
         if [ -n "$ranges" ]; then
             # R33(P1): 存在 hop 规则但 iptables 不可用 → 无法安全删除(否则删 config/metadata
             # 留孤儿 DNAT, 且 metadata 已删后无法追溯 dport 归属)
             if ! command -v iptables >/dev/null 2>&1; then
                 _error "节点存在端口跳跃规则, 但 iptables 不可用, 无法安全删除: $tag"
-                _press_any_key; return
+                return 1
             fi
             if ! hop_port=$(jq -r '.port // empty' "$NODES_DIR/${tag}.json" 2>/dev/null); then
                 _error "节点元数据损坏, 无法确认端口: $tag"
-                _press_any_key; return
+                return 1
             fi
             [[ "$hop_port" =~ ^[0-9]+$ ]] || {
                 _error "节点元数据损坏(端口无效): $tag"
-                _press_any_key; return
+                return 1
             }
             # R31(P1): metadata.port 必须与 config 真实监听端口一致——否则 teardown 用错误目标
             # 端口找不到(或误删)DNAT 规则, 留下 :<真实端口> 的孤儿规则。
@@ -5454,13 +5472,13 @@ _delete_node() {
             cfg_port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' "$CONFIG_FILE" 2>/dev/null)
             if [ -n "$cfg_port" ] && [ "$cfg_port" != "$hop_port" ]; then
                 _error "节点元数据端口($hop_port)与 config 监听端口($cfg_port)不一致, 无法安全删除: $tag"
-                _press_any_key; return
+                return 1
             fi
             _info "清理端口跳跃规则..."
             # shellcheck disable=SC2086
             if ! _hy2_hop_teardown "$hop_port" $ranges; then
                 _error "端口跳跃规则清理失败, 已取消删除(节点未动)"
-                _press_any_key; return
+                return 1
             fi
         fi
     fi
@@ -5477,19 +5495,19 @@ _delete_node() {
         _HY2_HOP_TD=()
         _success "节点已删除"
         _hy2_purge_self_certs
-    else
-        # config 提交失败(已回滚): 恢复已清理的 hop 规则
-        # R38(P1): 原写法 `[ -n "$ranges" ] && A || _error` 在 ranges 为空时(任何非 hy2 /
-        # 无 hop 的节点)必然执行 _error, 于是删除普通 VLESS 节点失败时会额外报一条
-        # "恢复端口跳跃规则失败, 请手动检查 iptables" —— 用户会去翻根本不存在的规则。
-        if [ -n "$ranges" ]; then
-            # shellcheck disable=SC2086
-            _hy2_hop_reverse remove "$hop_port" $ranges 2>/dev/null || \
-                _error "恢复端口跳跃规则失败, 请手动检查 iptables"
-        fi
-        _error "删除失败, 已回滚"
+        return 0
     fi
-    _press_any_key
+    # config 提交失败(已回滚): 恢复已清理的 hop 规则
+    # R38(P1): 原写法 `[ -n "$ranges" ] && A || _error` 在 ranges 为空时(任何非 hy2 /
+    # 无 hop 的节点)必然执行 _error, 于是删除普通 VLESS 节点失败时会额外报一条
+    # "恢复端口跳跃规则失败, 请手动检查 iptables" —— 用户会去翻根本不存在的规则。
+    if [ -n "$ranges" ]; then
+        # shellcheck disable=SC2086
+        _hy2_hop_reverse remove "$hop_port" $ranges 2>/dev/null || \
+            _error "恢复端口跳跃规则失败, 请手动检查 iptables"
+    fi
+    _error "删除失败, 已回滚"
+    return 1
 }
 
 # 改端口的 Reality 事务(R41)。**整个事务在 _with_config_lock 内** —— 与 _port_txn /
