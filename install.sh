@@ -622,6 +622,11 @@ INSTALL_LOCK_FILE="${INSTALL_LOCK_DIR}.fd"
 # 重建旧路径, 新版无从协调 —— 旧版只认目录内的路径, 新版不能为一个已卸载的目录保留占位。
 INSTALL_LEGACY_LOCK_FILE="$DEPLOY_DIR/.install.lock.fd"
 INSTALL_LEGACY_LOCK_DIR="$DEPLOY_DIR/.install.lock"
+# 旧锁路径**尚不存在**(本次将新建 inode)时才需要 /proc 扫描: 旧持有者的锁文件若随整棵树
+# 被删除, 我们在同一路径重建的是新 inode, 与旧 fd 不互斥。路径已存在时打开的正是旧 inode,
+# 后续 flock/inode 复核足以覆盖 —— 且逐 fd 扫描在繁忙主机上可能耗秒级, 不能放进常路径。
+INSTALL_LEGACY_FRESH=0
+[ -e "$INSTALL_LEGACY_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY_LOCK_DIR" ] || INSTALL_LEGACY_FRESH=1
 INSTALL_LOCK_HELD=0
 INSTALL_LOCK_FD=""
 INSTALL_LEGACY_LOCK_FD=""
@@ -786,7 +791,7 @@ _install_lock_acquire() {
                 _install_lock_release
                 return 1
             fi
-            if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+            if [ "${INSTALL_LEGACY_FRESH:-1}" -eq 1 ] && _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
                 echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
                 _install_lock_release
                 return 1
@@ -820,7 +825,7 @@ _install_lock_acquire() {
                 _install_lock_release
                 return 1
             fi
-            if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+            if [ "${INSTALL_LEGACY_FRESH:-1}" -eq 1 ] && _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
                 echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
                 _install_lock_release
                 return 1
@@ -842,7 +847,7 @@ _install_lock_acquire() {
         _install_lock_release
         return 1
     fi
-    if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+    if [ "${INSTALL_LEGACY_FRESH:-1}" -eq 1 ] && _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
         echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
         _install_lock_release
         return 1
