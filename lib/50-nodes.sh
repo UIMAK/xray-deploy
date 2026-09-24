@@ -698,29 +698,50 @@ _hy2_iptables_persist_files() {
 #      不含 "nat"(文件不存在同样说明 x_tables 未被使用) => 内核里不可能有 nat 规则;
 #   c) 上面能确认无 runtime 规则后, 再看持久化文件(它们会在重启时被重新加载)。
 # 任一通道都无法确认 => 返回 1(UNKNOWN, 按不安全处理), 由调用方拒绝并给出人工路径。
+# IPv6 NAT 统一观察口径(二十八轮 P2): remove / candidates / no_hop_rules_at_all 三个观察点
+# 共用同一判定, 避免下一个观察点再次漂移。**只走 stdout(三态)**, 调用方各自决定文案与动作:
+#   ip6tables = ip6tables 可用, 调用方必须自己查询(查询失败即 UNKNOWN)
+#   absent    = 无 ip6tables、无 nft, 且内核 ip6 x_tables 从未注册 nat 表 ⇒ 可证明无 IPv6 NAT
+#   unknown   = 无法证明(存在 nft / 注册了 nat 表 / 注册表读不到) ⇒ 调用方必须 fail-closed
+# `unknown` 的第二词是原因(nft|proc_nat|proc_unreadable), 仅供调用方给准确文案, 不参与判定。
+_hy2_ipv6_state() {
+    local q
+    if command -v ip6tables >/dev/null 2>&1; then
+        printf 'ip6tables\n'; return 0
+    fi
+    # xtables-nft 下 IPv6 NAT 规则进入 nf_tables, 只查 x_tables 注册表不足以证明不存在。
+    if command -v nft >/dev/null 2>&1; then
+        printf 'unknown nft\n'; return 0
+    fi
+    if [ -e /proc/net/ip6_tables_names ]; then
+        if ! q=$(cat /proc/net/ip6_tables_names 2>/dev/null); then
+            printf 'unknown proc_unreadable\n'; return 0
+        fi
+        printf '%s\n' "$q" | grep -qx "nat" && { printf 'unknown proc_nat\n'; return 0; }
+    fi
+    printf 'absent\n'; return 0
+}
+
 # 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
 _hy2_no_hop_rules_at_all() {
     local q f runtime_clean=0 persist_files persist_rc
     if command -v iptables >/dev/null 2>&1; then
         q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
         printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
-        # IPv6 侧: 命令存在但查询失败时无法确认, 保守判 UNKNOWN
-        if command -v ip6tables >/dev/null 2>&1; then
-            q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
-            printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
-        elif command -v nft >/dev/null 2>&1; then
-            # ip6tables 缺失但存在 nft: IPv6 NAT 可能在 nf_tables 中, 无法观察 ⇒ UNKNOWN。
-            _warn "ip6tables 不可用但检测到 nft, 无法确认是否存在 IPv6 跳跃规则"
-            return 1
-        elif [ -e /proc/net/ip6_tables_names ]; then
-            # ip6tables 二进制不在, 但内核可能仍有历史 IPv6 nat 规则: 与 IPv4 的无
-            # iptables 分支同口径 —— 只有"ip6 x_tables 从未注册过 nat 表"才能证明
-            # 不存在 IPv6 DNAT; 注册了 nat 却无从查询内容 ⇒ UNKNOWN(fail-closed)。
-            if ! q=$(cat /proc/net/ip6_tables_names 2>/dev/null); then
-                return 1
-            fi
-            printf '%s\n' "$q" | grep -qx "nat" && return 1
-        fi
+        # IPv6 侧: 统一三态观察(二十八轮 P2 收口; 原来 nft / /proc 的判定散在各处)。
+        case "$(_hy2_ipv6_state)" in
+            ip6tables)
+                q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
+                printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
+                ;;
+            absent) : ;;
+            'unknown nft')
+                _warn "ip6tables 不可用但检测到 nft, 无法确认是否存在 IPv6 跳跃规则"
+                return 1 ;;
+            *)
+                _warn "无法确认是否存在 IPv6 跳跃规则(IPv6 nat 注册表读不到或已注册 nat)"
+                return 1 ;;
+        esac
         runtime_clean=1
     else
         # 无 iptables: 唯一可靠的替代证据是"内核 nat 表从未被使用过"。
@@ -832,26 +853,21 @@ _hy2_add_hop_rules() {
 _hy2_remove_hop_rules() {
     local hy2_port="$1"; shift
     local range remain_any=0 v6ok=0
-    # IPv6 观测能力预检(与 `_hy2_no_hop_rules_at_all` 同口径): ip6tables 缺失时只有内核
-    # ip6 x_tables 从未注册 nat 表才能证明无需清理; 其余一律 UNKNOWN ⇒ fail-closed。
-    if command -v ip6tables >/dev/null 2>&1; then
-        v6ok=1
-    elif command -v nft >/dev/null 2>&1; then
-        # xtables-nft 下 IPv6 NAT 规则可能位于 nf_tables, 只读 /proc/net/ip6_tables_names
-        # 不能证明不存在 ⇒ UNKNOWN, fail-closed(二十七轮 P2)。
-        _error "ip6tables 不可用但检测到 nft, 无法确认/清理 IPv6 跳跃规则"
-        return 1
-    elif [ -e /proc/net/ip6_tables_names ]; then
-        local names6
-        if ! names6=$(cat /proc/net/ip6_tables_names 2>/dev/null); then
+    # IPv6 观测能力预检(统一走 `_hy2_ipv6_state`, 与另外两个观察点同口径):
+    # ip6tables 缺失时只有内核 ip6 x_tables 从未注册 nat 表且无 nft 才能证明无需清理。
+    case "$(_hy2_ipv6_state)" in
+        ip6tables) v6ok=1 ;;
+        absent) : ;;
+        'unknown nft')
+            _error "ip6tables 不可用但检测到 nft, 无法确认/清理 IPv6 跳跃规则"
+            return 1 ;;
+        'unknown proc_unreadable')
             _error "无法确认 IPv6 NAT 状态(读取 /proc/net/ip6_tables_names 失败), 中止删除"
-            return 1
-        fi
-        if printf '%s\n' "$names6" | grep -qx "nat"; then
+            return 1 ;;
+        *)
             _error "ip6tables 不可用但内核注册了 IPv6 nat 表, 无法安全清理 IPv6 跳跃规则"
-            return 1
-        fi
-    fi
+            return 1 ;;
+    esac
     for range in "$@"; do
         local q specs
         if ! q=$(iptables -t nat -S PREROUTING 2>/dev/null); then
@@ -1516,17 +1532,21 @@ _hy2_hop_cleanup_candidates() {
     command -v iptables >/dev/null 2>&1 || return 1
     local q q6="" v6ok=0
     q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
-    if command -v ip6tables >/dev/null 2>&1; then
-        # IPv6 与 IPv4 同为"会被删除的 runtime": 查不到就建不起恢复源 ⇒ 返回 1(fail-closed)。
-        # 这与 `_hy2_no_hop_rules_at_all` 对 ip6 查询失败判 UNKNOWN 同口径。
-        q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
-        v6ok=1
-    elif command -v nft >/dev/null 2>&1; then
-        # ip6tables 缺失但存在 nft: IPv6 NAT 可能由 nftables 承载(xtables-nft), 无法枚举
-        # 恢复源 ⇒ fail-closed(二十七轮 P2, 与 `_hy2_no_hop_rules_at_all` 同口径)。
-        _error "ip6tables 不可用但检测到 nft, 无法枚举 IPv6 端口跳跃恢复源"
-        return 1
-    fi
+    # 统一三态观察(二十八轮 P2): 之前这里缺 /proc/net/ip6_tables_names 分支, 会只枚举 IPv4,
+    # 把可能存在却观察不到的 IPv6 规则漏出恢复源; 现在与另两个观察点完全同口径。
+    case "$(_hy2_ipv6_state)" in
+        ip6tables)
+            # IPv6 与 IPv4 同为"会被删除的 runtime": 查不到就建不起恢复源 ⇒ 返回 1(fail-closed)。
+            q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
+            v6ok=1 ;;
+        absent) : ;;
+        'unknown nft')
+            _error "ip6tables 不可用但检测到 nft, 无法枚举 IPv6 端口跳跃恢复源"
+            return 1 ;;
+        *)
+            _error "无法确认 IPv6 NAT 状态(nat 注册表读不到或已注册), 无法枚举 IPv6 端口跳跃恢复源"
+            return 1 ;;
+    esac
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         proto=$(jq -r '.protocol' "$f" 2>/dev/null)
@@ -1840,6 +1860,14 @@ _render_template() {
 # 并发防护(F5): 全体修改经 _with_config_lock 串行化, 实际事务体在 _mutate_config_locked。
 # ---------------------------------------------------------------------------
 _mutate_config() {
+    # 二十八轮 P2: 存在未收敛的 reset 事务日志时, 禁止任何常规配置写入 —— 事务现场(账本+快照)
+    # 必须由 `_reset_config_recover` 收敛后再谈别的改动, 否则在"半重置"的 config/metadata 上
+    # 继续叠加, 会让恢复源与真实状态进一步分叉。恢复成功后账本被删除, 本门禁自动解除
+    # (看盘上事实, 不用粘滞标志)。`_reset_config_*` 自身不经过本函数, 不受影响。
+    if declare -F _reset_journal_path >/dev/null 2>&1 && [ -e "$(_reset_journal_path 2>/dev/null)" ]; then
+        _error "存在未收敛的 reset 事务日志, 已阻止本次配置修改; 请重启脚本以收敛(或先修复现场)"
+        return 1
+    fi
     _with_config_lock _mutate_config_locked "$@"
 }
 

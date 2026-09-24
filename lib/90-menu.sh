@@ -114,18 +114,31 @@ _main_menu() {
     # 各恢复/迁移步骤都用 declare -F 守卫: 混装版本(模块未同步更新)时静默跳过。
     # reset 恢复放在最前: 半截 reset 的 live 状态可能是"config 空/缺 + nodes 空 + 快照藏着
     # 旧 metadata", 先收敛再让 adopt/normalize 基于稳定状态工作。
-    if declare -F _reset_config_recover >/dev/null 2>&1; then _reset_config_recover; fi
-    _auto_tag_tagless_inbounds
-    _auto_adopt_orphans
-    # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
-    if declare -F _port_txn_recover >/dev/null 2>&1; then _port_txn_recover; fi
+    RESET_RECOVERY_FAILED=0
+    local reset_rc=0
+    if declare -F _reset_config_recover >/dev/null 2>&1; then
+        _reset_config_recover || reset_rc=$?
+    fi
+    if [ "$reset_rc" -ne 0 ]; then
+        RESET_RECOVERY_FAILED=1
+        _error "reset 事务未收敛(账本/快照已保留): 已跳过自动迁移/规范化, 并阻止配置修改类操作; 请处理后重启脚本"
+    fi
+    if [ "$RESET_RECOVERY_FAILED" -eq 0 ]; then
+        _auto_tag_tagless_inbounds
+        _auto_adopt_orphans
+        # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
+        if declare -F _port_txn_recover >/dev/null 2>&1; then _port_txn_recover; fi
+    fi
     # 核心切换的崩溃恢复(十一轮 P1-②): 进程在"二进制已换 / unit 已重写"之后被杀(断电/OOM/
     # kill -9)时没有任何函数会被调用, 只能靠启动期按 state/coretxn.json 收敛。
     # 放在 config 相关操作之前 —— 它可能重启服务, 先让服务回到已知状态再谈配置。
+    # 它只动二进制/unit, 不写 config, 故不受未收敛 reset 的门禁影响。
     if declare -F _xray_core_txn_recover >/dev/null 2>&1; then _xray_core_txn_recover; fi
-    if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
-    if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
-    _normalize_config_format
+    if [ "$RESET_RECOVERY_FAILED" -eq 0 ]; then
+        if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
+        if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
+        _normalize_config_format
+    fi
     local choice
 
     while true; do
@@ -821,12 +834,22 @@ _reset_config_recover_locked() {
         # **运行态收敛必须早于清理/删账本**(二十五轮 P1): 原顺序(删快照→删账本→重启)在
         # "已提交但未重启"处崩溃时会留下 磁盘新配置 / runtime 旧配置 且无账本可查。
         if [ "$phase" = "committed" ]; then
-            if [ -x "$XRAY_BIN" ] && declare -F _restart_xray_verified >/dev/null 2>&1; then
+            if [ -x "$XRAY_BIN" ]; then
+                # 存在运行态就必须具备收敛它的能力(二十八轮 P1): 混装版本(旧 20-xray-core 没有
+                # `_restart_xray_verified`)时 **不能**把"无法验证"当成"已验证"而直接写
+                # runtime_verified —— 那样状态机的不变量就被伪证绕过了。fail-closed。
+                if ! declare -F _restart_xray_verified >/dev/null 2>&1; then
+                    _error "缺少 _restart_xray_verified, 无法验证 committed reset 的运行态; 账本与快照保留"
+                    return 1
+                fi
                 if ! _restart_xray_verified; then
                     _warn "上次 reset 已提交但运行态未收敛(Xray 重启失败), 账本保留待下次启动重试"
                     return 1
                 fi
                 _info "上次 reset 的运行态已收敛(已按已提交配置重启)"
+            else
+                # 显式判定"没有运行态需要收敛"; 绝不靠 helper 缺失来推导这一分支。
+                _info "未安装 Xray 核心, 本次 reset 无运行态需要收敛"
             fi
         fi
         # 收敛后写 runtime_verified 再清理; 写入或清理失败都保留账本供下次重试。
