@@ -820,10 +820,29 @@ _hy2_add_hop_rules() {
 # R17: 同时匹配 comment + dport + 目标端口, 保证跨节点隔离——不同节点即使 hop dport 重叠,
 #      删除本节点(目标端口 X)绝不误删他节点(目标端口 Y)的同 dport 规则。
 # R18: 目标端口用 _hy2_match_target 精确边界匹配; -S 查询失败显式报错, 不把"查不到"当"已删干净"。
-# 返回: 0 全部 IPv4 范围删除干净; 1 有 IPv4 残留或查询失败(调用方应中止事务/显式提示; IPv6 为 best-effort 只警告)
+# 二十五轮 P1: **IPv6 不再 best-effort** —— ip6tables 可用时, 查询失败/删除失败/删除后残留
+# 都让本函数返回 1; ip6tables 不可用时用 `/proc/net/ip6_tables_names` 证明内核 ip6 nat 表从未
+# 注册(否则 UNKNOWN ⇒ 失败)。否则 IPv4 删干净而 IPv6 残留时函数仍返回 0, 上层继续删
+# metadata/config, 就制造出失去归属的 IPv6 orphan DNAT。
+# 返回: 0 双栈全部删除干净(或可证明不存在 IPv6 NAT); 1 任一 family 残留/查询失败/无法确认
 _hy2_remove_hop_rules() {
     local hy2_port="$1"; shift
-    local range remain_any=0
+    local range remain_any=0 v6ok=0
+    # IPv6 观测能力预检(与 `_hy2_no_hop_rules_at_all` 同口径): ip6tables 缺失时只有内核
+    # ip6 x_tables 从未注册 nat 表才能证明无需清理; 其余一律 UNKNOWN ⇒ fail-closed。
+    if command -v ip6tables >/dev/null 2>&1; then
+        v6ok=1
+    elif [ -e /proc/net/ip6_tables_names ]; then
+        local names6
+        if ! names6=$(cat /proc/net/ip6_tables_names 2>/dev/null); then
+            _error "无法确认 IPv6 NAT 状态(读取 /proc/net/ip6_tables_names 失败), 中止删除"
+            return 1
+        fi
+        if printf '%s\n' "$names6" | grep -qx "nat"; then
+            _error "ip6tables 不可用但内核注册了 IPv6 nat 表, 无法安全清理 IPv6 跳跃规则"
+            return 1
+        fi
+    fi
     for range in "$@"; do
         local q specs
         if ! q=$(iptables -t nat -S PREROUTING 2>/dev/null); then
@@ -851,26 +870,31 @@ _hy2_remove_hop_rules() {
             _warn "IPv4 范围 ${range} 的跳跃规则删除后仍残留, 请手动检查"
             remain_any=1
         fi
-        if command -v ip6tables >/dev/null 2>&1; then
+        if [ "$v6ok" -eq 1 ]; then
             local q6 specs6
             if ! q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null); then
-                _warn "无法读取 IPv6 PREROUTING 规则, 跳过 IPv6 跳跃规则删除核验"
-                continue
+                _error "无法读取 IPv6 PREROUTING 规则, 中止删除"
+                return 1
             fi
             specs6=$(printf '%s\n' "$q6" | grep "xray-deploy-hy2-hop" \
                     | grep -e "dport ${range} " -e "dport ${range}\$" \
                     | _hy2_match_target "$hy2_port" | sed 's/^-A/-D/')
             while IFS= read -r line; do
-                [ -n "$line" ] && ip6tables -t nat $line 2>/dev/null || true
+                if [ -n "$line" ]; then
+                    ip6tables -t nat $line 2>/dev/null || remain_any=1
+                fi
             done <<< "$specs6"
             if ! q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null); then
-                _warn "无法读取 IPv6 PREROUTING 规则核验, 跳过 IPv6 残留判断"
-                continue
+                _error "无法读取 IPv6 PREROUTING 规则核验, 中止删除"
+                return 1
             fi
             remain=$(printf '%s\n' "$q6" | grep "xray-deploy-hy2-hop" \
                     | grep -e "dport ${range} " -e "dport ${range}\$" \
                     | _hy2_match_target "$hy2_port")
-            [ -n "$remain" ] && _warn "IPv6 范围 ${range} 的跳跃规则删除后仍残留, 请手动检查"
+            if [ -n "$remain" ]; then
+                _warn "IPv6 范围 ${range} 的跳跃规则删除后仍残留, 请手动检查"
+                remain_any=1
+            fi
         fi
     done
     return "$remain_any"
