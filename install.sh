@@ -727,6 +727,8 @@ _install_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持
     for p in /proc/[0-9]*/fd/*; do
         pid=${p#/proc/}; pid=${pid%%/*}
         [ "$pid" = "$$" ] && continue
+        # fd 在扫描期间被并发关闭是常态, 读不到就跳过(不是"发现旧进程")。判定主力是
+        # 上面的 `find` 快路径: 它一次遍历完成, 不受这种逐 fd 竞态影响。
         target=$(readlink "$p" 2>/dev/null) || continue
         case "$target" in
             "$prefix"*" (deleted)") return 0 ;;
@@ -735,8 +737,30 @@ _install_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持
     return 1
 }
 
+# 当前无 flock 时仍要拒绝**另一种旧后端**的活持有者: 旧版可能用 flock 文件,
+# 而本进程只能使用 mkdir 退路。0=文件被其他进程打开, 1=确认没有, 2=无法确认。
+_install_legacy_flock_active() {
+    local p pid target want="$1" matches find_rc
+    if command -v find >/dev/null 2>&1; then
+        matches=$(find /proc/[0-9]*/fd -type l -lname "$want" -print -quit 2>/dev/null)
+        find_rc=$?
+        if [ "$find_rc" -eq 0 ]; then
+            [ -n "$matches" ] && return 0
+            return 1
+        fi
+    fi
+    [ -d /proc ] || return 2
+    for p in /proc/[0-9]*/fd/*; do
+        pid=${p#/proc/}; pid=${pid%%/*}
+        [ "$pid" = "$$" ] && continue
+        target=$(readlink "$p" 2>/dev/null) || continue
+        [ "$target" = "$want" ] && return 0
+    done
+    return 1
+}
+
 _install_lock_acquire() {
-    local install_lock_parent="${DEPLOY_DIR%/*}"
+    local install_lock_parent="${DEPLOY_DIR%/*}" lrc
     [ -n "$install_lock_parent" ] || install_lock_parent="/"
     mkdir -p "$install_lock_parent" 2>/dev/null || {
         echo "[错误] 无法创建安装锁父目录 $install_lock_parent(权限/只读文件系统?), 安装中止"
@@ -761,6 +785,16 @@ _install_lock_acquire() {
             fi
             if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
                 echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
+                _install_lock_release
+                return 1
+            fi
+            # 旧版 mkdir 后端(`.install.lock` 目录): 目录存在(活持有者或 SIGKILL 残留)一律
+            # 拒绝, 绝不自动接管。**只检查、不创建标记**: 本路径有 flock(内核持锁, SIGKILL
+            # 自动释放), 若在此 mkdir 目录标记, 一次强杀就会留下无人持有的目录锁, 之后每次
+            # 安装/卸载都被自己的残留永久拒绝 —— 那等于用"跨版本协调"换掉 flock 的自愈性。
+            if [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
+                echo "[错误] 旧版安装锁目录仍存在: $INSTALL_LEGACY_LOCK_DIR"
+                echo "       确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
                 _install_lock_release
                 return 1
             fi
@@ -809,6 +843,21 @@ _install_lock_acquire() {
         echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
         _install_lock_release
         return 1
+    fi
+    if [ -e "$INSTALL_LEGACY_LOCK_FILE" ]; then
+        if ! declare -F _install_legacy_flock_active >/dev/null 2>&1; then
+            echo "[错误] 无法确认旧版 flock 安装锁是否空闲(缺少检查助手), 本次安装中止"
+            _install_lock_release
+            return 1
+        fi
+        _install_legacy_flock_active "$INSTALL_LEGACY_LOCK_FILE"; lrc=$?
+        case "$lrc" in
+            0|2)
+                echo "[错误] 检测到旧版 flock 安装锁仍被占用或无法确认, 本次安装中止"
+                _install_lock_release
+                return 1
+                ;;
+        esac
     fi
     # 旧版无 flock 时用的是 `$DEPLOY_DIR/.install.lock` 目录锁: 这里同样 mkdir 下来,
     # 旧版读到活 pid 会等待/拒绝; 我们读不到活 pid 时也一律拒绝, 不接管别人的现场。

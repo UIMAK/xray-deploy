@@ -645,6 +645,46 @@ _hy2_match_target() {
     grep -e "--to-destination :${port} " -e "--to-destination :${port}\$"
 }
 
+# 持久化文件路径的单一读取入口。Debian/直接 save 使用 rules.v4/rules.v6;
+# Alpine OpenRC 的 iptables.initd 读取 /etc/conf.d/iptables 与 ip6tables 中的
+# IPTABLES_SAVE/IP6TABLES_SAVE(官方默认分别是 rules-save/rules6-save)。全局 orphan
+# 检查必须覆盖这些 OpenRC 文件, 否则 runtime 已清空但重启后规则仍会恢复。
+_hy2_conf_save_path() {   # <conf> <key> <default>
+    local conf="$1" key="$2" def="$3" line value=""
+    if [ -r "$conf" ]; then
+        while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in
+                "$key"=*) value="${line#*=}"; break ;;
+            esac
+        done < "$conf"
+    fi
+    value="${value#\"}"; value="${value%\"}"
+    value="${value#\'}"; value="${value%\'}"
+    case "$value" in
+        /*) printf '%s\n' "$value" ;;
+        *) printf '%s\n' "$def" ;;
+    esac
+}
+
+_hy2_iptables_persist_files() {
+    local ipt_dir="${HY2_IPTABLES_DIR:-/etc/iptables}"
+    local initd_dir="${HY2_INITD_DIR:-/etc/init.d}"
+    local conf_dir="${HY2_CONF_DIR:-/etc/conf.d}"
+    local fam=""
+    declare -F _detect_os_family >/dev/null 2>&1 && fam=$(_detect_os_family 2>/dev/null)
+    printf '%s\n' "$ipt_dir/rules.v4" "$ipt_dir/rules.v6"
+    if [ "$fam" = alpine ]; then
+        _hy2_conf_save_path "$conf_dir/iptables" IPTABLES_SAVE "$ipt_dir/rules-save"
+        _hy2_conf_save_path "$conf_dir/ip6tables" IP6TABLES_SAVE "$ipt_dir/rules6-save"
+    elif [ -x "$initd_dir/iptables" ] || [ -x "$initd_dir/ip6tables" ]; then
+        # A test/container may expose the OpenRC scripts without being classified Alpine;
+        # their default save paths are still part of the persistence surface.
+        _hy2_conf_save_path "$conf_dir/iptables" IPTABLES_SAVE "$ipt_dir/rules-save"
+        _hy2_conf_save_path "$conf_dir/ip6tables" IP6TABLES_SAVE "$ipt_dir/rules6-save"
+    fi
+}
+
 # R38(P1)/R39(P1): 本机是否"**有证据表明**不存在任何 xray-deploy 端口跳跃规则"。
 # 用于给 _node_protocol_safe 的 fail-closed 提供一个可证伪的逃生口。
 # R39 收紧: 必须真的**看过** runtime, 才能说"没有规则"。
@@ -660,7 +700,7 @@ _hy2_match_target() {
 # 任一通道都无法确认 => 返回 1(UNKNOWN, 按不安全处理), 由调用方拒绝并给出人工路径。
 # 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
 _hy2_no_hop_rules_at_all() {
-    local q f runtime_clean=0
+    local q f runtime_clean=0 persist_files persist_rc
     if command -v iptables >/dev/null 2>&1; then
         q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
         printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
@@ -690,10 +730,14 @@ _hy2_no_hop_rules_at_all() {
     fi
     [ "$runtime_clean" -eq 1 ] || return 1
     # runtime 已确认无规则; 持久化文件会在重启时重新加载, 同样必须干净
-    for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+    persist_files=$(_hy2_iptables_persist_files) || return 1
+    while IFS= read -r f; do
         [ -f "$f" ] || continue
-        grep -q "xray-deploy-hy2-hop" "$f" 2>/dev/null && return 1
-    done
+        grep -q "xray-deploy-hy2-hop" "$f" 2>/dev/null; persist_rc=$?
+        case "$persist_rc" in
+            0|2) return 1 ;;
+        esac
+    done <<< "$persist_files"
     return 0
 }
 
@@ -841,55 +885,56 @@ _hy2_persist_iptables() {
         _error "iptables-save 不可用, 无法安全持久化端口跳跃规则(重启后规则会丢失)"
         return 1
     fi
-    local ok=0 fam v4tmp v6tmp
+    local ok=0 fam v4tmp v6tmp ipt_dir="${HY2_IPTABLES_DIR:-/etc/iptables}" \
+        initd_dir="${HY2_INITD_DIR:-/etc/init.d}"
     fam=$(_detect_os_family)
     case "$fam" in
         debian)
-            mkdir -p /etc/iptables 2>/dev/null || ok=1
-            v4tmp="/etc/iptables/rules.v4.tmp.$$"
+            mkdir -p "$ipt_dir" 2>/dev/null || ok=1
+            v4tmp="$ipt_dir/rules.v4.tmp.$$"
             if iptables-save > "$v4tmp" 2>/dev/null; then
-                mv -f "$v4tmp" /etc/iptables/rules.v4 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
+                mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
             else
                 rm -f "$v4tmp"; ok=1
             fi
             if command -v ip6tables-save >/dev/null 2>&1; then
-                v6tmp="/etc/iptables/rules.v6.tmp.$$"
+                v6tmp="$ipt_dir/rules.v6.tmp.$$"
                 if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                    mv -f "$v6tmp" /etc/iptables/rules.v6 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
+                    mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
                 else
                     rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
                 fi
             fi
             ;;
         alpine)
-            if [ -x /etc/init.d/iptables ]; then
+            if [ -x "$initd_dir/iptables" ]; then
                 # init.d save 由服务脚本自行管理其持久化文件, 无法原子化, 仅检查返回
-                /etc/init.d/iptables save >/dev/null 2>&1 || ok=1
+                "$initd_dir/iptables" save >/dev/null 2>&1 || ok=1
                 # R34(P2): ip6 侧先确认 init.d 脚本存在; 不存在但 ip6tables-save 可用时
                 # 回退到直接原子写(与无 init.d 分支一致), 避免调用不存在的脚本 rc127 误报失败
-                if [ -x /etc/init.d/ip6tables ]; then
-                    /etc/init.d/ip6tables save >/dev/null 2>&1 || _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
+                if [ -x "$initd_dir/ip6tables" ]; then
+                    "$initd_dir/ip6tables" save >/dev/null 2>&1 || _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
                 elif command -v ip6tables-save >/dev/null 2>&1; then
-                    mkdir -p /etc/iptables 2>/dev/null || _warn "无法创建 /etc/iptables, IPv6 规则持久化失败(best-effort)"
-                    v6tmp="/etc/iptables/rules.v6.tmp.$$"
+                    mkdir -p "$ipt_dir" 2>/dev/null || _warn "无法创建 $ipt_dir, IPv6 规则持久化失败(best-effort)"
+                    v6tmp="$ipt_dir/rules.v6.tmp.$$"
                     if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                        mv -f "$v6tmp" /etc/iptables/rules.v6 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
+                        mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
                     else
                         rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
                     fi
                 fi
             else
-                mkdir -p /etc/iptables 2>/dev/null || ok=1
-                v4tmp="/etc/iptables/rules.v4.tmp.$$"
+                mkdir -p "$ipt_dir" 2>/dev/null || ok=1
+                v4tmp="$ipt_dir/rules.v4.tmp.$$"
                 if iptables-save > "$v4tmp" 2>/dev/null; then
-                    mv -f "$v4tmp" /etc/iptables/rules.v4 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
+                    mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
                 else
                     rm -f "$v4tmp"; ok=1
                 fi
                 if command -v ip6tables-save >/dev/null 2>&1; then
-                    v6tmp="/etc/iptables/rules.v6.tmp.$$"
+                    v6tmp="$ipt_dir/rules.v6.tmp.$$"
                     if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                        mv -f "$v6tmp" /etc/iptables/rules.v6 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
+                        mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
                     else
                         rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
                     fi
@@ -897,10 +942,10 @@ _hy2_persist_iptables() {
             fi
             ;;
         *)
-            mkdir -p /etc/iptables 2>/dev/null || ok=1
-            v4tmp="/etc/iptables/rules.v4.tmp.$$"
+            mkdir -p "$ipt_dir" 2>/dev/null || ok=1
+            v4tmp="$ipt_dir/rules.v4.tmp.$$"
             if iptables-save > "$v4tmp" 2>/dev/null; then
-                mv -f "$v4tmp" /etc/iptables/rules.v4 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
+                mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
             else
                 rm -f "$v4tmp"; ok=1
             fi

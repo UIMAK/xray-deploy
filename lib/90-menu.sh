@@ -626,11 +626,38 @@ _reset_config() {
             *) _info "已取消"; return 0 ;;
         esac
     fi
-    _with_config_lock _reset_config_locked
+    # 全站破坏性操作遵循 install → config → core 的锁序, 与 uninstall 相同。
+    # 仅取 config lock 会让 uninstall 在 install+core 锁内删除部署树, 把 config fd 拆成
+    # deleted inode 后继续写 metadata/restart; 外层 install lock 先把两条破坏性路径串起来。
+    if declare -F _with_deploy_install_lock >/dev/null 2>&1; then
+        _with_deploy_install_lock _with_config_lock _reset_config_locked
+    else
+        # 混装旧 lib 的兼容降级: 至少保留原 config 锁保护, 不退回裸执行。
+        _with_config_lock _reset_config_locked
+    fi
+}
+
+# Restore the filesystem side of a reset that has not committed yet. The config backup and
+# the metadata/clash snapshot are separate evidence, so both must converge before the caller
+# reports the reset as failed-and-recovered.
+_reset_config_snapshot_restore() {
+    local stage="$1" nodes_moved="$2" clash_moved="$3" ok=0
+    if [ "$nodes_moved" -eq 1 ]; then
+        rm -rf "$NODES_DIR" 2>/dev/null || ok=1
+        if ! mv "$stage/nodes" "$NODES_DIR" 2>/dev/null; then ok=1; fi
+    fi
+    if [ "$clash_moved" -eq 1 ]; then
+        rm -f "$CLASH_YAML" 2>/dev/null || ok=1
+        if ! mv "$stage/clash.yaml" "$CLASH_YAML" 2>/dev/null; then ok=1; fi
+    fi
+    if [ "$ok" -eq 0 ]; then
+        rm -rf "$stage" 2>/dev/null || ok=1
+    fi
+    return "$ok"
 }
 
 _reset_config_locked() {
-    local had_config=0
+    local had_config=0 nodes_moved=0 clash_moved=0 snapshot
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
         had_config=1
         # 2026-09-12 三审(M1): 重置是清空全部节点数据的破坏性操作, 备份失败(磁盘满/IO 错误)
@@ -647,6 +674,36 @@ _reset_config_locked() {
             return 1
         fi
     fi
+    snapshot="$DEPLOY_DIR/.reset-snapshot.$$"
+    if [ -e "$snapshot" ] || ! mkdir "$snapshot" 2>/dev/null; then
+        _error "无法创建 reset 恢复快照目录, 已取消重置以保护现有数据"
+        return 1
+    fi
+    if [ -d "$NODES_DIR" ]; then
+        # mv 失败时 NODES_DIR 仍是原件, **绝不能**走恢复路径(那里会 rm -rf 它再去搬
+        # 快照里不存在的内容 ⇒ 直接毁掉全部节点元数据)。只有 mv 确认成功才置 nodes_moved。
+        if ! mv "$NODES_DIR" "$snapshot/nodes" 2>/dev/null; then
+            _error "无法准备节点 metadata 恢复快照, 已取消重置以保护现有数据"
+            rm -rf "$snapshot" 2>/dev/null
+            return 1
+        fi
+        nodes_moved=1
+        if ! mkdir -p "$NODES_DIR" 2>/dev/null; then
+            _error "无法重建节点 metadata 目录, 正在恢复重置前的快照"
+            _reset_config_snapshot_restore "$snapshot" 1 0 || \
+                _error "节点 metadata 快照恢复失败, 请手动检查: $snapshot"
+            return 1
+        fi
+    fi
+    if [ -f "$CLASH_YAML" ]; then
+        if ! mv "$CLASH_YAML" "$snapshot/clash.yaml" 2>/dev/null; then
+            _error "无法准备 clash 恢复快照, 已取消重置以保护现有数据"
+            _reset_config_snapshot_restore "$snapshot" "$nodes_moved" 0 || \
+                _error "metadata 恢复失败, 请手动检查: $snapshot"
+            return 1
+        fi
+        clash_moved=1
+    fi
     # 删掉 config 让 _init_config_if_empty 重建。
     # **重建失败必须回滚, 且回滚要在清元数据之前**(2026-09-22 九轮 OCR #41)。
     # 旧写法 `rm -f "$CONFIG_FILE"; _init_config_if_empty`(返回值丢弃)随后**无条件**清空
@@ -656,24 +713,38 @@ _reset_config_locked() {
     # 并立即返回 —— 元数据与 clash 只有在配置确实重建成功之后才允许被清。
     if ! rm -f "$CONFIG_FILE" 2>/dev/null; then
         _error "无法删除旧 config.json, 已取消重置以保护现有数据"
+        _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved" || \
+            _error "metadata/clash 恢复失败, 请手动检查: $snapshot"
         return 1
     fi
     if ! _init_config_if_empty; then
         _error "重建默认配置失败(只读/磁盘空间/jq 异常?), 正在回滚到重置前的配置"
-        if [ "$had_config" -eq 1 ] && _restore_config; then
+        local config_ok=0 snapshot_ok=0
+        if [ "$had_config" -eq 1 ] && _restore_config; then config_ok=1; fi
+        if _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved"; then snapshot_ok=1; fi
+        if [ "$config_ok" -eq 1 ] && [ "$snapshot_ok" -eq 1 ]; then
             _warn "已回滚, 重置未生效: 配置与节点数据均保持原样"
-        elif [ "$had_config" -eq 1 ]; then
-            _error "回滚失败, 请手动从 $BACKUP_DIR/config.json.lastbak 恢复"
         else
-            _error "重置前没有可恢复的旧配置, 请检查磁盘空间/权限后重试"
+            [ "$had_config" -eq 1 ] || _error "重置前没有可恢复的旧配置"
+            [ "$config_ok" -eq 1 ] || _error "配置回滚失败, 请手动从 $BACKUP_DIR/config.json.lastbak 恢复"
+            [ "$snapshot_ok" -eq 1 ] || _error "metadata/clash 回滚失败, 请手动检查: $snapshot"
         fi
         return 1
     fi
-    # 清空节点元数据 + clash.yaml(只有配置确认重建成功才会走到这里)
-    if [ -d "$NODES_DIR" ]; then
-        rm -f "$NODES_DIR"/*.json 2>/dev/null
+    # 配置已确认重建成功; live metadata 目录已经是空目录, clash 重新落地也必须成功。
+    if [ "$clash_moved" -eq 1 ] && \
+       { ! printf 'proxies:\n' > "$CLASH_YAML" 2>/dev/null || [ ! -s "$CLASH_YAML" ]; }; then
+        _error "清空 clash 派生配置失败, 正在回滚重置"
+        local config_ok=0 snapshot_ok=0
+        if [ "$had_config" -eq 1 ] && _restore_config; then config_ok=1; fi
+        if _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved"; then snapshot_ok=1; fi
+        [ "$config_ok" -eq 1 ] && [ "$snapshot_ok" -eq 1 ] || \
+            _error "reset 回滚不完整, 请手动检查配置与 metadata"
+        return 1
     fi
-    [ -f "$CLASH_YAML" ] && printf 'proxies:\n' > "$CLASH_YAML" 2>/dev/null
+    if ! rm -rf "$snapshot" 2>/dev/null || [ -e "$snapshot" ]; then
+        _warn "重置已应用, 但旧 metadata/clash 快照清理失败: $snapshot"
+    fi
     # 重启 xray(若在跑)
     if [ -x "$XRAY_BIN" ]; then
         if _restart_xray_verified; then

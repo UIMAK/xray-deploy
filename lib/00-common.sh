@@ -945,12 +945,19 @@ _press_any_key() {
 # ---------------------------------------------------------------------------
 # 跨进程配置修改锁(2026-09-12 审查 F5, 借鉴 singbox-lite _with_state_lock):
 # 包住 _mutate_config 的 read-modify-write, 防止两个并发 xd 会话交叠产生丢失更新。
+# 主锁文件在部署目录的**父目录**(`.<deploy-name>.config.lock`): 卸载/reset 的 `rm -rf $DEPLOY_DIR`
+# 不会把它拆成两个 inode, 因而 config writer 与全站破坏性操作能真正互斥。旧版(0.17.11 及
+# PR #48 早期 HEAD)只认目录内 `.config.lock`, 故同时用 flock 占住该路径作为跨版本协调。
+# 全站破坏性锁序是 install → config → core: install/uninstall/reset 先取安装锁, 再由本函数
+# 取 config 主锁, 最后由 `_restart_xray_verified` 取 core 锁; 单独 config writer 走 config → core。
+# 本函数**不自取 install lock** —— 那会让每次普通配置写入都创建旧版目录锁标记, SIGKILL 残局
+# 会让菜单再也改不了配置; 破坏性路径的 install 锁由各自入口显式获取。
 # best-effort 语义, 与 singbox-lite 的"缺 flock 硬失败"刻意不同:
 #   - flock 不可用(裁剪版 busybox)时直接放行 —— 配置写者只有单管理员 TUI 一个,
 #     为锁而拒绝服务比偶发竞态更伤; 放行属于已声明的降级而非静默吞错。
 #   - 持锁者导出 XRAY_DEPLOY_LOCK_HELD=1 支持重入(当前无嵌套调用, 防御性保留)。
 # 注意: "$@" 在子 shell 中执行 —— _mutate_config 及其下游不向调用方回传全局变量,
-# 返回码经子 shell 退出码透传; fd 9 随子 shell 结束自动关闭并释放锁。
+# 返回码经子 shell 退出码透传; fd 9 与旧版协调 fd 随子 shell 结束自动关闭并释放锁。
 # ---------------------------------------------------------------------------
 _with_config_lock() {
     if [ "${XRAY_DEPLOY_LOCK_HELD:-0}" = "1" ]; then
@@ -961,14 +968,20 @@ _with_config_lock() {
         "$@"
         return $?
     fi
+    local config_parent="${DEPLOY_DIR%/*}" config_name="${DEPLOY_DIR##*/}" config_lock_file legacy_lock_file
+    [ -n "$config_parent" ] || config_parent="/"
+    config_lock_file="${config_parent}/.${config_name}.config.lock"
+    legacy_lock_file="$DEPLOY_DIR/.config.lock"
     (
-        mkdir -p "$DEPLOY_DIR" 2>/dev/null
+        mkdir -p "$config_parent" "$DEPLOY_DIR" 2>/dev/null
+        # config lock 主文件在部署目录父目录, 不能被 uninstall 的 rm -rf 拆成新旧 inode。
+        # legacy_lock_file 仍会被打开并占用, 用来排斥旧版仍只认识目录内 .config.lock 的写者。
         # 注意: exec 仅带重定向时重定向会**持久化**到整个子 shell —— 原写法
         # `exec 9>... 2>/dev/null` 把子 shell 的 stderr 永久吞掉, 事务体内的全部
         # _error/超时提示静默丢失(2026-09-13 Alpine 实测)。去掉 2>/dev/null:
         # open 失败时 bash 自身报错 + 下面的 _error 都可见, 语义更正确。
-        if ! exec 9>"$DEPLOY_DIR/.config.lock"; then
-            _error "无法创建配置锁文件 $DEPLOY_DIR/.config.lock(目录不可写?), 放弃本次修改"
+        if ! exec 9>"$config_lock_file"; then
+            _error "无法创建配置锁文件 $config_lock_file(目录不可写?), 放弃本次修改"
             exit 1
         fi
         local i
@@ -980,8 +993,28 @@ _with_config_lock() {
             _error "等待配置锁超时(15s), 可能有其他 xd 会话正在修改配置"
             exit 1
         fi
+        local legacy_fd="" li
+        if ! exec {legacy_fd}>>"$legacy_lock_file" 2>/dev/null; then
+            _error "无法打开旧版配置锁文件 $legacy_lock_file(目录不可写?), 放弃本次修改"
+            [ -n "$legacy_fd" ] && eval "exec ${legacy_fd}>&-" 2>/dev/null
+            exit 1
+        fi
+        for li in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+            flock -n "$legacy_fd" 2>/dev/null && break
+            sleep 1
+        done
+        if ! flock -n "$legacy_fd" 2>/dev/null; then
+            _error "旧版配置写者仍持有 $legacy_lock_file(15s), 可能仍有旧版会话在改配置"
+            _tip "等旧版会话退出后重试(内核会在持有进程退出时自动释放该锁)"
+            eval "exec ${legacy_fd}>&-" 2>/dev/null
+            exit 1
+        fi
         export XRAY_DEPLOY_LOCK_HELD=1
         "$@"
+        local rc=$?
+        flock -u "$legacy_fd" 2>/dev/null
+        eval "exec ${legacy_fd}>&-" 2>/dev/null
+        exit "$rc"
     )
 }
 
