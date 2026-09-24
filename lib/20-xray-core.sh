@@ -518,12 +518,10 @@ _xray_restore_prev_bin() {
 # 完整的 restart/stop liveness 观察。否则普通服务控制可穿插在 rollback 的 stop→restore→start
 # 中间, 让 recovery 失去对运行实例的独占控制。下载与网络等待仍在锁外。
 #
-# 与 config 锁的关系: 两把**独立的**锁(`.<deploy-name>.core.lock` / `.config.lock`)。核心锁
-# 放在部署目录的父目录, 不随部署目录卸载而消失。config 事务会在持
-# config lock 时调用 `_restart_xray_verified`, 因而实际嵌套方向是 config → core; 核心事务
-# 路径不获取 config lock, 没有反向边, 所以不会成环。两个包装器各自可重入, 故不自锁。
-# `_uninstall_xray` 按 install → core 顺序同时持有两把稳定锁直到部署目录删除完成; install.sh
-# 更新与核心安装/服务操作都要等, 不会因 `rm -rf $DEPLOY_DIR` 删除锁文件而分裂 inode。
+# 与 config 锁的关系: 两把**独立**的锁(`.<deploy-name>.core.lock` / parent-level config lock)。
+# 核心锁放在部署目录的父目录, config 主锁也在父目录, legacy config lock 仍在部署目录内。
+# 普通配置事务的完整顺序是 install → config → core; 核心事务只取 core, 没有反向边, 所以不会成环。
+# `_uninstall_xray` 与 reset 都按 install → config → core 持锁直到部署目录删除/重建完成。
 #
 # flock 锁 fd 必须动态分配并**在派生服务进程时关闭**(`{fd}>&-`): 写死 fd 会与 _with_config_lock
 # 的 fd 9 相撞(install.sh 实测过这类相撞会静默释放锁); 不关闭则被 supervise-daemon/nohup
@@ -556,22 +554,40 @@ _xray_core_lock_fd_reset() {
 # 旧版(0.17.11 / PR #48 早期 HEAD)把核心锁与安装锁都放在 `$DEPLOY_DIR` **内**
 # (`$DEPLOY_DIR/.core.lock` + `.install.lock.fd` / `.install.lock`); 新版主锁移到了父目录
 # (卸载 `rm -rf` 不会把锁文件拆成新旧 inode)。只持新锁**排斥不了旧版进程** —— 旧版只认它
-# 自己那条路径。故取到主锁后必须再按同一种手段取一次旧路径:
-#   · 有 flock ⇒ 也 flock 旧文件(与旧版 `flock -n` 直接互斥);
-#   · 无 flock ⇒ 也 mkdir 旧目录(旧版读到活 pid 会等待/拒绝)。
-# 取不到一律 fail-closed。**不删别人的锁**: 旧路径下的残留是别人的现场, 只提示人工清理。
+# 自己那条路径。故取到主锁后必须再协调旧路径。**后端不能按本机环境猜**(十七轮 P1-2):
+# 旧进程当时用的是 flock 还是 mkdir, 与本机现在
+# 有没有 `flock` 无关, 故两条路径都要检查:
+#   · 有 flock ⇒ 先看旧 mkdir 目录是否存在(存在即拒绝), 再 flock 旧文件(旧 flock 后端互斥);
+#   · 无 flock ⇒ 先用 `/proc` 扫描旧 flock 文件是否被他人打开, 再 mkdir 旧目录。
+# 任一条显示占用/残留一律 fail-closed。**不删别人的锁**: 旧路径下的残留是别人的现场,
+# 只提示人工清理。仍存的窗口: 旧 mkdir 后端若在本机检查**之后**才启动, 新版无法阻止
+# (旧二进制不认识父目录新锁) —— 与"旧进程在新版释放后才启动"同属无法结构性消除的残余。
 #
 # **未闭环的残局(必须如实说明, 不当作已消失)**: 旧版进程若在我们释放锁之后才启动, 或在
 # `$DEPLOY_DIR` 已被删除后重建目录内的旧锁路径, 新版无从协调 —— 新版不能为一个已卸载的目录
 # 永久保留占位锁(那会让"卸载后重装"永远拒绝)。跨版本竞态因此是"窗口大幅收窄 + fail-closed",
 # 不是"结构性消除"; 结构性消除只存在于同版本(全部进程都走父目录稳定锁)之后。
 _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkdir目录> <显示名>
-    local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i owner="" ef
+    local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i owner="" ef lrc
     # **变量名按锁家族分开**: 卸载要同时持 install 锁与 core 锁, 两者都要协调各自的旧路径;
     # 共用一个全局会让后取的覆盖先取的, 先取那把 fd 再也没人关闭/解锁(锁泄漏到进程退出)。
     eval "$fdvar=\"\""
     eval "$dirvar=\"\""
     if command -v flock >/dev/null 2>&1; then
+        # 旧版 mkdir 后端: 目录存在(活持有者或 SIGKILL 残留)一律拒绝 —— 绝不自动接管。
+        # **只检查、不创建标记**: 本路径有 flock(内核持锁, SIGKILL 自动释放), 若在这里
+        # mkdir 目录标记, 一次强杀就会留下无人持有的目录锁, 之后每次服务操作/核心事务都
+        # 被自己的残留永久拒绝 —— 那等于用"跨版本协调"换掉 flock 路径最宝贵的自愈性。
+        if [ -e "$ldir" ]; then
+            owner=$(cat "$ldir/pid" 2>/dev/null)
+            case "$owner" in
+                ''|*[!0-9]*) owner="" ;;
+                *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
+            esac
+            _error "旧版${label}目录锁仍存在(pid ${owner:-未知}): $ldir"
+            _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+            return 1
+        fi
         if ! eval "exec {${fdvar}}>>\"\$lfile\""; then
             _error "无法打开旧版${label} $lfile, 放弃本次操作"
             return 1
@@ -586,6 +602,23 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
         eval "exec ${ef}>&-" 2>/dev/null
         eval "$fdvar=\"\""
         return 1
+    fi
+    # 无 flock: 旧版通常走 mkdir 目录锁, 但仍先检查旧 flock 文件是否被某个进程打开。
+    # 当前没有 flock 时无法建立内核 flock, 因而只能阻止已经存在的旧 flock 持有者;
+    # 同环境旧版本也没有 flock 时, mkdir 标记提供完整互斥。
+    if [ -e "$lfile" ] && ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
+        _error "无法确认旧版${label} flock 文件是否空闲(缺少检查助手): $lfile"
+        return 1
+    fi
+    if [ -e "$lfile" ] && declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
+        _xray_legacy_flock_active "$lfile"; lrc=$?
+        case "$lrc" in
+            0|2)
+                _error "旧版${label}不可确认空闲(旧 flock 文件: $lfile), 放弃本次操作"
+                _tip "确认没有旧版会话在运行后, 请人工检查旧锁现场并重试"
+                return 1
+                ;;
+        esac
     fi
     # 无 flock: 旧版走的是 mkdir 目录锁。活持有者/残留一律拒绝, 绝不删除别人的锁目录。
     if ! mkdir "$ldir" 2>/dev/null; then
@@ -608,6 +641,27 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
     fi
     eval "$dirvar=\"\$ldir\""
     return 0
+}
+
+# <path> 被其他进程打开为 fd: 0=有, 1=没有, 2=无法确认。
+_xray_legacy_flock_active() {
+    local p pid target want="$1" matches find_rc
+    if command -v find >/dev/null 2>&1; then
+        matches=$(find /proc/[0-9]*/fd -type l -lname "$want" -print -quit 2>/dev/null)
+        find_rc=$?
+        if [ "$find_rc" -eq 0 ]; then
+            [ -n "$matches" ] && return 0
+            return 1
+        fi
+    fi
+    [ -d /proc ] || return 2
+    for p in /proc/[0-9]*/fd/*; do
+        pid=${p#/proc/}; pid=${pid%%/*}
+        [ "$pid" = "$$" ] && continue
+        target=$(readlink "$p" 2>/dev/null) || return 2
+        [ "$target" = "$want" ] && return 0
+    done
+    return 1
 }
 
 # 确认"我们持有的旧版锁"仍**就是路径上那个文件**(十六轮 P2-②)。
@@ -667,6 +721,8 @@ _xray_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持有
     for p in /proc/[0-9]*/fd/*; do
         pid=${p#/proc/}; pid=${pid%%/*}
         [ "$pid" = "$$" ] && continue
+        # fd 在扫描期间被并发关闭是常态, 读不到就跳过(不是"发现旧进程")。判定主力是
+        # 上面的 `find` 快路径: 它一次遍历完成, 不受这种逐 fd 竞态影响。
         target=$(readlink "$p" 2>/dev/null) || continue
         case "$target" in
             "$prefix"*" (deleted)") return 0 ;;
@@ -2876,6 +2932,12 @@ _uninstall_xray() {
 }
 
 _uninstall_xray_core_locked() {
+    # 卸载锁序: install(外层) → config → core。reset 也走同一顺序, 因而 rm -rf
+    # 不会穿插在 config 事务的 config lock 与 verified restart 之间。
+    _with_config_lock _uninstall_xray_config_locked "$@"
+}
+
+_uninstall_xray_config_locked() {
     _with_core_lock _uninstall_xray_locked "$@"
 }
 
