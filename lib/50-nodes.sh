@@ -708,6 +708,10 @@ _hy2_no_hop_rules_at_all() {
         if command -v ip6tables >/dev/null 2>&1; then
             q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
             printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
+        elif command -v nft >/dev/null 2>&1; then
+            # ip6tables 缺失但存在 nft: IPv6 NAT 可能在 nf_tables 中, 无法观察 ⇒ UNKNOWN。
+            _warn "ip6tables 不可用但检测到 nft, 无法确认是否存在 IPv6 跳跃规则"
+            return 1
         elif [ -e /proc/net/ip6_tables_names ]; then
             # ip6tables 二进制不在, 但内核可能仍有历史 IPv6 nat 规则: 与 IPv4 的无
             # iptables 分支同口径 —— 只有"ip6 x_tables 从未注册过 nat 表"才能证明
@@ -832,6 +836,11 @@ _hy2_remove_hop_rules() {
     # ip6 x_tables 从未注册 nat 表才能证明无需清理; 其余一律 UNKNOWN ⇒ fail-closed。
     if command -v ip6tables >/dev/null 2>&1; then
         v6ok=1
+    elif command -v nft >/dev/null 2>&1; then
+        # xtables-nft 下 IPv6 NAT 规则可能位于 nf_tables, 只读 /proc/net/ip6_tables_names
+        # 不能证明不存在 ⇒ UNKNOWN, fail-closed(二十七轮 P2)。
+        _error "ip6tables 不可用但检测到 nft, 无法确认/清理 IPv6 跳跃规则"
+        return 1
     elif [ -e /proc/net/ip6_tables_names ]; then
         local names6
         if ! names6=$(cat /proc/net/ip6_tables_names 2>/dev/null); then
@@ -1512,6 +1521,11 @@ _hy2_hop_cleanup_candidates() {
         # 这与 `_hy2_no_hop_rules_at_all` 对 ip6 查询失败判 UNKNOWN 同口径。
         q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
         v6ok=1
+    elif command -v nft >/dev/null 2>&1; then
+        # ip6tables 缺失但存在 nft: IPv6 NAT 可能由 nftables 承载(xtables-nft), 无法枚举
+        # 恢复源 ⇒ fail-closed(二十七轮 P2, 与 `_hy2_no_hop_rules_at_all` 同口径)。
+        _error "ip6tables 不可用但检测到 nft, 无法枚举 IPv6 端口跳跃恢复源"
+        return 1
     fi
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
