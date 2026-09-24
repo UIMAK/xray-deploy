@@ -777,16 +777,21 @@ _reset_config_recover_locked() {
         _reset_journal_quarantine "$journal" "schema 非法"
         return 1
     fi
-    had_config=$(jq -r 'if .had_config == true then 1 else 0 end' "$journal" 2>/dev/null)
-    case "$had_config" in
-        0|1) ;;
-        *) _reset_journal_quarantine "$journal" "had_config 非法"; return 1 ;;
-    esac
-    # hop_specs 是**回放执行**的 iptables 参数, 必须严格限定形状, 绝不能信任任意字符串
-    # (损坏/被改写的账本不得变成任意 iptables 命令注入)。
-    if ! jq -e '(.hop_specs == null) or (((.hop_specs | type) == "array") and all(.hop_specs[]; (type == "string") and startswith("-A PREROUTING ") and contains("xray-deploy-hy2-hop")))' \
+    # **严格 schema**(二十四轮 P1): 缺字段/类型不对一律 quarantine, 绝不"猜成默认值"。
+    # 旧写法 `if .had_config == true then 1 else 0 end` 会把缺失/null/字符串/数字全部映射成
+    # 0(= 重置前没有 config), 于是恢复可能 `rm -f "$CONFIG_FILE"` —— 用损坏的账本做出破坏性
+    # 决策。对齐 design: had_config 必须是 boolean, hop_specs 必须是 array(可为空)。
+    if ! jq -e '(.had_config | type) == "boolean"' "$journal" >/dev/null 2>&1; then
+        _reset_journal_quarantine "$journal" "had_config 缺失或非布尔"
+        return 1
+    fi
+    had_config=$(jq -r 'if .had_config then 1 else 0 end' "$journal" 2>/dev/null)
+    # hop_specs 是**回放执行**的参数, 必须严格限定形状(防账本被改写后的命令注入), 且必须
+    # 与候选输出同源: `<4|6> -A PREROUTING ... xray-deploy-hy2-hop`。字段缺失/非数组一律
+    # quarantine —— 否则会把"不知道要恢复什么"当成"没有需要恢复的"。
+    if ! jq -e '((.hop_specs | type) == "array") and all(.hop_specs[]; (type == "string") and test("^[46] -A PREROUTING .*xray-deploy-hy2-hop"))' \
         "$journal" >/dev/null 2>&1; then
-        _reset_journal_quarantine "$journal" "hop_specs 非法"
+        _reset_journal_quarantine "$journal" "hop_specs 缺失/非数组/形状非法"
         return 1
     fi
     if [ "$phase" = "committed" ]; then
@@ -796,6 +801,16 @@ _reset_config_recover_locked() {
         fi
         rm -f "$journal" 2>/dev/null || { _warn "reset journal 清理失败: $journal"; return 1; }
         _info "上次 reset 已提交, 已清理残留快照"
+        # **运行态收敛**(二十四轮 P1): commit 已落盘但进程在重启前被杀 —— 若 Xray 守护进程
+        # 仍活着, 它跑的是旧配置, 与磁盘上的新配置分裂。这里补一次 verified restart, 让运行态
+        # 与已提交状态一致(失败只告警: 文件侧已是提交态, 不能回滚)。
+        if [ -x "$XRAY_BIN" ] && declare -F _restart_xray_verified >/dev/null 2>&1; then
+            if _restart_xray_verified; then
+                _info "上次 reset 的运行态已收敛(已按已提交配置重启)"
+            else
+                _warn "上次 reset 已提交, 但 Xray 重启失败; 请检查服务状态"
+            fi
+        fi
         return 0
     fi
     # (1) 先回补本次 reset 已删除的端口跳跃规则(幂等; 失败保留现场下次重试)。
@@ -870,6 +885,13 @@ _reset_config_locked() {
                 return 1
             fi
         fi
+    elif declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
+        # **混装版本必须 fail-closed**(二十四轮 P1): 有清理能力却拿不到候选枚举助手, 说明
+        # 50-nodes 与 90-menu 版本不一致; 继续清理会在无账本保护下删除 hop runtime。
+        _error "lib 版本不匹配(缺 hop 恢复源枚举助手), 拒绝在无账本保护下执行端口跳跃清理"
+        _tip "请先执行 install.sh --update 同步全部模块, 再重试重置"
+        rm -rf "$snapshot" 2>/dev/null
+        return 1
     fi
     if ! _reset_journal_write "$journal" "$snapshot" "prepared" "$had_json" "$specs_json"; then
         _error "无法写入 reset 事务日志(磁盘空间/权限?), 已取消重置以保护现有数据"
@@ -936,10 +958,13 @@ _reset_config_locked() {
         return 1
     fi
     if ! rm -rf "$snapshot" 2>/dev/null || [ -e "$snapshot" ]; then
+        # **不得提前 return**(二十四轮 P1): 那会跳过下面的 verified restart, 让 disk(新配置)
+        # 与 runtime(旧配置)分裂, 且不经过任何 SIGKILL 就可能发生。保留 committed journal
+        # 供下次启动重试清理, 但本次仍要把运行态收敛到已提交配置。
         _warn "重置已应用, 但旧 metadata/clash 快照清理失败(下次启动会重试): $snapshot"
-        return 0
+    else
+        rm -f "$journal" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动清理"
     fi
-    rm -f "$journal" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动清理"
     # 重启 xray(若在跑)
     if [ -x "$XRAY_BIN" ]; then
         if _restart_xray_verified; then

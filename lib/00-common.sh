@@ -1056,11 +1056,33 @@ _with_config_lock() {
             _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
         fi
-        local legacy_fd="" li
+        # (T1) 旧版配置锁文件若已存在, 用只读见证 fd 记下 inode 身份 —— 与 core/install 的
+        # legacy 锁同一契约: 路径"存在→被删→我们新建 inode"时, 新 fd 与路径都指向新 inode,
+        # 只查"fd 指向路径"会放行, 而旧版写者的 flock 落在已被删除的旧 inode 上, 两边同时进入。
+        local legacy_fd="" legacy_witness="" li
+        if [ -e "$legacy_lock_file" ]; then
+            exec {legacy_witness}<"$legacy_lock_file" 2>/dev/null || legacy_witness=""
+            if [ -z "$legacy_witness" ]; then
+                _error "旧版配置锁文件存在但无法打开见证, 放弃本次修改: $legacy_lock_file"
+                exit 1
+            fi
+        fi
         if ! exec {legacy_fd}>>"$legacy_lock_file" 2>/dev/null; then
+            [ -n "$legacy_witness" ] && eval "exec ${legacy_witness}<&-" 2>/dev/null
             _error "无法打开旧版配置锁文件 $legacy_lock_file(目录不可写?), 放弃本次修改"
             [ -n "$legacy_fd" ] && eval "exec ${legacy_fd}>&-" 2>/dev/null
             exit 1
+        fi
+        # (T2) 见证身份: 打开到的必须就是 T1 看到的那个 inode; 被删除/替换 ⇒ fail-closed。
+        if [ -n "$legacy_witness" ]; then
+            if ! [ "/proc/self/fd/$legacy_fd" -ef "/proc/self/fd/$legacy_witness" ]; then
+                _error "旧版配置锁文件在判定后被删除/替换(部署目录正被卸载?), 放弃本次修改"
+                eval "exec ${legacy_witness}<&-" 2>/dev/null
+                eval "exec ${legacy_fd}>&-" 2>/dev/null
+                exit 1
+            fi
+            eval "exec ${legacy_witness}<&-" 2>/dev/null
+            legacy_witness=""
         fi
         for li in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
             flock -n "$legacy_fd" 2>/dev/null && break

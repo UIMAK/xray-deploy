@@ -571,31 +571,21 @@ _xray_core_lock_fd_reset() {
 # 永久保留占位锁(那会让"卸载后重装"永远拒绝)。跨版本竞态因此是"窗口大幅收窄 + fail-closed",
 # 不是"结构性消除"; 结构性消除只存在于同版本(全部进程都走父目录稳定锁)之后。
 _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkdir目录> <显示名>
-    local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i owner="" ef lrc
-    local witness="" deploy_dir
+    local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i owner="" ef lrc locked=0
+    local witness="" deploy_dir devino
     # **变量名按锁家族分开**: 卸载要同时持 install 锁与 core 锁, 两者都要协调各自的旧路径;
     # 共用一个全局会让后取的覆盖先取的, 先取那把 fd 再也没人关闭/解锁(锁泄漏到进程退出)。
     eval "$fdvar=\"\""
     eval "$dirvar=\"\""
     if command -v flock >/dev/null 2>&1; then
-        # 旧版 mkdir 后端: 目录存在(活持有者或 SIGKILL 残留)一律拒绝 —— 绝不自动接管。
-        # **只检查、不创建标记**: 本路径有 flock(内核持锁, SIGKILL 自动释放), 若在这里
-        # mkdir 目录标记, 一次强杀就会留下无人持有的目录锁, 之后每次服务操作/核心事务都
-        # 被自己的残留永久拒绝 —— 那等于用"跨版本协调"换掉 flock 路径最宝贵的自愈性。
-        if [ -e "$ldir" ]; then
-            owner=$(cat "$ldir/pid" 2>/dev/null)
-            case "$owner" in
-                ''|*[!0-9]*) owner="" ;;
-                *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
-            esac
-            _error "旧版${label}目录锁仍存在(pid ${owner:-未知}): $ldir"
-            _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-            return 1
-        fi
         # (T1) 旧 flock 文件若已存在, 用**见证 fd** 记下它此刻的 inode 身份(只读, 不加锁);
         # 拿不到(不存在/打不开)视为"即将新建 inode", 先跑 /proc 删除树扫描。
         if [ -e "$lfile" ]; then
             eval "exec {witness}<\"\$lfile\"" 2>/dev/null || witness=""
+            if [ -z "$witness" ]; then
+                _error "旧版${label}文件存在但无法打开见证, 放弃本次操作: $lfile"
+                return 1
+            fi
         fi
         if [ -z "$witness" ]; then
             deploy_dir=$(dirname "$lfile")
@@ -626,14 +616,75 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
             witness=""
         fi
         for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-            if flock -n "$ef" 2>/dev/null; then return 0; fi
+            if flock -n "$ef" 2>/dev/null; then locked=1; break; fi
             sleep 1
         done
-        _error "旧版${label}仍被占用(15s), 可能仍有旧版会话在操作: $lfile"
-        _tip "等旧版会话退出后重试(内核会在持有进程退出时自动释放该锁)"
-        eval "exec ${ef}>&-" 2>/dev/null
-        eval "$fdvar=\"\""
-        return 1
+        if [ "$locked" -ne 1 ]; then
+            _error "旧版${label}仍被占用(15s), 可能仍有旧版会话在操作: $lfile"
+            _tip "等旧版会话退出后重试(内核会在持有进程退出时自动释放该锁)"
+            eval "exec ${ef}>&-" 2>/dev/null
+            eval "$fdvar=\"\""
+            return 1
+        fi
+        # (T3) 旧版 **mkdir 后端**的排他标记(二十四轮 P1): 只"看一眼目录在不在"不是互斥 ——
+        # 无 flock 的旧进程可以在我们检查之后 mkdir。故在持有旧版 flock 期间创建同名标记目录,
+        # 让它的 mkdir 失败而拒绝。标记带 `.witness`(= 本 flock 文件的 dev:ino): 若我们被
+        # SIGKILL, 下一个持有**同一 flock** 的进程可以安全清理并重建(此时无人持有该 flock);
+        # 没有匹配 witness 的目录 = 旧版持有者/残留 ⇒ 一律拒绝, 绝不自动接管。
+        devino=$(_xray_devino "$lfile" 2>/dev/null)
+        if [ -z "$devino" ]; then
+            _error "无法读取旧版${label}文件标识(dev:ino), 放弃本次操作: $lfile"
+            eval "exec ${ef}>&-" 2>/dev/null
+            eval "$fdvar=\"\""
+            return 1
+        fi
+        if [ -e "$ldir" ]; then
+            if [ -f "$ldir/.witness" ] && [ "$(cat "$ldir/.witness" 2>/dev/null)" = "$devino" ]; then
+                # 同族进程上次持锁时被强杀留下的标记: 此刻已无人持有该 flock ⇒ 安全清理
+                rm -rf "$ldir" 2>/dev/null
+            fi
+        fi
+        if [ -e "$ldir" ]; then
+            owner=$(cat "$ldir/pid" 2>/dev/null)
+            case "$owner" in
+                ''|*[!0-9]*) owner="" ;;
+                *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
+            esac
+            _error "旧版${label}目录锁仍存在(pid ${owner:-未知}): $ldir"
+            _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+            flock -u "$ef" 2>/dev/null
+            eval "exec ${ef}>&-" 2>/dev/null
+            eval "$fdvar=\"\""
+            return 1
+        fi
+        if ! mkdir "$ldir" 2>/dev/null; then
+            _error "旧版${label}目录锁被占用或无法创建: $ldir"
+            _tip "确认没有旧版会话在运行后, 请人工检查该锁目录后重试"
+            flock -u "$ef" 2>/dev/null
+            eval "exec ${ef}>&-" 2>/dev/null
+            eval "$fdvar=\"\""
+            return 1
+        fi
+        # 先写 .witness 再写 pid: 若恰在此刻被杀, 留下"有 witness 无 pid"的目录仍可被同族
+        # 进程安全接管; 反过来则只能人工处理。任一步写入失败都滚回去(fail-closed)。
+        if ! printf '%s\n' "$devino" > "$ldir/.witness" 2>/dev/null; then
+            rm -rf "$ldir" 2>/dev/null
+            flock -u "$ef" 2>/dev/null
+            eval "exec ${ef}>&-" 2>/dev/null
+            eval "$fdvar=\"\""
+            _error "无法写入旧版${label}见证记录 $ldir/.witness, 放弃本次操作"
+            return 1
+        fi
+        if ! printf '%s\n' "$$" > "$ldir/pid" 2>/dev/null; then
+            rm -rf "$ldir" 2>/dev/null
+            flock -u "$ef" 2>/dev/null
+            eval "exec ${ef}>&-" 2>/dev/null
+            eval "$fdvar=\"\""
+            _error "无法写入旧版${label}持有者记录 $ldir/pid, 放弃本次操作"
+            return 1
+        fi
+        eval "$dirvar=\"\$ldir\""
+        return 0
     fi
     # 无 flock: 旧版通常走 mkdir 目录锁, 但仍先检查旧 flock 文件是否被某个进程打开。
     # 当前没有 flock 时无法建立内核 flock, 因而只能阻止已经存在的旧 flock 持有者;
@@ -738,6 +789,9 @@ _xray_legacy_lock_identity_ok() {   # <fd> <见证fd>; 0 = 同一 inode
     [ "/proc/self/fd/$fd" -ef "/proc/self/fd/$wfd" ]
 }
 
+# 路径的 dev:ino 标识(用于 mkdir 标记的自愈判定)。取不到输出空; 调用方必须 fail-closed。
+_xray_devino() { stat -c '%d:%i' "$1" 2>/dev/null; }
+
 _xray_legacy_lock_release() {   # <fd变量名> <mkdir变量名>
     local fdvar="$1" dirvar="$2" ef d
     eval "ef=\${${fdvar}:-}"
@@ -749,8 +803,8 @@ _xray_legacy_lock_release() {   # <fd变量名> <mkdir变量名>
     eval "d=\${${dirvar}:-}"
     if [ -n "$d" ]; then
         if [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ]; then
-            rm -f "$d/pid" 2>/dev/null
-            rmdir "$d" 2>/dev/null
+            # 目录内有 .witness(flock 路径)或仅 pid(无 flock 退路); 归属校验通过后整体删除。
+            rm -rf "$d" 2>/dev/null
         fi
         eval "$dirvar=\"\""
     fi
