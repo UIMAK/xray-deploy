@@ -110,8 +110,11 @@ _has_reality_nodes() {
 # 主菜单
 # ---------------------------------------------------------------------------
 _main_menu() {
-    # 启动时: 自动补 tag + 自动采纳孤儿入站 + 恢复中断的端口事务 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
-    # 后三个用 declare -F 守卫: 混装版本(90-menu 已更新而 20/30/50-nodes 未更新)时静默跳过
+    # 启动时: 收敛中断的 reset + 自动补 tag + 自动采纳孤儿入站 + 恢复中断的端口事务 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
+    # 各恢复/迁移步骤都用 declare -F 守卫: 混装版本(模块未同步更新)时静默跳过。
+    # reset 恢复放在最前: 半截 reset 的 live 状态可能是"config 空/缺 + nodes 空 + 快照藏着
+    # 旧 metadata", 先收敛再让 adopt/normalize 基于稳定状态工作。
+    if declare -F _reset_config_recover >/dev/null 2>&1; then _reset_config_recover; fi
     _auto_tag_tagless_inbounds
     _auto_adopt_orphans
     # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
@@ -637,11 +640,49 @@ _reset_config() {
     fi
 }
 
-# Restore the filesystem side of a reset that has not committed yet. The config backup and
-# the metadata/clash snapshot are separate evidence, so both must converge before the caller
-# reports the reset as failed-and-recovered.
-_reset_config_snapshot_restore() {
-    local stage="$1" nodes_moved="$2" clash_moved="$3" ok=0
+# ---------------------------------------------------------------------------
+# reset 的崩溃恢复(二十轮 P1-3)。
+#
+# reset 是"备份 → 移走 metadata/clash → 删 config → 重建"的多步事务, 进程被 SIGKILL/OOM/
+# 掉电杀死时没有任何函数会被调用。故与 coretxn 同口径: **先把 journal(含 config 副本)
+# 落盘, 再动任何真实状态**; 启动期发现未提交的 journal 就回滚到重置前, 已提交的只清理:
+#   prepared  -> 已开始移动 metadata/clash, 崩溃必须回滚(config 也回到副本)
+#   committed -> 重置后状态已生效, 崩溃只需清理快照与 journal
+# 快照目录用**固定名**: reset 全程持有 install+config 锁, 同一时刻只可能有一个 reset 事务。
+# journal 经 `_atomic_write_json` 提交(内部 fsync 文件 + 父目录), 掉电不会读到半写 phase。
+# ---------------------------------------------------------------------------
+_reset_journal_path() { printf '%s' "$DEPLOY_DIR/.reset-journal.json"; }
+_reset_snapshot_path() { printf '%s' "$DEPLOY_DIR/.reset-snapshot"; }
+
+_reset_journal_quarantine() {   # <journal> <原因>
+    local journal="$1" why="$2" bad i=0
+    bad="${journal}.corrupt"
+    while [ -e "$bad" ]; do i=$((i+1)); bad="${journal}.corrupt.${i}"; done
+    if mv "$journal" "$bad" 2>/dev/null; then
+        _warn "reset 事务日志${why}, 已隔离为 $bad; 快照保留在 $(_reset_snapshot_path) 供人工检查"
+    else
+        _warn "reset 事务日志${why}且隔离失败, 请人工检查: $journal"
+    fi
+    return 1
+}
+
+# 回滚"未提交的 reset"的文件系统侧。config 优先用快照里的副本恢复(不依赖会被后续事务
+# 覆盖的 lastbak); 重置前没有 config 时回滚即恢复"无配置"。
+_reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_config>
+    local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0
+    if [ "$had_config" -eq 1 ]; then
+        if [ -s "$stage/config.json" ]; then
+            if ! _atomic_write_json "$CONFIG_FILE" "$(cat "$stage/config.json" 2>/dev/null)"; then
+                _error "配置回滚失败, 请手动从快照副本恢复: $stage/config.json"
+                ok=1
+            fi
+        elif ! _restore_config; then
+            _error "配置回滚失败, 请手动从 $BACKUP_DIR/config.json.lastbak 恢复"
+            ok=1
+        fi
+    else
+        rm -f "$CONFIG_FILE" 2>/dev/null || ok=1
+    fi
     if [ "$nodes_moved" -eq 1 ]; then
         rm -rf "$NODES_DIR" 2>/dev/null || ok=1
         if ! mv "$stage/nodes" "$NODES_DIR" 2>/dev/null; then ok=1; fi
@@ -656,8 +697,83 @@ _reset_config_snapshot_restore() {
     return "$ok"
 }
 
+# 回滚 + 清 journal(仅回滚完整时才清账本); 不完整则保留 journal 与快照供启动期重试。
+_reset_config_abort_locked() {   # <stage> <nodes_moved> <clash_moved> <had_config>
+    local stage="$1" journal
+    if ! _reset_config_snapshot_restore "$@"; then
+        _error "reset 回滚不完整, 快照与事务日志保留供下次启动重试: $stage"
+        return 1
+    fi
+    journal=$(_reset_journal_path)
+    rm -f "$journal" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动收敛"
+    _warn "已回滚, 重置未生效: 配置与节点数据均保持原样"
+    return 0
+}
+
+# 带锁的恢复入口(启动期/菜单调用); `_reset_config_locked` 内部直接调 locked 体。
+_reset_config_recover() {
+    _with_config_lock _reset_config_recover_locked
+}
+
+_reset_config_recover_locked() {
+    local journal snapshot phase had_config nodes_moved=0 clash_moved=0
+    journal=$(_reset_journal_path)
+    snapshot=$(_reset_snapshot_path)
+    if [ ! -e "$journal" ]; then
+        # journal 是提交顺序里的**最后**一个文件: 没有它, 快照只能是"写 journal 之前"的
+        # 残骸或已提交后的清理残留, 两者都无权威可恢复, 直接清掉。
+        [ -e "$snapshot" ] && rm -rf "$snapshot" 2>/dev/null
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        # 没有 jq 不能把合法 journal 误判成损坏去隔离: 原样保留, 下次带 jq 启动再收敛。
+        _warn "jq 不可用, 无法解析 reset 事务日志, 已跳过恢复(现场保留): $journal"
+        return 1
+    fi
+    if ! jq -e . "$journal" >/dev/null 2>&1; then
+        _reset_journal_quarantine "$journal" "无法解析"
+        return 1
+    fi
+    phase=$(jq -r '.phase // empty' "$journal" 2>/dev/null)
+    if [ "$(jq -r '.snapshot // empty' "$journal" 2>/dev/null)" != "$snapshot" ] || \
+       { [ "$phase" != "prepared" ] && [ "$phase" != "committed" ]; }; then
+        _reset_journal_quarantine "$journal" "schema 非法"
+        return 1
+    fi
+    had_config=$(jq -r 'if .had_config == true then 1 else 0 end' "$journal" 2>/dev/null)
+    case "$had_config" in
+        0|1) ;;
+        *) _reset_journal_quarantine "$journal" "had_config 非法"; return 1 ;;
+    esac
+    if [ "$phase" = "committed" ]; then
+        if ! rm -rf "$snapshot" 2>/dev/null || [ -e "$snapshot" ]; then
+            _warn "reset 已提交, 但快照清理失败(下次启动重试): $snapshot"
+            return 1
+        fi
+        rm -f "$journal" 2>/dev/null || { _warn "reset journal 清理失败: $journal"; return 1; }
+        _info "上次 reset 已提交, 已清理残留快照"
+        return 0
+    fi
+    [ -d "$snapshot/nodes" ] && nodes_moved=1
+    [ -f "$snapshot/clash.yaml" ] && clash_moved=1
+    if ! _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"; then
+        _warn "上次 reset 崩溃后的回滚不完整, 快照与 journal 保留供重试: $snapshot"
+        return 1
+    fi
+    rm -f "$journal" 2>/dev/null || { _warn "reset journal 清理失败: $journal"; return 1; }
+    _warn "检测到上次 reset 未提交, 已回滚到重置前的配置与节点"
+    return 0
+}
+
 _reset_config_locked() {
-    local had_config=0 nodes_moved=0 clash_moved=0 snapshot
+    local had_config=0 nodes_moved=0 clash_moved=0 snapshot journal had_json
+    snapshot=$(_reset_snapshot_path)
+    journal=$(_reset_journal_path)
+    # 先收敛上一次崩溃的 reset(同锁内); 收敛失败(损坏/schema 非法/回滚不完整)时拒绝开新事务。
+    if ! _reset_config_recover_locked; then
+        _error "上次 reset 的残局未能收敛, 已取消本次重置(现场保留供人工检查)"
+        return 1
+    fi
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
         had_config=1
         # 2026-09-12 三审(M1): 重置是清空全部节点数据的破坏性操作, 备份失败(磁盘满/IO 错误)
@@ -667,6 +783,7 @@ _reset_config_locked() {
             return 1
         fi
     fi
+    if [ "$had_config" -eq 1 ]; then had_json=true; else had_json=false; fi
     # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
         if ! _hy2_cleanup_all_hops; then
@@ -674,9 +791,22 @@ _reset_config_locked() {
             return 1
         fi
     fi
-    snapshot="$DEPLOY_DIR/.reset-snapshot.$$"
+    # 恢复源与账本先落盘, 再动任何真实状态: 崩溃时才有据可回滚。
     if [ -e "$snapshot" ] || ! mkdir "$snapshot" 2>/dev/null; then
         _error "无法创建 reset 恢复快照目录, 已取消重置以保护现有数据"
+        return 1
+    fi
+    if [ "$had_config" -eq 1 ]; then
+        # config 副本是比 lastbak 更可靠的恢复源(lastbak 会被后续任何配置事务覆盖)。
+        if ! cp -f "$CONFIG_FILE" "$snapshot/config.json" 2>/dev/null || [ ! -s "$snapshot/config.json" ]; then
+            _error "无法保存重置前的配置快照, 已取消重置以保护现有数据"
+            rm -rf "$snapshot" 2>/dev/null
+            return 1
+        fi
+    fi
+    if ! _atomic_write_json "$journal" "{\"snapshot\":\"$snapshot\",\"phase\":\"prepared\",\"had_config\":$had_json}"; then
+        _error "无法写入 reset 事务日志(磁盘空间/权限?), 已取消重置以保护现有数据"
+        rm -rf "$snapshot" 2>/dev/null
         return 1
     fi
     if [ -d "$NODES_DIR" ]; then
@@ -684,67 +814,56 @@ _reset_config_locked() {
         # 快照里不存在的内容 ⇒ 直接毁掉全部节点元数据)。只有 mv 确认成功才置 nodes_moved。
         if ! mv "$NODES_DIR" "$snapshot/nodes" 2>/dev/null; then
             _error "无法准备节点 metadata 恢复快照, 已取消重置以保护现有数据"
-            rm -rf "$snapshot" 2>/dev/null
+            _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
             return 1
         fi
         nodes_moved=1
         if ! mkdir -p "$NODES_DIR" 2>/dev/null; then
             _error "无法重建节点 metadata 目录, 正在恢复重置前的快照"
-            _reset_config_snapshot_restore "$snapshot" 1 0 || \
-                _error "节点 metadata 快照恢复失败, 请手动检查: $snapshot"
+            _reset_config_abort_locked "$snapshot" 1 0 "$had_config"
             return 1
         fi
     fi
     if [ -f "$CLASH_YAML" ]; then
         if ! mv "$CLASH_YAML" "$snapshot/clash.yaml" 2>/dev/null; then
             _error "无法准备 clash 恢复快照, 已取消重置以保护现有数据"
-            _reset_config_snapshot_restore "$snapshot" "$nodes_moved" 0 || \
-                _error "metadata 恢复失败, 请手动检查: $snapshot"
+            _reset_config_abort_locked "$snapshot" "$nodes_moved" 0 "$had_config"
             return 1
         fi
         clash_moved=1
     fi
     # 删掉 config 让 _init_config_if_empty 重建。
-    # **重建失败必须回滚, 且回滚要在清元数据之前**(2026-09-22 九轮 OCR #41)。
-    # 旧写法 `rm -f "$CONFIG_FILE"; _init_config_if_empty`(返回值丢弃)随后**无条件**清空
-    # `nodes/*.json` —— 于是"重建失败(只读/磁盘满/jq 异常)"的残局是**既没有配置、也没有
-    # 节点元数据**, 而上面那段刚花力气做的备份只保护了 config 一侧。
-    # 处置: 消费返回码, 失败走 `_restore_config`(它读的是 `_backup_config` 刚写的 lastbak)
-    # 并立即返回 —— 元数据与 clash 只有在配置确实重建成功之后才允许被清。
+    # **重建失败必须回滚**(2026-09-22 九轮 OCR #41): 不滚会留下"既没有配置、也没有节点
+    # 元数据"; 回滚源是快照里的 config 副本与 metadata/clash, 失败时保留 journal 供启动重试。
     if ! rm -f "$CONFIG_FILE" 2>/dev/null; then
         _error "无法删除旧 config.json, 已取消重置以保护现有数据"
-        _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved" || \
-            _error "metadata/clash 恢复失败, 请手动检查: $snapshot"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
     if ! _init_config_if_empty; then
         _error "重建默认配置失败(只读/磁盘空间/jq 异常?), 正在回滚到重置前的配置"
-        local config_ok=0 snapshot_ok=0
-        if [ "$had_config" -eq 1 ] && _restore_config; then config_ok=1; fi
-        if _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved"; then snapshot_ok=1; fi
-        if [ "$config_ok" -eq 1 ] && [ "$snapshot_ok" -eq 1 ]; then
-            _warn "已回滚, 重置未生效: 配置与节点数据均保持原样"
-        else
-            [ "$had_config" -eq 1 ] || _error "重置前没有可恢复的旧配置"
-            [ "$config_ok" -eq 1 ] || _error "配置回滚失败, 请手动从 $BACKUP_DIR/config.json.lastbak 恢复"
-            [ "$snapshot_ok" -eq 1 ] || _error "metadata/clash 回滚失败, 请手动检查: $snapshot"
-        fi
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
     # 配置已确认重建成功; live metadata 目录已经是空目录, clash 重新落地也必须成功。
     if [ "$clash_moved" -eq 1 ] && \
        { ! printf 'proxies:\n' > "$CLASH_YAML" 2>/dev/null || [ ! -s "$CLASH_YAML" ]; }; then
         _error "清空 clash 派生配置失败, 正在回滚重置"
-        local config_ok=0 snapshot_ok=0
-        if [ "$had_config" -eq 1 ] && _restore_config; then config_ok=1; fi
-        if _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved"; then snapshot_ok=1; fi
-        [ "$config_ok" -eq 1 ] && [ "$snapshot_ok" -eq 1 ] || \
-            _error "reset 回滚不完整, 请手动检查配置与 metadata"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        return 1
+    fi
+    # COMMIT: phase 先 durable 落盘, 之后**绝不再回滚**; 任一步失败都留 committed journal
+    # 给启动恢复做 cleanup。
+    if ! _atomic_write_json "$journal" "{\"snapshot\":\"$snapshot\",\"phase\":\"committed\",\"had_config\":$had_json}"; then
+        _error "重置已应用但提交日志写入失败, 正在回滚"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
     if ! rm -rf "$snapshot" 2>/dev/null || [ -e "$snapshot" ]; then
-        _warn "重置已应用, 但旧 metadata/clash 快照清理失败: $snapshot"
+        _warn "重置已应用, 但旧 metadata/clash 快照清理失败(下次启动会重试): $snapshot"
+        return 0
     fi
+    rm -f "$journal" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动清理"
     # 重启 xray(若在跑)
     if [ -x "$XRAY_BIN" ]; then
         if _restart_xray_verified; then

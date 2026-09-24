@@ -704,10 +704,18 @@ _hy2_no_hop_rules_at_all() {
     if command -v iptables >/dev/null 2>&1; then
         q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
         printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
-        # IPv6 侧为 best-effort: 命令存在但查询失败时无法确认, 保守判 UNKNOWN
+        # IPv6 侧: 命令存在但查询失败时无法确认, 保守判 UNKNOWN
         if command -v ip6tables >/dev/null 2>&1; then
             q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
             printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
+        elif [ -e /proc/net/ip6_tables_names ]; then
+            # ip6tables 二进制不在, 但内核可能仍有历史 IPv6 nat 规则: 与 IPv4 的无
+            # iptables 分支同口径 —— 只有"ip6 x_tables 从未注册过 nat 表"才能证明
+            # 不存在 IPv6 DNAT; 注册了 nat 却无从查询内容 ⇒ UNKNOWN(fail-closed)。
+            if ! q=$(cat /proc/net/ip6_tables_names 2>/dev/null); then
+                return 1
+            fi
+            printf '%s\n' "$q" | grep -qx "nat" && return 1
         fi
         runtime_clean=1
     else
