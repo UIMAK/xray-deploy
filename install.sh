@@ -708,6 +708,15 @@ _install_lock_inode_ok() {   # <fd> <path>
     esac
 }
 
+# 见证 inode 身份: 打开的旧锁 fd 必须与 T1 见证 fd 指向同一 inode。只查"fd 是否指向路径上的
+# 文件"挡不住"路径存在 → 被删 → 我们新建 inode"的 TOCTOU —— 那时 fd 与路径都是新 inode, 会
+# 通过复核, 而 flock 落在旧进程根本不认识的新 inode 上(与 `_xray_legacy_lock_identity_ok` 同源)。
+_install_legacy_lock_identity_ok() {   # <fd> <见证fd>; 0 = 同一 inode
+    local fd="$1" wfd="$2"
+    [ -n "$fd" ] && [ -n "$wfd" ] || return 1
+    [ "/proc/self/fd/$fd" -ef "/proc/self/fd/$wfd" ]
+}
+
 # 旧版安装器不认识部署目录外的新锁。若旧版已拿到目录内锁并在卸载时删掉整棵树,
 # 新版随后重建同名目录/锁路径会得到全新的 inode, 与旧进程手里的已删除 fd 不互斥。
 # 在重建旧路径前扫描仍持有已删除部署文件的进程并 fail-closed。该检查只能缩小窗口;
@@ -763,7 +772,7 @@ _install_legacy_flock_active() {
 }
 
 _install_lock_acquire() {
-    local install_lock_parent="${DEPLOY_DIR%/*}" legacy_fresh=0 lrc
+    local install_lock_parent="${DEPLOY_DIR%/*}" lrc legacy_witness=""
     [ -n "$install_lock_parent" ] || install_lock_parent="/"
     mkdir -p "$install_lock_parent" 2>/dev/null || {
         echo "[错误] 无法创建安装锁父目录 $install_lock_parent(权限/只读文件系统?), 安装中止"
@@ -786,11 +795,13 @@ _install_lock_acquire() {
                 _install_lock_release
                 return 1
             fi
-            # **在此刻判定**, 而不是脚本启动时: 旧版卸载者可能在启动之后才删掉整棵树与旧锁路径,
-            # 启动快照(0)会让下面跳过扫描而新建 inode —— 跨版本竞态窗口重新打开。
-            legacy_fresh=0
-            [ -e "$INSTALL_LEGACY_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY_LOCK_DIR" ] || legacy_fresh=1
-            if [ "$legacy_fresh" -eq 1 ] && _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+            # (T1) 旧 flock 文件若已存在, 用见证 fd 记下它此刻的 inode 身份(只读, 不加锁);
+            # 拿不到(不存在/打不开)才跑 /proc 删除树扫描 —— 判定必须是此刻的事实, 且不
+            # 依赖"路径存在"这一会在打开前失效的快照。
+            if [ -e "$INSTALL_LEGACY_LOCK_FILE" ]; then
+                eval "exec {legacy_witness}<\"\$INSTALL_LEGACY_LOCK_FILE\"" 2>/dev/null || legacy_witness=""
+            fi
+            if [ -z "$legacy_witness" ] && _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
                 echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
                 _install_lock_release
                 return 1
@@ -808,9 +819,23 @@ _install_lock_acquire() {
             # 旧版同为 flock 路径(`.install.lock.fd`): 拿不到就说明旧版安装/卸载仍在跑。
             exec {INSTALL_LEGACY_LOCK_FD}>>"$INSTALL_LEGACY_LOCK_FILE" 2>/dev/null || {
                 INSTALL_LEGACY_LOCK_FD=""
+                [ -n "$legacy_witness" ] && eval "exec ${legacy_witness}<&-" 2>/dev/null
                 echo "[错误] 无法打开旧版安装锁文件 $INSTALL_LEGACY_LOCK_FILE(权限/只读文件系统?), 安装中止"
                 _install_lock_release
                 return 1; }
+            # (T2) 见证身份: 打开的 fd 必须就是 T1 看到的那个 inode; "存在→被删→新建"时
+            # 我们拿到的是新 inode, 与旧进程的 flock 不互斥 ⇒ fail-closed。
+            if [ -n "$legacy_witness" ]; then
+                if ! _install_legacy_lock_identity_ok "$INSTALL_LEGACY_LOCK_FD" "$legacy_witness"; then
+                    echo "[错误] 旧版安装锁文件在判定后被删除/替换(部署目录正被卸载?), 本次中止"
+                    eval "exec ${legacy_witness}<&-" 2>/dev/null
+                    legacy_witness=""
+                    _install_lock_release
+                    return 1
+                fi
+                eval "exec ${legacy_witness}<&-" 2>/dev/null
+                legacy_witness=""
+            fi
             if ! flock -n "$INSTALL_LEGACY_LOCK_FD" 2>/dev/null; then
                 echo "[错误] 旧版安装/卸载仍在运行(持有 $INSTALL_LEGACY_LOCK_FILE), 本次中止"
                 echo "       以免两棵树互相覆盖; 等它退出后重试(内核会在持有进程退出时自动释放)"
@@ -821,11 +846,6 @@ _install_lock_acquire() {
             # 否则我们握着的是已解除链接的 inode, 与"路径上新建文件的旧版进程"会同时放行。
             if ! _install_lock_inode_ok "${INSTALL_LEGACY_LOCK_FD:-}" "$INSTALL_LEGACY_LOCK_FILE"; then
                 echo "[错误] 旧版安装锁文件在获取后被替换/删除(部署目录正被卸载?), 本次中止"
-                _install_lock_release
-                return 1
-            fi
-            if [ "$legacy_fresh" -eq 1 ] && _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
-                echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
                 _install_lock_release
                 return 1
             fi
@@ -846,9 +866,8 @@ _install_lock_acquire() {
         _install_lock_release
         return 1
     fi
-    legacy_fresh=0
-    [ -e "$INSTALL_LEGACY_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY_LOCK_DIR" ] || legacy_fresh=1
-    if [ "$legacy_fresh" -eq 1 ] && _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+    # mkdir 退路没有"见证 fd"可用(旧后端就是目录锁): 目录不存在时先跑 /proc 删除树扫描。
+    if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
         echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
         _install_lock_release
         return 1
