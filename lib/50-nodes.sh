@@ -5264,7 +5264,9 @@ _delete_node() {
             y|Y) ;;
             *) _info "已取消"; _press_any_key; return ;;
         esac
-        _with_config_lock _delete_node_apply_all "${tags[@]}"
+        # 自签证书询问在锁外完成(二十九轮 P2): 把人工思考时间留在临界区外。
+        _hy2_ask_purge_self_certs "${tags[@]}"
+        _with_config_lock _delete_node_apply_all
         _press_any_key; return
     fi
 
@@ -5293,6 +5295,7 @@ _delete_node() {
         read -rp "  继续? [y/N]: " ans
         case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; return ;; esac
 
+        _hy2_ask_purge_self_certs "${del_tags[@]}"
         _with_config_lock _delete_node_apply_multi "${del_tags[@]}"
         _press_any_key; return
     fi
@@ -5301,14 +5304,26 @@ _delete_node() {
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
+    _hy2_ask_purge_self_certs "$tag"
     _with_config_lock _delete_node_apply_single "$tag"
     _press_any_key
 }
 
 # 破坏性阶段(调用方必须已持 config lock)。返回 0=已提交, 1=失败/取消(原因已打印)。
-# **绝不在此等待按键**(避免持锁阻塞在其他交互路径上)。
+# **绝不在此等待按键**(避免持锁阻塞在其他交互路径上), **也不接受调用方的节点快照**:
+# "全部删除"的范围必须在锁内重新枚举(二十九轮 P1) —— 锁外确认期间并发新增的节点若不在
+# 删除集合里, `.inbounds = []` 仍会清掉它的 inbound 而 metadata 保留, 直接造出 config/metadata
+# 分裂(甚至孤儿 DNAT)。
 _delete_node_apply_all() {
-    local tags=("$@") tag
+    local tags=() tag f
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        tags+=("$(basename "$f" .json)")
+    done
+    if [ ${#tags[@]} -eq 0 ]; then
+        _error "当前没有可删除的节点(metadata 为空), 已取消"
+        return 1
+    fi
     # R17: 先清理所有端口跳跃 iptables 规则(teardown 事务)
     # R33(P1): 无条件调用 teardown_all——iptables 不可用但存在 hop 规则时由其内部 fail-closed
     # (不能因 command -v iptables 为假就跳过, 否则删 config/metadata 后留下孤儿 DNAT)
@@ -5323,9 +5338,8 @@ _delete_node_apply_all() {
         _error "没有可安全删除的节点"
         return 1
     fi
-    # 自签证书: 只对 metadata 声明 self_signed=true 的节点提示(自定义证书不提示、不删除),
-    # 且在节点删除**成功后**才落地删除
-    _hy2_ask_purge_self_certs "${del_all[@]}"
+    # 自签证书: 询问已在**锁外**完成(`_delete_node` 里), 这里只消费回答; 实际删除在提交成功后。
+    # 被跳过的节点其证书仍被 config 引用, `_hy2_purge_self_certs` 会自行保留(不会误删)。
     # 无排除项: 沿用原语义(清空 inbounds, 连手工添加的入站一并清掉)
     # 有排除项: 只删可安全删除的 tag(含其 tunnel_tag), 保留被排除节点的入站
     # (M2 同口径: 非对象规则元素保留, 避免 jq 整体报错)
@@ -5389,7 +5403,7 @@ _delete_node_apply_multi() {
         _error "没有可安全删除的节点"
         return 1
     fi
-    _hy2_ask_purge_self_certs "${del_tags[@]}"
+    # 自签证书询问在锁外(_delete_node)完成, 这里只消费回答
     local del_ttags=() dtt
     for dt in "${del_tags[@]}"; do
         dtt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${dt}.json" 2>/dev/null)
@@ -5482,7 +5496,7 @@ _delete_node_apply_single() {
             fi
         fi
     fi
-    _hy2_ask_purge_self_certs "$tag"
+    # 自签证书询问在锁外(_delete_node)完成, 这里只消费回答
     if _mutate_config --arg t "$tag" --arg tg "$tunnel_tag" "$jq_filter"; then
         # R18: 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
         # R19: 消费 YAML 删除返回值——失败不静默(权威删除已完成, clash.yaml 属派生导出)
