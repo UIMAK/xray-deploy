@@ -1453,9 +1453,67 @@ _hy2_list_all_hop_rules() {
     fi
 }
 
-# 清理所有节点的端口跳跃 iptables 规则
+# 打印"当前会被 `_hy2_cleanup_all_hops` 删除"的 IPv4 规则 spec(每行一个, `-A PREROUTING ...`)。
+# 单一来源: 清理函数用它做失败回滚的 `saved` 集合, reset 用它把恢复源写进 journal,
+# 两处不得各自再写一份(否则必然漂移)。只读; iptables 不可用/查询失败时输出空并返回 1。
+_hy2_hop_cleanup_candidates() {
+    command -v iptables >/dev/null 2>&1 || return 1
+    [ -d "$NODES_DIR" ] || return 0
+    local q f proto port ranges
+    q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        port=$(jq -r '.port' "$f" 2>/dev/null)
+        [ -n "$port" ] || continue
+        ranges=$(_read_hop_ranges "$f")
+        [ -n "$ranges" ] || continue
+        # 目标端口在节点间唯一(即 hy2 监听端口), 故按 target 取到的就是本节点的全部规则;
+        # 即便 metadata 的 range 与 runtime 有出入, 作为"恢复源"取超集也是安全的(回滚只补缺失项)。
+        printf '%s\n' "$q" | grep "xray-deploy-hy2-hop" | _hy2_match_target "$port"
+    done
+}
+
+# 恢复被删除的 IPv4 规则: **只补当前不存在的 spec**, 已存在的不重复添加。0=全部就位; 1=有失败。
+_hy2_restore_hop_rules() {
+    local q line ok=0
+    [ "$#" -gt 0 ] || return 0
+    command -v iptables >/dev/null 2>&1 || return 1
+    q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
+    for line in "$@"; do
+        [ -n "$line" ] || continue
+        printf '%s\n' "$q" | grep -qF -- "$line" && continue
+        # spec 来自 `iptables -S`(`-A PREROUTING ...`, 无引号空白), 直接作为命令回放。
+        # shellcheck disable=SC2086
+        iptables -t nat $line 2>/dev/null || ok=1
+    done
+    return "$ok"
+}
+
+# 回滚 + 重新持久化。0=规则已全部恢复(或无需恢复); 1=恢复不完整, 调用方必须如实报告并保留现场。
+_hy2_restore_hop_rules_checked() {
+    [ "$#" -gt 0 ] || return 0
+    if ! _hy2_restore_hop_rules "$@"; then
+        _error "回滚未能恢复全部端口跳跃规则, metadata 与 runtime 可能分裂, 请手动检查: iptables -t nat -S PREROUTING"
+        return 1
+    fi
+    if ! _hy2_persist_iptables; then
+        _warn "端口跳跃规则已恢复, 但持久化刷新失败: 重启后规则可能丢失"
+    fi
+    return 0
+}
+
+# 清理所有节点的端口跳跃 iptables 规则。
+#
+# **失败即回滚**(二十轮 P1-2/P1-3): 逐个节点删除时, 任一后续步骤失败都会让"已删除的规则"
+# 停留在 runtime 而 metadata 仍在 —— 这正是项目一直在防的 metadata↔runtime 分裂。故本函数
+# 先把候选 spec 全量捕获, 失败(删除残留/持久化失败/全局核验失败)时按 spec 回补缺失项并
+# 重新持久化, 使失败返回时的现场与调用前一致。崩溃(SIGKILL)窗口不在本函数内闭环: reset 把
+# 候选 spec 写进自己的 journal, 由启动恢复回补; uninstall 无 journal, 该窗口作为已知残余声明。
 _hy2_cleanup_all_hops() {
     local found=0 residual=0 metadata_hop=0
+    local saved=()
     if [ -d "$NODES_DIR" ] && grep -lq 'hop_ranges\|udp_hop_ports\|hop_start\|hop_end' \
         "$NODES_DIR"/*.json 2>/dev/null; then
         metadata_hop=1
@@ -1467,6 +1525,10 @@ _hy2_cleanup_all_hops() {
         return 1
     fi
     if command -v iptables >/dev/null 2>&1 && [ -d "$NODES_DIR" ]; then
+        local _cand
+        while IFS= read -r _cand; do
+            [ -n "$_cand" ] && saved+=("$_cand")
+        done <<< "$(_hy2_hop_cleanup_candidates 2>/dev/null || true)"
         for f in "$NODES_DIR"/*.json; do
             [ -f "$f" ] || continue
             local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
@@ -1475,7 +1537,6 @@ _hy2_cleanup_all_hops() {
             port=$(jq -r '.port' "$f" 2>/dev/null)
             ranges=$(_read_hop_ranges "$f")
             if [ -n "$ranges" ] && [ -n "$port" ]; then
-                # R17: 全量重置场景 metadata 整体丢弃, 清理为 best-effort; 但残留必须显式报告, 不静默
                 # shellcheck disable=SC2086
                 _hy2_remove_hop_rules "$port" $ranges || residual=1
                 found=1
@@ -1494,7 +1555,14 @@ _hy2_cleanup_all_hops() {
         residual=1
     fi
     if [ "$residual" -ne 0 ]; then
-        _error "端口跳跃规则清理未完成, 请手动检查 iptables -t nat -S PREROUTING"
+        if [ "${#saved[@]}" -gt 0 ]; then
+            _error "端口跳跃清理未完成, 正在回滚本次已删除的规则, 使 metadata 与 runtime 保持一致..."
+            if _hy2_restore_hop_rules_checked "${saved[@]}"; then
+                _error "已回滚到清理前状态; 节点数据保留, 请处理后重试"
+            fi
+        else
+            _error "端口跳跃规则清理未完成, 请手动检查 iptables -t nat -S PREROUTING"
+        fi
         return 1
     fi
     return 0

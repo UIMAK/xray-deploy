@@ -697,22 +697,59 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_
     return "$ok"
 }
 
+# 写 reset 账本(唯一入口): 经 `_atomic_write_json` 落盘(fsync 文件 + 父目录)。
+_reset_journal_write() {   # <journal> <snapshot> <phase> <had_json> <specs_json>
+    local content
+    content=$(jq -nc --arg snap "$2" --arg phase "$3" --argjson had "$4" --argjson specs "$5" \
+        '{snapshot:$snap,phase:$phase,had_config:$had,hop_specs:$specs}') || return 1
+    _atomic_write_json "$1" "$content"
+}
+
+# 回补 journal 里记录的、本次 reset 已删除的端口跳跃规则(只补缺失项, 幂等)。
+# reset 失败回滚与启动恢复共用; 无 hop_specs / 助手缺失时如实返回。
+_reset_config_replay_hop_specs_locked() {   # <journal>
+    local journal="$1" specs=() line
+    [ -f "$journal" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] && specs+=("$line")
+    done <<< "$(jq -r '.hop_specs[]? // empty' "$journal" 2>/dev/null)"
+    [ "${#specs[@]}" -gt 0 ] || return 0
+    if ! declare -F _hy2_restore_hop_rules_checked >/dev/null 2>&1; then
+        _error "缺少 hop 回滚助手, 无法恢复本次删除的端口跳跃规则; 请手动检查 iptables"
+        return 1
+    fi
+    _hy2_restore_hop_rules_checked "${specs[@]}"
+}
+
 # 回滚 + 清 journal(仅回滚完整时才清账本); 不完整则保留 journal 与快照供启动期重试。
+# 顺序: 先回补 iptables(读取 journal), 再还原文件, 最后删账本。
 _reset_config_abort_locked() {   # <stage> <nodes_moved> <clash_moved> <had_config>
     local stage="$1" journal
+    journal=$(_reset_journal_path)
+    if ! _reset_config_replay_hop_specs_locked "$journal"; then
+        _error "reset 回滚不完整(端口跳跃规则未全部恢复), 快照与事务日志保留供下次启动重试: $stage"
+        return 1
+    fi
     if ! _reset_config_snapshot_restore "$@"; then
         _error "reset 回滚不完整, 快照与事务日志保留供下次启动重试: $stage"
         return 1
     fi
-    journal=$(_reset_journal_path)
     rm -f "$journal" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动收敛"
     _warn "已回滚, 重置未生效: 配置与节点数据均保持原样"
     return 0
 }
 
 # 带锁的恢复入口(启动期/菜单调用); `_reset_config_locked` 内部直接调 locked 体。
+# **本入口也必须持 install 锁**(与正常 reset/uninstall 同锁序): 它同样会移动/删除
+# deployment tree 内的文件, 只拿 config 锁会让 `install.sh --update` 与恢复交错。
+# 无账本且无快照时是纯读检查, 不加锁直接返回(避免每次启动都与并发安装互等)。
 _reset_config_recover() {
-    _with_config_lock _reset_config_recover_locked
+    [ -e "$(_reset_journal_path)" ] || [ -e "$(_reset_snapshot_path)" ] || return 0
+    if declare -F _with_deploy_install_lock >/dev/null 2>&1; then
+        _with_deploy_install_lock _with_config_lock _reset_config_recover_locked
+    else
+        _with_config_lock _reset_config_recover_locked
+    fi
 }
 
 _reset_config_recover_locked() {
@@ -745,6 +782,13 @@ _reset_config_recover_locked() {
         0|1) ;;
         *) _reset_journal_quarantine "$journal" "had_config 非法"; return 1 ;;
     esac
+    # hop_specs 是**回放执行**的 iptables 参数, 必须严格限定形状, 绝不能信任任意字符串
+    # (损坏/被改写的账本不得变成任意 iptables 命令注入)。
+    if ! jq -e '(.hop_specs == null) or (((.hop_specs | type) == "array") and all(.hop_specs[]; (type == "string") and startswith("-A PREROUTING ") and contains("xray-deploy-hy2-hop")))' \
+        "$journal" >/dev/null 2>&1; then
+        _reset_journal_quarantine "$journal" "hop_specs 非法"
+        return 1
+    fi
     if [ "$phase" = "committed" ]; then
         if ! rm -rf "$snapshot" 2>/dev/null || [ -e "$snapshot" ]; then
             _warn "reset 已提交, 但快照清理失败(下次启动重试): $snapshot"
@@ -754,11 +798,20 @@ _reset_config_recover_locked() {
         _info "上次 reset 已提交, 已清理残留快照"
         return 0
     fi
-    [ -d "$snapshot/nodes" ] && nodes_moved=1
-    [ -f "$snapshot/clash.yaml" ] && clash_moved=1
-    if ! _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"; then
-        _warn "上次 reset 崩溃后的回滚不完整, 快照与 journal 保留供重试: $snapshot"
+    # (1) 先回补本次 reset 已删除的端口跳跃规则(幂等; 失败保留现场下次重试)。
+    if ! _reset_config_replay_hop_specs_locked "$journal"; then
+        _warn "上次 reset 崩溃后的回滚不完整(端口跳跃规则), 快照与 journal 保留供重试: $snapshot"
         return 1
+    fi
+    # (2) 再还原文件。快照目录已不在 ⇒ 文件侧此前已还原(或本次事务根本没移动过), 跳过;
+    #     不能因为"快照里的 nodes 不在"就去回退 lastbak, 那会把已还原的 config 再改一次。
+    if [ -d "$snapshot" ]; then
+        [ -d "$snapshot/nodes" ] && nodes_moved=1
+        [ -f "$snapshot/clash.yaml" ] && clash_moved=1
+        if ! _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"; then
+            _warn "上次 reset 崩溃后的回滚不完整, 快照与 journal 保留供重试: $snapshot"
+            return 1
+        fi
     fi
     rm -f "$journal" 2>/dev/null || { _warn "reset journal 清理失败: $journal"; return 1; }
     _warn "检测到上次 reset 未提交, 已回滚到重置前的配置与节点"
@@ -784,14 +837,7 @@ _reset_config_locked() {
         fi
     fi
     if [ "$had_config" -eq 1 ]; then had_json=true; else had_json=false; fi
-    # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)
-    if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        if ! _hy2_cleanup_all_hops; then
-            _error "端口跳跃规则清理失败, 已取消重置(配置与节点数据保留), 请处理后重试"
-            return 1
-        fi
-    fi
-    # 恢复源与账本先落盘, 再动任何真实状态: 崩溃时才有据可回滚。
+    # 恢复源与账本先落盘, 再动任何真实状态(包括 iptables): 崩溃时才有据可回滚。
     if [ -e "$snapshot" ] || ! mkdir "$snapshot" 2>/dev/null; then
         _error "无法创建 reset 恢复快照目录, 已取消重置以保护现有数据"
         return 1
@@ -804,10 +850,28 @@ _reset_config_locked() {
             return 1
         fi
     fi
-    if ! _atomic_write_json "$journal" "{\"snapshot\":\"$snapshot\",\"phase\":\"prepared\",\"had_config\":$had_json}"; then
+    # hop 清理会删除 iptables 规则, 属于"真实状态改动": 候选 spec 必须先写进账本,
+    # 崩溃时由启动恢复回补(见 `_reset_config_replay_hop_specs_locked`)。
+    local specs_json="[]" hop_specs=""
+    if declare -F _hy2_hop_cleanup_candidates >/dev/null 2>&1; then
+        hop_specs=$(_hy2_hop_cleanup_candidates 2>/dev/null || true)
+        if [ -n "$hop_specs" ]; then
+            specs_json=$(printf '%s\n' "$hop_specs" | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null) || specs_json="[]"
+        fi
+    fi
+    if ! _reset_journal_write "$journal" "$snapshot" "prepared" "$had_json" "$specs_json"; then
         _error "无法写入 reset 事务日志(磁盘空间/权限?), 已取消重置以保护现有数据"
         rm -rf "$snapshot" 2>/dev/null
         return 1
+    fi
+    # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)。
+    # 失败时 `_hy2_cleanup_all_hops` 已自行回补已删规则; abort 再按账本回补一次(幂等)并还原文件。
+    if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
+        if ! _hy2_cleanup_all_hops; then
+            _error "端口跳跃规则清理失败, 正在回滚本次重置"
+            _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
+            return 1
+        fi
     fi
     if [ -d "$NODES_DIR" ]; then
         # mv 失败时 NODES_DIR 仍是原件, **绝不能**走恢复路径(那里会 rm -rf 它再去搬
@@ -854,7 +918,7 @@ _reset_config_locked() {
     fi
     # COMMIT: phase 先 durable 落盘, 之后**绝不再回滚**; 任一步失败都留 committed journal
     # 给启动恢复做 cleanup。
-    if ! _atomic_write_json "$journal" "{\"snapshot\":\"$snapshot\",\"phase\":\"committed\",\"had_config\":$had_json}"; then
+    if ! _reset_journal_write "$journal" "$snapshot" "committed" "$had_json" "$specs_json"; then
         _error "重置已应用但提交日志写入失败, 正在回滚"
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
