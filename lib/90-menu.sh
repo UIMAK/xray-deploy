@@ -676,8 +676,10 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_
                 _error "配置回滚失败, 请手动从快照副本恢复: $stage/config.json"
                 ok=1
             fi
-        elif ! _restore_config; then
-            _error "配置回滚失败, 请手动从 $BACKUP_DIR/config.json.lastbak 恢复"
+        else
+            # **不得退回 lastbak**(二十五轮 P2): 它不是 transaction-ID 绑定的恢复源, 可能已被
+            # 后续事务覆盖。自己的副本丢失/为空 ⇒ UNKNOWN, 停止恢复并保留现场供人工处理。
+            _error "事务快照中的配置副本缺失或为空, 无法确认恢复源; 已保留现场供人工检查: $stage/config.json"
             ok=1
         fi
     else
@@ -739,6 +741,20 @@ _reset_config_abort_locked() {   # <stage> <nodes_moved> <clash_moved> <had_conf
     return 0
 }
 
+# 运行态已收敛后的收尾: 先 durable 记 runtime_verified, 再清快照与账本。
+# 快照清理失败只告警并保留 runtime_verified 账本(下次启动只需再清一次, 不再回滚/重启)。
+_reset_config_commit_finish_locked() {   # <journal> <snapshot> <had_json> <specs_json>
+    if ! _reset_journal_write "$1" "$2" "runtime_verified" "$3" "$4"; then
+        _warn "运行态已收敛, 但 runtime_verified 账本写入失败; 下次启动会重复一次收敛(无害)"
+    fi
+    if ! rm -rf "$2" 2>/dev/null || [ -e "$2" ]; then
+        _warn "重置已应用且运行态已收敛, 但旧快照清理失败(下次启动会重试): $2"
+        return 0
+    fi
+    rm -f "$1" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动清理"
+    return 0
+}
+
 # 带锁的恢复入口(启动期/菜单调用); `_reset_config_locked` 内部直接调 locked 体。
 # **本入口也必须持 install 锁**(与正常 reset/uninstall 同锁序): 它同样会移动/删除
 # deployment tree 内的文件, 只拿 config 锁会让 `install.sh --update` 与恢复交错。
@@ -773,7 +789,7 @@ _reset_config_recover_locked() {
     fi
     phase=$(jq -r '.phase // empty' "$journal" 2>/dev/null)
     if [ "$(jq -r '.snapshot // empty' "$journal" 2>/dev/null)" != "$snapshot" ] || \
-       { [ "$phase" != "prepared" ] && [ "$phase" != "committed" ]; }; then
+       { [ "$phase" != "prepared" ] && [ "$phase" != "committed" ] && [ "$phase" != "runtime_verified" ]; }; then
         _reset_journal_quarantine "$journal" "schema 非法"
         return 1
     fi
@@ -794,22 +810,24 @@ _reset_config_recover_locked() {
         _reset_journal_quarantine "$journal" "hop_specs 缺失/非数组/形状非法"
         return 1
     fi
-    if [ "$phase" = "committed" ]; then
-        if ! rm -rf "$snapshot" 2>/dev/null || [ -e "$snapshot" ]; then
-            _warn "reset 已提交, 但快照清理失败(下次启动重试): $snapshot"
-            return 1
-        fi
-        rm -f "$journal" 2>/dev/null || { _warn "reset journal 清理失败: $journal"; return 1; }
-        _info "上次 reset 已提交, 已清理残留快照"
-        # **运行态收敛**(二十四轮 P1): commit 已落盘但进程在重启前被杀 —— 若 Xray 守护进程
-        # 仍活着, 它跑的是旧配置, 与磁盘上的新配置分裂。这里补一次 verified restart, 让运行态
-        # 与已提交状态一致(失败只告警: 文件侧已是提交态, 不能回滚)。
-        if [ -x "$XRAY_BIN" ] && declare -F _restart_xray_verified >/dev/null 2>&1; then
-            if _restart_xray_verified; then
+    if [ "$phase" = "committed" ] || [ "$phase" = "runtime_verified" ]; then
+        local had_json2 specs_json2
+        had_json2=$(jq -c '.had_config' "$journal" 2>/dev/null) || had_json2="false"
+        specs_json2=$(jq -c '.hop_specs // []' "$journal" 2>/dev/null) || specs_json2="[]"
+        # **运行态收敛必须早于清理/删账本**(二十五轮 P1): 原顺序(删快照→删账本→重启)在
+        # "已提交但未重启"处崩溃时会留下 磁盘新配置 / runtime 旧配置 且无账本可查。
+        if [ "$phase" = "committed" ]; then
+            if [ -x "$XRAY_BIN" ] && declare -F _restart_xray_verified >/dev/null 2>&1; then
+                if ! _restart_xray_verified; then
+                    _warn "上次 reset 已提交但运行态未收敛(Xray 重启失败), 账本保留待下次启动重试"
+                    return 1
+                fi
                 _info "上次 reset 的运行态已收敛(已按已提交配置重启)"
-            else
-                _warn "上次 reset 已提交, 但 Xray 重启失败; 请检查服务状态"
             fi
+        fi
+        # 收敛后写 runtime_verified 再清理; 清理失败保留账本, 下次只需继续清理。
+        if _reset_config_commit_finish_locked "$journal" "$snapshot" "$had_json2" "$specs_json2"; then
+            [ "$phase" = "runtime_verified" ] && _info "上次 reset 已收敛, 已清理残留快照"
         fi
         return 0
     fi
@@ -957,22 +975,17 @@ _reset_config_locked() {
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
-    if ! rm -rf "$snapshot" 2>/dev/null || [ -e "$snapshot" ]; then
-        # **不得提前 return**(二十四轮 P1): 那会跳过下面的 verified restart, 让 disk(新配置)
-        # 与 runtime(旧配置)分裂, 且不经过任何 SIGKILL 就可能发生。保留 committed journal
-        # 供下次启动重试清理, 但本次仍要把运行态收敛到已提交配置。
-        _warn "重置已应用, 但旧 metadata/clash 快照清理失败(下次启动会重试): $snapshot"
-    else
-        rm -f "$journal" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动清理"
-    fi
-    # 重启 xray(若在跑)
+    # **运行态收敛必须早于删除账本**(二十五轮 P1): 顺序是
+    # committed → restart+verified → runtime_verified(durable) → 清快照 → 删账本。
+    # 否则在"已提交但未重启"处崩溃会留下 disk 新配置 / runtime 旧配置且无账本可查。
     if [ -x "$XRAY_BIN" ]; then
-        if _restart_xray_verified; then
-            _tip "xray 已使用新配置重启"
-        else
-            _warn "配置重置后 xray 重启失败, 请检查状态"
+        if ! _restart_xray_verified; then
+            _warn "重置已提交, 但 Xray 重启未通过验证; 事务日志保留, 下次启动会重试收敛"
+            return 1
         fi
+        _tip "xray 已使用新配置重启"
     fi
+    _reset_config_commit_finish_locked "$journal" "$snapshot" "$had_json" "$specs_json"
     _success "config.json 已重置(含 routing 规则), 节点已清空"
 }
 
