@@ -1938,6 +1938,52 @@ _commit_reality_inbound() {
 }
 
 # ---------------------------------------------------------------------------
+# 新增节点的原子提交(三十一轮 P1-①)。
+# **问题**: 原流程是 `_commit_inbound`(config, 自带锁) → 释放锁 → 交互/拼装 → `_save_node_meta`。
+# 两步之间没有锁, 并发的"全部删除"会在锁内重新枚举 metadata(还看不到新节点), `.inbounds = []`
+# 把刚提交的入站一并清掉, 随后 metadata 才落地 ⇒ config/metadata 分裂(hop 节点还会留 orphan DNAT)。
+# **契约**: 所有交互(端口/域名/连接地址/证书)必须在本函数**之前**完成; 本函数在 config lock 内
+# 一次性完成 config 提交 + metadata 落盘(+ 派生 YAML), **metadata 失败时回滚刚插入的 config**,
+# 绝不留 orphan。`_mutate_config` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 不会自锁死。
+# ---------------------------------------------------------------------------
+_commit_node_txn() {            # <tag> <inbound_json> <meta_json> [<clash_line> <name>]
+    _with_config_lock _commit_node_txn_locked "$@"
+}
+_commit_node_txn_locked() {
+    local tag="$1" inbound="$2" meta_json="$3" clash_line="${4:-}" name="${5:-}"
+    _commit_inbound "$inbound" || return 1
+    if ! _save_node_meta "$tag" "$meta_json"; then
+        _error "元数据写入失败, 正在回滚入站: $tag"
+        _mutate_config --arg t "$tag" \
+            '.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))' || \
+            _error "回滚入站失败, 请手动检查 config.json: $tag"
+        return 1
+    fi
+    [ -n "$clash_line" ] && { _add_node_to_yaml "$clash_line" "$name" || true; }
+    return 0
+}
+
+_commit_reality_node_txn() {    # <tag> <tunnel_json> <reality_json> <tunnel_tag> <domain> <meta_json> [<clash_line> <name>]
+    _with_config_lock _commit_reality_node_txn_locked "$@"
+}
+_commit_reality_node_txn_locked() {
+    local tag="$1" tunnel="$2" reality="$3" tunnel_tag="$4" domain="$5" meta_json="$6" clash_line="${7:-}" name="${8:-}"
+    _commit_reality_inbound "$tunnel" "$reality" "$tunnel_tag" "$domain" || return 1
+    if ! _save_node_meta "$tag" "$meta_json"; then
+        _error "元数据写入失败, 正在回滚入站与路由: $tag"
+        # 同时移除两个入站与该 tunnel 的路由引用(非对象元素保留, 与删除路径同口径)。
+        _mutate_config --arg tg "$tunnel_tag" --arg t "$tag" \
+            '.inbounds |= map(select((type != "object") or ((.tag // "") as $x | ($x != $t and $x != $tg))))
+             | .routing.rules |= map(select((type != "object") or .inboundTag == null
+                   or ([.inboundTag[]? | . as $it | ($it != $tg)] | all)))' || \
+            _error "回滚入站/路由失败, 请手动检查 config.json: $tag"
+        return 1
+    fi
+    [ -n "$clash_line" ] && { _add_node_to_yaml "$clash_line" "$name" || true; }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Reality 部署模式(R42)
 # 两种拓扑, 协议键相同(vless-tcp-reality-vision / vless-xhttp-reality):
 #   direct — 单个 Reality 入站, realitySettings.target = "<sni>:443" 直指真实伪装站,
@@ -2160,6 +2206,24 @@ _node_count() {
         [ -f "$f" ] && n=$((n+1))
     done
     echo "$n"
+}
+
+# ---------------------------------------------------------------------------
+# 节点身份指纹(三十一轮 P1-②): 删除的"选择/确认"在锁外完成, 锁内必须证明**还是同一个节点**。
+# tag 只是文件名: 并发"删除 + 重建同名节点"后, 锁内的 tag 会指向另一个节点 —— 直接按 tag 删除
+# 会合法地误删别人刚建的节点。指纹取 metadata 全文 + config 中该节点(含 tunnel_tag)的入站,
+# 经 jq -S 归一化后 cksum —— 内容级身份, 删/重建/改端口/换域名都会变 ⇒ 调用方 fail-closed。
+# 输出: "<crc>:<bytes>"(stdout); 无法读取 metadata/config 时返回 1。
+# ---------------------------------------------------------------------------
+_node_identity() {
+    local tag="$1" meta tt cfg
+    meta=$(jq -S -c . "$NODES_DIR/${tag}.json" 2>/dev/null) || return 1
+    tt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+    cfg=$(jq -S -c --arg t "$tag" --arg tt "$tt" \
+        '[.inbounds[]? | select((.tag // "") == $t or ($tt != "" and (.tag // "") == $tt))]' \
+        "$CONFIG_FILE" 2>/dev/null) || return 1
+    printf '%s\n%s\n' "$meta" "${cfg:-[]}" | \
+        { if command -v cksum >/dev/null 2>&1; then cksum | awk '{print $1":"$2}'; else sha256sum | awk '{print $1}'; fi; }
 }
 
 # ---------------------------------------------------------------------------
@@ -2875,19 +2939,16 @@ _add_vless_tcp_reality_vision() {
         R_SHORT_ID="$REALITY_SHORT_ID" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
         reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision-tunnel)") || return 1
 
-        _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
     else
         # R42 直连: target = <sni>:443, 只提交 1 个入站, 不写任何路由规则
-        # (_commit_reality_inbound 固定插 2 条 tunnel 路由规则, 故此处走 _commit_inbound)
         R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
         R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
         R_SHORT_ID="$REALITY_SHORT_ID" R_MLDSA65_SEED="$pq_seed"
         reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision-direct)") || return 1
-
-        _commit_inbound "$reality_json" || return 1
     fi
 
-    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    # 三十一轮 P1-①: 连接地址询问必须在 config 提交前完成, config+metadata 由事务一次性提交
+    local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
@@ -2933,14 +2994,12 @@ _add_vless_tcp_reality_vision() {
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
             '. + {auth:$auth,decryption:$dec,encryption:$enc}')
     fi
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
+    # 原子提交(三十一轮 P1-①): config + metadata + 派生 YAML(metadata 失败会回滚入站/路由)。
+    if [ "$mode" = "tunnel" ]; then
+        _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" "$clash" "$name" || return 1
+    else
+        _commit_node_txn "$tag" "$reality_json" "$meta_json" "$clash" "$name" || return 1
     fi
-    # R38(P1): 必须在 metadata 成功之后再写 clash.yaml —— 否则 metadata 写失败时 YAML 条目
-    # 已落地而 nodes/<tag>.json 不存在, _remove_node_from_yaml_by_tag 读不到 name,
-    # 该条目再也无法通过任何界面清除。
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
 
     _success "节点 [${name}] 创建成功"
     if [ "$mode" = "tunnel" ]; then
@@ -3017,18 +3076,16 @@ _add_vless_xhttp_reality() {
         R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
         reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality-tunnel)") || return 1
 
-        _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
     else
         # R42 直连: target = <sni>:443, 单入站提交, 无路由规则
         R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
         R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
         R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_MLDSA65_SEED="$pq_seed"
         reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality-direct)") || return 1
-
-        _commit_inbound "$reality_json" || return 1
     fi
 
-    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    # 三十一轮 P1-①: 连接地址询问必须在 config 提交前完成
+    local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
@@ -3068,12 +3125,12 @@ _add_vless_xhttp_reality() {
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
             '. + {auth:$auth,decryption:$dec,encryption:$enc}')
     fi
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
+    # 原子提交(三十一轮 P1-①): config + metadata + 派生 YAML(metadata 失败会回滚入站/路由)。
+    if [ "$mode" = "tunnel" ]; then
+        _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" "$clash" "$name" || return 1
+    else
+        _commit_node_txn "$tag" "$reality_json" "$meta_json" "$clash" "$name" || return 1
     fi
-    # R38(P1): metadata 成功后才写派生 YAML(见 _add_vless_tcp_reality_vision 同处注释)
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
 
     _success "节点 [${name}] 创建成功"
     if [ "$mode" = "tunnel" ]; then
@@ -3230,9 +3287,8 @@ _add_vless_enc() {
     R_FLOW="$flow" R_DECRYPTION="$VLESS_ENC_DECRYPTION"
     local inbound
     inbound=$(_render_template "$(_tpl_path vless-enc)") || return 1
-    _commit_inbound "$inbound" || return 1
-
-    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    # 三十一轮 P1-①: 连接地址询问提前到提交之前; config+metadata 由事务一次性提交
+    local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
@@ -3247,18 +3303,15 @@ _add_vless_enc() {
     [ -n "$flow" ] && clash_flow=", flow: ${flow}"
     local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, encryption: \"$(_yaml_dq "$VLESS_ENC_ENCRYPTION")\", network: tcp, tls: false${clash_flow}}"
 
-    if ! _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-enc" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg flow "$flow" --arg auth "$AUTH_TYPE" \
         --arg dec "$VLESS_ENC_DECRYPTION" --arg enc "$VLESS_ENC_ENCRYPTION" \
         --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,flow:$flow,auth:$auth,decryption:$dec,encryption:$enc,share_link:$link}')"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,flow:$flow,auth:$auth,decryption:$dec,encryption:$enc,share_link:$link}')
+    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
     [ -n "$flow" ] && _tip "已启用 xtls-rprx-vision (splice 优化)"
@@ -3318,7 +3371,6 @@ _add_vless_xhttp_cdn() {
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_HOST="$host"
     local inbound
     inbound=$(_render_template "$(_tpl_path vless-xhttp-cdn)") || return 1
-    _commit_inbound "$inbound" || return 1
 
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
@@ -3351,12 +3403,7 @@ _add_vless_xhttp_cdn() {
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
             '. + {auth:$auth,decryption:$dec,encryption:$enc}')
     fi
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -3408,7 +3455,6 @@ _add_vless_ws_cdn() {
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_HOST="$host"
     local inbound
     inbound=$(_render_template "$(_tpl_path vless-ws-cdn)") || return 1
-    _commit_inbound "$inbound" || return 1
 
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
@@ -3439,12 +3485,7 @@ _add_vless_ws_cdn() {
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
             '. + {auth:$auth,decryption:$dec,encryption:$enc}')
     fi
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -3504,10 +3545,9 @@ _add_shadowsocks() {
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_METHOD="$method" R_PASSWORD="$password" R_NETWORK="$network_val"
     local inbound
     inbound=$(_render_template "$(_tpl_path shadowsocks)") || return 1
-    _commit_inbound "$inbound" || return 1
-
+    # 三十一轮 P1-①: 连接地址询问提前到提交之前; config+metadata 由事务一次性提交
     local addr
-    addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     # ss 链接(SIP002): userinfo 必须 base64url 无填充 —— 标准 base64 可能含 + / =,
@@ -3523,16 +3563,13 @@ _add_shadowsocks() {
     [[ "$network_val" == *"udp"* ]] && clash_udp=", udp: true"
     local clash="- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${clash_udp}}"
 
-    if ! _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "shadowsocks" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg method "$method" --arg password "$password" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,method:$method,password:$password,share_link:$link}')"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,method:$method,password:$password,share_link:$link}')
+    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
@@ -4649,17 +4686,14 @@ _add_hysteria2() {
         return 1
     fi
 
-    if ! _commit_inbound "$inbound"; then
+    # 三十一轮 P1-①: 连接地址询问必须在 config 提交**之前**完成 —— 交互期间不能有已提交的入站
+    # (并发的"全部删除"会按 metadata 重枚举后把它清掉)。此处尚未提交, 取消时回滚证书。
+    local addr
+    if ! addr=$(_ask_link_addr); then
         _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
+        _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"
         return 1
     fi
-    # 配置已提交(节点已引用该证书) ⇒ 回滚点作废; 删不掉要如实报(快照内含旧私钥副本)
-    if [ "$cert_dirty" = "true" ] && ! _hy2_cert_snapshot_drop "$cert_bak"; then
-        _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
-    fi
-
-    local addr
-    addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
 
     # ---------------------------------------------------------------------
     # 先落 **canonical metadata**, 再由它派生 link 与 clash —— 与修改路径**同一条**逻辑。
@@ -4677,9 +4711,14 @@ _add_hysteria2() {
         --arg obfsType "$obfs_type" --arg obfsPw "$obfs_pw" --arg obfsSize "$obfs_size" \
         --argjson ss "$self_signed" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,obfs_type:$obfsType,obfs_password:$obfsPw,obfs_packet_size:(if $obfsSize == "" then null else $obfsSize end),self_signed:$ss,share_link:""}')
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
+    # 原子提交(config + metadata, metadata 失败回滚入站); 派生链接/YAML 在提交成功后同步。
+    if ! _commit_node_txn "$tag" "$inbound" "$meta_json"; then
+        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
         return 1
+    fi
+    # 配置与 metadata 均已提交(节点已引用该证书) ⇒ 回滚点作废; 删不掉要如实报(快照内含旧私钥副本)
+    if [ "$cert_dirty" = "true" ] && ! _hy2_cert_snapshot_drop "$cert_bak"; then
+        _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
     fi
     local meta="$NODES_DIR/${tag}.json"
     # 派生状态(链接 + clash)走**唯一入口**(clash 步骤是 upsert, 新建节点会追加条目);
@@ -5295,8 +5334,14 @@ _delete_node() {
         read -rp "  继续? [y/N]: " ans
         case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; return ;; esac
 
+        # 身份绑定(三十一轮 P1-②): 每个 tag 带上确认时的指纹, 锁内逐一复核。
+        local del_idents=() _dt _idt
+        for _dt in "${del_tags[@]}"; do
+            _idt=$(_node_identity "$_dt") || { _error "无法读取节点身份, 已取消: $_dt"; _press_any_key; return; }
+            del_idents+=("$_dt" "$_idt")
+        done
         _hy2_ask_purge_self_certs "${del_tags[@]}"
-        _with_config_lock _delete_node_apply_multi "${del_tags[@]}"
+        _with_config_lock _delete_node_apply_multi "${del_idents[@]}"
         _press_any_key; return
     fi
 
@@ -5304,8 +5349,11 @@ _delete_node() {
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
+    # 身份绑定(三十一轮 P1-②): 锁外选的 tag 可能已被并发删除/重建 —— 锁内必须复核指纹。
+    local ident
+    ident=$(_node_identity "$tag") || { _error "无法读取节点身份, 已取消: $tag"; _press_any_key; return; }
     _hy2_ask_purge_self_certs "$tag"
-    _with_config_lock _delete_node_apply_single "$tag"
+    _with_config_lock _delete_node_apply_single "$tag" "$ident"
     _press_any_key
 }
 
@@ -5391,7 +5439,25 @@ _delete_node_apply_all() {
 }
 
 _delete_node_apply_multi() {
-    local del_tags=("$@") dt
+    # 参数是 tag/fingerprint 交错对(三十一轮 P1-②): 只有指纹与当前内容一致才允许删除。
+    local del_tags=() del_idents=() dt now
+    while [ "$#" -gt 0 ]; do
+        del_tags+=("$1"); shift
+        del_idents+=("${1:-}")
+        [ "$#" -gt 0 ] && shift
+    done
+    local _i
+    for _i in "${!del_tags[@]}"; do
+        if [ -z "${del_idents[$_i]:-}" ]; then
+            _error "缺少节点身份指纹, 拒绝删除(请重新选择): ${del_tags[$_i]}"
+            return 1
+        fi
+        now=$(_node_identity "${del_tags[$_i]}") || { _error "无法重新读取节点身份: ${del_tags[$_i]}"; return 1; }
+        if [ "$now" != "${del_idents[$_i]}" ]; then
+            _error "节点内容已变化(可能被并发删除/重建/修改), 请重新选择: ${del_tags[$_i]}"
+            return 1
+        fi
+    done
     # R17/R33(P1)/R38(P1): 同 _delete_node_apply_all —— teardown 在锁内, 逐项判定。
     if ! _hy2_hop_teardown_all "${del_tags[@]}"; then
         _error "所选节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
@@ -5445,7 +5511,17 @@ _delete_node_apply_multi() {
 }
 
 _delete_node_apply_single() {
-    local tag="$1"
+    local tag="$1" expect="${2:-}" now
+    # 身份绑定(三十一轮 P1-②): 缺指纹或与当前内容不符一律拒绝 —— 防止误删并发重建的同名节点。
+    if [ -z "$expect" ]; then
+        _error "缺少节点身份指纹, 拒绝删除(请重新选择): $tag"
+        return 1
+    fi
+    now=$(_node_identity "$tag") || { _error "无法重新读取节点身份: $tag"; return 1; }
+    if [ "$now" != "$expect" ]; then
+        _error "节点内容已变化(可能被并发删除/重建/修改), 请重新选择: $tag"
+        return 1
+    fi
     # 读取 tunnel_tag, 一次性删除 tunnel + reality + 路由(原子操作)
     # M2 同口径: type 守卫防止非对象入站/规则元素让 jq 整体报错(手改 config 时删除被拒绝服务)
     local tunnel_tag
