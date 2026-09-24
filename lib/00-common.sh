@@ -942,6 +942,61 @@ _press_any_key() {
     read -r
 }
 
+# 无 flock 时的 config 锁退路(二十轮 P1-2): 与 install/core 的 mkdir 退路同一契约 ——
+# 父目录下 `.<name>.config.lock.d` 原子 mkdir + pid, **永不自动接管**任何既有目录
+# (活持有者/死 pid/无 pid 一律拒绝并给出人工清理命令)。SIGKILL 残局需要一次人工 rm -rf,
+# 这是 mkdir 退路相对 flock 的已知代价; 但"无 flock 就直接放行"会让 reset 的
+# backup→删除→重建整段事务与普通 config writer 完全失去互斥, 故不再放行。
+_with_config_lock_mkdir() {
+    local deploy_path="${DEPLOY_DIR%/}" parent name lock_dir rc owner
+    case "$deploy_path" in
+        /*) ;;
+        *) _error "部署目录必须是绝对路径, 无法建立配置锁: $DEPLOY_DIR"; return 1 ;;
+    esac
+    if [ -z "$deploy_path" ] || [ "$deploy_path" = "/" ]; then
+        _error "部署目录路径无效, 无法建立配置锁: $DEPLOY_DIR"
+        return 1
+    fi
+    parent="${deploy_path%/*}"; name="${deploy_path##*/}"
+    [ -n "$parent" ] || parent="/"
+    lock_dir="${parent}/.${name}.config.lock.d"
+    mkdir -p "$parent" 2>/dev/null || {
+        _error "无法创建配置锁父目录 $parent(权限/只读文件系统?), 放弃本次修改"
+        return 1
+    }
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        owner=$(cat "$lock_dir/pid" 2>/dev/null)
+        _error "配置锁目录已存在(可能有其他会话, 或上次被强杀): $lock_dir (pid ${owner:-未知})"
+        _tip "确认没有会话在修改配置后, 请手动删除该锁目录: rm -rf -- '$lock_dir'"
+        return 1
+    fi
+    if ! printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null; then
+        rm -f "$lock_dir/pid" 2>/dev/null
+        rmdir "$lock_dir" 2>/dev/null
+        _error "无法写入配置锁持有者记录 $lock_dir/pid(磁盘空间/权限?), 放弃本次修改"
+        return 1
+    fi
+    if [ ! -d "$deploy_path" ]; then
+        _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $deploy_path"
+        rm -f "$lock_dir/pid" 2>/dev/null
+        rmdir "$lock_dir" 2>/dev/null
+        return 1
+    fi
+    (
+        XRAY_DEPLOY_LOCK_HELD=1
+        export XRAY_DEPLOY_LOCK_HELD
+        "$@"
+    )
+    rc=$?
+    owner=$(cat "$lock_dir/pid" 2>/dev/null)
+    if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
+        _error "配置锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
+        _tip "确认没有配置事务仍在运行后, 请手动检查并清理该锁目录"
+        return 1
+    fi
+    return "$rc"
+}
+
 # ---------------------------------------------------------------------------
 # 跨进程配置修改锁(2026-09-12 审查 F5, 借鉴 singbox-lite _with_state_lock):
 # 包住 _mutate_config 的 read-modify-write, 防止两个并发 xd 会话交叠产生丢失更新。
@@ -952,10 +1007,9 @@ _press_any_key() {
 # 取 config 主锁, 最后由 `_restart_xray_verified` 取 core 锁; 单独 config writer 走 config → core。
 # 本函数**不自取 install lock** —— 那会让每次普通配置写入都创建旧版目录锁标记, SIGKILL 残局
 # 会让菜单再也改不了配置; 破坏性路径的 install 锁由各自入口显式获取。
-# best-effort 语义, 与 singbox-lite 的"缺 flock 硬失败"刻意不同:
-#   - flock 不可用(裁剪版 busybox)时直接放行 —— 配置写者只有单管理员 TUI 一个,
-#     为锁而拒绝服务比偶发竞态更伤; 放行属于已声明的降级而非静默吞错。
-#   - 持锁者导出 XRAY_DEPLOY_LOCK_HELD=1 支持重入(当前无嵌套调用, 防御性保留)。
+# `flock` 不可用(裁剪版 busybox / 未装 util-linux 的 Alpine)时走 `_with_config_lock_mkdir`:
+# reset 的 backup→删除→重建整段已是事务, 放行等于让它与普通 config writer 完全失去互斥,
+# 因此不再 best-effort 直通。持锁者导出 `XRAY_DEPLOY_LOCK_HELD=1` 支持重入。
 # 注意: "$@" 在子 shell 中执行 —— _mutate_config 及其下游不向调用方回传全局变量,
 # 返回码经子 shell 退出码透传; fd 9 与旧版协调 fd 随子 shell 结束自动关闭并释放锁。
 # ---------------------------------------------------------------------------
@@ -965,7 +1019,7 @@ _with_config_lock() {
         return $?
     fi
     if ! command -v flock >/dev/null 2>&1; then
-        "$@"
+        _with_config_lock_mkdir "$@"
         return $?
     fi
     local config_parent="${DEPLOY_DIR%/*}" config_name="${DEPLOY_DIR##*/}" config_lock_file legacy_lock_file
@@ -973,7 +1027,10 @@ _with_config_lock() {
     config_lock_file="${config_parent}/.${config_name}.config.lock"
     legacy_lock_file="$DEPLOY_DIR/.config.lock"
     (
-        mkdir -p "$config_parent" "$DEPLOY_DIR" 2>/dev/null
+        # **只创建父目录**(锁文件所在目录), 绝不创建 `$DEPLOY_DIR`: 与卸载竞态时, 普通
+        # config writer 若在这里 mkdir 部署目录, 会把刚被卸载的树重新制造出来 ——
+        # 目录存在性改为**取到主锁之后**再判定, 不存在就 fail-closed(不重建)。
+        mkdir -p "$config_parent" 2>/dev/null
         # config lock 主文件在部署目录父目录, 不能被 uninstall 的 rm -rf 拆成新旧 inode。
         # legacy_lock_file 仍会被打开并占用, 用来排斥旧版仍只认识目录内 .config.lock 的写者。
         # 注意: exec 仅带重定向时重定向会**持久化**到整个子 shell —— 原写法
@@ -991,6 +1048,12 @@ _with_config_lock() {
         done
         if ! flock -n 9 2>/dev/null; then
             _error "等待配置锁超时(15s), 可能有其他 xd 会话正在修改配置"
+            exit 1
+        fi
+        # 主锁已在手, 此时才判部署树是否存在: 锁内的真实状态。不存在 ⇒ 确实没有部署
+        # (或刚被卸载), fail-closed 退出且**不重建**目录。
+        if [ ! -d "$DEPLOY_DIR" ]; then
+            _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
         fi
         local legacy_fd="" li

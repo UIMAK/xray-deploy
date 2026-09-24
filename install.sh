@@ -753,7 +753,10 @@ _install_legacy_flock_active() {
     for p in /proc/[0-9]*/fd/*; do
         pid=${p#/proc/}; pid=${pid%%/*}
         [ "$pid" = "$$" ] && continue
-        target=$(readlink "$p" 2>/dev/null) || continue
+        # fd 在扫描期间被并发关闭时无法判定该进程是否持有目标文件 —— 按契约返回
+        # "无法确认"(2) 而不是静默跳过; 与 20-xray-core 的 `_xray_legacy_flock_active`
+        # 保持同一 fail-closed 语义。判定主力是上面的 find 快路径(一次遍历, 无逐 fd 竞态)。
+        target=$(readlink "$p" 2>/dev/null) || return 2
         [ "$target" = "$want" ] && return 0
     done
     return 1
@@ -768,8 +771,8 @@ _install_lock_acquire() {
     }
     # ---- 首选: flock(内核持有, 进程退出即释放, 无陈旧锁/无接管竞态) ----
     if command -v flock >/dev/null 2>&1; then
-        # **动态分配 fd, 不要写死 9**: `lib/00-common.sh` 的 `_with_config_lock` 用
-        # `exec 9>"$DEPLOY_DIR/.config.lock"` 也占 fd 9 —— 写死 9 会在同一进程里互相踩掉
+        # **动态分配 fd, 不要写死 9**: `lib/00-common.sh` 的 `_with_config_lock` 用固定 fd 9
+        # 占 config 主锁(二十轮起锁文件在部署目录父目录) —— 写死 9 会在同一进程里互相踩掉
         # 对方的锁(fd 被重新赋值即释放原锁), 表现为"锁莫名失效"。`{var}` 形式由 shell
         # 保证分配一个空闲 fd。
         exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_FILE" 2>/dev/null || {
