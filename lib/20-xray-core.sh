@@ -750,12 +750,6 @@ _with_core_lock() {
     fallback_dir="${lockf}.d"
     legacy_lockf="$deploy_path/.core.lock"
     legacy_fallback_dir="$deploy_path/.core.lock.d"
-    # 只有当旧锁路径**尚不存在**(本次将新建 inode)时才需要 /proc 扫描: 旧持有者的锁文件
-    # 若随整棵树被删除, 我们在同一路径重建的将是新 inode, 与旧 fd 不互斥。路径已存在时
-    # 我们打开的正是旧 inode, 后续 flock/inode 复核足以覆盖(且扫描每个 fd 在繁忙主机上
-    # 可能耗秒级, 不能放进每次服务操作的常路径)。
-    legacy_fresh=0
-    [ -e "$legacy_lockf" ] || [ -e "$legacy_fallback_dir" ] || legacy_fresh=1
     # 已是持锁状态(嵌套调用) ⇒ 直接跑, 不再重复加锁。
     # 嵌套判定必须放在 `$DEPLOY_DIR` 存在性检查**之前**: 卸载主体(持锁中)会走到
     # `rm -rf "$DEPLOY_DIR"`, 之后仍可能有嵌套调用(收尾/提示), 那些调用不该因为目录已被
@@ -794,6 +788,12 @@ _with_core_lock() {
             _xray_core_lock_fd_reset
             return 1
         fi
+        # **在此刻判定**(而非函数入口): 旧锁路径尚不存在(本次将新建 inode)时才需要 /proc
+        # 扫描 —— 旧持有者的锁文件若随整棵树被删除, 我们在同一路径重建的将是新 inode, 与旧
+        # fd 不互斥; 路径已存在时打开的就是旧 inode, flock/inode 复核已覆盖。逐 fd 扫描在
+        # 繁忙主机上可能耗秒级, 不能放进每次服务操作的常路径。
+        legacy_fresh=0
+        [ -e "$legacy_lockf" ] || [ -e "$legacy_fallback_dir" ] || legacy_fresh=1
         if [ "$legacy_fresh" -eq 1 ] && \
            declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
            _xray_legacy_deleted_tree_active "$deploy_path"; then
@@ -860,6 +860,8 @@ _with_core_lock() {
         rmdir "$fallback_dir" 2>/dev/null
         return 1
     fi
+    legacy_fresh=0
+    [ -e "$legacy_lockf" ] || [ -e "$legacy_fallback_dir" ] || legacy_fresh=1
     if [ "$legacy_fresh" -eq 1 ] && \
        declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
        _xray_legacy_deleted_tree_active "$deploy_path"; then
@@ -912,8 +914,6 @@ _with_deploy_install_lock() {
     lock_file="${lock_dir}.fd"
     legacy_lock_file="$deploy_path/.install.lock.fd"
     legacy_lock_dir="$deploy_path/.install.lock"
-    # 同 `_with_core_lock`: 仅在旧锁路径不存在(本次新建 inode)时才需要 /proc 扫描。
-    [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ] || legacy_fresh=1
     if [ "${XRAY_DEPLOY_INSTALL_LOCK_HELD:-0}" = "1" ]; then
         "$@"
         return $?
@@ -948,6 +948,10 @@ _with_deploy_install_lock() {
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
+        # 同 `_with_core_lock`: 在**此刻**(而非函数入口/脚本启动)判定旧锁路径是否将新建,
+        # 旧版卸载者可能在启动之后才把整棵树连旧锁一起删掉。
+        legacy_fresh=0
+        [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ] || legacy_fresh=1
         if [ "$legacy_fresh" -eq 1 ] && \
            declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
            _xray_legacy_deleted_tree_active "$deploy_path"; then
@@ -1006,6 +1010,8 @@ _with_deploy_install_lock() {
                 rmdir "$lock_dir" 2>/dev/null
                 return 1
             fi
+            legacy_fresh=0
+            [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ] || legacy_fresh=1
             if [ "$legacy_fresh" -eq 1 ] && \
                declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1 && \
                _xray_legacy_deleted_tree_active "$deploy_path"; then
