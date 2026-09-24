@@ -1453,12 +1453,16 @@ _hy2_list_all_hop_rules() {
     fi
 }
 
-# 打印"当前会被 `_hy2_cleanup_all_hops` 删除"的 IPv4 规则 spec(每行一个, `-A PREROUTING ...`)。
+# 打印"当前会被 `_hy2_cleanup_all_hops` 删除"的规则 spec, **每行带 family 前缀**:
+#   `4 -A PREROUTING ...`  (iptables)
+#   `6 -A PREROUTING ...`  (ip6tables)
 # 单一来源: 清理函数用它做失败回滚的 `saved` 集合, reset 用它把恢复源写进 journal,
 # 两处不得各自再写一份(否则必然漂移)。
+# **为什么必须含 IPv6(二十四轮 P1)**: `_hy2_remove_hop_rules` 会同时删除 IPv4 与 IPv6 规则;
+# 恢复源只存 IPv4 时, "失败回滚/崩溃恢复"会把 IPv6 规则永久丢掉 —— 现场与清理前不一致。
 # **契约(二十一轮 P1-1)**: `0` = 已枚举(可能为空 —— 没有任何会被删除的节点时不必碰 iptables);
-# `1` = **存在**会被删除的 hop 节点却无法枚举(缺 iptables / `-S` 失败)。调用方在拿到 1 时
-# 必须 fail-closed: 恢复源建不起来就绝不允许继续删除 runtime 状态。
+# `1` = **存在**会被删除的 hop 节点却无法枚举(缺 iptables / 任一 family 的 `-S` 失败)。
+# 调用方在拿到 1 时必须 fail-closed: 恢复源建不起来就绝不允许继续删除 runtime 状态。
 _hy2_hop_cleanup_candidates() {
     [ -d "$NODES_DIR" ] || return 0
     local f proto port ranges any=0
@@ -1477,8 +1481,14 @@ _hy2_hop_cleanup_candidates() {
     done
     [ "$any" -eq 1 ] || return 0
     command -v iptables >/dev/null 2>&1 || return 1
-    local q
+    local q q6="" v6ok=0
     q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
+    if command -v ip6tables >/dev/null 2>&1; then
+        # IPv6 与 IPv4 同为"会被删除的 runtime": 查不到就建不起恢复源 ⇒ 返回 1(fail-closed)。
+        # 这与 `_hy2_no_hop_rules_at_all` 对 ip6 查询失败判 UNKNOWN 同口径。
+        q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
+        v6ok=1
+    fi
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         proto=$(jq -r '.protocol' "$f" 2>/dev/null)
@@ -1489,27 +1499,54 @@ _hy2_hop_cleanup_candidates() {
         [ -n "$ranges" ] || continue
         # 目标端口在节点间唯一(即 hy2 监听端口), 故按 target 取到的就是本节点的全部规则;
         # 即便 metadata 的 range 与 runtime 有出入, 作为"恢复源"取超集也是安全的(回滚只补缺失项)。
-        printf '%s\n' "$q" | grep "xray-deploy-hy2-hop" | _hy2_match_target "$port"
+        printf '%s\n' "$q" | grep "xray-deploy-hy2-hop" | _hy2_match_target "$port" | sed 's/^/4 /'
+        if [ "$v6ok" -eq 1 ]; then
+            printf '%s\n' "$q6" | grep "xray-deploy-hy2-hop" | _hy2_match_target "$port" | sed 's/^/6 /'
+        fi
     done
 }
 
-# 恢复被删除的 IPv4 规则: **只补当前不存在的 spec**, 已存在的不重复添加。0=全部就位; 1=有失败。
-# 每次成功添加后刷新规则快照(二十一轮 P2): 否则重复的 spec 在第二次判定时仍被当作"不存在"
-# 而重复执行 `-A`; 刷新后重复项自然被跳过。
+# 恢复被删除的规则: 输入是 `_hy2_hop_cleanup_candidates` 的 `<4|6> <spec>` 行。
+# **只补当前不存在的 spec**, 已存在的不重复添加; 每次成功添加后刷新该 family 的快照
+# (二十一轮 P2: 否则重复的 spec 在第二次判定时仍被当作"不存在"而重复 `-A`)。
+# family 缺失/无法识别 ⇒ 失败(fail-closed, 绝不把未知行猜成 IPv4)。
+# 返回: 0=全部就位; 1=有失败或输入非法。
 _hy2_restore_hop_rules() {
-    local q line ok=0
+    local line fam spec q="" cur_fam="" ok=0
     [ "$#" -gt 0 ] || return 0
-    command -v iptables >/dev/null 2>&1 || return 1
-    q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
     for line in "$@"; do
         [ -n "$line" ] || continue
-        printf '%s\n' "$q" | grep -qF -- "$line" && continue
+        fam="${line%% *}"; spec="${line#* }"
+        case "$fam" in
+            4) [ "$spec" != "$line" ] || { ok=1; continue; } ;;
+            6) [ "$spec" != "$line" ] || { ok=1; continue; } ;;
+            *) ok=1; continue ;;
+        esac
+        if [ "$cur_fam" != "$fam" ]; then
+            if [ "$fam" = "4" ]; then
+                command -v iptables >/dev/null 2>&1 || { ok=1; cur_fam="$fam"; q=""; continue; }
+                q=$(iptables -t nat -S PREROUTING 2>/dev/null) || { ok=1; q=""; }
+            else
+                command -v ip6tables >/dev/null 2>&1 || { ok=1; cur_fam="$fam"; q=""; continue; }
+                q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || { ok=1; q=""; }
+            fi
+            cur_fam="$fam"
+        fi
+        printf '%s\n' "$q" | grep -qF -- "$spec" && continue
         # spec 来自 `iptables -S`(`-A PREROUTING ...`, 无引号空白), 直接作为命令回放。
         # shellcheck disable=SC2086
-        if iptables -t nat $line 2>/dev/null; then
-            q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
+        if [ "$fam" = "4" ]; then
+            if iptables -t nat $spec 2>/dev/null; then
+                q=$(iptables -t nat -S PREROUTING 2>/dev/null) || { ok=1; q=""; }
+            else
+                ok=1
+            fi
         else
-            ok=1
+            if ip6tables -t nat $spec 2>/dev/null; then
+                q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || { ok=1; q=""; }
+            else
+                ok=1
+            fi
         fi
     done
     return "$ok"

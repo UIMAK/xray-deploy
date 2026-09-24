@@ -717,6 +717,9 @@ _install_legacy_lock_identity_ok() {   # <fd> <见证fd>; 0 = 同一 inode
     [ "/proc/self/fd/$fd" -ef "/proc/self/fd/$wfd" ]
 }
 
+# 路径的 dev:ino 标识(mkdir 标记的自愈判定)。取不到输出空; 调用方必须 fail-closed。
+_install_lock_devino() { stat -c '%d:%i' "$1" 2>/dev/null; }
+
 # 旧版安装器不认识部署目录外的新锁。若旧版已拿到目录内锁并在卸载时删掉整棵树,
 # 新版随后重建同名目录/锁路径会得到全新的 inode, 与旧进程手里的已删除 fd 不互斥。
 # 在重建旧路径前扫描仍持有已删除部署文件的进程并 fail-closed。该检查只能缩小窗口;
@@ -772,7 +775,7 @@ _install_legacy_flock_active() {
 }
 
 _install_lock_acquire() {
-    local install_lock_parent="${DEPLOY_DIR%/*}" lrc legacy_witness=""
+    local install_lock_parent="${DEPLOY_DIR%/*}" lrc legacy_witness="" _devino=""
     [ -n "$install_lock_parent" ] || install_lock_parent="/"
     mkdir -p "$install_lock_parent" 2>/dev/null || {
         echo "[错误] 无法创建安装锁父目录 $install_lock_parent(权限/只读文件系统?), 安装中止"
@@ -806,16 +809,6 @@ _install_lock_acquire() {
                 _install_lock_release
                 return 1
             fi
-            # 旧版 mkdir 后端(`.install.lock` 目录): 目录存在(活持有者或 SIGKILL 残留)一律
-            # 拒绝, 绝不自动接管。**只检查、不创建标记**: 本路径有 flock(内核持锁, SIGKILL
-            # 自动释放), 若在此 mkdir 目录标记, 一次强杀就会留下无人持有的目录锁, 之后每次
-            # 安装/卸载都被自己的残留永久拒绝 —— 那等于用"跨版本协调"换掉 flock 的自愈性。
-            if [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
-                echo "[错误] 旧版安装锁目录仍存在: $INSTALL_LEGACY_LOCK_DIR"
-                echo "       确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-                _install_lock_release
-                return 1
-            fi
             # 旧版同为 flock 路径(`.install.lock.fd`): 拿不到就说明旧版安装/卸载仍在跑。
             exec {INSTALL_LEGACY_LOCK_FD}>>"$INSTALL_LEGACY_LOCK_FILE" 2>/dev/null || {
                 INSTALL_LEGACY_LOCK_FD=""
@@ -846,6 +839,48 @@ _install_lock_acquire() {
             # 否则我们握着的是已解除链接的 inode, 与"路径上新建文件的旧版进程"会同时放行。
             if ! _install_lock_inode_ok "${INSTALL_LEGACY_LOCK_FD:-}" "$INSTALL_LEGACY_LOCK_FILE"; then
                 echo "[错误] 旧版安装锁文件在获取后被替换/删除(部署目录正被卸载?), 本次中止"
+                _install_lock_release
+                return 1
+            fi
+            # (T3) 旧版 **mkdir 后端**的排他标记: 只"看一眼目录在不在"不能阻止旧版无-flock
+            # 进程在我们检查之后 mkdir。故在持有旧版 flock 期间创建同名标记目录, 使其 mkdir
+            # 失败而拒绝。标记带 `.witness`(= 本 flock 文件的 dev:ino): 被 SIGKILL 后, 下一个
+            # 持有同一 flock 的进程可安全清理重建; 无匹配 witness 的目录一律拒绝, 绝不接管。
+            _devino=$(_install_lock_devino "$INSTALL_LEGACY_LOCK_FILE")
+            if [ -z "$_devino" ]; then
+                echo "[错误] 无法读取旧版安装锁文件标识(dev:ino), 本次安装中止"
+                _install_lock_release
+                return 1
+            fi
+            if [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
+                if [ -f "$INSTALL_LEGACY_LOCK_DIR/.witness" ] && \
+                   [ "$(cat "$INSTALL_LEGACY_LOCK_DIR/.witness" 2>/dev/null)" = "$_devino" ]; then
+                    rm -rf "$INSTALL_LEGACY_LOCK_DIR" 2>/dev/null
+                fi
+            fi
+            if [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
+                echo "[错误] 旧版安装锁目录仍存在: $INSTALL_LEGACY_LOCK_DIR"
+                echo "       确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+                _install_lock_release
+                return 1
+            fi
+            if ! mkdir "$INSTALL_LEGACY_LOCK_DIR" 2>/dev/null; then
+                echo "[错误] 旧版安装锁目录被占用或无法创建: $INSTALL_LEGACY_LOCK_DIR"
+                _install_lock_release
+                return 1
+            fi
+            INSTALL_LEGACY_LOCK_DIR_HELD=1
+            if ! printf '%s\n' "$_devino" > "$INSTALL_LEGACY_LOCK_DIR/.witness" 2>/dev/null; then
+                rm -rf "$INSTALL_LEGACY_LOCK_DIR" 2>/dev/null
+                INSTALL_LEGACY_LOCK_DIR_HELD=0
+                echo "[错误] 无法写入旧版安装锁见证记录, 本次安装中止"
+                _install_lock_release
+                return 1
+            fi
+            if ! printf '%s\n' "$$" > "$INSTALL_LEGACY_LOCK_DIR/pid" 2>/dev/null; then
+                rm -rf "$INSTALL_LEGACY_LOCK_DIR" 2>/dev/null
+                INSTALL_LEGACY_LOCK_DIR_HELD=0
+                echo "[错误] 无法写入旧版安装锁持有者记录, 本次安装中止"
                 _install_lock_release
                 return 1
             fi
@@ -906,6 +941,10 @@ _install_lock_release() {
             flock -u "$INSTALL_LEGACY_LOCK_FD" 2>/dev/null
             eval "exec ${INSTALL_LEGACY_LOCK_FD}>&-" 2>/dev/null
             INSTALL_LEGACY_LOCK_FD=""
+        fi
+        if [ "${INSTALL_LEGACY_LOCK_DIR_HELD:-0}" = "1" ]; then
+            _install_lock_mkdir_release "$INSTALL_LEGACY_LOCK_DIR"
+            INSTALL_LEGACY_LOCK_DIR_HELD=0
         fi
         flock -u "$INSTALL_LOCK_FD" 2>/dev/null
         eval "exec ${INSTALL_LOCK_FD}>&-" 2>/dev/null
