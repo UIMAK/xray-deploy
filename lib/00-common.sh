@@ -191,9 +191,10 @@ _get_public_ip() {
         (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && \
         echo "$ip" && return 0
     done
-    # IPv6 兜底
+    # IPv6 兜底 —— **必须校验字面量**(#06)。旧写法只判 `[ -n "$ip" ]`, 源返回错误页/
+    # 代理提示时那段文本会被当成服务器地址写进分享链接(实测复现见 implement.md)。
     for url in "https://api64.ipify.org" "https://6.ipw.cn" "https://ipv6.icanhazip.com"; do
-        ip=$(curl -s6 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return 0
+        ip=$(curl -s6 --max-time 6 "$url" 2>/dev/null) && _is_ipv6_literal "$ip" && echo "$ip" && return 0
     done
     return 1
 }
@@ -438,8 +439,28 @@ _check_port_occupied() {
 }
 
 # ---------------------------------------------------------------------------
-# 原子写 JSON:临时文件写 + 校验 + mv(配合 xray -test)
+# 持久化屏障(十六轮 P1-③)。`mv` 只保证 rename **原子**(读不到半份文件), **不等于掉电持久**:
+# 数据可能仍在页缓存里。事务账本的 phase barrier 声称 durable, 就必须刷两次 —— 先刷临时文件
+# (数据块落盘), rename 之后再刷**父目录**(新目录项落盘; 只刷文件不足以让 rename 持久)。
+# 只刷文件不刷目录时, 断电后目录项可能仍是旧的 ⇒ 读到旧 phase, 而真实现场已完成 mutation。
+# 手段按平台级联(覆盖面递减): `sync <path>`(coreutils ≥8.24 / busybox ≥1.31)按路径刷 →
+# `sync -f <path>`(GNU)刷该路径所在文件系统 → 退回**全系统 sync**(更重但语义更强, 永远正确)。
+# 尽力而为: 任一步成功即返回 0, 全部失败才告警 —— 不改变调用方对"写入成功"的判定。
+# ---------------------------------------------------------------------------
+_fsync_path() {   # <path>
+    local p="$1"
+    [ -n "$p" ] || return 0
+    sync "$p" >/dev/null 2>&1 && return 0
+    sync -f "$p" >/dev/null 2>&1 && return 0
+    sync >/dev/null 2>&1 && return 0
+    _warn "无法把 $p 刷入持久存储(平台不支持按路径 fsync), 掉电一致性降级"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# 原子写 JSON:临时文件写 + 校验 + fsync + mv + 目录 fsync(配合 xray -test)
 # 用法:_atomic_write_json <目标文件> <内容>
+# 事务账本(phase barrier)、config 与节点元数据的**唯一**提交点, 故持久化屏障只加在这一处。
 # ---------------------------------------------------------------------------
 _atomic_write_json() {
     local target="$1" content="$2" tmp
@@ -468,11 +489,16 @@ _atomic_write_json() {
             return 1
         fi
     fi
+    # 校验全部通过后才刷: 刷一个马上要丢弃的临时文件是白等。数据块必须先于 rename 落盘,
+    # 否则 rename 后断电可能留下"新名字 + 空内容"(比旧内容更糟)。
+    _fsync_path "$tmp"
     if ! mv -f "$tmp" "$target"; then
         rm -f "$tmp"
         _error "替换 JSON 文件失败: $target"
         return 1
     fi
+    # rename 之后刷**父目录**: 让新目录项本身落盘。
+    _fsync_path "$(dirname "$target")"
     return 0
 }
 
@@ -593,7 +619,14 @@ _crontab_read() {
     return 0
 }
 
+# 三十四轮 P2: crontab 是独立于 config.json 的共享状态, 但同样是"读 → 改 → 写"的 RMW ——
+# 两个会话并发执行会最后写入者覆盖前者。这里沿用项目唯一的进程间事务锁(config lock)串行化,
+# 不再新建第二套锁机制。锁可重入: `_auto_migrate_geo_autoupdate_locked` / `_uninstall_xray_locked`
+# 等已在 config lock 内的调用者不会自锁死。只读的 `_crontab_read` 不取锁(写路径在锁内重读)。
 _crontab_replace() {
+    _with_config_lock _crontab_replace_locked "$@"
+}
+_crontab_replace_locked() {
     local marker="$1" newline="${2:-}" cur filtered grc
     [ -n "$marker" ] || return 1
     cur=$(_crontab_read) || return 1
@@ -608,8 +641,11 @@ _crontab_replace() {
         return 1
     fi
     if [ -n "$newline" ]; then
-        filtered="${filtered:+${filtered}
-}${newline}"
+        # 这里**不能**在字符串里换行写 "${filtered:+${filtered}\n}" —— 源码里那会造出一行
+        # 以 `}` 开头的内容行, 会让测试套件的函数体提取器(_fn_body_extract 以行首 `}` 为结束)
+        # 截断函数; 用变量承载换行, 行为不变且函数可被完整提取。
+        local nl=$'\n'
+        filtered="${filtered:+${filtered}${nl}}${newline}"
     fi
     printf '%s\n' "$filtered" | crontab - 2>/dev/null || return 1
     return 0
@@ -743,7 +779,14 @@ _gen_rand_path() {
 # R38(P1): jq 对"只含空白的文件"不报错但输出空, 旧写法会把 config.json 截断成 0 字节。
 # 现由 _atomic_write_json 的空内容拦截兜住, 这里再显式判一次以避免无谓的错误输出。
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: 本函数是"读整份 config → jq 重排 → 原子写回"的 RMW, 必须在 config lock 内执行 ——
+# 否则并发节点事务提交后会被这里的旧快照整份覆盖(lost update)。外层先做廉价守卫, 不存在/空文件
+# 时不取锁(也避免在无部署目录的调用场景里白报锁错误)。
 _normalize_config_format() {
+    [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
+    _with_config_lock _normalize_config_format_locked
+}
+_normalize_config_format_locked() {
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
     local content
@@ -916,15 +959,76 @@ _press_any_key() {
     read -r
 }
 
+# 无 flock 时的 config 锁退路(二十轮 P1-2): 与 install/core 的 mkdir 退路同一契约 ——
+# 父目录下 `.<name>.config.lock.d` 原子 mkdir + pid, **永不自动接管**任何既有目录
+# (活持有者/死 pid/无 pid 一律拒绝并给出人工清理命令)。SIGKILL 残局需要一次人工 rm -rf,
+# 这是 mkdir 退路相对 flock 的已知代价; 但"无 flock 就直接放行"会让 reset 的
+# backup→删除→重建整段事务与普通 config writer 完全失去互斥, 故不再放行。
+_with_config_lock_mkdir() {
+    local deploy_path="${DEPLOY_DIR%/}" parent name lock_dir rc owner
+    case "$deploy_path" in
+        /*) ;;
+        *) _error "部署目录必须是绝对路径, 无法建立配置锁: $DEPLOY_DIR"; return 1 ;;
+    esac
+    if [ -z "$deploy_path" ] || [ "$deploy_path" = "/" ]; then
+        _error "部署目录路径无效, 无法建立配置锁: $DEPLOY_DIR"
+        return 1
+    fi
+    parent="${deploy_path%/*}"; name="${deploy_path##*/}"
+    [ -n "$parent" ] || parent="/"
+    lock_dir="${parent}/.${name}.config.lock.d"
+    mkdir -p "$parent" 2>/dev/null || {
+        _error "无法创建配置锁父目录 $parent(权限/只读文件系统?), 放弃本次修改"
+        return 1
+    }
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        owner=$(cat "$lock_dir/pid" 2>/dev/null)
+        _error "配置锁目录已存在(可能有其他会话, 或上次被强杀): $lock_dir (pid ${owner:-未知})"
+        _tip "确认没有会话在修改配置后, 请手动删除该锁目录: rm -rf -- '$lock_dir'"
+        return 1
+    fi
+    if ! printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null; then
+        rm -f "$lock_dir/pid" 2>/dev/null
+        rmdir "$lock_dir" 2>/dev/null
+        _error "无法写入配置锁持有者记录 $lock_dir/pid(磁盘空间/权限?), 放弃本次修改"
+        return 1
+    fi
+    if [ ! -d "$deploy_path" ]; then
+        _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $deploy_path"
+        rm -f "$lock_dir/pid" 2>/dev/null
+        rmdir "$lock_dir" 2>/dev/null
+        return 1
+    fi
+    (
+        XRAY_DEPLOY_LOCK_HELD=1
+        export XRAY_DEPLOY_LOCK_HELD
+        "$@"
+    )
+    rc=$?
+    owner=$(cat "$lock_dir/pid" 2>/dev/null)
+    if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
+        _error "配置锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
+        _tip "确认没有配置事务仍在运行后, 请手动检查并清理该锁目录"
+        return 1
+    fi
+    return "$rc"
+}
+
 # ---------------------------------------------------------------------------
 # 跨进程配置修改锁(2026-09-12 审查 F5, 借鉴 singbox-lite _with_state_lock):
 # 包住 _mutate_config 的 read-modify-write, 防止两个并发 xd 会话交叠产生丢失更新。
-# best-effort 语义, 与 singbox-lite 的"缺 flock 硬失败"刻意不同:
-#   - flock 不可用(裁剪版 busybox)时直接放行 —— 配置写者只有单管理员 TUI 一个,
-#     为锁而拒绝服务比偶发竞态更伤; 放行属于已声明的降级而非静默吞错。
-#   - 持锁者导出 XRAY_DEPLOY_LOCK_HELD=1 支持重入(当前无嵌套调用, 防御性保留)。
+# 主锁文件在部署目录的**父目录**(`.<deploy-name>.config.lock`): 卸载/reset 的 `rm -rf $DEPLOY_DIR`
+# 不会把它拆成两个 inode, 因而 config writer 与全站破坏性操作能真正互斥。旧版(0.17.11 及
+# PR #48 早期 HEAD)只认目录内 `.config.lock`, 故同时用 flock 占住该路径作为跨版本协调。
+# 全站破坏性锁序是 install → config → core: install/uninstall/reset 先取安装锁, 再由本函数
+# 取 config 主锁, 最后由 `_restart_xray_verified` 取 core 锁; 单独 config writer 走 config → core。
+# 本函数**不自取 install lock** —— 那会让每次普通配置写入都创建旧版目录锁标记, SIGKILL 残局
+# 会让菜单再也改不了配置; 破坏性路径的 install 锁由各自入口显式获取。
+# `flock` 不可用(裁剪版 busybox / 未装 util-linux 的 Alpine)时走 `_with_config_lock_mkdir`:
+# reset 的 backup→删除→重建整段已是事务, 放行等于让它与普通 config writer 完全失去互斥,
+# 因此不再 best-effort 直通。持锁者导出 `XRAY_DEPLOY_LOCK_HELD=1` 支持重入。
 # 注意: "$@" 在子 shell 中执行 —— _mutate_config 及其下游不向调用方回传全局变量,
-# 返回码经子 shell 退出码透传; fd 9 随子 shell 结束自动关闭并释放锁。
+# 返回码经子 shell 退出码透传; fd 9 与旧版协调 fd 随子 shell 结束自动关闭并释放锁。
 # ---------------------------------------------------------------------------
 _with_config_lock() {
     if [ "${XRAY_DEPLOY_LOCK_HELD:-0}" = "1" ]; then
@@ -932,17 +1036,26 @@ _with_config_lock() {
         return $?
     fi
     if ! command -v flock >/dev/null 2>&1; then
-        "$@"
+        _with_config_lock_mkdir "$@"
         return $?
     fi
+    local config_parent="${DEPLOY_DIR%/*}" config_name="${DEPLOY_DIR##*/}" config_lock_file legacy_lock_file
+    [ -n "$config_parent" ] || config_parent="/"
+    config_lock_file="${config_parent}/.${config_name}.config.lock"
+    legacy_lock_file="$DEPLOY_DIR/.config.lock"
     (
-        mkdir -p "$DEPLOY_DIR" 2>/dev/null
+        # **只创建父目录**(锁文件所在目录), 绝不创建 `$DEPLOY_DIR`: 与卸载竞态时, 普通
+        # config writer 若在这里 mkdir 部署目录, 会把刚被卸载的树重新制造出来 ——
+        # 目录存在性改为**取到主锁之后**再判定, 不存在就 fail-closed(不重建)。
+        mkdir -p "$config_parent" 2>/dev/null
+        # config lock 主文件在部署目录父目录, 不能被 uninstall 的 rm -rf 拆成新旧 inode。
+        # legacy_lock_file 仍会被打开并占用, 用来排斥旧版仍只认识目录内 .config.lock 的写者。
         # 注意: exec 仅带重定向时重定向会**持久化**到整个子 shell —— 原写法
         # `exec 9>... 2>/dev/null` 把子 shell 的 stderr 永久吞掉, 事务体内的全部
         # _error/超时提示静默丢失(2026-09-13 Alpine 实测)。去掉 2>/dev/null:
         # open 失败时 bash 自身报错 + 下面的 _error 都可见, 语义更正确。
-        if ! exec 9>"$DEPLOY_DIR/.config.lock"; then
-            _error "无法创建配置锁文件 $DEPLOY_DIR/.config.lock(目录不可写?), 放弃本次修改"
+        if ! exec 9>"$config_lock_file"; then
+            _error "无法创建配置锁文件 $config_lock_file(目录不可写?), 放弃本次修改"
             exit 1
         fi
         local i
@@ -954,8 +1067,56 @@ _with_config_lock() {
             _error "等待配置锁超时(15s), 可能有其他 xd 会话正在修改配置"
             exit 1
         fi
+        # 主锁已在手, 此时才判部署树是否存在: 锁内的真实状态。不存在 ⇒ 确实没有部署
+        # (或刚被卸载), fail-closed 退出且**不重建**目录。
+        if [ ! -d "$DEPLOY_DIR" ]; then
+            _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
+            exit 1
+        fi
+        # (T1) 旧版配置锁文件若已存在, 用只读见证 fd 记下 inode 身份 —— 与 core/install 的
+        # legacy 锁同一契约: 路径"存在→被删→我们新建 inode"时, 新 fd 与路径都指向新 inode,
+        # 只查"fd 指向路径"会放行, 而旧版写者的 flock 落在已被删除的旧 inode 上, 两边同时进入。
+        local legacy_fd="" legacy_witness="" li
+        if [ -e "$legacy_lock_file" ]; then
+            exec {legacy_witness}<"$legacy_lock_file" 2>/dev/null || legacy_witness=""
+            if [ -z "$legacy_witness" ]; then
+                _error "旧版配置锁文件存在但无法打开见证, 放弃本次修改: $legacy_lock_file"
+                exit 1
+            fi
+        fi
+        if ! exec {legacy_fd}>>"$legacy_lock_file" 2>/dev/null; then
+            [ -n "$legacy_witness" ] && eval "exec ${legacy_witness}<&-" 2>/dev/null
+            _error "无法打开旧版配置锁文件 $legacy_lock_file(目录不可写?), 放弃本次修改"
+            [ -n "$legacy_fd" ] && eval "exec ${legacy_fd}>&-" 2>/dev/null
+            exit 1
+        fi
+        # (T2) 见证身份: 打开到的必须就是 T1 看到的那个 inode; 被删除/替换 ⇒ fail-closed。
+        if [ -n "$legacy_witness" ]; then
+            if ! [ "/proc/self/fd/$legacy_fd" -ef "/proc/self/fd/$legacy_witness" ]; then
+                _error "旧版配置锁文件在判定后被删除/替换(部署目录正被卸载?), 放弃本次修改"
+                eval "exec ${legacy_witness}<&-" 2>/dev/null
+                eval "exec ${legacy_fd}>&-" 2>/dev/null
+                exit 1
+            fi
+            eval "exec ${legacy_witness}<&-" 2>/dev/null
+            legacy_witness=""
+        fi
+        for li in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+            flock -n "$legacy_fd" 2>/dev/null && break
+            sleep 1
+        done
+        if ! flock -n "$legacy_fd" 2>/dev/null; then
+            _error "旧版配置写者仍持有 $legacy_lock_file(15s), 可能仍有旧版会话在改配置"
+            _tip "等旧版会话退出后重试(内核会在持有进程退出时自动释放该锁)"
+            eval "exec ${legacy_fd}>&-" 2>/dev/null
+            exit 1
+        fi
         export XRAY_DEPLOY_LOCK_HELD=1
         "$@"
+        local rc=$?
+        flock -u "$legacy_fd" 2>/dev/null
+        eval "exec ${legacy_fd}>&-" 2>/dev/null
+        exit "$rc"
     )
 }
 

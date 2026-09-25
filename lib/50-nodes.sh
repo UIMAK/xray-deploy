@@ -645,6 +645,46 @@ _hy2_match_target() {
     grep -e "--to-destination :${port} " -e "--to-destination :${port}\$"
 }
 
+# 持久化文件路径的单一读取入口。Debian/直接 save 使用 rules.v4/rules.v6;
+# Alpine OpenRC 的 iptables.initd 读取 /etc/conf.d/iptables 与 ip6tables 中的
+# IPTABLES_SAVE/IP6TABLES_SAVE(官方默认分别是 rules-save/rules6-save)。全局 orphan
+# 检查必须覆盖这些 OpenRC 文件, 否则 runtime 已清空但重启后规则仍会恢复。
+_hy2_conf_save_path() {   # <conf> <key> <default>
+    local conf="$1" key="$2" def="$3" line value=""
+    if [ -r "$conf" ]; then
+        while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in
+                "$key"=*) value="${line#*=}"; break ;;
+            esac
+        done < "$conf"
+    fi
+    value="${value#\"}"; value="${value%\"}"
+    value="${value#\'}"; value="${value%\'}"
+    case "$value" in
+        /*) printf '%s\n' "$value" ;;
+        *) printf '%s\n' "$def" ;;
+    esac
+}
+
+_hy2_iptables_persist_files() {
+    local ipt_dir="${HY2_IPTABLES_DIR:-/etc/iptables}"
+    local initd_dir="${HY2_INITD_DIR:-/etc/init.d}"
+    local conf_dir="${HY2_CONF_DIR:-/etc/conf.d}"
+    local fam=""
+    declare -F _detect_os_family >/dev/null 2>&1 && fam=$(_detect_os_family 2>/dev/null)
+    printf '%s\n' "$ipt_dir/rules.v4" "$ipt_dir/rules.v6"
+    if [ "$fam" = alpine ]; then
+        _hy2_conf_save_path "$conf_dir/iptables" IPTABLES_SAVE "$ipt_dir/rules-save"
+        _hy2_conf_save_path "$conf_dir/ip6tables" IP6TABLES_SAVE "$ipt_dir/rules6-save"
+    elif [ -x "$initd_dir/iptables" ] || [ -x "$initd_dir/ip6tables" ]; then
+        # A test/container may expose the OpenRC scripts without being classified Alpine;
+        # their default save paths are still part of the persistence surface.
+        _hy2_conf_save_path "$conf_dir/iptables" IPTABLES_SAVE "$ipt_dir/rules-save"
+        _hy2_conf_save_path "$conf_dir/ip6tables" IP6TABLES_SAVE "$ipt_dir/rules6-save"
+    fi
+}
+
 # R38(P1)/R39(P1): 本机是否"**有证据表明**不存在任何 xray-deploy 端口跳跃规则"。
 # 用于给 _node_protocol_safe 的 fail-closed 提供一个可证伪的逃生口。
 # R39 收紧: 必须真的**看过** runtime, 才能说"没有规则"。
@@ -658,17 +698,50 @@ _hy2_match_target() {
 #      不含 "nat"(文件不存在同样说明 x_tables 未被使用) => 内核里不可能有 nat 规则;
 #   c) 上面能确认无 runtime 规则后, 再看持久化文件(它们会在重启时被重新加载)。
 # 任一通道都无法确认 => 返回 1(UNKNOWN, 按不安全处理), 由调用方拒绝并给出人工路径。
+# IPv6 NAT 统一观察口径(二十八轮 P2): remove / candidates / no_hop_rules_at_all 三个观察点
+# 共用同一判定, 避免下一个观察点再次漂移。**只走 stdout(三态)**, 调用方各自决定文案与动作:
+#   ip6tables = ip6tables 可用, 调用方必须自己查询(查询失败即 UNKNOWN)
+#   absent    = 无 ip6tables、无 nft, 且内核 ip6 x_tables 从未注册 nat 表 ⇒ 可证明无 IPv6 NAT
+#   unknown   = 无法证明(存在 nft / 注册了 nat 表 / 注册表读不到) ⇒ 调用方必须 fail-closed
+# `unknown` 的第二词是原因(nft|proc_nat|proc_unreadable), 仅供调用方给准确文案, 不参与判定。
+_hy2_ipv6_state() {
+    local q
+    if command -v ip6tables >/dev/null 2>&1; then
+        printf 'ip6tables\n'; return 0
+    fi
+    # xtables-nft 下 IPv6 NAT 规则进入 nf_tables, 只查 x_tables 注册表不足以证明不存在。
+    if command -v nft >/dev/null 2>&1; then
+        printf 'unknown nft\n'; return 0
+    fi
+    if [ -e /proc/net/ip6_tables_names ]; then
+        if ! q=$(cat /proc/net/ip6_tables_names 2>/dev/null); then
+            printf 'unknown proc_unreadable\n'; return 0
+        fi
+        printf '%s\n' "$q" | grep -qx "nat" && { printf 'unknown proc_nat\n'; return 0; }
+    fi
+    printf 'absent\n'; return 0
+}
+
 # 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
 _hy2_no_hop_rules_at_all() {
-    local q f runtime_clean=0
+    local q f runtime_clean=0 persist_files persist_rc
     if command -v iptables >/dev/null 2>&1; then
         q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
         printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
-        # IPv6 侧为 best-effort: 命令存在但查询失败时无法确认, 保守判 UNKNOWN
-        if command -v ip6tables >/dev/null 2>&1; then
-            q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
-            printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
-        fi
+        # IPv6 侧: 统一三态观察(二十八轮 P2 收口; 原来 nft / /proc 的判定散在各处)。
+        case "$(_hy2_ipv6_state)" in
+            ip6tables)
+                q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
+                printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
+                ;;
+            absent) : ;;
+            'unknown nft')
+                _warn "ip6tables 不可用但检测到 nft, 无法确认是否存在 IPv6 跳跃规则"
+                return 1 ;;
+            *)
+                _warn "无法确认是否存在 IPv6 跳跃规则(IPv6 nat 注册表读不到或已注册 nat)"
+                return 1 ;;
+        esac
         runtime_clean=1
     else
         # 无 iptables: 唯一可靠的替代证据是"内核 nat 表从未被使用过"。
@@ -690,10 +763,14 @@ _hy2_no_hop_rules_at_all() {
     fi
     [ "$runtime_clean" -eq 1 ] || return 1
     # runtime 已确认无规则; 持久化文件会在重启时重新加载, 同样必须干净
-    for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+    persist_files=$(_hy2_iptables_persist_files) || return 1
+    while IFS= read -r f; do
         [ -f "$f" ] || continue
-        grep -q "xray-deploy-hy2-hop" "$f" 2>/dev/null && return 1
-    done
+        grep -q "xray-deploy-hy2-hop" "$f" 2>/dev/null; persist_rc=$?
+        case "$persist_rc" in
+            0|2) return 1 ;;
+        esac
+    done <<< "$persist_files"
     return 0
 }
 
@@ -768,10 +845,29 @@ _hy2_add_hop_rules() {
 # R17: 同时匹配 comment + dport + 目标端口, 保证跨节点隔离——不同节点即使 hop dport 重叠,
 #      删除本节点(目标端口 X)绝不误删他节点(目标端口 Y)的同 dport 规则。
 # R18: 目标端口用 _hy2_match_target 精确边界匹配; -S 查询失败显式报错, 不把"查不到"当"已删干净"。
-# 返回: 0 全部 IPv4 范围删除干净; 1 有 IPv4 残留或查询失败(调用方应中止事务/显式提示; IPv6 为 best-effort 只警告)
+# 二十五轮 P1: **IPv6 不再 best-effort** —— ip6tables 可用时, 查询失败/删除失败/删除后残留
+# 都让本函数返回 1; ip6tables 不可用时用 `/proc/net/ip6_tables_names` 证明内核 ip6 nat 表从未
+# 注册(否则 UNKNOWN ⇒ 失败)。否则 IPv4 删干净而 IPv6 残留时函数仍返回 0, 上层继续删
+# metadata/config, 就制造出失去归属的 IPv6 orphan DNAT。
+# 返回: 0 双栈全部删除干净(或可证明不存在 IPv6 NAT); 1 任一 family 残留/查询失败/无法确认
 _hy2_remove_hop_rules() {
     local hy2_port="$1"; shift
-    local range remain_any=0
+    local range remain_any=0 v6ok=0
+    # IPv6 观测能力预检(统一走 `_hy2_ipv6_state`, 与另外两个观察点同口径):
+    # ip6tables 缺失时只有内核 ip6 x_tables 从未注册 nat 表且无 nft 才能证明无需清理。
+    case "$(_hy2_ipv6_state)" in
+        ip6tables) v6ok=1 ;;
+        absent) : ;;
+        'unknown nft')
+            _error "ip6tables 不可用但检测到 nft, 无法确认/清理 IPv6 跳跃规则"
+            return 1 ;;
+        'unknown proc_unreadable')
+            _error "无法确认 IPv6 NAT 状态(读取 /proc/net/ip6_tables_names 失败), 中止删除"
+            return 1 ;;
+        *)
+            _error "ip6tables 不可用但内核注册了 IPv6 nat 表, 无法安全清理 IPv6 跳跃规则"
+            return 1 ;;
+    esac
     for range in "$@"; do
         local q specs
         if ! q=$(iptables -t nat -S PREROUTING 2>/dev/null); then
@@ -799,26 +895,31 @@ _hy2_remove_hop_rules() {
             _warn "IPv4 范围 ${range} 的跳跃规则删除后仍残留, 请手动检查"
             remain_any=1
         fi
-        if command -v ip6tables >/dev/null 2>&1; then
+        if [ "$v6ok" -eq 1 ]; then
             local q6 specs6
             if ! q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null); then
-                _warn "无法读取 IPv6 PREROUTING 规则, 跳过 IPv6 跳跃规则删除核验"
-                continue
+                _error "无法读取 IPv6 PREROUTING 规则, 中止删除"
+                return 1
             fi
             specs6=$(printf '%s\n' "$q6" | grep "xray-deploy-hy2-hop" \
                     | grep -e "dport ${range} " -e "dport ${range}\$" \
                     | _hy2_match_target "$hy2_port" | sed 's/^-A/-D/')
             while IFS= read -r line; do
-                [ -n "$line" ] && ip6tables -t nat $line 2>/dev/null || true
+                if [ -n "$line" ]; then
+                    ip6tables -t nat $line 2>/dev/null || remain_any=1
+                fi
             done <<< "$specs6"
             if ! q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null); then
-                _warn "无法读取 IPv6 PREROUTING 规则核验, 跳过 IPv6 残留判断"
-                continue
+                _error "无法读取 IPv6 PREROUTING 规则核验, 中止删除"
+                return 1
             fi
             remain=$(printf '%s\n' "$q6" | grep "xray-deploy-hy2-hop" \
                     | grep -e "dport ${range} " -e "dport ${range}\$" \
                     | _hy2_match_target "$hy2_port")
-            [ -n "$remain" ] && _warn "IPv6 范围 ${range} 的跳跃规则删除后仍残留, 请手动检查"
+            if [ -n "$remain" ]; then
+                _warn "IPv6 范围 ${range} 的跳跃规则删除后仍残留, 请手动检查"
+                remain_any=1
+            fi
         fi
     done
     return "$remain_any"
@@ -835,61 +936,62 @@ _hy2_persist_iptables() {
     # 否则 metadata 提交 hop=enabled, 重启后 runtime DNAT 全丢, 直接违反
     # "runtime/metadata 不分裂"原则。_ensure_iptables 只保证 iptables 存在,
     # 不保证 iptables-save, 故必须在此显式 fail-closed。正常 enable/disable/
-    # retarget/delete 的事务都会因 rc1 回滚 runtime 且不提交 metadata; reset
-    # 路径由调用方保持 best-effort + warn。
+    # retarget/delete 的事务都会因 rc1 回滚 runtime 且不提交 metadata; reset/uninstall
+    # 路径也必须保留现场并返回失败。
     if ! command -v iptables-save >/dev/null 2>&1; then
         _error "iptables-save 不可用, 无法安全持久化端口跳跃规则(重启后规则会丢失)"
         return 1
     fi
-    local ok=0 fam v4tmp v6tmp
+    local ok=0 fam v4tmp v6tmp ipt_dir="${HY2_IPTABLES_DIR:-/etc/iptables}" \
+        initd_dir="${HY2_INITD_DIR:-/etc/init.d}"
     fam=$(_detect_os_family)
     case "$fam" in
         debian)
-            mkdir -p /etc/iptables 2>/dev/null || ok=1
-            v4tmp="/etc/iptables/rules.v4.tmp.$$"
+            mkdir -p "$ipt_dir" 2>/dev/null || ok=1
+            v4tmp="$ipt_dir/rules.v4.tmp.$$"
             if iptables-save > "$v4tmp" 2>/dev/null; then
-                mv -f "$v4tmp" /etc/iptables/rules.v4 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
+                mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
             else
                 rm -f "$v4tmp"; ok=1
             fi
             if command -v ip6tables-save >/dev/null 2>&1; then
-                v6tmp="/etc/iptables/rules.v6.tmp.$$"
+                v6tmp="$ipt_dir/rules.v6.tmp.$$"
                 if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                    mv -f "$v6tmp" /etc/iptables/rules.v6 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
+                    mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
                 else
                     rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
                 fi
             fi
             ;;
         alpine)
-            if [ -x /etc/init.d/iptables ]; then
+            if [ -x "$initd_dir/iptables" ]; then
                 # init.d save 由服务脚本自行管理其持久化文件, 无法原子化, 仅检查返回
-                /etc/init.d/iptables save >/dev/null 2>&1 || ok=1
+                "$initd_dir/iptables" save >/dev/null 2>&1 || ok=1
                 # R34(P2): ip6 侧先确认 init.d 脚本存在; 不存在但 ip6tables-save 可用时
                 # 回退到直接原子写(与无 init.d 分支一致), 避免调用不存在的脚本 rc127 误报失败
-                if [ -x /etc/init.d/ip6tables ]; then
-                    /etc/init.d/ip6tables save >/dev/null 2>&1 || _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
+                if [ -x "$initd_dir/ip6tables" ]; then
+                    "$initd_dir/ip6tables" save >/dev/null 2>&1 || _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
                 elif command -v ip6tables-save >/dev/null 2>&1; then
-                    mkdir -p /etc/iptables 2>/dev/null || _warn "无法创建 /etc/iptables, IPv6 规则持久化失败(best-effort)"
-                    v6tmp="/etc/iptables/rules.v6.tmp.$$"
+                    mkdir -p "$ipt_dir" 2>/dev/null || _warn "无法创建 $ipt_dir, IPv6 规则持久化失败(best-effort)"
+                    v6tmp="$ipt_dir/rules.v6.tmp.$$"
                     if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                        mv -f "$v6tmp" /etc/iptables/rules.v6 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
+                        mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
                     else
                         rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
                     fi
                 fi
             else
-                mkdir -p /etc/iptables 2>/dev/null || ok=1
-                v4tmp="/etc/iptables/rules.v4.tmp.$$"
+                mkdir -p "$ipt_dir" 2>/dev/null || ok=1
+                v4tmp="$ipt_dir/rules.v4.tmp.$$"
                 if iptables-save > "$v4tmp" 2>/dev/null; then
-                    mv -f "$v4tmp" /etc/iptables/rules.v4 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
+                    mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
                 else
                     rm -f "$v4tmp"; ok=1
                 fi
                 if command -v ip6tables-save >/dev/null 2>&1; then
-                    v6tmp="/etc/iptables/rules.v6.tmp.$$"
+                    v6tmp="$ipt_dir/rules.v6.tmp.$$"
                     if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                        mv -f "$v6tmp" /etc/iptables/rules.v6 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
+                        mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
                     else
                         rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
                     fi
@@ -897,10 +999,10 @@ _hy2_persist_iptables() {
             fi
             ;;
         *)
-            mkdir -p /etc/iptables 2>/dev/null || ok=1
-            v4tmp="/etc/iptables/rules.v4.tmp.$$"
+            mkdir -p "$ipt_dir" 2>/dev/null || ok=1
+            v4tmp="$ipt_dir/rules.v4.tmp.$$"
             if iptables-save > "$v4tmp" 2>/dev/null; then
-                mv -f "$v4tmp" /etc/iptables/rules.v4 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
+                mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
             else
                 rm -f "$v4tmp"; ok=1
             fi
@@ -1400,36 +1502,200 @@ _hy2_list_all_hop_rules() {
     fi
 }
 
-# 清理所有节点的端口跳跃 iptables 规则
-_hy2_cleanup_all_hops() {
+# 打印"当前会被 `_hy2_cleanup_all_hops` 删除"的规则 spec, **每行带 family 前缀**:
+#   `4 -A PREROUTING ...`  (iptables)
+#   `6 -A PREROUTING ...`  (ip6tables)
+# 单一来源: 清理函数用它做失败回滚的 `saved` 集合, reset 用它把恢复源写进 journal,
+# 两处不得各自再写一份(否则必然漂移)。
+# **为什么必须含 IPv6(二十四轮 P1)**: `_hy2_remove_hop_rules` 会同时删除 IPv4 与 IPv6 规则;
+# 恢复源只存 IPv4 时, "失败回滚/崩溃恢复"会把 IPv6 规则永久丢掉 —— 现场与清理前不一致。
+# **契约(二十一轮 P1-1)**: `0` = 已枚举(可能为空 —— 没有任何会被删除的节点时不必碰 iptables);
+# `1` = **存在**会被删除的 hop 节点却无法枚举(缺 iptables / 任一 family 的 `-S` 失败)。
+# 调用方在拿到 1 时必须 fail-closed: 恢复源建不起来就绝不允许继续删除 runtime 状态。
+_hy2_hop_cleanup_candidates() {
     [ -d "$NODES_DIR" ] || return 0
-    if ! command -v iptables >/dev/null 2>&1; then
-        # R33(P2): iptables 不可用时不阻塞 reset, 但存在 hop metadata 时必须显式提示——
-        # 否则 metadata 随 reset 删除后, DNAT 可能残留且无法追溯
-        if grep -lq 'hop_ranges\|udp_hop_ports' "$NODES_DIR"/*.json 2>/dev/null; then
-            _warn "iptables 不可用, 无法验证/清理端口跳跃规则(存在 hop metadata), 请手动检查 iptables -t nat -S PREROUTING"
-        fi
-        return 0
-    fi
-    local found=0 residual=0
+    local f proto port ranges any=0
+    # 先判"是否真有会被删除的节点": 没有 hop 的机器不因 iptables 缺失而阻塞 reset/uninstall。
+    # 谓词与下面清理循环一致(protocol=hysteria2 + 非空 ranges + 非空 port)。
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        proto=$(jq -r '.protocol' "$f" 2>/dev/null)
         [ "$proto" = "hysteria2" ] || continue
-        local port ranges
         port=$(jq -r '.port' "$f" 2>/dev/null)
+        [ -n "$port" ] || continue
         ranges=$(_read_hop_ranges "$f")
-        if [ -n "$ranges" ] && [ -n "$port" ]; then
-            # R17: 全量重置场景 metadata 整体丢弃, 清理为 best-effort; 但残留必须显式报告, 不静默
-            # shellcheck disable=SC2086
-            _hy2_remove_hop_rules "$port" $ranges || residual=1
-            found=1
+        [ -n "$ranges" ] || continue
+        any=1
+        break
+    done
+    [ "$any" -eq 1 ] || return 0
+    command -v iptables >/dev/null 2>&1 || return 1
+    local q q6="" v6ok=0
+    q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
+    # 统一三态观察(二十八轮 P2): 之前这里缺 /proc/net/ip6_tables_names 分支, 会只枚举 IPv4,
+    # 把可能存在却观察不到的 IPv6 规则漏出恢复源; 现在与另两个观察点完全同口径。
+    case "$(_hy2_ipv6_state)" in
+        ip6tables)
+            # IPv6 与 IPv4 同为"会被删除的 runtime": 查不到就建不起恢复源 ⇒ 返回 1(fail-closed)。
+            q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
+            v6ok=1 ;;
+        absent) : ;;
+        'unknown nft')
+            _error "ip6tables 不可用但检测到 nft, 无法枚举 IPv6 端口跳跃恢复源"
+            return 1 ;;
+        *)
+            _error "无法确认 IPv6 NAT 状态(nat 注册表读不到或已注册), 无法枚举 IPv6 端口跳跃恢复源"
+            return 1 ;;
+    esac
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+        [ "$proto" = "hysteria2" ] || continue
+        port=$(jq -r '.port' "$f" 2>/dev/null)
+        [ -n "$port" ] || continue
+        ranges=$(_read_hop_ranges "$f")
+        [ -n "$ranges" ] || continue
+        # 目标端口在节点间唯一(即 hy2 监听端口), 故按 target 取到的就是本节点的全部规则;
+        # 即便 metadata 的 range 与 runtime 有出入, 作为"恢复源"取超集也是安全的(回滚只补缺失项)。
+        printf '%s\n' "$q" | grep "xray-deploy-hy2-hop" | _hy2_match_target "$port" | sed 's/^/4 /'
+        if [ "$v6ok" -eq 1 ]; then
+            printf '%s\n' "$q6" | grep "xray-deploy-hy2-hop" | _hy2_match_target "$port" | sed 's/^/6 /'
         fi
     done
-    if [ "$found" -eq 1 ]; then
-        _hy2_persist_iptables || _warn "iptables 规则持久化失败, 重启后可能丢失"
+}
+
+# 恢复被删除的规则: 输入是 `_hy2_hop_cleanup_candidates` 的 `<4|6> <spec>` 行。
+# **只补当前不存在的 spec**, 已存在的不重复添加; 每次成功添加后刷新该 family 的快照
+# (二十一轮 P2: 否则重复的 spec 在第二次判定时仍被当作"不存在"而重复 `-A`)。
+# family 缺失/无法识别 ⇒ 失败(fail-closed, 绝不把未知行猜成 IPv4)。
+# 返回: 0=全部就位; 1=有失败或输入非法。
+_hy2_restore_hop_rules() {
+    local line fam spec q="" cur_fam="" ok=0
+    [ "$#" -gt 0 ] || return 0
+    for line in "$@"; do
+        [ -n "$line" ] || continue
+        fam="${line%% *}"; spec="${line#* }"
+        case "$fam" in
+            4) [ "$spec" != "$line" ] || { ok=1; continue; } ;;
+            6) [ "$spec" != "$line" ] || { ok=1; continue; } ;;
+            *) ok=1; continue ;;
+        esac
+        if [ "$cur_fam" != "$fam" ]; then
+            if [ "$fam" = "4" ]; then
+                command -v iptables >/dev/null 2>&1 || { ok=1; cur_fam="$fam"; q=""; continue; }
+                q=$(iptables -t nat -S PREROUTING 2>/dev/null) || { ok=1; q=""; }
+            else
+                command -v ip6tables >/dev/null 2>&1 || { ok=1; cur_fam="$fam"; q=""; continue; }
+                q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || { ok=1; q=""; }
+            fi
+            cur_fam="$fam"
+        fi
+        printf '%s\n' "$q" | grep -qF -- "$spec" && continue
+        # spec 来自 `iptables -S`(`-A PREROUTING ...`, 无引号空白), 直接作为命令回放。
+        # shellcheck disable=SC2086
+        if [ "$fam" = "4" ]; then
+            if iptables -t nat $spec 2>/dev/null; then
+                q=$(iptables -t nat -S PREROUTING 2>/dev/null) || { ok=1; q=""; }
+            else
+                ok=1
+            fi
+        else
+            if ip6tables -t nat $spec 2>/dev/null; then
+                q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || { ok=1; q=""; }
+            else
+                ok=1
+            fi
+        fi
+    done
+    return "$ok"
+}
+
+# 回滚 + 重新持久化。0=规则已恢复**且**持久化已刷新; 1=回滚未完整收敛, 调用方必须保留现场。
+# **持久化失败不是 warning 而是失败**(二十一轮 P1-2): IPv4 持久化在本项目是 authoritative,
+# "runtime 恢复但磁盘仍是删除后状态"会在重启后再次丢失规则; 返回 0 会让 reset/恢复把
+# journal 删掉, 从此失去唯一的恢复源。返回 1 时 journal 会保留, 下次启动继续重试。
+_hy2_restore_hop_rules_checked() {
+    [ "$#" -gt 0 ] || return 0
+    if ! _hy2_restore_hop_rules "$@"; then
+        _error "回滚未能恢复全部端口跳跃规则, metadata 与 runtime 可能分裂, 请手动检查: iptables -t nat -S PREROUTING"
+        return 1
     fi
-    [ "$residual" -eq 0 ] || _warn "部分端口跳跃规则清理后仍有残留, 请手动检查 iptables -t nat -S PREROUTING"
+    if ! _hy2_persist_iptables; then
+        _error "端口跳跃规则已恢复到 runtime, 但持久化刷新失败: 重启后状态可能不一致, 现场已保留待重试"
+        return 1
+    fi
+    return 0
+}
+
+# 清理所有节点的端口跳跃 iptables 规则。
+#
+# **失败即回滚**(二十轮 P1-2/P1-3): 逐个节点删除时, 任一后续步骤失败都会让"已删除的规则"
+# 停留在 runtime 而 metadata 仍在 —— 这正是项目一直在防的 metadata↔runtime 分裂。故本函数
+# 先把候选 spec 全量捕获, 失败(删除残留/持久化失败/全局核验失败)时按 spec 回补缺失项并
+# 重新持久化, 使失败返回时的现场与调用前一致。崩溃(SIGKILL)窗口不在本函数内闭环: reset 把
+# 候选 spec 写进自己的 journal, 由启动恢复回补; uninstall 无 journal, 该窗口作为已知残余声明。
+_hy2_cleanup_all_hops() {
+    local found=0 residual=0 metadata_hop=0
+    local saved=()
+    if [ -d "$NODES_DIR" ] && grep -lq 'hop_ranges\|udp_hop_ports\|hop_start\|hop_end' \
+        "$NODES_DIR"/*.json 2>/dev/null; then
+        metadata_hop=1
+    fi
+    if [ "$metadata_hop" -eq 1 ] && ! command -v iptables >/dev/null 2>&1; then
+        # metadata says this deployment owns hop rules, but there is no way to issue the
+        # precise -D commands or verify runtime state. Preserve the deployment tree.
+        _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
+        return 1
+    fi
+    if command -v iptables >/dev/null 2>&1 && [ -d "$NODES_DIR" ]; then
+        local _cand_all _cand
+        # 恢复源建不起来就绝不动 runtime(否则失败后无法回补, 直接造成 metadata/runtime 分裂)。
+        if ! _cand_all=$(_hy2_hop_cleanup_candidates 2>/dev/null); then
+            _error "无法枚举待清理的端口跳跃规则(恢复源获取失败), 已中止清理以避免 metadata/runtime 分裂"
+            return 1
+        fi
+        while IFS= read -r _cand; do
+            [ -n "$_cand" ] && saved+=("$_cand")
+        done <<< "$_cand_all"
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            [ "$proto" = "hysteria2" ] || continue
+            local port ranges
+            port=$(jq -r '.port' "$f" 2>/dev/null)
+            ranges=$(_read_hop_ranges "$f")
+            if [ -n "$ranges" ] && [ -n "$port" ]; then
+                # shellcheck disable=SC2086
+                _hy2_remove_hop_rules "$port" $ranges || residual=1
+                found=1
+            fi
+        done
+    fi
+    if [ "$found" -eq 1 ] && ! _hy2_persist_iptables; then
+        _error "iptables 规则持久化失败, 端口跳跃清理未完成"
+        residual=1
+    fi
+    # metadata 可能已经丢失/损坏, 不能因为没有可遍历的节点文件就报告清理成功。
+    # 事务调用方随后会删除 deployment tree, 所以最终判据必须是 runtime + 持久化文件中已经
+    # 没有任何本项目拥有的规则; 发现孤儿规则时只能 fail-closed, 不能猜测 dport/target 去删。
+    if ! declare -F _hy2_no_hop_rules_at_all >/dev/null 2>&1 || ! _hy2_no_hop_rules_at_all; then
+        _error "无法证明端口跳跃规则已清空, 或仍存在孤儿规则; 已保留现场, 请手动检查 iptables -t nat -S PREROUTING"
+        residual=1
+    fi
+    if [ "$residual" -ne 0 ]; then
+        if [ "${#saved[@]}" -gt 0 ]; then
+            _error "端口跳跃清理未完成, 正在回滚本次已删除的规则, 使 metadata 与 runtime 保持一致..."
+            if _hy2_restore_hop_rules_checked "${saved[@]}"; then
+                _error "已回滚到清理前状态; 节点数据保留, 请处理后重试"
+            else
+                _error "回滚未完整收敛(见上), 请手动检查 iptables 与持久化文件后重试"
+            fi
+        else
+            _error "端口跳跃规则清理未完成, 请手动检查 iptables -t nat -S PREROUTING"
+        fi
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1594,6 +1860,14 @@ _render_template() {
 # 并发防护(F5): 全体修改经 _with_config_lock 串行化, 实际事务体在 _mutate_config_locked。
 # ---------------------------------------------------------------------------
 _mutate_config() {
+    # 二十八轮 P2: 存在未收敛的 reset 事务日志时, 禁止任何常规配置写入 —— 事务现场(账本+快照)
+    # 必须由 `_reset_config_recover` 收敛后再谈别的改动, 否则在"半重置"的 config/metadata 上
+    # 继续叠加, 会让恢复源与真实状态进一步分叉。恢复成功后账本被删除, 本门禁自动解除
+    # (看盘上事实, 不用粘滞标志)。`_reset_config_*` 自身不经过本函数, 不受影响。
+    if declare -F _reset_journal_path >/dev/null 2>&1 && [ -e "$(_reset_journal_path 2>/dev/null)" ]; then
+        _error "存在未收敛的 reset 事务日志, 已阻止本次配置修改; 请重启脚本以收敛(或先修复现场)"
+        return 1
+    fi
     _with_config_lock _mutate_config_locked "$@"
 }
 
@@ -1661,6 +1935,194 @@ _commit_reality_inbound() {
        '.inbounds += [$tb, $rb] | .routing.rules = [
             {inboundTag: [$tg], domain: [$dom], outboundTag: "direct"},
             {inboundTag: [$tg], outboundTag: "block"}] + .routing.rules' || return 1
+}
+
+# ---------------------------------------------------------------------------
+# 新增节点的原子提交(三十一轮 P1-①)。
+# **问题**: 原流程是 `_commit_inbound`(config, 自带锁) → 释放锁 → 交互/拼装 → `_save_node_meta`。
+# 两步之间没有锁, 并发的"全部删除"会在锁内重新枚举 metadata(还看不到新节点), `.inbounds = []`
+# 把刚提交的入站一并清掉, 随后 metadata 才落地 ⇒ config/metadata 分裂(hop 节点还会留 orphan DNAT)。
+# **契约**: 所有交互(端口/域名/连接地址/证书)必须在本函数**之前**完成; 本函数在 config lock 内
+# 一次性完成 config 提交 + metadata 落盘(+ 派生 YAML), **metadata 失败时回滚刚插入的 config**,
+# 绝不留 orphan。`_mutate_config` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 不会自锁死。
+# ---------------------------------------------------------------------------
+_commit_node_txn() {            # <tag> <inbound_json> <meta_json> [<clash_line> <name>]
+    _with_config_lock _commit_node_txn_locked "$@"
+}
+_commit_node_txn_locked() {
+    local tag="$1" inbound="$2" meta_json="$3" clash_line="${4:-}" name="${5:-}"
+    # 锁内占用校验(三十二轮 P1/P2): 锁外的"端口空闲/名称唯一"都是 TOCTOU 检查 —— 并发会话可以
+    # 在两次检查之间提交同名/同 tag 节点。这里在真正写入前再验一次, 冲突则整个事务拒绝。
+    if [ -e "$NODES_DIR/${tag}.json" ] || \
+       jq -e --arg t "$tag" '[.inbounds[]? | select((.tag // "") == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消: ${tag}"
+        return 1
+    fi
+    local meta_name
+    meta_name=$(printf '%s' "$meta_json" | jq -r '.name // empty' 2>/dev/null)
+    if [ -n "$meta_name" ] && ! _ensure_unique_name "$meta_name"; then
+        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${meta_name}"
+        return 1
+    fi
+    _commit_inbound "$inbound" || return 1
+    if ! _save_node_meta "$tag" "$meta_json"; then
+        _error "元数据写入失败, 正在回滚入站: $tag"
+        _mutate_config --arg t "$tag" \
+            '.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))' || \
+            _error "回滚入站失败, 请手动检查 config.json: $tag"
+        return 1
+    fi
+    [ -n "$clash_line" ] && { _add_node_to_yaml "$clash_line" "$name" || true; }
+    return 0
+}
+
+_commit_reality_node_txn() {    # <tag> <tunnel_json> <reality_json> <tunnel_tag> <domain> <meta_json> [<clash_line> <name>]
+    _with_config_lock _commit_reality_node_txn_locked "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Hysteria2 新增事务(三十二轮 P1): 自签证书的 snapshot/生成作用在**固定共享路径**
+# `$CERT_DIR/$tag` 上, 必须与占用校验、config/metadata 提交在同一把 config lock 内 —— 否则两个
+# 会话同时创建同一端口时, 后失败者的 `_hy2_cert_rollback` 会还原/删除先成功者正在使用的证书。
+# 参数: <tag> <name> <addr> <port> <listen> <auth> <sni> <self_signed> <self_domain>
+#       <congestion> <brutal_up> <brutal_down> <obfs_type> <obfs_pw> <obfs_size> <cert_file> <key_file>
+# 锁内顺序: 占用校验(tag/name) → 证书准备 → 渲染 → config+metadata → 成功后丢弃证书快照。
+# 返回值: 0 成功; 1 失败; 2 失败且证书回滚不完整(调用方应原样上报)。
+# ---------------------------------------------------------------------------
+_commit_hy2_node_txn() {
+    _with_config_lock _commit_hy2_node_txn_locked "$@"
+}
+_commit_hy2_node_txn_locked() {
+    local tag="$1" name="$2" addr="$3" port="$4" listen="$5" auth="$6" sni="$7" self_signed="$8" self_domain="$9"
+    shift 9
+    local congestion="$1" brutal_up="$2" brutal_down="$3" obfs_type="$4" obfs_pw="$5" obfs_size="$6" cert_file="$7" key_file="$8"
+
+    # (1) 锁内占用校验 —— 必须在任何证书操作之前, 冲突直接返回且不碰共享证书路径。
+    if [ -e "$NODES_DIR/${tag}.json" ] || \
+       jq -e --arg t "$tag" '[.inbounds[]? | select((.tag // "") == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消且未生成证书: ${tag}"
+        return 1
+    fi
+    if [ -n "$name" ] && ! _ensure_unique_name "$name"; then
+        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${name}"
+        return 1
+    fi
+
+    # (2) 自签证书准备。所有提问已经结束, 生成失败/取消路径见各自回滚。
+    #     既有证书(可复用)与自定义证书不生成 ⇒ 无快照、不进入回滚路径。
+    local cert_bak="" cert_dirty="false" cert_dir_existed="false" cert_dir="$CERT_DIR/$tag"
+    if [ "$self_signed" = "true" ]; then
+        cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
+        local genrc=0
+        [ -e "$cert_dir" ] && cert_dir_existed="true"
+        if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
+            # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
+            # 复用但如实报告, 不假装证书身份已与输入域名统一。
+            if ! command -v openssl >/dev/null 2>&1; then
+                _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${self_domain})"
+                _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
+            fi
+            _info "已有证书, 复用: $cert_dir"
+        else
+            [ -f "$cert_file" ] && [ -f "$key_file" ] && \
+                _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $cert_dir"
+            cert_bak=$(_hy2_cert_snapshot "$cert_file" "$key_file") || {
+                _error "证书快照失败(无法备份既有证书), 已中止, 未生成新证书"; return 1; }
+            _gen_hy2_cert "$tag" "$self_domain" || genrc=$?
+            if [ "$genrc" != 0 ]; then
+                # 生成失败: 证书已是提交前状态(生成器自带回滚), 丢掉快照即可;
+                # 目录是本次新建且已空 ⇒ 顺手清掉(rc=2 的备份必须保留, 绝不动)
+                if ! _hy2_cert_snapshot_drop "$cert_bak"; then
+                    _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
+                fi
+                [ "$genrc" = 1 ] && [ "$cert_dir_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
+                return 1
+            fi
+            cert_dirty="true"
+        fi
+        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
+        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
+        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
+        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
+        local self_cert_domain
+        self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
+        sni=${self_cert_domain:-$self_domain}
+    fi
+
+    # (3) 渲染参数块与 inbound
+    local brutal_block=""
+    if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
+        brutal_block=""
+        [ -n "$brutal_up" ] && brutal_block="${brutal_block}, \"brutalUp\": \"${brutal_up}\""
+        [ -n "$brutal_down" ] && brutal_block="${brutal_block}, \"brutalDown\": \"${brutal_down}\""
+    fi
+    local obfs_mask=""
+    if [ -n "$obfs_type" ]; then
+        if ! obfs_mask=$(_hy2_obfs_mask_block "$obfs_type" "$obfs_pw" "$obfs_size"); then
+            _error "混淆参数构造失败"
+            _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$cert_dir" || return 2
+            return 1
+        fi
+    fi
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag"
+    R_AUTH="$auth" R_CERT_FILE="$cert_file" R_KEY_FILE="$key_file"
+    R_CONGESTION="$congestion" R_BRUTAL_PARAMS_BLOCK="$brutal_block"
+    R_OBFS_MASK_BLOCK="$obfs_mask"
+    local inbound
+    if ! inbound=$(_render_template "$(_tpl_path hysteria2)"); then
+        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$cert_dir" || return 2
+        return 1
+    fi
+
+    # (4) canonical metadata → config+metadata 原子提交(复用通用事务的锁内复核)。
+    local meta_json
+    meta_json=$(jq -n \
+        --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
+        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
+        --arg auth "$auth" --arg sni "$sni" --arg congestion "$congestion" \
+        --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
+        --arg obfsType "$obfs_type" --arg obfsPw "$obfs_pw" --arg obfsSize "$obfs_size" \
+        --argjson ss "$self_signed" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,obfs_type:$obfsType,obfs_password:$obfsPw,obfs_packet_size:(if $obfsSize == "" then null else $obfsSize end),self_signed:$ss,share_link:""}')
+    if ! _commit_node_txn_locked "$tag" "$inbound" "$meta_json"; then
+        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$cert_dir" || return 2
+        return 1
+    fi
+    # 配置与 metadata 均已提交(节点已引用该证书) ⇒ 回滚点作废; 删不掉要如实报(快照内含旧私钥副本)
+    if [ "$cert_dirty" = "true" ] && ! _hy2_cert_snapshot_drop "$cert_bak"; then
+        _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
+    fi
+    return 0
+}
+_commit_reality_node_txn_locked() {
+    local tag="$1" tunnel="$2" reality="$3" tunnel_tag="$4" domain="$5" meta_json="$6" clash_line="${7:-}" name="${8:-}"
+    # 锁内占用校验(三十二轮 P1/P2): tag 与 tunnel_tag 都必须仍空闲; name 也必须仍唯一。
+    if [ -e "$NODES_DIR/${tag}.json" ] || \
+       jq -e --arg t "$tag" --arg tt "$tunnel_tag" \
+          '[.inbounds[]? | select((.tag // "") == $t or (.tag // "") == $tt)] | length > 0' \
+          "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消: ${tag}"
+        return 1
+    fi
+    local meta_name
+    meta_name=$(printf '%s' "$meta_json" | jq -r '.name // empty' 2>/dev/null)
+    if [ -n "$meta_name" ] && ! _ensure_unique_name "$meta_name"; then
+        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${meta_name}"
+        return 1
+    fi
+    _commit_reality_inbound "$tunnel" "$reality" "$tunnel_tag" "$domain" || return 1
+    if ! _save_node_meta "$tag" "$meta_json"; then
+        _error "元数据写入失败, 正在回滚入站与路由: $tag"
+        # 同时移除两个入站与该 tunnel 的路由引用(非对象元素保留, 与删除路径同口径)。
+        _mutate_config --arg tg "$tunnel_tag" --arg t "$tag" \
+            '.inbounds |= map(select((type != "object") or ((.tag // "") as $x | ($x != $t and $x != $tg))))
+             | .routing.rules |= map(select((type != "object") or .inboundTag == null
+                   or ([.inboundTag[]? | . as $it | ($it != $tg)] | all)))' || \
+            _error "回滚入站/路由失败, 请手动检查 config.json: $tag"
+        return 1
+    fi
+    [ -n "$clash_line" ] && { _add_node_to_yaml "$clash_line" "$name" || true; }
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1889,6 +2351,24 @@ _node_count() {
 }
 
 # ---------------------------------------------------------------------------
+# 节点身份指纹(三十一轮 P1-②): 删除的"选择/确认"在锁外完成, 锁内必须证明**还是同一个节点**。
+# tag 只是文件名: 并发"删除 + 重建同名节点"后, 锁内的 tag 会指向另一个节点 —— 直接按 tag 删除
+# 会合法地误删别人刚建的节点。指纹取 metadata 全文 + config 中该节点(含 tunnel_tag)的入站,
+# 经 jq -S 归一化后 cksum —— 内容级身份, 删/重建/改端口/换域名都会变 ⇒ 调用方 fail-closed。
+# 输出: "<crc>:<bytes>"(stdout); 无法读取 metadata/config 时返回 1。
+# ---------------------------------------------------------------------------
+_node_identity() {
+    local tag="$1" meta tt cfg
+    meta=$(jq -S -c . "$NODES_DIR/${tag}.json" 2>/dev/null) || return 1
+    tt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+    cfg=$(jq -S -c --arg t "$tag" --arg tt "$tt" \
+        '[.inbounds[]? | select((.tag // "") == $t or ($tt != "" and (.tag // "") == $tt))]' \
+        "$CONFIG_FILE" 2>/dev/null) || return 1
+    printf '%s\n%s\n' "$meta" "${cfg:-[]}" | \
+        { if command -v cksum >/dev/null 2>&1; then cksum | awk '{print $1":"$2}'; else sha256sum | awk '{print $1}'; fi; }
+}
+
+# ---------------------------------------------------------------------------
 # 列出 config.json 中有元数据文件的入站 tag 集合(含 tunnel_tag)
 # 输出: 每行一个 tag
 # ---------------------------------------------------------------------------
@@ -1930,7 +2410,13 @@ _tag_is_managed() {
 # 有 port: manual-<port> (如 manual-443)
 # Unix socket: manual-<socket文件名去后缀> (如 manual-xrxh-socket)
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: "读入站 → 计算新 tag → 原子写回"的 RMW 必须持 config lock, 否则与并发节点事务
+# 互相覆盖(启动期自动执行, 是真实竞态面)。锁可重入, 被其它持锁路径调用时不会自锁。
 _auto_tag_tagless_inbounds() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    _with_config_lock _auto_tag_tagless_inbounds_locked
+}
+_auto_tag_tagless_inbounds_locked() {
     [ -f "$CONFIG_FILE" ] || return 0
     # 一次性读取所有入站的 tag/port/listen, 减少 jq 调用
     local inbounds_info
@@ -2104,7 +2590,12 @@ _find_reality_for_tunnel_tag() {
 # 采纳单个入站: 从 config.json 推断元数据, 创建 nodes/*.json
 # 返回 0 = 成功, 1 = 跳过(tunnel)
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: 采纳会在锁外写出 metadata —— 与并发删除/重置交错时会重建出"config 无此入站 /
+# metadata 存在"的分裂。整个采纳(含 config 读取与唯一性检查)在 config lock 内执行。
 _adopt_single_inbound() {
+    _with_config_lock _adopt_single_inbound_locked "$@"
+}
+_adopt_single_inbound_locked() {
     local tag="$1" suffix="${2:-adopted}"
     local proto port listen
     proto=$(_detect_inbound_protocol "$tag")
@@ -2179,7 +2670,13 @@ _adopt_single_inbound() {
 # 自动采纳孤儿入站: 为无元数据的入站创建 nodes/*.json
 # 启动时静默运行, 不询问用户
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: 扫描(枚举孤儿) → 判断 → 采纳 必须整体在 config lock 内, 锁内重新枚举 ——
+# 否则锁外扫到的 orphan 可能在取锁前已被并发事务删除, 采纳又把它写成 metadata。
 _auto_adopt_orphans() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    _with_config_lock _auto_adopt_orphans_locked
+}
+_auto_adopt_orphans_locked() {
     [ -f "$CONFIG_FILE" ] || return 0
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
     local known_list
@@ -2601,19 +3098,16 @@ _add_vless_tcp_reality_vision() {
         R_SHORT_ID="$REALITY_SHORT_ID" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
         reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision-tunnel)") || return 1
 
-        _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
     else
         # R42 直连: target = <sni>:443, 只提交 1 个入站, 不写任何路由规则
-        # (_commit_reality_inbound 固定插 2 条 tunnel 路由规则, 故此处走 _commit_inbound)
         R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
         R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
         R_SHORT_ID="$REALITY_SHORT_ID" R_MLDSA65_SEED="$pq_seed"
         reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision-direct)") || return 1
-
-        _commit_inbound "$reality_json" || return 1
     fi
 
-    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    # 三十一轮 P1-①: 连接地址询问必须在 config 提交前完成, config+metadata 由事务一次性提交
+    local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
@@ -2659,14 +3153,12 @@ _add_vless_tcp_reality_vision() {
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
             '. + {auth:$auth,decryption:$dec,encryption:$enc}')
     fi
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
+    # 原子提交(三十一轮 P1-①): config + metadata + 派生 YAML(metadata 失败会回滚入站/路由)。
+    if [ "$mode" = "tunnel" ]; then
+        _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" "$clash" "$name" || return 1
+    else
+        _commit_node_txn "$tag" "$reality_json" "$meta_json" "$clash" "$name" || return 1
     fi
-    # R38(P1): 必须在 metadata 成功之后再写 clash.yaml —— 否则 metadata 写失败时 YAML 条目
-    # 已落地而 nodes/<tag>.json 不存在, _remove_node_from_yaml_by_tag 读不到 name,
-    # 该条目再也无法通过任何界面清除。
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
 
     _success "节点 [${name}] 创建成功"
     if [ "$mode" = "tunnel" ]; then
@@ -2743,18 +3235,16 @@ _add_vless_xhttp_reality() {
         R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
         reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality-tunnel)") || return 1
 
-        _commit_reality_inbound "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" || return 1
     else
         # R42 直连: target = <sni>:443, 单入站提交, 无路由规则
         R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
         R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
         R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_MLDSA65_SEED="$pq_seed"
         reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality-direct)") || return 1
-
-        _commit_inbound "$reality_json" || return 1
     fi
 
-    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    # 三十一轮 P1-①: 连接地址询问必须在 config 提交前完成
+    local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
@@ -2794,12 +3284,12 @@ _add_vless_xhttp_reality() {
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
             '. + {auth:$auth,decryption:$dec,encryption:$enc}')
     fi
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
+    # 原子提交(三十一轮 P1-①): config + metadata + 派生 YAML(metadata 失败会回滚入站/路由)。
+    if [ "$mode" = "tunnel" ]; then
+        _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" "$clash" "$name" || return 1
+    else
+        _commit_node_txn "$tag" "$reality_json" "$meta_json" "$clash" "$name" || return 1
     fi
-    # R38(P1): metadata 成功后才写派生 YAML(见 _add_vless_tcp_reality_vision 同处注释)
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
 
     _success "节点 [${name}] 创建成功"
     if [ "$mode" = "tunnel" ]; then
@@ -2956,9 +3446,8 @@ _add_vless_enc() {
     R_FLOW="$flow" R_DECRYPTION="$VLESS_ENC_DECRYPTION"
     local inbound
     inbound=$(_render_template "$(_tpl_path vless-enc)") || return 1
-    _commit_inbound "$inbound" || return 1
-
-    local addr; addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    # 三十一轮 P1-①: 连接地址询问提前到提交之前; config+metadata 由事务一次性提交
+    local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
 
@@ -2973,18 +3462,15 @@ _add_vless_enc() {
     [ -n "$flow" ] && clash_flow=", flow: ${flow}"
     local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, encryption: \"$(_yaml_dq "$VLESS_ENC_ENCRYPTION")\", network: tcp, tls: false${clash_flow}}"
 
-    if ! _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-enc" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg flow "$flow" --arg auth "$AUTH_TYPE" \
         --arg dec "$VLESS_ENC_DECRYPTION" --arg enc "$VLESS_ENC_ENCRYPTION" \
         --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,flow:$flow,auth:$auth,decryption:$dec,encryption:$enc,share_link:$link}')"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,flow:$flow,auth:$auth,decryption:$dec,encryption:$enc,share_link:$link}')
+    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
     [ -n "$flow" ] && _tip "已启用 xtls-rprx-vision (splice 优化)"
@@ -3044,7 +3530,6 @@ _add_vless_xhttp_cdn() {
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_HOST="$host"
     local inbound
     inbound=$(_render_template "$(_tpl_path vless-xhttp-cdn)") || return 1
-    _commit_inbound "$inbound" || return 1
 
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
@@ -3077,12 +3562,7 @@ _add_vless_xhttp_cdn() {
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
             '. + {auth:$auth,decryption:$dec,encryption:$enc}')
     fi
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -3134,7 +3614,6 @@ _add_vless_ws_cdn() {
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_HOST="$host"
     local inbound
     inbound=$(_render_template "$(_tpl_path vless-ws-cdn)") || return 1
-    _commit_inbound "$inbound" || return 1
 
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
@@ -3165,12 +3644,7 @@ _add_vless_ws_cdn() {
             --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
             '. + {auth:$auth,decryption:$dec,encryption:$enc}')
     fi
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -3230,10 +3704,9 @@ _add_shadowsocks() {
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_METHOD="$method" R_PASSWORD="$password" R_NETWORK="$network_val"
     local inbound
     inbound=$(_render_template "$(_tpl_path shadowsocks)") || return 1
-    _commit_inbound "$inbound" || return 1
-
+    # 三十一轮 P1-①: 连接地址询问提前到提交之前; config+metadata 由事务一次性提交
     local addr
-    addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     # ss 链接(SIP002): userinfo 必须 base64url 无填充 —— 标准 base64 可能含 + / =,
@@ -3249,16 +3722,13 @@ _add_shadowsocks() {
     [[ "$network_val" == *"udp"* ]] && clash_udp=", udp: true"
     local clash="- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${clash_udp}}"
 
-    if ! _save_node_meta "$tag" "$(jq -n \
+    local meta_json
+    meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "shadowsocks" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg method "$method" --arg password "$password" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,method:$method,password:$password,share_link:$link}')"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
-    # R38(P1): metadata 成功后才写派生 YAML
-    _add_node_to_yaml "$clash" "$name" || true  # 派生缓存, 失败内部已 _warn, 不阻断节点创建
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,method:$method,password:$password,share_link:$link}')
+    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
@@ -4302,117 +4772,32 @@ _add_hysteria2() {
                 # 规范化(排序 + 去前导零)后回写, 使元数据/clash 与 Xray 看到同一区间
                 obfs_size=$(_hy2_obfs_size_canon "$obfs_size") || { _error "packetSize 规范化失败"; return 1; }
             fi
-            obfs_mask=$(_hy2_obfs_mask_block "$obfs_type" "$obfs_pw" "$obfs_size") || { _error "混淆参数构造失败"; return 1; }
+            # obfs_mask / brutal_block 由提交事务内部构造(三十二轮 P1: 证书与提交同锁)
             ;;
     esac
 
-    # 构建 brutal 参数块(brutal / force-brutal 模式有值)
-    local brutal_block=""
-    if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
-        brutal_block=""
-        [ -n "$brutal_up" ] && brutal_block="${brutal_block}, \"brutalUp\": \"${brutal_up}\""
-        [ -n "$brutal_down" ] && brutal_block="${brutal_block}, \"brutalDown\": \"${brutal_down}\""
-    fi
-
     # ---------------------------------------------------------------------
-    # 自签证书: **所有提问结束后、即将提交配置时才真正生成**(0.17.7)。
-    # 早先是在 TLS 提问阶段就生成, 于是"生成后 ^C / 中途放弃"会留下一个没有任何节点引用的
-    # 证书目录(实测); 提交失败时同样会留下。故: 生成推迟到此, 且**生成本身纳入节点创建
-    # 事务** —— 生成前先对既有 cert/key 做快照, render/commit 失败时按快照还原(快照里没有
-    # 的说明是本次新建, 删掉), 而不是只看"目录是不是新出现的"。
-    # 只看目录会漏掉一类真实残局: 目录已存在(上次删节点选了保留证书)但域名变了 ⇒ 重新生成
-    # 已把旧证书替换掉、_gen_hy2_cert 自己的备份也已删除, 此时"删新建目录"判据为假 ⇒ 既不还原
-    # 也不清理, 留下无节点引用的新证书且旧证书不可恢复。
-    # 既有证书(可复用)与自定义证书不生成 ⇒ 无快照、不进入回滚路径。
+    # 三十二轮 P1: 自签证书的 snapshot/生成作用在固定共享路径 `$CERT_DIR/$tag`, 必须与
+    # 占用校验、config/metadata 提交在**同一把 config lock** 内(见 _commit_hy2_node_txn)——
+    # 否则两个会话同时建同一端口时, 后失败者的证书回滚会还原/删除先成功者正在使用的证书。
+    # 连接地址询问仍在锁外(人工时间不进临界区); 此时尚未生成证书, 取消无任何副作用。
     # ---------------------------------------------------------------------
-    local cert_bak="" cert_dirty="false" cert_dir_existed="false"
-    if [ "$tls_mode" = "selfsigned" ]; then
-        cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
-        local cert_dir="$CERT_DIR/$tag" genrc=0
-        [ -e "$cert_dir" ] && cert_dir_existed="true"
-        if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
-            # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
-            # 复用但如实报告, 不假装证书身份已与输入域名统一。
-            if ! command -v openssl >/dev/null 2>&1; then
-                _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${self_domain})"
-                _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
-            fi
-            _info "已有证书, 复用: $cert_dir"
-        else
-            [ -f "$cert_file" ] && [ -f "$key_file" ] && \
-                _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $cert_dir"
-            cert_bak=$(_hy2_cert_snapshot "$cert_file" "$key_file") || {
-                _error "证书快照失败(无法备份既有证书), 已中止, 未生成新证书"; return 1; }
-            _gen_hy2_cert "$tag" "$self_domain" || genrc=$?
-            if [ "$genrc" != 0 ]; then
-                # 生成失败: 证书已是提交前状态(生成器自带回滚), 丢掉快照即可;
-                # 目录是本次新建且已空 ⇒ 顺手清掉(rc=2 的备份必须保留, 绝不动)
-                if ! _hy2_cert_snapshot_drop "$cert_bak"; then
-                    _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
-                fi
-                [ "$genrc" = 1 ] && [ "$cert_dir_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
-                return 1
-            fi
-            cert_dirty="true"
-        fi
-        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
-        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
-        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
-        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
-        local self_cert_domain
-        self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
-        sni=${self_cert_domain:-$self_domain}
-    fi
-
-    # 渲染模板
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag"
-    R_AUTH="$auth" R_CERT_FILE="$cert_file" R_KEY_FILE="$key_file"
-    R_CONGESTION="$congestion" R_BRUTAL_PARAMS_BLOCK="$brutal_block"
-    R_OBFS_MASK_BLOCK="$obfs_mask"
-    local inbound
-    if ! inbound=$(_render_template "$(_tpl_path hysteria2)"); then
-        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
-        return 1
-    fi
-
-    if ! _commit_inbound "$inbound"; then
-        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
-        return 1
-    fi
-    # 配置已提交(节点已引用该证书) ⇒ 回滚点作废; 删不掉要如实报(快照内含旧私钥副本)
-    if [ "$cert_dirty" = "true" ] && ! _hy2_cert_snapshot_drop "$cert_bak"; then
-        _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
-    fi
-
     local addr
-    addr=$(_ask_link_addr) || { _error "节点已加入 Xray 配置, 但未获取到客户端连接地址(输入已结束); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"; return 1; }
+    addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未生成证书/未写入 config)"; return 1; }
 
-    # ---------------------------------------------------------------------
-    # 先落 **canonical metadata**, 再由它派生 link 与 clash —— 与修改路径**同一条**逻辑。
-    # 创建路径曾自己内联拼 link(无条件 `&obfs=salamander`), 于是 gecko 节点会被写进一条
-    # 无法表达 packetSize 的链接, 而同一节点走菜单修改时 _rebuild_hy2_link 却拒绝生成
-    # ⇒ 同一状态两个入口两种结果。现统一为:
-    #   metadata(权威) → _rebuild_hy2_link(可表达才生成) / _hy2_clash_line(能完整承载该尺寸)
-    # ---------------------------------------------------------------------
-    local meta_json
-    meta_json=$(jq -n \
-        --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
-        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
-        --arg auth "$auth" --arg sni "$sni" --arg congestion "$congestion" \
-        --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
-        --arg obfsType "$obfs_type" --arg obfsPw "$obfs_pw" --arg obfsSize "$obfs_size" \
-        --argjson ss "$self_signed" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,obfs_type:$obfsType,obfs_password:$obfsPw,obfs_packet_size:(if $obfsSize == "" then null else $obfsSize end),self_signed:$ss,share_link:""}')
-    if ! _save_node_meta "$tag" "$meta_json"; then
-        _error "节点已加入 Xray 配置, 但元数据写入失败(${tag}); 将按孤儿入站处理, 建议删除后重建(或使用 [采纳孤儿入站] 补回元数据)"
-        return 1
-    fi
+    local rc=0
+    _commit_hy2_node_txn "$tag" "$name" "$addr" "$port" "$listen" "$auth" "$sni" "$self_signed" "$self_domain" \
+        "$congestion" "$brutal_up" "$brutal_down" "$obfs_type" "$obfs_pw" "$obfs_size" "$cert_file" "$key_file" || rc=$?
+    if [ "$rc" -ne 0 ]; then return "$rc"; fi
+
     local meta="$NODES_DIR/${tag}.json"
     # 派生状态(链接 + clash)走**唯一入口**(clash 步骤是 upsert, 新建节点会追加条目);
     # 失败只告警, **不**回滚已提交的 config/metadata。
     _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     local link=""
     link=$(jq -r '.share_link // ""' "$meta" 2>/dev/null)
+    # 自签证书的 SNI 在锁内由证书 SAN 决定(子 shell 不传值), 显示时从 metadata 回读
+    sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
 
     _success "节点 [${name}] 创建成功"
     if [ "$self_signed" = "true" ]; then
@@ -4705,30 +5090,42 @@ _rebuild_clash_line() {
 # 把节点 metadata 的当前状态同步进 clash.yaml 派生缓存(F1 的统一入口)。
 # 用法: _sync_node_clash <meta_file> [old_name]
 #   old_name 非空且与现名不同(改端口会连带改名)时先删旧行, 避免残留幽灵条目。
-# best-effort: builder 失败(被采纳节点缺字段)或文件写失败只告警, 不阻断主流程 ——
-# clash.yaml 是可再生派生导出, 权威身份始终是 tag/config/metadata。
+# best-effort **语义**不变: 任何失败都不回滚权威状态(config/metadata 始终是事实), 调用方
+# 也从不因为本函数的失败而中止事务。但**返回值必须如实**(2026-09-22 十轮 P1-⑤):
+# 旧实现每条失败路径都"告警 + return 0", 于是返回码恒为 0 —— 九轮 OCR #45 给域名切换加的
+# `if ! _sync_node_clash "$meta"; then ...` 是一句**永远不成立的条件**, 那条"clash 未同步"
+# 的告警从未打印过(实测三种失败输入全部 rc=0)。同项目的官方 Hysteria 侧
+# (`_hysteria_sync_clash`, 0.16.10 P2-1)早已改成"失败 return 1 并在本函数内告警",
+# 这里补齐同一契约。告警文本留在本函数内 —— 有调用点是事务回滚路径的 `|| true`。
 # ---------------------------------------------------------------------------
 _sync_node_clash() {
-    local meta="$1" old_name="${2:-}" line name key
-    line=$(_rebuild_clash_line "$meta") || {
+    local meta="$1" old_name="${2:-}" line name key crc=0
+    # 元数据缺必填字段时保留 clash 旧行(它可能仍指向一个可用的旧配置), 但如实返回失败
+    if ! line=$(_rebuild_clash_line "$meta"); then
         _warn "Clash 条目重建失败(元数据缺少必要字段), clash.yaml 未同步: $meta"
-        return 0
-    }
+        return 1
+    fi
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
-    [ -n "$name" ] || return 0
+    [ -n "$name" ] || return 1
     if [ -n "$old_name" ] && [ "$old_name" != "$name" ]; then
-        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || \
+        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || {
+            crc=1
             _warn "Clash YAML 旧条目删除失败(${old_name}), 可手工编辑 ${CLASH_YAML}"
+        }
     fi
     key=$(_yaml_dq "$name")
     if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
-        _replace_node_in_yaml "$line" "$name" || \
+        _replace_node_in_yaml "$line" "$name" || {
+            crc=1
             _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+        }
     else
-        _add_node_to_yaml "$line" "$name" || \
+        _add_node_to_yaml "$line" "$name" || {
+            crc=1
             _warn "Clash YAML 条目追加失败, 可手工编辑 ${CLASH_YAML}"
+        }
     fi
-    return 0
+    return "$crc"
 }
 
 # 重建 vless:// reality 分享链接(从元数据读参数)
@@ -4946,6 +5343,11 @@ _view_nodes() {
 # ---------------------------------------------------------------------------
 # 删除节点
 # ---------------------------------------------------------------------------
+# 删除节点: 交互选择/确认在锁外; **破坏性阶段(iptables teardown + config + metadata/YAML)
+# 整体进入 `_with_config_lock`(二十九轮 P1)**。旧写法先删 DNAT 规则、之后才取 config lock:
+# 与 reset/并发删除竞态时 runtime 先被改而恢复源后录, reset 回滚可能重建出
+# "metadata 有 hop / runtime 无 hop" 的分裂, 且完全绕过 reset journal 的保护。
+# 三个 apply 函数在锁内执行, 只返回状态(不等待按键), 交互提示由本函数在锁外统一处理。
 _delete_node() {
     clear
     local count; count=$(_node_count)
@@ -4973,75 +5375,13 @@ _delete_node() {
             y|Y) ;;
             *) _info "已取消"; _press_any_key; return ;;
         esac
-        # R17: 先清理所有端口跳跃 iptables 规则(teardown 事务)
-        # R33(P1): 无条件调用 teardown_all——iptables 不可用但存在 hop 规则时由其内部 fail-closed
-        # (不能因 command -v iptables 为假就跳过, 否则删 config/metadata 后留下孤儿 DNAT)
-        # R38(P1): teardown_all 现在逐项判定, 无法安全清理的节点进 _HY2_HOP_SKIP 并被保留,
-        # 不再因一个损坏节点让"全部删除"整体不可用。
-        if ! _hy2_hop_teardown_all "${tags[@]}"; then
-            _error "所有节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
-            _press_any_key; return
-        fi
-        _hy2_filter_skipped "${tags[@]}"
-        local del_all=("${_HY2_DEL_KEEP[@]}")
-        if [ ${#del_all[@]} -eq 0 ]; then
-            _error "没有可安全删除的节点"
-            _press_any_key; return
-        fi
-        # 自签证书: 只对 metadata 声明 self_signed=true 的节点提示(自定义证书不提示、不删除),
-        # 且在节点删除**成功后**才落地删除
-        _hy2_ask_purge_self_certs "${del_all[@]}"
-        # 无排除项: 沿用原语义(清空 inbounds, 连手工添加的入站一并清掉)
-        # 有排除项: 只删可安全删除的 tag(含其 tunnel_tag), 保留被排除节点的入站
-        # (M2 同口径: 非对象规则元素保留, 避免 jq 整体报错)
-        local all_filter='.inbounds = [] | .routing.rules |= map(select((type != "object") or .inboundTag == null or ((.inboundTag | type) == "array" and (.inboundTag | length) == 0)))'
-        local all_ok=0
-        if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ]; then
-            _mutate_config "$all_filter" && all_ok=1
-        else
-            local keep_tags=() kt ktt
-            for kt in "${del_all[@]}"; do
-                keep_tags+=("$kt")
-                ktt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${kt}.json" 2>/dev/null)
-                [ -n "$ktt" ] && keep_tags+=("$ktt")
-            done
-            local rm_json
-            rm_json=$(printf '%s\n' "${keep_tags[@]}" | jq -R . | jq -c -s .) || rm_json=""
-            if [ -z "$rm_json" ]; then
-                _error "生成移除集合失败"
-                _hy2_hop_restore_after_teardown
-                _press_any_key; return
-            fi
-            _mutate_config --argjson rm "$rm_json" \
-                '.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
-                 | .routing.rules |= map(select((type != "object") or .inboundTag == null
-                       or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))' && all_ok=1
-        fi
-        if [ "$all_ok" -eq 1 ]; then
-            for tag in "${del_all[@]}"; do
-                # R38(P1): 先删 metadata 再删 YAML 会读不到 name; 但 YAML 删除失败不阻断,
-                # 顺序仍是"先 YAML(读 json 的 name) 后 json"
-                _remove_node_from_yaml_by_tag "$tag" || \
-                    _warn "Clash YAML 同步删除失败($tag), 可手工编辑 ${CLASH_YAML} 清除该行"
-                rm -f "$NODES_DIR/${tag}.json"
-            done
-            # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
-            _HY2_HOP_TD=()
-            # 仅在"确实全删干净"时才截断 clash.yaml; 有保留节点时不能清空
-            if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ] && [ -f "$CLASH_YAML" ]; then
-                printf 'proxies:\n' > "$CLASH_YAML"
-            fi
-            _success "已删除 ${#del_all[@]} 个节点"
-            _hy2_purge_self_certs
-        else
-            # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
-            _hy2_hop_restore_after_teardown
-            _error "删除失败, 已回滚"
-        fi
+        # 自签证书询问在锁外完成(二十九轮 P2): 把人工思考时间留在临界区外。
+        _hy2_ask_purge_self_certs "${tags[@]}"
+        _with_config_lock _delete_node_apply_all
         _press_any_key; return
     fi
 
-    # 多选删除:逗号分隔(如 1,3,5)
+    # 多选删除:逗号分隔(如1,3,5)
     if [[ "$choice" == *","* ]]; then
         IFS=',' read -ra nums <<< "$choice"
         local del_tags=()
@@ -5066,58 +5406,14 @@ _delete_node() {
         read -rp "  继续? [y/N]: " ans
         case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; return ;; esac
 
-        # R17: 先清理端口跳跃 iptables 规则(teardown 事务)
-        # R33(P1): 无条件调用 teardown_all——iptables 不可用但存在 hop 规则时由其内部 fail-closed
-        # R38(P1): 逐项判定, 无法安全清理的节点被排除而不是整批取消; 删除集合(含 tunnel_tag)
-        # 必须在 teardown 之后按剩余项重算, 否则会把被排除节点的入站一起删掉。
-        if ! _hy2_hop_teardown_all "${del_tags[@]}"; then
-            _error "所选节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
-            _press_any_key; return
-        fi
-        _hy2_filter_skipped "${del_tags[@]}"
-        del_tags=("${_HY2_DEL_KEEP[@]}")
-        if [ ${#del_tags[@]} -eq 0 ]; then
-            _error "没有可安全删除的节点"
-            _press_any_key; return
-        fi
-        _hy2_ask_purge_self_certs "${del_tags[@]}"
-        local del_ttags=()
-        for dt in "${del_tags[@]}"; do
-            local dtt; dtt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${dt}.json" 2>/dev/null)
-            [ -n "$dtt" ] && del_ttags+=("$dtt")
+        # 身份绑定(三十一轮 P1-②): 每个 tag 带上确认时的指纹, 锁内逐一复核。
+        local del_idents=() _dt _idt
+        for _dt in "${del_tags[@]}"; do
+            _idt=$(_node_identity "$_dt") || { _error "无法读取节点身份, 已取消: $_dt"; _press_any_key; return; }
+            del_idents+=("$_dt" "$_idt")
         done
-
-        local tun_json='[]'
-        [ ${#del_ttags[@]} -gt 0 ] && tun_json=$(printf '%s\n' "${del_ttags[@]}" | jq -R . | jq -s .)
-        local all_json; all_json=$(printf '%s\n' "${del_tags[@]}" "${del_ttags[@]}" | jq -R . | jq -s .)
-
-        # M2 同口径: type 守卫防止非对象规则/入站元素让 jq 整体报错。
-        # tag 同样需 as 绑定后再 index(index 参数以 $all_tags 为输入求值, 见 _remove_orphan_inbounds 注)
-        local jq_multi='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($all_tags | index($tg)) == null)))'
-        if [ ${#del_ttags[@]} -gt 0 ]; then
-            jq_multi="$jq_multi | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag as \$it | \$tun_tags | index(\$it)) == null)))"
-        fi
-
-        if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
-            # R19: 消费 YAML 删除返回值, 失败则累计并显式告警(不静默; clash.yaml 属派生导出)
-            local yaml_fail=0
-            for dt in "${del_tags[@]}"; do
-                # R18: 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
-                _remove_node_from_yaml_by_tag "$dt" || yaml_fail=1
-                rm -f "$NODES_DIR/${dt}.json"
-            done
-            # R38(P1): 不再指向不存在的"重新生成 Clash 配置"功能, 给出真实可执行的路径
-            [ "$yaml_fail" -eq 1 ] && \
-                _warn "部分节点 Clash YAML 同步删除失败, 已从 Xray 删除; 可手工编辑 ${CLASH_YAML} 删除对应行"
-            # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
-            _HY2_HOP_TD=()
-            _success "已删除 ${#del_tags[@]} 个节点"
-            _hy2_purge_self_certs
-        else
-            # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
-            _hy2_hop_restore_after_teardown
-            _error "删除失败, 已回滚"
-        fi
+        _hy2_ask_purge_self_certs "${del_tags[@]}"
+        _with_config_lock _delete_node_apply_multi "${del_idents[@]}"
         _press_any_key; return
     fi
 
@@ -5125,6 +5421,179 @@ _delete_node() {
     local idx=$((choice-1)); local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
+    # 身份绑定(三十一轮 P1-②): 锁外选的 tag 可能已被并发删除/重建 —— 锁内必须复核指纹。
+    local ident
+    ident=$(_node_identity "$tag") || { _error "无法读取节点身份, 已取消: $tag"; _press_any_key; return; }
+    _hy2_ask_purge_self_certs "$tag"
+    _with_config_lock _delete_node_apply_single "$tag" "$ident"
+    _press_any_key
+}
+
+# 破坏性阶段(调用方必须已持 config lock)。返回 0=已提交, 1=失败/取消(原因已打印)。
+# **绝不在此等待按键**(避免持锁阻塞在其他交互路径上), **也不接受调用方的节点快照**:
+# "全部删除"的范围必须在锁内重新枚举(二十九轮 P1) —— 锁外确认期间并发新增的节点若不在
+# 删除集合里, `.inbounds = []` 仍会清掉它的 inbound 而 metadata 保留, 直接造出 config/metadata
+# 分裂(甚至孤儿 DNAT)。
+_delete_node_apply_all() {
+    local tags=() tag f
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        tags+=("$(basename "$f" .json)")
+    done
+    if [ ${#tags[@]} -eq 0 ]; then
+        _error "当前没有可删除的节点(metadata 为空), 已取消"
+        return 1
+    fi
+    # R17: 先清理所有端口跳跃 iptables 规则(teardown 事务)
+    # R33(P1): 无条件调用 teardown_all——iptables 不可用但存在 hop 规则时由其内部 fail-closed
+    # (不能因 command -v iptables 为假就跳过, 否则删 config/metadata 后留下孤儿 DNAT)
+    # R38(P1): teardown_all 逐项判定, 无法安全清理的节点进 _HY2_HOP_SKIP 并被保留。
+    if ! _hy2_hop_teardown_all "${tags[@]}"; then
+        _error "所有节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
+        return 1
+    fi
+    _hy2_filter_skipped "${tags[@]}"
+    local del_all=("${_HY2_DEL_KEEP[@]}")
+    if [ ${#del_all[@]} -eq 0 ]; then
+        _error "没有可安全删除的节点"
+        return 1
+    fi
+    # 自签证书: 询问已在**锁外**完成(`_delete_node` 里), 这里只消费回答; 实际删除在提交成功后。
+    # 被跳过的节点其证书仍被 config 引用, `_hy2_purge_self_certs` 会自行保留(不会误删)。
+    # 无排除项: 沿用原语义(清空 inbounds, 连手工添加的入站一并清掉)
+    # 有排除项: 只删可安全删除的 tag(含其 tunnel_tag), 保留被排除节点的入站
+    # (M2 同口径: 非对象规则元素保留, 避免 jq 整体报错)
+    local all_filter='.inbounds = [] | .routing.rules |= map(select((type != "object") or .inboundTag == null or ((.inboundTag | type) == "array" and (.inboundTag | length) == 0)))'
+    local all_ok=0
+    if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ]; then
+        _mutate_config "$all_filter" && all_ok=1
+    else
+        local keep_tags=() kt ktt
+        for kt in "${del_all[@]}"; do
+            keep_tags+=("$kt")
+            ktt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${kt}.json" 2>/dev/null)
+            [ -n "$ktt" ] && keep_tags+=("$ktt")
+        done
+        local rm_json
+        rm_json=$(printf '%s\n' "${keep_tags[@]}" | jq -R . | jq -c -s .) || rm_json=""
+        if [ -z "$rm_json" ]; then
+            _error "生成移除集合失败"
+            _hy2_hop_restore_after_teardown
+            return 1
+        fi
+        _mutate_config --argjson rm "$rm_json" \
+            '.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
+             | .routing.rules |= map(select((type != "object") or .inboundTag == null
+                   or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))' && all_ok=1
+    fi
+    if [ "$all_ok" -eq 1 ]; then
+        for tag in "${del_all[@]}"; do
+            # R38(P1): 先删 metadata 再删 YAML 会读不到 name; 但 YAML 删除失败不阻断,
+            # 顺序仍是"先 YAML(读 json 的 name) 后 json"
+            _remove_node_from_yaml_by_tag "$tag" || \
+                _warn "Clash YAML 同步删除失败($tag), 可手工编辑 ${CLASH_YAML} 清除该行"
+            rm -f "$NODES_DIR/${tag}.json"
+        done
+        # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
+        _HY2_HOP_TD=()
+        # 仅在"确实全删干净"时才截断 clash.yaml; 有保留节点时不能清空
+        if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ] && [ -f "$CLASH_YAML" ]; then
+            printf 'proxies:\n' > "$CLASH_YAML"
+        fi
+        _success "已删除 ${#del_all[@]} 个节点"
+        _hy2_purge_self_certs
+        return 0
+    fi
+    # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
+    _hy2_hop_restore_after_teardown
+    _error "删除失败, 已回滚"
+    return 1
+}
+
+_delete_node_apply_multi() {
+    # 参数是 tag/fingerprint 交错对(三十一轮 P1-②): 只有指纹与当前内容一致才允许删除。
+    local del_tags=() del_idents=() dt now
+    while [ "$#" -gt 0 ]; do
+        del_tags+=("$1"); shift
+        del_idents+=("${1:-}")
+        [ "$#" -gt 0 ] && shift
+    done
+    local _i
+    for _i in "${!del_tags[@]}"; do
+        if [ -z "${del_idents[$_i]:-}" ]; then
+            _error "缺少节点身份指纹, 拒绝删除(请重新选择): ${del_tags[$_i]}"
+            return 1
+        fi
+        now=$(_node_identity "${del_tags[$_i]}") || { _error "无法重新读取节点身份: ${del_tags[$_i]}"; return 1; }
+        if [ "$now" != "${del_idents[$_i]}" ]; then
+            _error "节点内容已变化(可能被并发删除/重建/修改), 请重新选择: ${del_tags[$_i]}"
+            return 1
+        fi
+    done
+    # R17/R33(P1)/R38(P1): 同 _delete_node_apply_all —— teardown 在锁内, 逐项判定。
+    if ! _hy2_hop_teardown_all "${del_tags[@]}"; then
+        _error "所选节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
+        return 1
+    fi
+    _hy2_filter_skipped "${del_tags[@]}"
+    del_tags=("${_HY2_DEL_KEEP[@]}")
+    if [ ${#del_tags[@]} -eq 0 ]; then
+        _error "没有可安全删除的节点"
+        return 1
+    fi
+    # 自签证书询问在锁外(_delete_node)完成, 这里只消费回答
+    local del_ttags=() dtt
+    for dt in "${del_tags[@]}"; do
+        dtt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${dt}.json" 2>/dev/null)
+        [ -n "$dtt" ] && del_ttags+=("$dtt")
+    done
+
+    local tun_json='[]'
+    [ ${#del_ttags[@]} -gt 0 ] && tun_json=$(printf '%s\n' "${del_ttags[@]}" | jq -R . | jq -s .)
+    local all_json; all_json=$(printf '%s\n' "${del_tags[@]}" "${del_ttags[@]}" | jq -R . | jq -s .)
+
+    # M2 同口径: type 守卫防止非对象规则/入站元素让 jq 整体报错。
+    # tag 同样需 as 绑定后再 index(index 参数以 $all_tags 为输入求值, 见 _remove_orphan_inbounds 注)
+    local jq_multi='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($all_tags | index($tg)) == null)))'
+    if [ ${#del_ttags[@]} -gt 0 ]; then
+        jq_multi="$jq_multi | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag as \$it | \$tun_tags | index(\$it)) == null)))"
+    fi
+
+    if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
+        # R19: 消费 YAML 删除返回值, 失败则累计并显式告警(不静默; clash.yaml 属派生导出)
+        local yaml_fail=0
+        for dt in "${del_tags[@]}"; do
+            # R18: 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
+            _remove_node_from_yaml_by_tag "$dt" || yaml_fail=1
+            rm -f "$NODES_DIR/${dt}.json"
+        done
+        # R38(P1): 不再指向不存在的"重新生成 Clash 配置"功能, 给出真实可执行的路径
+        [ "$yaml_fail" -eq 1 ] && \
+            _warn "部分节点 Clash YAML 同步删除失败, 已从 Xray 删除; 可手工编辑 ${CLASH_YAML} 删除对应行"
+        # R18: 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
+        _HY2_HOP_TD=()
+        _success "已删除 ${#del_tags[@]} 个节点"
+        _hy2_purge_self_certs
+        return 0
+    fi
+    # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
+    _hy2_hop_restore_after_teardown
+    _error "删除失败, 已回滚"
+    return 1
+}
+
+_delete_node_apply_single() {
+    local tag="$1" expect="${2:-}" now
+    # 身份绑定(三十一轮 P1-②): 缺指纹或与当前内容不符一律拒绝 —— 防止误删并发重建的同名节点。
+    if [ -z "$expect" ]; then
+        _error "缺少节点身份指纹, 拒绝删除(请重新选择): $tag"
+        return 1
+    fi
+    now=$(_node_identity "$tag") || { _error "无法重新读取节点身份: $tag"; return 1; }
+    if [ "$now" != "$expect" ]; then
+        _error "节点内容已变化(可能被并发删除/重建/修改), 请重新选择: $tag"
+        return 1
+    fi
     # 读取 tunnel_tag, 一次性删除 tunnel + reality + 路由(原子操作)
     # M2 同口径: type 守卫防止非对象入站/规则元素让 jq 整体报错(手改 config 时删除被拒绝服务)
     local tunnel_tag
@@ -5134,31 +5603,28 @@ _delete_node() {
         jq_filter="$jq_filter | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag | index(\$tg)) == null)))
             | .inbounds |= map(select((type != \"object\") or ((.tag // \"\") != \$tg)))"
     fi
-    # R17: 先清理端口跳跃规则(teardown 事务; 失败则取消删除, 节点整体保持原状)
-    # R30(P1): fail-closed——metadata 损坏/缺 protocol 不能当"非 HY2"跳过 teardown,
-    # 否则删节点后 hop DNAT 永久残留(孤儿防火墙规则)
+    # R17/R30(P1)/R31(P1): hop 校验与 teardown 都在锁内完成; 任一失败即取消删除, 节点保持原状。
     local proto hop_port ranges=""
     if ! proto=$(_node_protocol_safe "$tag"); then
-        _press_any_key; return
+        return 1
     fi
     if [ "$proto" = "hysteria2" ]; then
-        # R31(P1): hop 范围字段存在但无法解析 → 拒绝删除(不当作"无 hop"跳过 teardown)
-        _hy2_hop_meta_ok "$tag" || { _press_any_key; return; }
+        _hy2_hop_meta_ok "$tag" || return 1
         ranges=$(_read_hop_ranges "$NODES_DIR/${tag}.json")
         if [ -n "$ranges" ]; then
             # R33(P1): 存在 hop 规则但 iptables 不可用 → 无法安全删除(否则删 config/metadata
             # 留孤儿 DNAT, 且 metadata 已删后无法追溯 dport 归属)
             if ! command -v iptables >/dev/null 2>&1; then
                 _error "节点存在端口跳跃规则, 但 iptables 不可用, 无法安全删除: $tag"
-                _press_any_key; return
+                return 1
             fi
             if ! hop_port=$(jq -r '.port // empty' "$NODES_DIR/${tag}.json" 2>/dev/null); then
                 _error "节点元数据损坏, 无法确认端口: $tag"
-                _press_any_key; return
+                return 1
             fi
             [[ "$hop_port" =~ ^[0-9]+$ ]] || {
                 _error "节点元数据损坏(端口无效): $tag"
-                _press_any_key; return
+                return 1
             }
             # R31(P1): metadata.port 必须与 config 真实监听端口一致——否则 teardown 用错误目标
             # 端口找不到(或误删)DNAT 规则, 留下 :<真实端口> 的孤儿规则。
@@ -5168,17 +5634,17 @@ _delete_node() {
             cfg_port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' "$CONFIG_FILE" 2>/dev/null)
             if [ -n "$cfg_port" ] && [ "$cfg_port" != "$hop_port" ]; then
                 _error "节点元数据端口($hop_port)与 config 监听端口($cfg_port)不一致, 无法安全删除: $tag"
-                _press_any_key; return
+                return 1
             fi
             _info "清理端口跳跃规则..."
             # shellcheck disable=SC2086
             if ! _hy2_hop_teardown "$hop_port" $ranges; then
                 _error "端口跳跃规则清理失败, 已取消删除(节点未动)"
-                _press_any_key; return
+                return 1
             fi
         fi
     fi
-    _hy2_ask_purge_self_certs "$tag"
+    # 自签证书询问在锁外(_delete_node)完成, 这里只消费回答
     if _mutate_config --arg t "$tag" --arg tg "$tunnel_tag" "$jq_filter"; then
         # R18: 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
         # R19: 消费 YAML 删除返回值——失败不静默(权威删除已完成, clash.yaml 属派生导出)
@@ -5191,19 +5657,19 @@ _delete_node() {
         _HY2_HOP_TD=()
         _success "节点已删除"
         _hy2_purge_self_certs
-    else
-        # config 提交失败(已回滚): 恢复已清理的 hop 规则
-        # R38(P1): 原写法 `[ -n "$ranges" ] && A || _error` 在 ranges 为空时(任何非 hy2 /
-        # 无 hop 的节点)必然执行 _error, 于是删除普通 VLESS 节点失败时会额外报一条
-        # "恢复端口跳跃规则失败, 请手动检查 iptables" —— 用户会去翻根本不存在的规则。
-        if [ -n "$ranges" ]; then
-            # shellcheck disable=SC2086
-            _hy2_hop_reverse remove "$hop_port" $ranges 2>/dev/null || \
-                _error "恢复端口跳跃规则失败, 请手动检查 iptables"
-        fi
-        _error "删除失败, 已回滚"
+        return 0
     fi
-    _press_any_key
+    # config 提交失败(已回滚): 恢复已清理的 hop 规则
+    # R38(P1): 原写法 `[ -n "$ranges" ] && A || _error` 在 ranges 为空时(任何非 hy2 /
+    # 无 hop 的节点)必然执行 _error, 于是删除普通 VLESS 节点失败时会额外报一条
+    # "恢复端口跳跃规则失败, 请手动检查 iptables" —— 用户会去翻根本不存在的规则。
+    if [ -n "$ranges" ]; then
+        # shellcheck disable=SC2086
+        _hy2_hop_reverse remove "$hop_port" $ranges 2>/dev/null || \
+            _error "恢复端口跳跃规则失败, 请手动检查 iptables"
+    fi
+    _error "删除失败, 已回滚"
+    return 1
 }
 
 # 改端口的 Reality 事务(R41)。**整个事务在 _with_config_lock 内** —— 与 _port_txn /
@@ -5355,8 +5821,12 @@ _reality_port_txn_locked() {
     else
         _success "端口已改为 ${newport}(直连模式, 标签已同步更新)"
     fi
-    # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
-    _sync_node_clash "$meta" "$old_name"
+    # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)。
+    # 十轮 P1-⑤ 后本函数**如实返回**失败: 派生缓存同步失败不回滚已提交的端口事务(节点本体
+    # 是权威状态), 但必须消费返回码, 否则"报成功而订阅仍指向旧端口"无人知晓 —— 与九轮给
+    # 域名切换补 #45 是同一契约。告警文本由函数内部给出, 这里只补可操作提示。
+    _sync_node_clash "$meta" "$old_name" || \
+        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
 }
 
 # ---------------------------------------------------------------------------
@@ -5801,7 +6271,8 @@ _modify_port() {
         _press_any_key; return 1
     fi
     # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
-    _sync_node_clash "$meta" "$old_name"
+    _sync_node_clash "$meta" "$old_name" || \
+        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
     _success "端口已改为 ${newport}"
     _press_any_key
 }
@@ -5896,8 +6367,9 @@ _update_listen() {
             | (if has("preferred_addr") then .preferred_addr=$a else . end)' \
             --arg l "$newlisten" --arg a "$newaddr" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
     fi
-    # F1: 监听/链接地址变化需同步 clash 条目的 server 字段
-    _sync_node_clash "$meta"
+    # F1: 监听/链接地址变化需同步 clash 条目的 server 字段(失败只提示, 不回滚权威状态)
+    _sync_node_clash "$meta" || \
+        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
 
     _success "监听已更新为 ${newlisten}, 链接地址更新为 ${newaddr}"
     _press_any_key

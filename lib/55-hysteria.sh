@@ -586,6 +586,15 @@ _manage_hysteria() {
     # openrc 的 supervise-daemon / direct 模式的 nohup 会继承全部打开 fd —— 守护进程
     # 持有 fd9 = flock 永远被持有, 后续所有配置事务 15s 超时失败(2026-09-13 Alpine 实测;
     # systemd 不继承业务 fd 故 Ubuntu 无感)。对齐 singbox-lite 的锁 fd 泄漏修复。
+    #
+    # **写法必须是 local V="${V:-9}" + {V}>&-(十五轮实测 P1)**: bash 不把 `${V:-9}>&-`
+    # 当重定向, 展开出来的数字会变成**位置参数**传给被调命令(实测 `systemctl start xray 10`,
+    # 即去操作不存在的 10.service 而报失败), 锁 fd 也照旧被守护进程继承。详见 20-xray-core.sh
+    # 同名注释。四个变量归一成数字后, `{V}>&-` 才是真正只作用于该命令的重定向。
+    local CORE_LOCK_FD="${CORE_LOCK_FD:-9}"
+    local DEPLOY_INSTALL_LOCK_FD="${DEPLOY_INSTALL_LOCK_FD:-9}"
+    local XD_CORE_LEGACY_FLOCK_FD="${XD_CORE_LEGACY_FLOCK_FD:-9}"
+    local XD_INSTALL_LEGACY_FLOCK_FD="${XD_INSTALL_LEGACY_FLOCK_FD:-9}"
     case "$INIT_SYSTEM" in
         systemd)
             case "$action" in
@@ -594,11 +603,13 @@ _manage_hysteria() {
                     # 启动限流 "start-limit-hit", 之后 start 一律被拒 → 服务再也起不来。
                     # 启动前清掉限流计数(对未受限的 unit 是幂等 no-op), 与项目 xray 侧同口径。
                     systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
-                    systemctl start "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
+                    # start/restart 会派生守护进程: 一并关掉本项目可能持有的全部锁 fd
+                    # (config 锁 fd9 + 核心/安装主锁 + 跨版本协调的旧版锁); 少关一把 = 锁不释放。
+                    systemctl start "$HYSTERIA_SVC" 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- ;;
                 stop)    systemctl stop "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
                 restart)
                     systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
-                    systemctl restart "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
+                    systemctl restart "$HYSTERIA_SVC" 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- ;;
                 status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
@@ -608,7 +619,7 @@ _manage_hysteria() {
                 # 仅在确认无真实业务进程时 zap 复位(与 _manage_xray openrc 分支同口径)
                 start)
                     _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1 9>&-
-                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- ;;
+                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- ;;
                 stop)
                     rc-service "$HYSTERIA_SVC" stop 2>/dev/null 9>&-
                     _hysteria_kill_stale_supervisor ;;
@@ -619,7 +630,7 @@ _manage_hysteria() {
                     rc-service "$HYSTERIA_SVC" stop 2>/dev/null 9>&-
                     _hysteria_kill_stale_supervisor
                     _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1 9>&-
-                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- ;;
+                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- ;;
                 status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
@@ -639,7 +650,7 @@ _manage_hysteria() {
                         (
                             cd "$HYSTERIA_DATA_DIR" 2>/dev/null || cd /
                             exec nohup "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" --disable-update-check \
-                                >>"$HYSTERIA_LOG_FILE" 2>&1 9>&-
+                                >>"$HYSTERIA_LOG_FILE" 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&-
                         ) &
                         echo $! > "$HYSTERIA_PID_FILE"
                         sleep 1

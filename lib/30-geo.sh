@@ -118,148 +118,70 @@ _ensure_cron_running() {
 }
 
 # ---------------------------------------------------------------------------
-# 执行一次 Geo 更新(备份旧 dat → 下载覆盖 → 重启 xray)
+# 执行一次 Geo 更新。网络下载/体积校验在 core lock 外; live dat 的备份、原子替换、
+# 重启验证与回滚在 core lock 内, 与核心事务共享同一互斥边界。
 # ---------------------------------------------------------------------------
 _geo_update() {
     _ensure_dirs || return 1
     # M26: cron 环境下 _info/_warn 输出到 stdout 会产生噪音邮件, 重定向到日志。
-    # 日志目录必须先建好: `exec >> file` 在目录缺失时会让**整个函数后续输出**丢失或被
-    # bash 拒绝重定向 —— 更新过程的诊断信息全没了, 且这个失败发生在最需要日志的 cron 场景。
-    # 重定向失败时降级继续(日志问题不该中断更新)。
+    # 日志目录必须先建好: 否则 exec 重定向失败会丢失后续诊断; 日志问题本身仍降级继续。
     if [ ! -t 0 ]; then
-        # 先**探测可写性**再重定向: `exec` 是特殊内建, 重定向失败在非交互 shell 里会直接
-        # 终止 shell(bash posix 模式 rc=1 / dash rc=2), 于是 `|| _warn` 分支永远不会执行,
-        # "降级继续"的意图落空, 更新被日志问题打断。
         mkdir -p "$LOG_DIR" 2>/dev/null
+        # exec 是特殊内建, 非交互 shell 的重定向失败可能直接终止 shell; 先探测再重定向。
         if ( : >> "$GEO_LOG" ) 2>/dev/null; then
             exec >> "$GEO_LOG" 2>&1
         else
             _warn "无法写入日志 $GEO_LOG, 本次输出未落盘"
         fi
     fi
-    # R38(M5): mktemp -d 失败必须中止 —— 否则 tmp="" 会让 t="/geosite.dat", 两个 20MB+
-    # 的 dat 被下载到根目录, 且末尾 rm -rf "$tmp" 变成 rm -rf "" 空操作, 文件永久残留。
-    # /tmp 写满/只读/inode 耗尽正是本 PR 关注的低配 VPS 场景。
+    if ! declare -F _with_core_lock >/dev/null 2>&1; then
+        _error "缺少核心互斥锁, 拒绝更新 Geo 数据"
+        return 1
+    fi
+    # 临时目录只承载下载件; 创建失败必须中止, 否则空 tmp 会让下载路径退化到文件系统根目录。
     local tmp
-    tmp=$(mktemp -d) || { _error "无法创建临时目录(/tmp 写满或只读?), Geo 更新中止"; return 1; }
-    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+    tmp=$(mktemp -d) || { _error "无法创建 Geo 下载临时目录, 更新中止"; return 1; }
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
     _info "[$ts] 开始更新 Geo 数据..."
 
-    local ok=1
-    local backed=()  # 已备份的旧 dat 路径, 用于失败回退 (S9)
+    # 所有网络等待与下载校验均在锁外。两个 dat 作为一组提交; 任一下载失败都会在锁内
+    # coretxn preflight 拒绝整体变更, 不会把单个新 dat 与另一个旧 dat 混合提交。
+    local ok=1 f url t sz
     for f in geosite.dat geoip.dat; do
-        local url="$GEO_BASE/$f" dest="$ASSET_DIR/$f" t="${tmp}/${f}"
+        url="$GEO_BASE/$f"
+        t="${tmp}/${f}"
         _info "下载 $f <- $url"
         if ! _http_download "$url" "$t" 60; then
             _warn "$f 下载失败, 保留旧文件"
-            ok=0; continue
+            ok=0
+            rm -f "$t"
+            continue
         fi
-        # 校验: 非空 + 体积合理(>1KB)
-        local sz; sz=$(stat -c%s "$t" 2>/dev/null || stat -f%z "$t" 2>/dev/null || echo 0)
+        # 校验: 非空且体积至少 1KB。
+        sz=$(stat -c%s "$t" 2>/dev/null || stat -f%z "$t" 2>/dev/null || echo 0)
         if [ "$sz" -lt 1024 ]; then
             _warn "$f 体积异常(${sz}B), 保留旧文件"
-            ok=0; rm -f "$t"; continue
+            ok=0
+            rm -f "$t"
         fi
-        # 覆盖前备份旧 dat (S9: 运行期校验失败或部分下载失败时可回退)。
-        # 备份必须真正成功才允许覆盖: 磁盘满/IO 错误导致 cp 失败时, 若继续 mv 会让旧 dat
-        # 无备份可回滚 → 数据集不一致。备份失败则保留旧文件、本次不替换。
-        # 除 cp 的返回码外还要验**体积一致**: 磁盘满时 cp 可能返回 0 却只落地半截文件,
-        # 之后回滚流程会把这份损坏备份 mv 回 $ASSET_DIR, 覆盖掉唯一可用的旧 dat。
-        if [ -f "$dest" ]; then
-            if ! cp -f "$dest" "$dest.bak"; then
-                _warn "$f 旧文件备份失败(磁盘空间/IO?), 保留旧文件, 跳过本次替换"
-                ok=0; rm -f "$t"; continue
-            fi
-            local _osz _bsz
-            _osz=$(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest" 2>/dev/null || echo 0)
-            _bsz=$(stat -c%s "$dest.bak" 2>/dev/null || stat -f%z "$dest.bak" 2>/dev/null || echo 0)
-            if [ "$_osz" -le 0 ] || [ "$_bsz" != "$_osz" ]; then
-                _warn "$f 旧文件备份不完整(${_bsz}B != ${_osz}B), 保留旧文件, 跳过本次替换"
-                rm -f "$dest.bak"
-                ok=0; rm -f "$t"; continue
-            fi
-            backed+=("$dest")
-        fi
-        # 原子替换。mv 失败(磁盘满/IO/只读)时旧 dat 仍在原位, 不能报"更新成功"并随后删除 .bak;
-        # 置 ok=0 走"部分失败"分支, 由 backed[] 里的 .bak 把旧 dat 还原回来。
-        if ! mv -f "$t" "$dest"; then
-            _warn "$f 替换失败(磁盘空间/IO/只读?), 保留旧文件, 跳过本次更新"
-            ok=0; rm -f "$t"; continue
-        fi
-        _success "$f 更新成功 (${sz}B)"
     done
 
+    local rc=0
+    _with_core_lock _geo_update_commit_locked "$tmp" "$ts" "$ok" || rc=$?
     rm -rf "$tmp"
+    return "$rc"
+}
 
-    # 日志 + 校验
-    mkdir -p "$LOG_DIR"
-    if [ "$ok" -eq 1 ]; then
-        # 低内存机器不跑 xray -test(双份加载 OOM); 改为重启后做稳定存活确认。
-        # 仅当 xray 已安装且原本在运行/存在配置时才重启验证
-        local need_verify=0
-        if [ -x "$XRAY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
-            case "$(_manage_xray status 2>/dev/null)" in running) need_verify=1;; esac
-        fi
-        if [ "$need_verify" -eq 1 ]; then
-            if _restart_xray_verified; then
-                for dest in "${backed[@]}"; do rm -f "${dest}.bak" 2>/dev/null; done
-                echo "[$ts] OK 全部更新成功, xray 重启稳定" >> "$GEO_LOG"
-            else
-                # 新 dat 导致 xray 无法稳定运行: 回退旧 dat 并重新拉起
-                # R38(M4): 必须统计"实际回退了几个"——backed[] 只在旧文件存在时才追加, 首次
-                # 部署/assets 被清过的机器上它是空数组, 循环一次都不跑, 坏 dat 原样留在盘上,
-                # 而日志却写"已回退旧 dat"。cron 每月一次, 这行日志是用户唯一的诊断依据。
-                _warn "新 Geo 数据导致 xray 运行异常, 回退旧 dat"
-                local rolled=0
-                for dest in "${backed[@]}"; do
-                    if [ -f "${dest}.bak" ]; then
-                        if mv -f "${dest}.bak" "$dest"; then
-                            rolled=$((rolled+1))
-                        else
-                            _warn "回滚 ${dest} 失败, 请手动检查"
-                        fi
-                    fi
-                done
-                # R38(M4): 回退后是否救回来了, 是值班时最需要知道的一件事; 不能用
-                # `2>/dev/null || true` 把结果一并吞掉
-                local recovered="xray 仍未稳定运行, 需人工介入"
-                if _restart_xray_verified; then
-                    recovered="xray 已恢复运行"
-                fi
-                if [ "$rolled" -eq 0 ]; then
-                    _warn "无旧 dat 可回退(首次安装/assets 曾被清空), 新 dat 仍在 ${ASSET_DIR}"
-                    echo "[$ts] FAIL 新 dat 运行期校验失败, 无旧 dat 可回退, ${recovered}" >> "$GEO_LOG"
-                else
-                    echo "[$ts] FAIL 新 dat 运行期校验失败, 已回退 ${rolled} 个旧 dat, ${recovered}" >> "$GEO_LOG"
-                fi
-                return 1
-            fi
-        else
-            # xray 未安装/未运行: 无需重启, 清理备份
-            for dest in "${backed[@]}"; do rm -f "${dest}.bak" 2>/dev/null; done
-            echo "[$ts] OK 全部更新成功(xray 未运行, 已跳过重启)" >> "$GEO_LOG"
-        fi
-        return 0
-    else
-        # 部分下载失败: 回退已替换的文件, 保持 dat 对一致性
-        # R38(M4): 同样统计实际回退数量, 并区分"有旧文件可回退"与"某份是首次下载"
-        local rolled=0
-        for dest in "${backed[@]}"; do
-            if [ -f "${dest}.bak" ]; then
-                if mv -f "${dest}.bak" "$dest"; then
-                    rolled=$((rolled+1))
-                else
-                    _warn "回滚 ${dest} 失败, 请手动检查"
-                fi
-            fi
-        done
-        if [ "$rolled" -eq 0 ]; then
-            echo "[$ts] PARTIAL 部分失败, 无已替换文件需回退" >> "$GEO_LOG"
-        else
-            echo "[$ts] PARTIAL 部分失败, 已回退 ${rolled} 个旧 dat" >> "$GEO_LOG"
-        fi
+# 仅由 _geo_update 在 _with_core_lock 内调用。下载已完成; 从 pending coretxn 收敛后，
+# 才能快照/改写 live dat, 避免 geo updater 与核心切换互相覆盖对方的快照或提交。
+_geo_update_commit_locked() {
+    local tmp="$1" ts="$2" ok="$3"
+    if ! declare -F _xray_core_geo_update_locked >/dev/null 2>&1; then
+        _error "缺少 coretxn Geo 提交入口, 拒绝修改 live dat"
         return 1
     fi
+    _xray_core_geo_update_locked "$tmp" "$ts" "$ok"
 }
 
 # ---------------------------------------------------------------------------
@@ -373,8 +295,22 @@ _geo_set_auto_update_cron() {
             fi
             ;;
         off)
-            _geo_remove_cron_line
-            _state_set geo_cron "off"
+            # 移除失败**不得报成功**(2026-09-22 九轮 OCR #25)。
+            # 旧写法忽略 `_geo_remove_cron_line` 的返回码就 `_state_set geo_cron "off"` +
+            # `_success "已关闭"` —— 而这与同函数 `on)` 分支**自己**的回滚契约直接相反:
+            # 那里在 `_ensure_cron_running` 失败时会先把 cron 行撤掉再置 off, 目的正是维持
+            # `state=off ⇔ 项目 cron entry 不存在`。读不到/写不了 crontab 时旧写法会造出
+            # "cron 行还在跑 + UI 说已关闭"的分裂, 而 cron 会在无人值守时继续执行本脚本。
+            #
+            # 处置与 `_geo_set_auto_update` 的 `off)` 分支**刻意不同**: 那里 config 才是真相源,
+            # 残留 cron 行只是冗余清理, 失败只告警; 而**旧核心路径上 cron 行就是机制本身**,
+            # 移除失败必须 fail 且**不**改 state(保持 on —— 那才是磁盘上的事实)。
+            if ! _geo_remove_cron_line; then
+                _error "移除 geo 定时任务失败(crontab 不可读/不可写?), 自动更新仍是开启状态"
+                _tip "请手动检查 crontab 中的 ${GEO_CRON_MARKER} 行, 或修复 crontab 权限后重试"
+                return 1
+            fi
+            _state_set geo_cron "off" || _warn "geo_cron 状态写入失败, 状态显示可能不准"
             _success "Geo 自动更新已关闭"
             ;;
     esac
@@ -389,15 +325,29 @@ _geo_set_auto_update_cron() {
 #   - config 已有 geodata.cron(已迁移过) → 仅清理残留 cron 行与旧 state。
 # 幂等, 失败静默(启动路径不阻塞), 至多一条 _info。
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: 迁移会"读整份 config → 加入 geodata → 原子写回", 必须持 config lock, 否则会覆盖
+# 并发节点事务。外层用 state 守卫避免每次启动都取锁(绝大多数系统不需要迁移)。
 _auto_migrate_geo_autoupdate() {
     [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
+    [ -f "$CONFIG_FILE" ] || return 0
+    _with_config_lock _auto_migrate_geo_autoupdate_locked
+}
+_auto_migrate_geo_autoupdate_locked() {
+    [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
+    [ -f "$CONFIG_FILE" ] || return 0
     local has_gd=0
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
         has_gd=$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null || echo 0)
     fi
     if [ "$has_gd" = "1" ]; then
-        _geo_remove_cron_line >/dev/null 2>&1
-        _state_set geo_cron "off" 2>/dev/null || true
+        # 三十四轮 P2: 清理失败不再静默 —— cron 行残留会与内置 geodata 重复执行; 此时保持
+        # state=on 让下次启动继续重试(手动路径同样要求"移除成功才置 off")。
+        if _geo_remove_cron_line; then
+            _state_set geo_cron "off" 2>/dev/null || true
+        else
+            _warn "Geo 内置定时已启用, 但旧系统 cron 行清理失败(可能重复执行); 下次启动会重试"
+            _tip "请检查 crontab 权限或手动删除 ${GEO_CRON_MARKER} 行"
+        fi
         return 0
     fi
     if [ -x "$XRAY_BIN" ] && _xray_version_ge "26.4.25" \
@@ -407,9 +357,15 @@ _auto_migrate_geo_autoupdate() {
         content=$(jq --argjson gd "$gd" '.geodata = $gd' "$CONFIG_FILE" 2>/dev/null) || return 0
         [ -n "$content" ] || return 0
         if _atomic_write_json "$CONFIG_FILE" "$content" 2>/dev/null; then
-            _geo_remove_cron_line >/dev/null 2>&1
-            _state_set geo_cron "off" 2>/dev/null || true
-            _info "已迁移 Geo 自动更新到 Xray 内置定时($GEO_CRON_EXPR), 移除系统 cron, 下次重启生效"
+            # 三十四轮 P2: 迁移已生效(config 已写 geodata), 但 cron 清理失败必须明确告警;
+            # 保持 state=on ⇒ 下次启动重试清理(has_gd=1 分支), 不会遗留"两个机制同时跑".
+            if _geo_remove_cron_line; then
+                _state_set geo_cron "off" 2>/dev/null || true
+                _info "已迁移 Geo 自动更新到 Xray 内置定时($GEO_CRON_EXPR), 移除系统 cron, 下次重启生效"
+            else
+                _warn "geodata 已写入 config(内置定时生效), 但旧系统 cron 行清理失败; 下次启动会重试"
+                _tip "请检查 crontab 权限或手动删除 ${GEO_CRON_MARKER} 行"
+            fi
         fi
     fi
 }
