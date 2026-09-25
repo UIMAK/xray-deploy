@@ -1435,6 +1435,10 @@ _cloudflared_menu() {
                 echo -e "  ${GREEN}[1]${NC} 切换令牌"
             else
                 echo -e "  ${GREEN}[1]${NC} 补录令牌(手动安装的 cloudflared)"
+                # 管理范围声明: 本脚本只认启动行里的 `--token <值>`, 改写/切换都只针对它。
+                # token-file / Environment=TUNNEL_TOKEN 等官方形态无法安全重写(会破坏用户原配置),
+                # 故必须显式说明, 不能让用户以为"支持 cloudflared 令牌"就等于支持全部形态。
+                echo -e "  ${YELLOW}仅管理启动行中的 --token <值>; --token-file / Environment=TUNNEL_TOKEN 需手动维护${NC}"
             fi
             echo -e "  ${GREEN}[2]${NC} 切换 自动更新 (当前 $(_cf_onoff "$auto_disp"))"
             echo -e "  ${GREEN}[3]${NC} 切换 HTTP/2      (当前 $(_cf_onoff "${CF_CUR_HTTP2:-on}"))"
