@@ -903,9 +903,10 @@ _xd_kill_pid_graceful() {
     # 规范 PID: `kill 0` 是"发给当前进程组"(不是 PID 0), 会误伤整组进程; 前导零/超长一律拒绝。
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
     [ "${#pid}" -le 7 ] || return 1
-    kill "$pid" 2>/dev/null || return 0     # 已退出 => 无需再处理
-    [ -d "/proc/$pid" ] || return 0          # TERM 已把它带走
+    # **必须在发 TERM 之前取身份**(2026-09-26 复审 P1): 先 TERM 再读 starttime 时, 原进程可能
+    # 已迅速退出并被复用, 读到的是**新进程**的 starttime ⇒ 后面的强杀正好打在新进程上。
     st=$(_proc_starttime "$pid") || st=""
+    kill "$pid" 2>/dev/null || return 0     # 已退出 => 无需再处理
     if [ -z "$st" ]; then
         _warn "无法确认 PID $pid 的启动时间, 跳过延迟强杀(仅已发送 TERM)"
         while [ "$k" -lt "$grace" ]; do
@@ -922,6 +923,60 @@ _xd_kill_pid_graceful() {
     done
     # best-effort 强杀: 先确认仍是同一化身, 再把 read->kill 窗口压到最小(仍非原子, 见上)。
     _xd_pid_unchanged "$pid" "$st" && kill -9 "$pid" 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# direct 后端的进程身份 pidfile: 记录 "PID starttime", 使停止时能证明"还是启动时那个进程"。
+#
+# 为什么需要(2026-09-26 复审的"更现实结构"): 只记 PID 时, 调用点的 comm/exe 检查与真正的 kill
+# 之间仍有窗口 —— PID 被复用后, 即使复用者是同名/同路径的进程也分不出来(比如两个 xray 实例)。
+# 启动时记录的 starttime 来自我们 fork 的那一刻, 不依赖事后读取, 因而不受该窗口影响。
+# 兼容: 只含 PID 的旧 pidfile、以及 openrc 自己写的 pidfile 没有第二字段 ⇒ 退化为"PID 存活即视为
+# 同一进程"(与旧行为一致), 不做无法证实的判断 —— 与 `_proc_exe_is` 的 fail-open 口径同源。
+# ---------------------------------------------------------------------------
+_xd_pidfile_pid() {   # <file> -> stdout: 规范 PID, 否则空
+    local f="${1:-}" pid=""
+    [ -f "$f" ] || return 0
+    read -r pid _ < "$f" 2>/dev/null || true
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+    [ "${#pid}" -le 7 ] || return 0
+    printf '%s' "$pid"
+}
+
+_xd_pidfile_starttime() {   # <file> -> stdout: 记录的 starttime, 无则空
+    local f="${1:-}" pid="" st=""
+    [ -f "$f" ] || return 0
+    read -r pid st < "$f" 2>/dev/null || true
+    [ -n "$st" ] || return 0
+    [[ "$st" =~ ^[0-9]+$ ]] || return 0
+    printf '%s' "$st"
+}
+
+# 写入 "PID starttime"; starttime 读不到时只写 PID(调用方语义退化为旧行为)。
+_xd_pidfile_write() {   # <file> <pid>
+    local f="${1:-}" pid="${2:-}" st
+    [ -n "$f" ] || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    st=$(_proc_starttime "$pid") || st=""
+    if [ -n "$st" ]; then
+        printf '%s %s\n' "$pid" "$st" > "$f"
+    else
+        printf '%s\n' "$pid" > "$f"
+    fi
+}
+
+# 记录的身份是否仍指向同一进程: 有 starttime 时必须相符; 无 starttime 时只要求 PID 仍存在。
+_xd_pidfile_identity_ok() {   # <file>
+    local f="${1:-}" pid st
+    [ -f "$f" ] || return 1
+    pid=$(_xd_pidfile_pid "$f")
+    [ -n "$pid" ] || return 1
+    [ -d "/proc/$pid" ] || return 1
+    st=$(_xd_pidfile_starttime "$f")
+    if [ -n "$st" ]; then
+        _xd_pid_unchanged "$pid" "$st" || return 1
+    fi
     return 0
 }
 

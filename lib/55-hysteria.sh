@@ -501,15 +501,16 @@ _hysteria_is_running() {
             ;;
         direct)
             # direct: pidfile 即业务进程本身 → 必须用 exe 归属校验(P1-2), 只看 comm 会把
-            # 陈旧 pidfile 指向的他方 hysteria 误认成本项目服务
-            anchor=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
+            # 陈旧 pidfile 指向的他方 hysteria 误认成本项目服务。pidfile 形如 "PID starttime"
+            # (见 00-common `_xd_pidfile_*`), 故先取 PID 字段。
+            anchor=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null)
             _hysteria_pid_is_ours "${anchor:-}" && return 0
             ;;
         openrc)
             # openrc: pidfile 是 supervise-daemon 父进程(其 exe 不是 hysteria), 不能用 exe
             # 直接校验 anchor, 需沿 ppid 链回溯业务子进程(与 _xray_is_running 同口径)
-            anchor=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
-            if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] && [ -d "/proc/$anchor" ]; then
+            anchor=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null)
+            if [ -n "$anchor" ] && [ -d "/proc/$anchor" ]; then
                 _proc_named_under "$anchor" hysteria && return 0
             fi
             ;;
@@ -637,11 +638,12 @@ _manage_hysteria() {
         direct)
             case "$action" in
                 start)
-                    local dpid0
-                    [ -f "$HYSTERIA_PID_FILE" ] && dpid0=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
-                    # 归属用 exe 校验(不只看 comm); 陈旧 pidfile 指向他方 hysteria 时
-                    # 判为 stale → 清 pidfile 并正常启动, 绝不误认 running
-                    if _hysteria_pid_is_ours "${dpid0:-}"; then
+                    local dpid0 dpid1
+                    dpid0=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
+                    # 归属用 exe 校验(不只看 comm), 且 pidfile 记录的**身份**(PID+启动时 starttime)
+                    # 必须仍然成立; 陈旧 pidfile 指向他方 hysteria、或 PID 被复用(即使复用者也是
+                    # hysteria)时判为 stale → 清 pidfile 并正常启动, 绝不误认 running。
+                    if _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" && _hysteria_pid_is_ours "${dpid0:-}"; then
                         echo "running"
                     else
                         rm -f "$HYSTERIA_PID_FILE"
@@ -652,9 +654,10 @@ _manage_hysteria() {
                             exec nohup "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" --disable-update-check \
                                 >>"$HYSTERIA_LOG_FILE" 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&-
                         ) &
-                        echo $! > "$HYSTERIA_PID_FILE"
+                        _xd_pidfile_write "$HYSTERIA_PID_FILE" "$!"
                         sleep 1
-                        if ! _hysteria_pid_is_ours "$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)"; then
+                        dpid1=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
+                        if [ -z "$dpid1" ] || ! _hysteria_pid_is_ours "$dpid1"; then
                             _warn "Hysteria 启动失败, 进程已退出(查看 $HYSTERIA_LOG_FILE)"
                             rm -f "$HYSTERIA_PID_FILE"
                             return 1
@@ -664,10 +667,11 @@ _manage_hysteria() {
                 stop)
                     if [ -f "$HYSTERIA_PID_FILE" ]; then
                         local dpid
-                        dpid=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
-                        # 只对本项目自己的 hysteria(exe 归属)发信号, 绝不误杀同名的他方进程。
-                        # 等待窗口内 PID 被复用时, 强杀必须绑定同一进程化身(starttime)。
-                        if _hysteria_pid_is_ours "$dpid"; then
+                        dpid=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
+                        # 只对"身份仍相符且确属本项目的 hysteria(exe 归属)"发信号, 绝不误杀同名
+                        # 的他方进程。`_xd_kill_pid_graceful` 在同一化身内做等待与强杀。
+                        if [ -n "$dpid" ] && _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" \
+                           && _hysteria_pid_is_ours "$dpid"; then
                             _xd_kill_pid_graceful "$dpid" 5
                         fi
                     fi
@@ -690,8 +694,10 @@ _manage_hysteria() {
 # exe == $HYSTERIA_BIN 的进程**, 归属确属本项目才动手。
 _hysteria_kill_stale_supervisor() {
     local a c
-    a=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
-    [[ "$a" =~ ^[0-9]+$ ]] || return 0
+    # openrc 的 pidfile 由 supervise-daemon 写(纯 PID); 用统一解析器取第一字段, 兼容 direct 的
+    # "PID starttime" 形态。
+    a=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
+    [ -n "$a" ] || return 0
     [ -d "/proc/$a" ] || { rm -f "$HYSTERIA_PID_FILE"; return 0; }
     c=$(cat "/proc/$a/comm" 2>/dev/null)
     case "$c" in
