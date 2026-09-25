@@ -1183,23 +1183,11 @@ _hy2_manage_menu() {
 # 前导零单独处理有两种必要: bash 把 `08`/`09` 当**八进制**会报错(故用 `10#` 显式十进制),
 # 且 `0000001` 这类"长但数值很小"的输入不该被长度闸门误杀。
 _hy2_select_node() {   # <choice> <tag1> [<tag2> ...]
-    local c="${1:-}"
+    local c="${1:-}" idx
     shift || return 1
-    [ -n "$c" ] || return 1
-    case "$c" in *[!0-9]*) return 1 ;; esac
-    # 去前导零(bash 的 ${var#pattern} 只删最短匹配, 故迭代到无前导零为止)
-    while :; do
-        case "$c" in 0*) c="${c#0}" ;; *) break ;; esac
-    done
-    [ -n "$c" ] || return 1
-    # 长度闸门: 节点数不可能到 7 位; 必须在任何算术之前
-    [ "${#c}" -le 6 ] || return 1
-    local total=$#
-    [ "$total" -gt 0 ] || return 1
-    local n=$((10#$c))
-    [ "$n" -ge 1 ] && [ "$n" -le "$total" ] || return 1
+    idx=$(_xd_index_from_choice "$c" "$#") || return 1
     local -a tags=("$@")
-    printf '%s' "${tags[$((n-1))]}"
+    printf '%s' "${tags[$idx]}"
     return 0
 }
 

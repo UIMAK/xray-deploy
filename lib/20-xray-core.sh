@@ -2908,16 +2908,11 @@ _manage_xray() {
                 stop)
                     if [ -f /run/xray.pid ]; then
                         local dpid; dpid=$(cat /run/xray.pid 2>/dev/null)
-                        # PID reuse 防护: 只对 comm 确为 xray 的 pidfile 进程发信号, 绝不误杀复用该 PID 的其他程序
+                        # PID reuse 防护: 只对 comm 确为 xray 的 pidfile 进程发信号, 绝不误杀复用该 PID 的其他程序。
+                        # 优雅等待与强杀都绑定到**同一进程化身**(starttime), 否则 PID 在等待窗口内被
+                        # 复用后, kill -0 会误判"仍活着"并对无关进程发 SIGKILL。
                         if [ -n "$dpid" ] && [ "$(cat /proc/$dpid/comm 2>/dev/null)" = "xray" ]; then
-                            kill "$dpid" 2>/dev/null
-                            # 优雅等待最多 5s, 仍不退出再 SIGKILL, 避免端口未释放
-                            local k
-                            for k in 1 2 3 4 5; do
-                                kill -0 "$dpid" 2>/dev/null || break
-                                sleep 1
-                            done
-                            kill -0 "$dpid" 2>/dev/null && kill -9 "$dpid" 2>/dev/null
+                            _xd_kill_pid_graceful "$dpid" 5
                         fi
                     fi
                     rm -f /run/xray.pid
