@@ -2410,7 +2410,13 @@ _tag_is_managed() {
 # 有 port: manual-<port> (如 manual-443)
 # Unix socket: manual-<socket文件名去后缀> (如 manual-xrxh-socket)
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: "读入站 → 计算新 tag → 原子写回"的 RMW 必须持 config lock, 否则与并发节点事务
+# 互相覆盖(启动期自动执行, 是真实竞态面)。锁可重入, 被其它持锁路径调用时不会自锁。
 _auto_tag_tagless_inbounds() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    _with_config_lock _auto_tag_tagless_inbounds_locked
+}
+_auto_tag_tagless_inbounds_locked() {
     [ -f "$CONFIG_FILE" ] || return 0
     # 一次性读取所有入站的 tag/port/listen, 减少 jq 调用
     local inbounds_info
@@ -2584,7 +2590,12 @@ _find_reality_for_tunnel_tag() {
 # 采纳单个入站: 从 config.json 推断元数据, 创建 nodes/*.json
 # 返回 0 = 成功, 1 = 跳过(tunnel)
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: 采纳会在锁外写出 metadata —— 与并发删除/重置交错时会重建出"config 无此入站 /
+# metadata 存在"的分裂。整个采纳(含 config 读取与唯一性检查)在 config lock 内执行。
 _adopt_single_inbound() {
+    _with_config_lock _adopt_single_inbound_locked "$@"
+}
+_adopt_single_inbound_locked() {
     local tag="$1" suffix="${2:-adopted}"
     local proto port listen
     proto=$(_detect_inbound_protocol "$tag")
@@ -2659,7 +2670,13 @@ _adopt_single_inbound() {
 # 自动采纳孤儿入站: 为无元数据的入站创建 nodes/*.json
 # 启动时静默运行, 不询问用户
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: 扫描(枚举孤儿) → 判断 → 采纳 必须整体在 config lock 内, 锁内重新枚举 ——
+# 否则锁外扫到的 orphan 可能在取锁前已被并发事务删除, 采纳又把它写成 metadata。
 _auto_adopt_orphans() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    _with_config_lock _auto_adopt_orphans_locked
+}
+_auto_adopt_orphans_locked() {
     [ -f "$CONFIG_FILE" ] || return 0
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
     local known_list

@@ -769,7 +769,14 @@ _gen_rand_path() {
 # R38(P1): jq 对"只含空白的文件"不报错但输出空, 旧写法会把 config.json 截断成 0 字节。
 # 现由 _atomic_write_json 的空内容拦截兜住, 这里再显式判一次以避免无谓的错误输出。
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: 本函数是"读整份 config → jq 重排 → 原子写回"的 RMW, 必须在 config lock 内执行 ——
+# 否则并发节点事务提交后会被这里的旧快照整份覆盖(lost update)。外层先做廉价守卫, 不存在/空文件
+# 时不取锁(也避免在无部署目录的调用场景里白报锁错误)。
 _normalize_config_format() {
+    [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
+    _with_config_lock _normalize_config_format_locked
+}
+_normalize_config_format_locked() {
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
     local content

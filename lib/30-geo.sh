@@ -325,8 +325,16 @@ _geo_set_auto_update_cron() {
 #   - config 已有 geodata.cron(已迁移过) → 仅清理残留 cron 行与旧 state。
 # 幂等, 失败静默(启动路径不阻塞), 至多一条 _info。
 # ---------------------------------------------------------------------------
+# 三十三轮 P1: 迁移会"读整份 config → 加入 geodata → 原子写回", 必须持 config lock, 否则会覆盖
+# 并发节点事务。外层用 state 守卫避免每次启动都取锁(绝大多数系统不需要迁移)。
 _auto_migrate_geo_autoupdate() {
     [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
+    [ -f "$CONFIG_FILE" ] || return 0
+    _with_config_lock _auto_migrate_geo_autoupdate_locked
+}
+_auto_migrate_geo_autoupdate_locked() {
+    [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
+    [ -f "$CONFIG_FILE" ] || return 0
     local has_gd=0
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
         has_gd=$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null || echo 0)
