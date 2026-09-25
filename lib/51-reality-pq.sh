@@ -10,10 +10,27 @@
 # 参照实现:mack-a/v2ray-agent install.sh L9590-9627
 # ============================================================================
 
-# 有界执行的"基础设施失败"标志(见 _pq_run_bounded 的契约)。模块级默认值:
-# 调用方在 set -u 下读它时**必须**有定义 —— 混装旧 lib(51 是新版而调用方被旧桩替换)
-# 或测试桩不走真实实现时, 裸引用会直接 unbound 崩溃。
-_PQ_RUN_INFRA=""
+# 有界执行的"基础设施失败"标志(见 _pq_run_bounded 的契约)。
+#
+# **通道必须是文件, 不能是 shell 变量**(2026-09-22 九轮 OCR #36)。
+# 上游调用点写的是 `ping_out=$(_pq_run_bounded ...) || ping_rc=$?` —— 命令替换在**子 shell**
+# 里执行, 函数里对 `_PQ_RUN_INFRA` 的赋值随子 shell 一起消失; 调用方读到的永远是模块级
+# 那个空串, 于是"基础设施失败"这一支是**死代码**, mktemp 失败会被报成"xray tls ping 失败"
+# (排障方向直接跑偏 —— 这正是当初引入该标志要解决的问题, 却因为通道选错而没生效)。
+# 现改为**标志文件**: 跨子 shell 可见, 且只有一个写入点、一个读取点、一个清理点。
+# 位置优先 `$STATE_DIR`(部署目录, root 拥有), 退化到 `${TMPDIR:-/tmp}`; 名字带 `$$`
+# (bash 的子 shell 不改变 `$$`, 故父子同值)。
+# **已声明的残局**: 若连一个 0 字节标记都写不下去(满盘/只读), 调用方仍只能拿到 rc=125
+# 并报通用文案 —— 此时两个诊断都不准确, 但不会做出错误的状态变更(该分支只影响文案与返回码)。
+_pq_infra_flag_file() {
+    printf '%s' "${STATE_DIR:-${TMPDIR:-/tmp}}/.xray-deploy-pq-infra.$$"
+}
+# 进入时清残留(上一次调用的失败不得污染这一次)
+_pq_infra_clear() { rm -f "$(_pq_infra_flag_file)" 2>/dev/null; }
+# 置位(唯一写入点)
+_pq_infra_mark() { : > "$(_pq_infra_flag_file)" 2>/dev/null || true; }
+# 调用方判据(唯一读取点)
+_pq_infra_failed() { [ -e "$(_pq_infra_flag_file)" ]; }
 
 # ---------------------------------------------------------------------------
 # 有界执行: 优先用 coreutils/busybox 的 timeout; 缺失时用"后台 + 看门狗"兜底。
@@ -24,32 +41,40 @@ _PQ_RUN_INFRA=""
 #
 # **基础设施失败走独立通道, 不靠返回码**(2026-09-21 复审 P3): mktemp 失败时旧实现返回 125
 # 让调用方据此报"无法创建临时文件", 但被包裹的命令自身返回 125 时同样命中 —— 一个真实的
-# xray 失败会被误报成磁盘问题, 排障方向直接跑偏。改为: 基础设施失败置全局 _PQ_RUN_INFRA=1
+# xray 失败会被误报成磁盘问题, 排障方向直接跑偏。改为: 基础设施失败**置标志**
 # (并仍返回 125 以示"这不是命令的正常结果"), 调用方**查标志**而不是比 125。
 # 每次进入都先清标志, 避免上一次调用的残值污染这一次。
+# **标志的载体是文件, 不是 shell 变量**(2026-09-22 九轮 OCR #36): 上游调用点全部写成
+# `out=$(_pq_run_bounded ...)`, 命令替换的子 shell 会把变量赋值丢掉 —— 变量形态的标志
+# 在真实调用路径上**永远读不到**(详见 _pq_infra_flag_file 上方说明)。
 # ---------------------------------------------------------------------------
 _pq_run_bounded() {
     local secs="$1"; shift
-    _PQ_RUN_INFRA=""
+    _pq_infra_clear
     if command -v timeout >/dev/null 2>&1; then
         # -k <grace>: 先 TERM, grace 秒后 KILL。**没有 -k 时 timeout 并不"有界"** —— 子进程
         # 忽略/延迟处理 TERM 时它会一直等到对方自己退出(实测: 忽略 TERM 的子进程让
         # `timeout 1` 实际耗时 47s), 于是"有界执行"在最需要它的场景下失效。
-        # busybox 的 timeout 不支持 -k, 故先探测再用, 不支持则退回单参数形式。
+        # busybox 的 timeout 不支持 -k, 故先探测再用; 不支持则**落到下面的 setsid 看门狗路径**。
         # 探测必须用**宽松**的超时: 0.1s 在负载高的机器上连 `true` 都跑不完, timeout 会
         # 合法地返回 124, 于是我们误判"不支持 -k"并退回无 -k 形式 —— 恰好在最需要它的
         # 机器上丢掉有界保护。这里只问"这个 timeout 认不认 -k", 不问"机器快不快"。
+        # **不支持 -k 时不退回"没有硬杀"的 `timeout "$secs"`**(2026-09-22 十轮 P2)。
+        # 那样写等于在最需要兜底的机器(BusyBox 版本较旧)上把"有界"降级成"等对方自己退出" ——
+        # 而下面基于 setsid + 看门狗的兜底路径本来就为这种情况存在, 且它是真硬杀(-9)。
+        # 宁可走一条更啰嗦但确实有界的路, 也不要留一条名义上有界、实际会被忽略 TERM 的子进程
+        # 拖到天荒地老的 fast path。
         if timeout -k 1 5 true >/dev/null 2>&1; then
             timeout -k 2 "$secs" "$@"
-        else
-            timeout "$secs" "$@"
+            return $?
         fi
-        return $?
     fi
+    # 走到这里有两种原因: 机器上没有 timeout, 或者有但不支持 -k(旧 busybox)。两条都需要
+    # 真硬杀, 故共用下面的看门狗 —— 它的 kill -9 是不依赖 timeout 能力的。
     local tmp rc
     # mktemp 失败必须与"被包裹的命令失败"区分开(125): 否则调用方只会报
     # "xray tls ping 失败", 真正的原因(无法建临时文件)被掩盖, 排障时白绕一圈。
-    tmp=$(mktemp) || { _PQ_RUN_INFRA=1; _warn "无法创建临时文件(磁盘满/只读?), 无法有界执行"; return 125; }
+    tmp=$(mktemp) || { _pq_infra_mark; _warn "无法创建临时文件(磁盘满/只读?), 无法有界执行"; return 125; }
     # 放进独立进程组再后台执行: 被包裹的是 env + xray, 若 env 未 exec(部分精简
     # busybox)或命令自身 fork 子进程, 只 kill 直接子进程会留下孙进程继续占用资源。
     # **进程组隔离必须用 setsid --wait。**裸 `setsid cmd &` 不可用** —— setsid 只在自身不是
@@ -144,10 +169,12 @@ _detect_reality_pq() {
     # 故统一走 _pq_run_bounded; 退出码也要看 —— 失败时可能仍有半截 stdout, 不能当成可达。
     ping_out=$(_pq_run_bounded 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" tls ping "$target" 2>/dev/null) || ping_rc=$?
 
-    if [ -n "${_PQ_RUN_INFRA:-}" ]; then
+    if _pq_infra_failed; then
         # 判据是**标志**而不是 125: xray 自己返回 125 时同样会命中 rc==125, 那会被误报成
         # 磁盘问题(2026-09-21 复审 P3)。标志由 _pq_run_bounded 只在"有界执行根本没起来"
         # (mktemp 失败)时置位, 与命令自身的返回码无关。
+        # **必须查标志文件而不是变量**: 上面那行是命令替换(子 shell), 变量形态的标志读不到
+        # (2026-09-22 九轮 OCR #36 —— 旧写法使这一支成为死代码)。
         PQ_REASON="无法创建临时文件(磁盘满/只读?), 未能执行 tls ping"
         _warn "$PQ_REASON"        # 与其它失败分支一致: 两个调用方都只看返回码, 不读 PQ_REASON
         return 1
@@ -186,8 +213,8 @@ _detect_reality_pq() {
     _info "目标支持后量子(证书长度 ${length} > 3500),生成 ML-DSA-65 密钥对..."
     local mldsa_out mldsa_rc=0
     mldsa_out=$(_pq_run_bounded 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" mldsa65 2>/dev/null) || mldsa_rc=$?
-    if [ -n "${_PQ_RUN_INFRA:-}" ]; then
-        # 与 tls ping 侧同一口径: 查标志而不是比 125(见 _pq_run_bounded 的说明)。
+    if _pq_infra_failed; then
+        # 与 tls ping 侧同一口径: 查标志而不是比 125, 且必须经**文件**通道(见 #36)。
         PQ_REASON="无法创建临时文件(磁盘满/只读?), 未能执行 mldsa65"
         _warn "$PQ_REASON"
         return 1

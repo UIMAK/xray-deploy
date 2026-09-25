@@ -89,21 +89,96 @@ _logrotate_enabled_state() {
 
 # ---------------------------------------------------------------------------
 # 从 state 生成并写入 /etc/logrotate.d/xray-deploy
-# 返回 0 仅当配置文件确实写成; 任一步失败返回 1 并清掉半截文件。
+# 返回 0 仅当配置文件确实写成; 任一步失败返回 1。
 #
-# 为什么不用 _atomic_write_json 那样的 "tmp -> mv" 原子替换:
-#   tmp 必须与目标同目录才能保证 rename 原子, 而 /etc/logrotate.d 是 logrotate 的
-#   include 目录 —— 遗留的 xray-deploy.XXXXXX 会被一并解析, 与正式文件形成
-#   "duplicate log entry for .../access.log" 错误, 导致我们的日志**永久**不再轮换
-#   (临时文件后缀不在 logrotate 的 tabooext 白名单里)。跨目录 mv 又不是原子操作。
-#   而这里非原子的真实代价极小: logrotate 每天跑一次, 撞上毫秒级半写窗口时只是本次
-#   跳过并报错, 下次即恢复; 与 config.json 半截会让 xray 起不来完全不是一个量级。
-#   故取"直写 + 失败即删半截文件 + 严格传播失败", 不引入 include 目录里的临时文件。
+# **"失败时必须保住上一版可用配置"是 2026-09-22 九轮(OCR #32) 补的硬约束。**
+# 旧实现在写入失败/回读不一致时 `rm -f "$LOGROTATE_CONF"` —— 出发点是"半截配置比没有更糟"
+# (非空但解析失败会让 logrotate 拒绝整份文件), 但它连**原本那份好的**一起销毁了:
+# 一次 ENOSPC 就让轮换永久停摆, 而参数菜单的失败文案还告诉用户"轮换仍按旧参数执行"。
+# 现在的顺序: 先把上一版完整内容读到内存 → 写新版 → 回读比对 → 不一致则把上一版写回去。
+# 只有"上一版本就不存在"时才真的删文件(那时候删掉半截文件确实比留着更好)。
 #
-# 渲染与写入分离(复审 4): 配置内容由 _logrotate_render_config 产出, 写入与
+# 为什么不用"临时文件 + mv"这个更常见的原子写法(实测过, 见 CLAUDE.md 同名条目):
+#   · tmp 必须与目标同目录才能保证 rename 原子, 而 `/etc/logrotate.d` 是 logrotate 的
+#     include 目录 —— **实测**: 子目录会被 `Ignoring <name> because it's not a regular
+#     file.` 跳过(不递归), 而 `*.new` 会被 tabooext 跳过。两条路都能"不被解析", 但
+#     **同目录 = 同文件系统**并不由我们控制(`/etc` 常是独立挂载), 跨 fs 的 `mv` 退化成
+#     拷贝+unlink, 不是原子的, 反而更糟。
+#   · 而这里的非原子窗口代价极小: logrotate 每天跑一次, 撞上毫秒级半写窗口只是本次报错
+#     跳过, 下次即恢复 —— 与"config.json 半截会让 xray 起不来"完全不是一个量级。
+# 故保留"直写 + 回读比对 + 失败还原上一版"这一形态。
+#
+# 渲染与写入分离(复审 4): 配置内容由 `_logrotate_render_config` 产出, 写入与
 # "是否已同步"判定复用同一份渲染 —— 否则比对逻辑会与生成逻辑各自演化
 # (同一项目里 GEO_RULE_REF_JQ 用同一判据供统计与过滤复用, 同一个道理)。
 # ---------------------------------------------------------------------------
+_logrotate_write_config() {
+    local content
+    content=$(_logrotate_render_config) || {
+        _error "生成 logrotate 配置内容失败"
+        return 1
+    }
+    if ! mkdir -p /etc/logrotate.d; then
+        _error "无法创建 /etc/logrotate.d, logrotate 配置未写入"
+        return 1
+    fi
+    # 上一版完整内容(可能为空 = 本次是新建)。**必须在写之前读**, 写失败后再读就只剩半截。
+    # **读失败必须中止, 不能降级成"旧配置为空"**(2026-09-22 十轮 P2)。旧写法 `|| prev=""`
+    # 把读取失败(权限/IO/文件被删)静默变成空串, 而 had_prev 仍记 1; 于是后面只要写新配置
+    # 失败, `_logrotate_restore_prev` 就会拿这个空串去"还原上一版", 把**原本可用的配置写成
+    # 空文件** —— 正是这条路径本身要防的事(九轮 #32)。前提是"文件存在": 存在却读不出来,
+    # 任何一种原因都不等于"没有旧配置", 故中止比猜安全。
+    local prev="" had_prev=0
+    if [ -f "$LOGROTATE_CONF" ]; then
+        if ! prev=$(cat "$LOGROTATE_CONF" 2>/dev/null); then
+            _error "无法读取现有 logrotate 配置, 为免破坏它已取消本次修改: $LOGROTATE_CONF"
+            return 1
+        fi
+        had_prev=1
+    fi
+    # 重定向失败(只读 fs / 磁盘满 / 目录缺失)必须显式判定 —— 裸 `cat > f` 之后若紧跟
+    # `chmod ... || true`, 函数返回码会被洗成 0, 调用方据此把 state 置为"已启用"却没有
+    # 配置文件, 形成 state/实际分裂(2026-09-03 PR #27 复审 P1)。
+    if ! printf '%s\n' "$content" > "$LOGROTATE_CONF"; then
+        _error "写入 logrotate 配置失败(只读文件系统/磁盘空间?): $LOGROTATE_CONF"
+        _logrotate_restore_prev "$prev" "$had_prev"
+        return 1
+    fi
+    # 磁盘满时写入可能返回 0 却只落地 0 字节**或被截断**; 空配置对 logrotate 无意义,
+    # 截断配置更糟 —— 它是"非空但解析失败", logrotate 会拒绝整份文件,
+    # 而本函数却返回 0、state 记成 on、状态页显示健康。故回读比对, 不一致一律视为失败。
+    local landed
+    landed=$(cat "$LOGROTATE_CONF" 2>/dev/null)
+    if [ "$landed" != "$content" ]; then
+        _error "logrotate 配置写入不完整(磁盘空间?), 正在还原上一版配置"
+        _logrotate_restore_prev "$prev" "$had_prev"
+        return 1
+    fi
+    # R38(M14): umask 077 会让配置生成为 0600; logrotate 读它时不受影响(root 运行),
+    # 但系统集成文件按惯例给 644, 避免与其他工具/审计脚本产生困惑。
+    # 权限不对不影响 logrotate 工作(它以 root 读), 故只告警不判失败 —— 文件已经写成,
+    # 因权限而回滚会把"轮换已生效"这个用户真正要的结果丢掉。
+    chmod 644 "$LOGROTATE_CONF" 2>/dev/null || \
+        _warn "logrotate 配置权限设置失败(不影响轮换): $LOGROTATE_CONF"
+    return 0
+}
+
+# 写失败后的还原: 有上一版 => 写回去; 没有 => 删掉半截文件(那时"没有"确实优于"半截")。
+# 还原失败必须**明说** —— 否则用户以为轮换照旧, 实际上一份都没有了。
+_logrotate_restore_prev() {
+    local prev="$1" had_prev="$2"
+    if [ "$had_prev" != "1" ]; then
+        rm -f "$LOGROTATE_CONF" 2>/dev/null
+        return 0
+    fi
+    if printf '%s\n' "$prev" > "$LOGROTATE_CONF" 2>/dev/null; then
+        _warn "已还原上一版 logrotate 配置(参数变更未生效, 轮换仍按旧参数执行)"
+        chmod 644 "$LOGROTATE_CONF" 2>/dev/null || true
+        return 0
+    fi
+    _error "还原上一版 logrotate 配置失败: $LOGROTATE_CONF 可能不可用, 请手动检查"
+    return 1
+}
 
 # 渲染应有的配置内容到 stdout(参数校验与生成的唯一来源)
 _logrotate_render_config() {
@@ -165,43 +240,6 @@ _logrotate_config_in_sync() {
     want=$(_logrotate_render_config) || return 1
     got=$(cat "$LOGROTATE_CONF" 2>/dev/null) || return 1
     [ "$want" = "$got" ]
-}
-
-_logrotate_write_config() {
-    local content
-    content=$(_logrotate_render_config) || {
-        _error "生成 logrotate 配置内容失败"
-        return 1
-    }
-    if ! mkdir -p /etc/logrotate.d; then
-        _error "无法创建 /etc/logrotate.d, logrotate 配置未写入"
-        return 1
-    fi
-    # 重定向失败(只读 fs / 磁盘满 / 目录缺失)必须显式判定 —— 裸 `cat > f` 之后若紧跟
-    # `chmod ... || true`, 函数返回码会被洗成 0, 调用方据此把 state 置为"已启用"却没有
-    # 配置文件, 形成 state/实际分裂(2026-09-03 PR #27 复审 P1)。
-    if ! printf '%s\n' "$content" > "$LOGROTATE_CONF"; then
-        _error "写入 logrotate 配置失败(只读文件系统/磁盘空间?): $LOGROTATE_CONF"
-        rm -f "$LOGROTATE_CONF" 2>/dev/null
-        return 1
-    fi
-    # 磁盘满时写入可能返回 0 却只落地 0 字节**或被截断**; 空配置对 logrotate 无意义,
-    # 截断配置更糟 —— 它是"非空但解析失败", logrotate 会拒绝整份文件(轮换永久失效),
-    # 而本函数却返回 0、state 记成 on、状态页显示健康。故回读比对, 不一致一律视为失败。
-    local landed
-    landed=$(cat "$LOGROTATE_CONF" 2>/dev/null)
-    if [ "$landed" != "$content" ]; then
-        _error "logrotate 配置写入不完整(磁盘空间?), 已删除: $LOGROTATE_CONF"
-        rm -f "$LOGROTATE_CONF" 2>/dev/null
-        return 1
-    fi
-    # R38(M14): umask 077 会让配置生成为 0600; logrotate 读它时不受影响(root 运行),
-    # 但系统集成文件按惯例给 644, 避免与其他工具/审计脚本产生困惑。
-    # 权限不对不影响 logrotate 工作(它以 root 读), 故只告警不判失败 —— 文件已经写成,
-    # 因权限而回滚会把"轮换已生效"这个用户真正要的结果丢掉。
-    chmod 644 "$LOGROTATE_CONF" 2>/dev/null || \
-        _warn "logrotate 配置权限设置失败(不影响轮换): $LOGROTATE_CONF"
-    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -339,7 +377,19 @@ _logrotate_status() {
                 echo -e "  ${SKYBLUE}(在 [1] 里重新启用即可重写配置)${NC}"
             fi
             ;;
-        off) echo -e "  状态: ${RED}off${NC}" ;;
+        off)
+            # **与 `on` 分支对称**(2026-09-22 九轮 OCR #33): `off` + 配置文件存在同样是
+            # 本模块**自己生产**的残局 —— `_logrotate_enable` 在"文件写好但 state 写失败"时
+            # 返回 2(它刻意不回滚文件), 于是 state 停在 off 而轮换其实在跑。
+            # 旧实现只打一个裸 `off`, 用户据此以为日志不轮换、磁盘却在被慢慢撑满;
+            # 而且参数菜单在 enabled != on 时会**跳过**配置更新, 这个不一致会一直留着。
+            if [ -f "$LOGROTATE_CONF" ]; then
+                echo -e "  状态: ${RED}off${NC} (${YELLOW}但轮换配置仍存在, 实际生效中${NC})"
+                echo -e "  ${SKYBLUE}(状态记录与实际不一致: 按一次 [1] 即可把记录修正为「已启用」与现状一致)${NC}"
+            else
+                echo -e "  状态: ${RED}off${NC}"
+            fi
+            ;;
         *)
             if [ -f "$LOGROTATE_CONF" ]; then
                 echo -e "  状态: ${YELLOW}未记录(但轮换配置已存在, 实际生效中)${NC}"

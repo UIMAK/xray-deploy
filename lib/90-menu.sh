@@ -110,15 +110,35 @@ _has_reality_nodes() {
 # 主菜单
 # ---------------------------------------------------------------------------
 _main_menu() {
-    # 启动时: 自动补 tag + 自动采纳孤儿入站 + 恢复中断的端口事务 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
-    # 后三个用 declare -F 守卫: 混装版本(90-menu 已更新而 20/30/50-nodes 未更新)时静默跳过
-    _auto_tag_tagless_inbounds
-    _auto_adopt_orphans
-    # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
-    if declare -F _port_txn_recover >/dev/null 2>&1; then _port_txn_recover; fi
-    if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
-    if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
-    _normalize_config_format
+    # 启动时: 收敛中断的 reset + 自动补 tag + 自动采纳孤儿入站 + 恢复中断的端口事务 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
+    # 各恢复/迁移步骤都用 declare -F 守卫: 混装版本(模块未同步更新)时静默跳过。
+    # reset 恢复放在最前: 半截 reset 的 live 状态可能是"config 空/缺 + nodes 空 + 快照藏着
+    # 旧 metadata", 先收敛再让 adopt/normalize 基于稳定状态工作。
+    RESET_RECOVERY_FAILED=0
+    local reset_rc=0
+    if declare -F _reset_config_recover >/dev/null 2>&1; then
+        _reset_config_recover || reset_rc=$?
+    fi
+    if [ "$reset_rc" -ne 0 ]; then
+        RESET_RECOVERY_FAILED=1
+        _error "reset 事务未收敛(账本/快照已保留): 已跳过自动迁移/规范化, 并阻止配置修改类操作; 请处理后重启脚本"
+    fi
+    if [ "$RESET_RECOVERY_FAILED" -eq 0 ]; then
+        _auto_tag_tagless_inbounds
+        _auto_adopt_orphans
+        # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
+        if declare -F _port_txn_recover >/dev/null 2>&1; then _port_txn_recover; fi
+    fi
+    # 核心切换的崩溃恢复(十一轮 P1-②): 进程在"二进制已换 / unit 已重写"之后被杀(断电/OOM/
+    # kill -9)时没有任何函数会被调用, 只能靠启动期按 state/coretxn.json 收敛。
+    # 放在 config 相关操作之前 —— 它可能重启服务, 先让服务回到已知状态再谈配置。
+    # 它只动二进制/unit, 不写 config, 故不受未收敛 reset 的门禁影响。
+    if declare -F _xray_core_txn_recover >/dev/null 2>&1; then _xray_core_txn_recover; fi
+    if [ "$RESET_RECOVERY_FAILED" -eq 0 ]; then
+        if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
+        if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
+        _normalize_config_format
+    fi
     local choice
 
     while true; do
@@ -221,10 +241,15 @@ _view_status() {
     local st; st=$(_manage_xray status 2>/dev/null)
     echo -e "  Xray: $([ "$st" = "running" ] && echo "${GREEN}运行中${NC}" || echo "${RED}已停止${NC}")"
     if [ -x "$XRAY_BIN" ]; then
-        local ver=""
+        local ver="" ch
         ver=$(_xray_cached_version 2>/dev/null)
         [ -z "$ver" ] && ver="未知"
-        echo -e "  版本: $([ "$ver" = "未知" ] && echo "$ver" || echo "v${ver}")  通道: $(_state_get channel 2>/dev/null)"
+        # 通道名来自 state 文件(可被本地写坏/篡改), 且会进 `echo -e` —— **必须与
+        # `_print_status_bar` 同一口径净化**(2026-09-22 九轮 OCR #40)。同一个键在两个读点
+        # 一处净化一处不净化, 是项目反复踩过的"同一条件各调用点各自解释"形状; 未净化的那个
+        # 会把 ANSI/控制序列原样打给管理员终端。
+        ch=$(_sanitize_token "$(_state_get channel 2>/dev/null)") || ch="?"
+        echo -e "  版本: $([ "$ver" = "未知" ] && echo "$ver" || echo "v${ver}")  通道: ${ch}"
     fi
     echo -e "  节点数: $(_node_count)"
     case "$INIT_SYSTEM" in
@@ -595,6 +620,9 @@ _uninstall_menu() {
 # ---------------------------------------------------------------------------
 # 重置 config.json 为默认(含 routing 规则, 清空节点); 保留 Xray 二进制
 # ---------------------------------------------------------------------------
+# 破坏性部分必须整体位于 config lock 内: backup、hop 清理、config 替换、metadata 清理和
+# restart 之间不能让普通节点事务插入, 否则并发创建的节点会被 reset 在 rm config/nodes 时抹掉。
+# 提问留在锁外, 避免用户思考时长期占住配置锁; wrapper 只负责前置检查/确认和取锁。
 _reset_config() {
     echo
     # F10: 重建默认配置依赖 jq —— 先删后建, jq 缺失会留下"无 config + xray 起不来"的残局,
@@ -602,42 +630,394 @@ _reset_config() {
     if ! command -v jq >/dev/null 2>&1; then
         _error "jq 不可用, 无法重建默认配置, 已取消重置"
         _tip "请先安装 jq(主菜单启动时也会自动尝试安装), 再执行重置"
-        return
+        return 1
     fi
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
-        local ncount; ncount=$(_node_count 2>/dev/null)
+        local ncount ans
+        ncount=$(_node_count 2>/dev/null)
         echo -e "  ${YELLOW}当前有 ${ncount} 个节点, 重置将清空所有节点配置${NC}"
         read -rp "  确认清空并重置 config.json? [y/N]: " ans
         case "$ans" in
             y|Y) ;;
-            *) _info "已取消"; return ;;
+            *) _info "已取消"; return 0 ;;
         esac
+    fi
+    # 全站破坏性操作遵循 install → config → core 的锁序, 与 uninstall 相同。
+    # 仅取 config lock 会让 uninstall 在 install+core 锁内删除部署树, 把 config fd 拆成
+    # deleted inode 后继续写 metadata/restart; 外层 install lock 先把两条破坏性路径串起来。
+    if declare -F _with_deploy_install_lock >/dev/null 2>&1; then
+        _with_deploy_install_lock _with_config_lock _reset_config_locked
+    else
+        # 混装旧 lib 的兼容降级: 至少保留原 config 锁保护, 不退回裸执行。
+        _with_config_lock _reset_config_locked
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# reset 的崩溃恢复(二十轮 P1-3)。
+#
+# reset 是"备份 → 移走 metadata/clash → 删 config → 重建"的多步事务, 进程被 SIGKILL/OOM/
+# 掉电杀死时没有任何函数会被调用。故与 coretxn 同口径: **先把 journal(含 config 副本)
+# 落盘, 再动任何真实状态**; 启动期发现未提交的 journal 就回滚到重置前, 已提交的只清理:
+#   prepared  -> 已开始移动 metadata/clash, 崩溃必须回滚(config 也回到副本)
+#   committed -> 重置后状态已生效, 崩溃只需清理快照与 journal
+# 快照目录用**固定名**: reset 全程持有 install+config 锁, 同一时刻只可能有一个 reset 事务。
+# journal 经 `_atomic_write_json` 提交(内部 fsync 文件 + 父目录), 掉电不会读到半写 phase。
+# ---------------------------------------------------------------------------
+_reset_journal_path() { printf '%s' "$DEPLOY_DIR/.reset-journal.json"; }
+_reset_snapshot_path() { printf '%s' "$DEPLOY_DIR/.reset-snapshot"; }
+
+_reset_journal_quarantine() {   # <journal> <原因>
+    local journal="$1" why="$2" bad i=0
+    bad="${journal}.corrupt"
+    while [ -e "$bad" ]; do i=$((i+1)); bad="${journal}.corrupt.${i}"; done
+    if mv "$journal" "$bad" 2>/dev/null; then
+        _warn "reset 事务日志${why}, 已隔离为 $bad; 快照保留在 $(_reset_snapshot_path) 供人工检查"
+    else
+        _warn "reset 事务日志${why}且隔离失败, 请人工检查: $journal"
+    fi
+    return 1
+}
+
+# 回滚"未提交的 reset"的文件系统侧。config 优先用快照里的副本恢复(不依赖会被后续事务
+# 覆盖的 lastbak); 重置前没有 config 时回滚即恢复"无配置"。
+_reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_config>
+    local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0
+    if [ "$had_config" -eq 1 ]; then
+        if [ -s "$stage/config.json" ]; then
+            if ! _atomic_write_json "$CONFIG_FILE" "$(cat "$stage/config.json" 2>/dev/null)"; then
+                _error "配置回滚失败, 请手动从快照副本恢复: $stage/config.json"
+                ok=1
+            fi
+        else
+            # **不得退回 lastbak**(二十五轮 P2): 它不是 transaction-ID 绑定的恢复源, 可能已被
+            # 后续事务覆盖。自己的副本丢失/为空 ⇒ UNKNOWN, 停止恢复并保留现场供人工处理。
+            _error "事务快照中的配置副本缺失或为空, 无法确认恢复源; 已保留现场供人工检查: $stage/config.json"
+            ok=1
+        fi
+    else
+        rm -f "$CONFIG_FILE" 2>/dev/null || ok=1
+    fi
+    if [ "$nodes_moved" -eq 1 ]; then
+        rm -rf "$NODES_DIR" 2>/dev/null || ok=1
+        if ! mv "$stage/nodes" "$NODES_DIR" 2>/dev/null; then ok=1; fi
+    fi
+    if [ "$clash_moved" -eq 1 ]; then
+        rm -f "$CLASH_YAML" 2>/dev/null || ok=1
+        if ! mv "$stage/clash.yaml" "$CLASH_YAML" 2>/dev/null; then ok=1; fi
+    fi
+    if [ "$ok" -eq 0 ]; then
+        rm -rf "$stage" 2>/dev/null || ok=1
+    fi
+    return "$ok"
+}
+
+# 写 reset 账本(唯一入口): 经 `_atomic_write_json` 落盘(fsync 文件 + 父目录)。
+_reset_journal_write() {   # <journal> <snapshot> <phase> <had_json> <specs_json>
+    local content
+    content=$(jq -nc --arg snap "$2" --arg phase "$3" --argjson had "$4" --argjson specs "$5" \
+        '{snapshot:$snap,phase:$phase,had_config:$had,hop_specs:$specs}') || return 1
+    _atomic_write_json "$1" "$content"
+}
+
+# 回补 journal 里记录的、本次 reset 已删除的端口跳跃规则(只补缺失项, 幂等)。
+# reset 失败回滚与启动恢复共用; 无 hop_specs / 助手缺失时如实返回。
+_reset_config_replay_hop_specs_locked() {   # <journal>
+    local journal="$1" specs=() line
+    [ -f "$journal" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] && specs+=("$line")
+    done <<< "$(jq -r '.hop_specs[]? // empty' "$journal" 2>/dev/null)"
+    [ "${#specs[@]}" -gt 0 ] || return 0
+    if ! declare -F _hy2_restore_hop_rules_checked >/dev/null 2>&1; then
+        _error "缺少 hop 回滚助手, 无法恢复本次删除的端口跳跃规则; 请手动检查 iptables"
+        return 1
+    fi
+    _hy2_restore_hop_rules_checked "${specs[@]}"
+}
+
+# 回滚 + 清 journal(仅回滚完整时才清账本); 不完整则保留 journal 与快照供启动期重试。
+# 顺序: 先回补 iptables(读取 journal), 再还原文件, 最后删账本。
+_reset_config_abort_locked() {   # <stage> <nodes_moved> <clash_moved> <had_config>
+    local stage="$1" journal
+    journal=$(_reset_journal_path)
+    if ! _reset_config_replay_hop_specs_locked "$journal"; then
+        _error "reset 回滚不完整(端口跳跃规则未全部恢复), 快照与事务日志保留供下次启动重试: $stage"
+        return 1
+    fi
+    if ! _reset_config_snapshot_restore "$@"; then
+        _error "reset 回滚不完整, 快照与事务日志保留供下次启动重试: $stage"
+        return 1
+    fi
+    rm -f "$journal" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动收敛"
+    _warn "已回滚, 重置未生效: 配置与节点数据均保持原样"
+    return 0
+}
+
+# 运行态已收敛后的收尾: 先 durable 记 runtime_verified, 再清快照与账本。
+# **runtime_verified 落盘失败时必须中止清理并返回 1**(二十七轮 P1): 它是"清理之前必须先 durable"
+# 的检查点 —— 写不进去就继续 rm 快照/账本, 等于把最后的恢复证据毁掉, 协议自相矛盾。此时磁盘上
+# 仍是 committed 账本, 下次启动会重跑一次(幂等)restart+收敛并重试写入。快照清理失败则保留
+# runtime_verified 账本(下次只需继续清理)。
+_reset_config_commit_finish_locked() {   # <journal> <snapshot> <had_json> <specs_json>
+    if ! _reset_journal_write "$1" "$2" "runtime_verified" "$3" "$4"; then
+        _warn "运行态已收敛, 但 runtime_verified 账本写入失败; 已保留 committed 账本与快照, 下次启动重试收敛"
+        return 1
+    fi
+    if ! rm -rf "$2" 2>/dev/null || [ -e "$2" ]; then
+        _warn "重置已应用且运行态已收敛, 但旧快照清理失败(下次启动会重试): $2"
+        return 0
+    fi
+    rm -f "$1" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动清理"
+    return 0
+}
+
+# 带锁的恢复入口(启动期/菜单调用); `_reset_config_locked` 内部直接调 locked 体。
+# **本入口也必须持 install 锁**(与正常 reset/uninstall 同锁序): 它同样会移动/删除
+# deployment tree 内的文件, 只拿 config 锁会让 `install.sh --update` 与恢复交错。
+# 无账本且无快照时是纯读检查, 不加锁直接返回(避免每次启动都与并发安装互等)。
+_reset_config_recover() {
+    [ -e "$(_reset_journal_path)" ] || [ -e "$(_reset_snapshot_path)" ] || return 0
+    if declare -F _with_deploy_install_lock >/dev/null 2>&1; then
+        _with_deploy_install_lock _with_config_lock _reset_config_recover_locked
+    else
+        _with_config_lock _reset_config_recover_locked
+    fi
+}
+
+_reset_config_recover_locked() {
+    local journal snapshot phase had_config nodes_moved=0 clash_moved=0
+    journal=$(_reset_journal_path)
+    snapshot=$(_reset_snapshot_path)
+    if [ ! -e "$journal" ]; then
+        # journal 是提交顺序里的**最后**一个文件: 没有它, 快照只能是"写 journal 之前"的
+        # 残骸或已提交后的清理残留, 两者都无权威可恢复, 直接清掉。
+        [ -e "$snapshot" ] && rm -rf "$snapshot" 2>/dev/null
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        # 没有 jq 不能把合法 journal 误判成损坏去隔离: 原样保留, 下次带 jq 启动再收敛。
+        _warn "jq 不可用, 无法解析 reset 事务日志, 已跳过恢复(现场保留): $journal"
+        return 1
+    fi
+    if ! jq -e . "$journal" >/dev/null 2>&1; then
+        _reset_journal_quarantine "$journal" "无法解析"
+        return 1
+    fi
+    phase=$(jq -r '.phase // empty' "$journal" 2>/dev/null)
+    if [ "$(jq -r '.snapshot // empty' "$journal" 2>/dev/null)" != "$snapshot" ] || \
+       { [ "$phase" != "prepared" ] && [ "$phase" != "committed" ] && [ "$phase" != "runtime_verified" ]; }; then
+        _reset_journal_quarantine "$journal" "schema 非法"
+        return 1
+    fi
+    # **严格 schema**(二十四轮 P1): 缺字段/类型不对一律 quarantine, 绝不"猜成默认值"。
+    # 旧写法 `if .had_config == true then 1 else 0 end` 会把缺失/null/字符串/数字全部映射成
+    # 0(= 重置前没有 config), 于是恢复可能 `rm -f "$CONFIG_FILE"` —— 用损坏的账本做出破坏性
+    # 决策。对齐 design: had_config 必须是 boolean, hop_specs 必须是 array(可为空)。
+    if ! jq -e '(.had_config | type) == "boolean"' "$journal" >/dev/null 2>&1; then
+        _reset_journal_quarantine "$journal" "had_config 缺失或非布尔"
+        return 1
+    fi
+    had_config=$(jq -r 'if .had_config then 1 else 0 end' "$journal" 2>/dev/null)
+    # hop_specs 是**回放执行**的参数, 必须严格限定形状(防账本被改写后的命令注入), 且必须
+    # 与候选输出同源: `<4|6> -A PREROUTING ... xray-deploy-hy2-hop`。字段缺失/非数组一律
+    # quarantine —— 否则会把"不知道要恢复什么"当成"没有需要恢复的"。
+    if ! jq -e '((.hop_specs | type) == "array") and all(.hop_specs[]; (type == "string") and test("^[46] -A PREROUTING .*xray-deploy-hy2-hop"))' \
+        "$journal" >/dev/null 2>&1; then
+        _reset_journal_quarantine "$journal" "hop_specs 缺失/非数组/形状非法"
+        return 1
+    fi
+    if [ "$phase" = "committed" ] || [ "$phase" = "runtime_verified" ]; then
+        local had_json2 specs_json2
+        had_json2=$(jq -c '.had_config' "$journal" 2>/dev/null) || had_json2="false"
+        specs_json2=$(jq -c '.hop_specs // []' "$journal" 2>/dev/null) || specs_json2="[]"
+        # **运行态收敛必须早于清理/删账本**(二十五轮 P1): 原顺序(删快照→删账本→重启)在
+        # "已提交但未重启"处崩溃时会留下 磁盘新配置 / runtime 旧配置 且无账本可查。
+        if [ "$phase" = "committed" ]; then
+            if [ -x "$XRAY_BIN" ]; then
+                # 存在运行态就必须具备收敛它的能力(二十八轮 P1): 混装版本(旧 20-xray-core 没有
+                # `_restart_xray_verified`)时 **不能**把"无法验证"当成"已验证"而直接写
+                # runtime_verified —— 那样状态机的不变量就被伪证绕过了。fail-closed。
+                if ! declare -F _restart_xray_verified >/dev/null 2>&1; then
+                    _error "缺少 _restart_xray_verified, 无法验证 committed reset 的运行态; 账本与快照保留"
+                    return 1
+                fi
+                if ! _restart_xray_verified; then
+                    _warn "上次 reset 已提交但运行态未收敛(Xray 重启失败), 账本保留待下次启动重试"
+                    return 1
+                fi
+                _info "上次 reset 的运行态已收敛(已按已提交配置重启)"
+            else
+                # 显式判定"没有运行态需要收敛"; 绝不靠 helper 缺失来推导这一分支。
+                _info "未安装 Xray 核心, 本次 reset 无运行态需要收敛"
+            fi
+        fi
+        # 收敛后写 runtime_verified 再清理; 写入或清理失败都保留账本供下次重试。
+        if ! _reset_config_commit_finish_locked "$journal" "$snapshot" "$had_json2" "$specs_json2"; then
+            _warn "reset 收尾未完成(runtime_verified 写入失败), 账本与快照保留: $journal"
+            return 1
+        fi
+        [ "$phase" = "runtime_verified" ] && _info "上次 reset 已收敛, 已清理残留快照"
+        return 0
+    fi
+    # (1) 先回补本次 reset 已删除的端口跳跃规则(幂等; 失败保留现场下次重试)。
+    if ! _reset_config_replay_hop_specs_locked "$journal"; then
+        _warn "上次 reset 崩溃后的回滚不完整(端口跳跃规则), 快照与 journal 保留供重试: $snapshot"
+        return 1
+    fi
+    # (2) 再还原文件。快照目录已不在 ⇒ 文件侧此前已还原(或本次事务根本没移动过), 跳过;
+    #     不能因为"快照里的 nodes 不在"就去回退 lastbak, 那会把已还原的 config 再改一次。
+    if [ -d "$snapshot" ]; then
+        [ -d "$snapshot/nodes" ] && nodes_moved=1
+        [ -f "$snapshot/clash.yaml" ] && clash_moved=1
+        if ! _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"; then
+            _warn "上次 reset 崩溃后的回滚不完整, 快照与 journal 保留供重试: $snapshot"
+            return 1
+        fi
+    fi
+    rm -f "$journal" 2>/dev/null || { _warn "reset journal 清理失败: $journal"; return 1; }
+    _warn "检测到上次 reset 未提交, 已回滚到重置前的配置与节点"
+    return 0
+}
+
+_reset_config_locked() {
+    local had_config=0 nodes_moved=0 clash_moved=0 snapshot journal had_json
+    snapshot=$(_reset_snapshot_path)
+    journal=$(_reset_journal_path)
+    # 先收敛上一次崩溃的 reset(同锁内); 收敛失败(损坏/schema 非法/回滚不完整)时拒绝开新事务。
+    if ! _reset_config_recover_locked; then
+        _error "上次 reset 的残局未能收敛, 已取消本次重置(现场保留供人工检查)"
+        return 1
+    fi
+    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
+        had_config=1
         # 2026-09-12 三审(M1): 重置是清空全部节点数据的破坏性操作, 备份失败(磁盘满/IO 错误)
         # 必须中止 —— 原写法忽略返回值, 备份失败仍 rm config, 用户在无备份情况下丢失全部节点。
         if ! _backup_config; then
             _error "配置备份失败(磁盘空间/IO?), 已取消重置以保护现有数据"
-            return
+            return 1
         fi
     fi
-    # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)
+    if [ "$had_config" -eq 1 ]; then had_json=true; else had_json=false; fi
+    # 恢复源与账本先落盘, 再动任何真实状态(包括 iptables): 崩溃时才有据可回滚。
+    if [ -e "$snapshot" ] || ! mkdir "$snapshot" 2>/dev/null; then
+        _error "无法创建 reset 恢复快照目录, 已取消重置以保护现有数据"
+        return 1
+    fi
+    if [ "$had_config" -eq 1 ]; then
+        # config 副本是比 lastbak 更可靠的恢复源(lastbak 会被后续任何配置事务覆盖)。
+        if ! cp -f "$CONFIG_FILE" "$snapshot/config.json" 2>/dev/null || [ ! -s "$snapshot/config.json" ]; then
+            _error "无法保存重置前的配置快照, 已取消重置以保护现有数据"
+            rm -rf "$snapshot" 2>/dev/null
+            return 1
+        fi
+    fi
+    # hop 清理会删除 iptables 规则, 属于"真实状态改动": 候选 spec 必须先写进账本,
+    # 崩溃时由启动恢复回补(见 `_reset_config_replay_hop_specs_locked`)。
+    # **恢复源获取失败一律 fail-closed**(二十一轮 P1-1): 存在真实 hop 节点却枚举不出 spec 时
+    # 继续清理, 崩溃后会留下"metadata 有 hop / runtime 无 hop"且无账本可回补 —— 恰恰是本轮
+    # 要消灭的分裂。空数组只允许出现在"确实没有会被删除的节点"时(helper 返回 0 且输出为空)。
+    local specs_json="[]" hop_specs="" cand_rc=0
+    if declare -F _hy2_hop_cleanup_candidates >/dev/null 2>&1; then
+        hop_specs=$(_hy2_hop_cleanup_candidates 2>/dev/null) || cand_rc=$?
+        if [ "$cand_rc" -ne 0 ]; then
+            _error "无法枚举待清理的端口跳跃规则(恢复源获取失败), 已取消重置以保护 metadata/runtime 一致性"
+            rm -rf "$snapshot" 2>/dev/null
+            return 1
+        fi
+        if [ -n "$hop_specs" ]; then
+            if ! specs_json=$(printf '%s\n' "$hop_specs" | jq -R -s 'split("\n") | map(select(length > 0)) | unique' 2>/dev/null); then
+                _error "无法序列化端口跳跃恢复源, 已取消重置以保护 metadata/runtime 一致性"
+                rm -rf "$snapshot" 2>/dev/null
+                return 1
+            fi
+        fi
+    elif declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
+        # **混装版本必须 fail-closed**(二十四轮 P1): 有清理能力却拿不到候选枚举助手, 说明
+        # 50-nodes 与 90-menu 版本不一致; 继续清理会在无账本保护下删除 hop runtime。
+        _error "lib 版本不匹配(缺 hop 恢复源枚举助手), 拒绝在无账本保护下执行端口跳跃清理"
+        _tip "请先执行 install.sh --update 同步全部模块, 再重试重置"
+        rm -rf "$snapshot" 2>/dev/null
+        return 1
+    fi
+    if ! _reset_journal_write "$journal" "$snapshot" "prepared" "$had_json" "$specs_json"; then
+        _error "无法写入 reset 事务日志(磁盘空间/权限?), 已取消重置以保护现有数据"
+        rm -rf "$snapshot" 2>/dev/null
+        return 1
+    fi
+    # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)。
+    # 失败时 `_hy2_cleanup_all_hops` 已自行回补已删规则; abort 再按账本回补一次(幂等)并还原文件。
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        _hy2_cleanup_all_hops
-    fi
-    # 删掉 config 让 _init_config_if_empty 重建
-    rm -f "$CONFIG_FILE"
-    _init_config_if_empty
-    # 清空节点元数据 + clash.yaml
-    if [ -d "$NODES_DIR" ]; then
-        rm -f "$NODES_DIR"/*.json 2>/dev/null
-    fi
-    [ -f "$CLASH_YAML" ] && printf 'proxies:\n' > "$CLASH_YAML" 2>/dev/null
-    # 重启 xray(若在跑)
-    if [ -x "$XRAY_BIN" ]; then
-        if _restart_xray_verified; then
-            _tip "xray 已使用新配置重启"
-        else
-            _warn "配置重置后 xray 重启失败, 请检查状态"
+        if ! _hy2_cleanup_all_hops; then
+            _error "端口跳跃规则清理失败, 正在回滚本次重置"
+            _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
+            return 1
         fi
+    fi
+    if [ -d "$NODES_DIR" ]; then
+        # mv 失败时 NODES_DIR 仍是原件, **绝不能**走恢复路径(那里会 rm -rf 它再去搬
+        # 快照里不存在的内容 ⇒ 直接毁掉全部节点元数据)。只有 mv 确认成功才置 nodes_moved。
+        if ! mv "$NODES_DIR" "$snapshot/nodes" 2>/dev/null; then
+            _error "无法准备节点 metadata 恢复快照, 已取消重置以保护现有数据"
+            _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
+            return 1
+        fi
+        nodes_moved=1
+        if ! mkdir -p "$NODES_DIR" 2>/dev/null; then
+            _error "无法重建节点 metadata 目录, 正在恢复重置前的快照"
+            _reset_config_abort_locked "$snapshot" 1 0 "$had_config"
+            return 1
+        fi
+    fi
+    if [ -f "$CLASH_YAML" ]; then
+        if ! mv "$CLASH_YAML" "$snapshot/clash.yaml" 2>/dev/null; then
+            _error "无法准备 clash 恢复快照, 已取消重置以保护现有数据"
+            _reset_config_abort_locked "$snapshot" "$nodes_moved" 0 "$had_config"
+            return 1
+        fi
+        clash_moved=1
+    fi
+    # 删掉 config 让 _init_config_if_empty 重建。
+    # **重建失败必须回滚**(2026-09-22 九轮 OCR #41): 不滚会留下"既没有配置、也没有节点
+    # 元数据"; 回滚源是快照里的 config 副本与 metadata/clash, 失败时保留 journal 供启动重试。
+    if ! rm -f "$CONFIG_FILE" 2>/dev/null; then
+        _error "无法删除旧 config.json, 已取消重置以保护现有数据"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        return 1
+    fi
+    if ! _init_config_if_empty; then
+        _error "重建默认配置失败(只读/磁盘空间/jq 异常?), 正在回滚到重置前的配置"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        return 1
+    fi
+    # 配置已确认重建成功; live metadata 目录已经是空目录, clash 重新落地也必须成功。
+    if [ "$clash_moved" -eq 1 ] && \
+       { ! printf 'proxies:\n' > "$CLASH_YAML" 2>/dev/null || [ ! -s "$CLASH_YAML" ]; }; then
+        _error "清空 clash 派生配置失败, 正在回滚重置"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        return 1
+    fi
+    # COMMIT: phase 先 durable 落盘, 之后**绝不再回滚**; 任一步失败都留 committed journal
+    # 给启动恢复做 cleanup。
+    if ! _reset_journal_write "$journal" "$snapshot" "committed" "$had_json" "$specs_json"; then
+        _error "重置已应用但提交日志写入失败, 正在回滚"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        return 1
+    fi
+    # **运行态收敛必须早于删除账本**(二十五轮 P1): 顺序是
+    # committed → restart+verified → runtime_verified(durable) → 清快照 → 删账本。
+    # 否则在"已提交但未重启"处崩溃会留下 disk 新配置 / runtime 旧配置且无账本可查。
+    if [ -x "$XRAY_BIN" ]; then
+        if ! _restart_xray_verified; then
+            _warn "重置已提交, 但 Xray 重启未通过验证; 事务日志保留, 下次启动会重试收敛"
+            return 1
+        fi
+        _tip "xray 已使用新配置重启"
+    fi
+    if ! _reset_config_commit_finish_locked "$journal" "$snapshot" "$had_json" "$specs_json"; then
+        # 运行态已收敛但账本未能推进: 保留 committed 账本与快照, 下次启动幂等重试。
+        _warn "重置已应用且运行态已收敛, 但事务收尾未完成(runtime_verified 写入失败); 现场已保留"
+        return 1
     fi
     _success "config.json 已重置(含 routing 规则), 节点已清空"
 }
@@ -1367,6 +1747,158 @@ _hy2_obfs_rollback() {
             "$XD_UDP_JQ_UPSERT"
     fi
 }
+# ---------------------------------------------------------------------------
+# Reality 域名切换的**后置步骤失败回滚**(2026-09-22 九轮 OCR #43)。
+#
+# `_mutate_config` 提交之后还有三步: metadata 写入 → 分享链接重建 → clash 派生缓存同步。
+# 旧写法在这三步失败时只 `_error`/`_warn` + `continue`, 于是残局是
+# **config 已是新 SNI, 而 metadata/链接仍是旧的** —— config 是"事实"、metadata 是"声明",
+# 两者分裂后, 节点列表/分享链接/改端口/域名切换全都按 metadata 走, 用户看到的是一个
+# 与服务器实际行为不符的节点。同项目的 `_port_txn`/`_hy2_port_txn` 对同类窗口都是回滚语义。
+#
+# 还原源:
+#   · config —— `_mutate_config` 在改动前自己调过 `_backup_config`, 故
+#     `$BACKUP_DIR/config.json.lastbak` 正是切换前那一份, 直接用 `_restore_config`。
+#   · metadata —— 调用方在提交前把原文读进 `_reality_meta_prev`(节点元数据很小, 不必落盘)。
+# 还原后必须重新确认服务稳定(`_restart_xray_verified`), 因为它才是我方"新配置可用"的判据。
+#
+# 参数: <meta 路径> <metadata 原文>
+# 调用者: **必须**在 `_reality_domain_txn_locked` 的锁域内(见下面"锁域"一节)。
+# ---------------------------------------------------------------------------
+_reality_switch_rollback() {
+    local meta="$1" meta_prev="${2:-}"
+    # 锁域是这里的前提: `_restore_config` 读的是**共享**的 `config.json.lastbak`, 而它由
+    # `_backup_config` 在每次 config 写入前覆盖。锁外调用时, 另一会话只要在"`_mutate_config`
+    # 返回"与"后置步骤失败"之间改过 config, `lastbak` 就已经不是本次事务前的那一份, 回滚会把
+    # 别人**已提交**的改动一起抹掉(十轮 P1-③)。锁域内则保证该快照自始至终属于本次事务。
+    if _restore_config; then
+        _restart_xray_verified >/dev/null 2>&1 || \
+            _warn "配置已还原, 但 xray 未能稳定重启, 请查看状态"
+        if [ -n "$meta_prev" ]; then
+            _atomic_write_json "$meta" "$meta_prev" 2>/dev/null || \
+                _warn "元数据还原失败, 请手动核对: $meta"
+        else
+            _warn "没有元数据快照可还原, 请手动核对: $meta"
+        fi
+        _error "域名切换未完成(后置步骤失败), 配置与元数据已还原到切换前"
+        return 0
+    else
+        _error "后置步骤失败, 且配置回滚失败 —— 请手动核对 $CONFIG_FILE 与 $meta"
+        _tip "可用备份: $BACKUP_DIR/config.json.lastbak"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Reality 域名切换的**整个提交事务**(2026-09-22 十轮 P1-③)。
+#
+# 九轮把"后置失败回滚"做出来了, 但回滚源是**共享的** `config.json.lastbak`, 而该文件只在
+# `_mutate_config` 内部被锁保护 —— 事务的其余部分(metadata 写入、链接重建、失败回滚)都在
+# 锁**外**。于是并发场景: A 的 `_mutate_config` 提交并释放锁 → B 修改 config(覆盖 lastbak)
+# → A 的后置步骤失败 → A 用 **B 的快照**回滚, 把 B 已提交的改动静默抹掉(丢失更新)。
+# 同文件的 `_reality_port_txn` / `_hy2_port_txn` 早已是"整个事务在锁内"的形态 —— 这条路径
+# 漏了同一层保护。
+#
+# 锁域范围: config 提交 → metadata → 链接重建 → 失败回滚, 全部在 `_with_config_lock` 内。
+# **网络步骤(后量子检测)刻意留在锁外** —— 它可能耗时十几秒, 拿它占着全局 config 锁会让
+# 并发的另一会话全部撞 15s 锁超时。锁内只有本地文件写入与一次服务重启确认, 与端口事务同量级。
+# `_mutate_config` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 不会自锁死(与 _reality_port_txn 同款)。
+#
+# 参数: <tag> <meta> <new_sni> <pq_seed> <pq_verify> <rmode> <tunnel_tag>
+#       <new_tunnel_tag> <reality_target> <meta_prev>
+# 返回: 0 = 提交成功;
+#       1 = 失败但已完整回滚(原因已打印, 调用方无需再回滚);
+#       2 = 失败且回滚不完整(原因与人工核对点已打印);
+#       3 = 权威状态已提交, 仅分享链接未更新(见下, **刻意不回滚**)。
+#
+# 为什么"链接重建失败"不与另外四处后置写失败同待遇: 那一刻 config 与 metadata **都**已经是
+# 新 SNI(两者一致), 不一致的只有 metadata 里的 `.share_link` 这个**派生字段**; 而重建失败的
+# 根因是元数据本来就缺必填字段(不是本次改动造成的), 回滚并不会把它变好, 只会让这类节点永远
+# 切不了域名。九轮把"消费返回值并如实告警"作为这条路径的终态, 本轮回滚只针对**权威状态之间**
+# 的分裂, 故保持该口径(行为与改动前逐字一致)。
+# 新分享链接不回传: 锁体在**子 shell** 里跑, 变量带不出去, 而 stdout 又会被 direct 后端
+# 启动路径的 "running" 污染。成功路径直接回读 metadata 的 `.share_link` —— 它就是本事务
+# 刚刚原子写入的那个值, 比另开一条回传通道更少活动部件。
+# ---------------------------------------------------------------------------
+_reality_domain_txn() {
+    _with_config_lock _reality_domain_txn_locked "$@"
+}
+
+_reality_domain_txn_locked() {
+    local tag="$1" meta="$2" new_sni="$3" pq_seed="$4" pq_verify="$5" rmode="$6" \
+          tunnel_tag="$7" new_tunnel_tag="$8" reality_target="$9" meta_prev="${10}"
+    # 提交 config。失败时 `_mutate_config` 已自行回滚并重启, metadata 尚未改动 ⇒ 无需额外回滚。
+    if [ -n "$pq_seed" ]; then
+        _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
+             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
+             --arg newtgt "$reality_target" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+              (.serverNames = [$sni] | .mldsa65Seed = $seed
+               | if $newtgt != "" then .target = $newtgt else . end)
+              | if $tg != "" then
+                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
+                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
+                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
+                       | (if has("address") then .address = $dom else . end))
+                  | .routing.rules |= map(
+                      (if .inboundTag != null and (.inboundTag | type) == "array"
+                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                       else . end)
+                      | if .inboundTag != null and (.inboundTag | type) == "array"
+                           and (.inboundTag | index($new_tg)) != null
+                           and .domain != null
+                        then .domain = [$dom]
+                        else . end)
+                else . end' || return 1
+    else
+        _mutate_config --arg t "$tag" --arg sni "$new_sni" \
+             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
+             --arg newtgt "$reality_target" \
+             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
+              (.serverNames = [$sni] | del(.mldsa65Seed)
+               | if $newtgt != "" then .target = $newtgt else . end)
+              | if $tg != "" then
+                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
+                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
+                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
+                       | (if has("address") then .address = $dom else . end))
+                  | .routing.rules |= map(
+                      (if .inboundTag != null and (.inboundTag | type) == "array"
+                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                       else . end)
+                      | if .inboundTag != null and (.inboundTag | type) == "array"
+                           and (.inboundTag | index($new_tg)) != null
+                           and .domain != null
+                        then .domain = [$dom]
+                        else . end)
+                else . end' || return 1
+    fi
+    # 更新元数据(R42: 同时回填 reality_mode, 使旧节点元数据自描述)
+    if [ -n "$new_tunnel_tag" ]; then
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
+    elif [ "$rmode" = "direct" ]; then
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | del(.tunnel_port) | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
+    else
+        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | .reality_mode=$rm' \
+            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
+                _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
+    fi
+    # R38(M10): 消费 rebuild 返回码 —— SNI 已改, 但链接重建失败时不能写入空/坏链接
+    local newlink=""
+    if ! newlink=$(_rebuild_reality_link "$meta") || [ -z "$newlink" ]; then
+        _warn "域名已切换为 ${new_sni}, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
+        _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
+        return 3
+    fi
+    _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || {
+        _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
+    return 0
+}
+
 _reality_domain_menu() {
     local choice
     _has_reality_nodes || { _warn "暂无 Reality 节点"; _press_any_key; return; }
@@ -1444,77 +1976,33 @@ _reality_domain_menu() {
             new_tunnel_tag=$(_gen_tunnel_tag "$new_sni" "$tunnel_port" "$node_port")
         fi
     fi
-    if [ -n "$pq_seed" ]; then
-        if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
-             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
-             --arg newtgt "$reality_target" \
-             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-              (.serverNames = [$sni] | .mldsa65Seed = $seed
-               | if $newtgt != "" then .target = $newtgt else . end)
-              | if $tg != "" then
-                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
-                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
-                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
-                       | (if has("address") then .address = $dom else . end))
-                  | .routing.rules |= map(
-                      (if .inboundTag != null and (.inboundTag | type) == "array"
-                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
-                       else . end)
-                      | if .inboundTag != null and (.inboundTag | type) == "array"
-                           and (.inboundTag | index($new_tg)) != null
-                           and .domain != null
-                        then .domain = [$dom]
-                        else . end)
-                else . end'; then
-            _error "域名切换失败, 已回滚"; _press_any_key; continue
-        fi
-    else
-        if ! _mutate_config --arg t "$tag" --arg sni "$new_sni" \
-             --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
-             --arg newtgt "$reality_target" \
-             '(.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings) |=
-              (.serverNames = [$sni] | del(.mldsa65Seed)
-               | if $newtgt != "" then .target = $newtgt else . end)
-              | if $tg != "" then
-                  (.inbounds[] | select(.tag == $tg) | .tag) = $new_tg
-                  | (.inbounds[] | select(.tag == $new_tg) | .settings) |=
-                      ((if has("rewriteAddress") then .rewriteAddress = $dom else . end)
-                       | (if has("address") then .address = $dom else . end))
-                  | .routing.rules |= map(
-                      (if .inboundTag != null and (.inboundTag | type) == "array"
-                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
-                       else . end)
-                      | if .inboundTag != null and (.inboundTag | type) == "array"
-                           and (.inboundTag | index($new_tg)) != null
-                           and .domain != null
-                        then .domain = [$dom]
-                        else . end)
-                else . end'; then
-            _error "域名切换失败, 已回滚"; _press_any_key; continue
-        fi
-    fi
+    # 提交前留住 metadata 原文: 后置步骤失败时要连同 config 一起还原(#43)
+    local _reality_meta_prev=""
+    _reality_meta_prev=$(cat "$meta" 2>/dev/null) || _reality_meta_prev=""
 
-    # 更新元数据 + 分享链接(R42: 同时回填 reality_mode, 使旧节点元数据自描述)
-    if [ -n "$new_tunnel_tag" ]; then
-        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
-    elif [ "$rmode" = "direct" ]; then
-        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | del(.tunnel_port) | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
-    else
-        _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | del(.tunnel_tag) | .reality_mode=$rm' \
-            --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || { _error "元数据写入失败"; _press_any_key; continue; }
-    fi
-    # R38(M10): 消费 rebuild 返回码 —— SNI 已改, 但链接重建失败时不能写入空/坏链接
-    local newlink
-    if ! newlink=$(_rebuild_reality_link "$meta") || [ -z "$newlink" ]; then
-        _warn "域名已切换为 ${new_sni}, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
-        _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
+    # config 提交 + metadata + 链接重建 + 失败回滚 —— 一个整体事务, 全程持 config 锁(十轮 P1-③)。
+    # 旧写法只有中间那一次 `_mutate_config` 在锁内, 后置步骤失败时的回滚读的是**共享**的
+    # lastbak, 可能已被并发会话覆盖 ⇒ 回滚会抹掉别人已提交的改动。
+    _reality_domain_txn "$tag" "$meta" "$new_sni" "$pq_seed" "$pq_verify" "$rmode" \
+        "$tunnel_tag" "$new_tunnel_tag" "$reality_target" "$_reality_meta_prev"
+    local txn_rc=$?
+    if [ "$txn_rc" -ne 0 ]; then
+        # 1 = 失败但已完整回滚 / 2 = 回滚不完整 / 3 = 权威状态已提交但链接未更新。
+        # 三种都由事务体自己打印了原因与后续动作, 这里只补一句"改动未完成"的总括。
+        [ "$txn_rc" -eq 2 ] && _tip "本次改动未完成, 请按上方提示人工核对后重试"
         _press_any_key; continue
     fi
-    _meta_update "$meta" '.share_link=$l' --arg l "$newlink" || { _error "分享链接写入失败"; _press_any_key; continue; }
-    # F1: servername(域名)变化需同步 clash 派生缓存, 否则订阅仍指向旧伪装域名
-    _sync_node_clash "$meta"
+    # 成功路径: 分享链接即 metadata 里刚原子提交的那一份
+    local newlink=""
+    newlink=$(jq -r '.share_link // empty' "$meta" 2>/dev/null)
+    [ -n "$newlink" ] || _warn "未能读回新分享链接, 请用 [查看节点] 查看: $meta"
+    # F1: servername(域名)变化需同步 clash 派生缓存, 否则订阅仍指向旧伪装域名。
+    # **返回值必须消费**(2026-09-22 九轮 OCR #45): clash 是可再生的派生缓存, 失败**不回滚**
+    # 权威状态(与 hy2 侧同口径), 但"报成功却仍指向旧域名"必须让用户看见。
+    if ! _sync_node_clash "$meta"; then
+        _warn "clash 派生缓存同步失败, 订阅里的条目仍是旧伪装域名"
+        _tip "可重新执行一次本操作, 或删除后重建该节点以重建 clash 条目"
+    fi
 
     _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"
     if [ "$rmode" = "direct" ]; then
