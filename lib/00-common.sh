@@ -619,7 +619,14 @@ _crontab_read() {
     return 0
 }
 
+# 三十四轮 P2: crontab 是独立于 config.json 的共享状态, 但同样是"读 → 改 → 写"的 RMW ——
+# 两个会话并发执行会最后写入者覆盖前者。这里沿用项目唯一的进程间事务锁(config lock)串行化,
+# 不再新建第二套锁机制。锁可重入: `_auto_migrate_geo_autoupdate_locked` / `_uninstall_xray_locked`
+# 等已在 config lock 内的调用者不会自锁死。只读的 `_crontab_read` 不取锁(写路径在锁内重读)。
 _crontab_replace() {
+    _with_config_lock _crontab_replace_locked "$@"
+}
+_crontab_replace_locked() {
     local marker="$1" newline="${2:-}" cur filtered grc
     [ -n "$marker" ] || return 1
     cur=$(_crontab_read) || return 1
@@ -634,8 +641,11 @@ _crontab_replace() {
         return 1
     fi
     if [ -n "$newline" ]; then
-        filtered="${filtered:+${filtered}
-}${newline}"
+        # 这里**不能**在字符串里换行写 "${filtered:+${filtered}\n}" —— 源码里那会造出一行
+        # 以 `}` 开头的内容行, 会让测试套件的函数体提取器(_fn_body_extract 以行首 `}` 为结束)
+        # 截断函数; 用变量承载换行, 行为不变且函数可被完整提取。
+        local nl=$'\n'
+        filtered="${filtered:+${filtered}${nl}}${newline}"
     fi
     printf '%s\n' "$filtered" | crontab - 2>/dev/null || return 1
     return 0
