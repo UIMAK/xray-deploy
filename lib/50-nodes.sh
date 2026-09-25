@@ -1951,6 +1951,19 @@ _commit_node_txn() {            # <tag> <inbound_json> <meta_json> [<clash_line>
 }
 _commit_node_txn_locked() {
     local tag="$1" inbound="$2" meta_json="$3" clash_line="${4:-}" name="${5:-}"
+    # 锁内占用校验(三十二轮 P1/P2): 锁外的"端口空闲/名称唯一"都是 TOCTOU 检查 —— 并发会话可以
+    # 在两次检查之间提交同名/同 tag 节点。这里在真正写入前再验一次, 冲突则整个事务拒绝。
+    if [ -e "$NODES_DIR/${tag}.json" ] || \
+       jq -e --arg t "$tag" '[.inbounds[]? | select((.tag // "") == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消: ${tag}"
+        return 1
+    fi
+    local meta_name
+    meta_name=$(printf '%s' "$meta_json" | jq -r '.name // empty' 2>/dev/null)
+    if [ -n "$meta_name" ] && ! _ensure_unique_name "$meta_name"; then
+        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${meta_name}"
+        return 1
+    fi
     _commit_inbound "$inbound" || return 1
     if ! _save_node_meta "$tag" "$meta_json"; then
         _error "元数据写入失败, 正在回滚入站: $tag"
@@ -1966,8 +1979,137 @@ _commit_node_txn_locked() {
 _commit_reality_node_txn() {    # <tag> <tunnel_json> <reality_json> <tunnel_tag> <domain> <meta_json> [<clash_line> <name>]
     _with_config_lock _commit_reality_node_txn_locked "$@"
 }
+
+# ---------------------------------------------------------------------------
+# Hysteria2 新增事务(三十二轮 P1): 自签证书的 snapshot/生成作用在**固定共享路径**
+# `$CERT_DIR/$tag` 上, 必须与占用校验、config/metadata 提交在同一把 config lock 内 —— 否则两个
+# 会话同时创建同一端口时, 后失败者的 `_hy2_cert_rollback` 会还原/删除先成功者正在使用的证书。
+# 参数: <tag> <name> <addr> <port> <listen> <auth> <sni> <self_signed> <self_domain>
+#       <congestion> <brutal_up> <brutal_down> <obfs_type> <obfs_pw> <obfs_size> <cert_file> <key_file>
+# 锁内顺序: 占用校验(tag/name) → 证书准备 → 渲染 → config+metadata → 成功后丢弃证书快照。
+# 返回值: 0 成功; 1 失败; 2 失败且证书回滚不完整(调用方应原样上报)。
+# ---------------------------------------------------------------------------
+_commit_hy2_node_txn() {
+    _with_config_lock _commit_hy2_node_txn_locked "$@"
+}
+_commit_hy2_node_txn_locked() {
+    local tag="$1" name="$2" addr="$3" port="$4" listen="$5" auth="$6" sni="$7" self_signed="$8" self_domain="$9"
+    shift 9
+    local congestion="$1" brutal_up="$2" brutal_down="$3" obfs_type="$4" obfs_pw="$5" obfs_size="$6" cert_file="$7" key_file="$8"
+
+    # (1) 锁内占用校验 —— 必须在任何证书操作之前, 冲突直接返回且不碰共享证书路径。
+    if [ -e "$NODES_DIR/${tag}.json" ] || \
+       jq -e --arg t "$tag" '[.inbounds[]? | select((.tag // "") == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消且未生成证书: ${tag}"
+        return 1
+    fi
+    if [ -n "$name" ] && ! _ensure_unique_name "$name"; then
+        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${name}"
+        return 1
+    fi
+
+    # (2) 自签证书准备。所有提问已经结束, 生成失败/取消路径见各自回滚。
+    #     既有证书(可复用)与自定义证书不生成 ⇒ 无快照、不进入回滚路径。
+    local cert_bak="" cert_dirty="false" cert_dir_existed="false" cert_dir="$CERT_DIR/$tag"
+    if [ "$self_signed" = "true" ]; then
+        cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
+        local genrc=0
+        [ -e "$cert_dir" ] && cert_dir_existed="true"
+        if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
+            # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
+            # 复用但如实报告, 不假装证书身份已与输入域名统一。
+            if ! command -v openssl >/dev/null 2>&1; then
+                _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${self_domain})"
+                _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
+            fi
+            _info "已有证书, 复用: $cert_dir"
+        else
+            [ -f "$cert_file" ] && [ -f "$key_file" ] && \
+                _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $cert_dir"
+            cert_bak=$(_hy2_cert_snapshot "$cert_file" "$key_file") || {
+                _error "证书快照失败(无法备份既有证书), 已中止, 未生成新证书"; return 1; }
+            _gen_hy2_cert "$tag" "$self_domain" || genrc=$?
+            if [ "$genrc" != 0 ]; then
+                # 生成失败: 证书已是提交前状态(生成器自带回滚), 丢掉快照即可;
+                # 目录是本次新建且已空 ⇒ 顺手清掉(rc=2 的备份必须保留, 绝不动)
+                if ! _hy2_cert_snapshot_drop "$cert_bak"; then
+                    _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
+                fi
+                [ "$genrc" = 1 ] && [ "$cert_dir_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
+                return 1
+            fi
+            cert_dirty="true"
+        fi
+        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
+        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
+        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
+        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
+        local self_cert_domain
+        self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
+        sni=${self_cert_domain:-$self_domain}
+    fi
+
+    # (3) 渲染参数块与 inbound
+    local brutal_block=""
+    if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
+        brutal_block=""
+        [ -n "$brutal_up" ] && brutal_block="${brutal_block}, \"brutalUp\": \"${brutal_up}\""
+        [ -n "$brutal_down" ] && brutal_block="${brutal_block}, \"brutalDown\": \"${brutal_down}\""
+    fi
+    local obfs_mask=""
+    if [ -n "$obfs_type" ]; then
+        if ! obfs_mask=$(_hy2_obfs_mask_block "$obfs_type" "$obfs_pw" "$obfs_size"); then
+            _error "混淆参数构造失败"
+            _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$cert_dir" || return 2
+            return 1
+        fi
+    fi
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag"
+    R_AUTH="$auth" R_CERT_FILE="$cert_file" R_KEY_FILE="$key_file"
+    R_CONGESTION="$congestion" R_BRUTAL_PARAMS_BLOCK="$brutal_block"
+    R_OBFS_MASK_BLOCK="$obfs_mask"
+    local inbound
+    if ! inbound=$(_render_template "$(_tpl_path hysteria2)"); then
+        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$cert_dir" || return 2
+        return 1
+    fi
+
+    # (4) canonical metadata → config+metadata 原子提交(复用通用事务的锁内复核)。
+    local meta_json
+    meta_json=$(jq -n \
+        --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
+        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
+        --arg auth "$auth" --arg sni "$sni" --arg congestion "$congestion" \
+        --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
+        --arg obfsType "$obfs_type" --arg obfsPw "$obfs_pw" --arg obfsSize "$obfs_size" \
+        --argjson ss "$self_signed" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,obfs_type:$obfsType,obfs_password:$obfsPw,obfs_packet_size:(if $obfsSize == "" then null else $obfsSize end),self_signed:$ss,share_link:""}')
+    if ! _commit_node_txn_locked "$tag" "$inbound" "$meta_json"; then
+        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$cert_dir" || return 2
+        return 1
+    fi
+    # 配置与 metadata 均已提交(节点已引用该证书) ⇒ 回滚点作废; 删不掉要如实报(快照内含旧私钥副本)
+    if [ "$cert_dirty" = "true" ] && ! _hy2_cert_snapshot_drop "$cert_bak"; then
+        _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
+    fi
+    return 0
+}
 _commit_reality_node_txn_locked() {
     local tag="$1" tunnel="$2" reality="$3" tunnel_tag="$4" domain="$5" meta_json="$6" clash_line="${7:-}" name="${8:-}"
+    # 锁内占用校验(三十二轮 P1/P2): tag 与 tunnel_tag 都必须仍空闲; name 也必须仍唯一。
+    if [ -e "$NODES_DIR/${tag}.json" ] || \
+       jq -e --arg t "$tag" --arg tt "$tunnel_tag" \
+          '[.inbounds[]? | select((.tag // "") == $t or (.tag // "") == $tt)] | length > 0' \
+          "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消: ${tag}"
+        return 1
+    fi
+    local meta_name
+    meta_name=$(printf '%s' "$meta_json" | jq -r '.name // empty' 2>/dev/null)
+    if [ -n "$meta_name" ] && ! _ensure_unique_name "$meta_name"; then
+        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${meta_name}"
+        return 1
+    fi
     _commit_reality_inbound "$tunnel" "$reality" "$tunnel_tag" "$domain" || return 1
     if ! _save_node_meta "$tag" "$meta_json"; then
         _error "元数据写入失败, 正在回滚入站与路由: $tag"
@@ -4613,119 +4755,32 @@ _add_hysteria2() {
                 # 规范化(排序 + 去前导零)后回写, 使元数据/clash 与 Xray 看到同一区间
                 obfs_size=$(_hy2_obfs_size_canon "$obfs_size") || { _error "packetSize 规范化失败"; return 1; }
             fi
-            obfs_mask=$(_hy2_obfs_mask_block "$obfs_type" "$obfs_pw" "$obfs_size") || { _error "混淆参数构造失败"; return 1; }
+            # obfs_mask / brutal_block 由提交事务内部构造(三十二轮 P1: 证书与提交同锁)
             ;;
     esac
 
-    # 构建 brutal 参数块(brutal / force-brutal 模式有值)
-    local brutal_block=""
-    if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
-        brutal_block=""
-        [ -n "$brutal_up" ] && brutal_block="${brutal_block}, \"brutalUp\": \"${brutal_up}\""
-        [ -n "$brutal_down" ] && brutal_block="${brutal_block}, \"brutalDown\": \"${brutal_down}\""
-    fi
-
     # ---------------------------------------------------------------------
-    # 自签证书: **所有提问结束后、即将提交配置时才真正生成**(0.17.7)。
-    # 早先是在 TLS 提问阶段就生成, 于是"生成后 ^C / 中途放弃"会留下一个没有任何节点引用的
-    # 证书目录(实测); 提交失败时同样会留下。故: 生成推迟到此, 且**生成本身纳入节点创建
-    # 事务** —— 生成前先对既有 cert/key 做快照, render/commit 失败时按快照还原(快照里没有
-    # 的说明是本次新建, 删掉), 而不是只看"目录是不是新出现的"。
-    # 只看目录会漏掉一类真实残局: 目录已存在(上次删节点选了保留证书)但域名变了 ⇒ 重新生成
-    # 已把旧证书替换掉、_gen_hy2_cert 自己的备份也已删除, 此时"删新建目录"判据为假 ⇒ 既不还原
-    # 也不清理, 留下无节点引用的新证书且旧证书不可恢复。
-    # 既有证书(可复用)与自定义证书不生成 ⇒ 无快照、不进入回滚路径。
+    # 三十二轮 P1: 自签证书的 snapshot/生成作用在固定共享路径 `$CERT_DIR/$tag`, 必须与
+    # 占用校验、config/metadata 提交在**同一把 config lock** 内(见 _commit_hy2_node_txn)——
+    # 否则两个会话同时建同一端口时, 后失败者的证书回滚会还原/删除先成功者正在使用的证书。
+    # 连接地址询问仍在锁外(人工时间不进临界区); 此时尚未生成证书, 取消无任何副作用。
     # ---------------------------------------------------------------------
-    local cert_bak="" cert_dirty="false" cert_dir_existed="false"
-    if [ "$tls_mode" = "selfsigned" ]; then
-        cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
-        local cert_dir="$CERT_DIR/$tag" genrc=0
-        [ -e "$cert_dir" ] && cert_dir_existed="true"
-        if _hy2_cert_reusable "$cert_file" "$key_file" "$self_domain"; then
-            # 已有证书且(有 openssl 时)SAN 覆盖本次域名 ⇒ 沿用。无 openssl 时无从校验 SAN,
-            # 复用但如实报告, 不假装证书身份已与输入域名统一。
-            if ! command -v openssl >/dev/null 2>&1; then
-                _warn "无 openssl, 无法校验已有证书 SAN; 将复用既有证书(证书身份可能非 ${self_domain})"
-                _tip "如需确保证书 SAN 与域名一致, 请安装 openssl 后重新添加该节点"
-            fi
-            _info "已有证书, 复用: $cert_dir"
-        else
-            [ -f "$cert_file" ] && [ -f "$key_file" ] && \
-                _warn "已有证书不可复用(SAN 不含 ${self_domain}, 或 cert/key 不匹配), 重新生成: $cert_dir"
-            cert_bak=$(_hy2_cert_snapshot "$cert_file" "$key_file") || {
-                _error "证书快照失败(无法备份既有证书), 已中止, 未生成新证书"; return 1; }
-            _gen_hy2_cert "$tag" "$self_domain" || genrc=$?
-            if [ "$genrc" != 0 ]; then
-                # 生成失败: 证书已是提交前状态(生成器自带回滚), 丢掉快照即可;
-                # 目录是本次新建且已空 ⇒ 顺手清掉(rc=2 的备份必须保留, 绝不动)
-                if ! _hy2_cert_snapshot_drop "$cert_bak"; then
-                    _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
-                fi
-                [ "$genrc" = 1 ] && [ "$cert_dir_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
-                return 1
-            fi
-            cert_dirty="true"
-        fi
-        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
-        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
-        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
-        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
-        local self_cert_domain
-        self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
-        sni=${self_cert_domain:-$self_domain}
-    fi
-
-    # 渲染模板
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag"
-    R_AUTH="$auth" R_CERT_FILE="$cert_file" R_KEY_FILE="$key_file"
-    R_CONGESTION="$congestion" R_BRUTAL_PARAMS_BLOCK="$brutal_block"
-    R_OBFS_MASK_BLOCK="$obfs_mask"
-    local inbound
-    if ! inbound=$(_render_template "$(_tpl_path hysteria2)"); then
-        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
-        return 1
-    fi
-
-    # 三十一轮 P1-①: 连接地址询问必须在 config 提交**之前**完成 —— 交互期间不能有已提交的入站
-    # (并发的"全部删除"会按 metadata 重枚举后把它清掉)。此处尚未提交, 取消时回滚证书。
     local addr
-    if ! addr=$(_ask_link_addr); then
-        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
-        _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"
-        return 1
-    fi
+    addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未生成证书/未写入 config)"; return 1; }
 
-    # ---------------------------------------------------------------------
-    # 先落 **canonical metadata**, 再由它派生 link 与 clash —— 与修改路径**同一条**逻辑。
-    # 创建路径曾自己内联拼 link(无条件 `&obfs=salamander`), 于是 gecko 节点会被写进一条
-    # 无法表达 packetSize 的链接, 而同一节点走菜单修改时 _rebuild_hy2_link 却拒绝生成
-    # ⇒ 同一状态两个入口两种结果。现统一为:
-    #   metadata(权威) → _rebuild_hy2_link(可表达才生成) / _hy2_clash_line(能完整承载该尺寸)
-    # ---------------------------------------------------------------------
-    local meta_json
-    meta_json=$(jq -n \
-        --arg tag "$tag" --arg name "$name" --arg proto "hysteria2" \
-        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
-        --arg auth "$auth" --arg sni "$sni" --arg congestion "$congestion" \
-        --arg brutalUp "$brutal_up" --arg brutalDown "$brutal_down" \
-        --arg obfsType "$obfs_type" --arg obfsPw "$obfs_pw" --arg obfsSize "$obfs_size" \
-        --argjson ss "$self_signed" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$auth,sni:$sni,congestion:$congestion,brutal_up:$brutalUp,brutal_down:$brutalDown,obfs_type:$obfsType,obfs_password:$obfsPw,obfs_packet_size:(if $obfsSize == "" then null else $obfsSize end),self_signed:$ss,share_link:""}')
-    # 原子提交(config + metadata, metadata 失败回滚入站); 派生链接/YAML 在提交成功后同步。
-    if ! _commit_node_txn "$tag" "$inbound" "$meta_json"; then
-        _hy2_cert_rollback "$cert_dirty" "$cert_bak" "$cert_file" "$key_file" "$CERT_DIR/$tag" || return 2
-        return 1
-    fi
-    # 配置与 metadata 均已提交(节点已引用该证书) ⇒ 回滚点作废; 删不掉要如实报(快照内含旧私钥副本)
-    if [ "$cert_dirty" = "true" ] && ! _hy2_cert_snapshot_drop "$cert_bak"; then
-        _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
-    fi
+    local rc=0
+    _commit_hy2_node_txn "$tag" "$name" "$addr" "$port" "$listen" "$auth" "$sni" "$self_signed" "$self_domain" \
+        "$congestion" "$brutal_up" "$brutal_down" "$obfs_type" "$obfs_pw" "$obfs_size" "$cert_file" "$key_file" || rc=$?
+    if [ "$rc" -ne 0 ]; then return "$rc"; fi
+
     local meta="$NODES_DIR/${tag}.json"
     # 派生状态(链接 + clash)走**唯一入口**(clash 步骤是 upsert, 新建节点会追加条目);
     # 失败只告警, **不**回滚已提交的 config/metadata。
     _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     local link=""
     link=$(jq -r '.share_link // ""' "$meta" 2>/dev/null)
+    # 自签证书的 SNI 在锁内由证书 SAN 决定(子 shell 不传值), 显示时从 metadata 回读
+    sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
 
     _success "节点 [${name}] 创建成功"
     if [ "$self_signed" = "true" ]; then
