@@ -666,13 +666,15 @@ _manage_hysteria() {
                     ;;
                 stop)
                     if [ -f "$HYSTERIA_PID_FILE" ]; then
-                        local dpid
+                        local dpid _hy_st
                         dpid=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
-                        # 只对"身份仍相符且确属本项目的 hysteria(exe 归属)"发信号, 绝不误杀同名
-                        # 的他方进程。`_xd_kill_pid_graceful` 在同一化身内做等待与强杀。
+                        # 身份链闭合(第二轮复审 P1): 复核过的 starttime 必须传进 kill helper,
+                        # 否则 helper 自己重读 starttime, 两次读取之间 PID 可能被复用。
+                        # exe 归属只作附加收窄, 不能替代身份绑定。
+                        _hy_st=$(_xd_pidfile_starttime "$HYSTERIA_PID_FILE")
                         if [ -n "$dpid" ] && _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" \
                            && _hysteria_pid_is_ours "$dpid"; then
-                            _xd_kill_pid_graceful "$dpid" 5
+                            _xd_kill_pid_graceful "$dpid" 5 "$_hy_st"
                         fi
                     fi
                     rm -f "$HYSTERIA_PID_FILE"
@@ -693,7 +695,7 @@ _manage_hysteria() {
 # 父进程(其 exe 不是 hysteria), 无法像 direct 那样直接比 exe; 改为校验**其进程树里确实存在
 # exe == $HYSTERIA_BIN 的进程**, 归属确属本项目才动手。
 _hysteria_kill_stale_supervisor() {
-    local a c
+    local a c st
     # openrc 的 pidfile 由 supervise-daemon 写(纯 PID); 用统一解析器取第一字段, 兼容 direct 的
     # "PID starttime" 形态。
     a=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
@@ -703,8 +705,10 @@ _hysteria_kill_stale_supervisor() {
     case "$c" in
         supervise-daemo*)
             if _hysteria_proc_tree_has_bin "$a"; then
-                # 属主复核后仍要防等待窗口内 PID 复用: 强杀绑定同一进程化身。
-                _xd_kill_pid_graceful "$a" 5
+                # openrc 不记录 starttime(纯 PID pidfile), 故在属主复核**之后立刻**抓一次身份并
+                # 传入 helper, 把"复核→kill"窗口压到最小; 抓不到时 helper 退化为自读(已声明残余)。
+                st=$(_proc_starttime "$a") || st=""
+                _xd_kill_pid_graceful "$a" 5 "$st"
             else
                 _warn "pidfile 指向的 supervise-daemon(pid=$a) 未管理本项目的 hysteria, 不杀(可能是他方服务)"
             fi

@@ -897,15 +897,27 @@ _xd_pid_unchanged() {
 # 读不到身份时**不做**延迟强杀(fail-closed, 与 `_proc_exe_is_strict` 对破坏性操作的口径一致):
 # 退回 `kill -0 + kill -9` 恰好会重建本函数要消除的那个缺陷。此时只发 TERM 并如实告警, 由调用方
 # 按"仍在运行"处理。
-# 用法: _xd_kill_pid_graceful <pid> [grace_seconds]
+#
+# 用法: _xd_kill_pid_graceful <pid> [grace_seconds] [expected_starttime]
+#
+# **expected_starttime 是身份链闭合的关键**(2026-09-26 第二轮复审 P1): 调用方(如 pidfile 的
+# `_xd_pidfile_identity_ok`)复核完身份后, 必须把**那次复核所用的 starttime** 传进来。否则本函数
+# 自己重新读一次 starttime, 两次读取之间 PID 仍可能被复用 ⇒ "复核的是 A 进程、杀的是 B 进程"。
+# 传了 expected 时就只杀"仍是该化身"的进程; 为空时退化为"自己抓一次"(openrc 纯 PID pidfile 等
+# 无记录身份的场景, 属已声明的 best-effort 残余)。
 _xd_kill_pid_graceful() {
-    local pid="${1:-}" grace="${2:-5}" st k=0
+    local pid="${1:-}" grace="${2:-5}" expected_st="${3:-}" st k=0
     # 规范 PID: `kill 0` 是"发给当前进程组"(不是 PID 0), 会误伤整组进程; 前导零/超长一律拒绝。
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
     [ "${#pid}" -le 7 ] || return 1
     # **必须在发 TERM 之前取身份**(2026-09-26 复审 P1): 先 TERM 再读 starttime 时, 原进程可能
     # 已迅速退出并被复用, 读到的是**新进程**的 starttime ⇒ 后面的强杀正好打在新进程上。
     st=$(_proc_starttime "$pid") || st=""
+    if [ -n "$expected_st" ]; then
+        # 身份链闭合: 当前化身必须与调用方复核过的记录一致, 否则一个信号都不发。
+        [ "$st" = "$expected_st" ] || return 0
+        st="$expected_st"
+    fi
     kill "$pid" 2>/dev/null || return 0     # 已退出 => 无需再处理
     if [ -z "$st" ]; then
         _warn "无法确认 PID $pid 的启动时间, 跳过延迟强杀(仅已发送 TERM)"
