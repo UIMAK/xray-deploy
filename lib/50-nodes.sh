@@ -2840,9 +2840,9 @@ _sync_config_check() {
             IFS=',' read -ra nums <<< "$sel"
             for n in "${nums[@]}"; do
                 n=$(echo "$n" | tr -d ' ')
-                [[ "$n" =~ ^[0-9]+$ ]] || continue
-                local idx=$((n-1))
-                [ "$idx" -ge 0 ] && [ "$idx" -lt "${#orphans[@]}" ] && to_remove+=("${orphans[$idx]}")
+                local idx
+                idx=$(_xd_index_from_choice "$n" "${#orphans[@]}") || continue
+                to_remove+=("${orphans[$idx]}")
             done
             [ ${#to_remove[@]} -eq 0 ] && { _warn "无有效选择"; _press_any_key; return; }
             _remove_orphan_inbounds "${to_remove[@]}"
@@ -3018,8 +3018,8 @@ _add_node() {
     echo
     read -rp "  请选择协议: " choice
     [ "$choice" = "0" ] && return
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
-    local idx=$((choice-1))
+    local idx
+    idx=$(_xd_index_from_choice "$choice" "${#PROTOCOLS[@]}") || { _warn "无效选择"; _press_any_key; return; }
     local sel="${PROTOCOLS[$idx]:-}"
     [ -z "$sel" ] && { _warn "无效选择"; _press_any_key; return; }
 
@@ -5306,8 +5306,11 @@ _view_nodes() {
     echo -e "  ${YELLOW}查看某节点分享链接?${NC}"
     read -rp "  输入编号(0 返回): " choice
     [ "$choice" = "0" ] && return
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
-    local idx=$((choice)) n=0
+    # 本函数按显示序号遍历(没有 tags 数组), 故上界是节点总数 count; 复用共享边界解析
+    # 以避免超大编号回绕成负索引而命中别的节点。
+    local idx n=0
+    idx=$(_xd_index_from_choice "$choice" "$count") || { _warn "无效选择"; _press_any_key; return; }
+    idx=$((idx + 1))
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         n=$((n+1))
@@ -5387,8 +5390,9 @@ _delete_node() {
         local del_tags=()
         for n in "${nums[@]}"; do
             n="${n#"${n%%[![:space:]]*}"}"; n="${n%"${n##*[![:space:]]}"}"
-            [[ "$n" =~ ^[0-9]+$ ]] || continue
-            local di=$((n-1)); local dt="${tags[$di]:-}"
+            local di
+            di=$(_xd_index_from_choice "$n" "${#tags[@]}") || continue
+            local dt="${tags[$di]:-}"
             [ -z "$dt" ] && continue
             # 去重
             local dup=0
@@ -5417,8 +5421,9 @@ _delete_node() {
         _press_any_key; return
     fi
 
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
-    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    local idx
+    idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     # 身份绑定(三十一轮 P1-②): 锁外选的 tag 可能已被并发删除/重建 —— 锁内必须复核指纹。
@@ -6137,8 +6142,9 @@ _modify_port() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择: " choice
     [ "$choice" = "0" ] && return
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
-    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    local idx
+    idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local newport=$(_input_port)
@@ -6299,8 +6305,9 @@ _update_listen() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择: " choice
     [ "$choice" = "0" ] && return
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
-    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    local idx
+    idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
@@ -6517,8 +6524,9 @@ _hy2_toggle_hop() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
-    [[ "$choice" =~ ^[0-9]+$ ]] || { _warn "无效选择"; _press_any_key; return; }
-    local idx=$((choice-1)); local tag="${tags[$idx]:-}"
+    local idx
+    idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"

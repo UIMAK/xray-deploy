@@ -665,15 +665,10 @@ _manage_hysteria() {
                     if [ -f "$HYSTERIA_PID_FILE" ]; then
                         local dpid
                         dpid=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
-                        # 只对本项目自己的 hysteria(exe 归属)发信号, 绝不误杀同名的他方进程
+                        # 只对本项目自己的 hysteria(exe 归属)发信号, 绝不误杀同名的他方进程。
+                        # 等待窗口内 PID 被复用时, 强杀必须绑定同一进程化身(starttime)。
                         if _hysteria_pid_is_ours "$dpid"; then
-                            kill "$dpid" 2>/dev/null
-                            local k
-                            for k in 1 2 3 4 5; do
-                                kill -0 "$dpid" 2>/dev/null || break
-                                sleep 1
-                            done
-                            kill -0 "$dpid" 2>/dev/null && kill -9 "$dpid" 2>/dev/null
+                            _xd_kill_pid_graceful "$dpid" 5
                         fi
                     fi
                     rm -f "$HYSTERIA_PID_FILE"
@@ -694,7 +689,7 @@ _manage_hysteria() {
 # 父进程(其 exe 不是 hysteria), 无法像 direct 那样直接比 exe; 改为校验**其进程树里确实存在
 # exe == $HYSTERIA_BIN 的进程**, 归属确属本项目才动手。
 _hysteria_kill_stale_supervisor() {
-    local a c k
+    local a c
     a=$(cat "$HYSTERIA_PID_FILE" 2>/dev/null)
     [[ "$a" =~ ^[0-9]+$ ]] || return 0
     [ -d "/proc/$a" ] || { rm -f "$HYSTERIA_PID_FILE"; return 0; }
@@ -702,12 +697,8 @@ _hysteria_kill_stale_supervisor() {
     case "$c" in
         supervise-daemo*)
             if _hysteria_proc_tree_has_bin "$a"; then
-                kill "$a" 2>/dev/null
-                for k in 1 2 3 4 5; do
-                    kill -0 "$a" 2>/dev/null || break
-                    sleep 1
-                done
-                kill -0 "$a" 2>/dev/null && kill -9 "$a" 2>/dev/null
+                # 属主复核后仍要防等待窗口内 PID 复用: 强杀绑定同一进程化身。
+                _xd_kill_pid_graceful "$a" 5
             else
                 _warn "pidfile 指向的 supervise-daemon(pid=$a) 未管理本项目的 hysteria, 不杀(可能是他方服务)"
             fi

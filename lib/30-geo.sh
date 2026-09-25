@@ -292,6 +292,10 @@ _geo_set_auto_update_cron() {
                 _warn "cron 守护进程未能启动, 自动更新已取消"
                 _tip "请确保系统中有 cron 守护进程, 安装后重试"
                 _state_set geo_cron "off"
+                # **必须显式返回非零**: 否则本函数以 `_state_set` 的成功状态收尾, 调用方
+                # `_geo_set_auto_update on` 会把"已取消"报成"已开启"。实测: 桩化
+                # `_ensure_cron_running` 返回 1 时旧实现 rc=0。
+                return 1
             fi
             ;;
         off)
@@ -431,7 +435,7 @@ _route_preflight() {
 # ---------------------------------------------------------------------------
 _route_rules_stats() {
     if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1; then
-        printf '0 0 0 0'
+        printf '0 0 0 0 0'
         return 1
     fi
     local out
@@ -441,12 +445,31 @@ _route_rules_stats() {
             (\$r | length),
             ([\$r[] | select(${GEO_RULE_REF_JQ})] | length),
             ([\$r[] | select(.inboundTag? != null)] | length),
-            ([\$r[] | select((.ruleTag? // null) == \"${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}\")] | length)
-          ] | @tsv" "$CONFIG_FILE" 2>/dev/null) || { printf '0 0 0 0'; return 1; }
-    [ -n "$out" ] || { printf '0 0 0 0'; return 1; }
+            ([\$r[] | select((.ruleTag? // null) == \"${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}\")] | length),
+            ([\$r[] | select(.inboundTag? != null and (${GEO_RULE_REF_JQ}))] | length)
+          ] | @tsv" "$CONFIG_FILE" 2>/dev/null) || { printf '0 0 0 0 0'; return 1; }
+    [ -n "$out" ] || { printf '0 0 0 0 0'; return 1; }
     # @tsv 用制表符分隔, 转成空格便于调用方 read -r 拆分
     printf '%s' "$out" | tr '\t' ' '
     return 0
+}
+
+# `ruleTag` alone is not proof of private-network protection: hand-edited rules can retain the tag
+# while allowing traffic, omitting CIDRs, duplicating the marker, or sitting after a catch-all.
+_route_private_block_valid() {
+    [ -n "${XRAY_PRIVATE_BLOCK_RULE_JSON:-}" ] || return 1
+    jq -e --arg tag "${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}" \
+        --argjson expected "$XRAY_PRIVATE_BLOCK_RULE_JSON" '
+        ([.routing.rules[]?] ) as $r
+        | [range(0; ($r|length)) as $i
+           | select(($r[$i].ruleTag? // null) == $tag) | $i] as $marks
+        | [range(0; ($r|length)) as $i
+           | select($r[$i].inboundTag? == null and (($r[$i].ruleTag? // null) != $tag)) | $i] as $generic
+        | if ($marks|length) != 1 then false
+          else ($r[$marks[0]] == $expected)
+               and (($generic|length) == 0 or $marks[0] < $generic[0])
+          end
+    ' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -530,11 +553,12 @@ _route_rules_menu() {
         echo
         echo -e "  ${CYAN}【路由规则(小内存优化)】${NC}"
         echo
-        local total=0 geo=0 node=0 mark=0 stats_ok=1
+        local total=0 geo=0 node=0 mark=0 mixed=0 stats_ok=1 private_ok=0
         local stats; stats=$(_route_rules_stats) || stats_ok=0
         # 2026-09-12 三审(L9): stats 失败时不读 —— read 对空输入会把上面初始化的 0 覆盖成空串,
         # 后续 [ "" -eq 0 ] 会打出 bash "integer expression expected" 噪音(条件恒假, 不致命但困惑)。
-        [ "$stats_ok" -eq 1 ] && read -r total geo node mark <<< "$stats"
+        [ "$stats_ok" -eq 1 ] && read -r total geo node mark mixed <<< "$stats"
+        _route_private_block_valid && private_ok=1
         if [ "$stats_ok" -ne 1 ]; then
             _warn "无法读取当前路由规则(Xray 未安装 / 配置缺失 / jq 不可用)"
         else
@@ -545,8 +569,13 @@ _route_rules_menu() {
                 echo -e "  引用 geo:   ${GREEN}0${NC} 条 (不加载 dat)"
             fi
             echo -e "  节点规则:   ${CYAN}${node}${NC} 条 (tunnel 模式 Reality 的防偷跑规则)"
-            if [ "$mark" -gt 0 ]; then
+            if [ "$mixed" -gt 0 ]; then
+                _warn "其中 ${mixed} 条节点定向规则也引用 Geo; 精简时会一并删除以停止 dat 加载"
+            fi
+            if [ "$private_ok" -eq 1 ]; then
                 echo -e "  私网防护:   ${GREEN}已注入字面量 CIDR${NC} (${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private})"
+            elif [ "$mark" -gt 0 ]; then
+                echo -e "  私网防护:   ${RED}规则标记存在但内容、唯一性或顺序无效${NC}"
             else
                 echo -e "  私网防护:   ${CYAN}未注入${NC}"
             fi
@@ -569,8 +598,9 @@ _route_rules_menu() {
             0) return ;;
             1)
                 _route_preflight || { _press_any_key; continue; }
-                # 幂等: 已无 geo 引用且私网规则已在, 直接返回, 不触发 8 秒 verified-restart
-                if [ "$geo" -eq 0 ] && [ "$mark" -gt 0 ]; then
+                # 幂等: 仅在规则内容、唯一性、顺序都有效时跳过; 单有 ruleTag 不能证明
+                # 私网防护仍然生效。
+                if [ "$geo" -eq 0 ] && [ "$private_ok" -eq 1 ]; then
                     _info "已是精简状态(无 geo 引用 + 私网防护已注入), 无需重复操作"
                     _press_any_key; continue
                 fi
@@ -578,7 +608,8 @@ _route_rules_menu() {
                 echo -e "  将执行:"
                 echo -e "    ${CYAN}删除${NC} ${geo} 条引用 geo 数据的规则"
                 echo -e "    ${CYAN}注入${NC} 1 条字面量 CIDR 私网 block 规则(等价 geoip:private, 不加载 dat)"
-                echo -e "    ${CYAN}保留${NC} ${node} 条节点规则(仍在最前) + bittorrent 拦截 + 域名白名单直连"
+                echo -e "    ${CYAN}保留${NC} $((node - mixed)) 条不引用 Geo 的节点定向规则(仍在最前) + 其它非 Geo 规则"
+                [ "$mixed" -gt 0 ] && echo -e "    ${YELLOW}注意${NC} ${mixed} 条同时引用 Geo 的节点定向规则会删除"
                 read -rp "  确认精简? [y/N]: " ans
                 case "$ans" in
                     y|Y) ;;

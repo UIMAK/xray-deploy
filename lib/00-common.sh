@@ -179,22 +179,22 @@ _get_public_ip() {
     local ip url
     # IPv4 多源兜底(curl 优先, wget 兜底)
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ip.sb" "https://4.ipw.cn" "https://ipv4.icanhazip.com"; do
-        ip=$(curl -s4 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && \
+        ip=$(curl -fsS4 --max-time 6 "$url" 2>/dev/null) && [ -n "$ip" ] && \
         [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] && \
-        (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && \
+        (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 )) && \
         echo "$ip" && return 0
     done
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ipv4.icanhazip.com"; do
         # 与 _http_download 同一口径: --timeout 是 GNU 长选项, busybox wget 可能 unrecognized option (H1), 用 -T
         ip=$(wget -q -T 6 -O- "$url" 2>/dev/null) && [ -n "$ip" ] && \
         [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] && \
-        (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && \
+        (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 )) && \
         echo "$ip" && return 0
     done
     # IPv6 兜底 —— **必须校验字面量**(#06)。旧写法只判 `[ -n "$ip" ]`, 源返回错误页/
     # 代理提示时那段文本会被当成服务器地址写进分享链接(实测复现见 implement.md)。
     for url in "https://api64.ipify.org" "https://6.ipw.cn" "https://ipv6.icanhazip.com"; do
-        ip=$(curl -s6 --max-time 6 "$url" 2>/dev/null) && _is_ipv6_literal "$ip" && echo "$ip" && return 0
+        ip=$(curl -fsS6 --max-time 6 "$url" 2>/dev/null) && _is_ipv6_literal "$ip" && echo "$ip" && return 0
     done
     return 1
 }
@@ -264,7 +264,7 @@ _is_ipv6_literal() {
         *"."*)
             tail="${a##*:}"; head="${a%:*}"
             [[ "$tail" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
-            (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) || return 1
+            (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 )) || return 1
             [ "$head" = "$a" ] && return 1     # 纯 IPv4 由 IPv4 分支处理
             a="${head}:0:0"                     # 内嵌 IPv4 占两段, 参与结构校验
             ;;
@@ -335,7 +335,28 @@ _is_listen_loopback() {
 # ---------------------------------------------------------------------------
 _validate_port() {
     local p="$1"
-    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+    # Ports are emitted as JSON numbers by callers. Accept canonical decimal only: leading zeroes
+    # are not valid JSON integers, and unchecked long strings can wrap Bash arithmetic.
+    [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
+    [ "$p" -le 65535 ]
+}
+
+# Convert a one-based menu selection to a zero-based array index without evaluating unchecked
+# input as shell arithmetic. Returns the index on stdout; rejects zero, overflow, and out-of-range.
+_xd_index_from_choice() {
+    local choice="${1:-}" total="${2:-}" zeros n max
+    [[ "$choice" =~ ^[0-9]+$ ]] || return 1
+    [[ "$total" =~ ^[0-9]+$ ]] || return 1
+    zeros="${choice%%[!0]*}"
+    n="${choice#"$zeros"}"
+    [ -n "$n" ] || return 1
+    [ "${#n}" -le 6 ] || return 1
+    [ "${#total}" -le 6 ] || return 1
+    max=$((10#$total))
+    [ "$max" -gt 0 ] || return 1
+    local value=$((10#$n))
+    [ "$value" -ge 1 ] && [ "$value" -le "$max" ] || return 1
+    printf '%s' "$((value - 1))"
 }
 
 # ---------------------------------------------------------------------------
@@ -418,22 +439,34 @@ _yaml_dq() {
 
 # ---------------------------------------------------------------------------
 # 端口占用检测(复用 singbox-lite 思路)
-# 2026-09-13(0.16.2 评审轮) 实测修正: ss 数据行的本机监听在 $4(Local Address:Port),
-# $5 是对端(*:*, 无端口可提取) —— 原写法在装了 ss 的系统上是空扫(永远报未占用);
-# netstat 分支的 $4 本来就正确。两分支统一按本机地址列提取。
+# ss 同时列出 TCP+UDP 时会多一个 Netid 列, Local Address:Port 从 $4 移到 $5。
+# 分别查询每种协议, 保持列布局一致; 空协议表示检查 TCP 与 UDP 两者。
 # ---------------------------------------------------------------------------
 _check_port_occupied() {
     local port="$1" proto="${2:-}"
-    local ss_opts
-    case "$proto" in
-        tcp) ss_opts="-ltn" ;;
-        udp) ss_opts="-lun" ;;
-        *)   ss_opts="-lntu" ;;
-    esac
+    local ss_opts netstat_opts
     if command -v ss >/dev/null 2>&1; then
-        ss ${ss_opts} 2>/dev/null | awk 'NR > 1 {print $4}' | grep -q ":${port}$" && return 0
+        case "$proto" in
+            tcp) ss_opts="-ltn" ;;
+            udp) ss_opts="-lun" ;;
+            *)
+                for ss_opts in -ltn -lun; do
+                    ss $ss_opts 2>/dev/null | awk -v p="$port" 'NR > 1 { a=$4; sub(/^.*:/,"",a); if (a == p) found=1 } END { exit !found }' && return 0
+                done
+                return 1 ;;
+        esac
+        ss $ss_opts 2>/dev/null | awk -v p="$port" 'NR > 1 { a=$4; sub(/^.*:/,"",a); if (a == p) found=1 } END { exit !found }' && return 0
     elif command -v netstat >/dev/null 2>&1; then
-        netstat ${ss_opts} 2>/dev/null | awk '{print $4}' | grep -q ":${port}$" && return 0
+        case "$proto" in
+            tcp) netstat_opts="-lnt" ;;
+            udp) netstat_opts="-lnu" ;;
+            *)
+                for netstat_opts in -lnt -lnu; do
+                    netstat $netstat_opts 2>/dev/null | awk -v p="$port" 'NR > 1 { a=$4; sub(/^.*:/,"",a); if (a == p) found=1 } END { exit !found }' && return 0
+                done
+                return 1 ;;
+        esac
+        netstat $netstat_opts 2>/dev/null | awk -v p="$port" 'NR > 1 { a=$4; sub(/^.*:/,"",a); if (a == p) found=1 } END { exit !found }' && return 0
     fi
     return 1
 }
@@ -829,6 +862,54 @@ _proc_ppid() {
     printf '%s' "$2"
 }
 
+# Read Linux process start time (proc stat field 22) to detect PID reuse across delayed signals.
+_proc_starttime() {
+    local pid="${1:-}" line
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    line="${line##*') '}"
+    local -a fields
+    read -ra fields <<< "$line"
+    [ "${#fields[@]}" -ge 20 ] || return 1
+    printf '%s' "${fields[19]}"
+}
+
+# True while <pid> still refers to the same process incarnation whose start time is <starttime>.
+_xd_pid_unchanged() {
+    local pid="${1:-}" st="${2:-}" now
+    [ -n "$st" ] || return 1
+    now=$(_proc_starttime "$pid") || return 1
+    [ "$now" = "$st" ]
+}
+
+# TERM -> wait -> KILL without ever signaling a recycled PID.
+# A bare `kill -0 <pid>` wait treats a reused PID as "still alive" and then SIGKILLs an unrelated
+# process. When /proc/<pid>/stat is readable we bind both the wait and the forced kill to the
+# original incarnation; if start time is unavailable (hidepid / no procfs) we keep the old
+# kill -0 behaviour rather than refusing to stop anything.
+# 用法: _xd_kill_pid_graceful <pid> [grace_seconds]
+_xd_kill_pid_graceful() {
+    local pid="${1:-}" grace="${2:-5}" st k=0
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    st=$(_proc_starttime "$pid") || st=""
+    kill "$pid" 2>/dev/null || return 0
+    while [ "$k" -lt "$grace" ]; do
+        if [ -n "$st" ]; then
+            _xd_pid_unchanged "$pid" "$st" || return 0
+        else
+            kill -0 "$pid" 2>/dev/null || return 0
+        fi
+        sleep 1
+        k=$((k+1))
+    done
+    if [ -n "$st" ]; then
+        _xd_pid_unchanged "$pid" "$st" && kill -9 "$pid" 2>/dev/null
+    else
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    fi
+    return 0
+}
+
 # 严格版 exe 归属判定 —— **杀进程专用**。与 _proc_exe_is 的唯一差别: exe 读不到时**拒绝**。
 #
 # 为什么必须分开: _proc_exe_is 的"读不到就放行"是为**判活**设计的(CLAUDE.md: 假阴性会让
@@ -894,16 +975,19 @@ _proc_exe_is() {
     local pid="${1:-}" want="${2:-}" got rw
     [ -n "$want" ] || return 0                  # 未指定期望路径 => 不做这层过滤
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    got=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 0   # 读不到 => 放行
-    [ -n "$got" ] || return 0
+    [ -d "/proc/$pid" ] || return 1              # 已退出/不存在不是"无法读取", 而是明确停止
+    # 读不到 exe 仍 fail-open, 但先复核 PID 是否还存在: 进程恰在扫描后退出时, 不能把它
+    # 当成活进程报告。存在但受 hidepid/权限限制时仍按既定 liveness 契约放行。
+    got=$(readlink "/proc/$pid/exe" 2>/dev/null) || { [ -d "/proc/$pid" ] && return 0; return 1; }
+    [ -n "$got" ] || { [ -d "/proc/$pid" ] && return 0; return 1; }
     # 就地替换二进制(升级)后, 运行中进程的 exe 链会带 " (deleted)" 后缀
     got="${got% (deleted)}"
-    [ "$got" = "$want" ] && return 0
+    [ "$got" = "$want" ] && { [ -d "/proc/$pid" ] && return 0; return 1; }
     # 路径可能经由 symlink 呈现不同前缀(如 /opt 本身是软链, exe 记录的是解析后的真实路径),
     # 把期望路径也解析一次再比。解析失败(路径不存在/断链)时以上面的字面比较为结论 => 拒绝。
     rw=$(readlink -f "$want" 2>/dev/null) || return 1
     [ -n "$rw" ] || return 1
-    [ "$got" = "$rw" ] && return 0
+    [ "$got" = "$rw" ] && { [ -d "/proc/$pid" ] && return 0; return 1; }
     return 1
 }
 
@@ -1178,6 +1262,14 @@ _rewrite_link_port() {
     # 2026-09-12 三审(L2): oldport 与链接实际端口不符(metadata 被手改/损坏)时,
     # 下面的 ${after_at#...} 删除不生效, 结果会变成 "host:9999host:443?..." 拼接垃圾。
     # 与 F7 同一口径: 无法确定改写目标时输出空串, 调用方保留原链接。
-    [[ "$after_at" == "$host_part:$oldport"* ]] || { printf ''; return 0; }
-    printf '%s' "${before_at}@${host_part}:${newport}${after_at#"$host_part:$oldport"}"
+    local prefix="$host_part:$oldport" suffix
+    [[ "$after_at" == "$prefix"* ]] || { printf ''; return 0; }
+    suffix="${after_at#"$prefix"}"
+    # The port must end here or be followed by a URI delimiter. A prefix-only check lets oldport=443
+    # rewrite a real :4430 as :<newport>0, silently corrupting the share link.
+    case "$suffix" in
+        ""|/*|\?*|\#*) ;;
+        *) printf ''; return 0 ;;
+    esac
+    printf '%s' "${before_at}@${host_part}:${newport}${suffix}"
 }
