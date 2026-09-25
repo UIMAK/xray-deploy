@@ -2803,8 +2803,9 @@ _xray_is_running() {
             esac
             ;;
         openrc|direct)
-            anchor=$(cat /run/xray.pid 2>/dev/null)
-            if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] && [ -d "/proc/$anchor" ]; then
+            # direct 后端 pidfile 形如 "PID starttime"(见 00-common `_xd_pidfile_*`), openrc 的是纯 PID。
+            anchor=$(_xd_pidfile_pid /run/xray.pid 2>/dev/null)
+            if [ -n "$anchor" ] && [ -d "/proc/$anchor" ]; then
                 _proc_named_under "$anchor" xray && return 0
                 # 不直接判死: 见上方 R40(2), 继续按 exe 归属兜底
             fi
@@ -2887,18 +2888,21 @@ _manage_xray() {
         direct)
             case "$action" in
                 start)
-                    local dpid0=""
-                    [ -f /run/xray.pid ] && dpid0=$(cat /run/xray.pid 2>/dev/null)
-                    # PID reuse 防护: pidfile 的 PID 必须 comm 仍是 xray 才算已在运行;
-                    # 旧 xray 退出后 PID 若被其他程序复用, 陈旧 pidfile 应清掉再正常启动
-                    if [ -n "$dpid0" ] && [ "$(cat /proc/$dpid0/comm 2>/dev/null)" = "xray" ]; then
+                    local dpid0="" dpid1=""
+                    dpid0=$(_xd_pidfile_pid /run/xray.pid)
+                    # PID reuse 防护: pidfile 记录的**身份**(PID + 启动时 starttime)必须仍然成立,
+                    # 且 comm 仍是 xray, 才算已在运行; 旧 xray 退出后 PID 若被复用(即使复用者也是
+                    # xray), 记录的身份对不上, 陈旧 pidfile 应清掉再正常启动。
+                    if [ -n "$dpid0" ] && _xd_pidfile_identity_ok /run/xray.pid \
+                       && [ "$(cat /proc/$dpid0/comm 2>/dev/null)" = "xray" ]; then
                         echo "running"
                     else
                         rm -f /run/xray.pid
                         XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG_FILE" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- &
-                        echo $! > /run/xray.pid
+                        _xd_pidfile_write /run/xray.pid "$!"
                         sleep 1
-                        if [ "$(cat /proc/$(cat /run/xray.pid 2>/dev/null)/comm 2>/dev/null)" != "xray" ]; then
+                        dpid1=$(_xd_pidfile_pid /run/xray.pid)
+                        if [ -z "$dpid1" ] || [ "$(cat /proc/$dpid1/comm 2>/dev/null)" != "xray" ]; then
                             _warn "Xray 启动失败,进程已退出"
                             rm -f /run/xray.pid
                             return 1
@@ -2907,11 +2911,12 @@ _manage_xray() {
                     ;;
                 stop)
                     if [ -f /run/xray.pid ]; then
-                        local dpid; dpid=$(cat /run/xray.pid 2>/dev/null)
-                        # PID reuse 防护: 只对 comm 确为 xray 的 pidfile 进程发信号, 绝不误杀复用该 PID 的其他程序。
-                        # 优雅等待与强杀都绑定到**同一进程化身**(starttime), 否则 PID 在等待窗口内被
-                        # 复用后, kill -0 会误判"仍活着"并对无关进程发 SIGKILL。
-                        if [ -n "$dpid" ] && [ "$(cat /proc/$dpid/comm 2>/dev/null)" = "xray" ]; then
+                        local dpid; dpid=$(_xd_pidfile_pid /run/xray.pid)
+                        # PID reuse 防护: 只对"身份仍相符且 comm 确为 xray"的 pidfile 进程发信号,
+                        # 绝不误杀复用该 PID 的其他程序。`_xd_kill_pid_graceful` 在同一化身内做
+                        # 优雅等待与强杀(其残余窗口与限制见该函数注释)。
+                        if [ -n "$dpid" ] && _xd_pidfile_identity_ok /run/xray.pid \
+                           && [ "$(cat /proc/$dpid/comm 2>/dev/null)" = "xray" ]; then
                             _xd_kill_pid_graceful "$dpid" 5
                         fi
                     fi
