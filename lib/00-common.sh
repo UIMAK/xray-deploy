@@ -882,31 +882,46 @@ _xd_pid_unchanged() {
     [ "$now" = "$st" ]
 }
 
-# TERM -> wait -> KILL without ever signaling a recycled PID.
-# A bare `kill -0 <pid>` wait treats a reused PID as "still alive" and then SIGKILLs an unrelated
-# process. When /proc/<pid>/stat is readable we bind both the wait and the forced kill to the
-# original incarnation; if start time is unavailable (hidepid / no procfs) we keep the old
-# kill -0 behaviour rather than refusing to stop anything.
+# TERM -> 等待 -> KILL; 等待与强杀都尽量绑定到**同一个进程化身**(starttime), 但**不是**硬保证。
+#
+# 为什么需要: 裸 `kill -0 <pid>` 等待会把"等待窗口内退出并被复用的 PID"当成"仍活着", 随后的
+# SIGKILL 就落到无关进程上。抓一次 starttime 并在每次判定与强杀前比对, 把风险窗口从"整个等待期"
+# 收窄到"最后一次读 /proc/<pid>/stat 与 kill(2) 之间"。
+#
+# **残余窗口无法在本项目的依赖范围内消除(2026-09-26 复审结论, 不可写成"绝不误杀")**: 内核级
+# 无竞争信号需要 pidfd(pidfd_open + pidfd_send_signal)。util-linux 的 `kill --timeout` 基于 pidfd,
+# 但 Debian/Ubuntu 的 `kill` 由 **procps** 提供(实测 `--timeout` 不支持), Alpine 是 busybox,
+# bash 内建 kill 也没有该原语; python3 不是本项目运行期依赖(只依赖 jq/curl/wget/unzip)。
+# 故本函数契约是 **best-effort**: 只有 `read stat -> kill` 这一小段仍可能撞上 PID 复用。
+#
+# 读不到身份时**不做**延迟强杀(fail-closed, 与 `_proc_exe_is_strict` 对破坏性操作的口径一致):
+# 退回 `kill -0 + kill -9` 恰好会重建本函数要消除的那个缺陷。此时只发 TERM 并如实告警, 由调用方
+# 按"仍在运行"处理。
 # 用法: _xd_kill_pid_graceful <pid> [grace_seconds]
 _xd_kill_pid_graceful() {
     local pid="${1:-}" grace="${2:-5}" st k=0
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    # 规范 PID: `kill 0` 是"发给当前进程组"(不是 PID 0), 会误伤整组进程; 前导零/超长一律拒绝。
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    [ "${#pid}" -le 7 ] || return 1
+    kill "$pid" 2>/dev/null || return 0     # 已退出 => 无需再处理
+    [ -d "/proc/$pid" ] || return 0          # TERM 已把它带走
     st=$(_proc_starttime "$pid") || st=""
-    kill "$pid" 2>/dev/null || return 0
+    if [ -z "$st" ]; then
+        _warn "无法确认 PID $pid 的启动时间, 跳过延迟强杀(仅已发送 TERM)"
+        while [ "$k" -lt "$grace" ]; do
+            sleep 1
+            [ -d "/proc/$pid" ] || return 0
+            k=$((k+1))
+        done
+        return 0
+    fi
     while [ "$k" -lt "$grace" ]; do
-        if [ -n "$st" ]; then
-            _xd_pid_unchanged "$pid" "$st" || return 0
-        else
-            kill -0 "$pid" 2>/dev/null || return 0
-        fi
+        _xd_pid_unchanged "$pid" "$st" || return 0
         sleep 1
         k=$((k+1))
     done
-    if [ -n "$st" ]; then
-        _xd_pid_unchanged "$pid" "$st" && kill -9 "$pid" 2>/dev/null
-    else
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-    fi
+    # best-effort 强杀: 先确认仍是同一化身, 再把 read->kill 窗口压到最小(仍非原子, 见上)。
+    _xd_pid_unchanged "$pid" "$st" && kill -9 "$pid" 2>/dev/null
     return 0
 }
 
