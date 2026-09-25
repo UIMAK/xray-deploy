@@ -340,8 +340,14 @@ _auto_migrate_geo_autoupdate_locked() {
         has_gd=$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null || echo 0)
     fi
     if [ "$has_gd" = "1" ]; then
-        _geo_remove_cron_line >/dev/null 2>&1
-        _state_set geo_cron "off" 2>/dev/null || true
+        # 三十四轮 P2: 清理失败不再静默 —— cron 行残留会与内置 geodata 重复执行; 此时保持
+        # state=on 让下次启动继续重试(手动路径同样要求"移除成功才置 off")。
+        if _geo_remove_cron_line; then
+            _state_set geo_cron "off" 2>/dev/null || true
+        else
+            _warn "Geo 内置定时已启用, 但旧系统 cron 行清理失败(可能重复执行); 下次启动会重试"
+            _tip "请检查 crontab 权限或手动删除 ${GEO_CRON_MARKER} 行"
+        fi
         return 0
     fi
     if [ -x "$XRAY_BIN" ] && _xray_version_ge "26.4.25" \
@@ -351,9 +357,15 @@ _auto_migrate_geo_autoupdate_locked() {
         content=$(jq --argjson gd "$gd" '.geodata = $gd' "$CONFIG_FILE" 2>/dev/null) || return 0
         [ -n "$content" ] || return 0
         if _atomic_write_json "$CONFIG_FILE" "$content" 2>/dev/null; then
-            _geo_remove_cron_line >/dev/null 2>&1
-            _state_set geo_cron "off" 2>/dev/null || true
-            _info "已迁移 Geo 自动更新到 Xray 内置定时($GEO_CRON_EXPR), 移除系统 cron, 下次重启生效"
+            # 三十四轮 P2: 迁移已生效(config 已写 geodata), 但 cron 清理失败必须明确告警;
+            # 保持 state=on ⇒ 下次启动重试清理(has_gd=1 分支), 不会遗留"两个机制同时跑".
+            if _geo_remove_cron_line; then
+                _state_set geo_cron "off" 2>/dev/null || true
+                _info "已迁移 Geo 自动更新到 Xray 内置定时($GEO_CRON_EXPR), 移除系统 cron, 下次重启生效"
+            else
+                _warn "geodata 已写入 config(内置定时生效), 但旧系统 cron 行清理失败; 下次启动会重试"
+                _tip "请检查 crontab 权限或手动删除 ${GEO_CRON_MARKER} 行"
+            fi
         fi
     fi
 }
