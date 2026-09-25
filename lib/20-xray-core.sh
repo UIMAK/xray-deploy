@@ -2911,13 +2911,15 @@ _manage_xray() {
                     ;;
                 stop)
                     if [ -f /run/xray.pid ]; then
-                        local dpid; dpid=$(_xd_pidfile_pid /run/xray.pid)
-                        # PID reuse 防护: 只对"身份仍相符且 comm 确为 xray"的 pidfile 进程发信号,
-                        # 绝不误杀复用该 PID 的其他程序。`_xd_kill_pid_graceful` 在同一化身内做
-                        # 优雅等待与强杀(其残余窗口与限制见该函数注释)。
+                        local dpid _xray_st
+                        dpid=$(_xd_pidfile_pid /run/xray.pid)
+                        # 身份链闭合(第二轮复审 P1): 复核过的 starttime 必须**传进** kill helper,
+                        # 否则 helper 自己重读 starttime, 两次读取之间 PID 仍可能被复用 —— 会出现
+                        # "复核的是 A 进程、杀的是 B 进程"。comm 检查只作附加收窄。
+                        _xray_st=$(_xd_pidfile_starttime /run/xray.pid)
                         if [ -n "$dpid" ] && _xd_pidfile_identity_ok /run/xray.pid \
                            && [ "$(cat /proc/$dpid/comm 2>/dev/null)" = "xray" ]; then
-                            _xd_kill_pid_graceful "$dpid" 5
+                            _xd_kill_pid_graceful "$dpid" 5 "$_xray_st"
                         fi
                     fi
                     rm -f /run/xray.pid
