@@ -121,9 +121,10 @@ _cf_token_valid() {
     [[ "$token" == ey* ]] || return 1
     [[ "$token" =~ ^ey[A-Za-z0-9+/]+={0,2}$ ]] || return 1
     (( ${#token} % 4 == 0 )) || return 1
-    # jq 是本项目硬依赖(_ensure_base_deps 安装; 多处配置操作要求它)。缺失时退化为"仅语法校验",
-    # 不因缺工具误拒可用的 token —— shell 安全性(禁止元字符)已由上一步的字符集保证。
-    command -v jq >/dev/null 2>&1 || return 0
+    # jq is required to prove that the decoded payload is a TunnelToken object.
+    # Character-set validation alone is not enough: a syntactically valid
+    # base64 value can still decode to malformed JSON or a non-object.
+    command -v jq >/dev/null 2>&1 || return 1
     decoded=$(printf '%s' "$token" | jq -Rr '@base64d' 2>/dev/null) || return 1
     [ -n "$decoded" ] || return 1
     printf '%s' "$decoded" | jq -e 'type == "object"' >/dev/null 2>&1
@@ -995,10 +996,12 @@ _cf_kill_all() {
 # 重启 cloudflared service(先杀干净所有, 等 CF 边缘回收旧 session, 再重新 start)
 # 返回 start 命令的真实结果; 调用方仍应再做真实 liveness(_cf_is_running)确认
 _cf_restart() {
-    # R38(P2): 残留进程只告警、不再中止 start —— 见 _cf_kill_all 内的注释:
-    # "残留即中止"会让一次普通的开关切换确定性地把隧道打停且无法自动恢复。
-    # 双实例风险改由 start 后的 _cf_is_running 与显式告警交给用户判断。
-    _cf_kill_all || _warn "cloudflared 停止流程未完全成功(有残留进程), 仍尝试启动"
+    # An incomplete cleanup/ownership decision can create a second connector,
+    # so restart is fail-closed until all managed processes are accounted for.
+    if ! _cf_kill_all; then
+        _error "cloudflared 停止流程未完成, 为避免启动第二个实例已取消重启"
+        return 1
+    fi
     sleep 2   # 等 CF 边缘感知旧 connector 断开
     local rc=1
     case "$INIT_SYSTEM" in
@@ -1126,24 +1129,27 @@ _install_cloudflared() {
         _error "cloudflared 启动失败, 安装中止"
         return 1
     fi
-    # 安装事务完成(write+restart 成功): 清理 _cf_write_service_line 留下的预修改快照
+    # liveness 判定必须**先于**提交 state / 清理预修改快照(复审 P2): service install 在
+    # token 不可用时也会返回成功, 只有服务真的在跑, 安装事务才算可提交。失败时保留
+    # service 文件(用户唯一的修复入口), 但不写 state、不留预修改快照。
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
+    if ! _cf_is_running; then
+        rm -f "${svcfile}.bak" 2>/dev/null
+        _error "cloudflared service 已写入但启动后未运行, 安装未完成(请检查 token / 查看服务日志)"
+        _tip "service 文件已保留以便修复: $svcfile"
+        return 1
+    fi
+    # 安装事务可提交: 清理 _cf_write_service_line 留下的预修改快照
     rm -f "${svcfile}.bak"
-    # 全部成功后持久化状态。F3: cf_token 不再落盘(docs/security-audit.md 修复计划 #4)——
+    # 持久化状态。F3: cf_token 不再落盘(docs/security-audit.md 修复计划 #4)——
     # 该 state 键全项目无读者(权威来源是 service 启动行, _read_cf_state 随时能解析),
     # 多存一份明文只是纯泄漏面; 卸载清理保留, 以覆盖历史版本遗留的文件。
     mkdir -p "$STATE_DIR"
     _state_set cf_autoupdate "$CF_AUTOUPDATE" || _warn "状态持久化失败(cf_autoupdate)"
     _state_set cf_http2 "$CF_HTTP2" || _warn "状态持久化失败(cf_http2)"
     _state_set cf_edge_ip "$CF_EDGE_IP" || _warn "状态持久化失败(cf_edge_ip)"
-    # 验证 service 真正启动 (M5: token 非法时 service install 仍成功, 但服务无法运行;
-    # 此时配置/state 已一致, 仅提示用户检查 token, 不把"未运行"误报为安装失败)
-    if _cf_is_running; then
-        _success "cloudflared 安装完成(已注册服务并开机自启)"
-    else
-        _warn "cloudflared 已安装但服务未运行, 请检查 token 是否正确"
-    fi
+    _success "cloudflared 安装完成(已注册服务并开机自启)"
     _tip "已默认关闭 cloudflared 自动更新、开启 HTTP2 连接（可在 cloudflared 管理中修改）"
     _tip "隧道路由请在 Cloudflare Web 端配置, 本脚本不写 config.yml"
 }

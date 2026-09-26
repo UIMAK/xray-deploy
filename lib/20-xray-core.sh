@@ -39,7 +39,7 @@ _xray_fetch_tag() {
             fi
             ;;
         preview)
-            body=$(curl -sL --max-time 20 "$XRAY_REPO_API?per_page=30" 2>/dev/null) \
+            body=$(curl -fsSL --max-time 20 "$XRAY_REPO_API?per_page=30" 2>/dev/null) \
                 || body=$(wget -q -T 20 -O- "$XRAY_REPO_API?per_page=30" 2>/dev/null)
             [ -z "$body" ] && return 1
             # 优先 jq: 第一个 prerelease==true 的 tag_name
@@ -122,19 +122,21 @@ _xray_version_ge() {
     local min="$1" cur i x y
     cur=$(_xray_current_version 2>/dev/null)
     [ -n "$cur" ] || return 1
-    # 两侧都可能带 "v" 前缀(如 XRAY_VERSION 常量的 "v26.6.1" 形态)。不剥掉时 "v26" 会落进
-    # 下面的非数字分支被当成 0, 比较退化成**恒真** —— 实测: 26.2.6 也被判为 >= v26.6.1,
-    # 于是门控形同虚设, 旧核心照旧接收它不认识的字段(Go JSON 静默忽略 = 静默失效)。
-    # 这是本函数唯一存在的意义, 故在入口统一剥前缀, 使带不带 v 都按同一语义比较。
+    # 两侧都可能带 "v" 前缀。先统一剥掉前缀；格式不完整时下面的
+    # strict checks fail closed instead of guessing through a feature gate.
     cur="${cur#v}"; cur="${cur#V}"
     min="${min#v}"; min="${min#V}"
+    # Version gates must never guess through malformed input. A malformed
+    # version is an unknown capability, so callers must take the old-core path.
+    [[ "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "$min" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     local -a a b
     IFS='.' read -ra a <<< "$cur"
     IFS='.' read -ra b <<< "$min"
     for i in 0 1 2; do
         x="${a[$i]:-0}"; y="${b[$i]:-0}"
-        [[ "$x" =~ ^[0-9]+$ ]] || x=0
-        [[ "$y" =~ ^[0-9]+$ ]] || y=0
+        [[ "$x" =~ ^[0-9]+$ ]] || return 1
+        [[ "$y" =~ ^[0-9]+$ ]] || return 1
         [ "$x" -gt "$y" ] && return 0
         [ "$x" -lt "$y" ] && return 1
     done
@@ -1528,6 +1530,8 @@ _xray_core_journal_drop() {
 }
 
 # 任意 journal (包括 committed/rolled_back 的 cleanup journal) 都必须先恢复/清理, 不能新开覆盖。
+# **调用场景**: 核心事务准入(_install_or_switch_xray / _xray_commit_staged / geo 提交) ——
+# 它回答的是"能否开新核心事务", 因此终态但未 cleanup 的账本同样算 pending(防止覆盖证据)。
 _xray_core_txn_pending() {
     local j; j=$(_xray_core_journal_path)
     _xray_core_path_present "$(_xray_core_blocked_path)" && return 0
@@ -1536,6 +1540,97 @@ _xray_core_txn_pending() {
     # 否则新事务可能覆盖旧证据或误认 stale snapshots。
     _xray_core_path_present "$j"
 }
+
+# **config 写路径专用谓词**(复审 P2, 2026-09-26): 只有"未收敛"的核心事务才阻塞普通
+# config/metadata 写入。与 _xray_core_txn_pending 的分工必须分清:
+#   _xray_core_txn_pending   = 任何账本(含终态)都算 —— 阻止**新核心事务**覆盖旧证据;
+#   本函数                   = 终态已收敛(committed=切换成功 / rolled_back=回滚完成, 磁盘与
+#                              runtime 都已就位), 只剩删备份; 此时禁止普通配置写入属过度防御 ——
+#                              一个删不掉的旧备份不该锁死整个管理面, cleanup 留待下次启动重试。
+# BLOCKED / .corrupt / 账本无法解析 / phase 为空或非法 / 非终态 — 一律视为未收敛(fail-closed)。
+#
+# **边界声明(复审 P3): 本谓词只判 phase, 不做完整 schema 校验。** 完整校验是 recovery 的
+# 职责(`_xray_core_journal_ok`), 在这里再抄一份 schema 属于"对已由可信边界建立的 invariant
+# 重复验证", 而且会把一个大 jq 校验拉进每次普通写入的路径。正常崩溃不会产生"phase 完整而
+# 其余字段损坏"的账本(写入是 `_atomic_write_json` 原子提交, 非终态 phase 一律阻塞); 唯一能
+# 构造出该形态的是**手工篡改**, 属同机 root 篡改 = 已失守, 超出本项目威胁模型。若将来
+# 确实需要"终态账本必须可信", 正确做法是让 recovery 的 schema 校验结果成为唯一判据, 而
+# 不是在这里再实现一份。
+_xray_core_txn_unsettled() {
+    local j phase
+    j=$(_xray_core_journal_path)
+    _xray_core_path_present "$(_xray_core_blocked_path)" && return 0
+    _xray_core_path_present "${j}.corrupt" && return 0
+    _xray_core_path_present "$j" || return 1
+    phase=$(jq -r '.phase // empty' "$j" 2>/dev/null) || return 0
+    case "$phase" in
+        committed|rolled_back) return 1 ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# **统一"未收敛事务"写闸门**(复审 P1, 2026-09-26): reset / core / port 三套恢复账本
+# 任一未收敛, 即拒绝一切普通 config/metadata 写入; 账本/证据清除后闸门自动解除。
+# 策略与 _mutate_config 的 reset 检查一致: **只看盘上事实**, 不引入粘滞状态。
+#
+# 调用前提: 调用方已持 config lock(锁序 config → core, 不可反向);
+# **且调用方必须正在持 core lock**(`_mutate_config_locked` 经 `_with_core_lock` 屏障),
+# 或至少是在 core lock 内的一次判定 —— 否则"检查通过"与"实际写入"之间仍有 TOCTOU 窗口
+# (复审 P1: 检查后 core 事务可启动并留下未收敛账本)。屏障内本函数经持锁标记直接调用
+# probe, 不重复取锁。三个判定:
+#   · reset 账本(90-menu 定义): 锁内文件检查 —— reset 全程持 config lock 提交, 无竞态;
+#   · port 事务 journal: 锁内文件检查 —— 端口事务全程持 config lock 提交, 无竞态;
+#   · core 账本: 只看**非终态**(见 _xray_core_txn_unsettled) —— 在飞的切换持 core lock
+#     直到账本删除才释放, 不会误拒; 崩溃残留/BLOCKED 才命中。
+#
+# `XD_PORT_TXN_ACTIVE=1` 表示"当前进程正处于某个端口事务的临界区内": 该事务自己的
+# journal 不算未收敛 —— 进入事务前 `_port_txn_journal_write` 已拒绝任何既有 journal,
+# 且整个事务持 config lock, 不可能有外来 journal 插入。标记只活在该事务的锁子 shell 内。
+#
+# 返回 0 = 放行; 1 = 已拒绝(原因已打印)。
+# 混装旧 lib(缺 helper)时按各段单独跳过: 与项目其它 declare -F 守卫同口径
+# (可用性 fail-open; helper 属于同一次安装的完整版本)。
+# ---------------------------------------------------------------------------
+_core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无阻塞; 3=未收敛
+    _xray_core_txn_unsettled && return 3
+    return 0
+}
+
+_txn_allow_config_write() {
+    # 1) reset 账本(90-menu 定义; 缺 helper 的混装版本跳过)
+    if declare -F _reset_journal_path >/dev/null 2>&1 \
+       && [ -e "$(_reset_journal_path 2>/dev/null)" ]; then
+        _error "存在未收敛的 reset 事务日志, 已拒绝本次配置写入"
+        _tip "请重启脚本让 reset 事务先收敛(账本/快照已保留)"
+        return 1
+    fi
+    # 2) 端口事务 journal: 任何 *.porttxn 都是未收敛现场(当前端口事务自己的除外)
+    if [ "${XD_PORT_TXN_ACTIVE:-0}" != "1" ]; then
+        local _pf
+        for _pf in "$NODES_DIR"/*.porttxn; do
+            [ -e "$_pf" ] || continue
+            _error "存在未收敛的端口事务 journal, 已拒绝本次配置写入: ${_pf##*/}"
+            _tip "请重启脚本让启动恢复收敛该 journal 后再操作; 现场(journal)已保留"
+            return 1
+        done
+    fi
+    # 3) core 账本: 在 core lock 内判定
+    declare -F _core_txn_pending_probe >/dev/null 2>&1 || return 0
+    local rc=0
+    _with_core_lock _core_txn_pending_probe || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        3)
+            _error "存在未收敛的核心事务(账本/恢复源已保留), 已拒绝本次配置写入"
+            _tip "请重启脚本让核心事务先收敛; 收敛前请勿继续修改 config/metadata"
+            return 1 ;;
+        *)
+            _error "无法确认核心事务状态(核心锁不可用?), 已拒绝本次配置写入(fail-closed)"
+            return 1 ;;
+    esac
+}
+
 _xray_core_journal_ok() {
     local j="$1" id bin binbak pre hash binary_hash runtime unit sprev stage stage_name phase operation
     local gipre gspre service_pre giphash gsphash service_hash gi_new_hash gs_new_hash
@@ -2413,8 +2508,20 @@ _init_config_if_empty_locked() {
 # 同文件的 `_init_config_if_empty` 早已是这个 wrapper 形态(见它的 `_locked`), 这里补齐口径。
 # ---------------------------------------------------------------------------
 _auto_ensure_config_env_locked() {
+    # 廉价守卫留在屏障外(空配置/无 jq 的 no-op 不取 core lock)
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
+    # **本函数是权威 config 写入**(注入 env 段), 与其它写入口同一口径: 读-改-写整体进
+    # core lock 屏障, 检查与写入同临界区(复审 P2-1)。只靠启动链门禁覆盖不了
+    # "另一会话在此期间启动核心事务"的并发窗口。
+    _with_config_write_barrier _auto_ensure_config_env_write
+}
+
+_auto_ensure_config_env_write() {
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
+        return 1
+    fi
     local need
     # .env 非对象时 `.env.XRAY_LOCATION_ASSET` 会让 jq 报类型错误而整行失败 -> 前置判断
     # 必须先按类型分支(与注入处同一口径), 否则非对象 .env 会在这里提前 return 而无法自愈。
@@ -2907,6 +3014,10 @@ _create_xray_service() {
             # 无 init 系统:不做 service,提示手动运行
             _warn "未检测到 systemd/openrc,跳过 service 创建(可手动: XRAY_LOCATION_ASSET=${ASSET_DIR} ${XRAY_BIN} run -c ${CONFIG_FILE})"
             ;;
+        *)
+            _error "未知的 init backend: ${INIT_SYSTEM:-未设置}, 无法创建 Xray service"
+            return 1
+            ;;
     esac
 }
 
@@ -3154,8 +3265,8 @@ _restart_xray_verified() {
 #     用户既停不掉也起不来(实测复现见 implement.md)。
 # 判活用 `_xray_is_running`(R40 统一入口), **不用**裸 `systemctl is-active`/`rc-service status`
 # —— 那两者在崩溃窗口里都会说谎(见 CLAUDE.md 的"Unified liveness"段)。
-# `_xray_is_running` 缺失(混装旧 lib)时按 declare -F 守卫回退为"停一次即认为成功"并告警,
-# 绝不因此把卸载卡死。
+# `_xray_is_running` 缺失(混装旧 lib)时无法证明进程已经退出。破坏性卸载必须拒绝继续,
+# 而不是把能力缺失伪装成停止成功。
 # ---------------------------------------------------------------------------
 _xray_stop_and_verify() {
     # stop 与完整 liveness 确认不可被核心 transaction 的 restart 插入。
@@ -3165,9 +3276,9 @@ _xray_stop_and_verify() {
         return $?
     fi
     if ! declare -F _xray_is_running >/dev/null 2>&1; then
-        _warn "lib 版本过旧(缺 _xray_is_running), 无法确认进程是否退出, 仅执行停止"
-        _manage_xray stop >/dev/null 2>&1 || true
-        return 0
+        _error "lib 版本过旧(缺 _xray_is_running), 无法确认 Xray 是否退出, 已中止破坏性操作"
+        _tip "请执行 install.sh --update 同步全部模块后重试"
+        return 1
     fi
     _manage_xray stop >/dev/null 2>&1 || true
     local i
