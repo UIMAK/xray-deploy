@@ -648,7 +648,22 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
         fi
         if [ "$create_marker" != "1" ]; then
             # 树外旧锁(如 /opt/.xray-deploy.*): 只 flock 已知文件, 不创建任何新对象。
-            # 残余: 旧 mkdir 后端若在本检查之后才启动无从阻止 —— 与"旧进程在新版释放后启动"同类。
+            # **但必须检查旧 mkdir 目录是否已存在**(复审 P1): 旧 flock 文件可能长期残留,
+            # 而无-flock 旧进程正在用 `.d` 目录锁 —— 只看文件会双重放行(旧 mkdir 锁从未
+            # 被新版拿过)。存在即 fail-closed, 不接管。
+            if [ -e "$ldir" ]; then
+                owner=$(cat "$ldir/pid" 2>/dev/null)
+                case "$owner" in
+                    ''|*[!0-9]*) owner="" ;;
+                    *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
+                esac
+                _error "旧版${label}目录锁仍存在(pid ${owner:-未知}): $ldir"
+                _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+                flock -u "$ef" 2>/dev/null
+                eval "exec ${ef}>&-" 2>/dev/null
+                eval "$fdvar=\"\""
+                return 1
+            fi
             return 0
         fi
         # (T3) 旧版 **mkdir 后端**的排他标记(二十四轮 P1): 只"看一眼目录在不在"不是互斥 ——
