@@ -108,12 +108,17 @@ _extract_token() {
     [ -n "$token" ] && echo "$token"
 }
 
-# Tunnel tokens are opaque base64/base64url payloads. Restrict characters before embedding them in
-# systemd/OpenRC service files: OpenRC sources its init file as shell, so quotes, substitutions,
-# whitespace, or control characters must never be accepted as token data.
+# Tunnel tokens must pass cloudflared's own decoder before being embedded in service files
+# (OpenRC sources its init file as shell, so quotes/substitutions/whitespace must never be token data).
+# cloudflared 用 Go 的 `base64.StdEncoding` 解码(源码 cmd/cloudflared/tunnel/subcommands.go 的
+# `ParseToken` -> `base64.StdEncoding.DecodeString`): **标准**字母表 A-Za-z0-9+/ 且 padding 必须
+# 正确。此前允许 URL-safe 的 -/_ 又不校验 padding, 会造出"脚本说合法、cloudflared 自己拒绝"的
+# 伪合法 token。
 _cf_token_valid() {
     local token="${1:-}"
-    [[ "$token" == ey* && "$token" =~ ^ey[A-Za-z0-9._/+_-]+={0,2}$ ]]
+    [[ "$token" == ey* ]] || return 1
+    [[ "$token" =~ ^ey[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    (( ${#token} % 4 == 0 ))
 }
 
 # ---------------------------------------------------------------------------

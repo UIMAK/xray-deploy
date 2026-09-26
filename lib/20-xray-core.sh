@@ -2802,13 +2802,27 @@ _xray_is_running() {
                     return 1 ;;
             esac
             ;;
-        openrc|direct)
-            # direct 后端 pidfile 形如 "PID starttime"(见 00-common `_xd_pidfile_*`), openrc 的是纯 PID。
+        openrc)
+            # openrc 的 pidfile 由 supervise-daemon 写(纯 PID, 无身份记录): 判据保持不变 ——
+            # anchor 判不出归属时继续按 exe 归属兜底(见上方 R40(2); 假阴性会让 zap 杀掉活服务)。
             anchor=$(_xd_pidfile_pid /run/xray.pid 2>/dev/null)
             if [ -n "$anchor" ] && [ -d "/proc/$anchor" ]; then
                 _proc_named_under "$anchor" xray && return 0
-                # 不直接判死: 见上方 R40(2), 继续按 exe 归属兜底
             fi
+            ;;
+        direct)
+            # direct 的 pidfile 由本脚本写, 可能带 starttime 身份(见 00-common `_xd_pidfile_*`)。
+            # **有身份记录时身份就是权威**: 记录在而当前化身不符(已退出/被复用)即明确"不是我们的
+            # 实例", 直接判 stopped —— 不得再让下面的全机扫描把别的 xray 判活, 否则身份绑定会被
+            # 兜底绕掉, `_restart_xray_verified` 在坏配置下会收到假的 running(第二轮复审 P1)。
+            if [ -n "$(_xd_pidfile_starttime /run/xray.pid)" ]; then
+                _xd_pidfile_identity_ok /run/xray.pid || return 1
+            fi
+            anchor=$(_xd_pidfile_pid /run/xray.pid 2>/dev/null)
+            if [ -n "$anchor" ] && [ -d "/proc/$anchor" ]; then
+                _proc_named_under "$anchor" xray && return 0
+            fi
+            # 无身份记录(旧版纯 PID pidfile / 文件缺失)时保留既有兜底
             ;;
     esac
     # 兜底: 全机扫描 comm==xray, 但只承认 exe 指向本脚本自己的二进制的进程,
