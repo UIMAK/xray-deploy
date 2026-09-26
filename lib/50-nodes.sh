@@ -2,7 +2,7 @@
 # =============================================================================
 # lib/50-nodes.sh — 节点管理(7 协议)
 # 需求 R6(协议集) + R7(按节点改监听) + R8(Reality 后量子)
-# 配置以官方为准(design.md 配置依据表), 模板在 templates/ 下, 占位符 {{...}} 渲染.
+# 配置以官方 Xray 文档为准, 模板在 templates/ 下, 占位符 {{...}} 渲染.
 # 节点元数据: $NODES_DIR/<tag>.json (按节点独立文件, 便于 R7 单节点改监听)
 # ============================================================================
 
@@ -41,32 +41,29 @@ _normalize_bandwidth() {
 # ---------------------------------------------------------------------------
 # Hysteria2 混淆(FinalMask.udp)辅助
 #
-# 依据分三层(项目红线: 层与层不得混用, 注释必须点名来源; 用户 2026-09-15 明确接受
-# mihomo 官方作为 clash 字段名的第三层依据, 以及"官方源码"作为 Xray 版本门控的依据):
+# 依据分三层(项目红线: 层与层不得混用, 注释必须点名来源; 用户 2026-09-15 接受 mihomo 官方
+# 作为 clash 字段名的第三层依据、"官方源码"作为 Xray 版本门控的依据):
 #
-# [Xray 官方] config/transports/finalmask.md「UDPMask」/「### salamander」/「#### gecko」:
-#   "udp": [ { "type": "", "settings": {} } ]  —— 数组第一个为最内层伪装;
+# [Xray 官方] config/transports/finalmask.md + development/intro/guide.md:
+#   "udp": [ { "type": "", "settings": {} } ] —— 数组第一个为最内层伪装;
 #   type = "salamander" 时 settings = { "password": ..., "packetSize": "512-1200" };
-#   **packetSize 不为空则启用 Gecko**(对 QUIC 长包头额外分片填充), 上限不能超过 2048。
-#   packetSize 为 Int32Range(development/intro/guide.md): "114" / "114-514" 引号内范围,
-#   或独立 int(仅单数字); **From>To 会自动交换**; "" 视为 0。
+#   **packetSize 非空则启用 Gecko**(QUIC 长包头额外分片填充), 上限不能超过 2048;
+#   packetSize 为 Int32Range: 独立 int 或引号内 "114-514"; From>To 自动交换; "" 视为 0;
 #   Xray 官方文档**没有** `hysteriaSettings.obfs` 字段 —— 混淆只存在于 finalmask.udp。
 #
 # [Hysteria 2 官方] developers/URI-Scheme.md + advanced/Full-Client-Config.md:
-#   URI scheme `hysteria2` 或 `hy2`; 参数 `obfs`(类型枚举: salamander|gecko)与
-#   `obfs-password`; **URI 参数表中没有 gecko 的尺寸参数**(尺寸只存在于客户端配置文件的
-#   `obfs.gecko.minPacketSize` / `maxPacketSize`)。
-#   Gecko 客户端尺寸: minPacketSize 默认 512, maxPacketSize 默认 1200,
-#   **必须 max >= min 且 max <= 2048**。
+#   URI scheme `hysteria2` 或 `hy2`; 参数 `obfs`(salamander|gecko)与 `obfs-password`;
+#   **URI 参数表中没有 gecko 的尺寸参数**(尺寸只在客户端配置文件
+#   `obfs.gecko.minPacketSize` / `maxPacketSize`: 默认 512/1200, **必须 max >= min 且 max <= 2048**)。
 #
 # [mihomo 官方] Meta-Docs config/proxies/hysteria2 + 源码 adapter/outbound/hysteria2.go:
 #   proxy 字段名 `obfs` / `obfs-password` / `obfs-min-packet-size` / `obfs-max-packet-size`;
-#   源码里尺寸字段**只在 `case ObfsTypeGecko` 分支被读取**(salamander 分支只取密码)。
+#   尺寸字段**只在 `case ObfsTypeGecko` 分支被读取**(salamander 分支只取密码)。
 #
-# 尺寸文本的**唯一规范化入口是 _hy2_obfs_size_canon**: 三个消费者(Xray config 的
-# packetSize、mihomo 的 obfs-min/max-packet-size、菜单/链接回显)必须看到**同一个**已排序
-# 区间。否则 `1500-800` 会在 Xray 侧被自动交换成 800-1500, 而 mihomo 侧照抄成
-# min=1500/max=800 —— 违反 Hysteria 官方 max>=min 约束的非法客户端配置。
+# 尺寸文本的**唯一规范化入口是 _hy2_obfs_size_canon**: 三个消费者(Xray config 的 packetSize、
+# mihomo 的 obfs-min/max-packet-size、菜单/链接回显)必须看到**同一个**已排序区间; 否则
+# `1500-800` 在 Xray 侧被交换成 800-1500 而 mihomo 侧照抄成 min=1500/max=800 ——
+# 违反 Hysteria 官方 max>=min 约束的非法客户端配置。
 # ---------------------------------------------------------------------------
 
 # packetSize 文本规范化(唯一入口): 去空格 → 解析 → 排序(Int32Range 语义) → 去前导零 → 规范形式。
@@ -84,15 +81,13 @@ _hy2_obfs_size_canon() {
     else
         return 1
     fi
-    # 先做长度门限再比较: bash 的 [ 对 >= 2^63 的整数会报 "integer expected" 且返回非零,
-    # 不设门限时超大输入会被静默判为"合法"(实测 20 位数字), 直到核心侧 Int32Range 解析
-    # 失败才暴露(白等一次 8 秒重启回滚)。10 位门限只是**防 bash 溢出**, 不等于 int32 上界;
-    # 真正的范围上界由调用方的 _hy2_obfs_size_invalid(To<=2048)兜住。
+    # 先做长度门限再比较: bash 的 [ 对 >= 2^63 的整数报错且返回非零, 不设门限时超大输入会被
+    # 静默判为"合法", 直到核心侧 Int32Range 解析失败才暴露(白等一次重启回滚)。10 位门限只
+    # **防 bash 溢出**, 不等于 int32 上界; 真正上界由 _hy2_obfs_size_invalid(To<=2048)兜住。
     [ "${#a}" -le 10 ] && [ "${#b}" -le 10 ] || return 1
-    # 去前导零(十进制字面量规范化): "008" → "8"。Xray 的 Int32Range 按数值解释, 前导零本
-    # 无影响; 但同一区间会同时写进 metadata 与外部 YAML(clash), 各解析器对前导零的处理
-    # 未必一致 ⇒ 在唯一入口就归一, 让所有下游看到同一字面量。用 10# 强制十进制, 避免
-    # bash 把 "008" 当八进制(那会让 008/0010 直接报错)。
+    # 去前导零(十进制字面量规范化): "008" → "8"。前导零对 Xray 无影响, 但同一区间还写进
+    # metadata 与 clash, 各解析器处理未必一致 ⇒ 在唯一入口归一, 让下游看到同一字面量。
+    # 用 10# 强制十进制(否则 "008" 被 bash 当八进制直接报错)。
     a=$((10#$a)); b=$((10#$b))
     # Int32Range: From>To 自动交换 —— 规范化阶段就交换, 使所有下游看到同一区间
     if [ "$a" -gt "$b" ]; then local t="$a"; a="$b"; b="$t"; fi
@@ -100,10 +95,10 @@ _hy2_obfs_size_canon() {
 }
 
 # packetSize 合法性判定: 输出 ""(合法/未填) 或人类可读原因。
-# 规则: 数字或 "min-max"; 非空启用 gecko 时 To<=2048(Xray 官方 finalmask.md「#### gecko」
-# 明文的硬上限)。**From>=1 是本脚本自身的输入限制, 不是两个官方文档写明的统一硬限制** ——
-# Xray 的 Int32Range 通用定义允许 ""(视为 0)且未给所有字段规定"不能为 0"; Hysteria 官方
-# gecko 段落只写 max>=min 且 max<=2048。0 长度分片无意义, 故脚本层拒绝并如实说明来源。
+# 规则: 数字或 "min-max"; 非空启用 gecko 时 To<=2048(Xray 官方 finalmask.md「#### gecko」硬上限)。
+# **From>=1 是本脚本自身的输入限制, 不是两个官方文档写明的统一硬限制** —— Xray 的 Int32Range
+# 允许 ""(视为 0)且未规定"不能为 0"; Hysteria 官方只写 max>=min 且 max<=2048。0 长度分片
+# 无意义, 故脚本层拒绝并如实说明来源。
 # 先做形式检查再规范化, 使"格式错"与"数值超范围"给出**不同**的原因
 # (canon 对两者都返回 1, 直接透传会把 20 位数字误报成格式错)。
 _hy2_obfs_size_invalid() {
@@ -144,12 +139,11 @@ _hy2_obfs_size_get() {
 }
 
 # --- metadata 的混淆语义(单一模型, 勿在别处另立) -------------------------------
-# Xray 侧**没有** type:"gecko": gecko = type:"salamander" + 非空 packetSize
-# (官方 finalmask.md: packetSize 非空即启用 Gecko)。因此 metadata 里:
+# Xray 侧**没有** type:"gecko": gecko = type:"salamander" + 非空 packetSize(官方 finalmask.md)。
 #   obfs_type        = Xray 底层类型, 恒为 "salamander"(**不存 "gecko"**)
 #   obfs_packet_size = Gecko 开关: null/空 = 普通 salamander; 非空 = gecko
-# 类型枚举(salamander|gecko)是**客户端**侧的概念(Hysteria URI / mihomo), 由
-# _hy2_obfs_kind 统一翻译, 调用方不要各自推断。
+# 类型枚举(salamander|gecko)是**客户端**侧的概念(Hysteria URI / mihomo), 由 _hy2_obfs_kind
+# 统一翻译, 调用方不要各自推断。
 # ---------------------------------------------------------------------------
 
 # Hysteria 官方 Full-Client-Config 的 gecko 尺寸默认值(minPacketSize 512 / maxPacketSize
@@ -182,8 +176,8 @@ _hy2_obfs_size_is_default() {
 
 # 该节点是否**无法用官方 hy2 URI 表达** = gecko + 自定义尺寸。
 # 官方 URI 支持 obfs=gecko 但**没有尺寸参数**: 默认 512-1200 可表达; 自定义尺寸会让客户端
-# 退回默认值去连非默认服务端(尺寸不一致) ⇒ 不可表达, 改由 clash 承载(它有独立尺寸字段)。
-# 注意与"元数据缺字段"是两回事(后者应**保留**旧链接): _rebuild_hy2_link 对两者都返回 1,
+# 退回默认值去连非默认服务端 ⇒ 不可表达, 改由 clash 承载(它有独立尺寸字段)。
+# 与"元数据缺字段"是两回事(后者应**保留**旧链接): _rebuild_hy2_link 对两者都返回 1,
 # 调用方必须用本函数区分, 否则会误报原因并毁掉一条仍可用的旧链接。
 _hy2_link_unexpressible() {
     # 损坏的 obfs_type(_hy2_obfs_kind rc≠0)按"**不是**不可表达"处理 —— 调用方会走
@@ -202,27 +196,22 @@ _hy2_link_unexpressible() {
 #   $XD_UDP_OUR_MARKER   我们写入的 settings 里的**归属标记**字段名
 #   $XD_UDP_NEW          要写入的层对象(单个, 不是数组); $new == null 表示"剔除我们那层"
 #
-# **身份判定必须是正向标记, 不能只靠 `type == "salamander"`**: 该 type 是 Xray 的
-# 官方伪装类型名, 任何用户/其它工具都可以在同一个 udp 数组里放自己的 salamander 层。
-# 只按 type 匹配实际是"管理所有 salamander 层" —— 替换会吃掉别人的层, 关闭会一次删光,
-# 与"只管理自己写的那一层"的契约不符。故我们写入的层带一个可自证的归属标记
-# (settings.xd_managed = true), 识别与剔除都只认它; 它不影响 Xray(Go 的 json 解码
-# 按 struct 字段取用, settings 里的未知键被忽略), 也不改变任何官方字段的语义。
-# 兼容: 标记是我们自己上一版写下的层没有 —— 此时退化为"取 settings.password 存在且
-# 无其它伪装类型特征的那一层"? 不: 不做模糊推断(会把别人的层误认成自己的),
-# 而是**只在找到带标记的层时原位替换, 否则追加一层**; 无标记的旧层按"别人的层"保留。
+# **身份判定必须是正向标记, 不能只靠 `type == "salamander"`**: 该 type 是 Xray 的官方伪装
+# 类型名, 任何用户/其它工具都可以在同一个 udp 数组里放自己的 salamander 层。只按 type 匹配
+# 实际是"管理所有 salamander 层"(替换会吃掉别人的层, 关闭会一次删光), 与"只管理自己写的
+# 那一层"的契约不符。故我们写入的层带一个可自证的归属标记 settings.xd_managed = true,
+# 识别与剔除都只认它(Go 解码忽略 settings 未知键, 不影响 Xray, 也不改变官方字段语义)。
+# 兼容: 只对带标记的层原位替换, 否则追加一层; 无标记的旧层按"别人的层"保留(不做模糊推断)。
 # ---------------------------------------------------------------------------
 XD_UDP_OUR_TYPE="salamander"
 XD_UDP_OUR_MARKER="xd_managed"
 XD_UDP_JQ_UPSERT='def xd_udp_ours($new): .streamSettings.finalmask.udp = ((.streamSettings.finalmask.udp // []) as $a | ($a | map(.type == $ourtype and (.settings // {})[$ourmark] == true) | index(true)) as $i | if $i == null then (if $new == null then $a else $a + [$new] end) else (if $new == null then $a[0:$i] + $a[$i+1:] else $a[0:$i] + [$new] + $a[$i+1:] end) end); (.inbounds[] | select(.tag == $t)) |= xd_udp_ours($new)'
-# 兼容别名: 语义与 UPSERT($new=null) 完全相同 —— 保留独立常量只为调用点可读,
-# 但**不得**再各自复制一份过滤逻辑(两份副本会漂移)。
+# 兼容别名: 语义与 UPSERT($new=null) 完全相同 —— 独立常量只为调用点可读, 不得再复制过滤逻辑。
 XD_UDP_JQ_DROP="$XD_UDP_JQ_UPSERT"
 
-# 外来 salamander 层探测(只读): 该入站的 finalmask.udp 里是否存在 type=salamander
-# 但**没有**我们归属标记的层。存在时不得启用混淆 —— 追加我们那层会让 Xray 依次套两层
-# salamander(双重混淆, 客户端只做一层 ⇒ 必然连不上), 而"删掉别人的层"更不可接受。
-# 这是 fail-closed: 交给用户人工判断, 而不是替他猜。
+# 外来 salamander 层探测(只读): finalmask.udp 里是否存在 type=salamander 但**没有**我们归属
+# 标记的层。存在时不得启用混淆 —— 追加我们那层会让 Xray 依次套两层 salamander(双重混淆,
+# 客户端只做一层 ⇒ 必然连不上), 而"删掉别人的层"更不可接受。fail-closed: 交给用户人工判断。
 # 用法: _hy2_udp_has_foreign_salamander <tag>; rc=0 表示存在
 _hy2_udp_has_foreign_salamander() {
     local tag="$1"
@@ -232,11 +221,10 @@ _hy2_udp_has_foreign_salamander() {
         "$CONFIG_FILE" >/dev/null 2>&1
 }
 
-# 从 (type, password, packetSize) 构造 finalmask.udp 数组字面量
+# 从 (type, password, packetSize) 构造 finalmask.udp 数组字面量; 层带**归属标记**
+# settings.xd_managed=true, 使 XD_UDP_JQ_UPSERT/DROP 精确认出"我们写的那一层"。
 # 用法: _hy2_obfs_mask_block <type> <password> <packet_size_raw>
 # 输出: 空(未启用) 或 {"type": ..., "settings": {...}}  (可直接放进 [ ])
-# 生成的层带**归属标记** settings.xd_managed=true, 使 XD_UDP_JQ_UPSERT/DROP 能精确
-# 认出"我们写的那一层"而不是"所有 type=salamander 的层"(见上面过滤器注释)。
 # 失败(非法 packetSize)返回 1 —— 调用方必须消费返回码, 绝不能拿空输出当"无混淆"用:
 # 回滚/关闭路径上把"解析失败"误当"无混淆"会静默清掉一个正在工作的混淆配置。
 _hy2_obfs_mask_block() {
@@ -246,23 +234,21 @@ _hy2_obfs_mask_block() {
     # 单值(如 "2048")与区间在 Int32Range 下等价; 区间时写成字符串, 单值时写裸数字。
     local size_json=""
     [ -n "$canon" ] && { case "$canon" in *-*) size_json="\"$canon\"" ;; *) size_json="$canon" ;; esac; }
-    # 格式串必须是字面量: 第三个实参曾同时充当格式串, 一旦 size_json 的正则放宽就是
-    # 用户可控的 printf 格式串注入。这里用 %s 逐个拼装, 用户数据永远只当数据。
+    # 格式串必须是字面量: size_json 的正则一旦放宽, 兼作格式串的实参就是用户可控的
+    # printf 格式串注入。这里用 %s 逐个拼装, 用户数据永远只当数据。
     printf '%s' "{\"type\": \"${otype}\", \"settings\": {\"password\": \"${opw}\", \"${XD_UDP_OUR_MARKER}\": true${size_json:+, \"packetSize\": ${size_json}}}}"
 }
 
 # gecko(非空 packetSize)需要的最小核心版本 —— 版本门控, 与 R44/R45 同口径。
-# **依据层级必须分清**: Xray 官方 llms-full.txt / docs **没有任何版本门控表述**
-# ("文档未提及, 不能确认"); 下列版本来自**官方源码**逐 tag 核对
-# infra/conf/transport_internet.go 的 json tag —— 属"源码事实", 不是"文档依据"。
-# 用户 2026-09-15 明确接受"官方源码"作为 Xray 侧的第二依据(与文档依据分开声明)。
-#   v26.3.27 / v26.4.13 / v26.4.15 / v26.4.17 / v26.4.25 / v26.5.3 / v26.5.9
-#       Salamander{ Password }                                —— 无 packetSize 字段
-#   v26.6.1   Salamander{ Password, PacketSize *Int32Range }  —— 非 nil 即 GeckoConfig
-#   v26.7.11+ Salamander{ Password, PacketSize Int32Range }   —— 当前形态(To>0 即 Gecko)
-# Go 的 encoding/json 静默忽略未识别字段 ⇒ 旧核心会把 packetSize 丢掉、退化成**无分片的
-# salamander** 照常启动; 而按客户端 gecko 生成的条目连不上, 且报错发生在客户端一侧,
-# 服务端日志干净 —— 典型的静默失效。故启用 gecko 前先做版本门控。
+# **依据层级必须分清**: Xray 官方 llms-full.txt / docs **没有任何版本门控表述**; 下列版本来自
+# **官方源码**逐 tag 核对 infra/conf/transport_internet.go 的 json tag —— 属"源码事实", 不是
+# "文档依据"(用户 2026-09-15 明确接受"官方源码"作为 Xray 侧的第二依据)。
+#   v26.3.27 ~ v26.5.9  Salamander{ Password }                        —— 无 packetSize 字段
+#   v26.6.1              Salamander{ Password, PacketSize *Int32Range } —— 非 nil 即 GeckoConfig
+#   v26.7.11+            Salamander{ Password, PacketSize Int32Range }  —— 当前形态(To>0 即 Gecko)
+# Go 的 encoding/json 静默忽略未识别字段 ⇒ 旧核心把 packetSize 丢掉、退化成**无分片的
+# salamander** 照常启动; 而按客户端 gecko 生成的条目连不上(报错在客户端一侧, 服务端日志干净)
+# —— 典型静默失效。故启用 gecko 前先做版本门控。
 _HY2_GECKO_MIN_VER="v26.6.1"
 _hy2_gecko_supported() {
     [ -x "$XRAY_BIN" ] || return 1
@@ -281,30 +267,28 @@ _hy2_gecko_supported() {
 # 两者可同时启用; 本组函数只碰 .streamSettings.hysteriaSettings.masquerade 这一个路径。
 #
 # **字段是扁平的, 不是按 type 嵌套**: 依据 [Xray 官方源码] infra/conf/transport_method.go
-# (v26.7.11 之前为 infra/conf/transport_internet.go)的 Masquerade 结构体逐字段核对 json tag
-# (v26.3.23 / v26.3.27 / v26.9.9 三处一致)。**Xray 官方文档(Xray-docs-next 的
-# docs/{,en/,ru/}config/transports/hysteria.md)与源码一致, 也是扁平** —— 早期版本的注释曾
-# 声称"docs 写的是嵌套", 经 2026-09-20 复核(本地克隆全历史 + 当前上游 raw)确认**不成立**:
-# 该文件自 2026-01 引入以来从未出现嵌套形态(全历史 grep `"proxy": {` 为 0 命中)。
+# (v26.7.11 之前为 transport_internet.go)的 Masquerade 结构体逐字段核对 json tag。
+# Xray 官方文档(Xray-docs-next 的 transports/hysteria.md)与源码一致, 也是扁平; 早期注释
+# 曾声称"docs 写的是嵌套", 经 2026-09-20 复核(全历史 + 当前上游 raw)确认**不成立**。
 #
 # **嵌套形态属于另一个项目**: official Hysteria(HyNetworks)的 hysteria.json 才是
 # masquerade.file.dir / .proxy.url(见 app/cmd/server_test.yaml), 见 55-hysteria, 那边才是嵌套。
 # 两套实现不可互抄 —— 但理由是"两个不同的软件", 而不是"Xray 文档写错了"。
 #
-# 真机 v26.9.9 双向实测(证明扁平才是 Xray 要的形态):
-#     扁平 + url "ftp://bad"  → 启动即失败 "unknown scheme"(核心确实读了 url);
-#     嵌套 + url "ftp://bad"  → 正常启动(嵌套对象被 Go JSON 静默忽略 = 伪装静默失效)。
+# 真机 v26.9.9 双向实测(证明扁平才是 Xray 要的形态): 扁平 + url "ftp://bad" → 启动即失败
+# "unknown scheme"(核心确实读了 url); 嵌套 + 同 url → 正常启动(嵌套对象被 Go JSON 静默
+# 忽略 = 伪装静默失效)。
 #
 # 版本门控**分三段**(逐 tag 核对 infra/conf/transport_method.go 的 Masquerade 结构体 json tag
-# 与 transport/internet/hysteria/hub.go 的 scheme 分支。docs 与源码对 masquerade 的**字段形状**
-# 是一致的, 但**能力范围**随版本增长, 故门控依据必须是目标 tag 的源码, 不能只看 docs):
+# 与 transport/internet/hysteria/hub.go 的 scheme 分支。docs 与源码的**字段形状**一致, 但
+# **能力范围**随版本增长, 故门控依据必须是目标 tag 的源码, 不能只看 docs):
 #   >= v26.3.23  masquerade 本体(type/dir/url/rewriteHost/insecure/content/headers/statusCode)
-#                 —— v26.3.10 及更早无此字段; 该版本**没有 scheme 分支**, 故非 http(s) 的 url
-#                 会在**请求时**才失败(不阻断启动)
-#   >= v26.9.8   + unix socket(``case "", "unix":`` 走 DialContext)与 xForwarded 字段
-#                 —— 两者同 tag 引入(v26.7.28 及更早: 字段 8 个、无 unix 分支)
+#                —— v26.3.10 及更早无此字段; 该版本**没有 scheme 分支**, 故非 http(s) 的 url
+#                会在**请求时**才失败(不阻断启动)
+#   >= v26.9.8   + unix socket(``case "", "unix":`` 走 DialContext)与 xForwarded 字段(同 tag 引入)
 # 本脚本按"核心支持到什么就开放到什么"分层开放: unix/xForwarded 只在其门控通过时可选,
-# 不把支持范围硬编码得过窄(当前核心已支持的形态不该被 UI 阻断)。
+# 不把支持范围硬编码得过窄。
+# ---------------------------------------------------------------------------
 _HY2_MASQ_MIN_VER="26.3.23"
 _HY2_MASQ_UNIX_MIN_VER="26.9.8"
 _hy2_masq_supported() {
@@ -322,29 +306,21 @@ _hy2_masq_unix_supported() {
 
 # 已知字段全集(与**目标核心版本**的 Masquerade 结构体 json tag 逐字对应)。集合写入以此为准:
 # 先整体替换, 再把**非本脚本管理**的未知键原样搬回(用户或将来核心手工加过的字段不被吃掉),
-# 同时让上一形态的残留字段(proxy 切到 string 后遗留的 url 等)不再留在配置里 ——
+# 同时让上一形态的残留字段(proxy 切到 string 后遗留的 url 等)不再留在配置里 —— 残留不是无害
+# 噪声: 切回该形态时它会以旧值复活。
 #
-# **source 层与 docs 层的字段数不同, 不要混说(2026-09-20 实测)**:
-#   Xray-core 源码 `Masquerade` struct: 9 个(含 xForwarded);
-#   Xray-docs-next 三语的 `MasqObject`: **8 个, 未列出 xForwarded**(文档尚未跟上源码)。
+# **source 层与 docs 层的字段数不同, 不要混说**: Xray-core 源码 `Masquerade` struct 9 个(含
+# xForwarded); Xray-docs-next 三语的 `MasqObject` **8 个, 未列出 xForwarded**(文档尚未跟上源码)。
 # 本脚本以**源码**为准(功能由核心决定, 不由文档决定), 故用 9 个。
-# 残留不是无害噪声: 切回该形态时它会以旧值复活。
 XD_MASQ_KNOWN_KEYS_JSON='["type","dir","url","rewriteHost","xForwarded","insecure","content","headers","statusCode"]'
 
-# **本机核心实际支持**的已知字段表 —— 与常量表**故意不同**。
+# **本机核心实际支持**的已知字段表 —— 与全集表**故意不同**。
 #
-# 为什么必须按版本裁剪(而不是恒用全集): xForwarded 只有 >= v26.9.8 认。若在旧核心上仍把它当
-# "已知字段", 那么"集合替换"会拿 payload 里的 xForwarded:false 覆盖掉用户既有配置里的 true
-# (在旧核心上 UI 不会问它, 所以 payload 恒为 false)。残局:
-#
-#   v26.9.9 配好 xForwarded=true
-#     -> 用户切回旧核心(项目支持 stable/preview 通道切换, 切核心不动配置)
-#     -> 在旧核心上改一次 proxy 的其它参数
-#     -> xForwarded 被静默写成 false(永久丢失, 再升核心也不会自己回来)
-#
-# 这与本脚本"未管理字段原样保留"的承诺冲突。故旧核心上把它**从已知表里剔除**:
-# 它就成了 unknown key, 被原样搬回 —— 旧核心不消费它(写了也被 Go 静默忽略),
-# 而升级回新核心后用户原来的设置仍在。
+# 为什么必须按版本裁剪: xForwarded 只有 >= v26.9.8 认。旧核心上若仍把它当"已知字段", 集合
+# 替换会拿 payload 里恒为 false 的 xForwarded(旧核心 UI 不会问它)覆盖用户既有的 true; 且
+# 项目支持切核心不动配置, 用户切回旧核心改一次 proxy 再升级回去, 该值已永久丢失。故旧核心上
+# 把它**从已知表里剔除**: 它成为 unknown key 被原样搬回(旧核心不消费它, 写了也被 Go 静默
+# 忽略), 升级回新核心后用户设置仍在 —— 符合"未管理字段原样保留"的承诺。
 XD_MASQ_KNOWN_KEYS_BASE_JSON='["type","dir","url","rewriteHost","insecure","content","headers","statusCode"]'
 _hy2_masq_known_keys_json() {
     if _hy2_masq_unix_supported; then
@@ -419,9 +395,8 @@ _hy2_masq_desc() {
 # unix 绝对路径), **不是完整 URI 语法验证器** —— 不在 shell 里重写 RFC 3986。
 # 形如 "https://", "https://?x", "https://a.com:99999", "https://[bad" 之类的输入可能通过本层,
 # 由核心的 url.Parse 与 HTTP transport 在真实请求/启动时暴露(有 _mutate_config 的启动回滚兜底)。
-# 这样取舍是因为: 手写 parser 的误拒风险高于收益, 且这里只需挡住用户最常犯的错(漏 scheme、
-# 打错 scheme、unix 路径写成相对)。
-# 注意: 这些值最终经 jq --arg / --argjson 注入 config, JSON 转义由 jq 负责, 故**不**套用
+# 取舍: 手写 parser 的误拒风险高于收益, 这里只需挡住用户最常犯的错(漏/错 scheme、unix 相对路径)。
+# 注意: 这些值经 jq --arg / --argjson 注入 config, JSON 转义由 jq 负责, 故**不**套用
 # _validate_json_text: 那会连 HTML 里的 class="x" 引号一起拒绝, 而"固定字符串"伪装恰恰
 # 最可能是 HTML。这里只做语义校验。
 _hy2_masq_url_invalid() {
@@ -434,10 +409,9 @@ _hy2_masq_url_invalid() {
     #   http / https          => 普通反代(masquerade 本体自 v26.3.23 起存在)
     #   ""(裸绝对路径) / unix => Unix socket(v26.9.8 起, 核心用 DialContext 连 unix)
     #
-    # **版本行为务必分清(早期注释在这里写错过)**: `switch u.Scheme` 是 **v26.9.8 才加入**的。
-    # v26.3.23 ~ v26.7.28 的 hub.go **没有** scheme 分支 —— 任何 scheme 都被原样交给
-    # http.Transport, 所以非法 scheme 的失败会**推迟到实际代理请求时**, 而不是"启动即失败"。
-    # v26.9.8+ 才有 switch 并在 default 返回 "unknown scheme"(启动即失败)。
+    # **版本行为务必分清**: `switch u.Scheme` 是 **v26.9.8 才加入**的。v26.3.23 ~ v26.7.28 的
+    # hub.go **没有** scheme 分支 —— 任何 scheme 都被原样交给 http.Transport, 所以非法 scheme
+    # 的失败会**推迟到实际代理请求时**, 而不是"启动即失败"; v26.9.8+ 才有 default "unknown scheme"。
     # 故这里只放这三类, 不是因为"核心会启动即拒绝", 而是因为**只有这三类是有意义的输入**;
     # 真正决定能否用 unix 的是下面 _hy2_masq_unix_supported 的独立版本门控。
     scheme="${u%%://*}"
@@ -488,7 +462,7 @@ _hy2_masq_status_invalid() {
 # 解析一行 "名称: 值" 并合并进已累积的 headers JSON(参数 1)。
 # 成功: 输出**合并后**的 compact JSON; 失败: 输出原因文本并返回 1。
 # 用"逐行一条 + 空行结束"而不是逗号分隔: 响应头值本身可以含逗号
-# (如 Cache-Control: no-cache, no-store), 按逗号切会把它拆成两条非法头。
+# (如 Cache-Control: no-cache, no-store), 按逗号切会拆成两条非法头。
 _hy2_masq_headers_merge() {
     local h="$1" line="$2" name value
     case "$line" in
@@ -507,15 +481,14 @@ _hy2_masq_headers_merge() {
 
 # 三个形态的 payload 构造器(唯一入口)。全部用 jq -n --arg 拼装: 值里的引号/反斜杠/
 # 百分号由 jq 负责转义, 绝不手工拼串(手拼在 HTML 内容上必然出错)。
-# 只写该形态**用得上的**字段: type 之外的字段核心按 switch 分支各取所需, 写上无关字段
-# 只会让配置里的"上一形态残留"复活(见 XD_MASQ_JQ_SET 的注释)。
+# 只写该形态**用得上的**字段: 核心按 switch 分支各取所需, 写上无关字段只会让"上一形态残留"复活。
 _hy2_masq_json_file() {
     jq -nc --arg d "$1" '{type: "file", dir: $d}'
 }
 
 # $2/$3/$4 = rewriteHost / insecure / xForwarded(jq 布尔字面量 true|false)
 # xForwarded 只有 >= v26.9.8 的核心认(写入前有门控)。**只在核心支持时才写该键**:
-# 旧核心上写 xForwarded:false 会把用户既有的 true 覆盖掉(见 _hy2_masq_known_keys_json 的说明),
+# 旧核心上写 xForwarded:false 会覆盖用户既有的 true(见 _hy2_masq_known_keys_json),
 # 而该字段在旧核心上本就被 Go 静默忽略 —— 不写它才既不丢数据又不改变行为。
 _hy2_masq_json_proxy() {
     local xf="${4:-}"
@@ -543,17 +516,16 @@ _hy2_masq_json_string() {
 
 # 提交伪装变更。空 payload = 清除(默认 404)。
 # 备份 → jq → 原子替换 → verified-restart → 失败还原, 全部复用 _mutate_config 的既有
-# 事务机制(要求 6: 不另建第二条提交路径)。伪装是**单入站**属性, 不进 metadata、不影响
-# 分享链接与 clash 条目(客户端不关心服务端伪装), 故没有派生状态需要同步 —— 也因此
-# 不存在"元数据写失败要回滚 config"的第二阶段。
+# 事务机制(要求 6: 不另建第二条提交路径)。伪装是**单入站**属性, 不进 metadata、不影响分享
+# 链接与 clash 条目(客户端不关心服务端伪装), 无派生状态需同步, 也无"元数据写失败回滚 config"阶段。
 # 用法: _hy2_masq_apply <tag> <payload_json 或 "">
 _hy2_masq_apply() {
     local tag="$1" payload="${2:-}"
     if [ -z "$payload" ]; then
         _mutate_config --arg t "$tag" "$XD_MASQ_JQ_CLEAR"
     else
-        # known 表必须按**本机核心能力**取: 旧核心上把 xForwarded 排除在"已知"之外,
-        # 它才会作为 unknown key 被原样保留(而不是被 payload 的缺省值覆盖)。
+        # known 表必须按**本机核心能力**取(见 _hy2_masq_known_keys_json): 旧核心上把
+        # xForwarded 排除在"已知"之外, 它才会作为 unknown key 被原样保留。
         local known
         known=$(_hy2_masq_known_keys_json)
         _mutate_config --arg t "$tag" --argjson m "$payload" --argjson known "$known" "$XD_MASQ_JQ_SET"
@@ -686,21 +658,19 @@ _hy2_iptables_persist_files() {
 }
 
 # R38(P1)/R39(P1): 本机是否"**有证据表明**不存在任何 xray-deploy 端口跳跃规则"。
-# 用于给 _node_protocol_safe 的 fail-closed 提供一个可证伪的逃生口。
-# R39 收紧: 必须真的**看过** runtime, 才能说"没有规则"。
-#   "iptables 不可用 + 持久化文件不存在" 只是"我没有观察能力", 不等于"内核里没有规则":
-#   曾启用过 hop、规则已进内核、没装 iptables-persistent(无 rules.v4)、之后 iptables
-#   二进制被卸载 —— 此时规则仍在内核中转发流量, 而旧实现会返回 0(=已证明无规则),
-#   于是删除节点后留下无法追溯 dport 的孤儿 DNAT(metadata 也已被删)。
-# 证据来源(必须至少有一个可用的观察通道):
+# 给 _node_protocol_safe 的 fail-closed 提供可证伪的逃生口: 必须真的**看过** runtime,
+# 才能说"没有规则" —— "iptables 不可用 + 持久化文件不存在"只是"没有观察能力", 不等于
+# "内核里没有规则"(曾启用过 hop、规则已进内核、没装 iptables-persistent、iptables 又被
+# 卸载 ⇒ 旧实现返回 0 会留下无法追溯 dport 的孤儿 DNAT)。
+# 证据来源(至少一个可用观察通道):
 #   a) iptables -S 成功 -> 最权威, 直接看 runtime;
-#   b) iptables 不可用但内核 x_tables 从未装载过 nat 表 -> /proc/net/ip_tables_names
-#      不含 "nat"(文件不存在同样说明 x_tables 未被使用) => 内核里不可能有 nat 规则;
-#   c) 上面能确认无 runtime 规则后, 再看持久化文件(它们会在重启时被重新加载)。
+#   b) iptables 不可用但内核 x_tables 从未装载过 nat 表(/proc/net/ip_tables_names 不含
+#      "nat", 文件不存在同样说明未使用) => 内核里不可能有 nat 规则;
+#   c) 确认无 runtime 规则后, 再看持久化文件(它们会在重启时被重新加载)。
 # 任一通道都无法确认 => 返回 1(UNKNOWN, 按不安全处理), 由调用方拒绝并给出人工路径。
 # IPv6 NAT 统一观察口径(二十八轮 P2): remove / candidates / no_hop_rules_at_all 三个观察点
-# 共用同一判定, 避免下一个观察点再次漂移。**只走 stdout(三态)**, 调用方各自决定文案与动作:
-#   ip6tables = ip6tables 可用, 调用方必须自己查询(查询失败即 UNKNOWN)
+# 共用同一判定, 避免漂移。**只走 stdout(三态)**, 调用方各自决定文案与动作:
+#   ip6tables = 可用, 调用方必须自己查询(查询失败即 UNKNOWN)
 #   absent    = 无 ip6tables、无 nft, 且内核 ip6 x_tables 从未注册 nat 表 ⇒ 可证明无 IPv6 NAT
 #   unknown   = 无法证明(存在 nft / 注册了 nat 表 / 注册表读不到) ⇒ 调用方必须 fail-closed
 # `unknown` 的第二词是原因(nft|proc_nat|proc_unreadable), 仅供调用方给准确文案, 不参与判定。
@@ -744,11 +714,10 @@ _hy2_no_hop_rules_at_all() {
         esac
         runtime_clean=1
     else
-        # 无 iptables: 唯一可靠的替代证据是"内核 nat 表从未被使用过"。
-        # /proc/net/ip_tables_names 列出当前已注册的 iptables 表; 不含 nat(或文件不存在,
-        # 即 x_tables 未装载)时, 内核里不可能存在 nat PREROUTING 规则。
-        # 注意 nftables 后端(nft) 不体现在该文件里, 因此若 nft 存在而 iptables 不存在,
-        # 一律判 UNKNOWN —— 本项目只用 iptables 写规则, 但用户环境可能已迁移到 nft。
+        # 无 iptables 时唯一可靠的替代证据: 内核 nat 表从未被使用过。
+        # /proc/net/ip_tables_names 不含 nat(或文件不存在 = x_tables 未装载)⇒ 不可能有 nat 规则。
+        # nftables 后端不体现在该文件里, 故 nft 存在而 iptables 不存在时一律判 UNKNOWN
+        # (本项目只用 iptables 写规则, 但用户环境可能已迁移到 nft)。
         if command -v nft >/dev/null 2>&1; then
             _warn "iptables 不可用但检测到 nft, 无法确认是否存在跳跃规则"
             return 1
@@ -777,19 +746,18 @@ _hy2_no_hop_rules_at_all() {
 # 为多个范围添加 DNAT 规则(R16 幂等 + R17 跨节点冲突拒绝 + R19 -S 查询失败守卫):
 #   - 同 dport 且同目标端口已存在  -> 跳过(幂等, rollback/重试安全)
 #   - 同 dport 但目标端口不同      -> 拒绝(该范围已被其他节点占用, 避免两个 DNAT 规则并存)
-# R19: 每次调用只执行一次 iptables -S(整个 range 循环复用同一快照, 事务内一致视图),
+# R19: 每次调用只执行一次 iptables -S(整个 range 循环复用同一快照),
 #      且 -S 失败显式 return 1——绝不把"查不到规则"当成"无冲突"而继续 ADD(与 remove 同标准)。
-# R35(P1): stdout 输出"本次事务实际新增的 range"(每行一个, 即 CREATED 集合)。幂等跳过的
-#      既有规则绝不输出——调用方据此精确回滚本事务副作用, 而非按请求全量 remove(否则会误删
-#      事务开始前已存在的同 dport+同目标规则)。无需该输出的调用方应显式 >/dev/null。
-# R36(P2): CREATED 集合只表达"IPv4 侧副作用"。IPv6 为 best-effort(R14), 独立于 IPv4 检查/
-#      补建——即使 IPv4 已存在(幂等跳过)也继续尝试 IPv6, 避免"IPv6 曾失败就永久不再重试";
-#      IPv6 不进 CREATED、不参与 rollback ownership(移除仍靠 IPv4 幂等 skip 保护)。
+# R35(P1): stdout 输出"本次事务实际新增的 range"(CREATED 集合)。幂等跳过的既有规则绝不输出
+#      ——调用方据此精确回滚本事务副作用, 而非按请求全量 remove(会误删事务前已存在的规则)。
+# R36(P2): CREATED 只表达 IPv4 侧副作用。IPv6 为 best-effort(R14), 独立于 IPv4 检查/补建
+#      ——即使 IPv4 幂等跳过也继续尝试 IPv6, 避免"曾失败就永久不再重试"; IPv6 不进 CREATED、
+#      不参与 rollback ownership(移除仍靠 IPv4 幂等 skip 保护)。
 # 返回: 0 全部成功; 1 任一范围冲突/查询失败/添加失败
 _hy2_add_hop_rules() {
-    # 注意(R28, 设计边界): hop ownership 由 (dport, 目标端口) 构成, 记录在 iptables + 节点
-    # metadata(hop_ranges); 若节点 metadata 因外部事件丢失, 无法从 config 恢复 hop ownership,
-    # 不会自动清理对应 DNAT。这是已知限制(见 R25/R26 Known limitation), 非本函数可解。
+    # R28 设计边界: hop ownership 由 (dport, 目标端口) 构成, 记录在 iptables + metadata(hop_ranges);
+    # metadata 若因外部事件丢失, 无法从 config 恢复 ownership, 对应 DNAT 不会自动清理。
+    # 已知限制(见 R25/R26), 非本函数可解。
     local hy2_port="$1"; shift
     local range q v6ok="" v6q=""
     if ! q=$(iptables -t nat -S PREROUTING 2>/dev/null); then
@@ -845,10 +813,9 @@ _hy2_add_hop_rules() {
 # R17: 同时匹配 comment + dport + 目标端口, 保证跨节点隔离——不同节点即使 hop dport 重叠,
 #      删除本节点(目标端口 X)绝不误删他节点(目标端口 Y)的同 dport 规则。
 # R18: 目标端口用 _hy2_match_target 精确边界匹配; -S 查询失败显式报错, 不把"查不到"当"已删干净"。
-# 二十五轮 P1: **IPv6 不再 best-effort** —— ip6tables 可用时, 查询失败/删除失败/删除后残留
-# 都让本函数返回 1; ip6tables 不可用时用 `/proc/net/ip6_tables_names` 证明内核 ip6 nat 表从未
-# 注册(否则 UNKNOWN ⇒ 失败)。否则 IPv4 删干净而 IPv6 残留时函数仍返回 0, 上层继续删
-# metadata/config, 就制造出失去归属的 IPv6 orphan DNAT。
+# 二十五轮 P1: **IPv6 不再 best-effort** —— ip6tables 可用时, 查询/删除失败/删除后残留都返回 1;
+# ip6tables 不可用时须证明内核 ip6 nat 表从未注册(否则 UNKNOWN ⇒ 失败)。否则 IPv4 删干净而
+# IPv6 残留时函数仍返回 0, 上层继续删 metadata/config, 就制造出失去归属的 IPv6 orphan DNAT。
 # 返回: 0 双栈全部删除干净(或可证明不存在 IPv6 NAT); 1 任一 family 残留/查询失败/无法确认
 _hy2_remove_hop_rules() {
     local hy2_port="$1"; shift
@@ -927,17 +894,15 @@ _hy2_remove_hop_rules() {
 
 # 持久化 iptables 规则。R37(P1): IPv4 为 authoritative——save 失败返回 1(告知调用方
 # "重启后 IPv4 规则可能丢失", 事务必须回滚且不提交 metadata); IPv6 为 best-effort(R14)——save
-# 失败仅 _warn, 不决定事务成败。若把 IPv6 persistence 也设为 fatal, 而 IPv6 新增规则不在
-# CREATED/rollback ownership 内, 事务将因 IPv6 persist 失败而失败却无法回滚 IPv6 side effect。
+# 失败仅 _warn。若把 IPv6 persistence 也设为 fatal, 而 IPv6 新增规则不在 CREATED/rollback
+# ownership 内, 事务将因 IPv6 persist 失败而失败却无法回滚 IPv6 side effect。
 # 注意 ok 用 0=成功/1=失败(与 bash 退出码一致, 不要用 1=成功 + return "$ok" 的颠倒写法, R14)
 # 直接写采用 save -> tmp -> mv(R15): 避免 shell 先 truncate 目标文件再执行 save, save 失败把已有持久化规则清空
 _hy2_persist_iptables() {
     # R34(P1): 事务需要持久化时, 缺少 iptables-save 不是"无事发生"而是失败——
-    # 否则 metadata 提交 hop=enabled, 重启后 runtime DNAT 全丢, 直接违反
-    # "runtime/metadata 不分裂"原则。_ensure_iptables 只保证 iptables 存在,
-    # 不保证 iptables-save, 故必须在此显式 fail-closed。正常 enable/disable/
-    # retarget/delete 的事务都会因 rc1 回滚 runtime 且不提交 metadata; reset/uninstall
-    # 路径也必须保留现场并返回失败。
+    # 否则 metadata 提交 hop=enabled, 重启后 runtime DNAT 全丢, 违反"runtime/metadata 不分裂"。
+    # _ensure_iptables 只保证 iptables 存在, 不保证 iptables-save, 故必须在此显式 fail-closed。
+    # 正常事务会因 rc1 回滚 runtime 且不提交 metadata; reset/uninstall 也必须保留现场并返回失败。
     if ! command -v iptables-save >/dev/null 2>&1; then
         _error "iptables-save 不可用, 无法安全持久化端口跳跃规则(重启后规则会丢失)"
         return 1
@@ -1017,7 +982,6 @@ _hy2_persist_iptables() {
 # 调用方先纯内存生成 newmeta(完整新 metadata, 含 share_link; 失败则不进入事务)。
 # 用法: _hy2_hop_txn <add|remove> <meta> <newmeta> <port> <range...>
 # 返回: 0 全部成功提交; 1 任一步失败(已回滚 runtime 并重新持久化)
-# ---------------------------------------------------------------------------
 _hy2_hop_txn() {
     local op="$1" meta="$2" newmeta="$3" port="$4"; shift 4
     # 1+2. runtime 修改 + 原子持久化(失败自动回滚 runtime)
@@ -1109,10 +1073,9 @@ _hy2_hop_teardown() {
 }
 
 # 批量 teardown(多选/全部删除)。
-# R38(P1): 语义由"任一失败 → 整批取消"改为"逐项判定 → 坏项排除、其余照删"。
-#   原写法让一个损坏 metadata 就让"全部删除/多选删除"完全不可用(且报错文案是
-#   "端口跳跃规则清理失败", 与真实原因不符), 属拒绝服务。
-#   现在: 无法安全 teardown 的 tag 记入 _HY2_HOP_SKIP, 调用方必须把它们从删除集合里剔除;
+# R38(P1): 语义为"逐项判定 → 坏项排除、其余照删"(原"任一失败整批取消"会让一个损坏 metadata
+#   让"全部删除"完全不可用, 报错文案还与真实原因不符, 属拒绝服务)。
+#   无法安全 teardown 的 tag 记入 _HY2_HOP_SKIP, 调用方必须把它们从删除集合里剔除;
 #   已成功 teardown 的 tag 记入 _HY2_HOP_TD, 供 config 提交失败时整体回滚。
 #   每个失败项在 _hy2_hop_teardown 内部已自行恢复 runtime, 因此无需整批回滚。
 # 返回: 0 = 至少可以继续(调用方按 _HY2_HOP_SKIP 缩小集合); 1 = 全部被排除, 无事可做
@@ -1126,9 +1089,9 @@ _hy2_hop_teardown_all() {
     for tag in "$@"; do
         total=$((total+1))
         local proto hop_port ranges
-        # R30(P1): metadata 损坏/缺 protocol 不能当作"非 HY2"跳过 teardown, 否则节点随后
-        # 正常从 config 删除, hop DNAT 永久残留。_node_protocol_safe 在"确定本机无 hop 规则"
-        # 时会放行(见 R38), 无法确认时才拒绝。
+        # R30(P1): metadata 损坏/缺 protocol 不能当"非 HY2"跳过 teardown, 否则节点随后正常
+        # 从 config 删除, hop DNAT 永久残留。_node_protocol_safe 在"确定本机无 hop 规则"时
+        # 放行(见 R38), 无法确认时才拒绝。
         if ! proto=$(_node_protocol_safe "$tag"); then
             _HY2_HOP_SKIP+=("$tag")
             continue
@@ -1145,9 +1108,8 @@ _hy2_hop_teardown_all() {
             continue
         }
         # R31(P1): metadata.port 必须与 config 真实监听端口一致——否则 teardown 用错误目标
-        # 端口找不到(或误删)DNAT 规则, 留下 :<真实端口> 的孤儿规则。
-        # 仅当 config 存在该 inbound 时强制(真实删除流 inbound 必在 config; config 已无该
-        # inbound 说明已是孤儿/外部删除, metadata.port 仍是当初 add 用的正确清理目标)。
+        # 端口找不到(或误删)DNAT 规则。仅当 config 存在该 inbound 时强制; config 已无该 inbound
+        # 说明已是孤儿/外部删除, metadata.port 仍是当初 add 用的正确清理目标。
         local cfg_port
         cfg_port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' "$CONFIG_FILE" 2>/dev/null)
         if [ -n "$cfg_port" ] && [ "$cfg_port" != "$hop_port" ]; then
@@ -1200,9 +1162,9 @@ _hy2_filter_skipped() {
     done
 }
 
-# 恢复 _hy2_hop_teardown_all 已 teardown 的节点(幂等 add + 持久化), 用于 config 提交失败时的整体回滚
-# R18: 恢复失败的 tag 保留在 _HY2_HOP_TD 中(ROLLBACK_FAILED 状态), 只有全部恢复成功才清空,
-#      避免"已经报错但状态容器被清空、无法再重试"的问题
+# 恢复 _hy2_hop_teardown_all 已 teardown 的节点(幂等 add + 持久化), 用于 config 提交失败时整体回滚。
+# R18: 恢复失败的 tag 保留在 _HY2_HOP_TD(ROLLBACK_FAILED), 只有全部成功才清空, 避免报错后
+#      状态容器被清空而无法重试。
 _hy2_hop_restore_after_teardown() {
     local tag remain=()
     for tag in "${_HY2_HOP_TD[@]}"; do
@@ -1231,8 +1193,8 @@ _hy2_hop_retarget() {
         [ "$rok" = 1 ] && _error "旧端口规则恢复失败, 请手动检查 iptables"
         return 1
     fi
-    # R35(P1): created_new 只含本事务实际新增的 newport 规则(add 输出; 幂等跳过的既有
-    # 规则不在内), 后续失败回滚只清理 created_new, 绝不误删 retarget 前已存在的同目标规则
+    # R35(P1): created_new 只含本事务实际新增的 newport 规则(add 输出; 幂等跳过的既有规则
+    # 不在内), 后续失败回滚只清理它, 绝不误删 retarget 前已存在的同目标规则
     local created_new rc
     created_new=$(_hy2_add_hop_rules "$newport" "$@"); rc=$?
     if [ "$rc" != 0 ]; then
@@ -1260,8 +1222,8 @@ _hy2_hop_retarget() {
     return 0
 }
 
-# 在内存中生成完整新 metadata: 传入 hop 字段变换后的 hopmeta 内容, 重建分享链接(读临时文件, 因为
-# _rebuild_hy2_link 从文件读), 输出 newmeta(hop 字段 + 新 share_link)。失败返回 1(未落地任何文件)。
+# 在内存中生成完整新 metadata: 传入 hop 字段变换后的 hopmeta 内容, 重建分享链接(读临时文件,
+# 因为 _rebuild_hy2_link 从文件读), 输出 newmeta(hop 字段 + 新 share_link)。失败返回 1(未落地任何文件)。
 _hy2_gen_newmeta() {
     local meta="$1" hopmeta="$2" tmp_meta newlink rc
     tmp_meta=$(mktemp "${meta}.hop.XXXXXX") || return 1
@@ -1289,8 +1251,7 @@ _hy2_gen_port_newmeta() {
     newname=$(_rename_node_with_port "$name" "$oldport" "$newport")
     tmpm=$(mktemp "${meta}.port.XXXXXX") || return 1
     # 临时文件必须同时承载**新端口与新名称**: 链接的 #fragment 取 .name, 只改端口会让重建出的
-    # 链接停在旧名(实测 hop 改端口后 share_link 尾段仍是旧名, 而非 hop 路径给的是新名 ——
-    # 同一操作两条路径两种结果)。与 Reality 分支"临时文件承载新 port + 新 name 再重建"同源。
+    # 链接停在旧名。与 Reality 分支"临时文件承载新 port + 新 name 再重建"同源。
     jq --argjson p "$newport" --arg n "$newname" '.port=$p | .name=$n' "$meta" > "$tmpm" || { rm -f "$tmpm"; return 1; }
     newlink=$(_rebuild_hy2_link "$tmpm"); rc=$?
     # 同 _hy2_sync_derived: gecko 自定义尺寸 ⇒ 链接留空(正常); 元数据缺字段 ⇒ 拒绝
@@ -1415,11 +1376,10 @@ _read_hop_ranges() {    local meta="$1"
 }
 
 # R31/R32(P1,P2): HY2 删除/改端口前校验 hop metadata 可解析。区分"无 hop"与"metadata 损坏":
-# 所有 hop 字段缺失 → 无 hop(正常, 返回 0); 任一 hop 字段存在但内容不是合法 range
-# (纯数字 / 数字:数字) → 损坏(返回 1, 调用方必须中止操作)。R32(P2): 逐字段独立校验
-# (hop_ranges / udp_hop_ports / hop_start+hop_end), 不用 // 把它们当互斥字段——否则
-# hop_ranges="" 而 udp_hop_ports=坏数据会被漏过。正常 metadata 由启用时写入、禁用时 del,
-# 字段存在即必有合法内容, 因此空串/坏值一律判损坏。
+# 所有 hop 字段缺失 → 无 hop(返回 0); 任一 hop 字段存在但内容不是合法 range(纯数字 /
+# 数字:数字) → 损坏(返回 1, 调用方必须中止操作)。R32: 逐字段独立校验(hop_ranges /
+# udp_hop_ports / hop_start+hop_end), 不用 // 把它们当互斥字段——否则 hop_ranges="" 而
+# udp_hop_ports=坏数据会被漏过。字段存在即必有合法内容, 因此空串/坏值一律判损坏。
 _hy2_hop_meta_ok() {
     local tag="$1"
     local meta="$NODES_DIR/${tag}.json"
@@ -1506,15 +1466,14 @@ _hy2_list_all_hop_rules() {
 }
 
 # 打印"当前会被 `_hy2_cleanup_all_hops` 删除"的规则 spec, **每行带 family 前缀**:
-#   `4 -A PREROUTING ...`  (iptables)
-#   `6 -A PREROUTING ...`  (ip6tables)
+#   `4 -A PREROUTING ...`(iptables) / `6 -A PREROUTING ...`(ip6tables)
 # 单一来源: 清理函数用它做失败回滚的 `saved` 集合, reset 用它把恢复源写进 journal,
 # 两处不得各自再写一份(否则必然漂移)。
-# **为什么必须含 IPv6(二十四轮 P1)**: `_hy2_remove_hop_rules` 会同时删除 IPv4 与 IPv6 规则;
-# 恢复源只存 IPv4 时, "失败回滚/崩溃恢复"会把 IPv6 规则永久丢掉 —— 现场与清理前不一致。
-# **契约(二十一轮 P1-1)**: `0` = 已枚举(可能为空 —— 没有任何会被删除的节点时不必碰 iptables);
-# `1` = **存在**会被删除的 hop 节点却无法枚举(缺 iptables / 任一 family 的 `-S` 失败)。
-# 调用方在拿到 1 时必须 fail-closed: 恢复源建不起来就绝不允许继续删除 runtime 状态。
+# **为什么必须含 IPv6(二十四轮 P1)**: _hy2_remove_hop_rules 会同时删 IPv4 与 IPv6;
+# 恢复源只存 IPv4 时, "失败回滚/崩溃恢复"会把 IPv6 规则永久丢掉。
+# **契约(二十一轮 P1-1)**: 0 = 已枚举(可能为空 —— 没有会被删除的节点时不必碰 iptables);
+# 1 = **存在**会被删除的 hop 节点却无法枚举(缺 iptables / 任一 family 的 -S 失败)。
+# 拿到 1 时必须 fail-closed: 恢复源建不起来就绝不允许继续删除 runtime 状态。
 _hy2_hop_cleanup_candidates() {
     [ -d "$NODES_DIR" ] || return 0
     local f proto port ranges any=0
@@ -1568,10 +1527,9 @@ _hy2_hop_cleanup_candidates() {
 }
 
 # 恢复被删除的规则: 输入是 `_hy2_hop_cleanup_candidates` 的 `<4|6> <spec>` 行。
-# **只补当前不存在的 spec**, 已存在的不重复添加; 每次成功添加后刷新该 family 的快照
-# (二十一轮 P2: 否则重复的 spec 在第二次判定时仍被当作"不存在"而重复 `-A`)。
-# family 缺失/无法识别 ⇒ 失败(fail-closed, 绝不把未知行猜成 IPv4)。
-# 返回: 0=全部就位; 1=有失败或输入非法。
+# **只补当前不存在的 spec**; 每次成功添加后刷新该 family 的快照(二十一轮 P2: 否则重复的
+# spec 在第二次判定时仍被当作"不存在"而重复 `-A`)。family 缺失/无法识别 ⇒ 失败
+# (fail-closed, 绝不把未知行猜成 IPv4)。返回: 0=全部就位; 1=有失败或输入非法。
 _hy2_restore_hop_rules() {
     local line fam spec q="" cur_fam="" ok=0
     [ "$#" -gt 0 ] || return 0
@@ -1614,9 +1572,9 @@ _hy2_restore_hop_rules() {
 }
 
 # 回滚 + 重新持久化。0=规则已恢复**且**持久化已刷新; 1=回滚未完整收敛, 调用方必须保留现场。
-# **持久化失败不是 warning 而是失败**(二十一轮 P1-2): IPv4 持久化在本项目是 authoritative,
-# "runtime 恢复但磁盘仍是删除后状态"会在重启后再次丢失规则; 返回 0 会让 reset/恢复把
-# journal 删掉, 从此失去唯一的恢复源。返回 1 时 journal 会保留, 下次启动继续重试。
+# **持久化失败不是 warning 而是失败**(二十一轮 P1-2): IPv4 持久化是 authoritative,
+# "runtime 恢复但磁盘仍是删除后状态"会在重启后再次丢失; 返回 0 会让 reset/恢复把 journal
+# 删掉, 失去唯一的恢复源。返回 1 时 journal 保留, 下次启动继续重试。
 _hy2_restore_hop_rules_checked() {
     [ "$#" -gt 0 ] || return 0
     if ! _hy2_restore_hop_rules "$@"; then
@@ -1632,11 +1590,10 @@ _hy2_restore_hop_rules_checked() {
 
 # 清理所有节点的端口跳跃 iptables 规则。
 #
-# **失败即回滚**(二十轮 P1-2/P1-3): 逐个节点删除时, 任一后续步骤失败都会让"已删除的规则"
-# 停留在 runtime 而 metadata 仍在 —— 这正是项目一直在防的 metadata↔runtime 分裂。故本函数
-# 先把候选 spec 全量捕获, 失败(删除残留/持久化失败/全局核验失败)时按 spec 回补缺失项并
-# 重新持久化, 使失败返回时的现场与调用前一致。崩溃(SIGKILL)窗口不在本函数内闭环: reset 把
-# 候选 spec 写进自己的 journal, 由启动恢复回补; uninstall 无 journal, 该窗口作为已知残余声明。
+# **失败即回滚**(二十轮 P1-2/P1-3): 逐个删除时任一后续步骤失败, 都会让已删规则停留在
+# runtime 而 metadata 仍在(metadata↔runtime 分裂)。故先把候选 spec 全量捕获, 失败时按 spec
+# 回补缺失项并重新持久化, 使返回时的现场与调用前一致。崩溃(SIGKILL)窗口: reset 把候选 spec
+# 写进自己的 journal 由启动恢复回补; uninstall 无 journal, 该窗口作为已知残余声明。
 _hy2_cleanup_all_hops() {
     local found=0 residual=0 metadata_hop=0
     local saved=()
@@ -1645,8 +1602,8 @@ _hy2_cleanup_all_hops() {
         metadata_hop=1
     fi
     if [ "$metadata_hop" -eq 1 ] && ! command -v iptables >/dev/null 2>&1; then
-        # metadata says this deployment owns hop rules, but there is no way to issue the
-        # precise -D commands or verify runtime state. Preserve the deployment tree.
+        # metadata says we own hop rules, but cannot issue precise -D or verify runtime:
+        # preserve the deployment tree.
         _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
         return 1
     fi
@@ -1737,9 +1694,8 @@ _input_port() {
 }
 
 # 为 tunnel inbound(仅监听 127.0.0.1)生成一个排除已知冲突的随机端口(F9)。
-# 原 `_gen_random_port` 裸输出: 撞上已占用端口/已在 config 的端口/与 $1 指定端口相同
-# 时, verified-restart 会失败回滚, 用户只见"创建失败"。重试 20 次; 极端情况下仍放行
-# 随机值, 由 _mutate_config 的 verified-restart 兜底。
+# 原 `_gen_random_port` 裸输出撞上占用/已配置/排除端口时, verified-restart 会失败回滚,
+# 用户只见"创建失败"。重试 20 次; 极端情况仍放行随机值, 由 verified-restart 兜底。
 # 用法: tport=$(_gen_free_tunnel_port [exclude_port])
 _gen_free_tunnel_port() {
     local exclude="${1:-}" i r
@@ -1863,10 +1819,9 @@ _render_template() {
 # 并发防护(F5): 全体修改经 _with_config_lock 串行化, 实际事务体在 _mutate_config_locked。
 # ---------------------------------------------------------------------------
 _mutate_config() {
-    # 二十八轮 P2: 存在未收敛的 reset 事务日志时, 禁止任何常规配置写入 —— 事务现场(账本+快照)
-    # 必须由 `_reset_config_recover` 收敛后再谈别的改动, 否则在"半重置"的 config/metadata 上
-    # 继续叠加, 会让恢复源与真实状态进一步分叉。恢复成功后账本被删除, 本门禁自动解除
-    # (看盘上事实, 不用粘滞标志)。`_reset_config_*` 自身不经过本函数, 不受影响。
+    # 二十八轮 P2: 存在未收敛的 reset 事务日志时禁止任何常规配置写入 —— 事务现场(账本+快照)
+    # 必须由 _reset_config_recover 收敛, 否则在"半重置"状态上叠加会让恢复源进一步分叉。
+    # 恢复成功后账本被删, 本门禁自动解除(看盘上事实, 不用粘滞标志)。_reset_config_* 不受影响。
     if declare -F _reset_journal_path >/dev/null 2>&1 && [ -e "$(_reset_journal_path 2>/dev/null)" ]; then
         _error "存在未收敛的 reset 事务日志, 已阻止本次配置修改; 请重启脚本以收敛(或先修复现场)"
         return 1
@@ -1874,11 +1829,10 @@ _mutate_config() {
     _with_config_lock _mutate_config_locked "$@"
 }
 
-# config 写入的核心屏障(复审 P1, 2026-09-26): 闸门检查 + backup/jq/mv + verified restart
-# 必须整体处于**同一个 core lock 临界区**, 否则检查通过后、真正写 config 前, 另一会话仍可
-# 启动核心事务并留下未收敛账本(BLOCKED/replacing/…), 而后续 `_restart_xray_verified`
-# 不重新检查 pending ⇒ "未收敛禁止普通写入"被 TOCTOU 绕过。屏障实现见 00-common 的
-# `_with_config_write_barrier`(同一包装也用于 normalize/auto_tag/adopt 等直写入口)。
+# config 写入的核心屏障(复审 P1, 2026-09-26): 闸门检查 + backup/jq/mv + verified restart 必须
+# 整体处于**同一个 core lock 临界区**, 否则检查通过后、真正写 config 前, 另一会话仍可启动核心
+# 事务并留下未收敛账本, 而 _restart_xray_verified 不重新检查 pending ⇒ 闸门被 TOCTOU 绕过。
+# 屏障实现见 00-common 的 `_with_config_write_barrier`(也用于 normalize/auto_tag/adopt 等)。
 _mutate_config_locked() {
     _with_config_write_barrier _mutate_config_write "$@"
 }
@@ -1921,8 +1875,8 @@ _mutate_config_write() {
         _error "配置替换失败, 保留旧配置"
         return 1
     fi
-    # 低内存 VPS: 不再预跑 xray -test —— 它会与运行中的实例同时加载两份二进制+geo, 触发 OOM。
-    # 改为重启后校验服务是否稳定在运行态; 坏配置/被 OOM 都会导致启动失败并回滚旧配置。
+    # 低内存 VPS: 不预跑 xray -test(会与运行实例同时加载两份二进制+geo 触发 OOM),
+    # 改为重启后校验服务稳定在运行态; 坏配置/被 OOM 都会启动失败并回滚旧配置。
     if ! _restart_xray_verified; then
         _error "xray 启动失败,回滚配置"
         if ! _restore_config; then
@@ -1957,12 +1911,11 @@ _commit_reality_inbound() {
 
 # ---------------------------------------------------------------------------
 # 新增节点的原子提交(三十一轮 P1-①)。
-# **问题**: 原流程是 `_commit_inbound`(config, 自带锁) → 释放锁 → 交互/拼装 → `_save_node_meta`。
-# 两步之间没有锁, 并发的"全部删除"会在锁内重新枚举 metadata(还看不到新节点), `.inbounds = []`
-# 把刚提交的入站一并清掉, 随后 metadata 才落地 ⇒ config/metadata 分裂(hop 节点还会留 orphan DNAT)。
-# **契约**: 所有交互(端口/域名/连接地址/证书)必须在本函数**之前**完成; 本函数在 config lock 内
-# 一次性完成 config 提交 + metadata 落盘(+ 派生 YAML), **metadata 失败时回滚刚插入的 config**,
-# 绝不留 orphan。`_mutate_config` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 不会自锁死。
+# **契约**: 所有交互(端口/域名/连接地址/证书)必须在本函数**之前**完成; 本函数在 config lock
+# 内一次性完成 config 提交 + metadata 落盘(+ 派生 YAML), **metadata 失败时回滚刚插入的
+# config**, 绝不留 orphan。原两段式(先提交 config 后写 metadata)之间无锁, 并发的"全部删除"
+# 会重新枚举 metadata(还看不到新节点)而把刚提交的入站清掉 ⇒ config/metadata 分裂(hop 节点
+# 还留 orphan DNAT)。`_mutate_config` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 不会自锁死。
 # ---------------------------------------------------------------------------
 _commit_node_txn() {            # <tag> <inbound_json> <meta_json> [<clash_line> <name>]
     _with_config_lock _commit_node_txn_locked "$@"
@@ -1999,9 +1952,9 @@ _commit_reality_node_txn() {    # <tag> <tunnel_json> <reality_json> <tunnel_tag
 }
 
 # ---------------------------------------------------------------------------
-# Hysteria2 新增事务(三十二轮 P1): 自签证书的 snapshot/生成作用在**固定共享路径**
-# `$CERT_DIR/$tag` 上, 必须与占用校验、config/metadata 提交在同一把 config lock 内 —— 否则两个
-# 会话同时创建同一端口时, 后失败者的 `_hy2_cert_rollback` 会还原/删除先成功者正在使用的证书。
+# Hysteria2 新增事务(三十二轮 P1): 自签证书 snapshot/生成作用于**固定共享路径** `$CERT_DIR/$tag`,
+# 必须与占用校验、config/metadata 提交在同一把 config lock 内 —— 否则两会话同时创建同一端口时,
+# 后失败者的 `_hy2_cert_rollback` 会还原/删除先成功者正在使用的证书。
 # 参数: <tag> <name> <addr> <port> <listen> <auth> <sni> <self_signed> <self_domain>
 #       <congestion> <brutal_up> <brutal_down> <obfs_type> <obfs_pw> <obfs_size> <cert_file> <key_file>
 # 锁内顺序: 占用校验(tag/name) → 证书准备 → 渲染 → config+metadata → 成功后丢弃证书快照。
@@ -2058,10 +2011,9 @@ _commit_hy2_node_txn_locked() {
             fi
             cert_dirty="true"
         fi
-        # SNI 以**证书实际身份**为准 —— 现代 TLS 认 SAN, 故优先取 SAN 的 DNS 名(与 Xray
-        # 官方 tls.md「serverName 需存在于证书 SAN 中」一致), 无 SAN 才回退 CN(兼容手工
-        # 签发的 CN-only 证书); 都没有(无 openssl)则回退**本次输入域名** —— 绝不能退回
-        # 无关的硬编码默认值(那会让 sni 与实际证书、与用户输入三方脱节)。
+        # SNI 以**证书实际身份**为准: 优先 SAN 的 DNS 名(与 Xray 官方 tls.md「serverName 需
+        # 存在于证书 SAN 中」一致), 无 SAN 回退 CN(兼容手工 CN-only 证书); 都没有(无 openssl)
+        # 回退**本次输入域名** —— 绝不能退回无关的硬编码默认值(会让 sni 与实际证书、用户输入脱节)。
         local self_cert_domain
         self_cert_domain=$(_hy2_cert_domain "$cert_file" "$self_domain")
         sni=${self_cert_domain:-$self_domain}
@@ -2190,30 +2142,25 @@ _prompt_reality_mode() {
     done
 }
 
-# 判定已存在 Reality 节点的部署模式 —— 全项目唯一入口, 下游(改端口/域名切换/采纳)
-# 只允许通过本函数判模式, 不得各自散写推断。
-# 用法: mode=$(_reality_node_mode <tag>)   stdout 恒为 "tunnel" 或 "direct", 返回 0。
+# 判定已存在 Reality 节点的部署模式 —— 全项目唯一入口, 下游(改端口/域名切换/采纳)只允许
+# 通过本函数判模式, 不得各自散写推断。
+# 用法: mode=$(_reality_node_mode <tag>); stdout 恒为 "tunnel"|"direct", 返回 0。
 #
-# 判定原则: config 的 realitySettings.target 是实际运行状态, metadata 是声明的身份。
-# metadata 只是"提示", 必须与 config 交叉校验; 任何不一致一律回退到保守侧 tunnel
-# (tunnel 分支保留 R41 的 fail-closed, direct 分支会跳过 tunnel/路由一致性检查,
-# 所以"无法确定"绝不能判成 direct —— 否则 metadata 被外部改坏时改端口会漏改 tunnel)。
+# 判定原则: config 的 realitySettings.target 是实际运行状态, metadata 是声明的身份; 必须交叉
+# 校验, 任何不一致一律回退保守侧 tunnel(tunnel 分支保留 R41 fail-closed, direct 分支会跳过
+# tunnel/路由一致性检查, 所以"无法确定"绝不能判成 direct —— 否则 metadata 被外部改坏时改端口
+# 会漏改 tunnel)。
 #
 # 优先级:
-#   1. 先读 config realitySettings.target, 归为三类:
-#        target 缺失 / 无端口段 / 端口非数字   => unknown(旧版/手工配置, 保守)
-#        主机回环                              => tunnel
-#        其它主机                              => direct
-#   2. metadata reality_mode 必须是 direct|tunnel 之一才参与交叉校验(非法值视同无该字段):
-#        direct + config=direct              => direct(一致)
-#        direct + config≠direct              => _warn 冲突, 回退 tunnel(fail-closed)
-#        tunnel + config∈{tunnel,unknown}    => tunnel(一致/保守)
-#        tunnel + config=direct              => _warn 冲突, 回退 tunnel(fail-closed)
-#   3. metadata 无(或非法)reality_mode: tunnel_tag 非空 ⇒ tunnel; 否则按第 1 步的 config 归类。
+#   1. config realitySettings.target 归三类: 缺失/无端口段/端口非数字 => unknown(保守);
+#      主机回环 => tunnel; 其它主机 => direct。
+#   2. metadata reality_mode 仅 direct|tunnel 才参与交叉校验(非法值视同无该字段):
+#        direct + config=direct => direct(一致); direct + config≠direct => _warn + tunnel(fail-closed);
+#        tunnel + config∈{tunnel,unknown} => tunnel; tunnel + config=direct => _warn + tunnel(fail-closed)。
+#   3. metadata 无(或非法)reality_mode: tunnel_tag 非空 ⇒ tunnel; 否则按第 1 步 config 归类。
 #   4. 都读不到 ⇒ tunnel(保守)。
-# 为什么非法值必须忽略而不是原样返回: 本函数契约是 stdout 恒为 "tunnel"|"direct",
-# 下游只按这两个值分支; 原样返回 "foobar" 会形成第 3 种模式, 改端口/域名切换/删除/采纳
-# 全部行为未定义。
+# 非法值必须忽略而不能原样返回: 契约是 stdout 恒为两个值, 下游只按这两个值分支; 原样返回
+# "foobar" 会形成第 3 种模式, 改端口/域名切换/删除/采纳全部行为未定义。
 _reality_node_mode() {
     local tag="$1" meta mode ttag target host port cfg_mode
     meta="$NODES_DIR/${tag}.json"
@@ -2264,10 +2211,9 @@ _reality_node_mode() {
     return 0
 }
 
-# target 主机是否为回环(tunnel 模式的 target 恒为 127.0.0.0/8:<tunnel_port>)
-# R42 复审(P2): 只认 127.0.0.1 会把 127.0.0.2/127.10.x.x 等合法 IPv4 回环误判成 direct,
-# 从而绕过 tunnel 分支的 fail-closed。这里把整个 127.0.0.0/8 纳入(带 0-255 段校验),
-# 另保留 ::1 / localhost。
+# target 主机是否为回环(tunnel 模式的 target 恒为 127.0.0.0/8:<tunnel_port>)。
+# R42 复审(P2): 只认 127.0.0.1 会把 127.0.0.2/127.10.x.x 等合法回环误判成 direct, 绕过
+# tunnel 分支 fail-closed。这里纳入整个 127.0.0.0/8(带 0-255 段校验), 另保留 ::1 / localhost。
 _is_reality_loopback_host() {
     case "$1" in
         "127.0.0.1"|"::1"|"localhost") return 0 ;;
@@ -2284,18 +2230,14 @@ _is_reality_loopback_host() {
 
 # ---------------------------------------------------------------------------
 # 保存节点元数据(每节点独立文件)
-# 用法:_save_node_meta <tag> <json_object>
+# 用法: _save_node_meta <tag> <json_object>
 #
-# **本函数刻意不接"未收敛事务"写闸门/屏障**(复审 P2-2), 理由三条:
-#   ① 它写的是**元数据声明**, 权威状态是 config.json。两类调用点: 事务提交路径
-#      (`_commit_node_txn_locked` / `_commit_reality_node_txn_locked`)在**闸门化的 config
-#      提交之后**才调用 —— 此时若再拒绝元数据写入, 只会制造 config/metadata 分裂, 而且
-#      回滚路径(`_mutate_config`)本身也被闸门拦下(拒绝 = 分裂); metadata-only 的采纳路径
-#      已在 `_adopt_single_inbound_write` 的屏障+闸门内。
-#   ② 通用原语 `_meta_update` 还被**事务账本**(coretxn journal / reset journal)使用,
-#      对它加写闸门会自锁账本机制 —— 只能按"写入点是不是权威 config"逐个判定。
-#   ③ core recovery 不读写节点 metadata, 二者没有共享可变状态, 不存在"未收敛核心事务 +
-#      元数据写入"的破坏性竞争(经调用链核实, 非推测)。
+# **刻意不接"未收敛事务"写闸门/屏障**(复审 P2-2): ① 它写的是**元数据声明**, 权威状态是
+# config.json; 事务提交路径在闸门化的 config 提交**之后**才调用它, 再拒绝只会制造
+# config/metadata 分裂(回滚路径 _mutate_config 本身也被闸门拦下); metadata-only 的采纳路径
+# 已在 _adopt_single_inbound_write 的屏障+闸门内。② 通用原语 `_meta_update` 还被事务账本
+# (coretxn / reset journal)使用, 加写闸门会自锁账本机制。③ core recovery 不读写节点 metadata,
+# 二者无共享可变状态, 不存在"未收敛核心事务 + 元数据写入"的破坏性竞争(经调用链核实)。
 # ---------------------------------------------------------------------------
 _save_node_meta() {
     local tag="$1" json="$2"
@@ -2311,18 +2253,15 @@ _save_node_meta() {
     return 0
 }
 
-# R20: 节点名称唯一性校验。Clash/Mihomo 代理名必须唯一(重复名会导致配置无效);
-# 同时本项目 clash.yaml 按 name 删除(YAML 单行 flow 条目), name 唯一才能保证删除精确、
-# 不会误删同名节点。tag 是文件级稳定身份, name 是显示名——唯一性约束使二者在该场景一致。
-# R38(P1): 不可读的 metadata 不再整体 fail —— 原写法让"任意一个损坏文件"永久阻断
-# 所有新建节点(即使新名字与任何现存节点都不冲突), 这是拒绝服务而非安全。
-# 现改为: 损坏文件跳过并告警(它的 name 未知, 无法参与比较), 只有"确实读到同名"才拒绝。
-# R39(P2) 语义声明 —— **唯一性在存在损坏 metadata 时降级为 best-effort**:
-#   损坏文件里可能恰好存着同名节点, 本函数无从得知, 因此不能声称"name 全局唯一"。
-#   影响面: clash.yaml 按 name 删除时可能同时删掉两条同名条目(clash.yaml 属可再生的
-#   派生导出, 权威身份始终是 tag/nodes/<tag>.json), 不会影响 config.json 与节点本体。
-#   取舍理由: "一个坏文件让所有新建失败" 的代价远大于 "极小概率的派生缓存重名"。
-#   调用方若需要严格唯一, 必须先修复/移除损坏的 metadata(本函数已把数量告知用户)。
+# R20: 节点名称唯一性校验。Clash/Mihomo 代理名必须唯一(重复名使配置无效); clash.yaml 又按
+# name 删除, 唯一才能保证删除精确。tag 是文件级稳定身份, name 是显示名。
+# R38(P1): 损坏 metadata 不再整体 fail(那会让一个坏文件永久阻断所有新建, 属拒绝服务);
+# 改为跳过并告警, 只有"确实读到同名"才拒绝。
+# R39(P2) 语义声明 —— **存在损坏 metadata 时唯一性降级为 best-effort**: 损坏文件里可能恰好
+# 存着同名节点而本函数无从得知, 故不能声称"name 全局唯一"。影响面仅限 clash.yaml(可再生的
+# 派生导出, 按 name 删除时可能同时删掉两条同名条目), 不影响 config.json 与节点本体。
+# 取舍: "一个坏文件让所有新建失败"的代价远大于"极小概率的派生缓存重名"。调用方需要严格
+# 唯一时必须先修复/移除损坏的 metadata(本函数已把数量告知用户)。
 # 返回: 0 唯一(或无法确认); 1 确实已存在(调用方应中止创建)
 _ensure_unique_name() {
     local name="$1" f n rc bad=0
@@ -2362,8 +2301,8 @@ _ask_link_addr() {
         _warn "未能自动获取公网 IP,请手动填写客户端连接地址(公网IP或域名)"
         while true; do
             local addr
-            # RT-1 同类: 管道驱动/会话异常的 EOF 下 read 立即返回且 addr 恒空, 无守卫会死循环刷告警。
-            # EOF 即无法再获得输入, 显式 return 1 让调用方按"孤儿入站"惯例中止(5 个调用点均校验)。
+            # EOF(管道驱动/会话异常)下 read 立即返回且 addr 恒空, 无守卫会死循环刷告警;
+            # 显式 return 1, 调用方按"孤儿入站"惯例中止(5 个调用点均校验)。
             read -rp "  客户端连接地址: " addr || return 1
             [ -n "$addr" ] && { echo "$addr"; return 0; }
             _warn "不能为空"
@@ -2380,10 +2319,10 @@ _node_count() {
 }
 
 # ---------------------------------------------------------------------------
-# 节点身份指纹(三十一轮 P1-②): 删除的"选择/确认"在锁外完成, 锁内必须证明**还是同一个节点**。
-# tag 只是文件名: 并发"删除 + 重建同名节点"后, 锁内的 tag 会指向另一个节点 —— 直接按 tag 删除
-# 会合法地误删别人刚建的节点。指纹取 metadata 全文 + config 中该节点(含 tunnel_tag)的入站,
-# 经 jq -S 归一化后 cksum —— 内容级身份, 删/重建/改端口/换域名都会变 ⇒ 调用方 fail-closed。
+# 节点身份指纹(三十一轮 P1-②): 删除的"选择/确认"在锁外完成, 锁内必须证明**还是同一个节点**
+# (tag 只是文件名, 并发"删除+重建同名节点"后直接按 tag 删会误删别人刚建的节点)。指纹取
+# metadata 全文 + config 中该节点(含 tunnel_tag)的入站, 经 jq -S 归一化后 cksum ——
+# 删/重建/改端口/换域名都会变 ⇒ 调用方 fail-closed。
 # 输出: "<crc>:<bytes>"(stdout); 无法读取 metadata/config 时返回 1。
 # ---------------------------------------------------------------------------
 _node_identity() {
@@ -2435,12 +2374,11 @@ _tag_is_managed() {
 }
 
 # ---------------------------------------------------------------------------
-# 给 config.json 中无 tag 的入站自动分配 tag
-# 有 port: manual-<port> (如 manual-443)
-# Unix socket: manual-<socket文件名去后缀> (如 manual-xrxh-socket)
+# 给 config.json 中无 tag 的入站自动分配 tag:
+# 有 port: manual-<port> (如 manual-443); Unix socket: manual-<socket文件名去后缀>
 # ---------------------------------------------------------------------------
-# 三十三轮 P1: "读入站 → 计算新 tag → 原子写回"的 RMW 必须持 config lock, 否则与并发节点事务
-# 互相覆盖(启动期自动执行, 是真实竞态面)。锁可重入, 被其它持锁路径调用时不会自锁。
+# 三十三轮 P1: "读入站 → 计算新 tag → 原子写回"的 RMW 必须持 config lock, 否则与并发节点
+# 事务互相覆盖(启动期自动执行, 是真实竞态面)。锁可重入, 其它持锁路径调用不会自锁。
 _auto_tag_tagless_inbounds() {
     [ -f "$CONFIG_FILE" ] || return 0
     _with_config_lock _auto_tag_tagless_inbounds_locked
@@ -2516,11 +2454,10 @@ _auto_tag_tagless_inbounds_write() {
 }
 
 # ---------------------------------------------------------------------------
-# R23/R26: 由 Reality 主入站唯一关联其 tunnel 入站 tag。关联键必须唯一:
-# 多个 Reality 节点可共用同一 SNI(默认 www.amd.com), SNI/rewriteAddress 不唯一。
+# R23/R26: 由 Reality 主入站唯一关联其 tunnel 入站 tag。关联键必须唯一: 多个 Reality 可共用
+# 同一 SNI(默认 www.amd.com), SNI/rewriteAddress 不唯一。
 # 主键: realitySettings.target = "127.0.0.1:<tunnel_port>" 与 tunnel 入站 .port 一一对应。
-# 兜底(target 缺失, 旧版/手工配置): tunnel tag = "Tunnel-<sni>-<tport>-<reality_port>",
-# 末段是本节点 port(端口唯一), 按 tag 后缀匹配, 同样无 SNI 歧义。
+# 兜底(target 缺失, 旧版/手工配置): 按 tag 后缀 "-<reality_port>" 匹配(端口唯一, 无 SNI 歧义)。
 # 用法: tag=$(_find_reality_tunnel_tag <reality_tag>); 非 Reality 或无 tunnel 输出空。
 # 返回码三态(R28): 0=唯一关联(stdout=tunnel_tag) 1=无关联(stdout 空) 2=歧义(stdout 空, 禁止 fallback)
 # ---------------------------------------------------------------------------

@@ -21,9 +21,8 @@ _xray_arch_asset() {
 
 # ---------------------------------------------------------------------------
 # 通过 GitHub API 取指定通道最新 release 的 tag
-#   stable  : releases/latest(prerelease=false 的最新正式版)
-#   preview : releases 列表里 prerelease=true 的最新一个
-# 用 jq 解析(避免 busybox grep -E 对扩展正则的兼容问题); curl 失败兜底 wget
+#   stable: releases/latest; preview: releases 里最新的 prerelease
+# jq 解析(busybox grep -E 兼容性差); curl 失败兜底 wget
 # ---------------------------------------------------------------------------
 _xray_fetch_tag() {
     local channel="$1" body tag
@@ -44,15 +43,10 @@ _xray_fetch_tag() {
             [ -z "$body" ] && return 1
             # 优先 jq: 第一个 prerelease==true 的 tag_name
             tag=$(echo "$body" | jq -r '[.[] | select(.prerelease == true)] | .[0].tag_name // empty' 2>/dev/null)
-            # 兜底(无 jq): 记住"最近一次出现的 tag_name", 遇到 "prerelease": true 就输出它。
-            # 旧的 `grep -B5` 把窗口写死成 5 行 —— 一旦 API 在 tag_name 与 prerelease 之间
-            # 多插几个字段(或改成紧凑输出), 就会取到隔壁 release 的 tag 或取不到, 用户被装上
-            # 错误版本却毫无提示。按"最近一个 tag_name"取值只依赖对象内的字段先后(GitHub 的
-            # 稳定顺序), 不依赖行距。
+            # 兜底(无 jq): 记住"最近一个 tag_name", 遇到 prerelease:true 即输出 —— 只依赖对象
+            # 内字段先后(GitHub 稳定顺序), 不依赖行距(旧 grep -B5 固定窗口会取错版本)。
             if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-                # 先按对象边界把每个 release 拆到独立行, 否则紧凑单行 JSON 会被当成一行:
-                # 贪婪的 sub(/.*"tag_name".../) 只保留**最后一个** tag_name, 于是第一个
-                # prerelease:true 会拿到错误(但非空)的 tag, 通过末尾的 [ -n ] 守卫, 静默装错版本。
+                # 先按对象边界拆行; 否则紧凑单行 JSON 里贪婪的 sub 只保留最后一个 tag_name。
                 tag=$(printf '%s' "$body" | awk '
                     # 先按对象边界把每个 release 拆成独立记录, 再逐记录扫描。
                     # 用 awk 的 gsub+split 而不是 sed: sed 的替换串里带换行在不同实现上
@@ -87,12 +81,9 @@ _xray_fetch_tag() {
 }
 
 # ---------------------------------------------------------------------------
-# 版本号规范化(安装指定版本用): 接受 v26.3.27 / 26.3.27, 输出 GitHub release tag
-# "v26.3.27"; 非法输入返回 1。
-# Xray 的 release tag 恒为 vMAJOR.MINOR.PATCH(实测 v1.8.24 ~ v26.9.9 全部三段数字),
-# 因此只认三段数字, 不猜别名/前缀/范围(与 _hysteria_canon_version 同口径, 但保留 v 前缀
-# 作为 tag —— Xray 存进 state 的 version 由安装后的二进制反推, 不带 v)。
-# 只裁首尾空白, 不裁内部 —— 内部有空格的输入本就不是版本号, 应如实拒绝而不是"修复"。
+# 版本号规范化的唯一入口: 接受 v26.3.27 / 26.3.27, 输出 tag "v26.3.27"; 非法输入返回 1。
+# Xray release tag 恒为 vMAJOR.MINOR.PATCH, 只认三段数字, 不猜别名/前缀/范围
+# (与 _hysteria_canon_version 同口径)。只裁首尾空白, 内部空格如实拒绝。
 # ---------------------------------------------------------------------------
 _xray_canon_tag() {
     local v="${1:-}"
@@ -112,22 +103,19 @@ _xray_current_version() {
 }
 
 # ---------------------------------------------------------------------------
-# 版本门控: 当前已安装核心是否 >= 最低要求。用法: _xray_version_ge "26.7.11"
-# 背景(R44): docs 描述 main 分支, 领先于已发布核心 —— config 新字段(env/geodata 等)在旧
-# 核心上被 Go JSON 静默忽略, 按 docs 无脑写入会让功能"静默失效"。故新特性落地前必须对照
-# 目标发布版本, 这里用纯数字三段比较(version 输出形如 26.9.9), 不用 sort -V(busybox 兼容性)。
-# 未安装/版本读不到 → 返回 1(不满足), 调用方回退到保守行为。
+# 版本门控: 当前核心是否 >= 最低要求。用法: _xray_version_ge "26.7.11"
+# R44: docs 领先于已发布核心, config 新字段(env/geodata 等)在旧核心上被 Go JSON 静默忽略
+# ⇒ 新特性必须按目标发布版本门控。纯数字三段比较(不用 sort -V, busybox 兼容)。
+# 未安装/版本读不到/畸形版本 → 返回 1(fail-closed), 调用方走旧核心路径。
 # ---------------------------------------------------------------------------
 _xray_version_ge() {
     local min="$1" cur i x y
     cur=$(_xray_current_version 2>/dev/null)
     [ -n "$cur" ] || return 1
-    # 两侧都可能带 "v" 前缀。先统一剥掉前缀；格式不完整时下面的
-    # strict checks fail closed instead of guessing through a feature gate.
+    # 两侧都可能带 "v" 前缀, 先剥掉。
+    # 版本门控绝不猜畸形输入: 畸形版本 = 未知能力, 调用方必须走旧核心路径。
     cur="${cur#v}"; cur="${cur#V}"
     min="${min#v}"; min="${min#V}"
-    # Version gates must never guess through malformed input. A malformed
-    # version is an unknown capability, so callers must take the old-core path.
     [[ "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     [[ "$min" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     local -a a b
@@ -170,12 +158,10 @@ _maybe_drop_caches() {
 }
 
 # ---------------------------------------------------------------------------
-# 下载完整性校验(2026-09-12 审查 F2, 对齐官方 Xray-install install-release.sh
-# L442-459 的 .dgst 方案; singbox-lite xray_manager 同款)。
-# Xray release 的 <url>.dgst 为多行文本, 形如 "SHA2-256= <hex>"(实测), 
+# 下载完整性校验(2026-09-12 审查 F2, 对齐官方 Xray-install 的 .dgst 方案)。
+# Xray release 的 <url>.dgst 为多行文本, 形如 "SHA2-256= <hex>"; 
 # _dgst_sha256_of 取 sha+256 行最后一个字段并只留 hex, 供单测。
-# 校验失败/解析异常/sha256sum 缺失一律 fail-closed —— 宁可中止升级, 不落地
-# 未校验的二进制(docs/security-audit.md 曾认定".dgst 不可行", 系误判, 已纠正)。
+# 校验失败/解析异常/sha256sum 缺失一律 fail-closed(官方所有 release tag 都有 .dgst)。
 # ---------------------------------------------------------------------------
 
 # 从 .dgst 文本文件解析 SHA256(hex, 64 位); 解析不出输出空串
@@ -210,10 +196,9 @@ _xray_verify_sha256() {
     return 0
 }
 
-# 阶段一(十二轮 P2-③): **只做取件, 不碰任何共享状态** —— 下载/校验/解压全部落在自己独有的
-# staging 目录里, 因此**不需要核心锁**。锁只包住第二阶段(_xray_commit_staged), 于是
-# "另一个会话在下载 40s"不会把本会话拖成 15s 锁超时。
-# 成功时把 staging 目录路径打到 stdout(调用方持有它直到提交或放弃)。
+# 阶段一(十二轮 P2-③): **只做取件, 不碰任何共享状态** —— 下载/校验/解压全落在自有 staging
+# 目录, 因此**不需要核心锁**(锁只包住阶段二 _xray_commit_staged), 下载 40s 不会把别人拖成
+# 15s 锁超时。成功时把 staging 路径打到 stdout。
 _xray_stage_release() {
     local tag="$1"
     local asset tmp_dir tmp_zip
@@ -226,17 +211,14 @@ _xray_stage_release() {
     command -v unzip >/dev/null 2>&1 || _pkg_install unzip || return 1
 
     local dl_url="https://github.com/XTLS/Xray-core/releases/download/${tag}/${asset}"
-    # 临时目录必须与目标二进制**同一文件系统**(2026-09-22 十轮 P1-②)。默认的 /tmp 常与
-    # /opt 分属不同挂载, 而跨文件系统的 `mv` 会退化成"拷贝 + unlink": 中途 ENOSPC/IO 错误时
-    # 目标已被**截断**, 下面那句"mv 失败 ⇒ 旧二进制仍在原位 ⇒ .bak 可以删"的前提就不成立,
-    # 于是唯一的旧核心备份被删掉、盘上留半截新二进制。实测(写限额触发 ENOSPC): 跨 fs 的
-    # `mv` 把 8MB 目标截成 2048B 后才报错, 源文件仍在 —— 即失败后**新旧都不可用**。
+    # 临时目录必须与目标二进制**同一文件系统**(十轮 P1-②)。默认 /tmp 常与 /opt 分属不同挂载,
+    # 跨 fs 的 `mv` 会退化成"拷贝 + unlink": 中途 ENOSPC 时目标已被截断, 而"mv 失败 ⇒ 旧二进制
+    # 仍在原位 ⇒ .bak 可删"的前提随之失效(实测 8MB 目标被截成 2048B, 新旧都不可用)。
     # 放进 $BIN_DIR 后 mv 走 rename(2): 失败时旧文件要么原样、要么已完整替换, 无中间态。
-    # 不自动清理历史残留目录: 并发会话正在下载的 staging 与 SIGKILL 残留无法区分,
-    # 误删会让对方的替换凭空失败(install.sh 的 .install-rollback 同款取舍, 见 CLAUDE.md)。
-    # mktemp -d 失败必须中止 —— 与 30-geo.sh 的 Geo 更新同款: tmp_dir="" 会让
-    # tmp_zip="/xray.zip" 落到系统根目录, 且后续 [ ! -f "/xray" ] / mv -f "/xray" "$XRAY_BIN"
-    # 可能把根目录下恰好同名的文件当成新核心搬走。磁盘满/只读/inode 耗尽正是本 PR 关注的场景。
+    # 不自动清理历史残留目录: 并发下载的 staging 与 SIGKILL 残留无法区分, 误删会让对方失败
+    # (同 install.sh 的 .install-rollback 取舍)。
+    # mktemp -d 失败必须中止: tmp_dir="" 会让 tmp_zip 落到系统根目录, 且后续 mv 可能把根目录下
+    # 恰好同名的文件当新核心搬走(磁盘满/只读/inode 耗尽正是要防的场景)。
     mkdir -p "$BIN_DIR" || { _error "无法创建 $BIN_DIR, 核心替换中止"; return 1; }
     tmp_dir=$(mktemp -d "${BIN_DIR}/.xray-dl.XXXXXX") \
         || { _error "无法在 $BIN_DIR 创建临时目录(磁盘满/只读/inode 耗尽?), 核心替换中止"; return 1; }
@@ -259,7 +241,7 @@ _xray_stage_release() {
         rm -rf "$tmp_dir"
         return 1
     fi
-    # 立即删除 zip 文件(低内存 VPS 上, 多余的 20MB 无论是占 tmpfs 还是占磁盘都该立刻还回去)
+    # 立即删 zip(低内存 VPS: 多余的 20MB 无论占 tmpfs 还是磁盘都尽快还回去)
     rm -f "$tmp_zip"
     if [ ! -f "${tmp_dir}/xray" ]; then
         _error "压缩包内未找到 xray 二进制"
@@ -267,36 +249,32 @@ _xray_stage_release() {
         return 1
     fi
 
-    # 取件阶段到此为止 —— 共享状态(二进制/服务/geo dat)一律留到第二阶段的锁内处理。
-    # geo dat 从 staging 里就位, 由第二阶段带快照地提交(P2-②)。
+    # 取件到此为止: 共享状态(二进制/服务/geo dat)一律留到阶段二的锁内处理。
+    # geo dat 从 staging 就位, 由阶段二带快照地提交(P2-②)。
     printf '%s' "$tmp_dir"
     return 0
 }
 
-# 阶段二(锁内): 用 staging 里的产物**提交**这次替换。所有共享状态改动都在这里。
-# 返回 0 = 二进制已就位(还没验证服务); 1 = 失败(调用方按既有回滚路径处理)。
+# 阶段二(锁内): 用 staging 提交替换。所有共享状态改动都在这里。
 # 用法: _xray_commit_staged <staging目录>
-# 返回三态(十四轮协议): **调用方必须消费返回码**, 不得把所有非 0 都当成"没动过":
-#   0 = replacing 阶段的 mutation batch 完成(binary/geo 已就位, 尚未验证服务)
+# 返回三态(调用方必须消费, 不得把所有非 0 都当成"没动过"):
+#   0 = mutation batch 完成(binary/geo 已就位, 尚未验证服务)
 #   1 = staging 不可用, 或 phase barrier 明确仍停在 snapshotted; 未 stop/未触碰生产文件
-#   3 = replacing 已 durable, 后续 mutation 可能部分发生; caller 必须运行 journal recovery
+#   3 = replacing 已 durable, mutation 可能部分发生; caller 必须运行 journal recovery
 # 从 replacing 到恢复完成前, journal 与 snapshots 均不得由调用方直接丢弃。
-# Commit helper is entered only after all recovery sources are snapshotted.
-# Return contract (caller must consume): 0=mutation stage completed; 1=journal confirms no mutation
-# started; 3=mutation may have begun or phase durability is uncertain, so journal recovery is mandatory.
 _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutation never started; 3=recovery required
     local tmp_dir="$1" j binbak pre gd tmp phase
     [ -d "$tmp_dir" ] && [ -f "${tmp_dir}/xray" ] || {
         _error "staging 目录不可用: ${tmp_dir:-（空）}"; return 1; }
     j=$(_xray_core_journal_path)
-    # **Phase barrier**(十四轮 P1-①): replacing 在第一条真实 mutation(包括 stop)之前 durable 落盘。
-    # 若写入/回读失败, 重新读 journal 区分确定未推进(1)与落盘状态不明(3); 两条路径都尚未 stop。
+    # **Phase barrier**(十四轮 P1-①): replacing 必须在第一条真实 mutation(含 stop)之前 durable。
+    # 写入/回读失败时重读 journal: 确定未推进(1)与落盘状态不明(3); 两条路径都尚未 stop。
     if ! _xray_core_journal_phase "replacing"; then
         phase=$(jq -r '.phase // empty' "$j" 2>/dev/null) || phase=""
         [ "$phase" = snapshotted ] && return 1
         return 3
     fi
-    # 从此 phase 起任何失败都 return 3, 外层只能交给 journal recovery, 不得 drop 账本/快照。
+    # 从此 phase 起任何失败都 return 3: 外层只能交给 journal recovery, 不得 drop 账本/快照。
     if ! _xray_stop_and_verify; then
         _error "切换前未能确认 Xray 已停止"
         return 3
@@ -320,8 +298,8 @@ _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutatio
         return 3
     fi
 
-    # geo assets 是同一事务的真实状态; snapshotted phase 之前已为每个 dat 建好唯一快照。
-    # live 文件用同目录 temp + cmp + rename, 任何失败统一 return 3 交给 rollback。
+    # geo dat 是同一事务的真实状态; 快照在 snapshotted 之前已建好。同目录 temp + cmp + rename,
+    # 任何失败统一 return 3 交给 rollback。
     for gd in geoip.dat geosite.dat; do
         [ -f "${tmp_dir}/${gd}" ] || continue
         tmp=$(mktemp "${ASSET_DIR}/.${gd}.coretxn-new.XXXXXX") || {
@@ -343,8 +321,8 @@ _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutatio
     return 0
 }
 # ---------------------------------------------------------------------------
-# geo dat 的事务侧恢复(十四轮协议): rollback 始终从 journal 指向的事务唯一快照重放;
-# 删除快照统一由 _xray_core_cleanup_sources 执行, 并在删 journal 前检查所有残留。
+# geo dat 的事务侧恢复: rollback 始终从 journal 指向的事务唯一快照重放;
+# 快照删除统一由 _xray_core_cleanup_sources 执行(删 journal 前检查全部残留)。
 # ---------------------------------------------------------------------------
 _xref_snapshot_geo_dats() {  # <journal> -- unique transaction paths are recorded in the journal
     local j="$1" gd src bak pre hash
@@ -409,8 +387,7 @@ _xref_restore_geo_dats() {  # <journal> -- retain snapshot sources until rolled_
 
 # ---------------------------------------------------------------------------
 # 定时重启执行体(cron 调用: xd timed-restart)
-# 逻辑: 基础文件检查 → restart → 记录日志
-# 注意: 低内存机器上 cron 维护路径不预跑 xray -test, 避免额外加载二进制+geo
+# 基础文件检查 → restart → 记录日志; 低内存机器不预跑 xray -test(避免双份二进制+geo OOM)
 # ---------------------------------------------------------------------------
 _timed_restart_do() {
     local log_file="$LOG_DIR/timed-restart.log"
@@ -448,34 +425,26 @@ _ensure_xray_symlink() {
 }
 
 # ---------------------------------------------------------------------------
-# 核心切换失败时的**统一还原入口**(2026-09-22 九轮 OCR #15)。
+# 核心切换失败时的**统一还原入口**(九轮 OCR #15)。
 #
-# 背景: `_xray_commit_staged` 在**校验第 2..N 步之前**就把 $XRAY_BIN 换成了新二进制,
-# 旧的那个只存在于 `$XRAY_BIN.bak`。于是"替换之后、提交之前"的任何一步失败(配置初始化 /
-# service 文件生成 / 稳定运行确认)都必须把三者一起还原:
-#   1. `$XRAY_BIN.bak` → `$XRAY_BIN`(磁盘上是旧核心)
-#   2. service 文件写回替换前的那一份(十轮 P1-④) —— 否则"旧核心 + 半截/多余注入的 unit"
-#      仍是坏组合: 例如旧核心需要 `Environment=XRAY_LOCATION_ASSET`, 而被写坏的新 unit 没有,
-#      还原了二进制也起不来
-#   3. 重启(尽力; 失败只告警 —— 此时正确性优先于可用性)
-#   4. state 的 version/channel 写回**替换前**的值, 描述"磁盘上实际那个二进制"
+# `_xray_commit_staged` 在**校验第 2..N 步之前**就把 $XRAY_BIN 换成新二进制, 旧的只在
+# `$XRAY_BIN.bak`。此后任何一步失败(配置初始化 / service 生成 / 稳定运行确认)都必须一起还原:
+#   1. `$XRAY_BIN.bak` → `$XRAY_BIN`
+#   2. service 文件写回替换前那份(十轮 P1-④)—— unit 里的 `Environment=XRAY_LOCATION_ASSET`
+#      按核心版本门控注入, "旧核心 + 半截 unit"仍起不来, 只还原二进制不够
+#   3. 重启(尽力; 失败只告警 —— 正确性优先于可用性)
+#   4. state version/channel 写回**替换前**的值
 #
-# 为什么做成函数而不是在三处各写一遍: 三段的判据必须逐字一致(有无 `.bak`、要不要重启、
-# state 写什么), 而项目里"同一条件在各调用点各自解释"已被反复证明会漂移(见 _rename_node_*
-# 与 _reality_node_mode 的取舍)。差异部分由参数表达: `$3=binary_kept` 表示"无 .bak 可还原,
-# 新二进制保留在盘上", 此时 state 记新版本是**准确的**。
+# 做成函数而非三处各写: 三段判据必须逐字一致(有无 `.bak`、要不要重启、state 写什么)。
+# `$3=binary_kept` = "无 .bak 可还原, 新二进制保留在盘上", 此时 state 记新版本是准确的。
 #
 # 用法: _xray_restore_prev_bin <旧版本号> <旧通道> [binary_kept]
-#   返回 0 = **完整**还原到旧核心(二进制 + service 都回到改动前);
+#   返回 0 = **完整**还原(二进制 + service 都回到改动前);
 #        1 = 无 .bak(新二进制保留), 或二进制本身没还原成功;
-#        2 = 二进制已还原但 **service 没能还原**(见下, 是刻意区分的第三态)。
-#
-# **为什么 service 状态必须进返回码(2026-09-22 十一轮 P1-①)**: 旧写法三处都写
-# `_xray_service_restore_prev || true`, 于是"unit 还原失败"被吞掉后照样 restart、照样写
-# 旧 version/channel、照样 `return 0` —— 调用方据此认为回滚成功, 而盘上可能是
-# "旧二进制 + 新/损坏 unit"。这不是显示问题: unit 里的 `Environment=XRAY_LOCATION_ASSET`
-# 按核心版本门控注入, 旧核心配错 unit 会直接起不来(geo dat 找不到)。
-# 判据因此改为: **两侧都还原成功才算 0**。
+#        2 = 二进制已还原但 **service 没能还原**(刻意区分的第三态)。
+# **为什么 service 必须进返回码(十一轮 P1-①)**: 旧写法三处 `... || true` 吞掉 unit 还原失败
+# 后照样 return 0, 而盘上可能是"旧二进制 + 新/损坏 unit", 旧核心会直接起不来。
+# 判据: **两侧都还原成功才算 0**。
 # ---------------------------------------------------------------------------
 _xray_restore_prev_bin() {
     local cur="$1" prev_channel="${2:-}" binary_kept="${3:-}"
@@ -531,33 +500,25 @@ _xray_restore_prev_bin() {
 }
 
 # ---------------------------------------------------------------------------
-# 核心与运行实例的**互斥锁**(2026-09-22 十一轮 P2-③, 本轮纳入 Geo 与 service control)。
+# 核心与运行实例的**互斥锁**(十一轮 P2-③, 纳入 Geo 与 service control)。
 #
-# 同一把锁串行化核心 binary/service 事务、独立 Geo dat commit, 以及 start/stop/restart 和
-# 完整的 restart/stop liveness 观察。否则普通服务控制可穿插在 rollback 的 stop→restore→start
-# 中间, 让 recovery 失去对运行实例的独占控制。下载与网络等待仍在锁外。
+# 同一把锁串行化核心 binary/service 事务、独立 Geo dat commit, 以及 start/stop/restart 和完整的
+# liveness 观察; 下载与网络等待仍在锁外。
 #
-# 与 config 锁的关系: 两把**独立**的锁(`<lock-root>/core.lock` / `<lock-root>/config.lock`,
-# 锁根为 /var/lock/xray-deploy, 0.18.1 起)。
-# 两把主锁都在锁根(部署目录之外), 旧版 L1(部署父目录)/L2(部署目录内)路径仅作跨版本协调。
-# 普通配置事务的完整顺序是 install → config → core; 核心事务只取 core, 没有反向边, 所以不会成环。
+# 与 config 锁是两把**独立**的锁(`<lock-root>/core.lock` / `config.lock`, 锁根 /var/lock/xray-deploy,
+# 0.18.1 起)。普通配置事务顺序 install → config → core; 核心事务只取 core, 无反向边 ⇒ 不成环。
 # `_uninstall_xray` 与 reset 都按 install → config → core 持锁直到部署目录删除/重建完成。
 #
 # flock 锁 fd 必须动态分配并**在派生服务进程时关闭**(`{fd}>&-`): 写死 fd 会与 _with_config_lock
-# 的 fd 9 相撞(install.sh 实测过这类相撞会静默释放锁); 不关闭则被 supervise-daemon/nohup
-# 起的 xray 进程继承 —— 守护进程不退, 锁永不释放, 后续所有切换白等 15s 超时。
-# 无 flock 的裁剪版 BusyBox 使用锁根下 `core.lock.d` mkdir 锁, 发现残留立即拒绝并要求人工清理;
-# 不自动接管, 避免并发读写 PID 与删除目录造成双重放行。
-# 实测: `sleep 30 {fd}>&- &` 后父进程退出, 锁立即免费; 不关闭则被子进程持有。
-# 因此 `_manage_xray` 派生守护进程时用 `$` 一并关闭: 未持锁时它退化为
-# 关掉那个同样没在用的 fd 9(实测 no-op 且 rc=0), 持锁时则精确关掉锁 fd。
+# 的 fd 9 相撞; 不关闭则被 supervise-daemon/nohup 起的进程继承 —— 守护进程不退, 锁永不释放,
+# 后续所有切换白等 15s 超时。无 flock 的裁剪版 BusyBox 用锁根下 `core.lock.d` mkdir 锁,
+# 发现残留立即拒绝并要求人工清理; **不自动接管**, 避免双重放行。
 # ---------------------------------------------------------------------------
-# 未持锁时的默认值: 9 只用于关闭"服务进程继承的 fd"(该 fd 本就不存在, no-op)。
-# **释放后必须复位成 9**(十六轮 P2-①): `exec {CORE_LOCK_FD}>>` 会把动态分配的真实 fd 号写进这个
-# **全局**变量, 关闭 fd 并不会把它改回来。若不复位, 之后任何**未持锁**的调用者(如 _manage_xray
-# 派生守护进程时按 `${CORE_LOCK_FD:-9}` 关 fd)就会拿着上个事务残留的号去关一个**与本项目无关**
-# 的 fd —— 那个号可能已被无关代码占用。锁内使用真实号、锁外恒为 9, 才能让"关错 fd"在结构上
-# 不可能发生。复位点与 fd 关闭点成对出现(见下方四处 `_xray_core_lock_fd_reset`)。
+# 未持锁时默认值 9 只用于关闭"服务进程继承的 fd"(该 fd 本就不存在, no-op)。
+# **释放后必须复位成 9**(十六轮 P2-①): `exec {CORE_LOCK_FD}>>` 把动态分配的真实 fd 号写进这个
+# **全局**变量, 关闭 fd 不会把它改回来。不复位则之后**未持锁**的调用者会拿着上个事务残留的号
+# 去关一个**与本项目无关**的 fd。锁内使用真实号、锁外恒为 9, "关错 fd"才在结构上不可能发生;
+# 复位点与 fd 关闭点成对出现(见下方四处 `_xray_core_lock_fd_reset`)。
 # ---------------------------------------------------------------------------
 export CORE_LOCK_FD=9      # 未持锁时恒为 9: 只用于关闭服务进程继承的 fd(no-op)
 # 关闭核心锁 fd 并把全局复位到 9。**每次关闭都必须调用它**, 否则动态号会残留到下次未持锁的调用。
@@ -569,43 +530,38 @@ _xray_core_lock_fd_reset() {
 }
 
 # ---------------------------------------------------------------------------
-# 卸载侧对**旧版锁路径**的跨版本协调(2026-09-23 十五轮; 2026-09-26 十六轮扩为两层)。
+# 卸载侧对**旧版锁路径**的跨版本协调(十五轮; 十六轮扩为两层)。
 #
-# 旧版把核心锁与安装锁放在别处: L2(0.17.11 / PR #48 早期 HEAD)在 `$DEPLOY_DIR` **内**
+# 旧版锁位置: L2(0.17.11 / PR #48 早期 HEAD)在 `$DEPLOY_DIR` **内**
 # (`$DEPLOY_DIR/.core.lock` + `.install.lock.fd` / `.install.lock`), L1(0.17.13/0.18.0)在部署
-# 父目录(`.<name>.core.lock` / `.install.lock[.fd]`); 新版主锁搬到锁根 /var/lock/xray-deploy
-# (卸载 `rm -rf` 不会把锁文件拆成新旧 inode)。只持新锁**排斥不了旧版进程** —— 旧版只认
-# 自己那条路径。故取到主锁后必须对**已存在**的旧路径再协调(不存在则跳过, 不凭空重建 /opt 旧锁)。**后端不能按本机环境猜**(十七轮 P1-2):
-# 旧进程当时用的是 flock 还是 mkdir, 与本机现在
-# 有没有 `flock` 无关, 故两条路径都要检查:
-#   · 有 flock ⇒ 先看旧 mkdir 目录是否存在(存在即拒绝), 再 flock 旧文件(旧 flock 后端互斥);
-#     旧文件已存在时用**见证 fd** 记下 inode 并在打开后复核身份(见 `_xray_legacy_lock_identity_ok`),
-#     "路径存在→被删→新建 inode"的 TOCTOU 因此被拒绝; 文件不存在时才跑 /proc 删除树扫描。
-#   · 无 flock ⇒ 先用 `/proc` 扫描旧 flock 文件是否被他人打开, 再 mkdir 旧目录(目录将新建时
-#     同样先跑删除树扫描)。
-# 任一条显示占用/残留一律 fail-closed。**不删别人的锁**: 旧路径下的残留是别人的现场,
-# 只提示人工清理。**旧 mkdir 目录(L1 树外也一样)会被占位**: 在持锁期间创建同名标记目录,
-# 让旧无-flock 进程的 mkdir 失败 —— 否则"只检查不占位"会留下"旧进程在检查之后启动并进入"
-# 的真实窗口(复审四 P1)。标记在释放时删除, 因此 /opt 不留持久产物; SIGKILL 残留按
-# `.witness` 自愈或拒绝。**仍然存在的残局**: 旧 flock 文件(.fd)缺失时绝不新建它(持久污染),
-# 故一个"旧 flock 后端进程在新版检查之后才启动"的窗口无法封住 —— 与"旧进程在新版释放后
-# 才启动"同属无法结构性消除的残余。
-#
-# **未闭环的残局(必须如实说明, 不当作已消失)**: 旧版进程若在我们释放锁之后才启动, 或在
-# `$DEPLOY_DIR` 已被删除后重建目录内的旧锁路径, 新版无从协调 —— 新版不能为一个已卸载的目录
-# 永久保留占位锁(那会让"卸载后重装"永远拒绝)。跨版本竞态因此是"窗口大幅收窄 + fail-closed",
-# 不是"结构性消除"; 结构性消除只存在于同版本(全部进程都走父目录稳定锁)之后。
+# 父目录(`.<name>.core.lock` / `.install.lock[.fd]`); 新版主锁在锁根 /var/lock/xray-deploy
+# (卸载 `rm -rf` 不会把锁文件拆成新旧 inode)。只持新锁**排斥不了旧版进程**(旧版只认自己那条
+# 路径), 故取到主锁后对**已存在**的旧路径再协调(不存在则跳过, 不凭空重建 /opt 旧锁)。
+# **后端不能按本机环境猜**(十七轮 P1-2): 旧进程当时用 flock 还是 mkdir 与本机现在有没有
+# `flock` 无关, 两条路径都要检查:
+#   · 有 flock ⇒ 先看旧 mkdir 目录是否存在(存在即拒绝), 再 flock 旧文件; 旧文件已存在时用
+#     **见证 fd** 记下 inode 并在打开后复核身份(见 `_xray_legacy_lock_identity_ok`),
+#     拒绝"路径存在→被删→新建 inode"的 TOCTOU; 文件不存在时才跑 /proc 删除树扫描。
+#   · 无 flock ⇒ 先用 `/proc` 扫描旧 flock 文件是否被他人打开, 再 mkdir 旧目录(同样先扫删除树)。
+# 任一条显示占用/残留一律 fail-closed。**不删别人的锁**。**旧 mkdir 目录(L1 树外也一样)会被
+# 占位**: 持锁期间创建同名标记目录, 让旧无-flock 进程的 mkdir 失败(否则"只检查不占位"会留下
+# "旧进程在检查之后启动并进入"的窗口, 复审四 P1)。标记释放时删除, /opt 不留持久产物;
+# SIGKILL 残留按 `.witness` 自愈或拒绝。
+# **未闭环的残局(必须如实说明)**: 旧 flock 文件(.fd)缺失时绝不新建(持久污染), 故"旧 flock
+# 后端进程在新版检查之后才启动"的窗口无法封住 —— 与"旧进程在新版释放后才启动"同属残余。
+# 跨版本竞态因此是"窗口大幅收窄 + fail-closed", 不是"结构性消除"; 结构性消除只存在于
+# 同版本(全部进程都走父目录稳定锁)之后。
+# ---------------------------------------------------------------------------
 _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkdir目录> <显示名>
     local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i owner="" ef lrc locked=0
     local witness="" deploy_dir devino
-    # **变量名按锁家族分开**: 卸载要同时持 install 锁与 core 锁, 两者都要协调各自的旧路径;
-    # 共用一个全局会让后取的覆盖先取的, 先取那把 fd 再也没人关闭/解锁(锁泄漏到进程退出)。
+    # **变量名按锁家族分开**: 卸载要同时持 install 锁与 core 锁, 共用全局会让后取的覆盖先取的,
+    # 先取那把 fd 再没人关闭/解锁(锁泄漏到进程退出)。
     eval "$fdvar=\"\""
     eval "$dirvar=\"\""
-    # 旧 mkdir 标记对 L1(树外 /opt/.xray-deploy.*)与 L2(树内 $DEPLOY_DIR/.*)**一视同仁地创建**:
-    # 只"检查不占位"留了一个真实窗口 —— 旧无-flock 进程可在新版检查之后 `mkdir "$ldir"` 并进入
-    # 临界区(复审四 P1)。标记在释放时删除, 因此 /opt 不留持久产物(SIGKILL 残留与 L2 同语义:
-    # 有匹配 witness 可自愈, 否则拒绝并要求人工清理)。
+    # 旧 mkdir 标记对 L1(树外 /opt/.xray-deploy.*)与 L2(树内)**一视同仁地创建**: 只"检查不占位"
+    # 留了真实窗口 —— 旧无-flock 进程可在检查之后 mkdir 并进入临界区(复审四 P1)。标记释放时删除;
+    # 有匹配 witness 的 SIGKILL 残留可自愈, 否则拒绝并要求人工清理。
     # **旧 flock 文件(.fd)缺失时仍然绝不新建** —— 那是持久污染(复审 P2), 见下。
     if command -v flock >/dev/null 2>&1; then
         # (T1) 旧 flock 文件不存在 ⇒ **绝不为了"协调"新建它**(否则又把锁文件写回 /opt)。
@@ -629,8 +585,8 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
             return 1
         fi
         eval "ef=\${${fdvar}}"
-        # (T2) 见证身份: 打开的 fd 必须就是 T1 看到的那个 inode。路径"存在→被删→新建"的
-        # TOCTOU 里, 只看路径会让新 inode 通过, 而旧进程的 flock 落在已删除的旧 inode 上。
+        # (T2) 见证身份: 打开的 fd 必须就是 T1 看到的那个 inode —— 只看路径会让"存在→被删→
+        # 新建"的新 inode 通过, 而旧进程的 flock 落在已删除的旧 inode 上。
         if [ -n "$witness" ]; then
             if ! _xray_legacy_lock_identity_ok "$ef" "$witness"; then
                 _error "旧版${label}文件在判定后被删除/替换(部署目录正被卸载?), 拒绝继续: $lfile"
@@ -655,11 +611,10 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
             return 1
         fi
         # (T3) 旧版 **mkdir 后端**的排他标记(二十四轮 P1, 复审四扩到 L1): 只"看一眼目录在不在"
-        # 不是互斥 —— 无 flock 的旧进程可以在我们检查之后 mkdir。故在持有旧版 flock 期间创建
-        # **同名标记目录**(L1 树外也创建, 释放时删除), 让它的 mkdir 失败而拒绝。标记带
-        # `.witness`(= 本 flock 文件的 dev:ino): 若我们被 SIGKILL, 下一个持有**同一 flock** 的
-        # 进程可以安全清理并重建(此时无人持有该 flock); 没有匹配 witness 的目录 = 旧版持有者/
-        # 残留 ⇒ 一律拒绝, 绝不自动接管。
+        # 不是互斥 —— 无 flock 的旧进程可在检查之后 mkdir。故持旧版 flock 期间创建**同名标记
+        # 目录**(L1 树外也创建, 释放时删除), 让它的 mkdir 失败。标记带 `.witness`(= 本 flock
+        # 文件的 dev:ino): 我们被 SIGKILL 后, 下一个持有**同一 flock** 的进程可安全清理并重建;
+        # 没有匹配 witness 的目录 = 旧版持有者/残留 ⇒ 一律拒绝, 绝不自动接管。
         devino=$(_xray_devino "$lfile" 2>/dev/null)
         if [ -z "$devino" ]; then
             _error "无法读取旧版${label}文件标识(dev:ino), 放弃本次操作: $lfile"
@@ -694,8 +649,8 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
             eval "$fdvar=\"\""
             return 1
         fi
-        # 先写 .witness 再写 pid: 若恰在此刻被杀, 留下"有 witness 无 pid"的目录仍可被同族
-        # 进程安全接管; 反过来则只能人工处理。任一步写入失败都滚回去(fail-closed)。
+        # 先写 .witness 再写 pid: 若恰在此刻被杀, 留下"有 witness 无 pid"的目录仍可被同族进程
+        # 安全接管; 反过来只能人工处理。任一步写入失败都滚回去(fail-closed)。
         if ! printf '%s\n' "$devino" > "$ldir/.witness" 2>/dev/null; then
             rm -rf "$ldir" 2>/dev/null
             flock -u "$ef" 2>/dev/null
@@ -715,9 +670,8 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
         eval "$dirvar=\"\$ldir\""
         return 0
     fi
-    # 无 flock: 旧版通常走 mkdir 目录锁, 但仍先检查旧 flock 文件是否被某个进程打开。
-    # 当前没有 flock 时无法建立内核 flock, 因而只能阻止已经存在的旧 flock 持有者;
-    # 同环境旧版本也没有 flock 时, mkdir 标记提供完整互斥。
+    # 无 flock: 旧版可能走 mkdir 目录锁, 但仍先检查旧 flock 文件是否被某进程打开。
+    # 无 flock 时只能阻止已存在的旧 flock 持有者; 同环境旧版也无 flock 时 mkdir 标记提供完整互斥。
     if [ -e "$lfile" ] && ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
         _error "无法确认旧版${label} flock 文件是否空闲(缺少检查助手): $lfile"
         return 1
@@ -744,10 +698,8 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
         return 1
     fi
     # 无 flock: 创建旧 mkdir 目录前先跑删除树扫描 —— 与 flock 分支"即将新建 inode"同口径。
-    # **扫描根固定为 `$DEPLOY_DIR`, 不是 `dirname "$ldir"`**(复审四 P2)：L1 的 ldir 在 /opt 下,
-    # 用 dirname 会把整个 /opt 纳入扫描, 任何无关软件在 /opt 持有的 deleted fd 都会让 xd
-    # 误 fail-closed。我们关心的始终是"部署树被删而旧进程仍持有其文件"。
-    # (L1 树外目录也创建并占位, 见上方说明; 释放时删除。)
+    # **扫描根固定 `$DEPLOY_DIR`, 不是 `dirname "$ldir"`**(复审四 P2): L1 的 ldir 在 /opt 下,
+    # 用 dirname 会把整个 /opt 纳入扫描, 无关软件的 deleted fd 会让 xd 误 fail-closed。
     deploy_dir="${DEPLOY_DIR%/}"
     if _xray_legacy_deleted_tree_active "$deploy_dir"; then
         _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝新建旧版${label}目录: $ldir"
@@ -791,13 +743,10 @@ _xray_legacy_flock_active() {
     return 1
 }
 
-# 确认"我们持有的旧版锁"仍**就是路径上那个文件**(十六轮 P2-②)。
-# 为什么必须查: 旧版协调的顺序是"先拿主锁 → mkdir -p 部署目录 → 再 flock 旧版锁文件"。若旧版
-# 卸载者此刻正持旧版锁并执行 `rm -rf $DEPLOY_DIR`, 它会连同我们刚打开的锁文件一起删掉 —— 我们
-# 的 fd 随后 flock 成功, 但那把锁落在**已解除链接的 inode** 上: 路径上已经没有它的目录项, 任何
-# 新来的旧版进程都会在**同一个路径**上创建新文件并成功加锁 ⇒ 两个持有者同时进场。
-# 故拿到锁后必须复核 inode 身份, 不一致一律 fail-closed (宁可拒绝, 不做双重放行)。
-# fd 目标无法读取时也必须拒绝: 无法确认仍指向原路径, 不能按安全放行处理。
+# 确认"我们持有的旧版锁"仍**就是路径上那个文件**(十六轮 P2-②): 旧版卸载者可能正持旧版锁并
+# `rm -rf $DEPLOY_DIR`, 连我们刚打开的锁文件一起删掉 —— 我们的 fd 随后 flock 成功, 但锁落在
+# **已解除链接的 inode** 上, 路径上任何新来的旧版进程都能重建文件并成功加锁 ⇒ 双重持有。
+# 故拿到锁后必须复核 inode 身份; 不一致或 fd 目标读不到一律 fail-closed(宁可拒绝, 不做双重放行)。
 _xray_legacy_lock_inode_ok() {   # <fd> <path>; 0 = 我们持有的 fd 仍指向该路径上的文件
     local fd="$1" p="$2" t
     [ -n "$fd" ] && [ -n "$p" ] || return 0
@@ -810,12 +759,11 @@ _xray_legacy_lock_inode_ok() {   # <fd> <path>; 0 = 我们持有的 fd 仍指向
     esac
 }
 
-# 见证 inode 身份: 打开的旧锁 fd 必须与 T1 时见证 fd 指向**同一个 inode**。
-# 为什么不能只查"fd 仍指向路径上的文件"(`_xray_legacy_lock_inode_ok`): 旧版卸载者删除整棵树
-# 后, 我们随后的 `exec {fd}>>` 会**新建**一个 inode; 此时 fd 与路径都指向新 inode, 后者会
-# 通过, 但这把 flock 落在新 inode 上, 与旧进程手里的旧 inode 根本不互斥。见证 fd 是在任何
-# 创建动作之前打开的 T1 快照, `-ef` 比较两个 fd 的 inode 身份, 能区分"旧 inode 仍在"(正常
-# 竞争)与"旧 inode 已被删除/替换"(必须 fail-closed)。
+# 见证 inode 身份: 打开的旧锁 fd 必须与 T1 时见证 fd 指向**同一个 inode**。只查"fd 仍指向
+# 路径上的文件"(`_xray_legacy_lock_inode_ok`)挡不住"路径存在→被删→新建 inode": 那时 fd 与
+# 路径都是新 inode, 复核通过, 而 flock 落在旧进程根本不认识的新 inode 上。见证 fd 是任何
+# 创建动作之前打开的 T1 快照, `-ef` 比较两个 fd 的 inode 身份, 能区分正常竞争与必须
+# fail-closed 的"旧 inode 已被删除/替换"。
 # /proc 不可读(容器裁剪)时判为无法确认 ⇒ 拒绝; 与 inode 复核同口径。
 _xray_legacy_lock_identity_ok() {   # <fd> <见证fd>; 0 = 同一 inode
     local fd="$1" wfd="$2"
@@ -845,10 +793,9 @@ _xray_legacy_lock_release() {   # <fd变量名> <mkdir变量名>
     return 0
 }
 
-# 旧版进程不认识部署目录外的新锁。它可能已经拿着目录内锁, 随后把整棵部署树删掉;
-# 这时路径上再建一个同名锁文件并不能与旧 fd/旧进程互斥。扫描仍指向已删除部署文件的
-# 进程, 在重建旧锁路径前 fail-closed。该检测只缩小旧版残留窗口: 旧版完全不配合新版
-# 锁协议, 因而不能声称跨版本竞态被结构性消除。
+# 旧版进程不认识部署目录外的新锁, 可能已持目录内锁并把整棵部署树删掉; 此时在路径上重建同名
+# 锁文件不能与旧 fd 互斥。故重建旧锁路径前, 扫描仍指向已删除部署文件的进程, 命中即 fail-closed。
+# 该检测只缩小旧版残留窗口, 不构成跨版本竞态的结构性消除。
 _xray_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持有已删除树中的 fd
     local root="${1%/}" p pid target prefix matches find_rc
     [ -n "$root" ] || return 1
@@ -898,9 +845,8 @@ _with_core_lock() {
     legacy1_lockf="${deploy_parent}/.${deploy_name}.core.lock"
     legacy1_fallback_dir="${legacy1_lockf}.d"
     # 已是持锁状态(嵌套调用) ⇒ 直接跑, 不再重复加锁。
-    # 嵌套判定必须放在 `$DEPLOY_DIR` 存在性检查**之前**: 卸载主体(持锁中)会走到
-    # `rm -rf "$DEPLOY_DIR"`, 之后仍可能有嵌套调用(收尾/提示), 那些调用不该因为目录已被
-    # 删除而报错 —— 它们在外层事务的锁保护下。
+    # 嵌套判定必须在 `$DEPLOY_DIR` 存在性检查**之前**: 卸载主体(持锁中)会 `rm -rf "$DEPLOY_DIR"`,
+    # 之后的嵌套调用(收尾/提示)在外层事务锁保护下, 不该因目录已被删除而报错。
     if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" = "1" ]; then
         "$@"
         return $?
@@ -921,27 +867,24 @@ _with_core_lock() {
         done
         if [ "$locked" -ne 1 ]; then
             _error "等待核心锁超时(15s), 可能有其他 xd 会话正在切换核心"
-            # 超时路径同样要关掉刚打开的 fd: 菜单是长驻循环, 漏掉会让每次失败都泄漏一个 fd,
-            # 最终撞上 ulimit 后连 _state_set 的 mktemp 都开始失败。复位全局见 helper。
+            # 超时路径同样要关掉刚打开的 fd: 菜单是长驻循环, 漏掉会让每次失败泄漏一个 fd,
+            # 最终撞上 ulimit。复位全局见 helper。
             _xray_core_lock_fd_reset
             return 1
         fi
-        # 目录存在性检查放在**拿到锁之后**: 卸载期间到达的竞争者应当先排队、再按锁内的真实
-        # 状态判断, 而不是在锁外看一眼"目录恰好不存在"就立刻失败(那是锁外读共享状态的经典
-        # 竞态)。锁内仍不存在 ⇒ 确实没有部署, fail-closed 退出, 且**不重建**目录 —— 旧版锁
-        # 路径在目录内, 重建会留下"空目录 + 新锁"的假现场。
+        # 目录存在性检查放在**拿到锁之后**: 锁外看一眼"目录恰好不存在"是锁外读共享状态的经典
+        # 竞态; 卸载期间的竞争者应先排队再按锁内真实状态判断。锁内仍不存在 ⇒ 确实没有部署,
+        # fail-closed 退出, 且**不重建**目录(旧版锁路径在目录内, 重建会留下"空目录 + 新锁"假现场)。
         if [ ! -d "$deploy_path" ]; then
             _error "部署目录不存在, 放弃本次操作: $deploy_path"
             _xray_core_lock_fd_reset
             return 1
         fi
-        # 旧版锁协调(**仅对已存在的旧路径**; 不存在就没有旧版会话, 跳过以免把旧锁文件
-        # 凭空写回 /opt —— 本改动要消除的污染):
-        #   L2(<=0.17.11): 部署目录内 `.core.lock[.d]`
-        #   L1(0.17.13/0.18.0): 部署父目录 `.<name>.core.lock[.d]`
-        # 旧锁路径的"存在性 + inode 身份"由 `_xray_legacy_lock_name` 在打开处一并处理。
+        # 旧版锁协调(**仅对已存在的旧路径**; 不存在就没有旧版会话, 跳过以免把旧锁文件凭空写回 /opt):
+        #   L2(<=0.17.11): 部署目录内 `.core.lock[.d]`; L1(0.17.13/0.18.0): 父目录 `.<name>.core.lock[.d]`
+        # 存在性 + inode 身份由 `_xray_legacy_lock_name` 在打开处一并处理。
         # **(P1, 复审)** L2 路径不存在时不能当成"没有旧版进程": 旧版卸载 `rm -rf` 后路径消失
-        # 而 fd/flock 仍在(已删除 inode)。补一次 /proc 删除树扫描。
+        # 而 fd/flock 仍在(已删除 inode), 故补一次 /proc 删除树扫描。
         if [ ! -e "$legacy_lockf" ] && [ ! -e "$legacy_fallback_dir" ]; then
             if _xray_legacy_deleted_tree_active "$deploy_path"; then
                 _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
@@ -994,8 +937,8 @@ _with_core_lock() {
         return "$rc"
     fi
 
-    # 裁剪版 BusyBox 可能没有 flock。使用独立 mkdir 锁目录并**永不自动接管**: SIGKILL 后
-    # 的残留锁宁可要求人工确认/清理, 也不能用 read→rm→mkdir 的竞态冒险地双重放行。
+    # 裁剪版 BusyBox 可能没有 flock: 用独立 mkdir 锁目录并**永不自动接管** —— SIGKILL 残留
+    # 宁可要求人工确认/清理, 也不能用 read→rm→mkdir 的竞态冒险双重放行。
     if ! mkdir "$fallback_dir" 2>/dev/null; then
         if [ -d "$fallback_dir" ]; then
             _error "核心锁目录已存在(可能有其他会话运行, 或上次被强制终止): $fallback_dir"
@@ -1011,16 +954,15 @@ _with_core_lock() {
         _error "无法写入核心锁持有者记录 $fallback_dir/pid, 放弃本次操作"
         return 1
     fi
-    # 同 flock 路径: 目录存在性在**锁内**判定(锁外判断会与并发卸载竞态), 锁内不存在则
-    # fail-closed 退出且不重建目录。
+    # 同 flock 路径: 目录存在性在**锁内**判定(锁外判断会与并发卸载竞态), 锁内不存在则 fail-closed
+    # 退出且不重建目录。
     if [ ! -d "$deploy_path" ]; then
         _error "部署目录不存在, 放弃本次操作: $deploy_path"
         rm -f "$fallback_dir/pid" 2>/dev/null
         rmdir "$fallback_dir" 2>/dev/null
         return 1
     fi
-    # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过, 不凭空重建旧锁文件)。
-    # (P1) L2 不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
+    # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过, 不凭空重建旧锁文件); (P1) L2 不存在时补删除树扫描。
     if [ ! -e "$legacy_lockf" ] && [ ! -e "$legacy_fallback_dir" ]; then
         if _xray_legacy_deleted_tree_active "$deploy_path"; then
             _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
@@ -1098,8 +1040,8 @@ _with_deploy_install_lock() {
         _error "无法创建安装锁目录 $(dirname "$lock_file"), 放弃本次卸载"
         return 1
     }
-    # 主锁文件在目录外, 竞争者不会被卸载的 `rm -rf` 拆成新旧 inode; 目录本身不在这里创建 ——
-    # 旧版锁路径在目录内, "先拿主锁再建目录再取旧锁"的顺序见下面 flock/mkdir 两条分支。
+    # 主锁文件在目录外, 竞争者不会被卸载的 `rm -rf` 拆成新旧 inode; 部署目录不在这里创建 ——
+    # 旧版锁在目录内, "先拿主锁再建目录再取旧锁"见下面两条分支。
 
     if command -v flock >/dev/null 2>&1; then
         if ! eval "exec {DEPLOY_INSTALL_LOCK_FD}>>\"\$lock_file\""; then
@@ -1115,13 +1057,12 @@ _with_deploy_install_lock() {
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
-        # 主锁已在手, 再确保部署目录存在 —— 旧版(0.17.11 / PR #48 早期 HEAD)的安装锁文件在
-        # **目录内**, 而旧版进程也必须先建目录才能取它; 故"先拿主锁, 再建目录, 再取旧锁"这条
-        # 顺序不存在"目录刚被卸载删掉 / 旧进程刚建好目录"的漏网窗口。等待者(卸载期间才启动)
-        # 因此会在卸载释放主锁后照常继续, 而不是因为目录一度不存在而直接失败。
-        # **(P1, 复审) 先扫已删除部署树**: L2 旧安装锁文件在部署树内, 旧版卸载 `rm -rf` 后
-        # 路径消失而 fd/flock 仍在 —— "路径不存在" 不能解释成"没有旧版进程"。必须在
-        # `mkdir -p "$deploy_path"` 之前判定, 否则会为已删除树重造路径, 两边随后看不见彼此。
+        # 主锁已在手再建部署目录 —— 旧版安装锁文件在**目录内**, 旧版进程也必须先建目录才能取它,
+        # 故"主锁→建目录→旧锁"不存在"目录刚被卸载删掉 / 旧进程刚建好目录"的漏网窗口; 卸载期间
+        # 才启动的等待者会在释放主锁后照常继续, 而不是因目录一度不存在而失败。
+        # **(P1, 复审) 先扫已删除部署树**: 旧版卸载 `rm -rf` 后路径消失而 fd/flock 仍在 ——
+        # "路径不存在"不能解释成"没有旧版进程"; 必须在 `mkdir -p` 之前判定, 否则会为已删除树
+        # 重造路径, 两边看不见彼此。
         if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ]; then
             if _xray_legacy_deleted_tree_active "$deploy_path"; then
                 _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
@@ -1136,16 +1077,15 @@ _with_deploy_install_lock() {
             return 1
         fi
         # 同一种手段再取旧版锁(**仅对已存在的旧路径**; 不存在则跳过, 不凭空重建旧锁文件),
-        # 否则旧版 install.sh 会与新版各持一把锁同时落地。L2(<=0.17.11 目录内) 与
-        # L1(0.17.13/0.18.0 父目录)。
+        # 否则旧版 install.sh 会与新版各持一把锁同时落地。L2(<=0.17.11 目录内) 与 L1(父目录)。
         if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
             if ! _xray_legacy_lock_name XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR \
                 "$legacy_lock_file" "$legacy_lock_dir" "安装锁"; then
                 eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
                 return 1
             fi
-            # 旧版卸载者可能在我们打开锁文件之后 `rm -rf` 掉整棵树并删掉该锁文件: 那样我们握着的
-            # 是已解除链接的 inode, 路径上换成了新文件 ⇒ 再复核一次身份, 不一致就拒绝(P2-②)。
+            # 旧版卸载者可能在打开锁文件后 rm -rf 整棵树并删掉该锁文件 ⇒ 复核 inode 身份,
+            # 不一致就拒绝(P2-②)。
             if ! _xray_legacy_lock_inode_ok "${XD_INSTALL_LEGACY_FLOCK_FD:-}" "$legacy_lock_file"; then
                 _error "旧版安装锁文件在获取后被替换/删除(部署目录正被卸载?): $legacy_lock_file"
                 _tip "等对方结束后重试; 本次不做任何落地"
@@ -1182,7 +1122,7 @@ _with_deploy_install_lock() {
     fi
 
     # 与 install.sh 相同: 无 flock 时 mkdir 锁按 PID 有界等待活持有者, 对死锁/未知锁立即
-    # fail-closed, 绝不自动接管。SIGKILL 残留需人工确认后清理。
+    # fail-closed, **永不自动接管**。SIGKILL 残留需人工确认后清理。
     for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
         if mkdir "$lock_dir" 2>/dev/null; then
             tmp="$lock_dir/.pid.$$"
@@ -1192,8 +1132,7 @@ _with_deploy_install_lock() {
                 _error "无法写入安装锁持有者记录 $lock_dir/pid, 放弃本次卸载"
                 return 1
             fi
-            # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过, 不凭空重建旧锁文件)。
-            # (P1) L2 不存在时补删除树扫描, 再 mkdir 部署目录(同 flock 分支)。
+            # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过); (P1) L2 不存在时补删除树扫描, 再建目录。
             if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ]; then
                 if _xray_legacy_deleted_tree_active "$deploy_path"; then
                     _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
@@ -1270,45 +1209,33 @@ _with_deploy_install_lock() {
 }
 
 # ---------------------------------------------------------------------------
-# 核心切换事务的**状态机 + 崩溃恢复**(2026-09-22 十二轮; 十一轮建立, 本轮补齐两次闭环)。
+# 核心切换事务的**状态机 + 崩溃恢复**(第十一/十二/十四轮)。
 #
-# 为什么要有账本: 函数返回失败这条路径可以靠 `|| 回滚` 覆盖, 但**进程被杀**(SIGKILL / OOM /
-# 掉电)时没有任何函数会被调用, 盘上留"新二进制 + 旧 .bak + 新 unit"而下次开机无人判断。
-# 同项目的 `_port_txn` 早已用"先落 journal → 启动期按事实收敛"处理这类窗口。
+# 为什么要有账本: `|| 回滚` 覆盖不了**进程被杀**(SIGKILL/OOM/掉电) —— 盘上留"新二进制 +
+# 旧 .bak + 新 unit"而下次开机无人判断。同项目 `_port_txn` 早用"先落 journal → 启动期按事实收敛"。
 #
 # 阶段转移(**单向, 只允许向后推进**):
-#   core: prepared → snapshotted → replacing → binary_replaced → service_replaced
-#         → restart_verified → committed → (cleanup) → 删账本
-#   geo:  prepared → snapshotted → replacing → geo_replaced → restart_verified
-#         → committed → (cleanup) → 删账本
-#   rollback: replacing / 各 mutation 后置 phase → rolled_back → (cleanup) → 删账本
+#   core:      prepared → snapshotted → replacing → binary_replaced → service_replaced
+#              → restart_verified → committed → (cleanup) → 删账本
+#   geo:       prepared → snapshotted → replacing → geo_replaced → restart_verified
+#              → committed → (cleanup) → 删账本
+#   rollback:  replacing / 各 mutation 后置 phase → rolled_back → (cleanup) → 删账本
 #
-# **每个 phase 只能有一种现实解释**(十四轮 P1-①):
-#   prepared     = 账本已建, 恢复源**未**就绪。真实状态从未被触碰
-#                  ⇒ 崩溃后只清理中间产物, 绝不回滚(快照可能半截, 不能当恢复源)
-#   snapshotted  = 恢复源(binary / service / geo)全部就绪, 真实状态仍未动
-#                  ⇒ 崩溃后同样只清理(没有需要恢复的东西)
-#   replacing    = durable mutation barrier; 后续任何生产状态都可能已被部分改动
-#                  ⇒ 崩溃后按快照回滚。core 与 geo operation 都使用这一入口
-#   binary_replaced / service_replaced / geo_replaced / restart_verified
-#                = 对应 mutation 已完成或 runtime 已验证 ⇒ 尚未 committed 时崩溃都回滚
-#   committed    = 永不回滚, 只允许 cleanup
-#   rolled_back  = rollback 已收敛, 永不重放 mutation, 只允许 cleanup
+# **每个 phase 只能有一种现实解释**(第十四轮 P1):
+#   prepared / snapshotted        = 真实状态从未被触碰(恢复源未就绪 / 已就绪) ⇒ 只清理, **绝不回滚**
+#   replacing                     = durable mutation barrier; 此后生产状态可能已被部分改动 ⇒ 按快照回滚
+#   *_replaced / restart_verified = 对应 mutation 已完成或 runtime 已验证 ⇒ 未 committed 时崩溃都回滚
+#   committed / rolled_back       = 永不回滚(只允许 cleanup)
 #
-# 两条闭环各自要成立(十二轮复审指出的正是它们没成立):
-#   · **提交闭环**: `committed` 必须先于清理备份落盘。否则"已删 .bak、账本还写着可回滚"的
-#     窗口会让恢复无源可回(旧顺序就是这样: 先 rm .bak 再删账本)。
-#     落盘 committed 之后**永不再回滚**, 只继续清理 —— 清理中断也只是残留备份, 下次看到
-#     committed 就把清理做完。所以"清理"是幂等的、可重复执行的。
-#   · **恢复闭环**: 恢复必须把"磁盘 + **运行实例**"一起收敛。只改文件不重启会让
-#     "磁盘=旧核心 / 内存里跑着新核心"长期并存(十一轮的实现只改文件)。
+# 两条闭环(第十二轮补齐): (1) **提交闭环** committed 必须先于清理备份落盘 —— 否则"已删 .bak、
+# 账本还写着可回滚"会让恢复无源可回; committed 落盘后永不再回滚, cleanup 因而必须幂等可重入。
+# (2) **恢复闭环** 恢复必须把"磁盘 + **运行实例**"一起收敛; 只改文件不重启会留下"磁盘=旧核心 /
+# 内存里跑着新核心"长期并存。
 #
-# 判据三态, 任一为 0 即**不完整**: disk_ok(二进制+service 落盘)、run_ok(服务真的跑起来
-# 且版本正确)。不完整时账本**保留**、返回 1, 并拒绝开启新事务(P1-⑤: 否则新事务会覆盖
-# 上一次未收敛事务的唯一证据)。
-#
-# fail-closed: 账本不可解析 / schema 不合法 ⇒ **隔离**(改名 .corrupt)并告警, 绝不按猜测动作
-# ——与 `_ptx_journal_quarantine` 同策。账本落 $STATE_DIR(已 chmod 700), 它是账本不是产物。
+# 判据三态, 任一为 0 即**不完整**: disk_ok(二进制+service+geo 落盘)、run_ok(服务真的跑起来
+# 且版本正确)。不完整时账本**保留**、返回 1, 并拒绝开启新事务(否则会覆盖上一次未收敛事务的
+# 唯一证据)。fail-closed: 账本不可解析 / schema 不合法 ⇒ **隔离**(改名 .corrupt)并告警, 绝不
+# 猜测动作(与 `_ptx_journal_quarantine` 同策)。账本落 $STATE_DIR(已 chmod 700)。
 # ---------------------------------------------------------------------------
 _xray_core_journal_path() { printf '%s' "$STATE_DIR/coretxn.json"; }
 _xray_core_blocked_path() { printf '%s' "$STATE_DIR/coretxn.blocked"; }
@@ -3262,7 +3189,7 @@ _restart_xray_verified() {
 # 退出**, 只有确认成功才返回 0。为什么不能只 `_manage_xray stop || true`:
 #   · `systemctl stop` 返回 0 不等于进程已退出(Type=simple 下 systemd 可能仍在收尾);
 #   · 停失败时旧实现照样继续删 unit 与部署目录 —— 残局是"进程仍监听端口 + 二进制/配置已删",
-#     用户既停不掉也起不来(实测复现见 implement.md)。
+#     用户既停不掉也起不来(已实测复现)。
 # 判活用 `_xray_is_running`(R40 统一入口), **不用**裸 `systemctl is-active`/`rc-service status`
 # —— 那两者在崩溃窗口里都会说谎(见 CLAUDE.md 的"Unified liveness"段)。
 # `_xray_is_running` 缺失(混装旧 lib)时无法证明进程已经退出。破坏性卸载必须拒绝继续,

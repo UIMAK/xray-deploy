@@ -2,51 +2,30 @@
 # =============================================================================
 # lib/55-hysteria.sh — Official Hysteria2 Manager(官方 Hysteria2 服务端管理)
 # 与 Xray Hy2(lib/50-nodes.sh 的 hysteria2 协议)是完全独立的两个实现:
-# Xray Hy2        = Xray-core 实现的 hysteria2 协议, _hy2_* 函数族, config.json 模型
-# Official Hy2    = Hysteria 官方 binary(HyNetworks/hysteria, 旧组织名已 301 重定向, v2.x), _hysteria_* 函数族
+# Xray Hy2     = Xray-core 实现的 hysteria2 协议, _hy2_* 函数族, config.json 模型
+# Official Hy2 = HyNetworks/hysteria 官方 binary(旧组织名 apernet 已 301), _hysteria_* 函数族
 # 两者不得共享配置模型/binary/版本管理/服务/认证与链接生成逻辑。
 #
-# 事实依据(hysteria-website 官方文档 + get.hy2.sh + 2.12.2 实测, 2026-09-13):
-# - 官方配置完整支持 JSON(与 YAML 同构), 故配置文件为 hysteria.json, 全部 jq 生成/变更
-# - 无 check/validate 子命令, 坏配置=启动 FATAL exit 1 → 只能靠 verified-restart 失败回滚
-# - `hysteria cert` 官方自签工具, 打印 pinSHA256(小写十六进制)
-# - 端口跳跃 = listen 写 ":<min>-<max>": binary 监听首端口并自动 nft/iptables 重定向
-# 其余端口, 停止时自清 —— 本模块绝不自己写防火墙规则(与 Xray Hy2 的 iptables DNAT 不同)
+# 关键事实(官方文档 + get.hy2.sh + 2.12.2 实测, 2026-09-13):
+# - 官方配置完整支持 JSON(与 YAML 同构), 故 hysteria.json 全部 jq 生成/变更
+# - 无 check/validate 子命令, 坏配置 = 启动 FATAL exit 1 ⇒ 只能靠 verified-restart 失败回滚
+# - 端口跳跃是官方内置(listen 写 ":<min>-<max>"), 本模块**绝不自己写防火墙规则**
+#   (与 Xray Hy2 的 iptables DNAT 是两条路); 只支持单段连续区间
 # - 完整性校验 = 官方 hashes.txt SHA256(fail-closed) + 可执行自检 + 版本匹配三层
-# (0.16.1 曾误判"官方无校验和", 0.16.2 实证修正: hashes.txt 与 binary 同目录发布)
-# - 混淆 obfs 官方有两种实现 salamander / gecko(Full-Server-Config "混淆" 一节),
-# 链接与 clash 必须按**实际类型**输出参数(读取统一走 _hysteria_obfs_get) ——
-# 只认 salamander 会让 gecko 配置的链接/clash 完全丢参数(0.16.13 前实测缺陷)
-# - gecko 分片尺寸(minPacketSize 默认 512 / maxPacketSize 默认 1200, 且 max<=2048)是
-# **配置文件字段**, 官方 URI-Scheme 只有 obfs / obfs-password 两个混淆参数, 没有尺寸参数。
-# 故 gecko 非默认尺寸时链接**拒绝生成**(否则是一条"看着正常、语义不等价"的链接),
-# 判据唯一入口 _hysteria_obfs_uri_gap; clash 条目有独立字段可完整表达, 不受影响(0.16.15)
-# - AVX 变体的兜底覆盖两层: 下载后 `version` 可执行自检(0.16.14) + **装机后真实启动验证**
-# (0.16.15) —— 自检不覆盖热路径 AVX 指令, 只有后者能抓住"能跑 version 但启动 SIGILL"
-# - 架构映射以官方 get.hy2.sh 为基准; armv5*/riscv64 取官方资产表(脚本漏列),
-# armv6/mips(BE)/mips64 因 ABI 不兼容明确拒绝(收紧)
+# - 混淆 obfs 官方有两种 salamander / gecko; gecko 的尺寸是**配置文件字段**, 官方 URI-Scheme
+#   没有尺寸参数 ⇒ gecko 非默认尺寸时**拒绝生成链接**(判据唯一入口 _hysteria_obfs_uri_gap),
+#   clash 条目有独立字段可完整表达
+# - AVX 变体自动选择, 但必须有装机后**真实启动验证**兜底(version 自检不覆盖热路径 AVX 指令)
+# - 架构映射以官方 get.hy2.sh 为基准并**更严格**: armv6/mips(BE)/mips64 明确拒绝; 补 armv5*/riscv64
 # - **认证模型 = 单一认证密码(auth.type: password), 不是 userpass**(0.16.19 用户实测):
-# 用户要求"只要认证密码、不要用户名"。这不是偏好问题而是**互操作硬约束** —— 官方
-# `userpass` 的认证串是 `username:password`, 客户端必须原样提交该串:
-#   * Xray 的 hysteria 入站 `settings.users[].auth` = "任意长度字符串"(无 userpass 概念),
-#     sing-box 的 hysteria2 出站/入站 `password` 同样只是"认证密码"; 两者都不会替你拼
-#     `user:pass`, 用户必须手填 `user:pass` 才能连上 —— 实测正是"用户名+认证密码都不支持连接"。
-#   * sing-box 官方文档明文: "官方程序支持 userpass...本质上是将用户名与密码的组合
-#     <username>:<password> 作为实际上的密码, 而 sing-box 不提供此别名"。
-# 故本模块改用 `auth.type=password`(单密码), 与 `hysteria2://` 链接的 userinfo
-# (单一 auth 段)、clash/mihomo 的 `password` 字段、Xray/sing-box 的"认证密码"一一对应。
-# 代价(已与用户确认): 官方服务端一个 auth 段只能有一个密码, 故**不再支持多用户** ——
-# 节点 = 这一台服务器的唯一认证凭据, 模型见下。
-# - 服务器配置为**单文件**(hysteria.json) + **单节点元数据**(node.json)。
-# 本模块自 0.16.19 起即为单密码模型, 从未发布过 userpass 多用户版本, 故**不做任何
-# 旧配置迁移** —— 迁移代码属于没有真实受众的死代码(项目惯例: 不留不可达分支,
-# 同 0.16.18 清理 plain 死分支)。检测到非 password 的 auth 一律按"外来配置"拒绝接管。
-# - **[4] 删除节点 = 删除服务器配置并停止服务**(0.16.20, 用户要求, 动机是省内存/省消耗):
-# 官方 Hysteria 里"配置即节点", 旧实现只删 Manager 侧记录(hysteria/node.json)不释放
-# 任何资源 —— 服务照跑、内存照占。现固定顺序: 停服 → 删 hysteria.json → 删 node.json
-# → 清 service 定义/logrotate → 清 clash 派生条目(删配置必须早于清 unit, 否则删配置失败时
-# unit 已消失、原运行状态无法恢复); 核心 binary / server_meta / 自签证书保留(重新初始化
-# 可复用), 彻底移除仍走 [14] 卸载。
+#   官方 userpass 的认证串是 `username:password`, 而 Xray/sing-box 只提交单一字符串, 用户必须
+#   手填 `user:pass` 才能连 —— 互操作硬约束, 不是偏好。代价(用户已确认): 不再支持多用户,
+#   一个 auth 段 = 一个密码, 节点 = 服务器的唯一凭据。本模块从未发布过 userpass 版本, 故
+#   **不做任何迁移**; 检测到非 password 的 auth 一律按"外来配置"拒绝接管。
+# - [4] 删除节点 = 删除服务器配置并停止服务(0.16.20, 用户要求, 动机省内存): 配置即节点。
+#   固定顺序 停服 → 删 hysteria.json → 删 node.json → 清 service/logrotate → 清 clash 派生
+#   条目; **删配置必须早于清 unit**(否则删配置失败时 unit 已消失、原运行状态无法恢复);
+#   核心 binary / server_meta / 自签证书保留([2] 可重新初始化复用), 彻底移除走 [14] 卸载。
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -68,8 +47,7 @@ export HYSTERIA_ACME_DIR="$DEPLOY_DIR/hysteria/acme"
 export HYSTERIA_SVC="xray-deploy-hysteria"
 export HYSTERIA_PID_FILE="/run/xray-deploy-hysteria.pid"
 export HYSTERIA_DL_BASE="https://download.hysteria.network/app"
-# 官方仓库组织名已更改为 HyNetworks/hysteria(旧名 301 重定向)
-# (2026-09-13 实证: API full_name=HyNetworks/hysteria; 旧路径 301 重定向仍可用但不再依赖)
+# 官方仓库已改名 HyNetworks/hysteria(旧名 301 重定向, 不再依赖)
 export HYSTERIA_GH_API="https://api.github.com/repos/HyNetworks/hysteria/releases/latest"
 
 # ---------------------------------------------------------------------------
@@ -77,8 +55,8 @@ export HYSTERIA_GH_API="https://api.github.com/repos/HyNetworks/hysteria/release
 # ---------------------------------------------------------------------------
 _hysteria_ensure_dirs() {
     local ok=1 d f
-    # LOG_DIR 一并确保: openrc output_log / direct 启动重定向都写 $LOG_DIR/hysteria.log,
-    # 而模块可能被非 xd 主入口路径调用(cron/直接 source), 不能假设 _ensure_dirs 已跑过。
+    # LOG_DIR 一并确保: openrc output_log / direct 重定向都写 $LOG_DIR/hysteria.log,
+    # 而模块可能被非 xd 主入口调用(cron/直接 source), 不能假设 _ensure_dirs 已跑过。
     for d in "$HYSTERIA_DATA_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR" "$HYSTERIA_ACME_DIR" "$LOG_DIR"; do
         mkdir -p "$d" || ok=0
         chmod 700 "$d" 2>/dev/null || ok=0
@@ -117,17 +95,17 @@ _hysteria_cached_version() {
     echo "$ver"
 }
 
-# 版本号 canonicalize: 官方 GitHub release tag 形态为 app/v2.12.2(2026-09-13 实测),
-# GitHub API fallback 会拿到 app/ 前缀; 统一在此剥离并校验 v2.x.x 格式
+# 版本号 canonicalize: 官方 release tag 形态为 app/v2.12.2, GitHub API fallback 会拿到
+# app/ 前缀; 统一在此剥离并校验 v2.x.x 格式
 _hysteria_canon_version() {
     local v="${1#app/}"
     [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$v"; return 0; }
     return 1
 }
 
-# 从官方 hashes.txt 提取指定资产的 SHA256(格式 "<sha256>  build/<asset>")。
-# 精确锚定行尾防前缀误匹配(amd64 vs amd64-avx)。fail-closed 口径与注释一致:
-# 0 条=无此资产、>1 条=校验文件异常(正常官方文件唯一) —— 都拒绝, 不取 tail。
+# 从官方 hashes.txt(格式 "<sha256>  build/<asset>")提取指定资产的 SHA256。
+# 精确锚定行尾防前缀误匹配(amd64 vs amd64-avx)。fail-closed: 0 条=无此资产、
+# >1 条=校验文件异常(正常官方文件唯一) —— 都拒绝, 不取 tail。
 _hysteria_expected_sha256() {
     local f="$1" name="$2" count sha
     [ -s "$f" ] || return 1
@@ -139,16 +117,15 @@ _hysteria_expected_sha256() {
 }
 
 # 最新版本: 官方下载服务的 302 终点 URL 携带版本段(/app/latest/<asset> → /app/v2.12.2/<asset>);
-# 失败回落 GitHub API latest(注意: 仓库改名后 API 会 301, 必须 -L 跟随; tag 形态 app/v2.x.x,
+# 失败回落 GitHub API latest(仓库改名后 API 会 301, 必须 -L 跟随; tag 形态 app/v2.x.x,
 # 经 canonicalize)。两个通道都失败 → 输出空, 调用方显式处理。
 _hysteria_latest_version() {
     local asset final ver
     asset=$(_hysteria_arch_asset) || return 1
-    # 用 GET(只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层对 HEAD 返回 405 而 GET 正常,
-    # 强依赖 HEAD 是无谓的脆弱点。加 `-r 0-0`(Range: 只取第 1 字节): 这里要的只是 302 终点
-    # URL, 不加 Range 时 curl 会把**整个 23MB binary** 拉完才结束 —— 弱机/慢 CDN 上 15s 超时
-    # 后只剩 GitHub API 兜底, 实测因此让一次 E2E 误判为"重装失败"(2026-09-14)。官方 CDN 支持
-    # Range(实测 206 + size_download=1), 服务器若忽略 Range 则退化为旧行为, 不会更差。
+    # 用 GET(只取最终 URL)而非 HEAD —— 部分 CDN/代理/缓存层对 HEAD 返 405 而 GET 正常。
+    # 加 `-r 0-0`(Range: 只取第 1 字节): 不加时 curl 会把**整个 23MB binary** 拉完, 弱机/
+    # 慢 CDN 上 15s 超时后只剩 API 兜底(实测因此误判过一次"重装失败")。官方 CDN 支持 Range;
+    # 服务器忽略 Range 则退化旧行为, 不会更差。
     final=$(curl -fsSL -r 0-0 -o /dev/null --max-time 15 -w '%{url_effective}' \
             "${HYSTERIA_DL_BASE}/latest/hysteria-linux-${asset}" 2>/dev/null) || final=""
     ver=$(_hysteria_canon_version "$(printf '%s' "$final" | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -1)")
@@ -160,14 +137,10 @@ _hysteria_latest_version() {
 }
 
 # ---------------------------------------------------------------------------
-# 架构映射(uname -m → 官方资产名)
-# 基准 = 官方 get.hy2.sh 的映射表; 差异点:
-# - armv5* → armv5 官方资产(资产表明确提供; get.hy2.sh 把 armv5tel 映去 arm, 但 armv7
-# 二进制在 armv5 CPU 上必然 SIGILL, 资产表优先)
-# - riscv64 → riscv64 官方资产(资产表提供, get.hy2.sh 未映射)
-# - 收紧口径: mips(BE)/mips64/mips64le 明确拒绝 —— uname 名相似 ≠ ABI 兼容,
-# 大端 CPU 跑 mipsle(小端)资产必然失败, 32 位 LE 资产在 64 位用户态也不保证可跑;
-# 无法可靠判定就拒绝并提示, 不猜。mipsle(含软浮点设备手选 mipsle-sf)不受影响。
+# 架构映射(uname -m → 官方资产名; 基准 = 官方 get.hy2.sh 映射表)
+# 差异: armv5*/riscv64 取官方资产表(get.hy2.sh 漏列); armv6(官方 linux/arm 是 GOARM=7
+# 构建, ARMv6 会 SIGILL)与 mips(BE)/mips64/mips64le 因 ABI 不兼容明确拒绝 ——
+# uname 名相似 ≠ ABI 兼容, 无法可靠判定就拒绝并提示, 不猜。mipsle(含软浮点 mipsle-sf)不受影响。
 # 返回: stdout=资产名; 非 0 = 不支持的架构
 # ---------------------------------------------------------------------------
 _hysteria_arch_asset() {
@@ -178,8 +151,8 @@ _hysteria_arch_asset() {
         i386|i486|i586|i686)       echo "386" ;;
         aarch64|arm64|armv8*)      echo "arm64" ;;
         armv7|armv7l)              echo "arm" ;;
-        # armv6 明确拒绝: 官方 linux/arm 资产是 GOARM=7 构建, 在 ARMv6 CPU 上
-        # 会因缺少 v7 指令 SIGILL; 官方 release 无独立 armv6 平台, 不猜映射
+        # armv6 明确拒绝: 官方 linux/arm 资产是 GOARM=7 构建, ARMv6 会 SIGILL;
+        # 官方 release 无独立 armv6 平台, 不猜映射
         armv6|armv6l)              return 1 ;;
         armv5*)                    echo "armv5" ;;
         mipsle)                    echo "mipsle" ;;
@@ -191,22 +164,19 @@ _hysteria_arch_asset() {
     esac
 }
 
-# CPU 是否支持 AVX(amd64 AVX 变体的唯一判据: 支持即优先使用)
-# 用 `tr` 拆词 + `grep -qx` 精确整行匹配, 而非 `grep -qw avx`: busybox 的 `-w` 在部分
-# 构建里不生效(实测 Alpine 上 `grep -ow avx` 把 avx2/avx_vnni 也算了进来, 返回 3 个匹配),
-# 而 `-qx` 的语义是 POSIX 明确的, 与 grep 实现无关。方向上也安全: 只认真正的 avx 词条。
+# CPU 是否支持 AVX(amd64 AVX 变体的唯一判据)。`tr` 拆词 + `grep -qx` 整行匹配,
+# 而非 `grep -qw avx`: busybox 的 -w 在部分构建不生效(实测把 avx2/avx_vnni 也算进来),
+# 而 -qx 语义由 POSIX 明确, 与实现无关; 方向也安全: 只认真正的 avx 词条。
 _hysteria_cpu_has_avx() {
     [ -r /proc/cpuinfo ] || return 1
     grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | tr ' ' '\n' | grep -qx avx
 }
 
-# 结合 CPU 能力给出最终资产名: x86_64 且本机 /proc/cpuinfo 有 avx → amd64-avx(**优先**),
-# 否则普通 amd64。**变体不再由用户选择** —— 旧版有 [4] 手动开关 + state/hysteria_variant,
-# 现改为纯自动检测。依据: 官方文档的 Client/Server 示例直接把 `hysteria-linux-amd64-avx`
-# 当作 amd64 的产物名, 且实测官方 release v2.6.0/v2.9.2/v2.12.2 均提供该资产。
-# 自动选择必须自带兜底: 万一"cpuinfo 有 avx 但 AVX 指令实际不可执行", 下载后的可执行自检
-# 会失败, 此时 _hysteria_download_install 以 _HY_FORCE_PLAIN=1 重试普通 amd64 —— 手动开关
-# 已移除, 没有这条自愈路径用户会被永久锁在"装不上"的状态。
+# 结合 CPU 能力给出最终资产名: x86_64 且 cpuinfo 有 avx → amd64-avx(**优先**), 否则 amd64。
+# **变体不再由用户选择** —— 旧版手动开关与 state/hysteria_variant 已移除, 纯自动检测;
+# 官方文档与实测 release 均提供该资产。自动选择必须自带兜底: cpuinfo 有 avx 但指令实际
+# 不可执行时, 下载后可执行自检会失败, _hysteria_download_install 以 _HY_FORCE_PLAIN=1
+# 重试普通 amd64 —— 没有这条自愈路径用户会被永久锁在"装不上"。
 _hysteria_pick_asset() {
     local base
     base=$(_hysteria_arch_asset) || return 1
@@ -254,9 +224,9 @@ _hysteria_download_install() {
         _error "下载失败(网络受限?), 当前安装未变动"
         return 1
     fi
-    # (官方 hashes.txt, 2026-09-13 实证与 binary 同目录发布): SHA256 校验 fail-closed。
-    # 拿不到官方校验和 = 不可信任下载内容, 直接中止(自检+版本匹配只能证明"能执行且报对版本",
-    # 无法证明"就是官方发布的那个 binary")。hashes.txt 格式: "<sha256>  build/<asset>"。
+    # 官方 hashes.txt 与 binary 同目录发布(2026-09-13 实证): SHA256 校验 fail-closed。
+    # 拿不到官方校验和 = 不可信任下载内容 —— 自检+版本匹配只能证明"能执行且报对版本",
+    # 无法证明"就是官方发布的那个 binary"。
     local h_file expected sha
     h_file=$(mktemp "$BIN_DIR/hashes.txt.XXXXXX") || { rm -f "$tmp"; _error "临时文件创建失败"; return 1; }
     if ! _http_download "${HYSTERIA_DL_BASE}/${want}/hashes.txt" "$h_file" 60 || [ ! -s "$h_file" ]; then
@@ -278,10 +248,9 @@ _hysteria_download_install() {
     ver=$("$tmp" version 2>/dev/null | grep '^Version' | grep -o 'v[.0-9]*' | head -1)
     if [ "$ver" != "$want" ]; then
         rm -f "$tmp"
-        # 自愈兜底: 选了 AVX 版但本机执行不了(cpuinfo 报 avx 而实际不可执行, 或容器屏蔽)
-        # → 自动改用普通 amd64 重试一次。变体已改为自动选择、手动开关已移除, 没有这条
-        # 路径用户会永久卡在"每次安装都失败"。_HY_FORCE_PLAIN 保证只重试一次(前缀赋值仅
-        # 作用于该次调用), 普通版再失败就是真失败, 正常报错返回。
+        # 自愈兜底: 选了 AVX 版但本机执行不了(cpuinfo 假阳性/容器屏蔽)→ 自动改用普通
+        # amd64 重试一次(_HY_FORCE_PLAIN 前缀赋值只作用于该次调用; 手动开关已移除,
+        # 没有这条路径用户会永久卡在"每次安装都失败")。普通版再失败就是真失败。
         if [ "$asset" = "amd64-avx" ] && [ -z "${_HY_FORCE_PLAIN:-}" ]; then
             _warn "AVX 版无法在本机执行(可执行自检未通过), 自动改用普通 amd64 重试"
             _HY_FORCE_PLAIN=1 _hysteria_download_install "$want"
@@ -291,9 +260,9 @@ _hysteria_download_install() {
         return 1
     fi
     if _hysteria_installed; then
-        # 备份名必须**每次调用唯一**: 运行期 AVX 兜底会在本函数内再调一次本函数(嵌套),
-        # 固定名 ".hysteria.rollback.$$" 会被内层覆盖、并在内层收尾时删除 —— 外层回滚
-        # 就失去了旧 binary(嵌套调用同 PID, $$ 不区分层级)。
+        # 备份名必须**每次调用唯一**: 运行期 AVX 兜底会在本函数内嵌套再调一次, 固定名
+        # ".hysteria.rollback.$$" 会被内层覆盖并在内层收尾时删除 —— 外层回滚就失去旧
+        # binary(嵌套同 PID, $$ 不区分层级)。
         backup=$(mktemp "$BIN_DIR/.hysteria.rollback.XXXXXX") \
             || { rm -f "$tmp"; _error "回滚备份文件创建失败, 已中止"; return 1; }
         cp -p "$HYSTERIA_BIN" "$backup" || { rm -f "$tmp" "$backup"; _error "旧核心备份失败, 已中止"; return 1; }
@@ -322,17 +291,16 @@ _hysteria_download_install() {
         chmod 755 "$HYSTERIA_BIN" 2>/dev/null
     fi
     _state_set hysteria_version "$want" || _warn "版本记录写入失败(不影响运行)"
-    # 记录**实际安装的资产名**(观察值, 不是用户配置): 运行期 AVX 兜底优先据此判断当前
-    # binary 是不是 AVX 变体 —— 不能靠 CPU 能力反推, 自检兜底可能已把变体换成普通版。
-    # 写失败只降级不阻断: 兜底侧对缺失记录有第二来源(amd64+CPU avx 的保守弱推断,
-    # 见 _hysteria_avx_runtime_retry), 故这里失败不影响安装本体。
+    # 记录**实际安装的资产名**(观察值, 不是用户配置): 运行期 AVX 兜底据此判断当前 binary
+    # 是不是 AVX 变体 —— 不能靠 CPU 能力反推(自检兜底可能已把变体换成普通版)。写失败只降级
+    # 不阻断: 兜底侧对缺失记录有第二来源(CPU 弱推断, 见 _hysteria_avx_runtime_retry)。
     _state_set hysteria_asset "$asset" || _warn "资产记录写入失败(不影响运行, AVX 兜底将按 CPU 弱推断)"
     if [ "$was_running" -eq 1 ]; then
         if _hysteria_restart_verified; then
             _success "官方 Hysteria2 核心已升级: ${want}"
         else
-            # P2-1(十五轮评审): 自检只跑 `version` 子命令, 不覆盖热路径 AVX 指令。
-            # 装的是 AVX 变体且启动失败时, 先换普通 amd64 重装重试, 再考虑回滚旧核心。
+            # 自检只跑 `version` 子命令, 不覆盖热路径 AVX 指令。装的是 AVX 变体且启动
+            # 失败时, 先换普通 amd64 重装重试, 再考虑回滚旧核心。
             if _hysteria_avx_runtime_retry "$want" "$asset"; then
                 [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
                 return 0
@@ -367,26 +335,24 @@ _hysteria_download_install() {
 }
 
 # ---------------------------------------------------------------------------
-# AVX 运行期兜底(P2-1, 十五轮评审):
-# 下载阶段的自检只执行 `hysteria version` —— 它证明"这个 binary 能在本机执行",
-# 但**不覆盖服务热路径**里的 AVX 指令。cpuinfo 报 avx 而实际不可执行(容器屏蔽、
-# 虚拟化暴露不完整、异构迁移)时可能出现"自检通过 → 装机 → 启动 SIGILL"。
-# 此时把已装上的 AVX 变体换成普通 amd64 重装并重试启动一次, 与自检兜底合成
-# 完整生命周期: 自检失败 → 兜底; 自检通过但启动失败 → 本兜底。
-# 仅当**当前实际装的确实是 AVX 变体**才动手(据 state/hysteria_asset 这一观察值判断,
-# 不用 CPU 能力反推); _HY_FORCE_PLAIN 保证只重试一次(内层调用不再递归兜底)。
+# AVX 运行期兜底:
+# 下载阶段的自检只执行 `hysteria version` —— 证明"这个 binary 能在本机执行", 但
+# **不覆盖服务热路径**里的 AVX 指令。cpuinfo 报 avx 而实际不可执行(容器屏蔽、虚拟化暴露
+# 不完整、异构迁移)时会出现"自检通过 → 装机 → 启动 SIGILL"。此时把已装的 AVX 变体换成
+# 普通 amd64 重装并重试启动一次, 与自检兜底合成完整生命周期。
+# 仅当**当前实际装的确实是 AVX 变体**才动手(据 state/hysteria_asset 判断, 不用 CPU 反推);
+# _HY_FORCE_PLAIN 保证只重试一次(内层不再递归兜底)。
 # 用法: _hysteria_avx_runtime_retry <version> <asset>; 返回 0 = 已换普通版且启动成功
 # ---------------------------------------------------------------------------
 _hysteria_avx_runtime_retry() {
     local want="$1" asset="$2"
     [ -n "$want" ] || return 1
     [ -z "${_HY_FORCE_PLAIN:-}" ] || return 1
-    # 第二来源(P2, 十六轮评审): state/hysteria_asset 只是观察值, 可能缺失或写入失败。
-    # 不能用 `hysteria version` 反推 —— 实测 v2.12.2 输出 Architecture: amd64, **不区分**
-    # avx 变体; 也不值得为它去下载官方 hashes.txt 比对 SHA256(兜底触发频率极低, 但代价
-    # 是每次失败都要一次网络往返)。改用与 _hysteria_pick_asset 相同口径的保守弱推断:
-    # amd64 架构 + CPU 报 avx → 当初装的极可能就是 AVX 变体, 宁可多做一次兜底尝试
-    # (若当初装的其实是普通版, 这次重装普通版同样能启动, 只是多一次下载)。
+    # 第二来源: state/hysteria_asset 只是观察值, 可能缺失或写入失败; `hysteria version`
+    # 不区分 avx 变体(实测 v2.12.2 输出 Architecture: amd64), 也不值得为它下载 hashes.txt
+    # 比对 SHA256(兜底触发频率极低)。改用与 _hysteria_pick_asset 同口径的保守弱推断:
+    # amd64 + CPU 报 avx → 当初装的极可能就是 AVX 变体, 宁可多做一次兜底尝试
+    # (若当初装的其实是普通版, 重装普通版同样能启动, 只多一次下载)。
     if [ -z "$asset" ]; then
         local base
         base=$(_hysteria_arch_asset 2>/dev/null) || return 1
@@ -418,8 +384,8 @@ _hysteria_core_menu() {
     else
         echo -e "  当前版本: ${RED}未安装${NC}"
     fi
-    # AVX 变体不再提供手动切换: 变体由 CPU 能力自动决定(见 _hysteria_pick_asset),
-    # 具体下载的资产名会在安装时的"下载 <url>"一行里体现(含 -avx 后缀)。
+    # AVX 变体不提供手动切换: 变体由 CPU 能力自动决定(见 _hysteria_pick_asset), 具体下载的
+    # 资产名会在安装时的"下载 <url>"一行里体现(含 -avx 后缀)。
     echo
     echo -e "  ${GREEN}[1]${NC} 安装/更新到最新版"
     echo -e "  ${GREEN}[2]${NC} 安装指定版本 (v2.x.x)"
@@ -447,8 +413,8 @@ _hysteria_core_menu() {
 
 _hysteria_is_running() {
     # 结构复刻 _xray_is_running 的三分支判活(该函数是项目加固最重的函数, 不参数化共用,
-    # 避免"为了 DRY 动它"引入回归; 本函数独立维护同样的判活口径):
-    # systemd: 必须 ActiveState=active 且 SubState=running, 且 MainPID 非 0 —— 只认"service
+    # 避免"为了 DRY 动它"引入回归):
+    # systemd: 必须 ActiveState=active 且 SubState=running 且 MainPID 非 0 —— 只认"service
     # 真正在跑", 不回退全机扫描(否则宿主上别人的 hysteria 会被当成我们的服务)
     # openrc : pidfile 是 supervise-daemon 父进程, 需回溯 ppid 链找业务子进程
     # direct : pidfile 即业务进程
@@ -463,19 +429,15 @@ _hysteria_is_running() {
                     systemctl is-active --quiet "$HYSTERIA_SVC" 2>/dev/null || return 1
                     ;;
                 *)
-                    # P2-1(第十轮评审): 判活语义从"进程存在"提升为"service 真正 active/running"。
-                    # 只看 MainPID != 0 会把 activating(auto-restart 等待期)/deactivating 也算成
-                    # running —— 与瞬态验证的连续采样修复同源(同一类"崩溃重启窗口"误判): 配置
-                    # 启动后 8~10s 才崩的场景下, 旧的 8 次全 running 轮询可能整体落在
-                    # activating/auto-restart 窗口内而误判成功并提交。加 ActiveState/SubState
-                    # 后 activating/deactivating/failed/auto-restart 自然全部排除。
+                    # 判活语义从"进程存在"提升为"service 真正 active/running"。只看
+                    # MainPID != 0 会把 activating(auto-restart 等待期)/deactivating 也算成
+                    # running —— 配置启动后 8~10s 才崩的场景下, 旧的 8 次全 running 轮询可能
+                    # 整体落在该窗口内而误判成功并提交。加 ActiveState/SubState 后
+                    # activating/deactivating/failed/auto-restart 自然全部排除。
                     #
-                    # 关于 `--value`: 进入本分支说明它**可用** —— 上面的 LoadState 就是用
-                    # `--value` 读到的, 读到非空即证明本机 systemctl 支持该选项(systemd >= 230)。
-                    # `--value` 不支持的机器(老 systemd / 容器内无 systemctl)会在上面落到
-                    # `load=""` 分支, 走 "is-active + 本机 binary 归属" 兜底, **不会**走到这里;
-                    # 所以此处不再为 `--value` 不可用做额外分支, 否则会出现"注释声称兼容、
-                    # 实际这条路径永远不执行"的误导(第十轮评审 P2 的合理内核)。
+                    # 进入本分支说明 `--value` **可用** —— 上面的 LoadState 就是用它读到的
+                    # (systemd >= 230)。不支持的机器会落到 load="" 分支, **不会**走到这里,
+                    # 故不再为它加额外分支(否则会出现"注释声称兼容、实际永不执行"的误导)。
                     active=$(systemctl show -p ActiveState --value "$HYSTERIA_SVC" 2>/dev/null)
                     if [ -n "$active" ]; then
                         [ "$active" = "active" ] || return 1
@@ -487,10 +449,9 @@ _hysteria_is_running() {
                         return 1
                     fi
                     # ActiveState 读不到(理论上不可达: 能读到 LoadState 就说明 --value 可用)。
-                    # 用 is-active 精确判定, 再**尽量**用 MainPID 定位本单元进程树; 但 MainPID
-                    # 读不到时绝不判 stopped —— 交给函数末尾的全机 binary 归属扫描兜底。
-                    # (评审担心的"读不到 → 误报 stopped"正由这层兜底消除; 而 MainPID 可读时
-                    # 仍走更严格的本单元进程树校验, 不因兜底而降级。)
+                    # 用 is-active 精确判定, 再**尽量**用 MainPID 定位本单元进程树; 但
+                    # MainPID 读不到时绝不判 stopped —— 交给函数末尾的全机 binary 归属扫描兜底
+                    # (MainPID 可读时仍走更严格的本单元进程树校验, 不因兜底而降级)。
                     systemctl is-active --quiet "$HYSTERIA_SVC" 2>/dev/null || return 1
                     anchor=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null)
                     if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ]; then
@@ -503,7 +464,7 @@ _hysteria_is_running() {
             # direct 的 pidfile 由本脚本写, 可能带 starttime 身份(见 00-common `_xd_pidfile_*`)。
             # **有身份记录时身份就是权威**: 记录在而当前化身不符(已退出/被复用)直接判 stopped,
             # 不再由全机扫描兜底 —— 否则 `_hysteria_restart_verified` 会把坏配置下的假 running
-            # 当成成功(第二轮复审 P1)。
+            # 当成成功。
             if [ -n "$(_xd_pidfile_starttime "$HYSTERIA_PID_FILE")" ]; then
                 _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" || return 1
             fi
@@ -523,10 +484,10 @@ _hysteria_is_running() {
     _proc_any_named hysteria "$HYSTERIA_BIN"
 }
 
-# direct backend 的 PID 归属判定: 只看 comm=="hysteria" 太宽 ——
-# PID reuse / 陈旧 pidfile 场景下, 别的 hysteria(系统包 / 用户自建)会被误认成本项目的服务,
-# 甚至被 kill。项目在卸载路径已用 /proc/<pid>/exe 判归属, 这里统一到同一口径:
-# pid 数字合法 + /proc/<pid>/exe(含 "(deleted)" 就地替换形态, 经 readlink -f 归一) == $HYSTERIA_BIN
+# direct backend 的 PID 归属判定: 只看 comm=="hysteria" 太宽 —— PID reuse / 陈旧 pidfile
+# 场景下, 别的 hysteria(系统包 / 用户自建)会被误认成本项目的服务, 甚至被 kill。统一到
+# 卸载路径的同一口径: pid 数字合法 + /proc/<pid>/exe(含 "(deleted)" 形态, 经 readlink -f 归一)
+# == $HYSTERIA_BIN。
 # 返回 0 = 确属本项目的 hysteria 进程; 1 = 不是(含进程不存在)。
 _hysteria_pid_is_ours() {
     local pid="${1:-}" exe want
@@ -540,29 +501,25 @@ _hysteria_pid_is_ours() {
     [ -n "$want" ] && [ "$exe" = "$want" ]
 }
 
-# 判断以 anchor 为根(含自身)的进程树里是否存在 exe == $HYSTERIA_BIN 的进程(P2-1 第八轮评审)。
+# 判断以 anchor 为根(含自身)的进程树里是否存在 exe == $HYSTERIA_BIN 的进程。
 # 用于 openrc supervisor 归属校验: supervisor 自身 exe 是 supervise-daemon, 需向下找业务子进程。
 #
-# **深度 4 是实现假设, 不是通用保证**(第九轮评审 P2-3): 本函数的契约是
+# **深度 4 是实现假设, 不是通用保证**。契约:
 #   - rc=0: 在 anchor 向下 ≤4 层内找到 exe 完全等于 $HYSTERIA_BIN 的进程 ⇒ 确认归属;
-#   - rc=1: **未确认归属** —— 既包括"确实不是我们的进程", 也包括"确实是我们的但层级 >4 或
-#     /proc 读不到 exe"。两种"未确认"故意不区分: 调用方(杀进程前确认归属)只关心
-#     "能否证明是我们的", 证明不了就不动手。
-# 因此本函数**失败方向是 fail-closed**(宁可漏杀也不误杀他方服务): 覆盖不到时返回 1,
-# 调用方 `_hysteria_kill_stale_supervisor` 走"不杀 + 告警"分支, 由人工处理;
-# 绝不会因为"看不清"而 kill 一个可能属于他方的 supervisor。
-# 之所以是 4: 本项目 openrc 服务是 `supervise-daemon → hysteria` 一层拓扑, 4 层留足余量;
-# 若未来服务定义改成多层 wrapper(如 sudo/env 嵌套), 需同步调大此值。
+#   - rc=1: **未确认归属** —— 包括"确实不是我们的"与"是我们的但层级 >4 / 读不到 exe";
+#     两种故意不区分: 调用方只关心"能否证明是我们的", 证明不了就不动手。
+# 失败方向 = fail-closed(宁可漏杀也不误杀他方服务): 调用方走"不杀 + 告警"分支, 由人工处理;
+# 绝不会因为"看不清"而 kill 一个可能属于他方的 supervisor。深度 4 的依据: 本项目 openrc
+# 是 `supervise-daemon → hysteria` 一层拓扑; 未来若改成多层 wrapper 需同步调大此值。
 _hysteria_proc_tree_has_bin() {
     local anchor="$1" p c cur i
     local depth=4   # 见上方契约说明: 实现假设, 超出即返回 1(fail-closed)
     [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
     [ "$anchor" != "0" ] || return 1
-    # **必须用严格版**: 本函数的契约是 fail-closed(见上方说明), 而 _proc_exe_is 在读不到
-    # /proc/<pid>/exe 时**放行**(那是为判活设计的语义)。用宽松版会让"看不清"被当成"确认
-    # 归属", 于是下面去 kill 一个可能属于他方的 supervisor —— 与本函数声明的保证相反。
-    # 混装旧 lib(00-common 是旧版)时严格版不存在: 按项目惯例用 declare -F 守卫, 此时**拒绝**
-    # (即 fail-closed —— 与契约一致, 而不是 command-not-found 噪声后碰巧返回 1)。
+    # **必须用严格版**: 本函数契约是 fail-closed, 而 _proc_exe_is 在读不到 /proc/<pid>/exe
+    # 时**放行**(那是为判活设计的语义)。用宽松版会让"看不清"被当成"确认归属", 于是去 kill
+    # 一个可能属于他方的 supervisor。混装旧 lib(00-common 是旧版)时严格版不存在: 按项目
+    # 惯例用 declare -F 守卫, 此时**拒绝**(fail-closed, 与契约一致)。
     if declare -F _proc_exe_is_strict >/dev/null 2>&1; then
         _proc_exe_is_strict "$anchor" "$HYSTERIA_BIN" && return 0
     else
@@ -591,12 +548,11 @@ _manage_hysteria() {
     # fd9 关闭(9>&-): 本函数可能在 _with_config_lock 的锁子 shell 内被调用(config 事务),
     # openrc 的 supervise-daemon / direct 模式的 nohup 会继承全部打开 fd —— 守护进程
     # 持有 fd9 = flock 永远被持有, 后续所有配置事务 15s 超时失败(2026-09-13 Alpine 实测;
-    # systemd 不继承业务 fd 故 Ubuntu 无感)。对齐 singbox-lite 的锁 fd 泄漏修复。
+    # systemd 不继承业务 fd 故 Ubuntu 无感)。
     #
-    # **写法必须是 local V="${V:-9}" + {V}>&-(十五轮实测 P1)**: bash 不把 `${V:-9}>&-`
-    # 当重定向, 展开出来的数字会变成**位置参数**传给被调命令(实测 `systemctl start xray 10`,
-    # 即去操作不存在的 10.service 而报失败), 锁 fd 也照旧被守护进程继承。详见 20-xray-core.sh
-    # 同名注释。四个变量归一成数字后, `{V}>&-` 才是真正只作用于该命令的重定向。
+    # **写法必须是 local V="${V:-9}" + {V}>&-**: bash 不把 `${V:-9}>&-` 当重定向, 展开出来的
+    # 数字会变成**位置参数**传给被调命令(实测 `systemctl start xray 10`), 锁 fd 也照旧被继承。
+    # 变量归一成数字后 `{V}>&-` 才是真正只作用于该命令的重定向(详见 20-xray-core.sh 同名注释)。
     local CORE_LOCK_FD="${CORE_LOCK_FD:-9}"
     local DEPLOY_INSTALL_LOCK_FD="${DEPLOY_INSTALL_LOCK_FD:-9}"
     local XD_CORE_LEGACY_FLOCK_FD="${XD_CORE_LEGACY_FLOCK_FD:-9}"
@@ -607,9 +563,9 @@ _manage_hysteria() {
         systemd)
             case "$action" in
                 start)
-                    # 0.16.7(评审轮实测): 高频 stop/start(事务/瞬态验证循环)会触发 systemd
-                    # 启动限流 "start-limit-hit", 之后 start 一律被拒 → 服务再也起不来。
-                    # 启动前清掉限流计数(对未受限的 unit 是幂等 no-op), 与项目 xray 侧同口径。
+                    # 高频 stop/start(事务/瞬态验证循环)会触发 systemd 启动限流
+                    # "start-limit-hit", 之后 start 一律被拒 → 服务再也起不来。启动前清掉
+                    # 限流计数(对未受限的 unit 是幂等 no-op), 与项目 xray 侧同口径。
                     systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
                     # start/restart 会派生守护进程: 一并关掉本项目可能持有的全部锁 fd
                     # (config 锁 fd9 + 核心/安装主锁 + 跨版本协调的旧版锁); 少关一把 = 锁不释放。
@@ -675,9 +631,8 @@ _manage_hysteria() {
                     if [ -f "$HYSTERIA_PID_FILE" ]; then
                         local dpid _hy_st
                         dpid=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
-                        # 身份链闭合(第二轮复审 P1): 复核过的 starttime 必须传进 kill helper,
-                        # 否则 helper 自己重读 starttime, 两次读取之间 PID 可能被复用。
-                        # exe 归属只作附加收窄, 不能替代身份绑定。
+                        # 身份链闭合: 复核过的 starttime 必须传进 kill helper, 否则 helper
+                        # 自己重读 starttime, 两次读取之间 PID 可能被复用。exe 归属只作附加收窄。
                         _hy_st=$(_xd_pidfile_starttime "$HYSTERIA_PID_FILE")
                         if [ -n "$dpid" ] && _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" \
                            && _hysteria_pid_is_ours "$dpid"; then
@@ -693,18 +648,17 @@ _manage_hysteria() {
     esac
 }
 
-# openrc 状态机与 supervise-daemon 脱同步清理(2026-09-13 Alpine 实测):
-# 子进程 FATAL 后 supervisor 进入 respawn-wait(仍存活), openrc 却把服务标记 stopped;
-# 此后 start 被 "supervise-daemon: already running" 拒绝, 服务永远起不来。
-# stop 后若 pidfile 仍指向存活的 supervise-daemo(busybox comm 截断 15 字符), 显式 kill。
-# 归属安全(P2-1 第八轮评审): 不能只看 comm=supervise-daemo* —— pidfile 陈旧且 PID 被**别的**
-# openrc 服务的 supervisor 复用时, 只看名字会误杀他方进程。openrc 的 pidfile 是 supervisor
-# 父进程(其 exe 不是 hysteria), 无法像 direct 那样直接比 exe; 改为校验**其进程树里确实存在
-# exe == $HYSTERIA_BIN 的进程**, 归属确属本项目才动手。
+# openrc 状态机与 supervise-daemon 脱同步清理(2026-09-13 Alpine 实测): 子进程 FATAL 后
+# supervisor 进入 respawn-wait 仍存活, openrc 却标 service stopped; 此后 start 被
+# "already running" 拒绝, 服务永远起不来。stop 后若 pidfile 仍指向存活的 supervise-daemo
+# (busybox comm 截断 15 字符), 显式 kill。
+# 归属安全: 不能只看 comm —— pidfile 陈旧且 PID 被**别的** openrc supervisor 复用时, 只看
+# 名字会误杀他方。openrc pidfile 是 supervisor 父进程(exe 不是 hysteria), 无法像 direct
+# 那样直接比 exe; 改为校验**其进程树里确实存在 exe == $HYSTERIA_BIN 的进程**, 确属本项目才动手。
 _hysteria_kill_stale_supervisor() {
     local a c st
-    # openrc 的 pidfile 由 supervise-daemon 写(纯 PID); 用统一解析器取第一字段, 兼容 direct 的
-    # "PID starttime" 形态。
+    # openrc 的 pidfile 由 supervise-daemon 写(纯 PID); 用统一解析器取第一字段, 兼容 direct
+    # 的 "PID starttime" 形态。
     a=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
     [ -n "$a" ] || return 0
     [ -d "/proc/$a" ] || { rm -f "$HYSTERIA_PID_FILE"; return 0; }
@@ -712,7 +666,7 @@ _hysteria_kill_stale_supervisor() {
     case "$c" in
         supervise-daemo*)
             if _hysteria_proc_tree_has_bin "$a"; then
-                # openrc 不记录 starttime(纯 PID pidfile), 故在属主复核**之后立刻**抓一次身份并
+                # openrc 不记录 starttime(纯 PID pidfile), 故在属主复核**之后立刻**抓一次身份
                 # 传入 helper, 把"复核→kill"窗口压到最小; 抓不到时 helper 退化为自读(已声明残余)。
                 st=$(_proc_starttime "$a") || st=""
                 _xd_kill_pid_graceful "$a" 5 "$st"
@@ -747,8 +701,8 @@ _hysteria_restart_verified() {
 # 只"不主动启动"是不够的)。这是所有 rollback/recovery 路径的统一收尾入口。
 _hysteria_recover_to_state() {
     local want="${1:-}"
-    # 未知/空状态不得默认为 stopped —— 未来某 backend 返回
-    # unknown/failed/not-found 时被当成 stopped 会掩盖真实异常。只接受两个明确值。
+    # 未知/空状态不得默认为 stopped(unknown/failed/not-found 被当成 stopped 会掩盖真实异常),
+    # 只接受两个明确值。
     case "$want" in
         running) _hysteria_restart_verified ;;
         stopped) _hysteria_stop_and_verify >/dev/null 2>&1 ;;
@@ -765,14 +719,11 @@ _hysteria_recover_to_state() {
 _hysteria_validate_transient() {
     _manage_hysteria start 2>/dev/null
     local i streak=0 stable=0
-    # 必须**连续 3 次**采样均为 running 才算启动成功。单次命中不足以证明"配置可用":
-    # 坏配置下 systemd 单元(Restart=on-failure / RestartSec=3)处于崩溃重启循环,
-    # ActiveState=activating 而 MainPID 在每次重启尝试的瞬间非零, 1s 采样会撞上该窗口
-    # 误报 running —— 2026-09-14 实测(坏 tls 配置): 0.2s 采样 60 次命中 1 次, 彼时
-    # NRestarts=4 / ActiveState=activating。一次误判会让坏配置被**提交**(而非回滚),
-    # 服务随即崩溃循环, 后续所有事务/操作级联失败。
-    # 连续 3 次命中要求进程在 3 个采样点都存活; 崩溃循环(存活 <1s、间隔 3s)无法满足,
-    # 而正常配置启动 <1s 后长驻, 只多花 ~2s。
+    # 必须**连续 3 次**采样均为 running 才算启动成功。单次命中不足以证明"配置可用": 坏配置下
+    # systemd 单元(Restart=on-failure / RestartSec=3)处于崩溃重启循环, ActiveState=activating
+    # 而 MainPID 在每次重启尝试的瞬间非零, 1s 采样会撞上该窗口误报 running(2026-09-14 坏 tls
+    # 实测)。一次误判会让坏配置被**提交**(而非回滚), 服务随即崩溃循环, 后续操作级联失败。
+    # 连续 3 次命中要求进程在 3 个采样点都存活(崩溃循环无法满足), 正常配置只多花 ~2s。
     for i in 1 2 3 4 5 6 7 8; do
         sleep 1
         if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
@@ -1025,9 +976,8 @@ _hysteria_config_txn() {
 }
 
 # ---------------------------------------------------------------------------
-# 服务级统一事务(P1-4): hysteria.json(官方配置) + server_meta.json(manager
-# 元数据)必须作为一个整体提交 —— 先 config 后 meta 的两段式会在"config 已提交而 meta
-# 写失败"时产生状态漂移(服务是新 TLS / 链接按旧 TLS 重建)。
+# 服务级统一事务: hysteria.json(官方配置) + server_meta.json(manager 元数据)必须整体提交
+# —— 先 config 后 meta 的两段式会在"config 已提交而 meta 写失败"时漂移(服务新 TLS / 链接旧 TLS)。
 # 用法: _hysteria_server_txn [--arg/--argjson ...] <config_filter> <meta_filter>
 # meta_filter 传 "-" 表示本事务不动 server_meta。
 # 契约: 双备份 → config 变更 → meta 变更 → verified-restart → 失败双回滚+重启。
@@ -1058,9 +1008,9 @@ _hysteria_server_txn_locked() {
         _error "配置替换失败, 保留旧配置"
         return 1
     fi
-    # --- 至此 config 已变更: 之后任何失败都必须恢复 config + meta 并**按原运行状态**收尾 ---
-    # 早期回滚路径原直接 `_hysteria_restart_verified`, 忽略 was_running ——
-    # 用户原本 stopped 的服务会被一次失败的事务异常启动。统一走 _hysteria_recover_to_state。
+    # --- 至此 config 已变更: 之后任何失败都必须恢复 config + meta 并按**原运行状态**收尾 ---
+    # (早期回滚路径直接 restart, 忽略 was_running, 会把用户原本 stopped 的服务异常启动;
+    #  统一走 _hysteria_recover_to_state)
     local meta_bak="" meta_had=0 meta_created=0
     if [ "$meta_filter" != "-" ]; then
         if [ -f "$HYSTERIA_SERVER_META" ]; then
@@ -1100,9 +1050,8 @@ _hysteria_server_txn_locked() {
     if [ "$was_running" = "running" ]; then
         if ! _hysteria_restart_verified; then
             _error "hysteria 启动失败, 回滚配置与元数据"
-            # 无论 config 回滚成败都必须继续回滚 meta 并给出降级状态 ——
-            # 原写法在 restore 失败时提前 return, 留下"config 新/meta 新"或"config 未知/meta 新"
-            # 的不一致状态且无人工指引, 违反"失败即恢复原状或明确降级"。
+            # 无论 config 回滚成败都必须继续回滚 meta 并给出降级状态 —— 原写法在 restore
+            # 失败时提前 return, 留下 config/meta 不一致且无人工指引。
             local cfg_ok=0
             _hysteria_restore_config && cfg_ok=1
             local meta_ok=0
@@ -1146,10 +1095,9 @@ _hysteria_server_txn_locked() {
     return 0
 }
 
-# server_txn 的 meta 侧回滚(meta_had=1 还原备份; meta_created=1 删除新建; 失败显式报告)
-# server_meta 侧回滚。**返回真实状态**: 0=已还原到原状, 1=未能还原。
-# 原实现无条件 return 0, 调用方无从区分"回滚完成"与"回滚失败但已告警"; 严格事务 API 必须
-# 让调用者能据此判定是否进入 degraded state。
+# server_meta 侧回滚(meta_had=1 还原备份; meta_created=1 删除新建)。
+# **返回真实状态**: 0=已还原到原状, 1=未能还原 —— 调用方据此判定是否进入 degraded state
+# (原实现无条件 return 0, 无法区分"回滚完成"与"回滚失败但已告警")。
 _hysteria_server_txn_rollback() {
     local meta_had="$1" meta_created="$2" meta_bak="$3" mc rc=0
     if [ "$meta_had" -eq 1 ] && [ -s "$meta_bak" ]; then
@@ -1172,16 +1120,15 @@ _hysteria_server_txn() {
 }
 
 # ---------------------------------------------------------------------------
-# 节点级统一事务(): **config.auth.password + 节点元数据文件**是原子
-# 事务(含 verified-restart/瞬态验证与失败双回滚), 消除"config 已提交而节点元数据写失败"
-# 的两阶段漂移。**clash.yaml 是可再生的派生缓存, 不纳入事务** —— 阶段 4 同步失败仅告警,
-# 不回滚节点本体(与 Xray 侧 _sync_node_clash 同口径; P2-1 0.16.4 修正契约描述)。
-# 链接/元数据内容在事务前预构建(链接只依赖服务器级字段+本节点数据)。
-# 单密码模型下节点元数据只有一份($HYSTERIA_NODE_META), 但本事务的通用形态保留
+# 节点级统一事务: **config.auth.password + 节点元数据文件**原子提交(含 verified-restart /
+# 瞬态验证与失败双回滚), 消除"config 已提交而节点元数据写失败"的两阶段漂移。
+# **clash.yaml 是可再生的派生缓存, 不纳入事务** —— 阶段 4 同步失败仅告警, 不回滚节点本体
+# (与 Xray 侧 _sync_node_clash 同口径)。链接/元数据内容在事务前预构建。
+# 单密码模型下节点元数据只有一份($HYSTERIA_NODE_META), 但通用形态保留
 # (create/delete + 任意 config filter), 改密码与未来扩展都走同一条路径。
 # 用法: _hysteria_node_txn [--arg/--argjson ...] <config_filter> <meta_file> <op> <content>
 # op = create: 原子写入 meta_file(存在则覆盖; 回滚还原旧文件或删除新建)
-# delete: 删除 meta_file(fail-closed; 回滚还原)
+#      delete: 删除 meta_file(fail-closed; 回滚还原)
 # 返回 0 = config+meta 一致提交(clash 同步结果另计); 1 = 已回滚到原状(或显式报告回滚失败)
 # ---------------------------------------------------------------------------
 _hysteria_node_txn() {
@@ -1248,7 +1195,6 @@ _hysteria_node_txn_locked() {
         _error "配置替换失败, 保留旧配置"
         return 1
     fi
-    # 节点侧回滚 helper(meta 还原/删除 + clash 派生同步)
     # 节点侧回滚 helper(meta 还原/删除 + clash 派生同步)。返回真实状态:
     # 0=已还原; 1=未能还原(调用方据此判 degraded, 不再假定"回滚完成")
     _hysteria_node_txn_meta_rollback() {
@@ -1368,29 +1314,24 @@ _hysteria_server_txn_txn_wrapper() {
     fi
 }
 
-# 服务器是否已完成初始化(配置存在 + jq 可解析 + auth 段就绪)
-# 三态判定(P1-3): 官方 auth.type 有 password/userpass/http/command 四种,
-# 绝不能把"存在但非本 Manager 模型"的合法官方配置当成未初始化而 bootstrap 覆盖。
+# 服务器是否已完成初始化(配置存在 + jq 可解析 + auth 段就绪)。三态判定:
+# 官方 auth.type 有 password/userpass/http/command 四种, 绝不能把"存在但非本 Manager 模型"
+# 的合法官方配置当成未初始化而 bootstrap 覆盖。
 _hysteria_config_exists() {
     [ -f "$HYSTERIA_CONFIG" ] && [ -s "$HYSTERIA_CONFIG" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
     jq -e . "$HYSTERIA_CONFIG" >/dev/null 2>&1
 }
 
-# 本 Manager 认定的**可管理**认证状态。官方 binary 实测(2.12.2):
-#   - 缺 auth 段 / auth.type 为空 → FATAL "auth.type: empty auth type"
-#   - auth.type=password 且 password 为空串 → FATAL "auth.password: empty auth password"
-# 本 Manager 的模型是**单密码**(见文件头): 只有 password 且密码非空才算就绪。
-# 不接受 userpass/http/command: 它们都不是本模型 —— userpass 是被本模型取代的
-# 多用户形态(从未随本模块发布, 无需迁移), http/command 依赖外部后端, Manager
-# 无从校验也不该接管。判据只认一个模型, 才能保证"就绪 ⇒ 本模块能管理它"。
+# 本 Manager 认定的**可管理**认证状态。官方 binary 实测(2.12.2): 缺 auth 段/type 为空
+# → FATAL "empty auth type"; password 为空串 → FATAL "empty auth password"。
+# 模型是**单密码**(见文件头): 只有 password 且密码非空才算就绪; 不接受 userpass/http/command
+# (前者是被本模型取代的多用户形态, 从未随本模块发布, 无需迁移; 后两者依赖外部后端, 不该接管)。
 #
-# **契约边界(外部复审 P3, 已在此声明, 不靠函数名暗示)**: 本判据只证明"auth 段可用
-# 且是本模型", **不证明服务能启动** —— 官方 binary 无 validate/check 子命令, 坏配置
-# (listen 冲突、TLS 路径错等)只能靠真实启动结果判断, 那是 `_hysteria_restart_verified`
-# / `_hysteria_validate_transient` 的职责。函数名沿用 `server_initialized`(全模块 +
-# 测试套件的稳定契约), 但**不得**据此断言"服务在运行"; 需要运行事实请查
-# `_manage_hysteria status`。
+# **契约边界**: 本判据只证明"auth 段可用且是本模型", **不证明服务能启动** —— 官方无
+# validate/check 子命令, 坏配置(listen 冲突、TLS 路径错等)只能由真实启动结果判断, 那是
+# `_hysteria_restart_verified` / `_hysteria_validate_transient` 的职责。函数名沿用
+# `server_initialized`(全模块+测试套件的稳定契约), 但**不得**据此断言"服务在运行"。
 _hysteria_auth_ok() {
     _hysteria_config_exists || return 1
     jq -e '(.auth.type == "password") and (.auth.password | type == "string") and ((.auth.password | length) > 0)' "$HYSTERIA_CONFIG" >/dev/null 2>&1
@@ -1407,25 +1348,25 @@ _hysteria_config_password() {
     jq -r 'if .auth.type == "password" then (.auth.password // "") else "" end' "$HYSTERIA_CONFIG" 2>/dev/null
 }
 
-# **Manager 是否已接管这台服务器** —— 与 _hysteria_server_initialized 是两个不同的判断:
+# **Manager 是否已接管这台服务器** —— 与 _hysteria_server_initialized 是两个判断:
 #   _hysteria_server_initialized = 配置可运行(config.json 有 password)
 #   本函数                        = **Manager 侧有可用节点元数据**
-# 二者必须分开: 单密码模型下"有凭据"不等于"本 Manager 管过它" —— 用户可能手工
-# 部署过 Official Hysteria 再装上本脚本, 此时 config 有 password 但 node.json 不存在。
-# 用 initialized 去挡"添加节点"会造成**状态死结**(删了 node.json 就再也加不回来),
-# 用本函数才正确: 没有 node.json ⇒ 走接管流程重建元数据。
+# 必须分开: 单密码模型下"有凭据"不等于"本 Manager 管过它" —— 用户可能手工部署过
+# Official Hysteria 再装上本脚本, 此时 config 有 password 但 node.json 不存在。用
+# initialized 去挡"添加节点"会造成**状态死结**(删了 node.json 就再也加不回来), 用本函数
+# 才正确: 没有 node.json ⇒ 走接管流程重建元数据。
 #
-# **"存在"与"可用"必须分开判**(外部复审 P2): 旧实现只判 `-f && -s`, 于是半截/损坏的
-# node.json(JSON 语法错、缺 auth/name/link_addr)也被当成"已有节点" → [2] 说"已有节点"
-# 不给重建, [5] 改密码在 jq 上失败, [4] 又取不到 name —— 人为制造出**第二个死结**。
-# 契约: _hysteria_node_exists = 文件存在且**结构可用**(下游可直接 jq 取值)。
+# **"存在"与"可用"必须分开判**: 旧实现只判 `-f && -s`, 于是半截/损坏的 node.json(JSON
+# 语法错、缺 auth/name/link_addr)也被当成"已有节点" → [2] 不给重建, [5] 改密码 jq 失败,
+# [4] 取不到 name —— 人为制造出**第二个死结**。
+# 契约: _hysteria_node_exists = 文件存在且**结构可用**(下游可直接 jq 取值);
 # 只判"文件在不在"的场景(如卸载清 clash)用 _hysteria_node_file_present。
 _hysteria_node_file_present() {
     [ -f "$HYSTERIA_NODE_META" ] && [ -s "$HYSTERIA_NODE_META" ]
 }
 
-# 返回值**归一化为 0/1** —— jq 对非法 JSON 会返回 2/5 等非 1 码, 直接透出会让
-# 调用方/断言看到"意料外的错误码"; 布尔契约必须只有两种取值。
+# 返回值**归一化为 0/1** —— jq 对非法 JSON 会返回 2/5 等非 1 码, 直接透出会让调用方/断言
+# 看到"意料外的错误码"; 布尔契约必须只有两种取值。
 _hysteria_node_exists() {
     _hysteria_node_file_present || return 1
     command -v jq >/dev/null 2>&1 || return 1
