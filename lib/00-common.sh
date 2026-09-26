@@ -19,9 +19,8 @@ export STATE_DIR="$DEPLOY_DIR/state"
 export BACKUP_DIR="$STATE_DIR/backup"
 
 export XRAY_BIN="$BIN_DIR/xray"
-# XRAY_LOCATION_ASSET 优先经 config.json 的 env 段设置(官方 docs/config/env.md, 核心 ≥
-# v26.7.11 在构建模块前应用该段); 旧核心由 service 文件注入(见 20-xray-core _create_xray_service)。
-# 这里仅保留脚本自身调用(xray -test / direct 模式启动)时的进程级回退, 不再写入 service 文件。
+# XRAY_LOCATION_ASSET: 优先 config.json 的 env 段(核心 ≥ v26.7.11); 旧核心由 service 文件注入
+# (见 20-xray-core)。这里只是脚本自身调用(xray -test / direct 启动)的进程级回退。
 export XRAY_LOCATION_ASSET="$ASSET_DIR"
 export GEO_LOG="$LOG_DIR/geo.log"
 
@@ -31,13 +30,11 @@ export CF_UNIT_SYSTEMD="/etc/systemd/system/cloudflared.service"
 export CF_UNIT_OPENRC="/etc/init.d/cloudflared"
 
 # ---------------------------------------------------------------------------
-# 进程间锁的根目录(2026-09-26): 固定 `/var/lock/xray-deploy` —— 标准锁位置(FHS), 在
-# systemd/OpenRC 上通常是 tmpfs(`/var/lock -> /run/lock`), 重启即清空(陈旧锁自愈),
-# 且**不污染 /opt**。仍满足"锁必须在 `$DEPLOY_DIR` 之外"的硬约束: 卸载的 `rm -rf "$DEPLOY_DIR"`
-# 不会把锁文件拆成新旧 inode。**不读任何环境变量覆盖**(复审 P2): 能改锁命名空间的开关会让
-# 两进程各持不同锁而互不排斥; 测试沙箱直接改写本函数, 不走环境变量。
-# `/var/lock` 建不出时退 `/run/lock`; 二者都失败时**不回落到 /opt**, 而是返回 /var/lock 让
-# 调用方 fail-closed(明确报"无法创建锁")。**与 install.sh 的 `_install_lock_root` 同口径。**
+# 进程间锁根目录(2026-09-26): 固定 `/var/lock/xray-deploy`(FHS 标准位置, 通常 tmpfs, 重启
+# 自愈陈旧锁, 且不污染 /opt)。必须在 `$DEPLOY_DIR` 之外 —— 卸载的 rm -rf 不会把锁拆成
+# 新旧 inode。**不接受环境变量覆盖**(会致两进程各持不同锁而互不排斥); 测试直接改写本函数。
+# 建不出时退 /run/lock; 仍失败**不回落到 /opt**, 返回 /var/lock 让调用方 fail-closed。
+# 与 install.sh 的 `_install_lock_root` 同口径。
 # ---------------------------------------------------------------------------
 _deploy_lock_root() {
     if mkdir -p /var/lock/xray-deploy 2>/dev/null; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
@@ -53,19 +50,16 @@ export XRAY_REPO_API="https://api.github.com/repos/XTLS/Xray-core/releases"
 export GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
 
-# Xray config.json 官方顶层字段顺序(DRY: _normalize_config_format 与 _mutate_config 共用)
-# 官方顺序(docs/config/index.md): env → log → api → dns → routing → policy → inbounds →
-# outbounds → stats → fakedns → metrics → observatory → burstObservatory → geodata → version。
-# env 是 2026-07 新增(核心 ≥ v26.7.11), 旧核心会静默忽略该字段, 顺序本身对旧核心无影响。
+# Xray config.json 官方顶层字段顺序(官方 docs/config/index.md; _normalize_config_format 与
+# _mutate_config 共用)。env 为 2026-07 新增(核心 ≥ v26.7.11), 旧核心静默忽略, 顺序无影响。
 readonly XRAY_TOP_FIELDS_JSON='["env","log","api","dns","routing","policy","inbounds","outbounds","stats","fakedns","metrics","observatory","burstObservatory","geodata","version"]'
 
 # ---------------------------------------------------------------------------
-# 默认 routing 规则集(唯一真相)
-# 共用者: _init_config_if_empty(首次写配置, 20-xray-core) 与 _route_restore_default_rules
-# (恢复默认规则, 30-geo)。**绝不允许在任一侧另写一份** —— 两处硬编码必然随时间漂移。
-# 4 条规则中只有第 2、3 条会让 Xray 加载 geosite.dat / geoip.dat(各 ~20MB+),
-# 这正是 [9] → 路由规则精简 要摘掉的两条(见 XRAY_PRIVATE_BLOCK_RULE_JSON)。
-# 注意: regexp 内的 \\d / \\. 是 JSON 转义后的单个反斜杠, 单引号包裹以避免 bash 再吃一层。
+# 默认 routing 规则集(唯一真相): _init_config_if_empty(20-xray-core) 与
+# _route_restore_default_rules(30-geo) 共用, **绝不允许任一侧另写一份**。
+# 4 条中只有第 2、3 条会让 Xray 加载 geosite.dat/geoip.dat(各 ~20MB+), 这正是
+# [9] → 路由规则精简 要摘掉的两条(见 XRAY_PRIVATE_BLOCK_RULE_JSON)。
+# regexp 内 \\d / \\. 是 JSON 转义后的单个反斜杠(单引号防 bash 再吃一层)。
 # ---------------------------------------------------------------------------
 readonly XRAY_DEFAULT_ROUTING_RULES_JSON='[
   {
@@ -115,14 +109,10 @@ readonly XRAY_DEFAULT_ROUTING_RULES_JSON='[
 ]'
 
 # ---------------------------------------------------------------------------
-# 私网/保留地址 block 规则 —— 用字面量 CIDR 等价替换 "geoip:private"
-# 为什么需要它: 精简掉引用 geo 数据的规则后, 原 `ip:["geoip:private","geoip:cn"]` 一并消失,
-# 客户端就能借节点访问本机私网与云元数据端点(169.254.169.254)。routing.md 的 ip 字段
-# 接受字面量 CIDR, 因此把 private 段写死即可保住这层防护且**不加载 geoip.dat**。
-# CIDR 清单取自 v2fly/geoip 的 private 列表原文(plugin/special/private.go), 与
-# geoip:private 等价。
-# ruleTag 是本项目的所有权标记: 精简是幂等操作(重复执行先按该 tag 剔除旧的再重插),
-# 恢复默认规则时也靠它精确移除。Xray 支持 ruleTag(routing.md), 老核心忽略未知字段。
+# 私网/保留地址 block 规则: 用字面量 CIDR 等价替换 "geoip:private"。精简掉引用 geo 的规则
+# 后原 ip 段一并消失, 客户端就能借节点访问本机私网与云元数据(169.254.169.254); 写死
+# private 段即可保住防护且**不加载 geoip.dat**。CIDR 取自 v2fly/geoip private 列表原文。
+# ruleTag 是所有权标记: 精简/恢复都靠它精确增删(Xray 支持, 老核心忽略未知字段)。
 # ---------------------------------------------------------------------------
 readonly XRAY_PRIVATE_BLOCK_RULE_TAG="xd-block-private"
 readonly XRAY_PRIVATE_BLOCK_RULE_JSON='{
@@ -153,9 +143,8 @@ readonly XRAY_PRIVATE_BLOCK_RULE_JSON='{
   "outboundTag": "block"
 }'
 
-# Xray log.loglevel 合法取值(docs/config/log.md)。核心对未识别值静默回落 warning
-# (infra/conf/log.go 的 default 分支), 不会报配置错误 —— 所以校验必须由脚本自己做。
-# 注意 "none" 在核心里同时把 ErrorLogType 与 AccessLogType 置为 None, 即两个日志都停写。
+# Xray log.loglevel 合法取值。核心对未识别值静默回落 warning, 校验必须由脚本自己做。
+# "none" 同时停写 error 与 access 两个日志(infra/conf/log.go)。
 readonly XRAY_LOG_LEVELS="debug info warning error none"
 
 # ---------------------------------------------------------------------------
@@ -206,8 +195,7 @@ _get_public_ip() {
         (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 )) && \
         echo "$ip" && return 0
     done
-    # IPv6 兜底 —— **必须校验字面量**(#06)。旧写法只判 `[ -n "$ip" ]`, 源返回错误页/
-    # 代理提示时那段文本会被当成服务器地址写进分享链接(实测复现见 implement.md)。
+    # IPv6 兜底 —— **必须校验字面量**(#06): 只判非空会把错误页/代理提示写进分享链接。
     for url in "https://api64.ipify.org" "https://6.ipw.cn" "https://ipv6.icanhazip.com"; do
         ip=$(curl -fsS6 --max-time 6 "$url" 2>/dev/null) && _is_ipv6_literal "$ip" && echo "$ip" && return 0
     done
@@ -215,9 +203,8 @@ _get_public_ip() {
 }
 
 # ---------------------------------------------------------------------------
-# 通用 HTTP 下载: curl 优先, wget 兜底
-# 关键: wget 只用 busybox/GNU 都支持的 -q -T -O(禁用 --show-progress/-4 等 GNU 专有选项,
-# busybox wget 遇到会直接 unrecognized option 中止)。成功且文件非空才返回 0。
+# 通用 HTTP 下载: curl 优先, wget 兜底。wget 只用 busybox/GNU 都支持的 -q -T -O
+# (GNU 专有选项会让 busybox wget unrecognized option 中止)。成功且文件非空才返回 0。
 # 用法: _http_download <url> <dest> [timeout_sec]
 # ---------------------------------------------------------------------------
 _http_download() {
@@ -240,11 +227,9 @@ _http_download() {
 
 # ---------------------------------------------------------------------------
 # URL 编解码(节点链接生成用)
-# 实现 NOTE(2026-09-13, Alpine musl 实测): 旧版"按字符迭代 + printf '%%02X' 'c"依赖
-# locale 的字符/字节语义 —— glibc 下 LC_ALL=C 按字节迭代结果正确, 但 musl 的 C locale
-# 本身是 UTF-8, printf "'c" 对非 ASCII 字节会返回 0xDF00+byte 一类的错误码值, CJK
-# 名称被编码成 %DFE8 这类垃圾。现改为 od 拆字节后逐字节判定, 输出与平台/locale 无关:
-# 允许集(字母/数字/.~_-)保留字面量, 其余字节 %XX 大写十六进制(与旧行为逐字节一致)。
+# 实现 NOTE(Alpine musl): 旧"按字符 + printf '%%02X'"依赖 locale 的字符/字节语义, musl 的
+# C locale 是 UTF-8, CJK 被编成 %DFE8 一类垃圾。现用 od 拆字节后逐字节判定, 与平台/locale
+# 无关: 允许集(字母/数字/.~_-)保留字面量, 其余字节 %XX 大写十六进制。
 # ---------------------------------------------------------------------------
 _url_encode() {
     local s="$1" hex out="" b oct c o
@@ -252,7 +237,7 @@ _url_encode() {
     while [ -n "$hex" ]; do
         b=$((16#${hex:0:2})); hex="${hex:2}"
         if [ $(( (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 46 || b == 126 || b == 95 || b == 45 )) -eq 1 ]; then
-            # 字面字符渲染: \xHH 转义与 %02x 指令相邻会让 printf 把 % 当 hex digit 报错,
+            # 字面字符渲染: \xHH 与 %02x 相邻会让 printf 把 % 当 hex digit 报错,
             # 用 %b + 八进制两步构造(\141 -> a), 无子 shell
             printf -v oct '%03o' "$b"
             printf -v c '%b' "\\${oct}"
@@ -267,8 +252,6 @@ _url_encode() {
 
 # ---------------------------------------------------------------------------
 # IPv6 字面量校验(严格到足以拦住 xray 启动才报错的畸形输入)
-# 旧实现只要求"全是 hex/冒号且含冒号", 于是 1::2::3 / ::::: / abc:def 全部放行 ——
-# 用户拿到"配置已写入"后 xray 启动失败, 报错指向 core 而不是我们的输入校验。
 # 规则: 至多一个 "::"(至多 2 个空字段); 有 "::" 时非空段 ≤7, 无 "::" 时恰好 8 段;
 # 每段 1-4 位 hex; 允许尾部内嵌 IPv4(::ffff:1.2.3.4), 但纯 IPv4 不算 IPv6。
 # ---------------------------------------------------------------------------
@@ -284,15 +267,11 @@ _is_ipv6_literal() {
             a="${head}:0:0"                     # 内嵌 IPv4 占两段, 参与结构校验
             ;;
     esac
-    # 连续 3 个及以上冒号一律非法。**必须先拦这一条**: 下面用 ${a//::/} 数 "::" 次数时,
-    # "1:::2" 只会被消掉一个 "::"(dbl=1 通过), 而按段切分只产生 2 个空字段(empty=2 通过) ——
-    # 两条守卫各自都看不出它是畸形输入。这正是"至多一个 ::"的规则没有被真正执行的原因。
+    # 连续 3 个及以上冒号一律非法。**必须先拦这一条**: ${a//::/} 计数与按段切分各自都
+    # 看不出 "1:::2" 畸形(dbl=1、empty=2 都通过)。
     case "$a" in *:::* ) return 1 ;; esac
-    # 单个前导/尾随冒号也必须拒绝: 它只贡献 1 个空字段(在 empty<=2 预算内), 且不产生 "::"
-    # (dbl 仍为 0), 于是 "1:2:3:4:5:6:7:8:" / ":1:2:3:4:5:6:7:8" 两条守卫都放行 ——
-    # 实测这两个畸形地址曾被 _validate_listen 接受, xray 启动时才报错。
-    # 判据: 以单个 ':' 开头(后一个字符不是 ':')或以单个 ':' 结尾(前一个字符不是 ':')。
-    # '::1' / '1::' 前后都是 ':' , 不受影响。
+    # 单个前导/尾随冒号也必须拒绝: 它只贡献 1 个空字段且不产生 "::", 两条守卫都会放行。
+    # 判据: 单个 ':' 开头(后一个不是 ':')或单个 ':' 结尾(前一个不是 ':')。
     case "$a" in
         :[!:]*|*[!:]:) return 1 ;;
     esac
@@ -350,14 +329,13 @@ _is_listen_loopback() {
 # ---------------------------------------------------------------------------
 _validate_port() {
     local p="$1"
-    # Ports are emitted as JSON numbers by callers. Accept canonical decimal only: leading zeroes
-    # are not valid JSON integers, and unchecked long strings can wrap Bash arithmetic.
+    # 只接受规范十进制: 前导零不是合法 JSON 整数, 且未校验的超长串会溢出 bash 算术。
     [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
     [ "$p" -le 65535 ]
 }
 
-# Convert a one-based menu selection to a zero-based array index without evaluating unchecked
-# input as shell arithmetic. Returns the index on stdout; rejects zero, overflow, and out-of-range.
+# 菜单序号 -> 零基数组下标, 不把未校验输入直接进 shell 算术。
+# 输出到 stdout; 拒绝 0、溢出与越界。
 _xd_index_from_choice() {
     local choice="${1:-}" total="${2:-}" zeros n max
     [[ "$choice" =~ ^[0-9]+$ ]] || return 1
@@ -375,9 +353,8 @@ _xd_index_from_choice() {
 }
 
 # ---------------------------------------------------------------------------
-# 域名合法性校验(R38): 伪装域名会被拼进 inbound tag(Tunnel-<sni>-<tport>-<port>),
-# tag 含空格/引号会破坏后续按 tag 的关联匹配与 Clash 条目; 从输入侧就禁止。
-# 只接受 LDH 形式(字母/数字/连字符, 点分段), 单段 1-63 字符, 总长 <=253。
+# 域名合法性校验(R38): 伪装域名会被拼进 inbound tag, tag 含空格/引号会破坏按 tag 的关联
+# 匹配与 Clash 条目, 故从输入侧禁止。只接受 LDH 形式, 单段 1-63, 总长 ≤253。
 # ---------------------------------------------------------------------------
 _validate_domain() {
     local d="$1"
@@ -388,19 +365,16 @@ _validate_domain() {
 
 # ---------------------------------------------------------------------------
 # 用户自定义值(path/密码/认证串/证书路径)进入 JSON 模板前的字符安全校验(2026-09-12 三审 M5)。
-# _render_template 用 bash 占位符替换 + jq 兜底校验: 值含 " 或 \ 或换行/制表符会让渲染
-# 产物 JSON 不合法, 用户只能看到一句含混的"模板渲染后 JSON 不合法"(fail-closed 但不可诊断);
-# 含 {{ 占位符字样还会被后续替换轮次二次改写(如密码输入 "{{NETWORK}}" 会被偷换成 network 值)。
-# 在输入侧直接拒绝这四类字符, 给出可理解的报错。正常值(字母数字/中文/空格/点/斜杠)不受影响。
+# 值含 " \ 或换行/制表符会让渲染产物 JSON 不合法(用户只看到一句含混的"JSON 不合法");
+# 含 {{ 字样还会被后续替换轮次二次改写。在输入侧直接拒绝, 给出可理解的报错。
 # 用法: _validate_json_text <值>  非法返回 1
 # ---------------------------------------------------------------------------
 _validate_json_text() {
     case "$1" in
         *'"'*|*'\'*|*$'\n'*|*$'\r'*|*$'\t'*|*"{{"*) return 1 ;;
     esac
-    # 其余控制字符(0x01-0x1F 中未被上面覆盖的)与 DEL(0x7F): 它们不是合法 JSON 字符串
-    # 字面量, 会被 _render_template 原样拼进模板产出非法 JSON, 用户只看到含混的
-    # "渲染后 JSON 不合法"。NUL 无法存在于 bash 变量, 故区间从 0x01 起。
+    # 其余控制字符(0x01-0x1F 中未被上面覆盖的)与 DEL(0x7F)不是合法 JSON 字符串字面量,
+    # 同样会被原样拼进模板。NUL 无法存在于 bash 变量, 故区间从 0x01 起。
     # shellcheck disable=SC1010
     case "$1" in
         *[$'\x01'-$'\x1f'$'\x7f']*) return 1 ;;
@@ -409,14 +383,10 @@ _validate_json_text() {
 }
 
 # ---------------------------------------------------------------------------
-# 生成 Reality 的 tunnel inbound tag(R39)
-# 形态: Tunnel-<sni>-<tunnel_port>-<reality_port>
-# 为什么要单独封装并限长: tag 是内部标识, 不该无界地携带 display 信息。合法 SNI 最长
-# 253 字符, 拼出来的 tag 可达 270+; 虽然本项目从不用 tunnel_tag 作文件名(metadata 文件名
-# 是 xd-<proto>-<port>), config.json 也能容纳, 但超长 tag 会污染菜单显示、日志与人工排查,
-# 且一旦将来有人拿 tag 拼路径就会撞上 NAME_MAX(255)。这里把 SNI 段截断, 使整个 tag
-# <= 200 字符 —— 关联推导不受影响: 主键是 realitySettings.target 的端口, legacy 兜底按
-# "-<reality_port>" 后缀匹配, 两者都不依赖 SNI 段的完整性。
+# 生成 Reality 的 tunnel inbound tag(R39): 形态 Tunnel-<sni>-<tunnel_port>-<reality_port>
+# 合法 SNI 最长 253, 拼出的 tag 可达 270+ —— 内部标识不该无界携带 display 信息(污染菜单/
+# 日志, 且将来拿 tag 拼路径会撞 NAME_MAX)。这里截断 SNI 段使 tag ≤ 200 字符; 关联推导
+# 不受影响(主键是 realitySettings.target 端口, legacy 兜底按 "-<reality_port>" 后缀匹配)。
 # 用法: tag=$(_gen_tunnel_tag <sni> <tunnel_port> <reality_port>)
 # ---------------------------------------------------------------------------
 _gen_tunnel_tag() {
@@ -434,13 +404,10 @@ _gen_tunnel_tag() {
 
 # ---------------------------------------------------------------------------
 # YAML 双引号标量最小转义(R38)
-# clash.yaml 的 proxy 条目是单行 flow 映射, 用户可控字段(节点名/密码/SNI/地址)直接
-# 插进 "..." 里。实测(pyyaml)双引号标量内只有三类字符会破坏或改变语义:
-#   "  -> 提前闭合标量, 整份 YAML 不可解析(不只该节点, 导致整个订阅报错)
-#   \  -> 被当作转义引导符, 值被静默改写
-#   CR/LF -> 条目被截成两行, flow 映射结构损坏
-# 其余(  {} , # : ' 空格 Tab 中文 )在双引号内均安全, 无需处理。
-# 用法: v=$(_yaml_dq "$raw"); 输出的是"可直接放进双引号内"的内容, 不含外层引号。
+# clash.yaml 的 proxy 条目是单行 flow 映射, 用户可控字段直接插进 "..."。只有三类字符会
+# 破坏语义: " 提前闭合(整份 YAML 不可解析) / \ 被当转义符静默改写 / CR/LF 截断条目。
+# 其余( {} , # : ' 空格 Tab 中文 )在双引号内均安全。
+# 用法: v=$(_yaml_dq "$raw"); 输出可直接放进双引号内, 不含外层引号。
 # ---------------------------------------------------------------------------
 _yaml_dq() {
     local s="$1"
@@ -454,8 +421,8 @@ _yaml_dq() {
 
 # ---------------------------------------------------------------------------
 # 端口占用检测(复用 singbox-lite 思路)
-# ss 同时列出 TCP+UDP 时会多一个 Netid 列, Local Address:Port 从 $4 移到 $5。
-# 分别查询每种协议, 保持列布局一致; 空协议表示检查 TCP 与 UDP 两者。
+# ss 同时列 TCP+UDP 时会多一个 Netid 列, Local Address:Port 从 $4 移到 $5; 故分别查询
+# 每种协议保持列布局一致。空协议表示检查 TCP 与 UDP 两者。
 # ---------------------------------------------------------------------------
 _check_port_occupied() {
     local port="$1" proto="${2:-}"
@@ -487,13 +454,11 @@ _check_port_occupied() {
 }
 
 # ---------------------------------------------------------------------------
-# 持久化屏障(十六轮 P1-③)。`mv` 只保证 rename **原子**(读不到半份文件), **不等于掉电持久**:
-# 数据可能仍在页缓存里。事务账本的 phase barrier 声称 durable, 就必须刷两次 —— 先刷临时文件
-# (数据块落盘), rename 之后再刷**父目录**(新目录项落盘; 只刷文件不足以让 rename 持久)。
-# 只刷文件不刷目录时, 断电后目录项可能仍是旧的 ⇒ 读到旧 phase, 而真实现场已完成 mutation。
-# 手段按平台级联(覆盖面递减): `sync <path>`(coreutils ≥8.24 / busybox ≥1.31)按路径刷 →
-# `sync -f <path>`(GNU)刷该路径所在文件系统 → 退回**全系统 sync**(更重但语义更强, 永远正确)。
-# 尽力而为: 任一步成功即返回 0, 全部失败才告警 —— 不改变调用方对"写入成功"的判定。
+# 持久化屏障: `mv` 只保证 rename **原子**(读不到半份文件), **不等于掉电持久**。
+# 事务账本的 phase barrier 声称 durable 就必须刷两次 —— 先刷临时文件(数据落盘), rename
+# 之后再刷**父目录**(新目录项落盘); 只刷文件时断电后目录项可能仍是旧的。
+# 手段按平台级联: `sync <path>`(coreutils ≥8.24 / busybox ≥1.31) → `sync -f <path>`(GNU) →
+# 全系统 `sync`(更重但永远正确)。尽力而为: 任一步成功返回 0, 全失败才告警。
 # ---------------------------------------------------------------------------
 _fsync_path() {   # <path>
     local p="$1"
@@ -506,9 +471,9 @@ _fsync_path() {   # <path>
 }
 
 # ---------------------------------------------------------------------------
-# 原子写 JSON:临时文件写 + 校验 + fsync + mv + 目录 fsync(配合 xray -test)
-# 用法:_atomic_write_json <目标文件> <内容>
-# 事务账本(phase barrier)、config 与节点元数据的**唯一**提交点, 故持久化屏障只加在这一处。
+# 原子写 JSON: 临时文件写 + 校验 + fsync + mv + 目录 fsync(配合 xray -test)
+# 用法: _atomic_write_json <目标文件> <内容>
+# 事务账本(phase barrier)、config 与节点元数据的**唯一**提交点, 持久化屏障只加这里。
 # ---------------------------------------------------------------------------
 _atomic_write_json() {
     local target="$1" content="$2" tmp
@@ -519,10 +484,9 @@ _atomic_write_json() {
         _error "写入临时 JSON 文件失败: $target"
         return 1
     fi
-    # R38(P1): 空内容必须拦在这里。上游普遍写成 _atomic_write_json "$f" "$(jq ...)",
-    # jq 失败时命令替换为空串; 而 `jq empty` 对 0 字节/纯空白文件返回 0(不报错),
-    # 于是会把空文件当合法 JSON 提交 —— 表现为"节点元数据变 0 字节却报创建成功"、
-    # "config.json 被截断成 0 字节"、"回滚到空配置却报回滚成功"。
+    # R38(P1): 空内容必须拦在这里。上游普遍写 _atomic_write_json "$f" "$(jq ...)",
+    # jq 失败时为空串; 而 `jq empty` 对 0 字节返回 0, 于是空文件会被当合法 JSON 提交 ——
+    # 表现为"metadata 变 0 字节却报创建成功"、"config 被截断仍报回滚成功"。
     if [ ! -s "$tmp" ]; then
         rm -f "$tmp"
         _error "生成的 JSON 内容为空,已放弃写入: $target"
@@ -538,7 +502,7 @@ _atomic_write_json() {
         fi
     fi
     # 校验全部通过后才刷: 刷一个马上要丢弃的临时文件是白等。数据块必须先于 rename 落盘,
-    # 否则 rename 后断电可能留下"新名字 + 空内容"(比旧内容更糟)。
+    # 否则 rename 后断电可能留下"新名字 + 空内容"。
     _fsync_path "$tmp"
     if ! mv -f "$tmp" "$target"; then
         rm -f "$tmp"
@@ -550,9 +514,9 @@ _atomic_write_json() {
     return 0
 }
 
-# 原子更新 JSON 文件(R15): 先 jq 变换到内存(未落地), 成功后用 _atomic_write_json 提交。
-# 目标文件在失败时保持原样, 无 .tmp 残留。替代所有裸 "jq ... > tmp && mv" 写法。
-# 用法: _meta_update <目标文件> <jq-filter> [jq 参数...]  (jq 参数置于 filter 前, 如 --arg l "$link")
+# 原子更新 JSON 文件(R15): 先 jq 变换到内存, 成功后用 _atomic_write_json 提交。
+# 目标文件失败时保持原样, 无 .tmp 残留。替代所有裸 "jq ... > tmp && mv"。
+# 用法: _meta_update <目标文件> <jq-filter> [jq 参数...]  (jq 参数置于 filter 前)
 # 返回: 0 成功; 1 jq 变换或原子写失败
 _meta_update() {
     local target="$1" filter="$2"; shift 2
@@ -597,13 +561,10 @@ _state_get() {
 
 _state_set() {
     local key="$1" val="$2" tmp
-    # 严格半事务(R14): mkdir/printf/mv 任一步失败都返回 1 并清理 tmp,
-    # 避免"业务成功但 state 写失败被调用方忽略"导致 service/config 与 state 状态分裂
-    #
-    # 临时名必须唯一(mktemp), 不能是固定的 ${key}.tmp: 两个并发 _state_set 写同一个键时
-    # 会往同一文件里交错写, 先到的 mv 会把后者的半截缓冲一并发布出去, 最终 state 内容
-    # 损坏。state 键里含 cf_token 这类凭据, 故写完立即 chmod 600 —— umask 不可依赖
-    # (调用方可能带任意 umask, 且 _ensure_dirs 只收紧它自己创建的那批文件)。
+    # 严格半事务(R14): mkdir/printf/mv 任一步失败都返回 1 并清理 tmp, 避免
+    # "业务成功但 state 写失败被忽略"导致 service/config 与 state 分裂。
+    # 临时名必须唯一(mktemp): 两个并发 _state_set 写同一键时会交错写同一文件, 发布出半截状态。
+    # state 键含 cf_token 等凭据, 写完立即 chmod 600(umask 不可依赖)。
     mkdir -p "$STATE_DIR" || return 1
     tmp=$(mktemp "$STATE_DIR/${key}.tmp.XXXXXX") || return 1
     if ! printf '%s' "$val" > "$tmp"; then
@@ -621,20 +582,17 @@ _state_set() {
 # ---------------------------------------------------------------------------
 # crontab 读取/改写(30-geo 与 90-menu 共用, 避免两处各自演化)
 #
-# 为什么必须封装: `crontab -l 2>/dev/null | grep -v MARKER | crontab -` 在 `crontab -l`
-# 失败时会把**空输入**写回, 等于清空用户的全部定时任务(含与项目无关的任务); 而管道的
-# 退出码取自最后的 `crontab -`, 仍是 0, 调用方据此认为"删除成功"。已实测复现:
-# 令 `crontab -l` 返回 1, 用户的备份任务随之消失。
+# 为什么必须封装: `crontab -l 2>/dev/null | grep -v MARKER | crontab -` 在 crontab -l 失败时
+# 会把**空输入**写回, 等于清空用户全部定时任务; 且管道退出码取自最后的 crontab -, 仍是 0。
 #
 # 契约:
-#   _crontab_read                → stdout = 现有内容; "本来没有 crontab" 视为空且返回 0;
-#                                  真读不到(权限/瞬时 I/O)返回 1 且不输出任何内容
+#   _crontab_read                → stdout = 现有内容; "本来没有 crontab" 视为空返回 0;
+#                                  真读不到(权限/瞬时 I/O)返回 1 且不输出内容
 #   _crontab_replace <marker> [newline]
-#                                → 按**字面**删除含 marker 的行(marker 里的 . - 不当正则),
-#                                  可选追加 newline; 读或写任一步失败都返回 1 且不改动 crontab
-#   _crontab_has_marker <marker> → 0 = 该行存在; 1 = 读到了且确实没有; 2 = 读取失败(未知)
-#                                  三态而非布尔: "读失败"与"没启用"的处置相反, 合并会把
-#                                  读失败当成没启用(见函数注释)
+#                                → 按**字面**删除含 marker 的行, 可选追加 newline;
+#                                  读或写任一步失败都返回 1 且不改动 crontab
+#   _crontab_has_marker <marker> → 0 = 存在; 1 = 读到了且确实没有; 2 = 读取失败(未知)
+#                                  三态而非布尔: 两种"非 0"的处置完全相反
 # ---------------------------------------------------------------------------
 _crontab_read() {
     local cur rc err
@@ -643,18 +601,11 @@ _crontab_read() {
     if [ "$rc" -ne 0 ]; then
         local errtext; errtext=$(cat "$err" 2>/dev/null)
         rm -f "$err"
-        # "没有 crontab" 是正常空态(首次使用/被删空), 不是故障 —— 此时写回空内容是正确行为。
-        # 其余错误(权限被 /etc/cron.allow 拒、SUID 异常、瞬时 I/O)必须 fail-closed:
-        # 把它们当成空态会让调用方用空内容覆盖, 清空用户全部定时任务。
-        # 只认"确实没有 crontab"这一种正常空态。**不能把 can't open/cannot open 一并
-        # 当作空态** —— 它们同样出现在权限失败(如 cron.allow 拒绝、busybox
-        # `crontab: can't open 'root': Permission denied`)上, 而那正是必须 fail-closed 的
-        # 情形: 当成空态会让调用方用空内容覆盖, 清掉用户全部定时任务。
-        # 只认规范的"确实没有 crontab"文案(Vixie/cronie/busybox 都用这句)。
-        # **不能把 `No such file or directory` 也算进来**: 该串不只出现在"spool 文件缺失",
-        # 也会出现在 crontab 包装器缺失/损坏、spool 路径权限异常等场景 —— 那些都必须
-        # fail-closed, 否则 _crontab_read 返回 0+空输出, _crontab_replace 就会用空内容
-        # 覆盖, 清掉用户全部定时任务(本 helper 存在的唯一理由就是防这个)。
+        # "没有 crontab" 是正常空态(此时写回空内容正确); 其余错误(权限/I/O)必须 fail-closed,
+        # 当成空态会让调用方用空内容清空用户全部定时任务。
+        # 只认规范文案 "no crontab"(Vixie/cronie/busybox 共用)。**不能**把 can't open /
+        # cannot open / No such file or directory 也算进来 —— 它们同样出现在权限失败或
+        # crontab 包装器损坏场景, 而那正是必须 fail-closed 的情形。
         case "$errtext" in
             *"no crontab"*)
                 return 0 ;;
@@ -667,10 +618,9 @@ _crontab_read() {
     return 0
 }
 
-# 三十四轮 P2: crontab 是独立于 config.json 的共享状态, 但同样是"读 → 改 → 写"的 RMW ——
-# 两个会话并发执行会最后写入者覆盖前者。这里沿用项目唯一的进程间事务锁(config lock)串行化,
-# 不再新建第二套锁机制。锁可重入: `_auto_migrate_geo_autoupdate_locked` / `_uninstall_xray_locked`
-# 等已在 config lock 内的调用者不会自锁死。只读的 `_crontab_read` 不取锁(写路径在锁内重读)。
+# 三十四轮 P2: crontab 是独立于 config.json 的共享状态, 但同样是 RMW —— 并发会话会最后
+# 写入者覆盖前者。这里复用项目唯一的进程间事务锁(config lock), 不新建第二套锁机制。
+# 锁可重入: 已在 config lock 内的调用者不会自锁死。只读的 _crontab_read 不取锁。
 _crontab_replace() {
     _with_config_lock _crontab_replace_locked "$@"
 }
@@ -678,20 +628,18 @@ _crontab_replace_locked() {
     local marker="$1" newline="${2:-}" cur filtered grc
     [ -n "$marker" ] || return 1
     cur=$(_crontab_read) || return 1
-    # -F: marker 含 "." "-" 等正则元字符, 按字面匹配才不会误删无关行。
-    # **必须检查 grep 的退出码**: 命令替换的退出码不影响赋值语句, 所以 grep 真出错
-    # (rc>=2, 二进制缺失/读错误)时 filtered 会是空串, 我们随即把**空内容**写回 ——
-    # 又回到"清空用户全部 crontab"的灾难。注意 grep -v 在"所有行都被过滤掉"时**合法地**
-    # 返回 1, 因此只有 rc>=2 才算错误。
+    # -F: marker 含 "." "-" 等正则元字符, 按字面匹配。**必须检查 grep 退出码**:
+    # 命令替换的退出码不影响赋值, grep 真出错(rc>=2)时 filtered 为空串, 写回即清空 crontab。
+    # grep -v 在"所有行都被过滤掉"时**合法地**返回 1, 故只有 rc>=2 才算错误。
     filtered=$(printf '%s\n' "$cur" | grep -vF "$marker"); grc=$?
     if [ "$grc" -ge 2 ]; then
         _error "过滤 crontab 失败(grep 返回 ${grc}), 已中止(避免覆盖并清空现有定时任务)"
         return 1
     fi
     if [ -n "$newline" ]; then
-        # 这里**不能**在字符串里换行写 "${filtered:+${filtered}\n}" —— 源码里那会造出一行
-        # 以 `}` 开头的内容行, 会让测试套件的函数体提取器(_fn_body_extract 以行首 `}` 为结束)
-        # 截断函数; 用变量承载换行, 行为不变且函数可被完整提取。
+        # **不能**在字符串里换行写 "${filtered:+${filtered}\n}": 源码会造出一行以 `}`
+        # 开头的内容行, 让测试套件的函数体提取器(_fn_body_extract 以行首 `}` 结束)截断函数;
+        # 用变量承载换行, 行为不变且函数可被完整提取。
         local nl=$'\n'
         filtered="${filtered:+${filtered}${nl}}${newline}"
     fi
@@ -701,17 +649,12 @@ _crontab_replace_locked() {
 
 # 判断某条项目定时任务是否还在 —— **必须走 _crontab_read, 不能用裸管道**。
 #
-# 为什么不能写 `crontab -l 2>/dev/null | grep -qF "$marker"`: 那条管道的退出码把两种
-# 完全相反的事实压成同一个 1 ——
+# `crontab -l 2>/dev/null | grep -qF "$marker"` 的退出码把两种相反事实压成同一个 1:
 #   (a) 读成功, 确实没有这行          => 应继续把 state 记为 off
 #   (b) crontab -l 失败(权限/瞬时 I/O) => 行**可能仍在**, 绝不能记 off
-# 实测复现(2026-09-21): 令 crontab -l 输出 "cannot open spool: Input/output error" 并
-# 返回 2, 调用方(定时重启禁用)报"定时重启未启用"并写下 state=off —— 而 cron 行仍在,
-# 于是进入"UI 说已关、cron 仍在无人值守地重启服务"的分裂状态, 用户下次看到"未启用"
-# 也就不会再处理。这正是 _crontab_read 存在的理由, 该处却绕过了它。
+# (b) 会把系统留在"UI 说已关、cron 仍在无人值守重启服务"的分裂状态。
 #
-# 返回码刻意是三态(而不是布尔): 两种"非 0"的处置完全相反 —— (a) 该记账, (b) 该拒绝记账
-# 并告警。压成布尔就必然有一方被误判。
+# 返回码刻意三态(而非布尔): 两种"非 0"的处置完全相反, 压成布尔必然误判一方。
 _crontab_has_marker() {
     local marker="$1" cur rc
     [ -n "$marker" ] || return 2
@@ -736,25 +679,23 @@ _backup_config() {
     # 注意: busybox/musl 的 mktemp 要求模板以 XXXXXX 结尾, 后缀必须放在 X 之前(否则 EINVAL)
     tmp=$(mktemp "${BACKUP_DIR}/config.json.bak.XXXXXX") || return 1
     cp -f "$CONFIG_FILE" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    # R38(P1): 备份必须非空——磁盘满时 cp 可能返回 0 却只落地 0 字节, 之后 _restore_config
-    # 就会以"空配置"回滚。空备份视为备份失败, 由调用方中止事务。
+    # R38(P1): 备份必须非空 —— 磁盘满时 cp 可能返回 0 却只落地 0 字节, 之后回滚就会
+    # 以"空配置"覆盖。空备份视为备份失败, 由调用方中止事务。
     [ -s "$tmp" ] || { rm -f "$tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
-    # 备份含密码/UUID/私钥等敏感信息: chmod 600 失败视为备份失败(R13), 不能留下 0644 备份
+    # 备份含密码/UUID/私钥: chmod 600 失败视为备份失败(R13), 不能留下 0644 备份
     chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    # R23: lastbak 原子更新 — 先写临时文件并 chmod, 再 mv; 旧 lastbak 保持到新备份完整成功。
-    # 直接 cp 覆盖在 I/O 失败时会截断 lastbak, 损坏整个 rollback 基础。
+    # R23: lastbak 原子更新 —— 旧 lastbak 保持到新备份完整成功(直接 cp 覆盖在 I/O 失败时
+    # 会截断 lastbak, 损坏整个 rollback 基础)。
     local last_tmp
     last_tmp=$(mktemp "${BACKUP_DIR}/config.json.lastbak.XXXXXX") || { rm -f "$tmp"; return 1; }
     cp -f "$CONFIG_FILE" "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
-    # R38(P1): 同上——lastbak 是回滚基础, 0 字节比"没有备份"更危险
+    # R38(P1): 同上 —— lastbak 是回滚基础, 0 字节比"没有备份"更危险
     [ -s "$last_tmp" ] || { rm -f "$tmp" "$last_tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
     chmod 600 "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     mv -f "$last_tmp" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
-    # 轮转历史快照: 仅保留最新 10 份随机备份(回滚只用 lastbak, 其余仅作人工追溯)
-    # 用 while read 逐行消费 ls -1t 的输出, 不用 `for old in $(ls ...)` 词分割:
-    # 后者在文件名含空白时会拆成多个不存在的路径, rm -f 静默失败 → 目录无界增长。
-    # 只对确实是普通文件的条目计数(避免把目录/断链算进保留额度)。
-    # (不用 find -printf: busybox 的 find 未必编译了该特性。)
+    # 轮转历史快照: 仅保留最新 10 份随机备份(回滚只用 lastbak, 其余作人工追溯)。
+    # while read 逐行消费 ls -1t, 不用 `for old in $(ls ...)` 词分割(文件名含空白时 rm -f
+    # 静默失败 → 目录无界增长); 只对普通文件计数。不用 find -printf(busybox 未必编译)。
     local i=0 old
     while IFS= read -r old; do
         [ -n "$old" ] || continue
@@ -767,11 +708,9 @@ _backup_config() {
 
 _restore_config() {
     [ -f "$BACKUP_DIR/config.json.lastbak" ] || return 1
-    # R23: 原子回滚 — 直接 cp 覆盖在 I/O 失败时可能把 config 截断成半截(比回滚失败更糟);
-    # 复用 _atomic_write_json(tmp 构造→校验→mv), 失败时旧 config 保持原样
-    # R38(P1): 备份本身可能是 0 字节(上一次备份时磁盘满等), 必须先判非空——否则
-    # "回滚"会把 config.json 变成空文件却报成功(_atomic_write_json 已补空内容拦截, 这里
-    # 再前置判断以给出准确原因)。
+    # R23: 原子回滚 —— 直接 cp 覆盖在 I/O 失败时可能把 config 截断; 复用 _atomic_write_json
+    # (tmp → 校验 → mv), 失败时旧 config 保持原样。
+    # R38(P1): 前置判非空, 否则"回滚"会把 config 变成空文件却报成功。
     [ -s "$BACKUP_DIR/config.json.lastbak" ] || {
         _error "备份文件为空, 无法回滚($BACKUP_DIR/config.json.lastbak)"
         return 1
@@ -799,9 +738,8 @@ _gen_uuid() {
         # 兜底:从 /proc/sys/kernel/random/uuid(Linux)
         u=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
     fi
-    # 形状校验: 三个来源都可能失败(非 Linux 无 /proc、uuidgen 缺、xray 版本不支持 uuid),
-    # 或把告警行混进 stdout。返回空串会让调用方把空 UUID 写进配置 —— 节点看似建好,
-    # 客户端永远连不上, 且排查时很难想到是 UUID 为空。故这里 fail-closed。
+    # 形状校验: 三个来源都可能失败(非 Linux 无 /proc、uuidgen 缺、xray 版本不支持), 或把
+    # 告警行混进 stdout。空 UUID 写进配置会让节点看似建好却永远连不上, 故 fail-closed。
     if [[ "$u" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
         printf '%s\n' "$u"
         return 0
@@ -820,16 +758,13 @@ _gen_rand_path() {
 }
 
 # ---------------------------------------------------------------------------
-# 格式化 config.json: 按官方顺序重排字段 + 统一缩进
-# 幂等操作, 可在启动/检查配置时安全调用
-# R35(P2): 复用 _atomic_write_json 单一严格写入器(内存变换 -> 原子写), 不再维护第二套
-# tmp/mv 逻辑; 失败时原文件保持原样, 调用方(启动/检查)均不检查返回值, 不阻塞。
-# R38(P1): jq 对"只含空白的文件"不报错但输出空, 旧写法会把 config.json 截断成 0 字节。
-# 现由 _atomic_write_json 的空内容拦截兜住, 这里再显式判一次以避免无谓的错误输出。
+# 格式化 config.json: 按官方顺序重排字段 + 统一缩进, 幂等
+# R35(P2): 复用 _atomic_write_json 单一严格写入器, 不再维护第二套 tmp/mv 逻辑;
+# R38(P1): 空内容由 _atomic_write_json 拦截, 这里再显式判一次避免无谓错误输出。
+#
+# 三十三轮 P1: 本函数是"读整份 config → jq 重排 → 原子写回"的 RMW, 必须在 config lock
+# 内执行, 否则并发节点事务提交后会被旧快照整份覆盖(lost update)。外层先做廉价守卫。
 # ---------------------------------------------------------------------------
-# 三十三轮 P1: 本函数是"读整份 config → jq 重排 → 原子写回"的 RMW, 必须在 config lock 内执行 ——
-# 否则并发节点事务提交后会被这里的旧快照整份覆盖(lost update)。外层先做廉价守卫, 不存在/空文件
-# 时不取锁(也避免在无部署目录的调用场景里白报锁错误)。
 _normalize_config_format() {
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     _with_config_lock _normalize_config_format_locked
@@ -842,10 +777,10 @@ _normalize_config_format_locked() {
 }
 
 _normalize_config_format_write() {
-    # 本函数是直写整份 config 的 RMW(不经 _mutate_config), 因此必须自带未收敛事务闸门(复审 P1):
-    # reset / core(仅非终态) / port 任一未收敛时, 连"重排字段"这种整份替换也会改变现场。
-    # 屏障保证"检查"与"写入"处于同一 core lock 临界区(复审 P1 的 TOCTOU)。
-    # guard 是软依赖: 00-common 先于 20-xray-core 加载, 混装旧 lib 缺 helper 时放行(与项目口径一致)。
+    # 直写整份 config 的 RMW(不经 _mutate_config), 必须自带未收敛事务闸门(复审 P1):
+    # reset / core(仅非终态) / port 任一未收敛时, 连"重排字段"也会改变现场。
+    # 屏障保证"检查"与"写入"同一 core lock 临界区(TOCTOU)。
+    # guard 是软依赖: 混装旧 lib 缺 helper 时放行(与项目口径一致)。
     if declare -F _txn_allow_config_write >/dev/null 2>&1 \
        && ! _txn_allow_config_write; then
         return 1
@@ -861,8 +796,8 @@ _normalize_config_format_write() {
     ' "$CONFIG_FILE" 2>/dev/null) || return 0
     # 变换结果为空(输入是空白/非对象): 保持原文件不动, 交由 xray 自己报配置错误
     [ -n "$content" ] || return 0
-    # 2026-09-12 三审(L5): 本函数在每次主菜单启动都会跑; 内容无变化时跳过写入,
-    # 避免无条件 mv 让 config.json 的 mtime 每次启动都被刷新(纯 I/O 浪费)。
+    # 2026-09-12 三审(L5): 本函数每次主菜单启动都跑; 内容无变化时跳过写入,
+    # 避免无条件 mv 刷新 mtime(纯 I/O 浪费)。
     local cur
     cur=$(cat "$CONFIG_FILE" 2>/dev/null) || cur=""
     [ "$content" = "$cur" ] && return 0
@@ -871,14 +806,12 @@ _normalize_config_format_write() {
 
 # ---------------------------------------------------------------------------
 # 进程归属判定辅助(R38, M3)
-# 背景: 只按 comm 全机扫描"有没有叫 xray 的进程"会把**别的**安装(从 x-ui/3x-ui 迁移的
-# 残留、用户自己跑的 xray)也算成"我们的服务在跑" —— 于是本脚本的 unit 起不来也会被判
-# running, _restart_xray_verified 恒成功, 直接击穿本 PR 的核心保证。
-# 这两个 helper 用于把判活绑定到具体的 service 进程树上。
+# 只按 comm 全机扫描会把**别的**安装(x-ui/3x-ui 残留、用户自己跑的 xray)也算成"我们的
+# 服务在跑", _restart_xray_verified 恒成功, 击穿核心保证。这些 helper 把判活绑定到具体
+# service 进程树。
 # ---------------------------------------------------------------------------
 
-# 读取指定 pid 的父 pid。/proc/<pid>/stat 的 comm 字段可能含空格与括号,
-# 因此从最后一个 ') ' 之后开始取字段: $1=state $2=ppid。
+# 读取指定 pid 的父 pid。comm 字段可能含空格与括号, 故从最后一个 ') ' 之后取字段。
 _proc_ppid() {
     local pid="$1" line
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -910,36 +843,31 @@ _xd_pid_unchanged() {
     [ "$now" = "$st" ]
 }
 
-# TERM -> 等待 -> KILL; 等待与强杀都尽量绑定到**同一个进程化身**(starttime), 但**不是**硬保证。
+# TERM -> 等待 -> KILL; 等待与强杀都绑定**同一进程化身**(starttime), 但**不是**硬保证。
 #
-# 为什么需要: 裸 `kill -0 <pid>` 等待会把"等待窗口内退出并被复用的 PID"当成"仍活着", 随后的
-# SIGKILL 就落到无关进程上。抓一次 starttime 并在每次判定与强杀前比对, 把风险窗口从"整个等待期"
-# 收窄到"最后一次读 /proc/<pid>/stat 与 kill(2) 之间"。
+# 裸 `kill -0` 等待会把"等待窗口内退出并被复用的 PID"当成"仍活着", 随后的 SIGKILL 就落到
+# 无关进程上。抓一次 starttime 并在每次判定与强杀前比对, 把风险从"整个等待期"收窄到
+# "最后一次读 stat 与 kill(2) 之间"。
 #
-# **残余窗口无法在本项目的依赖范围内消除(2026-09-26 复审结论, 不可写成"绝不误杀")**: 内核级
-# 无竞争信号需要 pidfd(pidfd_open + pidfd_send_signal)。util-linux 的 `kill --timeout` 基于 pidfd,
-# 但 Debian/Ubuntu 的 `kill` 由 **procps** 提供(实测 `--timeout` 不支持), Alpine 是 busybox,
-# bash 内建 kill 也没有该原语; python3 不是本项目运行期依赖(只依赖 jq/curl/wget/unzip)。
-# 故本函数契约是 **best-effort**: 只有 `read stat -> kill` 这一小段仍可能撞上 PID 复用。
+# **残余窗口在本项目依赖范围内无法消除(不可写成"绝不误杀")**: 无竞争信号需要 pidfd;
+# Debian/Ubuntu 的 kill 由 procps 提供(无 --timeout), Alpine 是 busybox, bash 内建 kill 无该
+# 原语, python3 不是运行期依赖。契约是 **best-effort**。
 #
 # 读不到身份时**不做**延迟强杀(fail-closed, 与 `_proc_exe_is_strict` 对破坏性操作的口径一致):
-# 退回 `kill -0 + kill -9` 恰好会重建本函数要消除的那个缺陷。此时只发 TERM 并如实告警, 由调用方
-# 按"仍在运行"处理。
+# 退回 `kill -0 + kill -9` 恰好会重建本函数要消除的缺陷。此时只发 TERM 并如实告警。
 #
 # 用法: _xd_kill_pid_graceful <pid> [grace_seconds] [expected_starttime]
 #
-# **expected_starttime 是身份链闭合的关键**(2026-09-26 第二轮复审 P1): 调用方(如 pidfile 的
-# `_xd_pidfile_identity_ok`)复核完身份后, 必须把**那次复核所用的 starttime** 传进来。否则本函数
-# 自己重新读一次 starttime, 两次读取之间 PID 仍可能被复用 ⇒ "复核的是 A 进程、杀的是 B 进程"。
-# 传了 expected 时就只杀"仍是该化身"的进程; 为空时退化为"自己抓一次"(openrc 纯 PID pidfile 等
-# 无记录身份的场景, 属已声明的 best-effort 残余)。
+# **expected_starttime 是身份链闭合的关键**(复审 P1): 调用方复核身份后必须把**那次复核所用
+# 的 starttime** 传进来, 否则本函数重读一次, 两次读取之间 PID 仍可能被复用 ⇒ "复核的是 A、
+# 杀的是 B"。为空时退化为"自己抓一次"(openrc 纯 PID pidfile 等, 属已声明的 best-effort)。
 _xd_kill_pid_graceful() {
     local pid="${1:-}" grace="${2:-5}" expected_st="${3:-}" st k=0
-    # 规范 PID: `kill 0` 是"发给当前进程组"(不是 PID 0), 会误伤整组进程; 前导零/超长一律拒绝。
+    # 规范 PID: `kill 0` 发给整个进程组(非 PID 0), 会误伤整组; 前导零/超长一律拒绝。
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
     [ "${#pid}" -le 7 ] || return 1
-    # **必须在发 TERM 之前取身份**(2026-09-26 复审 P1): 先 TERM 再读 starttime 时, 原进程可能
-    # 已迅速退出并被复用, 读到的是**新进程**的 starttime ⇒ 后面的强杀正好打在新进程上。
+    # **必须在 TERM 之前取身份**(复审 P1): 先 TERM 再读时原进程可能已退出并被复用,
+    # 读到的是**新进程**的 starttime, 强杀就正好打在新进程上。
     st=$(_proc_starttime "$pid") || st=""
     if [ -n "$expected_st" ]; then
         # 身份链闭合: 当前化身必须与调用方复核过的记录一致, 否则一个信号都不发。
@@ -969,11 +897,10 @@ _xd_kill_pid_graceful() {
 # ---------------------------------------------------------------------------
 # direct 后端的进程身份 pidfile: 记录 "PID starttime", 使停止时能证明"还是启动时那个进程"。
 #
-# 为什么需要(2026-09-26 复审的"更现实结构"): 只记 PID 时, 调用点的 comm/exe 检查与真正的 kill
-# 之间仍有窗口 —— PID 被复用后, 即使复用者是同名/同路径的进程也分不出来(比如两个 xray 实例)。
-# 启动时记录的 starttime 来自我们 fork 的那一刻, 不依赖事后读取, 因而不受该窗口影响。
-# 兼容: 只含 PID 的旧 pidfile、以及 openrc 自己写的 pidfile 没有第二字段 ⇒ 退化为"PID 存活即视为
-# 同一进程"(与旧行为一致), 不做无法证实的判断 —— 与 `_proc_exe_is` 的 fail-open 口径同源。
+# 只记 PID 时, 调用点 comm/exe 检查与真正的 kill 之间仍有窗口 —— PID 被复用后, 即使复用者
+# 同名/同路径也分不出来(如两个 xray 实例)。启动时记录的 starttime 来自 fork 那一刻。
+# 兼容: 只含 PID 的旧 pidfile 与 openrc 自写 pidfile 没有第二字段 ⇒ 退化为"PID 存活即视为
+# 同一进程"(与旧行为一致), 与 `_proc_exe_is` 的 fail-open 口径同源。
 # ---------------------------------------------------------------------------
 _xd_pidfile_pid() {   # <file> -> stdout: 规范 PID, 否则空
     local f="${1:-}" pid=""
@@ -1022,13 +949,11 @@ _xd_pidfile_identity_ok() {   # <file>
 
 # 严格版 exe 归属判定 —— **杀进程专用**。与 _proc_exe_is 的唯一差别: exe 读不到时**拒绝**。
 #
-# 为什么必须分开: _proc_exe_is 的"读不到就放行"是为**判活**设计的(CLAUDE.md: 假阴性会让
-# 调用方重复启动实例, 比多算更糟)。把同一宽松语义用在**杀进程**上是反向危害 —— 读不到 exe
-# 时所有同名进程都被判成"我们的", 于是限定 exe 的杀进程扫描退化成它本该取代的全机 comm
-# 扫描, 可能 SIGKILL 掉用户自己装的 cloudflared。
-# 同理, 凡"凭 exe 归属决定是否 kill"的地方都必须用本函数: 55-hysteria 的
-# _hysteria_proc_tree_has_bin(杀 supervisor 前的归属闸门)与 _hysteria_stop_and_verify 的
-# 强杀循环都是 fail-closed 契约, 也都已改用它。
+# _proc_exe_is 的"读不到就放行"是为**判活**设计的(假阴性会让调用方重复启动实例, 比多算更糟)。
+# 用在杀进程上则是反向危害: 读不到 exe 时所有同名进程都被判成"我们的", 限定 exe 的杀进程
+# 扫描退化成它本该取代的全机 comm 扫描, 可能 SIGKILL 掉用户自己装的 cloudflared。
+# 凡"凭 exe 归属决定是否 kill"的地方都必须用本函数(55-hysteria 的两处杀 supervisor 闸门)。
+# ---------------------------------------------------------------------------
 _proc_exe_is_strict() {
     local pid="${1:-}" want="${2:-}" got rw
     [ -n "$want" ] || return 1                  # 没有期望路径 => 无法证明归属 => 拒绝
@@ -1045,8 +970,8 @@ _proc_exe_is_strict() {
 
 # 判断"以 anchor_pid 为祖先(含自身)的进程里, 是否存在 comm == name 的进程"。
 # 用法: _proc_named_under <anchor_pid> <comm> [max_depth]
-# openrc 的 supervise-daemon 把自身 pid 写进 pidfile, 真正的业务进程是它的子进程,
-# 因此需要向上回溯 ppid 链来确认归属(默认回溯 4 层, 足够覆盖 supervisor→业务进程)。
+# openrc 的 pidfile 记的是 supervise-daemon(真正的业务进程是其子进程), 故需回溯 ppid 链
+# 确认归属(默认 4 层, 足够覆盖 supervisor→业务进程)。
 _proc_named_under() {
     local anchor="$1" name="$2" depth="${3:-4}"
     [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
@@ -1072,15 +997,11 @@ _proc_named_under() {
     return 1
 }
 
-# R40: 校验 pid 的可执行文件是否就是期望的那个二进制。全机 comm 扫描的已知局限是
-# "无法区分本脚本管理的实例与宿主上别人的同名进程"(x-ui/3x-ui 迁移残留、用户手跑的
-# xray), 而 /proc/<pid>/exe 正好能把这个区分做出来 —— 本脚本的 unit/init 脚本里
-# ExecStart / command 永远是自己生成的 $XRAY_BIN, 别人的实例不可能指向同一路径。
-# fail-open 的边界要分清, 两种"读不到"不是一回事:
-#   - exe 读不到(权限/内核/进程刚退出) => 放行。这是判活的最后兜底路径, 假阴性会让上层
-#     认为"没在跑"而再起一个实例 → 端口冲突/双实例, 比"把别人的进程算成自己的"更糟。
-#   - exe 读到了但与期望路径不同 => 拒绝, 即使期望路径本身解析不出来。此时"不同"已经是
-#     确定结论, 再放行等于把这层过滤整个作废(exe=别人的路径 + 我们的二进制被删 => 误判 running)。
+# R40: 校验 pid 的 exe 是否就是期望的二进制 —— 全机 comm 扫描无法区分本脚本的实例与别人
+# 的同名进程(x-ui 残留、用户手跑), 而本脚本的 unit/init 永远指向自己的 $XRAY_BIN。
+# fail-open 的两种"读不到"要分清:
+#   - exe 读不到(权限/内核/刚退出) => 放行。判活的最后兜底, 假阴性会导致双实例, 更糟。
+#   - exe 读到但与期望不同 => 拒绝(即便期望路径解析不出来); "不同"已是确定结论。
 _proc_exe_is() {
     local pid="${1:-}" want="${2:-}" got rw
     [ -n "$want" ] || return 0                  # 未指定期望路径 => 不做这层过滤
@@ -1123,9 +1044,8 @@ _proc_any_named() {
 }
 
 # ---------------------------------------------------------------------------
-# 就地修改 config.json 前的共同前置校验(路由规则精简/恢复、日志级别切换共用)
-# 缺任一条件即拒绝: 在不存在/空的配置上跑 jq 会产出空或半截配置(_atomic_write_json
-# 已有空内容拦截, 这里前置判断以给出准确原因)。
+# 就地修改 config.json 前的共同前置校验(路由规则精简/恢复、日志级别切换共用):
+# 缺任一条件即拒绝并给出准确原因(而不是让下游 jq 产出空配置)。
 # 用法: _config_edit_preflight [操作名]   —— 操作名仅用于错误文案
 # ---------------------------------------------------------------------------
 _config_edit_preflight() {
@@ -1154,13 +1074,11 @@ _press_any_key() {
 }
 
 # 无 flock 时的 config 锁退路(二十轮 P1-2): 与 install/core 的 mkdir 退路同一契约 ——
-# 锁根下 `config.lock.d` 原子 mkdir + pid, **永不自动接管**任何既有目录
-# (活持有者/死 pid/无 pid 一律拒绝并给出人工清理命令)。SIGKILL 残局需要一次人工 rm -rf,
-# 这是 mkdir 退路相对 flock 的已知代价; 但"无 flock 就直接放行"会让 reset 的
-# backup→删除→重建整段事务与普通 config writer 完全失去互斥, 故不再放行。
-# **跨版本协调(复审三 P1)**: 与 flock 路径同样覆盖 L1/L2 × flock文件/mkdir目录 四种组合,
-# 复用 `_xray_legacy_lock_name` 的无-flock 分支(先扫旧 flock 文件是否被他人打开, 再按存在性
-# 拒绝/封存 mkdir 目录; 树外路径不创建任何对象)。缺该助手时 fail-closed。
+# 锁根下 `config.lock.d` 原子 mkdir + pid, **永不自动接管**既有目录(活持有者/死 pid/无 pid
+# 一律拒绝并给人工清理命令)。SIGKILL 残局需人工 rm -rf, 是相对 flock 的已知代价; 但直接
+# 放行会让 reset 事务与普通 config writer 完全失去互斥。
+# **跨版本协调**: 覆盖 L1/L2 × flock文件/mkdir目录 四种组合, 复用 `_xray_legacy_lock_name`
+# 的无-flock 分支; 缺该助手时 fail-closed。
 _with_config_lock_mkdir() {
     local deploy_path="${DEPLOY_DIR%/}" lock_dir rc owner
     local legacy_lock_file legacy_lock_dir legacy1_lock_file legacy1_lock_dir
@@ -1200,7 +1118,7 @@ _with_config_lock_mkdir() {
         rmdir "$lock_dir" 2>/dev/null
         return 1
     fi
-    # (P1, 复审) L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
+    # L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
     if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ] \
        && declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
         if _xray_legacy_deleted_tree_active "$deploy_path"; then
@@ -1210,7 +1128,7 @@ _with_config_lock_mkdir() {
             return 1
         fi
     fi
-    # 跨版本协调(仅对已存在的旧路径; 完整后端矩阵)。
+    # 跨版本协调(仅对已存在的旧路径)。
     if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
         if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
            || ! _xray_legacy_lock_name legacy_fd legacy_dir \
@@ -1252,26 +1170,16 @@ _with_config_lock_mkdir() {
 }
 
 # ---------------------------------------------------------------------------
-# 跨进程配置修改锁(2026-09-12 审查 F5, 借鉴 singbox-lite _with_state_lock):
-# 包住 _mutate_config 的 read-modify-write, 防止两个并发 xd 会话交叠产生丢失更新。
-# 主锁文件在 `/var/lock/xray-deploy/config.lock`(见 `_deploy_lock_root`): 卸载/reset 的
-# `rm -rf $DEPLOY_DIR` 不会把它拆成两个 inode, 因而 config writer 与全站破坏性操作能真正互斥。
-# **跨版本协调覆盖完整后端矩阵(复审三 P1)**: L1(0.17.13/0.18.0 父目录)/L2(<=0.17.11 目录内)
-# × flock 文件/mkdir 目录 四种组合, 与 install/core 用同一个 `_xray_legacy_lock_name`:
-#   · 新版有 flock → 取旧 flock 文件, 并检查同名 mkdir 目录(残留 .fd 不得掩盖活动 .d);
-#   · 新版无 flock → `_with_config_lock_mkdir` 走该助手的无-flock 分支(先扫旧 flock 文件是否
-#     被他人打开, 再按存在性拒绝/封存)。
-# 只对**已存在**的旧路径协调(不存在则跳过, 不凭空重建 /opt 旧锁/旧目录)。旧版(<=0.17.11)
-# 无 flock 的 config 写者当年根本不建锁, 对它无从协调 —— 该残局只随旧进程退出消失。
-# 全站破坏性锁序是 install → config → core: install/uninstall/reset 先取安装锁, 再由本函数
-# 取 config 主锁, 最后由 `_restart_xray_verified` 取 core 锁; 单独 config writer 走 config → core。
-# 本函数**不自取 install lock** —— 那会让每次普通配置写入都创建旧版目录锁标记, SIGKILL 残局
-# 会让菜单再也改不了配置; 破坏性路径的 install 锁由各自入口显式获取。
-# `flock` 不可用(裁剪版 busybox / 未装 util-linux 的 Alpine)时走 `_with_config_lock_mkdir`:
-# reset 的 backup→删除→重建整段已是事务, 放行等于让它与普通 config writer 完全失去互斥,
-# 因此不再 best-effort 直通。持锁者导出 `XRAY_DEPLOY_LOCK_HELD=1` 支持重入。
-# 注意: "$@" 在子 shell 中执行 —— _mutate_config 及其下游不向调用方回传全局变量,
-# 返回码经子 shell 退出码透传; fd 9 与旧版协调 fd 随子 shell 结束自动关闭并释放锁。
+# 跨进程配置修改锁(2026-09-12 审查 F5): 包住 config 的 read-modify-write, 防并发 xd 会话
+# 丢失更新。主锁在锁根 `/var/lock/xray-deploy/config.lock`(见 `_deploy_lock_root`): 卸载的
+# rm -rf $DEPLOY_DIR 不会把它拆成两个 inode, config writer 与全站破坏性操作才能真互斥。
+# **跨版本协调**: L1(父目录)/L2(目录内) × flock/mkdir 四种组合, 统一走 `_xray_legacy_lock_name`;
+# 只对**已存在**的旧路径协调(不凭空重建)。旧版(<=0.17.11)无锁写者无从协调。
+# 锁序: install → config → core(破坏性操作先取 install lock; 本函数**不自取** install lock ——
+# 那会让每次普通写入都创建旧版目录锁标记, SIGKILL 残局把菜单锁死)。
+# flock 不可用时走 `_with_config_lock_mkdir`(fail-closed, 不 best-effort 直通)。
+# 持锁者导出 `XRAY_DEPLOY_LOCK_HELD=1` 支持重入。$@ 在子 shell 中执行: 返回码经退出码透传,
+# fd 随子 shell 结束自动关闭释放锁。
 # ---------------------------------------------------------------------------
 _with_config_lock() {
     if [ "${XRAY_DEPLOY_LOCK_HELD:-0}" = "1" ]; then
@@ -1290,17 +1198,14 @@ _with_config_lock() {
     legacy_lock_file="$DEPLOY_DIR/.config.lock"
     legacy_lock_dir="$DEPLOY_DIR/.config.lock.d"
     (
-        # **只创建锁根目录**, 绝不创建 `$DEPLOY_DIR`: 与卸载竞态时, 普通
-        # config writer 若在这里 mkdir 部署目录, 会把刚被卸载的树重新制造出来 ——
-        # 目录存在性改为**取到主锁之后**再判定, 不存在就 fail-closed(不重建)。
+        # **只创建锁根目录**, 绝不创建 `$DEPLOY_DIR`: 与卸载竞态时会把它重新制造出来;
+        # 目录存在性改为**取到主锁之后**再判定, 不存在就 fail-closed。
         mkdir -p "$(dirname "$config_lock_file")" 2>/dev/null
-        # config lock 主文件在锁根(/var/lock/xray-deploy), 不能被 uninstall 的 rm -rf 拆成
-        # 新旧 inode。**已存在**的旧版 L1/L2 路径会被一并打开并占用, 用来排斥旧版写者;
-        # 不存在则跳过(不凭空重建 /opt 旧锁文件)。
-        # 注意: exec 仅带重定向时重定向会**持久化**到整个子 shell —— 原写法
-        # `exec 9>... 2>/dev/null` 把子 shell 的 stderr 永久吞掉, 事务体内的全部
-        # _error/超时提示静默丢失(2026-09-13 Alpine 实测)。去掉 2>/dev/null:
-        # open 失败时 bash 自身报错 + 下面的 _error 都可见, 语义更正确。
+        # 主锁文件在锁根, 不被卸载的 rm -rf 拆分。**已存在**的旧版 L1/L2 路径会被一并打开
+        # 占用以排斥旧版写者; 不存在则跳过。
+        # 注意: 仅带重定向的 exec 会把 stderr 重定向**持久化**到整个子 shell —— 原写法
+        # `exec 9>... 2>/dev/null` 吞掉事务体内全部 _error(2026-09-13 Alpine 实测);
+        # 去掉 2>/dev/null, open 失败时 bash 自身报错 + 下面的 _error 都可见。
         if ! exec 9>"$config_lock_file"; then
             _error "无法创建配置锁文件 $config_lock_file(目录不可写?), 放弃本次修改"
             exit 1
@@ -1314,13 +1219,13 @@ _with_config_lock() {
             _error "等待配置锁超时(15s), 可能有其他 xd 会话正在修改配置"
             exit 1
         fi
-        # 主锁已在手, 此时才判部署树是否存在: 锁内的真实状态。不存在 ⇒ 确实没有部署
-        # (或刚被卸载), fail-closed 退出且**不重建**目录。
+        # 主锁已在手, 此时才判部署树是否存在(锁内真实状态): 不存在 ⇒ 确实没有部署
+        # (或刚被卸载), fail-closed 不重建。
         if [ ! -d "$DEPLOY_DIR" ]; then
             _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
         fi
-        # (P1, 复审) L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
+        # L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
         if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ] \
            && declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
             if _xray_legacy_deleted_tree_active "$DEPLOY_DIR"; then
@@ -1328,10 +1233,8 @@ _with_config_lock() {
                 exit 1
             fi
         fi
-        # 跨版本协调(仅对**已存在**的旧路径; 完整后端矩阵)。复用 core 的通用助手: 它 flock
-        # 旧文件、检查同名 mkdir 目录, 并在 lfile 缺失时拒绝而不是新建 —— 既覆盖
-        # "旧 flock 文件 + 旧 mkdir 目录并存"(残留 .fd 不得掩盖活动 .d), 也不污染 /opt。
-        # 混装版本缺该助手时 fail-closed(无法确认便不放行)。
+        # 跨版本协调(仅对**已存在**的旧路径)。复用 core 的通用助手: flock 旧文件、检查同名
+        # mkdir 目录, lfile 缺失时拒绝而不是新建。混装版本缺该助手时 fail-closed。
         local legacy_fd="" legacy_dir="" legacy1_fd="" legacy1_dir=""
         if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
             if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
@@ -1363,13 +1266,10 @@ _with_config_lock() {
 
 # ---------------------------------------------------------------------------
 # 普通 config/metadata 写入的**核心屏障**(复审 P1, 2026-09-26)。
-# 调用前提: 已持 config lock; 本包装再取 core lock 并在其内执行写入体, 使
-# "未收敛事务检查 + 写入 + verified restart"处于**同一**临界区。旧写法只做一次瞬时
-# 探测(取 core lock → 查账本 → 释放)后再写, 检查通过后另一会话仍可启动核心事务并留下
-# 未收敛账本, 而写入照常进行 —— 锁协议未闭合(TOCTOU)。
-# 锁序 config → core 成立(核心事务侧从不取 config lock), 屏障内的嵌套
-# `_txn_allow_config_write` / `_restart_xray_verified` 经持锁标记退化为直接调用, 不死锁。
-# 缺 `_with_core_lock`(混装旧 lib)时直接执行, 与项目 declare -F 口径一致。
+# 调用前提: 已持 config lock; 本包装再取 core lock 并在其内执行写入体, 使"未收敛事务检查
+# + 写入 + verified restart"处于**同一**临界区 —— 只做一次瞬时探测再写是 TOCTOU。
+# 锁序 config → core 成立(核心事务侧从不取 config lock), 屏障内的嵌套调用经持锁标记
+# 退化为直接调用, 不死锁。缺 `_with_core_lock`(混装旧 lib)时直接执行。
 # ---------------------------------------------------------------------------
 _with_config_write_barrier() {
     if declare -F _with_core_lock >/dev/null 2>&1; then
@@ -1380,10 +1280,8 @@ _with_config_write_barrier() {
 }
 
 # ---------------------------------------------------------------------------
-# 节点改名(端口号出现在名称尾部)的安全替换(2026-09-12 审查 F8)。
-# 原 `${name//${oldport}/${newport}}` 全局子串替换会把名称中恰好包含端口号的
-# 其他数字一并改掉(实测: HY2-54321 + 5432→7777 得 HY2-77771)。默认命名形如
-# <Proto>-<port>, 因此只替换 "-<oldport>" 后缀; 无后缀匹配时名称原样保留。
+# 节点改名的安全替换(F8): 全局子串替换会误伤名称里含端口号的数字(5432 会改到 54321)。
+# 默认命名形如 <Proto>-<port>, 只替换 "-<oldport>" 后缀; 无匹配则原样保留。
 # 用法: new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
 # ---------------------------------------------------------------------------
 _rename_node_with_port() {
@@ -1397,13 +1295,11 @@ _rename_node_with_port() {
 }
 
 # ---------------------------------------------------------------------------
-# 分享链接地址/端口改写(2026-09-12 审查 F7, 收口 _modify_port 与 _update_listen
-# 原本各自维护的两份字符串手术)。@ 锚定分割, 不误伤 path/sni/name 段。
+# 分享链接地址/端口改写(F7, 收口 _modify_port 与 _update_listen 各自的字符串手术)。
+# @ 锚定分割, 不误伤 path/sni/name 段; IPv6 目标自动加括号, 源 host_part 还原成 "[addr]"。
 #   _rewrite_link_addr <link> <newaddr>          —— 只换 host 段, 保留端口(改监听)
 #   _rewrite_link_port <link> <oldport> <newport>—— 换 host:port 段(改端口, host 不变)
-# IPv6 目标自动加括号; IPv6 源 host_part 经 ${var%%]*} + 字面 "]" 还原成 "[addr]"。
-# **链接不含 @**(被采纳节点的 "#tag (adopted)" 占位)时输出空串 —— 调用方必须
-# 保留原链接并提示, 不得把 "@:新端口" 垃圾写回 metadata(实测复现过的 bug)。
+# **链接不含 @**时输出空串 —— 调用方必须保留原链接并提示, 不得把垃圾写回 metadata。
 # ---------------------------------------------------------------------------
 _rewrite_link_addr() {
     local oldlink="$1" newaddr="$2"

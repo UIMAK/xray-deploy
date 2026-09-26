@@ -614,23 +614,17 @@ _cf_unit_path() {
 # ---------------------------------------------------------------------------
 # 包装器的"取参选项"表 + 前置位置参数个数(2026-09-21 七轮复审 P2)。
 #
-# 为什么需要: 旧实现纯靠"词法外观"判断 —— `-*` 跳过、NAME=value 跳过、纯数字跳过、其余
-# 含非数字的词即视为二进制。而包装器的**选项取值**恰好长得像个路径(含非数字、不以 `-` 开头),
-# 于是被当成二进制。实测: `env -u FOO /opt/custom/cloudflared` → 返回 `FOO`;
-# `setpriv --reuid root ...` → `root`; `timeout --signal TERM 5 ...` → `TERM`;
-# `taskset -c 0x1 ...` → `0x1`。期望路径随即变成一个**不存在的词**, `command -v` 失败 =>
-# 回退 `$CF_BIN` => 我们自己的实例被判成"别人家"而永不杀 = 静默双实例。
-# **更危险的一支**: 当被吞掉的取值本身是**已存在的绝对路径**时(实测 `env -C /tmp` → `/tmp`),
-# `command -v /tmp` 成功 => 连 `$CF_BIN` 回退都不触发, 返回一个**确定的错路径**。
+# 为什么需要: 纯词法外观判断(`-*`/NAME=value/纯数字跳过, 其余含非数字的词视为二进制)会把
+# 包装器的**选项取值**当成二进制 —— `env -u FOO …` → `FOO`, `timeout --signal TERM 5` → `TERM`。
+# 期望路径成了不存在的词 ⇒ `command -v` 失败 ⇒ 回退 `$CF_BIN` ⇒ 自己的实例永不杀(静默双实例);
+# 若被吞掉的值本身是存在的绝对路径(`env -C /tmp` → `/tmp`), `command -v` 成功, 连回退都不
+# 触发, 返回**确定的错路径**。
 #
-# 表内容**逐条来自 `--help` 实测**(coreutils 9.x), 不是猜的。两个陷阱项按实测处理:
-#   · `env --ignore-signal/--default-signal/--block-signal` 是**可选参数**(`[=<SIG>]`):
-#     实测 `env --ignore-signal TERM cmd` 会把 TERM 当成要执行的命令(rc=127), 只有
-#     `=TERM` 形态才吃参数 ⇒ **不得**列进表里, 否则会吞掉真二进制。
-#   · `taskset -c/--cpu-list` 是 **flag 而非取参选项**: 实测 `taskset --cpu-list=0-3` 报
-#     "option '--cpu-list' doesn't allow an argument" ⇒ mask 是**前置位置参数**。
-# 只匹配**完整 token**(用 `case " $tbl "` 精确匹配), 因此粘连形态(`-n5`/`-oL`/`-uFOO`/
-# `--signal=TERM`)天然不命中、不消费下一个词 —— 它们本就自带取值。
+# 表内容逐条来自 `--help` 实测, 两个陷阱项必须记住:
+#   · `env --ignore-signal/--default-signal/--block-signal` 是**可选参数**(只有 `=SIG` 形态吃参,
+#     空格形态实测会把 SIG 当要执行的命令)⇒ **不得**列进表里;
+#   · `taskset -c/--cpu-list` 是 **flag**, mask 是**前置位置参数**。
+# 只匹配**完整 token**, 粘连形态(`-n5`/`--signal=TERM`)天然不命中、不消费下一个词。
 # ---------------------------------------------------------------------------
 _cf_opt_takes_value() { # <包装器名> <token> ; 0 = 该 token 的取值是下一个词
     local w="$1" t="$2" tbl=""
@@ -1142,7 +1136,7 @@ _install_cloudflared() {
     fi
     # 安装事务可提交: 清理 _cf_write_service_line 留下的预修改快照
     rm -f "${svcfile}.bak"
-    # 持久化状态。F3: cf_token 不再落盘(docs/security-audit.md 修复计划 #4)——
+    # 持久化状态。cf_token 不再落盘 ——
     # 该 state 键全项目无读者(权威来源是 service 启动行, _read_cf_state 随时能解析),
     # 多存一份明文只是纯泄漏面; 卸载清理保留, 以覆盖历史版本遗留的文件。
     mkdir -p "$STATE_DIR"
