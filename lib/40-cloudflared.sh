@@ -1129,23 +1129,26 @@ _install_cloudflared() {
         _error "cloudflared 启动失败, 安装中止"
         return 1
     fi
-    # 安装事务完成(write+restart 成功): 清理 _cf_write_service_line 留下的预修改快照
+    # liveness 判定必须**先于**提交 state / 清理预修改快照(复审 P2): service install 在
+    # token 不可用时也会返回成功, 只有服务真的在跑, 安装事务才算可提交。失败时保留
+    # service 文件(用户唯一的修复入口), 但不写 state、不留预修改快照。
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
+    if ! _cf_is_running; then
+        rm -f "${svcfile}.bak" 2>/dev/null
+        _error "cloudflared service 已写入但启动后未运行, 安装未完成(请检查 token / 查看服务日志)"
+        _tip "service 文件已保留以便修复: $svcfile"
+        return 1
+    fi
+    # 安装事务可提交: 清理 _cf_write_service_line 留下的预修改快照
     rm -f "${svcfile}.bak"
-    # 全部成功后持久化状态。F3: cf_token 不再落盘(docs/security-audit.md 修复计划 #4)——
+    # 持久化状态。F3: cf_token 不再落盘(docs/security-audit.md 修复计划 #4)——
     # 该 state 键全项目无读者(权威来源是 service 启动行, _read_cf_state 随时能解析),
     # 多存一份明文只是纯泄漏面; 卸载清理保留, 以覆盖历史版本遗留的文件。
     mkdir -p "$STATE_DIR"
     _state_set cf_autoupdate "$CF_AUTOUPDATE" || _warn "状态持久化失败(cf_autoupdate)"
     _state_set cf_http2 "$CF_HTTP2" || _warn "状态持久化失败(cf_http2)"
     _state_set cf_edge_ip "$CF_EDGE_IP" || _warn "状态持久化失败(cf_edge_ip)"
-    # service install may return success even when the token is unusable. The
-    # install contract is not complete until the managed service is live.
-    if ! _cf_is_running; then
-        _error "cloudflared service 已写入但启动后未运行, 安装未完成"
-        return 1
-    fi
     _success "cloudflared 安装完成(已注册服务并开机自启)"
     _tip "已默认关闭 cloudflared 自动更新、开启 HTTP2 连接（可在 cloudflared 管理中修改）"
     _tip "隧道路由请在 Cloudflare Web 端配置, 本脚本不写 config.yml"

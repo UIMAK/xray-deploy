@@ -2797,8 +2797,12 @@ _sync_config_check() {
     [ -f "$CONFIG_FILE" ] || { _warn "config.json 不存在"; _press_any_key; return; }
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
 
-    # 先自动给无 tag 入站分配 tag(幂等, 已分配的不变)
-    _auto_tag_tagless_inbounds
+    # 先自动给无 tag 入站分配 tag(幂等, 已分配的不变)。失败时后续孤儿扫描没有可靠输入
+    # (tag 未补齐 ⇒ 会把"未跟踪"误判成孤儿), 必须中止而不是拿半扫结果去采纳/清理。
+    if ! _auto_tag_tagless_inbounds; then
+        _error "自动分配入站 tag 失败(配置不可解析或写入失败), 已中止同步"
+        _press_any_key; return
+    fi
 
     local tags_json
     tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null)
