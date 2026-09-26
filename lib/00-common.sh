@@ -1145,8 +1145,13 @@ _press_any_key() {
 # (活持有者/死 pid/无 pid 一律拒绝并给出人工清理命令)。SIGKILL 残局需要一次人工 rm -rf,
 # 这是 mkdir 退路相对 flock 的已知代价; 但"无 flock 就直接放行"会让 reset 的
 # backup→删除→重建整段事务与普通 config writer 完全失去互斥, 故不再放行。
+# **跨版本协调(复审三 P1)**: 与 flock 路径同样覆盖 L1/L2 × flock文件/mkdir目录 四种组合,
+# 复用 `_xray_legacy_lock_name` 的无-flock 分支(先扫旧 flock 文件是否被他人打开, 再按存在性
+# 拒绝/封存 mkdir 目录; 树外路径不创建任何对象)。缺该助手时 fail-closed。
 _with_config_lock_mkdir() {
     local deploy_path="${DEPLOY_DIR%/}" lock_dir rc owner
+    local legacy_lock_file legacy_lock_dir legacy1_lock_file legacy1_lock_dir
+    local legacy_fd="" legacy_dir="" legacy1_fd="" legacy1_dir=""
     case "$deploy_path" in
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立配置锁: $DEPLOY_DIR"; return 1 ;;
@@ -1155,6 +1160,10 @@ _with_config_lock_mkdir() {
         _error "部署目录路径无效, 无法建立配置锁: $DEPLOY_DIR"
         return 1
     fi
+    legacy_lock_file="$deploy_path/.config.lock"
+    legacy_lock_dir="$deploy_path/.config.lock.d"
+    legacy1_lock_file="${deploy_path%/*}/.${deploy_path##*/}.config.lock"
+    legacy1_lock_dir="${deploy_path%/*}/.${deploy_path##*/}.config.lock.d"
     lock_dir="$(_deploy_lock_root)/config.lock.d"
     mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || {
         _error "无法创建配置锁目录 $(dirname "$lock_dir")(权限/只读文件系统?), 放弃本次修改"
@@ -1178,12 +1187,48 @@ _with_config_lock_mkdir() {
         rmdir "$lock_dir" 2>/dev/null
         return 1
     fi
+    # (P1, 复审) L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
+    if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ] \
+       && declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
+        if _xray_legacy_deleted_tree_active "$deploy_path"; then
+            _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次配置修改"
+            rm -f "$lock_dir/pid" 2>/dev/null
+            rmdir "$lock_dir" 2>/dev/null
+            return 1
+        fi
+    fi
+    # 跨版本协调(仅对已存在的旧路径; 完整后端矩阵)。
+    if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
+        if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
+           || ! _xray_legacy_lock_name legacy_fd legacy_dir \
+                "$legacy_lock_file" "$legacy_lock_dir" "旧版配置锁"; then
+            _error "无法协调旧版配置锁, 放弃本次修改"
+            rm -f "$lock_dir/pid" 2>/dev/null
+            rmdir "$lock_dir" 2>/dev/null
+            return 1
+        fi
+    fi
+    if [ -e "$legacy1_lock_file" ] || [ -e "$legacy1_lock_dir" ]; then
+        if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
+           || ! _xray_legacy_lock_name legacy1_fd legacy1_dir \
+                "$legacy1_lock_file" "$legacy1_lock_dir" "旧版L1配置锁"; then
+            _error "无法协调旧版L1配置锁, 放弃本次修改"
+            declare -F _xray_legacy_lock_release >/dev/null 2>&1 && _xray_legacy_lock_release legacy_fd legacy_dir
+            rm -f "$lock_dir/pid" 2>/dev/null
+            rmdir "$lock_dir" 2>/dev/null
+            return 1
+        fi
+    fi
     (
         XRAY_DEPLOY_LOCK_HELD=1
         export XRAY_DEPLOY_LOCK_HELD
         "$@"
     )
     rc=$?
+    if declare -F _xray_legacy_lock_release >/dev/null 2>&1; then
+        _xray_legacy_lock_release legacy1_fd legacy1_dir
+        _xray_legacy_lock_release legacy_fd legacy_dir
+    fi
     owner=$(cat "$lock_dir/pid" 2>/dev/null)
     if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
         _error "配置锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
@@ -1193,47 +1238,18 @@ _with_config_lock_mkdir() {
     return "$rc"
 }
 
-# config 旧锁(flock 后端)协调: 取同路径 flock, 用只读见证 fd 复核 inode 身份, 防
-# "路径存在→被删→我们新建 inode"的 TOCTOU(那时 flock 落在旧进程不认识的 inode 上)。
-# **仅在调用方确认旧路径已存在时调用** —— 不存在就没有旧版写者, 凭空重建会把旧锁文件
-# 写回 /opt(本改动要消除的污染)。返回 0 = 已持有, 1 = fail-closed。
-_config_lock_legacy_flock_take() {   # <file> <fdvar> <label>
-    local lfile="$1" fdvar="$2" label="$3" witness="" lf="" i
-    exec {witness}<"$lfile" 2>/dev/null || witness=""
-    if [ -z "$witness" ]; then
-        _error "${label}存在但无法打开见证, 放弃本次修改: $lfile"
-        return 1
-    fi
-    if ! eval "exec {${fdvar}}>>\"\$lfile\"" 2>/dev/null; then
-        eval "exec ${witness}<&-" 2>/dev/null
-        _error "无法打开${label} $lfile(目录不可写?), 放弃本次修改"
-        return 1
-    fi
-    eval "lf=\${${fdvar}}"
-    if ! [ "/proc/self/fd/$lf" -ef "/proc/self/fd/$witness" ]; then
-        _error "${label}在判定后被删除/替换(部署目录正被卸载?), 放弃本次修改"
-        eval "exec ${witness}<&-" 2>/dev/null
-        eval "exec ${lf}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    eval "exec ${witness}<&-" 2>/dev/null
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        flock -n "$lf" 2>/dev/null && return 0
-        sleep 1
-    done
-    _error "${label}仍被占用(15s), 可能仍有旧版会话在改配置: $lfile"
-    _tip "等旧版会话退出后重试(内核会在持有进程退出时自动释放该锁)"
-    eval "exec ${lf}>&-" 2>/dev/null; eval "$fdvar=\"\""
-    return 1
-}
-
 # ---------------------------------------------------------------------------
 # 跨进程配置修改锁(2026-09-12 审查 F5, 借鉴 singbox-lite _with_state_lock):
 # 包住 _mutate_config 的 read-modify-write, 防止两个并发 xd 会话交叠产生丢失更新。
 # 主锁文件在 `/var/lock/xray-deploy/config.lock`(见 `_deploy_lock_root`): 卸载/reset 的
 # `rm -rf $DEPLOY_DIR` 不会把它拆成两个 inode, 因而 config writer 与全站破坏性操作能真正互斥。
-# 旧版(L1 0.17.13/0.18.0 父目录 `.<name>.config.lock`; L2 <=0.17.11 目录内 `.config.lock`)
-# 只认各自路径, 故对**已存在**的旧路径一并 flock 作跨版本协调(仅存在时, 不凭空重建)。
+# **跨版本协调覆盖完整后端矩阵(复审三 P1)**: L1(0.17.13/0.18.0 父目录)/L2(<=0.17.11 目录内)
+# × flock 文件/mkdir 目录 四种组合, 与 install/core 用同一个 `_xray_legacy_lock_name`:
+#   · 新版有 flock → 取旧 flock 文件, 并检查同名 mkdir 目录(残留 .fd 不得掩盖活动 .d);
+#   · 新版无 flock → `_with_config_lock_mkdir` 走该助手的无-flock 分支(先扫旧 flock 文件是否
+#     被他人打开, 再按存在性拒绝/封存)。
+# 只对**已存在**的旧路径协调(不存在则跳过, 不凭空重建 /opt 旧锁/旧目录)。旧版(<=0.17.11)
+# 无 flock 的 config 写者当年根本不建锁, 对它无从协调 —— 该残局只随旧进程退出消失。
 # 全站破坏性锁序是 install → config → core: install/uninstall/reset 先取安装锁, 再由本函数
 # 取 config 主锁, 最后由 `_restart_xray_verified` 取 core 锁; 单独 config writer 走 config → core。
 # 本函数**不自取 install lock** —— 那会让每次普通配置写入都创建旧版目录锁标记, SIGKILL 残局
@@ -1254,9 +1270,12 @@ _with_config_lock() {
         return $?
     fi
     local config_lock_file legacy1_lock_file legacy_lock_file
+    local legacy1_lock_dir legacy_lock_dir
     config_lock_file="$(_deploy_lock_root)/config.lock"
     legacy1_lock_file="${DEPLOY_DIR%/*}/.${DEPLOY_DIR##*/}.config.lock"
+    legacy1_lock_dir="${DEPLOY_DIR%/*}/.${DEPLOY_DIR##*/}.config.lock.d"
     legacy_lock_file="$DEPLOY_DIR/.config.lock"
+    legacy_lock_dir="$DEPLOY_DIR/.config.lock.d"
     (
         # **只创建锁根目录**, 绝不创建 `$DEPLOY_DIR`: 与卸载竞态时, 普通
         # config writer 若在这里 mkdir 部署目录, 会把刚被卸载的树重新制造出来 ——
@@ -1288,34 +1307,42 @@ _with_config_lock() {
             _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
         fi
-        # (P1, 复审) L2 旧锁文件在部署树内: 旧版卸载 `rm -rf` 后路径消失而 fd/flock 仍在
-        # (已删除 inode)。路径不存在**不能**解释成"没有旧版写者", 补一次删除树扫描
-        # (跨模块助手, 混装版本时 declare -F 守卫跳过)。
-        if [ ! -e "$legacy_lock_file" ] && declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
+        # (P1, 复审) L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
+        if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ] \
+           && declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
             if _xray_legacy_deleted_tree_active "$DEPLOY_DIR"; then
                 _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次配置修改"
                 exit 1
             fi
         fi
-        # 旧版锁协调(仅对**已存在**的旧路径): L2 <=0.17.11(目录内) 与 L1 0.17.13/0.18.0
-        # (父目录)。旧路径不存在 ⇒ 没有旧版写者, 跳过 —— 否则会凭空重建旧锁文件(污染 /opt)。
-        local legacy_fd="" legacy1_fd=""
-        if [ -e "$legacy_lock_file" ]; then
-            _config_lock_legacy_flock_take "$legacy_lock_file" legacy_fd "旧版配置锁文件" || exit 1
+        # 跨版本协调(仅对**已存在**的旧路径; 完整后端矩阵)。复用 core 的通用助手: 它 flock
+        # 旧文件、检查同名 mkdir 目录, 并在 lfile 缺失时拒绝而不是新建 —— 既覆盖
+        # "旧 flock 文件 + 旧 mkdir 目录并存"(残留 .fd 不得掩盖活动 .d), 也不污染 /opt。
+        # 混装版本缺该助手时 fail-closed(无法确认便不放行)。
+        local legacy_fd="" legacy_dir="" legacy1_fd="" legacy1_dir=""
+        if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
+            if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
+               || ! _xray_legacy_lock_name legacy_fd legacy_dir \
+                    "$legacy_lock_file" "$legacy_lock_dir" "旧版配置锁"; then
+                _error "无法协调旧版配置锁, 放弃本次修改"
+                exit 1
+            fi
         fi
-        if [ -e "$legacy1_lock_file" ]; then
-            _config_lock_legacy_flock_take "$legacy1_lock_file" legacy1_fd "旧版L1配置锁文件" || exit 1
+        if [ -e "$legacy1_lock_file" ] || [ -e "$legacy1_lock_dir" ]; then
+            if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
+               || ! _xray_legacy_lock_name legacy1_fd legacy1_dir \
+                    "$legacy1_lock_file" "$legacy1_lock_dir" "旧版L1配置锁"; then
+                _error "无法协调旧版L1配置锁, 放弃本次修改"
+                declare -F _xray_legacy_lock_release >/dev/null 2>&1 && _xray_legacy_lock_release legacy_fd legacy_dir
+                exit 1
+            fi
         fi
         export XRAY_DEPLOY_LOCK_HELD=1
         "$@"
         local rc=$?
-        if [ -n "$legacy_fd" ]; then
-            flock -u "$legacy_fd" 2>/dev/null
-            eval "exec ${legacy_fd}>&-" 2>/dev/null
-        fi
-        if [ -n "$legacy1_fd" ]; then
-            flock -u "$legacy1_fd" 2>/dev/null
-            eval "exec ${legacy1_fd}>&-" 2>/dev/null
+        if declare -F _xray_legacy_lock_release >/dev/null 2>&1; then
+            _xray_legacy_lock_release legacy1_fd legacy1_dir
+            _xray_legacy_lock_release legacy_fd legacy_dir
         fi
         exit "$rc"
     )

@@ -635,24 +635,21 @@ _install_xd_link() {
 # `/var/lock` 建不出时退 `/run/lock`(同族 tmpfs); 二者都失败时**不回落到 /opt**(那正是本次
 # 要消除的污染), 而是返回 /var/lock 路径, 让调用方给出明确的"无法创建锁"错误(fail-closed)。
 _install_lock_root() {
-    # **纯函数: 只选根, 不建目录**。顶层在**参数校验之前**求值 —— 一个拼错的开关
-    # (`install.sh --typo`)不该产生任何副作用; 原实现在这里建目录会照样创建
-    # /var/lock/xray-deploy(复审 P2)。目录的实际创建推迟到 `_install_lock_acquire`
-    # (它本来就为锁文件创建所在目录)。
-    if [ -d /var/lock ] && [ -w /var/lock ]; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
-    if [ -d /run/lock ] && [ -w /run/lock ]; then printf '%s' "/run/lock/xray-deploy"; return 0; fi
+    # 选锁根并**真正尝试创建**: `/var/lock` 优先, 失败再试同族 tmpfs `/run/lock`
+    # (只按权限位判断会在"只读文件系统"上给出假阳性 —— 复审 P2)。两处都建不出时返回
+    # /var/lock 路径, 由调用方 fail-closed(绝不回落到 /opt)。
+    # **本函数有副作用, 故其求值被推迟到参数校验之后**(见下方 `INSTALL_LOCK_ROOT=`),
+    # 一个拼错的开关不该创建任何目录。
+    if mkdir -p /var/lock/xray-deploy 2>/dev/null; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
+    if mkdir -p /run/lock/xray-deploy 2>/dev/null; then printf '%s' "/run/lock/xray-deploy"; return 0; fi
     printf '%s' "/var/lock/xray-deploy"
 }
 INSTALL_LOCK_PARENT="${DEPLOY_DIR%/*}"
 INSTALL_LOCK_NAME="${DEPLOY_DIR##*/}"
 [ -n "$INSTALL_LOCK_PARENT" ] || INSTALL_LOCK_PARENT="/"
-INSTALL_LOCK_ROOT="$(_install_lock_root)"
-# flock 用的**文件**与 mkdir 退路用的**目录**必须是两个不同路径: 旧版本(以及本版本的
-# mkdir 退路)在 `.install.lock` 上放的是**目录**, 而 `exec 9>>` 需要的是文件 —— 复用同一
-# 路径会让升级后的第一次安装直接报 "Is a directory" 而**完全无法运行**(实测)。故在锁根下
-# 分别用 `install.lock/`(目录)与 `install.lock.fd`(文件)。
-INSTALL_LOCK_DIR="${INSTALL_LOCK_ROOT}/install.lock"
-INSTALL_LOCK_FILE="${INSTALL_LOCK_ROOT}/install.lock.fd"
+# 主锁路径(ROOT/DIR/FILE)与 `_install_lock_root` 的求值被**推迟到参数校验之后** ——
+# 该函数会真正尝试创建锁根目录, 而拼错的开关不该创建任何东西(见下方 `INSTALL_LOCK_ROOT=`)。
+# 此处只放无副作用的常量。
 # **跨版本协调**(2026-09-23 十五轮, 2026-09-26 随锁根迁移到 /var/lock 扩为两层):
 #   L1 (0.17.13/0.18.0): 部署父目录下 `.<name>.install.lock[.fd]`
 #   L2 (<=0.17.11):      部署目录内 `.install.lock[.fd]`
@@ -1117,6 +1114,18 @@ if [ "$IS_UPDATE" -eq 1 ] && [ "$ALLOW_LOCAL" -eq 1 ]; then
     echo "       本地源请直接运行: bash install.sh [--no-start]"
     exit 2
 fi
+
+# ---------------------------------------------------------------------------
+# 锁根与主锁路径。**放在参数校验之后**: `_install_lock_root` 会真正尝试创建 /var/lock
+# (退 /run/lock), 而拼错的开关/互斥冲突的开关不该产生任何副作用。
+# flock 用的**文件**与 mkdir 退路用的**目录**必须是两个不同路径: 旧版本(以及本版本的
+# mkdir 退路)在 `.install.lock` 上放的是**目录**, 而 `exec 9>>` 需要的是文件 —— 复用同一
+# 路径会让升级后的第一次安装直接报 "Is a directory" 而**完全无法运行**(实测)。故在锁根下
+# 分别用 `install.lock/`(目录)与 `install.lock.fd`(文件)。
+# ---------------------------------------------------------------------------
+INSTALL_LOCK_ROOT="$(_install_lock_root)"
+INSTALL_LOCK_DIR="${INSTALL_LOCK_ROOT}/install.lock"
+INSTALL_LOCK_FILE="${INSTALL_LOCK_ROOT}/install.lock.fd"
 
 # ---------------------------------------------------------------------------
 # 获取安装锁。位置刻意选在**参数互斥校验之后**(拼错开关不该创建 $DEPLOY_DIR 与锁, 那条路径
