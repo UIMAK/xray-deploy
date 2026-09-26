@@ -500,9 +500,14 @@ _hysteria_is_running() {
             esac
             ;;
         direct)
-            # direct: pidfile 即业务进程本身 → 必须用 exe 归属校验(P1-2), 只看 comm 会把
-            # 陈旧 pidfile 指向的他方 hysteria 误认成本项目服务。pidfile 形如 "PID starttime"
-            # (见 00-common `_xd_pidfile_*`), 故先取 PID 字段。
+            # direct 的 pidfile 由本脚本写, 可能带 starttime 身份(见 00-common `_xd_pidfile_*`)。
+            # **有身份记录时身份就是权威**: 记录在而当前化身不符(已退出/被复用)直接判 stopped,
+            # 不再由全机扫描兜底 —— 否则 `_hysteria_restart_verified` 会把坏配置下的假 running
+            # 当成成功(第二轮复审 P1)。
+            if [ -n "$(_xd_pidfile_starttime "$HYSTERIA_PID_FILE")" ]; then
+                _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" || return 1
+            fi
+            # exe 归属校验(P1-2): 只看 comm 会把陈旧 pidfile 指向的他方 hysteria 误认成本项目服务
             anchor=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null)
             _hysteria_pid_is_ours "${anchor:-}" && return 0
             ;;
