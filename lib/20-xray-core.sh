@@ -87,6 +87,23 @@ _xray_fetch_tag() {
 }
 
 # ---------------------------------------------------------------------------
+# 版本号规范化(安装指定版本用): 接受 v26.3.27 / 26.3.27, 输出 GitHub release tag
+# "v26.3.27"; 非法输入返回 1。
+# Xray 的 release tag 恒为 vMAJOR.MINOR.PATCH(实测 v1.8.24 ~ v26.9.9 全部三段数字),
+# 因此只认三段数字, 不猜别名/前缀/范围(与 _hysteria_canon_version 同口径, 但保留 v 前缀
+# 作为 tag —— Xray 存进 state 的 version 由安装后的二进制反推, 不带 v)。
+# 只裁首尾空白, 不裁内部 —— 内部有空格的输入本就不是版本号, 应如实拒绝而不是"修复"。
+# ---------------------------------------------------------------------------
+_xray_canon_tag() {
+    local v="${1:-}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    v="${v#v}"; v="${v#V}"
+    [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    printf 'v%s' "$v"
+}
+
+# ---------------------------------------------------------------------------
 # 当前已安装版本(R3 回显用)
 # ---------------------------------------------------------------------------
 _xray_current_version() {
@@ -1970,9 +1987,10 @@ _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
 
 # ---------------------------------------------------------------------------
 # 安装或切换 Xray 核心(R3)
-# 用法:_install_or_switch_xray <channel>
-#   未安装 -> 安装该通道最新版
-#   已安装 -> 切换到该通道最新版(配置与节点不动)
+# 用法:_install_or_switch_xray <stable|preview|custom> [指定 tag]
+#   stable/preview -> 取该通道最新版安装/切换
+#   custom         -> 安装/切换到第二个参数指定的 tag(须为规范化的 vX.Y.Z, 见 _xray_canon_tag)
+#   未安装 -> 安装; 已安装 -> 切换(配置与节点不动)
 # 并发模型(十二轮 P2-③ 收窄锁域):
 #   · 阶段一 `_xray_stage_release` **在锁外** —— 它只写下自己独有的 staging 目录, 不碰任何
 #     共享状态, 所以网络等待/下载/解压(可能 40s+)不需要互斥, 也就不会把另一个会话拖成
@@ -1983,9 +2001,18 @@ _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
 # 核心事务不获取 config lock, 因而没有反向边, 两个包装器也各自可重入。
 # ---------------------------------------------------------------------------
 _install_or_switch_xray() {
-    local channel="$1" tag staged rc=0
+    local channel="$1" explicit_tag="${2:-}" tag staged rc=0
     case "$channel" in
         stable|preview) ;;
+        custom)
+            # 指定版本必须带一个规范化的 tag。这里只做形状校验, 不重复调用 _xray_canon_tag
+            # —— 规范化的唯一入口是 _xray_canon_tag, 传未规范化的 26.3.27 应被拒而不是静默接受。
+            # 空 tag 会让 _xray_stage_release 去下载 .../download//<asset> 而失败, 故前置拒绝。
+            if [[ ! "$explicit_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                _error "指定版本需要一个规范化的 tag(形如 v26.3.27), 收到: ${explicit_tag:-（空）}"
+                return 1
+            fi
+            ;;
         *) _error "未知通道: $channel"; return 1 ;;
     esac
     _ensure_dirs || return 1
@@ -2007,15 +2034,24 @@ _install_or_switch_xray() {
         fi
         return 1
     fi
-    tag=$(_xray_fetch_tag "$channel") || {
-        _error "无法获取 ${channel} 通道最新版本(网络?)"
-        return 1
-    }
-    _info "${channel} 通道最新版本: ${tag}"
+    if [ "$channel" = "custom" ]; then
+        tag="$explicit_tag"
+        _info "指定版本: ${tag}"
+    else
+        tag=$(_xray_fetch_tag "$channel") || {
+            _error "无法获取 ${channel} 通道最新版本(网络?)"
+            return 1
+        }
+        _info "${channel} 通道最新版本: ${tag}"
+    fi
     # ---- 阶段一(锁外): 下载/校验/解压到自有 staging ----
     staged=$(_xray_stage_release "$tag")
     if [ -z "$staged" ] || [ ! -f "${staged}/xray" ]; then
-        _error "获取 ${channel} 版本失败(网络/校验/解压?), 未做任何改动"
+        if [ "$channel" = "custom" ]; then
+            _error "获取指定版本 ${tag} 失败: 该版本可能不存在, 或网络/校验/解压异常; 未做任何改动"
+        else
+            _error "获取 ${channel} 版本失败(网络/校验/解压?), 未做任何改动"
+        fi
         [ -n "$staged" ] && rm -rf "$staged" 2>/dev/null
         return 1
     fi
@@ -2030,9 +2066,9 @@ _install_or_switch_xray() {
 }
 
 _install_or_switch_xray_locked() {
-    # $1=通道 $2=staging 目录(锁外已下载校验) $3=目标 tag
+    # $1=通道(stable|preview|custom) $2=staging 目录(锁外已下载校验) $3=目标 tag
     local channel="$1" staged="$2" tag="$3" cur="" prev_channel="" newv=""
-    case "$channel" in stable|preview) ;; *) _error "未知通道: $channel"; return 1 ;; esac
+    case "$channel" in stable|preview|custom) ;; *) _error "未知通道: $channel"; return 1 ;; esac
     _ensure_dirs || return 1
 
     # 锁内先重试 terminal cleanup / 收敛中断事务, 再执行第二道门禁。
@@ -3114,20 +3150,35 @@ _xray_core_menu() {
     echo -e "  ${CYAN}【Xray 核心管理】${NC}"
     if [ -x "$XRAY_BIN" ] && [ -n "$cur" ]; then
         echo -e "  当前版本: ${GREEN}v${cur}${NC}  通道: ${CYAN}${cur_channel}${NC}"
-        echo -e "  ${YELLOW}已安装 → 选择通道将切换到该通道最新版(配置与节点不变)${NC}"
+        echo -e "  ${YELLOW}已安装 → 切换通道最新版或指定版本(配置与节点不变)${NC}"
     else
         echo -e "  当前版本: ${RED}未安装${NC}"
-        echo -e "  ${YELLOW}选择通道将安装该通道最新版${NC}"
+        echo -e "  ${YELLOW}选择通道或指定版本将安装核心${NC}"
     fi
     echo
     echo -e "  ${GREEN}[1]${NC} 稳定版(stable)"
     echo -e "  ${GREEN}[2]${NC} 预览版(preview)"
+    echo -e "  ${GREEN}[3]${NC} 安装指定版本 (vX.Y.Z)"
     echo -e "  ${GREEN}[0]${NC} 返回"
     echo
     read -rp "  请选择: " choice
     case "$choice" in
         1) _install_or_switch_xray stable ;;
         2) _install_or_switch_xray preview ;;
+        3)
+            # 规范化的唯一入口是 _xray_canon_tag: 只接受 vX.Y.Z / X.Y.Z, 其余一律拒绝。
+            # 版本存在与否不在菜单预检 —— 与 hy 官方核心管理菜单同口径, 由下载阶段(含 .dgst
+            # SHA256 校验)判定; 不存在的 tag 会在取件阶段失败, 不触碰任何生产文件。
+            local vraw vtag
+            read -rp "  输入版本号 (如 v26.3.27): " vraw || return 0
+            [ -n "$vraw" ] || { _info "已取消"; return 0; }
+            if ! vtag=$(_xray_canon_tag "$vraw"); then
+                _error "版本号格式应为 vX.Y.Z (如 v26.3.27): ${vraw}"
+                _press_any_key
+                return 0
+            fi
+            _install_or_switch_xray custom "$vtag"
+            ;;
         0) return ;;
         *) _warn "无效选择" ;;
     esac
