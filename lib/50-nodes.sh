@@ -1874,9 +1874,18 @@ _mutate_config() {
     _with_config_lock _mutate_config_locked "$@"
 }
 
+# config 写入的核心屏障(复审 P1, 2026-09-26): 闸门检查 + backup/jq/mv + verified restart
+# 必须整体处于**同一个 core lock 临界区**, 否则检查通过后、真正写 config 前, 另一会话仍可
+# 启动核心事务并留下未收敛账本(BLOCKED/replacing/…), 而后续 `_restart_xray_verified`
+# 不重新检查 pending ⇒ "未收敛禁止普通写入"被 TOCTOU 绕过。屏障实现见 00-common 的
+# `_with_config_write_barrier`(同一包装也用于 normalize/auto_tag/adopt 等直写入口)。
 _mutate_config_locked() {
-    # 未收敛的核心事务禁止任何配置写入(复审 P1): 在 core lock 内判定, 在飞的切换不误拒;
-    # 崩溃残留/BLOCKED 才命中。混装旧 lib 缺 helper 时放行(declare -F 守卫在 helper 内)。
+    _with_config_write_barrier _mutate_config_write "$@"
+}
+
+_mutate_config_write() {
+    # 统一闸门: reset / core(仅非终态) / port 三套账本任一未收敛即拒绝。
+    # 混装旧 lib 缺 helper 时放行(declare -F 守卫在 helper 内)。
     if declare -F _txn_allow_config_write >/dev/null 2>&1 \
        && ! _txn_allow_config_write; then
         return 1
@@ -2427,8 +2436,12 @@ _auto_tag_tagless_inbounds() {
 }
 _auto_tag_tagless_inbounds_locked() {
     [ -f "$CONFIG_FILE" ] || return 0
-    # 本函数是**直写 config** 的入口(不经 _mutate_config), 必须自带核心事务闸门 ——
-    # 手工 [同步配置] 也会走到这里(复审 P1)。
+    # 检查与写入同处 core lock 临界区(复审 P1); 手工 [同步配置] 也走这里。
+    _with_config_write_barrier _auto_tag_tagless_inbounds_write
+}
+
+_auto_tag_tagless_inbounds_write() {
+    # 本函数是**直写 config** 的入口(不经 _mutate_config), 必须自带核心事务闸门。
     if declare -F _txn_allow_config_write >/dev/null 2>&1 \
        && ! _txn_allow_config_write; then
         return 1
@@ -2620,9 +2633,13 @@ _adopt_single_inbound() {
     _with_config_lock _adopt_single_inbound_locked "$@"
 }
 _adopt_single_inbound_locked() {
+    # 检查与写入同处 core lock 临界区(复审 P1); 自动采纳与手工 [同步配置] 共用本函数。
+    _with_config_write_barrier _adopt_single_inbound_write "$@"
+}
+
+_adopt_single_inbound_write() {
     local tag="$1" suffix="${2:-adopted}"
-    # 采纳写 metadata(不经 _mutate_config), 同样属于"未收敛核心事务期间不得变更现场"
-    # (复审 P1); 自动采纳与手工 [同步配置] 共用本函数。
+    # 采纳写 metadata(不经 _mutate_config), 同样属于"未收敛核心事务期间不得变更现场"。
     if declare -F _txn_allow_config_write >/dev/null 2>&1 \
        && ! _txn_allow_config_write; then
         return 1

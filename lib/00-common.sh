@@ -835,10 +835,16 @@ _normalize_config_format() {
     _with_config_lock _normalize_config_format_locked
 }
 _normalize_config_format_locked() {
+    # 廉价守卫留在屏障外(不必要为空/无 jq 的 no-op 去取 core lock)
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
+    _with_config_write_barrier _normalize_config_format_write
+}
+
+_normalize_config_format_write() {
     # 本函数是直写整份 config 的 RMW(不经 _mutate_config), 因此必须自带未收敛事务闸门(复审 P1):
-    # reset / core / port 任一未收敛时, 连"重排字段"这种整份替换也会改变现场。
+    # reset / core(仅非终态) / port 任一未收敛时, 连"重排字段"这种整份替换也会改变现场。
+    # 屏障保证"检查"与"写入"处于同一 core lock 临界区(复审 P1 的 TOCTOU)。
     # guard 是软依赖: 00-common 先于 20-xray-core 加载, 混装旧 lib 缺 helper 时放行(与项目口径一致)。
     if declare -F _txn_allow_config_write >/dev/null 2>&1 \
        && ! _txn_allow_config_write; then
@@ -1353,6 +1359,24 @@ _with_config_lock() {
         fi
         exit "$rc"
     )
+}
+
+# ---------------------------------------------------------------------------
+# 普通 config/metadata 写入的**核心屏障**(复审 P1, 2026-09-26)。
+# 调用前提: 已持 config lock; 本包装再取 core lock 并在其内执行写入体, 使
+# "未收敛事务检查 + 写入 + verified restart"处于**同一**临界区。旧写法只做一次瞬时
+# 探测(取 core lock → 查账本 → 释放)后再写, 检查通过后另一会话仍可启动核心事务并留下
+# 未收敛账本, 而写入照常进行 —— 锁协议未闭合(TOCTOU)。
+# 锁序 config → core 成立(核心事务侧从不取 config lock), 屏障内的嵌套
+# `_txn_allow_config_write` / `_restart_xray_verified` 经持锁标记退化为直接调用, 不死锁。
+# 缺 `_with_core_lock`(混装旧 lib)时直接执行, 与项目 declare -F 口径一致。
+# ---------------------------------------------------------------------------
+_with_config_write_barrier() {
+    if declare -F _with_core_lock >/dev/null 2>&1; then
+        _with_core_lock "$@"
+        return $?
+    fi
+    "$@"
 }
 
 # ---------------------------------------------------------------------------
