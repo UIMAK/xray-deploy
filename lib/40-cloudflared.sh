@@ -67,7 +67,7 @@ _install_cloudflared_bin() {
 
 # ---------------------------------------------------------------------------
 # 从用户粘贴文本提取令牌(纯 bash, 不用 sed/grep -E, 避 busybox 兼容问题)
-# cloudflared token 是 base64 JSON 串, 可能含 . - _ =
+# cloudflared token 是 JSON 的标准 Base64 串(字母表 A-Za-z0-9+/ 与 '=' padding; 见 _cf_token_valid)
 # 策略: 优先取 "service install" 或 "--token" 后的第一个字段; 兜底 ey 开头串
 # ---------------------------------------------------------------------------
 _extract_token() {
@@ -110,15 +110,21 @@ _extract_token() {
 
 # Tunnel tokens must pass cloudflared's own decoder before being embedded in service files
 # (OpenRC sources its init file as shell, so quotes/substitutions/whitespace must never be token data).
-# cloudflared 用 Go 的 `base64.StdEncoding` 解码(源码 cmd/cloudflared/tunnel/subcommands.go 的
-# `ParseToken` -> `base64.StdEncoding.DecodeString`): **标准**字母表 A-Za-z0-9+/ 且 padding 必须
-# 正确。此前允许 URL-safe 的 -/_ 又不校验 padding, 会造出"脚本说合法、cloudflared 自己拒绝"的
-# 伪合法 token。
+# cloudflared 的 `ParseToken`(cmd/cloudflared/tunnel/subcommands.go)做的是
+# `base64.StdEncoding.DecodeString` **再** `json.Unmarshal`。故校验要对齐两者:
+# **标准**字母表 A-Za-z0-9+/、padding 正确(长度 %4==0)、**且解码后必须是合法 JSON**。
+# 只验字符集/长度会放过 `eyI=`(解码得 `{"`)这类"脚本说合法、cloudflared 自己拒绝"的伪 token。
 _cf_token_valid() {
-    local token="${1:-}"
+    local token="${1:-}" decoded
     [[ "$token" == ey* ]] || return 1
     [[ "$token" =~ ^ey[A-Za-z0-9+/]+={0,2}$ ]] || return 1
-    (( ${#token} % 4 == 0 ))
+    (( ${#token} % 4 == 0 )) || return 1
+    # jq 是本项目硬依赖(_ensure_base_deps 安装; 多处配置操作要求它)。缺失时退化为"仅语法校验",
+    # 不因缺工具误拒可用的 token —— shell 安全性(禁止元字符)已由上一步的字符集保证。
+    command -v jq >/dev/null 2>&1 || return 0
+    decoded=$(printf '%s' "$token" | jq -Rr '@base64d' 2>/dev/null) || return 1
+    [ -n "$decoded" ] || return 1
+    printf '%s' "$decoded" | jq -e . >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -1083,7 +1089,7 @@ _install_cloudflared() {
         _error "未能从输入中识别 Cloudflare Tunnel Token, 不会把原文写入 service 文件"
         return 1
     fi
-    _cf_token_valid "$token" || { _error "Token 格式非法(仅接受 ey 开头的 base64/base64url 字符串)"; return 1; }
+    _cf_token_valid "$token" || { _error "Token 格式非法(仅接受 ey 开头的标准 Base64 Tunnel Token: 解码后须为合法 JSON)"; return 1; }
 
     # 默认设置(脚本安装默认: 自动更新 off, HTTP2 on, 协议栈 off)。
     # FLAG=yes: 本脚本管理的启动行显式携带全部管理标志(_cf_build_cmdline 依赖)
