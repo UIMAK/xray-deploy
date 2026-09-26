@@ -627,17 +627,17 @@ _install_xd_link() {
 # 仍是比 mkdir 退路好的地方 —— 后者必须人工 `rm -rf`, 不会自愈。
 # 有意不为此改成"不继承 fd": 那要引入 CLOEXEC, bash 无可移植写法, 而收益只是把 30s 缩短到 0。
 #
-# 锁根目录(2026-09-26): 默认 `/var/lock/xray-deploy` —— 标准锁位置(systemd/OpenRC 上
+# 锁根目录(2026-09-26): 固定 `/var/lock/xray-deploy` —— 标准锁位置(FHS; systemd/OpenRC 上
 # `/var/lock -> /run/lock`, 通常是 tmpfs), 重启即清空(陈旧锁自愈), 且**不污染 /opt**。
 # 这仍满足"锁必须在 `$DEPLOY_DIR` 之外"的硬约束(卸载的 `rm -rf` 不会把锁拆成新旧 inode)。
-# `XD_LOCK_DIR` 供测试沙箱覆盖(**必须**: 否则所有测试共用一个全局锁并写入真实 /var/lock);
-# 目录不可创建时(只读 /var、极端容器)回退到部署父目录下的隐藏 lockroot 目录, 保证仍能安装。
+# **不读任何环境变量覆盖**: 一个能改锁命名空间的开关会让两个进程各持不同锁而互不排斥
+# (复审 P2)。测试沙箱直接改写本函数/相关变量, 不走环境变量。
+# `/var/lock` 建不出时退 `/run/lock`(同族 tmpfs); 二者都失败时**不回落到 /opt**(那正是本次
+# 要消除的污染), 而是返回 /var/lock 路径, 让调用方给出明确的"无法创建锁"错误(fail-closed)。
 _install_lock_root() {
-    local parent name
-    if [ -n "${XD_LOCK_DIR:-}" ]; then printf '%s' "$XD_LOCK_DIR"; return 0; fi
     if mkdir -p /var/lock/xray-deploy 2>/dev/null; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
-    parent="${DEPLOY_DIR%/*}"; name="${DEPLOY_DIR##*/}"; [ -n "$parent" ] || parent="/"
-    printf '%s' "${parent}/.${name}.lockroot"
+    if mkdir -p /run/lock/xray-deploy 2>/dev/null; then printf '%s' "/run/lock/xray-deploy"; return 0; fi
+    printf '%s' "/var/lock/xray-deploy"
 }
 INSTALL_LOCK_PARENT="${DEPLOY_DIR%/*}"
 INSTALL_LOCK_NAME="${DEPLOY_DIR##*/}"
@@ -818,41 +818,45 @@ _install_legacy_flock_active() {
 
 # ---------------------------------------------------------------------------
 # 旧版锁协调助手(与 20-xray-core 的 `_xray_legacy_lock_name` 同语义)。**仅在调用方确认
-# 旧路径已存在时调用** —— 不存在就没有旧版进程在用它, 凭空重建会在 /opt 留下旧锁文件。
-#   flock 路径: 取同路径 flock(旧 flock 后端互斥) + 建同名 `.witness` 标记目录(挡旧 mkdir 后端)。
-#   mkdir 路径: 先扫"旧 flock 文件是否被他人打开", 再 mkdir 封存目录。
+# 旧路径已存在时调用**; 它**绝不新建树外的锁对象** —— 协调动作本身不能又污染 /opt。
+#   · 旧 flock 文件存在 → 取同路径 flock(见证/身份复核, 防"存在→被删→新建"TOCTOU);
+#     **部署树内**的旧 mkdir 目录会建同名 `.witness` 标记(挡旧 mkdir 后端), 树外的一律不建。
+#   · 旧 flock 文件不存在(只有旧 mkdir 目录) → 直接 fail-closed, 不凭空建 .fd(复审 P2)。
 # 失败一律 fail-closed; 由调用方负责释放已取得的主锁。
 # ---------------------------------------------------------------------------
 _install_lock_legacy_flock_take() {   # <file> <dir> <fdvar> <heldvar> <label>
     local lfile="$1" ldir="$2" fdvar="$3" heldvar="$4" label="$5"
-    local witness="" devino="" ef=""
-    if [ -e "$lfile" ]; then
-        eval "exec {witness}<\"\$lfile\"" 2>/dev/null || witness=""
-        if [ -z "$witness" ]; then
-            echo "[错误] ${label}文件存在但无法打开见证, 本次安装中止: $lfile"
-            return 1
+    local witness="" devino="" ef="" create_marker=0
+    # 只有部署树内的旧路径才允许创建 mkdir 标记(挡旧 mkdir 后端); 树外(如 /opt/.xray-deploy.*)
+    # 绝不创建 —— 否则协调动作本身又把目录写回 /opt(本 PR 要消除的污染)。
+    case "$ldir" in "$DEPLOY_DIR"/*) create_marker=1 ;; esac
+    if [ ! -e "$lfile" ]; then
+        # 旧 flock 文件不存在: **绝不为了协调而新建它**(会污染 /opt)。若旧 mkdir 目录存在
+        # ⇒ 旧会话仍在, fail-closed; 否则调用方本就不该调用。
+        if [ -e "$ldir" ]; then
+            echo "[错误] ${label}目录仍存在: $ldir"
+            echo "       确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
         fi
+        return 1
     fi
-    if [ -z "$witness" ] && _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
-        echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
+    eval "exec {witness}<\"\$lfile\"" 2>/dev/null || witness=""
+    if [ -z "$witness" ]; then
+        echo "[错误] ${label}文件存在但无法打开见证, 本次安装中止: $lfile"
         return 1
     fi
     if ! eval "exec {${fdvar}}>>\"\$lfile\"" 2>/dev/null; then
-        [ -n "$witness" ] && eval "exec ${witness}<&-" 2>/dev/null
+        eval "exec ${witness}<&-" 2>/dev/null
         echo "[错误] 无法打开${label}文件 $lfile(权限/只读文件系统?), 本次安装中止"
         return 1
     fi
     eval "ef=\${${fdvar}}"
-    if [ -n "$witness" ]; then
-        if ! _install_legacy_lock_identity_ok "$ef" "$witness"; then
-            echo "[错误] ${label}文件在判定后被删除/替换(部署目录正被卸载?), 本次中止"
-            eval "exec ${witness}<&-" 2>/dev/null
-            eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-            return 1
-        fi
+    if ! _install_legacy_lock_identity_ok "$ef" "$witness"; then
+        echo "[错误] ${label}文件在判定后被删除/替换(部署目录正被卸载?), 本次中止"
         eval "exec ${witness}<&-" 2>/dev/null
-        witness=""
+        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
+        return 1
     fi
+    eval "exec ${witness}<&-" 2>/dev/null
     if ! flock -n "$ef" 2>/dev/null; then
         echo "[错误] 旧版安装/卸载仍在运行(持有 $lfile), 本次中止"
         echo "       以免两棵树互相覆盖; 等它退出后重试(内核会在持有进程退出时自动释放)"
@@ -863,6 +867,11 @@ _install_lock_legacy_flock_take() {   # <file> <dir> <fdvar> <heldvar> <label>
         echo "[错误] ${label}文件在获取后被替换/删除(部署目录正被卸载?), 本次中止"
         eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
         return 1
+    fi
+    if [ "$create_marker" != "1" ]; then
+        # 树外旧锁: 只 flock 已知文件, 不创建任何新对象(跨版本协调的已知残余:
+        # 旧 mkdir 后端若在本检查之后才启动无从阻止 —— 与"旧进程在新版释放后启动"同类)。
+        return 0
     fi
     devino=$(_install_lock_devino "$lfile")
     if [ -z "$devino" ]; then
@@ -903,7 +912,9 @@ _install_lock_legacy_flock_take() {   # <file> <dir> <fdvar> <heldvar> <label>
 }
 
 _install_lock_legacy_mkdir_take() {   # <file> <dir> <heldvar> <label>
-    local lfile="$1" ldir="$2" heldvar="$3" label="$4" lrc
+    local lfile="$1" ldir="$2" heldvar="$3" label="$4" lrc create_marker=0
+    # 只创建部署树内的旧 mkdir 目录; 树外(如 /opt/.xray-deploy.*)**绝不创建**(污染)。
+    case "$ldir" in "$DEPLOY_DIR"/*) create_marker=1 ;; esac
     if [ -e "$lfile" ]; then
         if ! declare -F _install_legacy_flock_active >/dev/null 2>&1; then
             echo "[错误] 无法确认${label} flock 是否空闲(缺少检查助手), 本次安装中止"
@@ -916,6 +927,13 @@ _install_lock_legacy_mkdir_take() {   # <file> <dir> <heldvar> <label>
                 return 1
                 ;;
         esac
+    fi
+    if [ -e "$ldir" ]; then
+        # 旧 mkdir 目录存在 ⇒ 交给 mkdir 助手拒绝并保留现场(绝不接管别人的锁)
+        _install_lock_mkdir_take "$ldir" "$label" || return 1
+    fi
+    if [ "$create_marker" != "1" ]; then
+        return 0
     fi
     _install_lock_mkdir_take "$ldir" "$label" || return 1
     eval "$heldvar=1"
@@ -942,13 +960,26 @@ _install_lock_acquire() {
         if flock -n "$INSTALL_LOCK_FD" 2>/dev/null; then
             INSTALL_LOCK_HELD=1
             printf '%s\n' "$$" >&"$INSTALL_LOCK_FD" 2>/dev/null || true   # 仅供诊断, 权威在 fd
+            # **(P1, 复审) 先扫已删除部署树上的旧进程**: L2 旧锁文件在部署树内, 旧版卸载执行
+            # `rm -rf "$DEPLOY_DIR"` 后路径消失, 但旧进程的 fd/flock 仍在(已删除 inode) ——
+            # "路径不存在" **不能** 解释成"没有旧版进程"。该扫描必须在 `mkdir -p "$DEPLOY_DIR"`
+            # **之前**做, 否则会为已删除树重新造出一个像样的路径, 两边随后完全看不见彼此。
+            # L2 路径存在时改用见证/身份复核(helper 内), 无需扫描。
+            if [ ! -e "$INSTALL_LEGACY_LOCK_FILE" ] && [ ! -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
+                if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+                    echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
+                    echo "       请等旧版 install/卸载退出后重试"
+                    _install_lock_release
+                    return 1
+                fi
+            fi
             if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
                 echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
                 _install_lock_release
                 return 1
             fi
             # 旧版锁协调(仅对**已存在**的旧路径): L1(0.17.13/0.18.0)、L2(<=0.17.11)。
-            # 不存在就没有旧版进程在用, 凭空重建会把旧锁文件写回 /opt(本改动要消除的污染)。
+            # 不存在就跳过; helper **绝不新建树外锁对象**(否则协调动作本身又污染 /opt)。
             if [ -e "$INSTALL_LEGACY1_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY1_LOCK_DIR" ]; then
                 _install_lock_legacy_flock_take "$INSTALL_LEGACY1_LOCK_FILE" "$INSTALL_LEGACY1_LOCK_DIR" \
                     INSTALL_LEGACY1_LOCK_FD INSTALL_LEGACY1_LOCK_DIR_HELD "旧版L1安装锁" || {
@@ -975,33 +1006,35 @@ _install_lock_acquire() {
     # 主锁取到**之后**才创建部署目录: 旧版锁路径就在该目录内, 必须等目录可写再取第二把。
     _install_lock_mkdir_take "$INSTALL_LOCK_DIR" "安装锁" || return 1
     INSTALL_LOCK_HELD=1
+    # (P1) 同 flock 分支: L2 路径不存在 ⇒ 先扫已删除部署树, 再创建部署目录。
+    if [ ! -e "$INSTALL_LEGACY_LOCK_FILE" ] && [ ! -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
+        if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+            echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
+            echo "       请等旧版 install/卸载退出后重试"
+            _install_lock_release
+            return 1
+        fi
+    fi
     if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
         echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
         _install_lock_release
         return 1
     fi
     # 旧版锁协调(仅对**已存在**的旧路径; 无 flock 时按"另一种后端可能存活"检查 + mkdir 封存)。
-    if [ -e "$INSTALL_LEGACY1_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY1_LOCK_DIR" ] || \
-       [ -e "$INSTALL_LEGACY_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
-        if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
-            echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
+    # 树外(如 /opt/.xray-deploy.*)只检查不创建(见 helper), 避免协调动作本身污染 /opt。
+    if [ -e "$INSTALL_LEGACY1_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY1_LOCK_DIR" ]; then
+        _install_lock_legacy_mkdir_take "$INSTALL_LEGACY1_LOCK_FILE" "$INSTALL_LEGACY1_LOCK_DIR" \
+            INSTALL_LEGACY1_LOCK_DIR_HELD "旧版L1安装锁" || {
             _install_lock_release
             return 1
-        fi
-        if [ -e "$INSTALL_LEGACY1_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY1_LOCK_DIR" ]; then
-            _install_lock_legacy_mkdir_take "$INSTALL_LEGACY1_LOCK_FILE" "$INSTALL_LEGACY1_LOCK_DIR" \
-                INSTALL_LEGACY1_LOCK_DIR_HELD "旧版L1安装锁" || {
-                _install_lock_release
-                return 1
-            }
-        fi
-        if [ -e "$INSTALL_LEGACY_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
-            _install_lock_legacy_mkdir_take "$INSTALL_LEGACY_LOCK_FILE" "$INSTALL_LEGACY_LOCK_DIR" \
-                INSTALL_LEGACY_LOCK_DIR_HELD "旧版安装锁" || {
-                _install_lock_release
-                return 1
-            }
-        fi
+        }
+    fi
+    if [ -e "$INSTALL_LEGACY_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
+        _install_lock_legacy_mkdir_take "$INSTALL_LEGACY_LOCK_FILE" "$INSTALL_LEGACY_LOCK_DIR" \
+            INSTALL_LEGACY_LOCK_DIR_HELD "旧版安装锁" || {
+            _install_lock_release
+            return 1
+        }
     fi
     return 0
 }

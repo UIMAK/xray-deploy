@@ -31,19 +31,18 @@ export CF_UNIT_SYSTEMD="/etc/systemd/system/cloudflared.service"
 export CF_UNIT_OPENRC="/etc/init.d/cloudflared"
 
 # ---------------------------------------------------------------------------
-# 进程间锁的根目录(2026-09-26): 默认 `/var/lock/xray-deploy` —— 标准锁位置, 在
+# 进程间锁的根目录(2026-09-26): 固定 `/var/lock/xray-deploy` —— 标准锁位置(FHS), 在
 # systemd/OpenRC 上通常是 tmpfs(`/var/lock -> /run/lock`), 重启即清空(陈旧锁自愈),
 # 且**不污染 /opt**。仍满足"锁必须在 `$DEPLOY_DIR` 之外"的硬约束: 卸载的 `rm -rf "$DEPLOY_DIR"`
-# 不会把锁文件拆成新旧 inode。`XD_LOCK_DIR` 供测试沙箱覆盖(**必须**: 否则测试会共用一个
-# 全局锁并写入真实 /var/lock); 目录不可创建时(只读 /var、极端容器)回退到部署父目录下的
-# 隐藏 lockroot 目录, 保证仍可运行。**与 install.sh 的 `_install_lock_root` 逐字同口径。**
+# 不会把锁文件拆成新旧 inode。**不读任何环境变量覆盖**(复审 P2): 能改锁命名空间的开关会让
+# 两进程各持不同锁而互不排斥; 测试沙箱直接改写本函数, 不走环境变量。
+# `/var/lock` 建不出时退 `/run/lock`; 二者都失败时**不回落到 /opt**, 而是返回 /var/lock 让
+# 调用方 fail-closed(明确报"无法创建锁")。**与 install.sh 的 `_install_lock_root` 同口径。**
 # ---------------------------------------------------------------------------
 _deploy_lock_root() {
-    local parent name
-    if [ -n "${XD_LOCK_DIR:-}" ]; then printf '%s' "$XD_LOCK_DIR"; return 0; fi
     if mkdir -p /var/lock/xray-deploy 2>/dev/null; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
-    parent="${DEPLOY_DIR%/*}"; name="${DEPLOY_DIR##*/}"; [ -n "$parent" ] || parent="/"
-    printf '%s' "${parent}/.${name}.lockroot"
+    if mkdir -p /run/lock/xray-deploy 2>/dev/null; then printf '%s' "/run/lock/xray-deploy"; return 0; fi
+    printf '%s' "/var/lock/xray-deploy"
 }
 
 # 脚本自身
@@ -1288,6 +1287,15 @@ _with_config_lock() {
         if [ ! -d "$DEPLOY_DIR" ]; then
             _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
+        fi
+        # (P1, 复审) L2 旧锁文件在部署树内: 旧版卸载 `rm -rf` 后路径消失而 fd/flock 仍在
+        # (已删除 inode)。路径不存在**不能**解释成"没有旧版写者", 补一次删除树扫描
+        # (跨模块助手, 混装版本时 declare -F 守卫跳过)。
+        if [ ! -e "$legacy_lock_file" ] && declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
+            if _xray_legacy_deleted_tree_active "$DEPLOY_DIR"; then
+                _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次配置修改"
+                exit 1
+            fi
         fi
         # 旧版锁协调(仅对**已存在**的旧路径): L2 <=0.17.11(目录内) 与 L1 0.17.13/0.18.0
         # (父目录)。旧路径不存在 ⇒ 没有旧版写者, 跳过 —— 否则会凭空重建旧锁文件(污染 /opt)。
