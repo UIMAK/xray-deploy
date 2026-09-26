@@ -67,7 +67,7 @@ _install_cloudflared_bin() {
 
 # ---------------------------------------------------------------------------
 # 从用户粘贴文本提取令牌(纯 bash, 不用 sed/grep -E, 避 busybox 兼容问题)
-# cloudflared token 是 base64 JSON 串, 可能含 . - _ =
+# cloudflared token 是 JSON 的标准 Base64 串(字母表 A-Za-z0-9+/ 与 '=' padding; 见 _cf_token_valid)
 # 策略: 优先取 "service install" 或 "--token" 后的第一个字段; 兜底 ey 开头串
 # ---------------------------------------------------------------------------
 _extract_token() {
@@ -106,6 +106,27 @@ _extract_token() {
     token="${token%\"}"; token="${token%\'}"
     token="${token#\"}"; token="${token#\'}"
     [ -n "$token" ] && echo "$token"
+}
+
+# Tunnel tokens must pass cloudflared's own decoder before being embedded in service files
+# (OpenRC sources its init file as shell, so quotes/substitutions/whitespace must never be token data).
+# cloudflared 的 `ParseToken`(cmd/cloudflared/tunnel/subcommands.go)做的是
+# `base64.StdEncoding.DecodeString` **再** `json.Unmarshal(content, &connection.TunnelToken{})`。
+# 故校验要对齐两者: **标准**字母表 A-Za-z0-9+/、padding 正确(长度 %4==0)、**且解码后必须是 JSON
+# 对象**。只验字符集/长度会放过 `eyI=`(解码得 `{"`); 只验"任意合法 JSON"又会接受 `[]`/`123`
+# 这类 Go 反序列化到 struct 时必然失败的值。(注: `ey` 前缀本身已蕴含首字节 `{`, 故此处的对象
+# 判定实际是"花钱很少的精确性保证", 而非可达的行为分歧。)
+_cf_token_valid() {
+    local token="${1:-}" decoded
+    [[ "$token" == ey* ]] || return 1
+    [[ "$token" =~ ^ey[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    (( ${#token} % 4 == 0 )) || return 1
+    # jq 是本项目硬依赖(_ensure_base_deps 安装; 多处配置操作要求它)。缺失时退化为"仅语法校验",
+    # 不因缺工具误拒可用的 token —— shell 安全性(禁止元字符)已由上一步的字符集保证。
+    command -v jq >/dev/null 2>&1 || return 0
+    decoded=$(printf '%s' "$token" | jq -Rr '@base64d' 2>/dev/null) || return 1
+    [ -n "$decoded" ] || return 1
+    printf '%s' "$decoded" | jq -e 'type == "object"' >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -213,6 +234,25 @@ _cf_mask_token() {
     fi
 }
 
+# Redact service lines without assuming quotes are absent. For an unparseable credential-bearing
+# line, omit the complete line instead of risking a plaintext token in copy/pasted diagnostics.
+_cf_redact_service_line() {
+    local line="$1" token masked lower
+    if _cf_is_cmd_line "$line"; then
+        token=$(_cf_extract_line_token "$line")
+        if [ -n "$token" ]; then
+            masked=$(_cf_mask_token "$token")
+            printf '%s\n' "${line//"$token"/$masked}"
+            return 0
+        fi
+    fi
+    lower="${line,,}"
+    case "$lower" in
+        *token*|*ey????????????????????*) printf '[敏感配置行已隐藏]\n' ;;
+        *) printf '%s\n' "$line" ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # 重组 cloudflared 启动命令行(按 3 开关 + token)
 # 用法:_cf_build_cmdline <token>
@@ -220,6 +260,7 @@ _cf_mask_token() {
 # ---------------------------------------------------------------------------
 _cf_build_cmdline() {
     local token="$1"
+    _cf_token_valid "$token" || { _error "拒绝把非法 Token 写入 service 命令行"; return 1; }
     local cmd="$CF_BIN"
     if [ "$CF_AUTOUPDATE" = "on" ]; then
         cmd="$cmd --autoupdate-freq 24h0m0s"
@@ -250,7 +291,7 @@ _svc_replace_line() {
     local svcfile="$1" pattern="$2" newline="$3" tmp found=0
     [ -f "$svcfile" ] || return 1
     # 备份必须真正成功才允许改 service(磁盘满/IO 失败时无 .bak 可恢复)
-    cp -f "$svcfile" "${svcfile}.bak" 2>/dev/null || { _error "service 备份失败: $svcfile"; return 1; }
+    _svc_backup "$svcfile" || return 1
     local tmp write_ok=1
     tmp=$(mktemp) || { _error "无法创建临时 service 文件: $svcfile"; return 1; }
     while IFS= read -r ln || [ -n "$ln" ]; do
@@ -272,6 +313,26 @@ _svc_replace_line() {
         return 1
     fi
     _svc_commit "$svcfile" "$tmp"
+}
+
+# Backups contain plaintext credentials. The global entry point uses umask 077, but the library
+# can also be sourced directly and an existing .bak keeps its old mode when cp truncates it.
+_svc_backup() {
+    local svcfile="$1" backup="${1}.bak"
+    if [ -e "$backup" ] && ! chmod 600 "$backup" 2>/dev/null; then
+        _error "无法收紧既有 service 备份权限, 未修改 service: $backup"
+        return 1
+    fi
+    ( umask 077; cp -f "$svcfile" "$backup" ) 2>/dev/null || {
+        _error "service 备份失败: $svcfile"
+        return 1
+    }
+    if ! chmod 600 "$backup" 2>/dev/null; then
+        rm -f "$backup" 2>/dev/null
+        _error "service 备份权限收紧失败, 未修改 service: $backup"
+        return 1
+    fi
+    return 0
 }
 
 # 把 tmp 提交为 service 文件内容: cat(而非 mv)保原文件 inode 与权限(openrc init.d 的
@@ -340,6 +401,8 @@ _svc_restore() {
 
 _cf_write_service_line() {
     local cmd="$1" svcfile
+    local token; token=$(_cf_extract_line_token "$cmd")
+    _cf_token_valid "$token" || { _error "拒绝写入不安全的 cloudflared Token"; return 1; }
     case "$INIT_SYSTEM" in
         systemd) svcfile="$CF_UNIT_SYSTEMD" ;;
         openrc)  svcfile="$CF_UNIT_OPENRC" ;;
@@ -442,6 +505,7 @@ _cf_extract_line_token() {
 # 参数 oldtok 现在只是提示(命令行上解析到的 token 才是权威), 保留以兼容调用方签名。
 _cf_replace_token_in_service() {
     local oldtok="$1" newtok="$2" svcfile
+    _cf_token_valid "$newtok" || { _error "拒绝写入不安全的 cloudflared Token"; return 1; }
     case "$INIT_SYSTEM" in
         systemd) svcfile="$CF_UNIT_SYSTEMD" ;;
         openrc)  svcfile="$CF_UNIT_OPENRC" ;;
@@ -449,7 +513,7 @@ _cf_replace_token_in_service() {
     esac
     [ -f "$svcfile" ] || return 1
     # 备份必须真正成功才允许改 service(失败可恢复)
-    cp -f "$svcfile" "${svcfile}.bak" 2>/dev/null || { _error "service 备份失败: $svcfile"; return 1; }
+    _svc_backup "$svcfile" || return 1
     local tmp write_ok=1 replaced=0 ln found
     tmp=$(mktemp) || { _error "无法创建临时 service 文件: $svcfile"; return 1; }
     while IFS= read -r ln || [ -n "$ln" ]; do
@@ -1024,10 +1088,10 @@ _install_cloudflared() {
     read -rp "  粘贴: " input
     local token; token=$(_extract_token "$input")
     if [ -z "$token" ]; then
-        _warn "未识别到 ey... 令牌, 将原样使用你输入的内容作为 token"
-        token="$input"
+        _error "未能从输入中识别 Cloudflare Tunnel Token, 不会把原文写入 service 文件"
+        return 1
     fi
-    [ -z "$token" ] && { _error "Token 不能为空"; return 1; }
+    _cf_token_valid "$token" || { _error "Token 格式非法(仅接受 ey 开头的标准 Base64 Tunnel Token: 解码后须为合法 JSON)"; return 1; }
 
     # 默认设置(脚本安装默认: 自动更新 off, HTTP2 on, 协议栈 off)。
     # FLAG=yes: 本脚本管理的启动行显式携带全部管理标志(_cf_build_cmdline 依赖)
@@ -1046,7 +1110,9 @@ _install_cloudflared() {
     esac
     # 官方命令生成的 service 行可能不含我们要的参数, 重组覆盖。写入失败必须中止(不写 state,
     # 否则 state 记录的参数与 service 实际内容不一致)。
-    if ! _cf_write_service_line "$(_cf_build_cmdline "$token")"; then
+    local cmdline
+    cmdline=$(_cf_build_cmdline "$token") || { _error "无法构造安全的 cloudflared 启动行"; return 1; }
+    if ! _cf_write_service_line "$cmdline"; then
         # 安装中止: 清掉 _svc_replace_line 可能留下的预修改快照, 否则它永远不会被消费
         # (_cf_rollback_service 只服务"已安装后的切换", 安装已中止)。
         local ab_svc
@@ -1148,8 +1214,8 @@ _cf_switch_token() {
     fi
     read -rp "  粘贴新令牌(或 CF 安装命令): " input
     local token; token=$(_extract_token "$input")
-    [ -z "$token" ] && token="$input"
-    [ -z "$token" ] && { _warn "令牌为空, 取消"; return 1; }
+    [ -n "$token" ] || { _warn "未能从输入中识别新令牌, 取消"; return 1; }
+    _cf_token_valid "$token" || { _error "新 Token 格式非法, 未修改 service"; return 1; }
 
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
@@ -1224,6 +1290,7 @@ _cf_toggle() {
         _warn "未能读取令牌(可能是手动安装), 请先 [1] 补录令牌后再切换开关"
         return 1
     fi
+    _cf_token_valid "$CF_CUR_TOKEN" || { _error "service 中的 Token 格式非法, 请先重新录入令牌"; return 1; }
     local cur
     case "$key" in
         # autoupdate 的"当前值"必须用与菜单显示同一个判据。启动行没写标志时 cloudflared
@@ -1247,7 +1314,9 @@ _cf_toggle() {
     esac
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
-    _cf_write_service_line "$(_cf_build_cmdline "$CF_CUR_TOKEN")" || return 1
+    local cmdline
+    cmdline=$(_cf_build_cmdline "$CF_CUR_TOKEN") || return 1
+    _cf_write_service_line "$cmdline" || return 1
 
     # restart 与 liveness 共同构成成功(与 _cf_switch_token 同一语义), 失败即回滚
     # R38(P1): 回滚消息按真实结果分支, 不再在回滚失败时也宣称"已回滚到原状态"
@@ -1285,6 +1354,7 @@ _cf_set_edge_ip() {
         _warn "未能读取令牌(可能是手动安装), 请先 [1] 补录令牌后再切换协议栈"
         return 1
     fi
+    _cf_token_valid "$CF_CUR_TOKEN" || { _error "service 中的 Token 格式非法, 请先重新录入令牌"; return 1; }
     local cur="${CF_CUR_EDGE_IP:-off}"
     echo
     echo -e "  ${CYAN}【切换协议栈】${NC}"
@@ -1313,7 +1383,9 @@ _cf_set_edge_ip() {
 
     CF_AUTOUPDATE="${CF_CUR_AUTOUPDATE}"; CF_HTTP2="${CF_CUR_HTTP2}"; CF_EDGE_IP="$val"
     CF_AUTOUPDATE_FLAG="${CF_CUR_AUTOUPDATE_FLAG:-yes}"   # F6: 保留原行对 autoupdate 的管理方式
-    _cf_write_service_line "$(_cf_build_cmdline "$CF_CUR_TOKEN")" || return 1
+    local cmdline
+    cmdline=$(_cf_build_cmdline "$CF_CUR_TOKEN") || return 1
+    _cf_write_service_line "$cmdline" || return 1
 
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
@@ -1376,6 +1448,10 @@ _cloudflared_menu() {
                 echo -e "  ${GREEN}[1]${NC} 切换令牌"
             else
                 echo -e "  ${GREEN}[1]${NC} 补录令牌(手动安装的 cloudflared)"
+                # 管理范围声明: 本脚本只认启动行里的 `--token <值>`, 改写/切换都只针对它。
+                # token-file / Environment=TUNNEL_TOKEN 等官方形态无法安全重写(会破坏用户原配置),
+                # 故必须显式说明, 不能让用户以为"支持 cloudflared 令牌"就等于支持全部形态。
+                echo -e "  ${YELLOW}仅管理启动行中的 --token <值>; --token-file / Environment=TUNNEL_TOKEN 需手动维护${NC}"
             fi
             echo -e "  ${GREEN}[2]${NC} 切换 自动更新 (当前 $(_cf_onoff "$auto_disp"))"
             echo -e "  ${GREEN}[3]${NC} 切换 HTTP/2      (当前 $(_cf_onoff "${CF_CUR_HTTP2:-on}"))"
@@ -1428,27 +1504,10 @@ _cf_diagnose() {
         echo -e "  解析到的开关: auto=${CF_CUR_AUTOUPDATE} http2=${CF_CUR_HTTP2} 协议栈=${CF_CUR_EDGE_IP}"
         echo
         echo -e "  ${CYAN}--- 文件内容(token 已掩码) ---${NC}"
-        # 把 ey... 串替换成 ey***: 不依赖 sed -E, 用 bash 逐词处理以兼容 busybox
-        local dl dw dout
+        # 共享 quote-aware redactor: 无法安全解析的 token 行整个隐藏, 绝不原样放行。
+        local dl
         while IFS= read -r dl || [ -n "$dl" ]; do
-            case "$dl" in
-                *ey????????????????????*)
-                    dout=""
-                    for dw in $dl; do
-                        case "$dw" in
-                            ey????????????????????*) dout="$dout ey***MASKED***" ;;
-                            *"ey"*)
-                                # token 可能与前缀粘连(--token=ey... / "ey...")
-                                case "$dw" in
-                                    *=ey????????????????????*) dout="$dout ${dw%%=ey*}=ey***MASKED***" ;;
-                                    *) dout="$dout $dw" ;;
-                                esac ;;
-                            *) dout="$dout $dw" ;;
-                        esac
-                    done
-                    printf '%s\n' "${dout# }" ;;
-                *) printf '%s\n' "$dl" ;;
-            esac
+            _cf_redact_service_line "$dl"
         done < "$svcfile"
         echo -e "  ${CYAN}--- end ---${NC}"
         echo
