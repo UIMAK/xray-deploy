@@ -2285,6 +2285,17 @@ _is_reality_loopback_host() {
 # ---------------------------------------------------------------------------
 # 保存节点元数据(每节点独立文件)
 # 用法:_save_node_meta <tag> <json_object>
+#
+# **本函数刻意不接"未收敛事务"写闸门/屏障**(复审 P2-2), 理由三条:
+#   ① 它写的是**元数据声明**, 权威状态是 config.json。两类调用点: 事务提交路径
+#      (`_commit_node_txn_locked` / `_commit_reality_node_txn_locked`)在**闸门化的 config
+#      提交之后**才调用 —— 此时若再拒绝元数据写入, 只会制造 config/metadata 分裂, 而且
+#      回滚路径(`_mutate_config`)本身也被闸门拦下(拒绝 = 分裂); metadata-only 的采纳路径
+#      已在 `_adopt_single_inbound_write` 的屏障+闸门内。
+#   ② 通用原语 `_meta_update` 还被**事务账本**(coretxn journal / reset journal)使用,
+#      对它加写闸门会自锁账本机制 —— 只能按"写入点是不是权威 config"逐个判定。
+#   ③ core recovery 不读写节点 metadata, 二者没有共享可变状态, 不存在"未收敛核心事务 +
+#      元数据写入"的破坏性竞争(经调用链核实, 非推测)。
 # ---------------------------------------------------------------------------
 _save_node_meta() {
     local tag="$1" json="$2"
