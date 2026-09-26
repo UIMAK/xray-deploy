@@ -138,10 +138,18 @@ _main_menu() {
         _tip "请在交互式终端中运行 xd(或为 stdin 连接一个 tty)"
         exit 1
     fi
-    # 启动时: 收敛中断的 reset + 自动补 tag + 自动采纳孤儿入站 + 恢复中断的端口事务 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
-    # 各恢复/迁移步骤都用 declare -F 守卫: 混装版本(模块未同步更新)时静默跳过。
+    # 启动期维护链(严格按此顺序):
+    #   reset 崩溃恢复 → 核心事务崩溃恢复 → 端口事务崩溃恢复 → 自动补 tag
+    #   → 自动采纳孤儿入站 → 注入 config env(R45) → 迁移 Geo 自动更新(R45) → 格式化配置
+    # 各恢复/迁移步骤都用 declare -F 守卫: 可选维护 helper 缺失时跳过; 事务恢复失败或任一
+    # 维护步骤失败, 则 fail-stop 停止后续步骤。**全局写闸门不在这里**: 未收敛的
+    # core/reset 事务由各 config/metadata 写路径的账本闸门(_core_txn_allow_config_write /
+    # _mutate_config 的 reset 检查)持续拒绝, 直到重启收敛后自动解除 —— 菜单变量只负责
+    # 启动链的顺序, 不承担"挡住用户操作"的责任。
     # reset 恢复放在最前: 半截 reset 的 live 状态可能是"config 空/缺 + nodes 空 + 快照藏着
     # 旧 metadata", 先收敛再让 adopt/normalize 基于稳定状态工作。
+    # 核心恢复紧随其后且**先于一切 config 写入**(复审 P1): 它可能重启服务, 且失败时运行态
+    # 未知, 半收敛的现场不允许再被 auto_tag/adopt 们叠加修改。
     RESET_RECOVERY_FAILED=0
     local reset_rc=0
     if declare -F _reset_config_recover >/dev/null 2>&1; then
@@ -149,20 +157,54 @@ _main_menu() {
     fi
     if [ "$reset_rc" -ne 0 ]; then
         RESET_RECOVERY_FAILED=1
-        _error "reset 事务未收敛(账本/快照已保留): 已跳过自动迁移/规范化, 并阻止配置修改类操作; 请处理后重启脚本"
-    fi
-    if [ "$RESET_RECOVERY_FAILED" -eq 0 ]; then
-        _auto_tag_tagless_inbounds
-        _auto_adopt_orphans
-        # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
-        if declare -F _port_txn_recover >/dev/null 2>&1; then _port_txn_recover; fi
+        _error "reset 事务未收敛(账本/快照已保留): 已跳过启动期维护, 并阻止配置修改类操作; 请处理后重启脚本"
     fi
     # 核心切换的崩溃恢复(十一轮 P1-②): 进程在"二进制已换 / unit 已重写"之后被杀(断电/OOM/
     # kill -9)时没有任何函数会被调用, 只能靠启动期按 state/coretxn.json 收敛。
-    # 放在 config 相关操作之前 —— 它可能重启服务, 先让服务回到已知状态再谈配置。
+    # **必须先于任何 config/metadata 写入**(复审 P1): 恢复失败时运行态未知, 下面全部会写
+    # config 的自动维护都必须让路; 原先它排在 auto_tag/auto_adopt 之后, 门禁形同虚设。
     # 它只动二进制/unit, 不写 config, 故不受未收敛 reset 的门禁影响。
-    if declare -F _xray_core_txn_recover >/dev/null 2>&1; then _xray_core_txn_recover; fi
-    if [ "$RESET_RECOVERY_FAILED" -eq 0 ]; then
+    CORE_RECOVERY_FAILED=0
+    local core_rc=0
+    if declare -F _xray_core_txn_recover >/dev/null 2>&1; then
+        _xray_core_txn_recover || core_rc=$?
+    fi
+    if [ "$core_rc" -ne 0 ]; then
+        CORE_RECOVERY_FAILED=1
+        _error "Xray 核心事务未收敛(账本/恢复源已保留): 已跳过全部启动期 config 维护, 请处理后重启脚本"
+    fi
+    # 启动期自动维护链: 恢复未收敛或任一维护步骤失败即停止后续步骤(fail-stop), 不让未收敛/
+    # 半维护的现场继续叠加写入。各步骤幂等, 修复后下次启动自动重试。
+    # 返回码必须被消费(复审 P2): auto_tag/auto_adopt 的失败与"本就不需要维护"是两回事。
+    STARTUP_MAINT_BLOCKED=0
+    if [ "$RESET_RECOVERY_FAILED" -ne 0 ] || [ "$CORE_RECOVERY_FAILED" -ne 0 ]; then
+        STARTUP_MAINT_BLOCKED=1
+    fi
+    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
+        # **端口事务恢复必须最先**(先于任何 config 写入): 遗留的 *.porttxn 是未收敛现场,
+        # 统一写闸门会拒绝所有普通 config 写入, 若不先收敛, 下面的 auto_tag/adopt 会被
+        # 闸门挡下并误报为"维护失败"。**必须消费返回码**(复审 P1): 未收敛(隔离/保留待人工)
+        # 时同样 fail-stop, 否则"任一维护步骤失败即停止"的新契约在端口事务这条路上不成立。
+        if declare -F _port_txn_recover >/dev/null 2>&1; then
+            if ! _port_txn_recover; then
+                STARTUP_MAINT_BLOCKED=1
+                _error "端口事务恢复未收敛(未完成项已保留 journal/证据), 已停止后续启动维护"
+            fi
+        fi
+    fi
+    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
+        if ! _auto_tag_tagless_inbounds; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "启动期自动分配 inbound tag 失败(配置不可解析/写入失败): 已停止后续启动维护"
+        fi
+    fi
+    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
+        if ! _auto_adopt_orphans; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "启动期自动采纳孤儿入站失败(配置不可解析/元数据写入失败): 已停止后续启动维护"
+        fi
+    fi
+    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
         if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
         if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
         _normalize_config_format

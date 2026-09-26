@@ -1318,6 +1318,9 @@ _hy2_port_txn() {
 _hy2_port_txn_locked() {
     local tag="$1" meta="$2" oldport="$3" newport="$4" newmeta="$5"; shift 5
     local ranges="$*" orig journal rok
+    # 本事务临界区标记(local 动态作用域, 事务返回即消失): 自己的 journal 在写 config 时
+    # 不算"未收敛现场" —— 见 _txn_allow_config_write 的 port 段。
+    local XD_PORT_TXN_ACTIVE=1
     journal="${meta}.porttxn"
     orig=$(cat "$meta" 2>/dev/null) || return 1
     # 0. journal: iptables 是本事务第一个被改动的真实状态, journal 必须先于它落盘
@@ -1871,7 +1874,22 @@ _mutate_config() {
     _with_config_lock _mutate_config_locked "$@"
 }
 
+# config 写入的核心屏障(复审 P1, 2026-09-26): 闸门检查 + backup/jq/mv + verified restart
+# 必须整体处于**同一个 core lock 临界区**, 否则检查通过后、真正写 config 前, 另一会话仍可
+# 启动核心事务并留下未收敛账本(BLOCKED/replacing/…), 而后续 `_restart_xray_verified`
+# 不重新检查 pending ⇒ "未收敛禁止普通写入"被 TOCTOU 绕过。屏障实现见 00-common 的
+# `_with_config_write_barrier`(同一包装也用于 normalize/auto_tag/adopt 等直写入口)。
 _mutate_config_locked() {
+    _with_config_write_barrier _mutate_config_write "$@"
+}
+
+_mutate_config_write() {
+    # 统一闸门: reset / core(仅非终态) / port 三套账本任一未收敛即拒绝。
+    # 混装旧 lib 缺 helper 时放行(declare -F 守卫在 helper 内)。
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
+        return 1
+    fi
     if ! _backup_config; then
         _error "配置备份失败,中止操作"
         return 1
@@ -2267,6 +2285,17 @@ _is_reality_loopback_host() {
 # ---------------------------------------------------------------------------
 # 保存节点元数据(每节点独立文件)
 # 用法:_save_node_meta <tag> <json_object>
+#
+# **本函数刻意不接"未收敛事务"写闸门/屏障**(复审 P2-2), 理由三条:
+#   ① 它写的是**元数据声明**, 权威状态是 config.json。两类调用点: 事务提交路径
+#      (`_commit_node_txn_locked` / `_commit_reality_node_txn_locked`)在**闸门化的 config
+#      提交之后**才调用 —— 此时若再拒绝元数据写入, 只会制造 config/metadata 分裂, 而且
+#      回滚路径(`_mutate_config`)本身也被闸门拦下(拒绝 = 分裂); metadata-only 的采纳路径
+#      已在 `_adopt_single_inbound_write` 的屏障+闸门内。
+#   ② 通用原语 `_meta_update` 还被**事务账本**(coretxn journal / reset journal)使用,
+#      对它加写闸门会自锁账本机制 —— 只能按"写入点是不是权威 config"逐个判定。
+#   ③ core recovery 不读写节点 metadata, 二者没有共享可变状态, 不存在"未收敛核心事务 +
+#      元数据写入"的破坏性竞争(经调用链核实, 非推测)。
 # ---------------------------------------------------------------------------
 _save_node_meta() {
     local tag="$1" json="$2"
@@ -2418,9 +2447,22 @@ _auto_tag_tagless_inbounds() {
 }
 _auto_tag_tagless_inbounds_locked() {
     [ -f "$CONFIG_FILE" ] || return 0
+    # 检查与写入同处 core lock 临界区(复审 P1); 手工 [同步配置] 也走这里。
+    _with_config_write_barrier _auto_tag_tagless_inbounds_write
+}
+
+_auto_tag_tagless_inbounds_write() {
+    # 本函数是**直写 config** 的入口(不经 _mutate_config), 必须自带核心事务闸门。
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
+        return 1
+    fi
     # 一次性读取所有入站的 tag/port/listen, 减少 jq 调用
     local inbounds_info
-    inbounds_info=$(jq -c '[.inbounds | to_entries[] | {idx: .key, tag: (.value.tag // ""), port: (.value.port // 0), listen: (.value.listen // "")}]' "$CONFIG_FILE" 2>/dev/null) || return 0
+    inbounds_info=$(jq -c '[.inbounds | to_entries[] | {idx: .key, tag: (.value.tag // ""), port: (.value.port // 0), listen: (.value.listen // "")}]' "$CONFIG_FILE" 2>/dev/null) || {
+        _warn "启动期自动分配 inbound tag 失败: 无法解析 $CONFIG_FILE"
+        return 1
+    }
     [ -z "$inbounds_info" ] || [ "$inbounds_info" = "[]" ] && return 0
 
     local used_tags
@@ -2456,10 +2498,16 @@ _auto_tag_tagless_inbounds_locked() {
         done
         used_tags="${used_tags}"$'\n'"${new_tag}"
 
-        # 原子写 config(静默补 tag 不应触发 _mutate_config 的重启; 失败跳过该入站, 下次启动再试)
+        # 原子写 config(静默补 tag 不应触发 _mutate_config 的重启; 任一写入失败中止本轮启动维护)
         local newcfg
-        newcfg=$(jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE") || continue
-        _atomic_write_json "$CONFIG_FILE" "$newcfg" || continue
+        newcfg=$(jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE") || {
+            _warn "启动期为 inbound[$idx] 生成 tag 失败"
+            return 1
+        }
+        _atomic_write_json "$CONFIG_FILE" "$newcfg" || {
+            _warn "启动期写入 inbound tag 失败: $new_tag"
+            return 1
+        }
         tagged=$((tagged+1))
     done <<< "$(jq -c '.[]' <<< "$inbounds_info" 2>/dev/null)"
 
@@ -2596,7 +2644,17 @@ _adopt_single_inbound() {
     _with_config_lock _adopt_single_inbound_locked "$@"
 }
 _adopt_single_inbound_locked() {
+    # 检查与写入同处 core lock 临界区(复审 P1); 自动采纳与手工 [同步配置] 共用本函数。
+    _with_config_write_barrier _adopt_single_inbound_write "$@"
+}
+
+_adopt_single_inbound_write() {
     local tag="$1" suffix="${2:-adopted}"
+    # 采纳写 metadata(不经 _mutate_config), 同样属于"未收敛核心事务期间不得变更现场"。
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
+        return 1
+    fi
     local proto port listen
     proto=$(_detect_inbound_protocol "$tag")
     [ "$proto" = "tunnel" ] && return 1
@@ -2683,7 +2741,10 @@ _auto_adopt_orphans_locked() {
     known_list=$(_known_tags)
 
     local tags_json
-    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null)
+    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null) || {
+        _warn "启动期自动采纳孤儿入站失败: 无法解析 $CONFIG_FILE"
+        return 1
+    }
     [ -z "$tags_json" ] || [ "$tags_json" = "[]" ] && return 0
 
     local orphans=()
@@ -2785,8 +2846,12 @@ _sync_config_check() {
     [ -f "$CONFIG_FILE" ] || { _warn "config.json 不存在"; _press_any_key; return; }
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
 
-    # 先自动给无 tag 入站分配 tag(幂等, 已分配的不变)
-    _auto_tag_tagless_inbounds
+    # 先自动给无 tag 入站分配 tag(幂等, 已分配的不变)。失败时后续孤儿扫描没有可靠输入
+    # (tag 未补齐 ⇒ 会把"未跟踪"误判成孤儿), 必须中止而不是拿半扫结果去采纳/清理。
+    if ! _auto_tag_tagless_inbounds; then
+        _error "自动分配入站 tag 失败(配置不可解析或写入失败), 已中止同步"
+        _press_any_key; return
+    fi
 
     local tags_json
     tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null)
@@ -5686,6 +5751,8 @@ _reality_port_txn() {
 }
 _reality_port_txn_locked() {
     local tag="$1" meta="$2" oldport="$3" newport="$4"
+    # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明)
+    local XD_PORT_TXN_ACTIVE=1
     # R42: 先经唯一入口判模式。direct 模式无 tunnel/路由需要同步, tunnel_tag 保持空,
     # 下面的事务天然退化为"只处理主入站"(new_tunnel_tag 与 jq 的 tunnel 段都受 -n 保护);
     # 绝不能让 direct 节点走 tunnel 分支的 fail-closed —— 那会把它永久锁成不能改端口。
@@ -5869,6 +5936,25 @@ _port_txn() {
 # 返回非 0 ⇒ 调用方必须**立即中止**, 不得继续改动任何真实文件。
 _port_txn_journal_write() {  # <old_path> <new_path> <kind> <oldport> <newport> <ranges> <old_json> <new_json>
     local old_path="$1" new_path="$2" kind="$3" oldport="$4" newport="$5" ranges="$6" old_json="$7" new_json="$8"
+    # 三条端口事务(port/hy2hop/reality)的第一步都是写 journal, 因此闸门放在这里即可在
+    # **触碰 iptables/metadata 之前**整体拦下。
+    # (a) **任何既有 *.porttxn 都拒绝**: 它代表一个未收敛的端口事务现场, 既不能覆盖
+    #     (会销毁唯一的事务证据), 也不允许在其未收敛时开启新事务(复审 P1)。
+    #     此检查**不看** XD_PORT_TXN_ACTIVE —— 事务入口处自己的 journal 尚未写入,
+    #     任何已存在的 journal 都是外来残留, 与"是否处于本事务临界区"无关。
+    local _ex
+    for _ex in "$NODES_DIR"/*.porttxn; do
+        [ -e "$_ex" ] || continue
+        _error "已存在未收敛的端口事务 journal, 拒绝开启新事务/覆盖现场: ${_ex##*/}"
+        _tip "请重启脚本让启动恢复先收敛该 journal(现场已保留)"
+        return 1
+    done
+    # (b) 统一闸门: reset / core 账本未收敛同样禁止开启端口事务(port 段由上面的检查承担,
+    #     或在事务临界区内被 XD_PORT_TXN_ACTIVE 跳过)。
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
+        return 1
+    fi
     local payload
     payload=$(jq -n --arg kind "$kind" --argjson op "$oldport" --argjson np "$newport" \
         --arg opath "$old_path" --arg npath "$new_path" --arg ranges "$ranges" \
@@ -5880,6 +5966,8 @@ _port_txn_journal_write() {  # <old_path> <new_path> <kind> <oldport> <newport> 
 
 _port_txn_locked() {
     local tag="$1" meta="$2" newport="$3" newmeta="$4" orig oldport journal
+    # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明)
+    local XD_PORT_TXN_ACTIVE=1
     journal="${meta}.porttxn"
     orig=$(cat "$meta" 2>/dev/null) || { _error "读取元数据失败: $meta"; return 1; }
     [ -n "$orig" ] || { _error "元数据为空, 放弃端口修改: $meta"; return 1; }
@@ -5935,6 +6023,11 @@ _hy2_hop_available() { command -v iptables >/dev/null 2>&1; }
 # **journal 用 .porttxn 后缀而非 .json** —— 节点目录的所有扫描都是 *.json 通配, .json 后缀
 # 会让它被当成一个节点参与列表/删除/采纳。
 # 幂等、静默(至多一条 _info), 与其它启动自动操作同级。
+#
+# **返回码契约(复审 P1, 2026-09-26)**: 返回 0 **仅当**所有 journal 都已收敛(删除)或本就
+# 没有 journal。任一 journal 未被收敛 —— 被隔离(.corrupt, 转人工)或被保留待下次重试 ——
+# 都返回 1。调用方(_main_menu 启动维护链)据此 fail-stop, 避免在未收敛现场上继续叠加
+# config 修改。隔离/保留本身仍是"尽力保全证据", 不改语义。
 # ---------------------------------------------------------------------------
 # journal 隔离: **绝不删除**(只读 fs / 权限 / I-O 异常时 mv 也会失败 —— 那恰恰是最该保住
 # 证据的场景, 保留原文件并告警)。改名后不再被 *.porttxn 扫到 ⇒ 幂等, 不会每次启动反复告警。
@@ -6011,11 +6104,15 @@ _port_txn_recover_locked() {
     [ -d "$NODES_DIR" ] || return 0
     local j kind tag newtag oldport newport old_path new_path ranges
     local cfg_tag committed cur_path p cur_canon old_canon new_canon tgt_path tgt_obj
+    # failed: 任一 journal 未收敛(被隔离/保留待人工) ⇒ 返回非零, 由调用方(启动维护链)
+    # fail-stop。空目录/全部收敛才返回 0 —— "隔离"也是未收敛, 只是不再自动处理(复审 P1)。
+    local failed=0
     for j in "$NODES_DIR"/*.porttxn; do
         [ -f "$j" ] || continue
         # 1) 必须是可解析的 JSON
         if ! jq -e . "$j" >/dev/null 2>&1; then
             _ptx_journal_quarantine "$j" "无法解析"
+            failed=1
             continue
         fi
         # 2) 必须是**合法事务记录**, 而不仅是合法 JSON: kind 枚举 + 按 kind 的字段/取值/结构校验
@@ -6023,6 +6120,7 @@ _port_txn_recover_locked() {
         #    非 object —— 一律 fail-closed: 隔离, **不**自动恢复(未知类型绝不当成 port 处理)。
         if ! _ptx_journal_ok "$j"; then
             _ptx_journal_quarantine "$j" "schema 不合法(kind/字段/取值/结构)"
+            failed=1
             continue
         fi
         kind=$(jq -r '.kind' "$j" 2>/dev/null)
@@ -6052,6 +6150,7 @@ _port_txn_recover_locked() {
         if [ -z "$cur_path" ]; then
             # 两个候选路径都没有元数据 —— 说不清的现场, 与其它非法 journal 同策: 隔离而非删除
             _ptx_journal_quarantine "$j" "对应的元数据文件已不存在"
+            failed=1
             continue
         fi
         cur_canon=$(jq -S . "$cur_path" 2>/dev/null)
@@ -6059,6 +6158,7 @@ _port_txn_recover_locked() {
         new_canon=$(jq -S '.new' "$j" 2>/dev/null)
         if [ "$cur_canon" != "$old_canon" ] && [ "$cur_canon" != "$new_canon" ]; then
             _warn "端口事务 journal 残留, 但 metadata 已被外部修改, 不自动处理(请人工核对): $cur_path"
+            failed=1
             continue
         fi
         # 事务身份校验(P2): 三条路径的提交顺序都是 **metadata 先、config 后** ⇒
@@ -6068,6 +6168,7 @@ _port_txn_recover_locked() {
         # 故这里按外部干预处理: 不覆盖 metadata, 保留 journal 与现场。
         if [ "$committed" = 1 ] && [ "$cur_canon" = "$old_canon" ]; then
             _warn "端口事务 journal 残留: config 已在目标态而 metadata 仍是旧态(本事务不可能产生), 不自动处理(请人工核对): $cur_path"
+            failed=1
             continue
         fi
 
@@ -6079,23 +6180,27 @@ _port_txn_recover_locked() {
             # 崩溃后有外部重建/替换 ⇒ 绝不覆盖, 保留 journal 转人工。
             if [ -e "$tgt_path" ]; then
                 _warn "端口事务恢复的目标文件已存在(疑似外部重建), 不覆盖, 保留 journal 待人工核对: $tgt_path"
+                failed=1
                 continue
             fi
             # mv -n: 即便在"检查"与"改名"之间被塞进目标文件也不覆盖(-n 不可用时报错 ⇒ 走失败
             # 分支保留 journal, 仍不丢数据)。改名后源路径消失, 故下面统一对 tgt_path 写内容。
             if ! mv -n "$cur_path" "$tgt_path" 2>/dev/null; then
                 _warn "端口事务恢复的元数据重命名失败, 保留 journal: $j"
+                failed=1
                 continue
             fi
             # mv -n 在"目标已存在"时可能静默不动作却返回 0 ⇒ 事后核验源路径确实消失,
             # 否则视为未生效(有竞态插入), 保留 journal 而不是继续写目标文件
             if [ -e "$cur_path" ]; then
                 _warn "端口事务恢复的元数据重命名未生效(目标已存在?), 不覆盖, 保留 journal: $tgt_path"
+                failed=1
                 continue
             fi
         fi
         if ! _atomic_write_json "$tgt_path" "$(jq "$tgt_obj" "$j" 2>/dev/null)"; then
             _warn "端口事务恢复的元数据写回失败, 保留 journal: $j"
+            failed=1
             continue
         fi
 
@@ -6103,11 +6208,13 @@ _port_txn_recover_locked() {
         if [ "$kind" = "hy2hop" ] && [ "$committed" = 0 ] && [ -n "$ranges" ]; then
             if ! _hy2_hop_available; then
                 _warn "端口跳跃规则需 iptables 修复, 保留 journal 待下次启动: $j"
+                failed=1
                 continue
             fi
             # shellcheck disable=SC2086
             if ! _hy2_hop_retarget "$newport" "$oldport" $ranges; then
                 _warn "端口跳跃规则回滚失败, 保留 journal: $j"
+                failed=1
                 continue
             fi
         fi
@@ -6119,6 +6226,7 @@ _port_txn_recover_locked() {
             _info "已回滚上次中断的端口修改: ${tgt_path##*/} (config 未提交该事务)"
         fi
     done
+    [ "$failed" -eq 0 ] || return 1
     return 0
 }
 

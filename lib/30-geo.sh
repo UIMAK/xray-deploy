@@ -337,8 +337,18 @@ _auto_migrate_geo_autoupdate() {
     _with_config_lock _auto_migrate_geo_autoupdate_locked
 }
 _auto_migrate_geo_autoupdate_locked() {
+    # 廉价守卫留在屏障外; 读-改-写整体进 core lock 屏障(复审 P2-1): 本函数会写权威 config
+    # (geodata 段), 与其它写入口同一口径 —— 检查与写入同临界区。
     [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
     [ -f "$CONFIG_FILE" ] || return 0
+    _with_config_write_barrier _auto_migrate_geo_autoupdate_write
+}
+
+_auto_migrate_geo_autoupdate_write() {
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
+        return 1
+    fi
     local has_gd=0
     if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
         has_gd=$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null || echo 0)
