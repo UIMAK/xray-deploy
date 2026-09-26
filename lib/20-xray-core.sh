@@ -582,8 +582,12 @@ _xray_core_lock_fd_reset() {
 #   · 无 flock ⇒ 先用 `/proc` 扫描旧 flock 文件是否被他人打开, 再 mkdir 旧目录(目录将新建时
 #     同样先跑删除树扫描)。
 # 任一条显示占用/残留一律 fail-closed。**不删别人的锁**: 旧路径下的残留是别人的现场,
-# 只提示人工清理。仍存的窗口: 旧 mkdir 后端若在本机检查**之后**才启动, 新版无法阻止
-# (旧二进制不认识父目录新锁) —— 与"旧进程在新版释放后才启动"同属无法结构性消除的残余。
+# 只提示人工清理。**旧 mkdir 目录(L1 树外也一样)会被占位**: 在持锁期间创建同名标记目录,
+# 让旧无-flock 进程的 mkdir 失败 —— 否则"只检查不占位"会留下"旧进程在检查之后启动并进入"
+# 的真实窗口(复审四 P1)。标记在释放时删除, 因此 /opt 不留持久产物; SIGKILL 残留按
+# `.witness` 自愈或拒绝。**仍然存在的残局**: 旧 flock 文件(.fd)缺失时绝不新建它(持久污染),
+# 故一个"旧 flock 后端进程在新版检查之后才启动"的窗口无法封住 —— 与"旧进程在新版释放后
+# 才启动"同属无法结构性消除的残余。
 #
 # **未闭环的残局(必须如实说明, 不当作已消失)**: 旧版进程若在我们释放锁之后才启动, 或在
 # `$DEPLOY_DIR` 已被删除后重建目录内的旧锁路径, 新版无从协调 —— 新版不能为一个已卸载的目录
@@ -591,14 +595,16 @@ _xray_core_lock_fd_reset() {
 # 不是"结构性消除"; 结构性消除只存在于同版本(全部进程都走父目录稳定锁)之后。
 _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkdir目录> <显示名>
     local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i owner="" ef lrc locked=0
-    local witness="" deploy_dir devino create_marker=0
+    local witness="" deploy_dir devino
     # **变量名按锁家族分开**: 卸载要同时持 install 锁与 core 锁, 两者都要协调各自的旧路径;
     # 共用一个全局会让后取的覆盖先取的, 先取那把 fd 再也没人关闭/解锁(锁泄漏到进程退出)。
     eval "$fdvar=\"\""
     eval "$dirvar=\"\""
-    # 只创建**部署树内**的旧 mkdir 标记; 树外(如 /opt/.xray-deploy.*)绝不创建 —— 协调动作
-    # 本身不能又污染 /opt(本 PR 要消除的; 复审 P2)。树外只 flock 已存在的旧文件。
-    case "$ldir" in "$DEPLOY_DIR"/*) create_marker=1 ;; esac
+    # 旧 mkdir 标记对 L1(树外 /opt/.xray-deploy.*)与 L2(树内 $DEPLOY_DIR/.*)**一视同仁地创建**:
+    # 只"检查不占位"留了一个真实窗口 —— 旧无-flock 进程可在新版检查之后 `mkdir "$ldir"` 并进入
+    # 临界区(复审四 P1)。标记在释放时删除, 因此 /opt 不留持久产物(SIGKILL 残留与 L2 同语义:
+    # 有匹配 witness 可自愈, 否则拒绝并要求人工清理)。
+    # **旧 flock 文件(.fd)缺失时仍然绝不新建** —— 那是持久污染(复审 P2), 见下。
     if command -v flock >/dev/null 2>&1; then
         # (T1) 旧 flock 文件不存在 ⇒ **绝不为了"协调"新建它**(否则又把锁文件写回 /opt)。
         # 若旧 mkdir 目录存在 ⇒ 旧会话仍在, fail-closed; 否则调用方本就不该调用。
@@ -646,31 +652,12 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
             eval "$fdvar=\"\""
             return 1
         fi
-        if [ "$create_marker" != "1" ]; then
-            # 树外旧锁(如 /opt/.xray-deploy.*): 只 flock 已知文件, 不创建任何新对象。
-            # **但必须检查旧 mkdir 目录是否已存在**(复审 P1): 旧 flock 文件可能长期残留,
-            # 而无-flock 旧进程正在用 `.d` 目录锁 —— 只看文件会双重放行(旧 mkdir 锁从未
-            # 被新版拿过)。存在即 fail-closed, 不接管。
-            if [ -e "$ldir" ]; then
-                owner=$(cat "$ldir/pid" 2>/dev/null)
-                case "$owner" in
-                    ''|*[!0-9]*) owner="" ;;
-                    *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
-                esac
-                _error "旧版${label}目录锁仍存在(pid ${owner:-未知}): $ldir"
-                _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-                flock -u "$ef" 2>/dev/null
-                eval "exec ${ef}>&-" 2>/dev/null
-                eval "$fdvar=\"\""
-                return 1
-            fi
-            return 0
-        fi
-        # (T3) 旧版 **mkdir 后端**的排他标记(二十四轮 P1): 只"看一眼目录在不在"不是互斥 ——
-        # 无 flock 的旧进程可以在我们检查之后 mkdir。故在持有旧版 flock 期间创建同名标记目录,
-        # 让它的 mkdir 失败而拒绝。标记带 `.witness`(= 本 flock 文件的 dev:ino): 若我们被
-        # SIGKILL, 下一个持有**同一 flock** 的进程可以安全清理并重建(此时无人持有该 flock);
-        # 没有匹配 witness 的目录 = 旧版持有者/残留 ⇒ 一律拒绝, 绝不自动接管。
+        # (T3) 旧版 **mkdir 后端**的排他标记(二十四轮 P1, 复审四扩到 L1): 只"看一眼目录在不在"
+        # 不是互斥 —— 无 flock 的旧进程可以在我们检查之后 mkdir。故在持有旧版 flock 期间创建
+        # **同名标记目录**(L1 树外也创建, 释放时删除), 让它的 mkdir 失败而拒绝。标记带
+        # `.witness`(= 本 flock 文件的 dev:ino): 若我们被 SIGKILL, 下一个持有**同一 flock** 的
+        # 进程可以安全清理并重建(此时无人持有该 flock); 没有匹配 witness 的目录 = 旧版持有者/
+        # 残留 ⇒ 一律拒绝, 绝不自动接管。
         devino=$(_xray_devino "$lfile" 2>/dev/null)
         if [ -z "$devino" ]; then
             _error "无法读取旧版${label}文件标识(dev:ino), 放弃本次操作: $lfile"
@@ -754,11 +741,8 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
         _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
         return 1
     fi
-    if [ "$create_marker" != "1" ]; then
-        # 树外旧路径: 不创建任何新对象(与 flock 分支同口径, 避免污染 /opt)
-        return 0
-    fi
-    # 无 flock: 创建树内旧 mkdir 目录前先跑删除树扫描 —— 与 flock 分支"即将新建 inode"同口径。
+    # 无 flock: 创建旧 mkdir 目录前先跑删除树扫描 —— 与 flock 分支"即将新建 inode"同口径。
+    # (L1 树外目录也创建并占位, 见上方说明; 释放时删除。)
     deploy_dir=$(dirname "$ldir")
     if _xray_legacy_deleted_tree_active "$deploy_dir"; then
         _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝新建旧版${label}目录: $ldir"
