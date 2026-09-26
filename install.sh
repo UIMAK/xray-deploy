@@ -635,8 +635,12 @@ _install_xd_link() {
 # `/var/lock` 建不出时退 `/run/lock`(同族 tmpfs); 二者都失败时**不回落到 /opt**(那正是本次
 # 要消除的污染), 而是返回 /var/lock 路径, 让调用方给出明确的"无法创建锁"错误(fail-closed)。
 _install_lock_root() {
-    if mkdir -p /var/lock/xray-deploy 2>/dev/null; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
-    if mkdir -p /run/lock/xray-deploy 2>/dev/null; then printf '%s' "/run/lock/xray-deploy"; return 0; fi
+    # **纯函数: 只选根, 不建目录**。顶层在**参数校验之前**求值 —— 一个拼错的开关
+    # (`install.sh --typo`)不该产生任何副作用; 原实现在这里建目录会照样创建
+    # /var/lock/xray-deploy(复审 P2)。目录的实际创建推迟到 `_install_lock_acquire`
+    # (它本来就为锁文件创建所在目录)。
+    if [ -d /var/lock ] && [ -w /var/lock ]; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
+    if [ -d /run/lock ] && [ -w /run/lock ]; then printf '%s' "/run/lock/xray-deploy"; return 0; fi
     printf '%s' "/var/lock/xray-deploy"
 }
 INSTALL_LOCK_PARENT="${DEPLOY_DIR%/*}"
@@ -869,8 +873,15 @@ _install_lock_legacy_flock_take() {   # <file> <dir> <fdvar> <heldvar> <label>
         return 1
     fi
     if [ "$create_marker" != "1" ]; then
-        # 树外旧锁: 只 flock 已知文件, 不创建任何新对象(跨版本协调的已知残余:
-        # 旧 mkdir 后端若在本检查之后才启动无从阻止 —— 与"旧进程在新版释放后启动"同类)。
+        # 树外旧锁: 只 flock 已知文件, 不创建任何新对象。但**已存在的旧 mkdir 目录必须拒绝**
+        # (复审 P1): 旧 flock 文件可能长期残留, 而无-flock 旧进程正用 `.d` 目录锁 —— 只看
+        # 文件会双重放行(新版从未拿过旧 mkdir 锁)。存在即 fail-closed。
+        if [ -e "$ldir" ]; then
+            echo "[错误] ${label}目录仍存在: $ldir"
+            echo "       确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+            eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
+            return 1
+        fi
         return 0
     fi
     devino=$(_install_lock_devino "$lfile")
