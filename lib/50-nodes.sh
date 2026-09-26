@@ -2420,7 +2420,10 @@ _auto_tag_tagless_inbounds_locked() {
     [ -f "$CONFIG_FILE" ] || return 0
     # 一次性读取所有入站的 tag/port/listen, 减少 jq 调用
     local inbounds_info
-    inbounds_info=$(jq -c '[.inbounds | to_entries[] | {idx: .key, tag: (.value.tag // ""), port: (.value.port // 0), listen: (.value.listen // "")}]' "$CONFIG_FILE" 2>/dev/null) || return 0
+    inbounds_info=$(jq -c '[.inbounds | to_entries[] | {idx: .key, tag: (.value.tag // ""), port: (.value.port // 0), listen: (.value.listen // "")}]' "$CONFIG_FILE" 2>/dev/null) || {
+        _warn "启动期自动分配 inbound tag 失败: 无法解析 $CONFIG_FILE"
+        return 1
+    }
     [ -z "$inbounds_info" ] || [ "$inbounds_info" = "[]" ] && return 0
 
     local used_tags
@@ -2456,10 +2459,16 @@ _auto_tag_tagless_inbounds_locked() {
         done
         used_tags="${used_tags}"$'\n'"${new_tag}"
 
-        # 原子写 config(静默补 tag 不应触发 _mutate_config 的重启; 失败跳过该入站, 下次启动再试)
+        # 原子写 config(静默补 tag 不应触发 _mutate_config 的重启; 任一写入失败中止本轮启动维护)
         local newcfg
-        newcfg=$(jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE") || continue
-        _atomic_write_json "$CONFIG_FILE" "$newcfg" || continue
+        newcfg=$(jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE") || {
+            _warn "启动期为 inbound[$idx] 生成 tag 失败"
+            return 1
+        }
+        _atomic_write_json "$CONFIG_FILE" "$newcfg" || {
+            _warn "启动期写入 inbound tag 失败: $new_tag"
+            return 1
+        }
         tagged=$((tagged+1))
     done <<< "$(jq -c '.[]' <<< "$inbounds_info" 2>/dev/null)"
 
@@ -2683,7 +2692,10 @@ _auto_adopt_orphans_locked() {
     known_list=$(_known_tags)
 
     local tags_json
-    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null)
+    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null) || {
+        _warn "启动期自动采纳孤儿入站失败: 无法解析 $CONFIG_FILE"
+        return 1
+    }
     [ -z "$tags_json" ] || [ "$tags_json" = "[]" ] && return 0
 
     local orphans=()

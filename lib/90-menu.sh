@@ -139,7 +139,7 @@ _main_menu() {
         exit 1
     fi
     # 启动时: 收敛中断的 reset + 自动补 tag + 自动采纳孤儿入站 + 恢复中断的端口事务 + 注入 config env(R45) + 迁移 Geo 自动更新(R45) + 格式化配置
-    # 各恢复/迁移步骤都用 declare -F 守卫: 混装版本(模块未同步更新)时静默跳过。
+    # 各恢复/迁移步骤都用 declare -F 守卫: 可选维护 helper 缺失时跳过, 事务恢复失败则明确阻止后续配置修改。
     # reset 恢复放在最前: 半截 reset 的 live 状态可能是"config 空/缺 + nodes 空 + 快照藏着
     # 旧 metadata", 先收敛再让 adopt/normalize 基于稳定状态工作。
     RESET_RECOVERY_FAILED=0
@@ -161,8 +161,16 @@ _main_menu() {
     # kill -9)时没有任何函数会被调用, 只能靠启动期按 state/coretxn.json 收敛。
     # 放在 config 相关操作之前 —— 它可能重启服务, 先让服务回到已知状态再谈配置。
     # 它只动二进制/unit, 不写 config, 故不受未收敛 reset 的门禁影响。
-    if declare -F _xray_core_txn_recover >/dev/null 2>&1; then _xray_core_txn_recover; fi
-    if [ "$RESET_RECOVERY_FAILED" -eq 0 ]; then
+    CORE_RECOVERY_FAILED=0
+    local core_rc=0
+    if declare -F _xray_core_txn_recover >/dev/null 2>&1; then
+        _xray_core_txn_recover || core_rc=$?
+    fi
+    if [ "$core_rc" -ne 0 ]; then
+        CORE_RECOVERY_FAILED=1
+        _error "Xray 核心事务未收敛(账本/恢复源已保留): 已跳过启动期配置修改, 请处理后重启脚本"
+    fi
+    if [ "$RESET_RECOVERY_FAILED" -eq 0 ] && [ "$CORE_RECOVERY_FAILED" -eq 0 ]; then
         if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
         if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
         _normalize_config_format
