@@ -131,9 +131,9 @@ _hysteria_canon_version() {
 _hysteria_expected_sha256() {
     local f="$1" name="$2" count sha
     [ -s "$f" ] || return 1
-    count=$(grep -cE " build/${name}\$" "$f" 2>/dev/null)
+    count=$(grep -c " build/${name}\$" "$f" 2>/dev/null)
     [ "$count" = 1 ] || return 1
-    sha=$(grep -E " build/${name}\$" "$f" | awk '{print $1}')
+    sha=$(grep " build/${name}\$" "$f" | awk '{print $1}')
     [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     printf '%s' "$sha"
 }
@@ -888,7 +888,10 @@ _hysteria_create_service() {
             _warn "未检测到 systemd/openrc, 跳过 service 创建(可手动: ${HYSTERIA_BIN} server -c ${HYSTERIA_CONFIG})"
             return 0
             ;;
-        *) return 0 ;;
+        *)
+            _error "未知的 init backend: ${INIT_SYSTEM:-未设置}, 无法创建 Hysteria service"
+            return 1
+            ;;
     esac
 }
 
