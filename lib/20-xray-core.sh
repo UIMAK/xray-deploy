@@ -1540,19 +1540,22 @@ _xray_core_txn_pending() {
 }
 
 # ---------------------------------------------------------------------------
-# config/metadata 写路径的**核心事务闸门**(复审 P1, 2026-09-26)。
+# **统一"未收敛事务"写闸门**(复审 P1, 2026-09-26): reset / core / port 三套恢复账本
+# 任一未收敛, 即拒绝一切普通 config/metadata 写入; 账本/证据清除后闸门自动解除。
+# 策略与 _mutate_config 的 reset 检查一致: **只看盘上事实**, 不引入粘滞状态。
 #
-# 问题: core recovery 失败后账本保留, 但普通配置写入仍可继续 —— 未收敛的
-# binary/service/runtime 现场会被继续叠加 config/metadata 变更, 与启动维护链
-# fail-stop 的语义矛盾("未收敛就不要再改现场")。本函数与 _mutate_config 的 reset 闸门
-# 同策: **只看盘上事实**(账本/标记存在即拒绝), 收敛后账本删除, 闸门自动解除。
+# 调用前提: 调用方已持 config lock(锁序 config → core, 不可反向)。三个判定:
+#   · reset 账本(90-menu 定义): 锁内文件检查 —— reset 全程持 config lock 提交, 无竞态;
+#   · port 事务 journal: 锁内文件检查 —— 端口事务全程持 config lock 提交, 无竞态;
+#   · core 账本: 必须另取 core lock 判定 —— 正常在飞的核心切换持 core lock 直到账本删除
+#     才释放, 因此不会被误拒; 只有崩溃残留(锁已释放、账本仍在)与 BLOCKED/corrupt 才命中。
 #
-# 判定必须在 **core lock 内**: 正常在飞的核心切换持 core lock 直到账本删除才释放,
-# 因此不会被误拒; 只有崩溃残留(锁已释放、账本仍在)与 BLOCKED/corrupt 标记才命中。
-# 调用前提: 调用方已持 config lock(锁序 config → core, 不可反向)。
+# `XD_PORT_TXN_ACTIVE=1` 表示"当前进程正处于某个端口事务的临界区内": 该事务自己的
+# journal 不算未收敛 —— 进入事务前 `_port_txn_journal_write` 已拒绝任何既有 journal,
+# 且整个事务持 config lock, 不可能有外来 journal 插入。标记只活在该事务的锁子 shell 内。
 #
 # 返回 0 = 放行; 1 = 已拒绝(原因已打印)。
-# 混装旧 lib(缺 _xray_core_txn_pending)时放行: 与项目其它 declare -F 守卫同口径
+# 混装旧 lib(缺 helper)时按各段单独跳过: 与项目其它 declare -F 守卫同口径
 # (可用性 fail-open; helper 属于同一次安装的完整版本)。
 # ---------------------------------------------------------------------------
 _core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无待收敛; 3=待收敛
@@ -1560,8 +1563,26 @@ _core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无待
     return 0
 }
 
-_core_txn_allow_config_write() {
-    declare -F _xray_core_txn_pending >/dev/null 2>&1 || return 0
+_txn_allow_config_write() {
+    # 1) reset 账本(90-menu 定义; 缺 helper 的混装版本跳过)
+    if declare -F _reset_journal_path >/dev/null 2>&1 \
+       && [ -e "$(_reset_journal_path 2>/dev/null)" ]; then
+        _error "存在未收敛的 reset 事务日志, 已拒绝本次配置写入"
+        _tip "请重启脚本让 reset 事务先收敛(账本/快照已保留)"
+        return 1
+    fi
+    # 2) 端口事务 journal: 任何 *.porttxn 都是未收敛现场(当前端口事务自己的除外)
+    if [ "${XD_PORT_TXN_ACTIVE:-0}" != "1" ]; then
+        local _pf
+        for _pf in "$NODES_DIR"/*.porttxn; do
+            [ -e "$_pf" ] || continue
+            _error "存在未收敛的端口事务 journal, 已拒绝本次配置写入: ${_pf##*/}"
+            _tip "请重启脚本让启动恢复收敛该 journal 后再操作; 现场(journal)已保留"
+            return 1
+        done
+    fi
+    # 3) core 账本: 在 core lock 内判定
+    declare -F _core_txn_pending_probe >/dev/null 2>&1 || return 0
     local rc=0
     _with_core_lock _core_txn_pending_probe || rc=$?
     case "$rc" in

@@ -139,8 +139,8 @@ _main_menu() {
         exit 1
     fi
     # 启动期维护链(严格按此顺序):
-    #   reset 崩溃恢复 → 核心事务崩溃恢复 → 自动补 tag → 自动采纳孤儿入站 → 端口事务恢复
-    #   → 注入 config env(R45) → 迁移 Geo 自动更新(R45) → 格式化配置
+    #   reset 崩溃恢复 → 核心事务崩溃恢复 → 端口事务崩溃恢复 → 自动补 tag
+    #   → 自动采纳孤儿入站 → 注入 config env(R45) → 迁移 Geo 自动更新(R45) → 格式化配置
     # 各恢复/迁移步骤都用 declare -F 守卫: 可选维护 helper 缺失时跳过; 事务恢复失败或任一
     # 维护步骤失败, 则 fail-stop 停止后续步骤。**全局写闸门不在这里**: 未收敛的
     # core/reset 事务由各 config/metadata 写路径的账本闸门(_core_txn_allow_config_write /
@@ -181,6 +181,18 @@ _main_menu() {
         STARTUP_MAINT_BLOCKED=1
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
+        # **端口事务恢复必须最先**(先于任何 config 写入): 遗留的 *.porttxn 是未收敛现场,
+        # 统一写闸门会拒绝所有普通 config 写入, 若不先收敛, 下面的 auto_tag/adopt 会被
+        # 闸门挡下并误报为"维护失败"。**必须消费返回码**(复审 P1): 未收敛(隔离/保留待人工)
+        # 时同样 fail-stop, 否则"任一维护步骤失败即停止"的新契约在端口事务这条路上不成立。
+        if declare -F _port_txn_recover >/dev/null 2>&1; then
+            if ! _port_txn_recover; then
+                STARTUP_MAINT_BLOCKED=1
+                _error "端口事务恢复未收敛(未完成项已保留 journal/证据), 已停止后续启动维护"
+            fi
+        fi
+    fi
+    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
         if ! _auto_tag_tagless_inbounds; then
             STARTUP_MAINT_BLOCKED=1
             _error "启动期自动分配 inbound tag 失败(配置不可解析/写入失败): 已停止后续启动维护"
@@ -190,17 +202,6 @@ _main_menu() {
         if ! _auto_adopt_orphans; then
             STARTUP_MAINT_BLOCKED=1
             _error "启动期自动采纳孤儿入站失败(配置不可解析/元数据写入失败): 已停止后续启动维护"
-        fi
-    fi
-    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata。
-        # **必须消费返回码**(复审 P1): 未收敛(隔离/保留待人工)时同样 fail-stop,
-        # 否则"任一维护步骤失败即停止"的新契约在端口事务这条路上不成立。
-        if declare -F _port_txn_recover >/dev/null 2>&1; then
-            if ! _port_txn_recover; then
-                STARTUP_MAINT_BLOCKED=1
-                _error "端口事务恢复未收敛(未完成项已保留 journal/证据), 已停止后续启动维护"
-            fi
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then

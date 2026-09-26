@@ -1318,6 +1318,9 @@ _hy2_port_txn() {
 _hy2_port_txn_locked() {
     local tag="$1" meta="$2" oldport="$3" newport="$4" newmeta="$5"; shift 5
     local ranges="$*" orig journal rok
+    # 本事务临界区标记(local 动态作用域, 事务返回即消失): 自己的 journal 在写 config 时
+    # 不算"未收敛现场" —— 见 _txn_allow_config_write 的 port 段。
+    local XD_PORT_TXN_ACTIVE=1
     journal="${meta}.porttxn"
     orig=$(cat "$meta" 2>/dev/null) || return 1
     # 0. journal: iptables 是本事务第一个被改动的真实状态, journal 必须先于它落盘
@@ -1874,8 +1877,8 @@ _mutate_config() {
 _mutate_config_locked() {
     # 未收敛的核心事务禁止任何配置写入(复审 P1): 在 core lock 内判定, 在飞的切换不误拒;
     # 崩溃残留/BLOCKED 才命中。混装旧 lib 缺 helper 时放行(declare -F 守卫在 helper 内)。
-    if declare -F _core_txn_allow_config_write >/dev/null 2>&1 \
-       && ! _core_txn_allow_config_write; then
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
         return 1
     fi
     if ! _backup_config; then
@@ -2426,8 +2429,8 @@ _auto_tag_tagless_inbounds_locked() {
     [ -f "$CONFIG_FILE" ] || return 0
     # 本函数是**直写 config** 的入口(不经 _mutate_config), 必须自带核心事务闸门 ——
     # 手工 [同步配置] 也会走到这里(复审 P1)。
-    if declare -F _core_txn_allow_config_write >/dev/null 2>&1 \
-       && ! _core_txn_allow_config_write; then
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
         return 1
     fi
     # 一次性读取所有入站的 tag/port/listen, 减少 jq 调用
@@ -2620,8 +2623,8 @@ _adopt_single_inbound_locked() {
     local tag="$1" suffix="${2:-adopted}"
     # 采纳写 metadata(不经 _mutate_config), 同样属于"未收敛核心事务期间不得变更现场"
     # (复审 P1); 自动采纳与手工 [同步配置] 共用本函数。
-    if declare -F _core_txn_allow_config_write >/dev/null 2>&1 \
-       && ! _core_txn_allow_config_write; then
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
         return 1
     fi
     local proto port listen
@@ -5720,6 +5723,8 @@ _reality_port_txn() {
 }
 _reality_port_txn_locked() {
     local tag="$1" meta="$2" oldport="$3" newport="$4"
+    # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明)
+    local XD_PORT_TXN_ACTIVE=1
     # R42: 先经唯一入口判模式。direct 模式无 tunnel/路由需要同步, tunnel_tag 保持空,
     # 下面的事务天然退化为"只处理主入站"(new_tunnel_tag 与 jq 的 tunnel 段都受 -n 保护);
     # 绝不能让 direct 节点走 tunnel 分支的 fail-closed —— 那会把它永久锁成不能改端口。
@@ -5902,14 +5907,26 @@ _port_txn() {
 # 再推算, 也不依赖 newmeta 还能重建; tag/newtag 从 old/new 的 .tag 派生(三类 metadata 都带 tag)。
 # 返回非 0 ⇒ 调用方必须**立即中止**, 不得继续改动任何真实文件。
 _port_txn_journal_write() {  # <old_path> <new_path> <kind> <oldport> <newport> <ranges> <old_json> <new_json>
+    local old_path="$1" new_path="$2" kind="$3" oldport="$4" newport="$5" ranges="$6" old_json="$7" new_json="$8"
     # 三条端口事务(port/hy2hop/reality)的第一步都是写 journal, 因此闸门放在这里即可在
-    # **触碰 iptables/metadata 之前**整体拦下 —— 未收敛的核心事务期间不允许开启端口事务
-    # (复审 P1: 若只靠 _mutate_config 的闸门, iptables/元数据 已被改过一轮再回滚)。
-    if declare -F _core_txn_allow_config_write >/dev/null 2>&1 \
-       && ! _core_txn_allow_config_write; then
+    # **触碰 iptables/metadata 之前**整体拦下。
+    # (a) **任何既有 *.porttxn 都拒绝**: 它代表一个未收敛的端口事务现场, 既不能覆盖
+    #     (会销毁唯一的事务证据), 也不允许在其未收敛时开启新事务(复审 P1)。
+    #     此检查**不看** XD_PORT_TXN_ACTIVE —— 事务入口处自己的 journal 尚未写入,
+    #     任何已存在的 journal 都是外来残留, 与"是否处于本事务临界区"无关。
+    local _ex
+    for _ex in "$NODES_DIR"/*.porttxn; do
+        [ -e "$_ex" ] || continue
+        _error "已存在未收敛的端口事务 journal, 拒绝开启新事务/覆盖现场: ${_ex##*/}"
+        _tip "请重启脚本让启动恢复先收敛该 journal(现场已保留)"
+        return 1
+    done
+    # (b) 统一闸门: reset / core 账本未收敛同样禁止开启端口事务(port 段由上面的检查承担,
+    #     或在事务临界区内被 XD_PORT_TXN_ACTIVE 跳过)。
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
         return 1
     fi
-    local old_path="$1" new_path="$2" kind="$3" oldport="$4" newport="$5" ranges="$6" old_json="$7" new_json="$8"
     local payload
     payload=$(jq -n --arg kind "$kind" --argjson op "$oldport" --argjson np "$newport" \
         --arg opath "$old_path" --arg npath "$new_path" --arg ranges "$ranges" \
@@ -5921,6 +5938,8 @@ _port_txn_journal_write() {  # <old_path> <new_path> <kind> <oldport> <newport> 
 
 _port_txn_locked() {
     local tag="$1" meta="$2" newport="$3" newmeta="$4" orig oldport journal
+    # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明)
+    local XD_PORT_TXN_ACTIVE=1
     journal="${meta}.porttxn"
     orig=$(cat "$meta" 2>/dev/null) || { _error "读取元数据失败: $meta"; return 1; }
     [ -n "$orig" ] || { _error "元数据为空, 放弃端口修改: $meta"; return 1; }
