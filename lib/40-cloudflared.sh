@@ -111,9 +111,11 @@ _extract_token() {
 # Tunnel tokens must pass cloudflared's own decoder before being embedded in service files
 # (OpenRC sources its init file as shell, so quotes/substitutions/whitespace must never be token data).
 # cloudflared 的 `ParseToken`(cmd/cloudflared/tunnel/subcommands.go)做的是
-# `base64.StdEncoding.DecodeString` **再** `json.Unmarshal`。故校验要对齐两者:
-# **标准**字母表 A-Za-z0-9+/、padding 正确(长度 %4==0)、**且解码后必须是合法 JSON**。
-# 只验字符集/长度会放过 `eyI=`(解码得 `{"`)这类"脚本说合法、cloudflared 自己拒绝"的伪 token。
+# `base64.StdEncoding.DecodeString` **再** `json.Unmarshal(content, &connection.TunnelToken{})`。
+# 故校验要对齐两者: **标准**字母表 A-Za-z0-9+/、padding 正确(长度 %4==0)、**且解码后必须是 JSON
+# 对象**。只验字符集/长度会放过 `eyI=`(解码得 `{"`); 只验"任意合法 JSON"又会接受 `[]`/`123`
+# 这类 Go 反序列化到 struct 时必然失败的值。(注: `ey` 前缀本身已蕴含首字节 `{`, 故此处的对象
+# 判定实际是"花钱很少的精确性保证", 而非可达的行为分歧。)
 _cf_token_valid() {
     local token="${1:-}" decoded
     [[ "$token" == ey* ]] || return 1
@@ -124,7 +126,7 @@ _cf_token_valid() {
     command -v jq >/dev/null 2>&1 || return 0
     decoded=$(printf '%s' "$token" | jq -Rr '@base64d' 2>/dev/null) || return 1
     [ -n "$decoded" ] || return 1
-    printf '%s' "$decoded" | jq -e . >/dev/null 2>&1
+    printf '%s' "$decoded" | jq -e 'type == "object"' >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
