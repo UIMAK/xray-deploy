@@ -819,18 +819,19 @@ _install_legacy_flock_active() {
 
 # ---------------------------------------------------------------------------
 # 旧版锁协调助手(与 20-xray-core 的 `_xray_legacy_lock_name` 同语义)。**仅在调用方确认
-# 旧路径已存在时调用**; 它**绝不新建树外的锁对象** —— 协调动作本身不能又污染 /opt。
+# 旧路径已存在时调用**; 它**绝不新建树外的旧 flock 文件(.fd)** —— 那是持久污染(复审 P2)。
 #   · 旧 flock 文件存在 → 取同路径 flock(见证/身份复核, 防"存在→被删→新建"TOCTOU);
-#     **部署树内**的旧 mkdir 目录会建同名 `.witness` 标记(挡旧 mkdir 后端), 树外的一律不建。
+#     并建同名 `.witness` mkdir 标记挡旧 mkdir 后端 —— **L1(树外)与 L2(树内)都建**,
+#     释放时删除, 否则"只检查不占位"会让旧无-flock 进程在检查之后 mkdir 插入(复审四 P1)。
 #   · 旧 flock 文件不存在(只有旧 mkdir 目录) → 直接 fail-closed, 不凭空建 .fd(复审 P2)。
 # 失败一律 fail-closed; 由调用方负责释放已取得的主锁。
 # ---------------------------------------------------------------------------
 _install_lock_legacy_flock_take() {   # <file> <dir> <fdvar> <heldvar> <label>
     local lfile="$1" ldir="$2" fdvar="$3" heldvar="$4" label="$5"
-    local witness="" devino="" ef="" create_marker=0
-    # 只有部署树内的旧路径才允许创建 mkdir 标记(挡旧 mkdir 后端); 树外(如 /opt/.xray-deploy.*)
-    # 绝不创建 —— 否则协调动作本身又把目录写回 /opt(本 PR 要消除的污染)。
-    case "$ldir" in "$DEPLOY_DIR"/*) create_marker=1 ;; esac
+    local witness="" devino="" ef=""
+    # 旧 mkdir 标记对 L1(树外 /opt/.xray-deploy.*)与 L2(树内)一视同仁地创建: 只检查不占位
+    # 留了真实窗口 —— 旧无-flock 进程可在检查之后 `mkdir "$ldir"` 并进入(复审四 P1)。标记
+    # 释放时删除, /opt 不留持久产物; **旧 flock 文件(.fd)缺失时仍然绝不新建**(复审 P2, 见下)。
     if [ ! -e "$lfile" ]; then
         # 旧 flock 文件不存在: **绝不为了协调而新建它**(会污染 /opt)。若旧 mkdir 目录存在
         # ⇒ 旧会话仍在, fail-closed; 否则调用方本就不该调用。
@@ -868,18 +869,6 @@ _install_lock_legacy_flock_take() {   # <file> <dir> <fdvar> <heldvar> <label>
         echo "[错误] ${label}文件在获取后被替换/删除(部署目录正被卸载?), 本次中止"
         eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
         return 1
-    fi
-    if [ "$create_marker" != "1" ]; then
-        # 树外旧锁: 只 flock 已知文件, 不创建任何新对象。但**已存在的旧 mkdir 目录必须拒绝**
-        # (复审 P1): 旧 flock 文件可能长期残留, 而无-flock 旧进程正用 `.d` 目录锁 —— 只看
-        # 文件会双重放行(新版从未拿过旧 mkdir 锁)。存在即 fail-closed。
-        if [ -e "$ldir" ]; then
-            echo "[错误] ${label}目录仍存在: $ldir"
-            echo "       确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-            eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-            return 1
-        fi
-        return 0
     fi
     devino=$(_install_lock_devino "$lfile")
     if [ -z "$devino" ]; then
@@ -920,9 +909,9 @@ _install_lock_legacy_flock_take() {   # <file> <dir> <fdvar> <heldvar> <label>
 }
 
 _install_lock_legacy_mkdir_take() {   # <file> <dir> <heldvar> <label>
-    local lfile="$1" ldir="$2" heldvar="$3" label="$4" lrc create_marker=0
-    # 只创建部署树内的旧 mkdir 目录; 树外(如 /opt/.xray-deploy.*)**绝不创建**(污染)。
-    case "$ldir" in "$DEPLOY_DIR"/*) create_marker=1 ;; esac
+    local lfile="$1" ldir="$2" heldvar="$3" label="$4" lrc
+    # 旧 mkdir 目录对 L1/L2 一视同仁地创建占位(复审四 P1): 只检查不占位会被旧无-flock
+    # 进程在检查之后 mkdir 插入。释放时删除(见 _install_lock_mkdir_release)。
     if [ -e "$lfile" ]; then
         if ! declare -F _install_legacy_flock_active >/dev/null 2>&1; then
             echo "[错误] 无法确认${label} flock 是否空闲(缺少检查助手), 本次安装中止"
@@ -939,9 +928,6 @@ _install_lock_legacy_mkdir_take() {   # <file> <dir> <heldvar> <label>
     if [ -e "$ldir" ]; then
         # 旧 mkdir 目录存在 ⇒ 交给 mkdir 助手拒绝并保留现场(绝不接管别人的锁)
         _install_lock_mkdir_take "$ldir" "$label" || return 1
-    fi
-    if [ "$create_marker" != "1" ]; then
-        return 0
     fi
     _install_lock_mkdir_take "$ldir" "$label" || return 1
     eval "$heldvar=1"
