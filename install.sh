@@ -67,7 +67,7 @@ umask 077
 # 确保 bash(Alpine 默认 ash)
 # ---------------------------------------------------------------------------
 ensure_bash() {
-    if [ -n "$BASH_VERSION" ]; then return 0; fi
+    if [ -n "${BASH_VERSION:-}" ]; then return 0; fi
     if command -v bash >/dev/null 2>&1; then exec bash "$0" "$@"; fi
     if command -v apk >/dev/null 2>&1; then
         apk add --no-cache bash >/dev/null 2>&1 && exec bash "$0" "$@"
@@ -562,6 +562,33 @@ download_all() {
     return 0
 }
 
+# Install and verify the primary command entry point. ln can succeed by placing a link inside an
+# existing destination directory, which is not the requested /usr/local/bin/xd executable.
+_install_xd_link() {
+    local bin_dir want got
+    bin_dir=$(dirname "$INSTALL_BIN")
+    mkdir -p "$bin_dir" || { echo "[错误] 无法创建命令目录: $bin_dir"; return 1; }
+    if [ -d "$INSTALL_BIN" ] && [ ! -L "$INSTALL_BIN" ]; then
+        echo "[错误] 命令目标是目录, 拒绝创建嵌套链接: $INSTALL_BIN"
+        return 1
+    fi
+    ln -sfn "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN" || {
+        echo "[错误] 创建快捷命令失败: $INSTALL_BIN(权限? /usr/local/bin 只读?)"
+        return 1
+    }
+    if ! chmod +x "$INSTALL_BIN" 2>/dev/null; then
+        echo "[错误] 设置快捷命令执行权限失败: $INSTALL_BIN"
+        return 1
+    fi
+    want=$(readlink -f "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null) || want="$DEPLOY_DIR/xray-deploy.sh"
+    got=$(readlink -f "$INSTALL_BIN" 2>/dev/null) || got=""
+    if [ ! -x "$INSTALL_BIN" ] || [ "$got" != "$want" ]; then
+        echo "[错误] 快捷命令链接校验失败: $INSTALL_BIN"
+        return 1
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # 安装级互斥锁(2026-09-21 七轮复审 P2; 2026-09-22 七轮复审 D2/D3/D6/D7 重做)
 #
@@ -1026,9 +1053,7 @@ if [ "$IS_UPDATE" -eq 1 ]; then
     echo "[信息] 正在更新 xray-deploy..."
     mkdir -p "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR"
     if download_all; then
-        # 软链
-        ln -sf "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN"
-        chmod +x "$INSTALL_BIN"
+        _install_xd_link || exit 1
         # xray 命令 symlink（检测已有安装不覆盖）
         if [ ! -e /usr/local/bin/xray ] || [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$DEPLOY_DIR/bin/xray" ]; then
             ln -sf "$DEPLOY_DIR/bin/xray" /usr/local/bin/xray
@@ -1167,14 +1192,7 @@ fi
 # 这里是"安装完成"之前的最后两步, 旧写法不看出错就报 `[成功] 安装完成`, 而 `/usr/local/bin/xd`
 # 可能根本没建出来 —— 用户拿到一条不存在的命令。注意 xd 的链接是**指向部署目录的符号链接**,
 # 它丢了不影响 `bash install.sh` 重跑(重跑即重建), 故这里报错即可, 不回滚已落地的文件。
-if ! ln -sf "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN"; then
-    echo "[错误] 创建快捷命令失败: $INSTALL_BIN(权限? /usr/local/bin 只读?)"
-    exit 1
-fi
-if ! chmod +x "$INSTALL_BIN"; then
-    echo "[错误] 设置快捷命令执行权限失败: $INSTALL_BIN"
-    exit 1
-fi
+_install_xd_link || exit 1
 # xray 命令 symlink（检测已有安装不覆盖）
 if [ ! -e /usr/local/bin/xray ] || [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$DEPLOY_DIR/bin/xray" ]; then
     ln -sf "$DEPLOY_DIR/bin/xray" /usr/local/bin/xray || \

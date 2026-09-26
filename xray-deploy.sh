@@ -93,7 +93,11 @@ unset _DEPLOY_ROOT
 # source 公共层(定义所有常量与 DEPLOY_DIR 等)
 for _m in $LIB_MODULES; do
     # shellcheck disable=SC1090
-    . "$LIB_DIR/${_m}.sh"
+    . "$LIB_DIR/${_m}.sh" || {
+        echo "[错误] 加载模块失败: $LIB_DIR/${_m}.sh" >&2
+        echo "       请运行 install.sh --update 修复不完整或语法错误的安装" >&2
+        exit 1
+    }
 done
 unset _m
 

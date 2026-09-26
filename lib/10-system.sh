@@ -79,27 +79,28 @@ _detect_arch() {
 # 用法:_pkg_install <pkg1> [pkg2 ...]
 # ---------------------------------------------------------------------------
 _pkg_install() {
-    local fam pkgs="$*" p
-    # 选项注入防护: $pkgs 故意不加引号(需要按空白拆成多参数), 于是以 "-" 开头的名字会被
-    # apt/apk 当成选项(如 --assume-yes)。调用方目前都传字面量, 但这是公共 helper
-    # (50-nodes/20-xray-core/45-logrotate 都在用), 故在入口拒绝。
+    local fam p
+    local -a pkgs=("$@")
+    local pkg_label="${pkgs[*]}"
+    # 保留原始参数边界传给包管理器; 不得把数组展平为字符串后未引用展开, 否则 glob 会按
+    # 当前工作目录扩展, 而含空白的包约束会被拆成多个包名。拒绝 option-like package name。
     for p in "$@"; do
         case "$p" in
             -*) _error "非法包名(不得以 - 开头): $p"; return 1 ;;
         esac
     done
     fam=$(_detect_os_family)
-    _info "安装依赖: $pkgs"
+    _info "安装依赖: $pkg_label"
     case "$fam" in
         alpine)
-            command -v apk >/dev/null 2>&1 || { _error "apk 不可用, 无法安装: $pkgs"; return 1; }
-            apk add --no-cache $pkgs >/dev/null 2>&1 || {
-                _error "apk 安装失败: $pkgs"
+            command -v apk >/dev/null 2>&1 || { _error "apk 不可用, 无法安装: $pkg_label"; return 1; }
+            apk add --no-cache "${pkgs[@]}" >/dev/null 2>&1 || {
+                _error "apk 安装失败: $pkg_label"
                 return 1
             }
             ;;
         debian)
-            command -v apt-get >/dev/null 2>&1 || { _error "apt-get 不可用, 无法安装: $pkgs"; return 1; }
+            command -v apt-get >/dev/null 2>&1 || { _error "apt-get 不可用, 无法安装: $pkg_label"; return 1; }
             # DEBIAN_FRONTEND=noninteractive 防交互卡住(时区/服务重启提示)
             # --no-install-recommends 省空间(小机器友好)
             # DPkg::Lock::Timeout: 另一个 apt/unattended-upgrades 持锁时等待而非立即失败
@@ -112,13 +113,13 @@ _pkg_install() {
             else
                 apt-get update -qq >/dev/null 2>&1 || _warn "apt-get update 失败(继续尝试安装)"
             fi
-            apt-get -o DPkg::Lock::Timeout=60 install -y -qq --no-install-recommends -- $pkgs >/dev/null 2>&1 || {
-                _error "apt 安装失败: $pkgs (网络/软件源/磁盘空间或 dpkg 被占用?)"
+            apt-get -o DPkg::Lock::Timeout=60 install -y -qq --no-install-recommends -- "${pkgs[@]}" >/dev/null 2>&1 || {
+                _error "apt 安装失败: $pkg_label (网络/软件源/磁盘空间或 dpkg 被占用?)"
                 return 1
             }
             ;;
         *)
-            _error "不支持的系统: $fam,请手动安装: $pkgs"
+            _error "不支持的系统: $fam,请手动安装: $pkg_label"
             return 1
             ;;
     esac
