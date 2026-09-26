@@ -1530,6 +1530,8 @@ _xray_core_journal_drop() {
 }
 
 # 任意 journal (包括 committed/rolled_back 的 cleanup journal) 都必须先恢复/清理, 不能新开覆盖。
+# **调用场景**: 核心事务准入(_install_or_switch_xray / _xray_commit_staged / geo 提交) ——
+# 它回答的是"能否开新核心事务", 因此终态但未 cleanup 的账本同样算 pending(防止覆盖证据)。
 _xray_core_txn_pending() {
     local j; j=$(_xray_core_journal_path)
     _xray_core_path_present "$(_xray_core_blocked_path)" && return 0
@@ -1539,16 +1541,40 @@ _xray_core_txn_pending() {
     _xray_core_path_present "$j"
 }
 
+# **config 写路径专用谓词**(复审 P2, 2026-09-26): 只有"未收敛"的核心事务才阻塞普通
+# config/metadata 写入。与 _xray_core_txn_pending 的分工必须分清:
+#   _xray_core_txn_pending   = 任何账本(含终态)都算 —— 阻止**新核心事务**覆盖旧证据;
+#   本函数                   = 终态已收敛(committed=切换成功 / rolled_back=回滚完成, 磁盘与
+#                              runtime 都已就位), 只剩删备份; 此时禁止普通配置写入属过度防御 ——
+#                              一个删不掉的旧备份不该锁死整个管理面, cleanup 留待下次启动重试。
+# BLOCKED / .corrupt / 账本无法解析 / phase 为空或非法 / 非终态 — 一律视为未收敛(fail-closed)。
+_xray_core_txn_unsettled() {
+    local j phase
+    j=$(_xray_core_journal_path)
+    _xray_core_path_present "$(_xray_core_blocked_path)" && return 0
+    _xray_core_path_present "${j}.corrupt" && return 0
+    _xray_core_path_present "$j" || return 1
+    phase=$(jq -r '.phase // empty' "$j" 2>/dev/null) || return 0
+    case "$phase" in
+        committed|rolled_back) return 1 ;;
+    esac
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # **统一"未收敛事务"写闸门**(复审 P1, 2026-09-26): reset / core / port 三套恢复账本
 # 任一未收敛, 即拒绝一切普通 config/metadata 写入; 账本/证据清除后闸门自动解除。
 # 策略与 _mutate_config 的 reset 检查一致: **只看盘上事实**, 不引入粘滞状态。
 #
-# 调用前提: 调用方已持 config lock(锁序 config → core, 不可反向)。三个判定:
+# 调用前提: 调用方已持 config lock(锁序 config → core, 不可反向);
+# **且调用方必须正在持 core lock**(`_mutate_config_locked` 经 `_with_core_lock` 屏障),
+# 或至少是在 core lock 内的一次判定 —— 否则"检查通过"与"实际写入"之间仍有 TOCTOU 窗口
+# (复审 P1: 检查后 core 事务可启动并留下未收敛账本)。屏障内本函数经持锁标记直接调用
+# probe, 不重复取锁。三个判定:
 #   · reset 账本(90-menu 定义): 锁内文件检查 —— reset 全程持 config lock 提交, 无竞态;
 #   · port 事务 journal: 锁内文件检查 —— 端口事务全程持 config lock 提交, 无竞态;
-#   · core 账本: 必须另取 core lock 判定 —— 正常在飞的核心切换持 core lock 直到账本删除
-#     才释放, 因此不会被误拒; 只有崩溃残留(锁已释放、账本仍在)与 BLOCKED/corrupt 才命中。
+#   · core 账本: 只看**非终态**(见 _xray_core_txn_unsettled) —— 在飞的切换持 core lock
+#     直到账本删除才释放, 不会误拒; 崩溃残留/BLOCKED 才命中。
 #
 # `XD_PORT_TXN_ACTIVE=1` 表示"当前进程正处于某个端口事务的临界区内": 该事务自己的
 # journal 不算未收敛 —— 进入事务前 `_port_txn_journal_write` 已拒绝任何既有 journal,
@@ -1558,8 +1584,8 @@ _xray_core_txn_pending() {
 # 混装旧 lib(缺 helper)时按各段单独跳过: 与项目其它 declare -F 守卫同口径
 # (可用性 fail-open; helper 属于同一次安装的完整版本)。
 # ---------------------------------------------------------------------------
-_core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无待收敛; 3=待收敛
-    _xray_core_txn_pending && return 3
+_core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无阻塞; 3=未收敛
+    _xray_core_txn_unsettled && return 3
     return 0
 }
 
