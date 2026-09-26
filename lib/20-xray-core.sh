@@ -1538,6 +1538,44 @@ _xray_core_txn_pending() {
     # 否则新事务可能覆盖旧证据或误认 stale snapshots。
     _xray_core_path_present "$j"
 }
+
+# ---------------------------------------------------------------------------
+# config/metadata 写路径的**核心事务闸门**(复审 P1, 2026-09-26)。
+#
+# 问题: core recovery 失败后账本保留, 但普通配置写入仍可继续 —— 未收敛的
+# binary/service/runtime 现场会被继续叠加 config/metadata 变更, 与启动维护链
+# fail-stop 的语义矛盾("未收敛就不要再改现场")。本函数与 _mutate_config 的 reset 闸门
+# 同策: **只看盘上事实**(账本/标记存在即拒绝), 收敛后账本删除, 闸门自动解除。
+#
+# 判定必须在 **core lock 内**: 正常在飞的核心切换持 core lock 直到账本删除才释放,
+# 因此不会被误拒; 只有崩溃残留(锁已释放、账本仍在)与 BLOCKED/corrupt 标记才命中。
+# 调用前提: 调用方已持 config lock(锁序 config → core, 不可反向)。
+#
+# 返回 0 = 放行; 1 = 已拒绝(原因已打印)。
+# 混装旧 lib(缺 _xray_core_txn_pending)时放行: 与项目其它 declare -F 守卫同口径
+# (可用性 fail-open; helper 属于同一次安装的完整版本)。
+# ---------------------------------------------------------------------------
+_core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无待收敛; 3=待收敛
+    _xray_core_txn_pending && return 3
+    return 0
+}
+
+_core_txn_allow_config_write() {
+    declare -F _xray_core_txn_pending >/dev/null 2>&1 || return 0
+    local rc=0
+    _with_core_lock _core_txn_pending_probe || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        3)
+            _error "存在未收敛的核心事务(账本/恢复源已保留), 已拒绝本次配置写入"
+            _tip "请重启脚本让核心事务先收敛; 收敛前请勿继续修改 config/metadata"
+            return 1 ;;
+        *)
+            _error "无法确认核心事务状态(核心锁不可用?), 已拒绝本次配置写入(fail-closed)"
+            return 1 ;;
+    esac
+}
+
 _xray_core_journal_ok() {
     local j="$1" id bin binbak pre hash binary_hash runtime unit sprev stage stage_name phase operation
     local gipre gspre service_pre giphash gsphash service_hash gi_new_hash gs_new_hash

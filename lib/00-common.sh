@@ -837,6 +837,13 @@ _normalize_config_format() {
 _normalize_config_format_locked() {
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
+    # 本函数是直写整份 config 的 RMW(不经 _mutate_config), 因此必须自带核心事务闸门(复审 P1):
+    # 未收敛的核心事务期间连"重排字段"这种整份替换也会改变现场。[同步配置]/[检查配置] 同受保护。
+    # guard 是软依赖: 00-common 先于 20-xray-core 加载, 混装旧 lib 缺 helper 时放行(与项目口径一致)。
+    if declare -F _core_txn_allow_config_write >/dev/null 2>&1 \
+       && ! _core_txn_allow_config_write; then
+        return 1
+    fi
     local content
     # 按官方顺序排已知字段, 未知字段追加到末尾, 去除 null 值; jq 失败保持原文件不动
     content=$(jq '

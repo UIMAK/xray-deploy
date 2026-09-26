@@ -142,7 +142,10 @@ _main_menu() {
     #   reset 崩溃恢复 → 核心事务崩溃恢复 → 自动补 tag → 自动采纳孤儿入站 → 端口事务恢复
     #   → 注入 config env(R45) → 迁移 Geo 自动更新(R45) → 格式化配置
     # 各恢复/迁移步骤都用 declare -F 守卫: 可选维护 helper 缺失时跳过; 事务恢复失败或任一
-    # 维护步骤失败, 则 fail-stop 停止后续步骤, 且阻止配置修改类操作。
+    # 维护步骤失败, 则 fail-stop 停止后续步骤。**全局写闸门不在这里**: 未收敛的
+    # core/reset 事务由各 config/metadata 写路径的账本闸门(_core_txn_allow_config_write /
+    # _mutate_config 的 reset 检查)持续拒绝, 直到重启收敛后自动解除 —— 菜单变量只负责
+    # 启动链的顺序, 不承担"挡住用户操作"的责任。
     # reset 恢复放在最前: 半截 reset 的 live 状态可能是"config 空/缺 + nodes 空 + 快照藏着
     # 旧 metadata", 先收敛再让 adopt/normalize 基于稳定状态工作。
     # 核心恢复紧随其后且**先于一切 config 写入**(复审 P1): 它可能重启服务, 且失败时运行态
@@ -190,8 +193,15 @@ _main_menu() {
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata
-        if declare -F _port_txn_recover >/dev/null 2>&1; then _port_txn_recover; fi
+        # 放在 config 相关操作之前, 使后续步骤看到的都是已收敛的 metadata。
+        # **必须消费返回码**(复审 P1): 未收敛(隔离/保留待人工)时同样 fail-stop,
+        # 否则"任一维护步骤失败即停止"的新契约在端口事务这条路上不成立。
+        if declare -F _port_txn_recover >/dev/null 2>&1; then
+            if ! _port_txn_recover; then
+                STARTUP_MAINT_BLOCKED=1
+                _error "端口事务恢复未收敛(未完成项已保留 journal/证据), 已停止后续启动维护"
+            fi
+        fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
         if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
