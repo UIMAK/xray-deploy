@@ -922,7 +922,12 @@ _install_lock_acquire() {
         # 占 config 主锁(锁根下 `config.lock`) —— 写死 9 会在同一进程里互相踩掉
         # 对方的锁(fd 被重新赋值即释放原锁), 表现为"锁莫名失效"。`{var}` 形式由 shell
         # 保证分配一个空闲 fd。
-        exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_FILE" 2>/dev/null || {
+        # **组重定向是硬约束(0.18.3)**: `exec` 的无命令形态会把重定向持久化到当前 shell ——
+        # 裸写法 `exec {fd}>>file 2>/dev/null` 会让 fd 2 从此指向 /dev/null, 又被末尾
+        # `exec "$INSTALL_BIN"` 带进菜单: `read -rp` 的提示符与全部 _info/_error 一并消失,
+        # 用户看到"菜单出现但没有 `请选择:`"(这才是该症状的根因; 菜单侧的 stdin 改接见
+        # `_menu_require_tty`)。
+        { exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_FILE"; } 2>/dev/null || {
             INSTALL_LOCK_FD=""
             echo "[错误] 无法打开安装锁文件 $INSTALL_LOCK_FILE(磁盘空间/权限?)"; return 1; }
         if flock -n "$INSTALL_LOCK_FD" 2>/dev/null; then
