@@ -742,8 +742,11 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
         return 1
     fi
     # 无 flock: 创建旧 mkdir 目录前先跑删除树扫描 —— 与 flock 分支"即将新建 inode"同口径。
+    # **扫描根固定为 `$DEPLOY_DIR`, 不是 `dirname "$ldir"`**(复审四 P2)：L1 的 ldir 在 /opt 下,
+    # 用 dirname 会把整个 /opt 纳入扫描, 任何无关软件在 /opt 持有的 deleted fd 都会让 xd
+    # 误 fail-closed。我们关心的始终是"部署树被删而旧进程仍持有其文件"。
     # (L1 树外目录也创建并占位, 见上方说明; 释放时删除。)
-    deploy_dir=$(dirname "$ldir")
+    deploy_dir="${DEPLOY_DIR%/}"
     if _xray_legacy_deleted_tree_active "$deploy_dir"; then
         _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝新建旧版${label}目录: $ldir"
         _tip "等旧版会话结束后重试"
