@@ -1548,6 +1548,14 @@ _xray_core_txn_pending() {
 #                              runtime 都已就位), 只剩删备份; 此时禁止普通配置写入属过度防御 ——
 #                              一个删不掉的旧备份不该锁死整个管理面, cleanup 留待下次启动重试。
 # BLOCKED / .corrupt / 账本无法解析 / phase 为空或非法 / 非终态 — 一律视为未收敛(fail-closed)。
+#
+# **边界声明(复审 P3): 本谓词只判 phase, 不做完整 schema 校验。** 完整校验是 recovery 的
+# 职责(`_xray_core_journal_ok`), 在这里再抄一份 schema 属于"对已由可信边界建立的 invariant
+# 重复验证", 而且会把一个大 jq 校验拉进每次普通写入的路径。正常崩溃不会产生"phase 完整而
+# 其余字段损坏"的账本(写入是 `_atomic_write_json` 原子提交, 非终态 phase 一律阻塞); 唯一能
+# 构造出该形态的是**手工篡改**, 属同机 root 篡改 = 已失守, 超出本项目威胁模型。若将来
+# 确实需要"终态账本必须可信", 正确做法是让 recovery 的 schema 校验结果成为唯一判据, 而
+# 不是在这里再实现一份。
 _xray_core_txn_unsettled() {
     local j phase
     j=$(_xray_core_journal_path)
@@ -2500,8 +2508,20 @@ _init_config_if_empty_locked() {
 # 同文件的 `_init_config_if_empty` 早已是这个 wrapper 形态(见它的 `_locked`), 这里补齐口径。
 # ---------------------------------------------------------------------------
 _auto_ensure_config_env_locked() {
+    # 廉价守卫留在屏障外(空配置/无 jq 的 no-op 不取 core lock)
     [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
+    # **本函数是权威 config 写入**(注入 env 段), 与其它写入口同一口径: 读-改-写整体进
+    # core lock 屏障, 检查与写入同临界区(复审 P2-1)。只靠启动链门禁覆盖不了
+    # "另一会话在此期间启动核心事务"的并发窗口。
+    _with_config_write_barrier _auto_ensure_config_env_write
+}
+
+_auto_ensure_config_env_write() {
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
+        return 1
+    fi
     local need
     # .env 非对象时 `.env.XRAY_LOCATION_ASSET` 会让 jq 报类型错误而整行失败 -> 前置判断
     # 必须先按类型分支(与注入处同一口径), 否则非对象 .env 会在这里提前 return 而无法自愈。
