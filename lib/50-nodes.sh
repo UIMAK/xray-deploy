@@ -5308,6 +5308,10 @@ _rebuild_clash_line() {
 # 这里补齐同一契约。告警文本留在本函数内 —— 有调用点是事务回滚路径的 `|| true`。
 # ---------------------------------------------------------------------------
 _sync_node_clash() {
+    _with_config_lock _sync_node_clash_locked "$@"
+}
+
+_sync_node_clash_locked() {
     local meta="$1" old_name="${2:-}" line name key crc=0
     # 元数据缺必填字段时保留 clash 旧行(它可能仍指向一个可用的旧配置), 但如实返回失败
     if ! line=$(_rebuild_clash_line "$meta"); then

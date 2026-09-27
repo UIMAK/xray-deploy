@@ -1909,7 +1909,42 @@ _hysteria_listen_port_part() {
     printf '%s' "$part"
 }
 
-# 端口跳跃范围冲突检查(只检查, 不写防火墙 —— 官方 binary 启动自建/停止自清):
+# 列出 Xray config 中**具备 UDP 监听能力**的入站端口, 展开为 `start:end` 行(PortList:
+# "443" / "443-500" / "443,8443-9000")。官方 Hysteria 的端口跳跃会在该 UDP 范围上建
+# REDIRECT 规则, 范围内**任何** UDP 监听都会被劫持 ⇒ 判据必须覆盖所有 UDP 能力的入站:
+#   · protocol `hysteria` —— Xray Hy2 的协议键就是它(本项目模板实测), 而 Xray 里不存在
+#     `hysteria2` 这个键 ⇒ 漏掉它会让 Xray Hy2 节点落在跳跃范围内时静默通过(端口被抢);
+#   · `streamSettings.network` 为 mkcp/quic —— 传输层本身走 UDP;
+#   · `dokodemo-door`/`tunnel` 的 `settings.network` 含 udp —— 本项目 tunnel 模板写死
+#     `"network": "tcp"`, TCP-only 不冲突 ⇒ 对它无条件判冲突是假阳性(会挡住合法跳跃范围);
+#   · `socks` 且 `settings.udp == true`;
+#   · `shadowsocks` 的 `settings.network` 含 udp(Xray 默认 "tcp,udp", 缺字段即 UDP 能力)。
+_hysteria_xray_udp_port_ranges() {
+    [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 0
+    local s e
+    while IFS=: read -r s e; do
+        [[ "$s" =~ ^[0-9]+$ && "$e" =~ ^[0-9]+$ ]] || continue
+        printf '%s:%s\n' "$s" "$e"
+    done < <(jq -r '
+        .inbounds[]? | select(.port != null)
+        | select(
+            (.protocol // "") == "hysteria"
+            or (.protocol // "") == "hysteria2"
+            or ((.streamSettings.network // "") == "mkcp")
+            or ((.streamSettings.network // "") == "quic")
+            or ((.protocol // "") == "socks" and ((.settings.udp // false) == true))
+            or (((.protocol // "") == "dokodemo-door" or (.protocol // "") == "tunnel")
+                and (((.settings.network // "tcp") | tostring) | test("udp")))
+            or ((.protocol // "") == "shadowsocks"
+                and (((.settings.network // "tcp,udp") | tostring) | test("udp")))
+          )
+        | (.port | tostring) | split(",")[]
+        | if test("^[0-9]+-[0-9]+$") then sub("-"; ":")
+          elif test("^[0-9]+$") then "\(.):\(.)"
+          else empty end
+    ' "$CONFIG_FILE" 2>/dev/null)
+}
+
 # a) 系统已监听的 UDP 端口落进范围(会被官方 REDIRECT 遮蔽)
 # b) Xray config inbound 端口落进范围
 # c) Xray Hy2 节点的 iptables 跳跃范围与本范围相交
@@ -1936,22 +1971,14 @@ _hysteria_check_hop_conflicts() {
     # hysteria2(QUIC)/dokodemo-door 原生 UDP; socks 需 settings.udp=true;
     # mKCP/QUIC 传输走 UDP。
     if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
-        while read -r p; do
-            [ -n "$p" ] || continue
-            [[ "$p" =~ ^[0-9]+$ ]] || continue
-            if [ "$p" -ge "$lo" ] && [ "$p" -le "$hi" ]; then
-                _error "Xray 入站端口 $p 在跳跃范围内, 会造成端口冲突"
+        while IFS=: read -r p_start p_end; do
+            [ -n "$p_start" ] || continue
+            [ -n "$exclude" ] && [ "$p_start" = "$exclude" ] && [ "$p_start" = "$p_end" ] && continue
+            if [ "$p_start" -le "$hi" ] && [ "$p_end" -ge "$lo" ]; then
+                _error "Xray 入站端口范围 ${p_start}-${p_end} 在跳跃范围内, 会造成端口冲突"
                 return 1
             fi
-        done <<< "$(jq -r '
-            .inbounds[]? | select(.port != null) |
-            select(
-                .protocol == "hysteria2" or
-                .protocol == "dokodemo-door" or
-                (.protocol == "socks" and ((.settings.udp // false) == true)) or
-                ((.streamSettings.network // "") == "mkcp") or
-                ((.streamSettings.network // "") == "quic")
-            ) | .port' "$CONFIG_FILE" 2>/dev/null)"
+        done < <(_hysteria_xray_udp_port_ranges)
     fi
     # c) Xray Hy2 节点 iptables 跳跃范围(区间相交判定; hop_ranges 形如 "20000-50000,3010")
     local f ranges tok_arr tok s e
@@ -2737,7 +2764,15 @@ _hysteria_clash_line() {
 }
 
 # clash 派生同步(替换或追加); old_name 非空且 != 当前名时先删旧行(改名场景)
+# 包在 config lock 内(十二轮 P2): clash.yaml 是 Xray 节点与官方 Hysteria 节点**共用**的
+# 一个文件, 追加/替换/去重都是读-改-写, 两个并发的 xd 会话会互相覆盖(丢条目)。事务内的
+# 调用经 XRAY_DEPLOY_LOCK_HELD 直接执行(不重复取锁, 也不进子 shell); 事务外(端口/带宽
+# 菜单改完之后的收尾)才真正取锁 —— 那正是旧实现裸奔的路径。
 _hysteria_sync_clash() {
+    _with_config_lock _hysteria_sync_clash_locked "$@"
+}
+
+_hysteria_sync_clash_locked() {
     local meta="$1" old_name="${2:-}" line name
     line=$(_hysteria_clash_line "$meta") || { _warn "clash 条目生成失败, 可手工编辑 ${CLASH_YAML}"; return 1; }
     name=$(jq -r '.name // empty' "$meta")

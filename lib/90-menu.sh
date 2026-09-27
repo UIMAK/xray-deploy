@@ -2291,12 +2291,29 @@ _reality_domain_menu() {
 
     local new_target="${new_sni}:443"
 
-    # 后量子检测(新域名可能支持或不支持)
-    local pq_seed="" pq_verify=""
-    if _detect_reality_pq "$new_target"; then
-        pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
-        _info "新域名支持后量子签名"
-    fi
+    # 后量子检测(新域名可能支持或不支持)。**必须按三态返回码分流**(十二轮复审 P2):
+    # 0=支持 / 1=明确不支持(可安全移除旧 PQ) / 2=探测失败或环境异常(结论未知)。
+    # 把 2 归到 1 会在一次临时网络故障后删掉节点上已生效的 mldsa65Seed/mldsa65_verify ——
+    # 等于用一次失败的探测完成不可逆降级。结论未知就不动: 直接取消本次域名切换。
+    local pq_seed="" pq_verify="" pq_rc=0
+    _detect_reality_pq "$new_target" || pq_rc=$?
+    case "$pq_rc" in
+        0)
+            pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
+            _info "新域名支持后量子签名"
+            ;;
+        1)
+            local old_pqv
+            old_pqv=$(jq -r '.mldsa65_verify // empty' "$meta" 2>/dev/null)
+            [ -n "$old_pqv" ] && _warn "新域名不支持后量子签名, 提交后将移除本节点现有的 PQ 配置"
+            ;;
+        *)
+            _error "后量子兼容性探测失败, 无法判断新域名是否支持 PQ(原因见上方告警)"
+            _tip "本次域名切换未执行, 节点配置保持不变; 请确认网络可达后重试"
+            _press_any_key
+            continue
+            ;;
+    esac
 
     # 仅为决定是否需要用户确认而在锁外读取拓扑; 切换事务会在锁内重新读取并校验所有状态。
     local preflight_mode allow_missing_tunnel=0 preflight_tunnel_tag=""
