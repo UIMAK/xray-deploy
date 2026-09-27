@@ -192,8 +192,18 @@ if _xh_hop_conflict '{"protocol":"vless","port":31500,"streamSettings":{"network
 if _xh_hop_conflict '{"protocol":"tunnel","port":31500,"settings":{"network":"tcp"}}' 20000 40000; then fail 'TCP-only tunnel not flagged as UDP conflict'; else pass 'TCP-only tunnel not flagged as UDP conflict'; fi
 check 'UDP-capable dokodemo-door flagged' _xh_hop_conflict \
     '{"protocol":"dokodemo-door","port":31500,"settings":{"network":"tcp,udp"}}' 20000 40000
-check 'default-network shadowsocks flagged' _xh_hop_conflict \
-    '{"protocol":"shadowsocks","port":31500,"settings":{"method":"aes-256-gcm"}}' 20000 40000
+# 十三轮复审: shadowsocks 缺 `network` 在核心里是 nil ⇒ [TCP]
+# (infra/conf/common.go 的 (*NetworkList).Build(): nil 返回 net.Network_TCP), 官方文档
+# inbounds/shadowsocks.md 也写"默认 tcp" ⇒ 默认 SS 入站**不监听 UDP**, 不得被误判成冲突。
+if _xh_hop_conflict '{"protocol":"shadowsocks","port":31500,"settings":{"method":"aes-256-gcm"}}' 20000 40000; then
+    fail 'default-network shadowsocks stays TCP-only'
+else
+    pass 'default-network shadowsocks stays TCP-only'
+fi
+check 'shadowsocks network=udp flagged' _xh_hop_conflict \
+    '{"protocol":"shadowsocks","port":31500,"settings":{"network":"udp"}}' 20000 40000
+check 'shadowsocks network=tcp,udp flagged' _xh_hop_conflict \
+    '{"protocol":"shadowsocks","port":31500,"settings":{"network":"tcp,udp"}}' 20000 40000
 if _xh_hop_conflict '{"protocol":"shadowsocks","port":31500,"settings":{"network":"tcp"}}' 20000 40000; then fail 'TCP-only shadowsocks not flagged'; else pass 'TCP-only shadowsocks not flagged'; fi
 check 'mkcp transport inbound flagged' _xh_hop_conflict \
     '{"protocol":"vless","port":31500,"streamSettings":{"network":"mkcp"}}' 20000 40000
