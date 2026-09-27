@@ -748,11 +748,10 @@ _hy2_no_hop_rules_at_all() {
 #   - 同 dport 但目标端口不同      -> 拒绝(该范围已被其他节点占用, 避免两个 DNAT 规则并存)
 # R19: 每次调用只执行一次 iptables -S(整个 range 循环复用同一快照),
 #      且 -S 失败显式 return 1——绝不把"查不到规则"当成"无冲突"而继续 ADD(与 remove 同标准)。
-# R35(P1): stdout 输出"本次事务实际新增的 range"(CREATED 集合)。幂等跳过的既有规则绝不输出
-#      ——调用方据此精确回滚本事务副作用, 而非按请求全量 remove(会误删事务前已存在的规则)。
-# R36(P2): CREATED 只表达 IPv4 侧副作用。IPv6 为 best-effort(R14), 独立于 IPv4 检查/补建
-#      ——即使 IPv4 幂等跳过也继续尝试 IPv6, 避免"曾失败就永久不再重试"; IPv6 不进 CREATED、
-#      不参与 rollback ownership(移除仍靠 IPv4 幂等 skip 保护)。
+# R35(P1): stdout 输出本次事务实际新增的 family-tagged records(空格分隔, 可跨命令替换完整传递);
+#      幂等跳过的既有规则绝不输出, 回滚只处理 CREATED, 不误删事务前已存在的规则。
+# R36(P2): CREATED records are family-tagged (`v4:<range>` / `v6:<range>`). IPv6 remains best-effort
+# for creation/persistence, but any successful IPv6 insertion is tracked so rollback ownership is exact.
 # 返回: 0 全部成功; 1 任一范围冲突/查询失败/添加失败
 _hy2_add_hop_rules() {
     # R28 设计边界: hop ownership 由 (dport, 目标端口) 构成, 记录在 iptables + metadata(hop_ranges);
@@ -767,13 +766,43 @@ _hy2_add_hop_rules() {
     # R36(P2): IPv6 快照一次获取并复用。v6ok 标记 ip6tables 命令可用(空表也须进入补建分支);
     # 查询失败仅警告, IPv6 跳跃规则整体跳过(仅 IPv4 生效)。v6q 为空表示"无既有 IPv6 规则"。
     if command -v ip6tables >/dev/null 2>&1; then
-        v6ok=1
-        v6q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || {
+        if v6q=$(ip6tables -t nat -S PREROUTING 2>/dev/null); then
+            v6ok=1
+        else
             _warn "无法读取 IPv6 PREROUTING 规则, 本次仅维护 IPv4 跳跃规则(best-effort)"
             v6q=""
-        }
+            v6ok=""
+        fi
     fi
     for range in "$@"; do
+        local req_start req_end existing existing_range existing_target existing_start existing_end idx
+        req_start="${range%%:*}"
+        req_end="$req_start"
+        [ "$range" = "$req_start" ] || req_end="${range##*:}"
+        while IFS= read -r existing; do
+            [[ "$existing" == *xray-deploy-hy2-hop* ]] || continue
+            local fields=()
+            read -ra fields <<< "$existing"
+            existing_range=""; existing_target=""
+            for ((idx=0; idx<${#fields[@]}; idx++)); do
+                case "${fields[$idx]}" in
+                    --dport) existing_range="${fields[$((idx+1))]:-}" ;;
+                    --to-destination) existing_target="${fields[$((idx+1))]:-}" ;;
+                esac
+            done
+            [[ "$existing_range" =~ ^[0-9]{1,5}(:[0-9]{1,5})?$ ]] || continue
+            existing_start="${existing_range%%:*}"
+            existing_end="$existing_start"
+            [ "$existing_range" = "$existing_start" ] || existing_end="${existing_range##*:}"
+            _validate_port "$existing_start" && _validate_port "$existing_end" || continue
+            if [ "$req_start" -le "$existing_end" ] && [ "$req_end" -ge "$existing_start" ]; then
+                if [ "$existing_target" != ":${hy2_port}" ]; then
+                    _error "端口范围 ${range} 与现有范围 ${existing_range} 数值重叠且指向其他节点, 拒绝添加"
+                    return 1
+                fi
+            fi
+        done <<< "$q"
+
         local dports
         dports=$(printf '%s\n' "$q" | grep "xray-deploy-hy2-hop" \
                 | grep -e "dport ${range} " -e "dport ${range}\$")
@@ -788,11 +817,32 @@ _hy2_add_hop_rules() {
             iptables -t nat -A PREROUTING -p udp --dport "${range}" \
                 -m comment --comment "xray-deploy-hy2-hop" \
                 -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || return 1
-            echo "$range"
+            printf 'v4:%s ' "$range"
         fi
         # R36(P2): IPv6 独立补建——即使 IPv4 已存在也检查/添加, 保证 best-effort 可重试
         if [ -n "$v6ok" ]; then
-            local v6d
+            local v6_existing v6_range v6_target v6_start v6_end
+            while IFS= read -r v6_existing; do
+                [[ "$v6_existing" == *xray-deploy-hy2-hop* ]] || continue
+                local v6_fields=() v6_idx
+                read -ra v6_fields <<< "$v6_existing"
+                v6_range=""; v6_target=""
+                for ((v6_idx=0; v6_idx<${#v6_fields[@]}; v6_idx++)); do
+                    case "${v6_fields[$v6_idx]}" in
+                        --dport) v6_range="${v6_fields[$((v6_idx+1))]:-}" ;;
+                        --to-destination) v6_target="${v6_fields[$((v6_idx+1))]:-}" ;;
+                    esac
+                done
+                [[ "$v6_range" =~ ^[0-9]{1,5}(:[0-9]{1,5})?$ ]] || continue
+                v6_start="${v6_range%%:*}"; v6_end="$v6_start"
+                [ "$v6_range" = "$v6_start" ] || v6_end="${v6_range##*:}"
+                _validate_port "$v6_start" && _validate_port "$v6_end" || continue
+                if [ "$req_start" -le "$v6_end" ] && [ "$req_end" -ge "$v6_start" ] \
+                   && [ "$v6_target" != ":${hy2_port}" ]; then
+                    _error "IPv6 端口范围 ${range} 与现有范围 ${v6_range} 数值重叠且指向其他节点, 拒绝添加"
+                    return 1
+                fi
+            done <<< "$v6q"
             v6d=$(printf '%s\n' "$v6q" | grep "xray-deploy-hy2-hop" \
                     | grep -e "dport ${range} " -e "dport ${range}\$")
             if [ -n "$v6d" ]; then
@@ -800,10 +850,13 @@ _hy2_add_hop_rules() {
                     _warn "IPv6 端口范围 ${range} 已被其他规则占用(目标端口不同), 未添加 IPv6 跳跃规则"
                 fi
             else
-                ip6tables -t nat -A PREROUTING -p udp --dport "${range}" \
-                    -m comment --comment "xray-deploy-hy2-hop" \
-                    -j DNAT --to-destination ":${hy2_port}" 2>/dev/null || \
+                if ! ip6tables -t nat -A PREROUTING -p udp --dport "${range}" \
+                     -m comment --comment "xray-deploy-hy2-hop" \
+                     -j DNAT --to-destination ":${hy2_port}" 2>/dev/null; then
                     _warn "IPv6 Hysteria2 跳跃规则添加失败(${range}, 可能缺少 IPv6 NAT 支持)"
+                else
+                    printf 'v6:%s ' "$range"
+                fi
             fi
         fi
     done
@@ -979,19 +1032,82 @@ _hy2_persist_iptables() {
 # ---------------------------------------------------------------------------
 # Hysteria2 端口跳跃事务(R15): runtime iptables 修改 + 持久化 + 节点 metadata 必须整体成功,
 # 任一步失败回滚已发生的变更, 保证 iptables 与 metadata 不永久分叉。
-# 调用方先纯内存生成 newmeta(完整新 metadata, 含 share_link; 失败则不进入事务)。
+# 事务在 config lock 内重读 metadata 并重建提交 payload, 不使用锁外的完整 metadata 快照。
 # 用法: _hy2_hop_txn <add|remove> <meta> <newmeta> <port> <range...>
 # 返回: 0 全部成功提交; 1 任一步失败(已回滚 runtime 并重新持久化)
 _hy2_hop_txn() {
-    local op="$1" meta="$2" newmeta="$3" port="$4"; shift 4
-    # 1+2. runtime 修改 + 原子持久化(失败自动回滚 runtime)
-    if ! _hy2_hop_apply "$op" "$port" "$@"; then
+    _with_config_lock _with_config_write_barrier _hy2_hop_txn_locked "$@"
+}
+
+_hy2_hop_txn_locked() {
+    local op="$1" meta="$2" _stale_newmeta="$3" port="$4"; shift 4
+    local created tag orig current_port current_ranges requested_ranges hopmeta newmeta range normalized rs re
+    # 非 config writer 的 runtime+metadata 事务也必须遵守同一 pending guard。
+    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
+       && ! _txn_allow_config_write; then
+        return 1
+    fi
+    orig=$(cat "$meta" 2>/dev/null) || { _error "读取 Hysteria2 元数据失败: $meta"; return 1; }
+    tag=$(jq -r '.tag // empty' <<< "$orig" 2>/dev/null)
+    current_port=$(jq -r '.port // empty' <<< "$orig" 2>/dev/null)
+    if [ -z "$tag" ] || [ "$meta" != "$NODES_DIR/${tag}.json" ] || [ "$current_port" != "$port" ] || \
+       [ "$(jq -r '.protocol // empty' <<< "$orig" 2>/dev/null)" != hysteria2 ]; then
+        _error "节点元数据已变化, 拒绝修改端口跳跃: $meta"
+        return 1
+    fi
+    _hy2_hop_meta_ok "$tag" || return 1
+    current_ranges=$(_read_hop_ranges "$meta")
+    requested_ranges="$*"
+    if [ "$op" = add ]; then
+        [ -z "$current_ranges" ] || { _error "节点端口跳跃状态已变化, 请重新选择"; return 1; }
+        if ! jq -e --arg t "$tag" --argjson p "$port" '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria" and .port == $p)] | length == 1' "$CONFIG_FILE" >/dev/null 2>&1; then
+            _error "config 中的节点已变化, 拒绝启用端口跳跃"
+            return 1
+        fi
+        normalized=""
+        for range in "$@"; do
+            rs="${range%%:*}"; re="$rs"
+            [ "$range" = "$rs" ] || re="${range##*:}"
+            if [ "$rs" = "$re" ]; then normalized="${normalized:+$normalized,}$rs"
+            else normalized="${normalized:+$normalized,}$rs-$re"
+            fi
+        done
+        hopmeta=$(jq --arg r "$normalized" '.hop_ranges=$r | .udp_hop_ports=$r | del(.hop_start) | del(.hop_end)' <<< "$orig") || return 1
+    elif [ "$op" = remove ]; then
+        [ -n "$current_ranges" ] && [ "$current_ranges" = "$requested_ranges" ] || {
+            _error "节点端口跳跃范围已变化, 请重新选择"; return 1;
+        }
+        if ! jq -e --arg t "$tag" --argjson p "$port" '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria" and .port == $p)] | length == 1' "$CONFIG_FILE" >/dev/null 2>&1; then
+            _error "config 中的节点已变化, 拒绝禁用端口跳跃"
+            return 1
+        fi
+        hopmeta=$(jq 'del(.hop_ranges) | del(.hop_start) | del(.hop_end) | del(.udp_hop_ports)' <<< "$orig") || return 1
+    else
+        _error "未知的端口跳跃事务类型: $op"
+        return 1
+    fi
+    newmeta=$(_hy2_gen_newmeta "$meta" "$hopmeta") || { _error "重建分享链接失败"; return 1; }
+    # 1+2. runtime 修改 + 原子持久化(失败自动回滚 runtime)。保留 CREATED 集合供 metadata
+    # 提交失败时精确回滚; add 的幂等跳过项不属于本事务, 不能因后续失败而被删除。
+    if ! created=$(_hy2_hop_apply "$op" "$port" "$@"); then
         return 1
     fi
     # 3. 原子提交 metadata(_atomic_write_json 失败时目标文件原样, 无需恢复 metadata)
     if ! _atomic_write_json "$meta" "$newmeta"; then
         _error "节点 metadata 提交失败, 回滚运行时规则..."
-        _hy2_hop_reverse "$op" "$port" "$@" || _error "回滚运行时规则失败, 请手动检查 iptables"
+        if [ "$op" = add ]; then
+            local created_ranges=()
+            [ -n "$created" ] && read -ra created_ranges <<< "$created"
+            if [ ${#created_ranges[@]} -gt 0 ]; then
+                if ! _hy2_hop_reverse add "$port" "${created_ranges[@]}"; then
+                    _error "回滚运行时规则失败, 请手动检查 iptables"
+                fi
+            fi
+        else
+            if ! _hy2_hop_reverse remove "$port" "$@"; then
+                _error "回滚运行时规则失败, 请手动检查 iptables"
+            fi
+        fi
         return 1
     fi
     return 0
@@ -1000,11 +1116,10 @@ _hy2_hop_txn() {
 # runtime 修改 + 原子持久化; 持久化失败则回滚 runtime 并重新持久化, 返回 1
 _hy2_hop_apply() {
     local op="$1" port="$2"; shift 2
-    local created rc
+    local created="" rc
     if [ "$op" = add ]; then
-        # IPv4 添加失败时可能有部分 range 已加入, 先回滚再返回。
-        # R35(P1): created 只含本事务实际新增的 range(_hy2_add_hop_rules 输出, 幂等跳过的
-        # 既有规则不在内); 回滚只删 created, 绝不误删事务开始前已存在的同目标规则。
+        # R35(P1): created 只含本事务实际新增的 family-tagged records; 幂等跳过的既有规则不在内,
+        # 回滚只删 CREATED, 绝不误删事务开始前已存在的同目标规则。
         created=$(_hy2_add_hop_rules "$port" "$@"); rc=$?
         if [ "$rc" != 0 ]; then
             _warn "跳跃规则添加失败, 回滚本事务实际新增的规则..."
@@ -1032,16 +1147,46 @@ _hy2_hop_apply() {
         fi
         return 1
     fi
+    printf '%s' "$created"
     return 0
 }
 
-# 反向操作: add 的回滚 = remove; remove 的回滚 = add(幂等)。
+# Remove only transaction-owned family-tagged records emitted by _hy2_add_hop_rules.
+# Records are v4:<range> or v6:<range>; an untagged legacy record is treated as v4.
+_hy2_remove_created_hop_rules() {
+    local port="$1" rec family range cmd q specs line remain rc=0
+    shift
+    for rec in "$@"; do
+        case "$rec" in
+            v4:*) family=v4; range="${rec#v4:}" ;;
+            v6:*) family=v6; range="${rec#v6:}" ;;
+            *) family=v4; range="$rec" ;;
+        esac
+        [ -n "$range" ] || continue
+        if [ "$family" = v6 ]; then cmd=ip6tables; else cmd=iptables; fi
+        q=$($cmd -t nat -S PREROUTING 2>/dev/null) || { rc=1; continue; }
+        specs=$(printf '%s\n' "$q" | grep 'xray-deploy-hy2-hop' \
+            | grep -e "dport ${range} " -e "dport ${range}\$" \
+            | _hy2_match_target "$port" | sed 's/^-A/-D/') || specs=""
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            $cmd -t nat $line 2>/dev/null || rc=1
+        done <<< "$specs"
+        q=$($cmd -t nat -S PREROUTING 2>/dev/null) || { rc=1; continue; }
+        remain=$(printf '%s\n' "$q" | grep 'xray-deploy-hy2-hop' \
+            | grep -e "dport ${range} " -e "dport ${range}\$" \
+            | _hy2_match_target "$port") || remain=""
+        [ -z "$remain" ] || rc=1
+    done
+    return "$rc"
+}
+
 # 返回 0=回滚成功; 1=回滚过程中仍有失败(runtime 或持久化), 调用方必须显式报告, 不能当作"已恢复原状"
 _hy2_hop_reverse() {
     local op="$1" port="$2"; shift 2
     local ok=0
     if [ "$op" = add ]; then
-        _hy2_remove_hop_rules "$port" "$@" || ok=1
+        _hy2_remove_created_hop_rules "$port" "$@" || ok=1
     else
         # R35(P1): 恢复操作不需要 CREATED 集合输出(add 的 stdout 仅由 _hy2_hop_apply/retarget
         # 按需捕获), 显式丢弃, 避免裸行泄漏到终端
@@ -1203,7 +1348,7 @@ _hy2_hop_retarget() {
         # 三步都尽力执行并聚合结果
         local rok=0
         # shellcheck disable=SC2086
-        _hy2_remove_hop_rules "$newport" $created_new 2>/dev/null || rok=1
+        _hy2_remove_created_hop_rules "$newport" $created_new 2>/dev/null || rok=1
         _hy2_add_hop_rules "$oldport" "$@" >/dev/null 2>/dev/null || rok=1
         _hy2_persist_iptables 2>/dev/null || rok=1
         [ "$rok" = 1 ] && _error "端口回滚不完整, 请手动检查 iptables"
@@ -1213,7 +1358,7 @@ _hy2_hop_retarget() {
         _warn "iptables 持久化失败, 回滚到旧端口规则..."
         local rok=0
         # shellcheck disable=SC2086
-        _hy2_remove_hop_rules "$newport" $created_new 2>/dev/null || rok=1
+        _hy2_remove_created_hop_rules "$newport" $created_new 2>/dev/null || rok=1
         _hy2_add_hop_rules "$oldport" "$@" >/dev/null 2>/dev/null || rok=1
         _hy2_persist_iptables 2>/dev/null || rok=1
         [ "$rok" = 1 ] && _error "端口回滚不完整, 请手动检查 iptables"
@@ -1264,7 +1409,7 @@ _hy2_gen_port_newmeta() {
        '.port=$p | .name=$n | .share_link=$l' "$meta"
 }
 
-# 端口修改统一事务(R16): 用于 hy2+hop 节点。调用方已用 _hy2_gen_port_newmeta 在内存生成完整 newmeta。
+# 端口修改统一事务(R16): 用于 hy2+hop 节点; 锁内按当前 metadata 重建完整 newmeta。
 # 提交顺序: runtime iptables old→new + 原子持久化(最常见失败点, 失败干净中止、config/metadata 未动)
 #         → 原子提交 metadata → 提交 config(_mutate_config 自带重启校验与失败回滚)。
 # 后两步失败回滚已提交步骤, 保证 config/metadata/iptables 三方一致(全部回到旧端口或全部新端口)。
@@ -1277,13 +1422,42 @@ _hy2_port_txn() {
 }
 
 _hy2_port_txn_locked() {
-    local tag="$1" meta="$2" oldport="$3" newport="$4" newmeta="$5"; shift 5
-    local ranges="$*" orig journal rok
+    local tag="$1" meta="$2" oldport="$3" newport="$4" _stale_newmeta="$5"; shift 5
+    local ranges="$*" orig journal rok current_port current_ranges
     # 本事务临界区标记(local 动态作用域, 事务返回即消失): 自己的 journal 在写 config 时
     # 不算"未收敛现场" —— 见 _txn_allow_config_write 的 port 段。
     local XD_PORT_TXN_ACTIVE=1
     journal="${meta}.porttxn"
-    orig=$(cat "$meta" 2>/dev/null) || return 1
+    orig=$(cat "$meta" 2>/dev/null) || { _error "读取元数据失败: $meta"; return 1; }
+    current_port=$(jq -r '.port // empty' <<< "$orig" 2>/dev/null)
+    if [ "$(jq -r '.tag // empty' <<< "$orig" 2>/dev/null)" != "$tag" ] || \
+       [ "$current_port" != "$oldport" ] || ! _validate_port "$oldport" || ! _validate_port "$newport"; then
+        _error "节点元数据已变化, 请重新选择端口: $tag"
+        return 1
+    fi
+    if ! _hy2_hop_meta_ok "$tag"; then return 1; fi
+    current_ranges=$(_read_hop_ranges "$meta")
+    if [ "$current_ranges" != "$ranges" ]; then
+        _error "节点端口跳跃范围已变化, 请重新选择端口: $tag"
+        return 1
+    fi
+    if ! jq -e --arg t "$tag" --argjson p "$oldport" \
+        '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria" and .port == $p)] | length == 1' \
+        "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "config 中的 Hysteria2 端口已变化, 拒绝开始端口事务: $tag"
+        return 1
+    fi
+    if ! newmeta=$(_hy2_gen_port_newmeta "$meta" "$newport"); then
+        if [ "$(jq -r 'has("share_link") or has("uuid")' <<< "$orig" 2>/dev/null)" = false ]; then
+            local old_name new_name
+            old_name=$(jq -r '.name // empty' <<< "$orig" 2>/dev/null)
+            new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
+            newmeta=$(jq --argjson p "$newport" --arg n "$new_name" '.port=$p | .name=$n' <<< "$orig") || return 1
+        else
+            _error "无法从当前元数据重建端口链接, 事务未开始: $tag"
+            return 1
+        fi
+    fi
     # 0. journal: iptables 是本事务第一个被改动的真实状态, journal 必须先于它落盘
     #    (崩溃残局是四元组 config/metadata/runtime DNAT/persisted DNAT, 恢复判据与修法见
     #    _port_txn_recover: config 未提交 ⇒ 回滚 metadata + retarget 回旧端口, 两者皆幂等)
@@ -2572,6 +2746,26 @@ _find_reality_for_tunnel_tag() {
 }
 
 # ---------------------------------------------------------------------------
+_reality_tunnel_has_surviving_refs() {
+    local tunnel_tag="$1" refs rt removed found tunnel_count
+    shift
+    tunnel_count=$(jq -r --arg t "$tunnel_tag" '[.inbounds[]? | select(.tag == $t and .protocol == "tunnel")] | length' "$CONFIG_FILE" 2>/dev/null) || return 2
+    [ "$tunnel_count" = 1 ] || return 2
+    if ! refs=$(_find_reality_for_tunnel_tag "$tunnel_tag"); then
+        return 2
+    fi
+    while IFS= read -r rt; do
+        [ -n "$rt" ] || continue
+        found=0
+        for removed in "$@"; do
+            [ "$rt" = "$removed" ] && { found=1; break; }
+        done
+        [ "$found" -eq 1 ] || return 0
+    done <<< "$refs"
+    return 1
+}
+
+
 # 采纳单个入站: 从 config.json 推断元数据, 创建 nodes/*.json
 # 返回 0 = 成功, 1 = 跳过(tunnel)
 # ---------------------------------------------------------------------------
@@ -2871,8 +3065,16 @@ _sync_config_check() {
 # 从 config.json 移除孤儿入站 + 关联路由规则
 # ---------------------------------------------------------------------------
 _remove_orphan_inbounds() {
+    _with_config_lock _remove_orphan_inbounds_locked "$@"
+}
+
+_remove_orphan_inbounds_locked() {
     local tags=("$@")
     [ ${#tags[@]} -eq 0 ] && return 0
+    if ! jq -e 'type == "object" and (.inbounds | type == "array")' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "config.json 不可读或结构无效, 无法安全移除孤儿入站"
+        return 1
+    fi
 
     # R26/R27: orphan remove 双向扩展关联结构, 避免留下半套:
     # 选 Reality → 关联 tunnel(唯一键 target port);
@@ -2888,6 +3090,11 @@ _remove_orphan_inbounds() {
     local safe=() excluded=() managed=()
     local tag ttag trc rtags rt
     for tag in "${tags[@]}"; do
+        if ! jq -e --arg t "$tag" 'any(.inbounds[]?; (.tag // "") == $t)' \
+            "$CONFIG_FILE" >/dev/null 2>&1; then
+            excluded+=("$tag")
+            continue
+        fi
         ttag=$(_find_reality_tunnel_tag "$tag"); trc=$?
         if [ "$trc" = "2" ]; then
             excluded+=("$tag")
@@ -5101,6 +5308,10 @@ _rebuild_clash_line() {
 # 这里补齐同一契约。告警文本留在本函数内 —— 有调用点是事务回滚路径的 `|| true`。
 # ---------------------------------------------------------------------------
 _sync_node_clash() {
+    _with_config_lock _sync_node_clash_locked "$@"
+}
+
+_sync_node_clash_locked() {
     local meta="$1" old_name="${2:-}" line name key crc=0
     # 元数据缺必填字段时保留 clash 旧行(它可能仍指向一个可用的旧配置), 但如实返回失败
     if ! line=$(_rebuild_clash_line "$meta"); then
@@ -5475,11 +5686,19 @@ _delete_node_apply_all() {
     if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ]; then
         _mutate_config "$all_filter" && all_ok=1
     else
-        local keep_tags=() kt ktt
+        local keep_tags=() kt ktt rrc
         for kt in "${del_all[@]}"; do
             keep_tags+=("$kt")
             ktt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${kt}.json" 2>/dev/null)
-            [ -n "$ktt" ] && keep_tags+=("$ktt")
+            [ -n "$ktt" ] || continue
+            _reality_tunnel_has_surviving_refs "$ktt" "${del_all[@]}"; rrc=$?
+            if [ "$rrc" = 0 ]; then
+                continue
+            elif [ "$rrc" = 2 ]; then
+                _warn "无法确认 Reality tunnel 是否仍被引用, 保留 tunnel 与路由规则: $ktt"
+                continue
+            fi
+            keep_tags+=("$ktt")
         done
         local rm_json
         rm_json=$(printf '%s\n' "${keep_tags[@]}" | jq -R . | jq -c -s .) || rm_json=""
@@ -5549,10 +5768,22 @@ _delete_node_apply_multi() {
         return 1
     fi
     # 自签证书询问在锁外(_delete_node)完成, 这里只消费回答
-    local del_ttags=() dtt
+    local del_ttags=() dtt rrc existing
     for dt in "${del_tags[@]}"; do
         dtt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${dt}.json" 2>/dev/null)
-        [ -n "$dtt" ] && del_ttags+=("$dtt")
+        [ -n "$dtt" ] || continue
+        _reality_tunnel_has_surviving_refs "$dtt" "${del_tags[@]}"; rrc=$?
+        if [ "$rrc" = 0 ]; then
+            continue
+        elif [ "$rrc" = 2 ]; then
+            _warn "无法确认 Reality tunnel 是否仍被引用, 保留 tunnel 与路由规则: $dtt"
+            continue
+        fi
+        local duplicate=0
+        for existing in "${del_ttags[@]}"; do
+            [ "$existing" = "$dtt" ] && { duplicate=1; break; }
+        done
+        [ "$duplicate" -eq 1 ] || del_ttags+=("$dtt")
     done
 
     local tun_json='[]'
@@ -5603,15 +5834,23 @@ _delete_node_apply_single() {
     fi
     # 读取 tunnel_tag, 一次性删除 tunnel + reality + 路由(原子操作)
     # M2 同口径: type 守卫防止非对象入站/规则元素让 jq 整体报错(手改 config 时删除被拒绝服务)
-    local tunnel_tag
+    local tunnel_tag preserve_tunnel=0 shared_rc proto
     tunnel_tag=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+    proto=$(jq -r '.protocol // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+    if [ -n "$tunnel_tag" ] && { [ "$proto" = vless-tcp-reality-vision ] || [ "$proto" = vless-xhttp-reality ]; }; then
+        _reality_tunnel_has_surviving_refs "$tunnel_tag" "$tag"; shared_rc=$?
+        case "$shared_rc" in
+            0) preserve_tunnel=1 ;;
+            2) preserve_tunnel=1; _warn "无法确认 Reality tunnel 是否仍被引用, 保留 tunnel 与路由规则: $tunnel_tag" ;;
+        esac
+    fi
     local jq_filter='.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))'
-    if [ -n "$tunnel_tag" ]; then
+    if [ -n "$tunnel_tag" ] && [ "$preserve_tunnel" -eq 0 ]; then
         jq_filter="$jq_filter | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag | index(\$tg)) == null)))
             | .inbounds |= map(select((type != \"object\") or ((.tag // \"\") != \$tg)))"
     fi
     # R17/R30(P1)/R31(P1): hop 校验与 teardown 都在锁内完成; 任一失败即取消删除, 节点保持原状。
-    local proto hop_port ranges=""
+    local hop_port ranges=""
     if ! proto=$(_node_protocol_safe "$tag"); then
         return 1
     fi
@@ -5689,7 +5928,20 @@ _reality_port_txn() {
 _reality_port_txn_locked() {
     local tag="$1" meta="$2" oldport="$3" newport="$4"
     # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明)
-    local XD_PORT_TXN_ACTIVE=1
+    local XD_PORT_TXN_ACTIVE=1 current_tag current_port
+    current_tag=$(jq -r '.tag // empty' "$meta" 2>/dev/null) || return 1
+    current_port=$(jq -r '.port // empty' "$meta" 2>/dev/null) || return 1
+    if [ "$current_tag" != "$tag" ] || [ "$current_port" != "$oldport" ] || \
+       ! _validate_port "$oldport" || ! _validate_port "$newport"; then
+        _error "Reality 节点元数据已变化, 请重新选择端口: $tag"
+        return 1
+    fi
+    if ! jq -e --arg t "$tag" --argjson p "$oldport" \
+        '[.inbounds[]? | select(.tag == $t and .protocol == "vless" and .port == $p and .streamSettings.realitySettings != null)] | length == 1' \
+        "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "config 中的 Reality 节点已变化, 拒绝开始端口事务: $tag"
+        return 1
+    fi
     # R42: 先经唯一入口判模式。direct 模式无 tunnel/路由需要同步, tunnel_tag 保持空,
     # 下面的事务天然退化为"只处理主入站"(new_tunnel_tag 与 jq 的 tunnel 段都受 -n 保护);
     # 绝不能让 direct 节点走 tunnel 分支的 fail-closed —— 那会把它永久锁成不能改端口。
@@ -5840,7 +6092,8 @@ _reality_port_txn_locked() {
 
 # ---------------------------------------------------------------------------
 # 非 hop 端口修改的统一事务(与 _hy2_port_txn / Reality 分支同模型)。
-# 调用方已在内存生成完整 newmeta(port + name + share_link), 事务内只做两步提交:
+# 锁内从当前 metadata 重建 newmeta(port + name + share_link), 不覆盖锁外出现的其它字段更新;
+# 事务内只做两步提交:
 #   1. 原子提交 metadata —— 失败干净中止, config 未动;
 #   2. 提交 config(_mutate_config 自带 verified-restart 与失败回滚); 失败则回滚 metadata。
 # **顺序不可交换**: 先 config 后 metadata 会在 metadata 写失败时留下 "config 新端口 /
@@ -5901,14 +6154,77 @@ _port_txn_journal_write() {  # <old_path> <new_path> <kind> <oldport> <newport> 
     _atomic_write_json "${old_path}.porttxn" "$payload"
 }
 
+_port_txn_build_newmeta() {
+    local meta="$1" orig="$2" oldport="$3" newport="$4"
+    local proto old_name new_name tmpm newlink="" rebuild_rc=0 newmeta=""
+    proto=$(jq -r '.protocol // empty' <<< "$orig" 2>/dev/null) || return 1
+    old_name=$(jq -r '.name // empty' <<< "$orig" 2>/dev/null) || return 1
+    new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
+    if [ "$proto" = hysteria2 ]; then
+        if newmeta=$(_hy2_gen_port_newmeta "$meta" "$newport"); then
+            printf '%s' "$newmeta"
+            return 0
+        fi
+        # Test/adopted metadata without any link identity can only update its numeric port/name.
+        if [ "$(jq -r 'has("share_link") or has("uuid")' <<< "$orig")" = false ]; then
+            jq --argjson p "$newport" --arg n "$new_name" '.port=$p | .name=$n' <<< "$orig"
+            return $?
+        fi
+        return 1
+    fi
+    tmpm=$(mktemp "${meta}.port.XXXXXX") || return 1
+    if ! jq --argjson p "$newport" --arg n "$new_name" '.port=$p | .name=$n' <<< "$orig" > "$tmpm"; then
+        rm -f "$tmpm"
+        return 1
+    fi
+    case "$proto" in
+        vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$tmpm") || rebuild_rc=1 ;;
+        vless-enc) newlink=$(_rebuild_vless_enc_link "$tmpm") || rebuild_rc=1 ;;
+        vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$tmpm") || rebuild_rc=1 ;;
+        *)
+            local oldlink
+            oldlink=$(jq -r '.share_link // empty' <<< "$orig" 2>/dev/null)
+            newlink=$(_rewrite_link_port "$oldlink" "$oldport" "$newport")
+            [ -n "$newlink" ] || rebuild_rc=1
+            ;;
+    esac
+    if [ "$rebuild_rc" -ne 0 ] || [ -z "$newlink" ]; then
+        newmeta=$(cat "$tmpm" 2>/dev/null) || newmeta=""
+    else
+        newmeta=$(jq --arg l "$newlink" '.share_link=$l' "$tmpm") || newmeta=""
+    fi
+    rm -f "$tmpm"
+    [ -n "$newmeta" ] || return 1
+    printf '%s' "$newmeta"
+}
+
+
 _port_txn_locked() {
-    local tag="$1" meta="$2" newport="$3" newmeta="$4" orig oldport journal
+    local tag="$1" meta="$2" newport="$3" _stale_newmeta="$4" expected_oldport="${5:-}" orig oldport journal newmeta
     # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明)
     local XD_PORT_TXN_ACTIVE=1
     journal="${meta}.porttxn"
+    [ -n "$_stale_newmeta" ] || { _error "新元数据为空, 端口事务未开始"; return 1; }
     orig=$(cat "$meta" 2>/dev/null) || { _error "读取元数据失败: $meta"; return 1; }
     [ -n "$orig" ] || { _error "元数据为空, 放弃端口修改: $meta"; return 1; }
     oldport=$(jq -r '.port // empty' <<< "$orig" 2>/dev/null)
+    if [ "$(jq -r '.tag // empty' <<< "$orig" 2>/dev/null)" != "$tag" ] || \
+       ! _validate_port "$oldport" || ! _validate_port "$newport"; then
+        _error "节点元数据已变化, 请重新选择端口: $tag"
+        return 1
+    fi
+    if [ -n "$expected_oldport" ] && [ "$expected_oldport" != "$oldport" ]; then
+        _error "节点端口已变化, 请重新选择端口: $tag"
+        return 1
+    fi
+    if [ -f "$CONFIG_FILE" ] && ! jq -e --arg t "$tag" --argjson p "$oldport" '[.inbounds[]? | select(.tag == $t and .port == $p)] | length == 1' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "config 中的节点端口已变化, 拒绝开始端口事务: $tag"
+        return 1
+    fi
+    newmeta=$(_port_txn_build_newmeta "$meta" "$orig" "$oldport" "$newport") || {
+        _error "无法从当前节点元数据重建端口链接, 事务未开始: $tag"
+        return 1
+    }
     # 1. journal: 先于任何真实状态改动落盘
     if ! _port_txn_journal_write "$meta" "$meta" port "$oldport" "$newport" "" "$orig" "$newmeta"; then
         _error "端口事务 journal 写入失败, 未做任何修改"
@@ -5991,7 +6307,7 @@ _ptx_journal_quarantine() {
 # 必须一致(否则身份校验与收敛会基于错位的数据)。
 # 用法: _ptx_journal_ok <journal>; 0=合法
 _ptx_journal_ok() {
-    jq -e '
+    jq -e --arg nodes "$NODES_DIR" --arg journal "$1" '
       def port_ok: (type == "number") and (. >= 1) and (. <= 65535) and (. == floor);
       def ranges_ok:
         (type == "string") and (. == "")
@@ -6025,11 +6341,15 @@ _ptx_journal_ok() {
        and (.new.port | port_ok)
        and (.old.port == .oldport)
        and (.new.port == .newport)
-       and (.old_path | type == "string" and length > 0)
-       and (.new_path | type == "string" and length > 0)
+       and (.tag | type == "string" and length > 0 and (contains("/") | not) and . != "." and . != "..")
+       and (.newtag | type == "string" and length > 0 and (contains("/") | not) and . != "." and . != "..")
+       and (.old_path == ($nodes + "/" + .tag + ".json"))
+       and (.new_path == ($nodes + "/" + .newtag + ".json"))
+       and ($journal == (.old_path + ".porttxn"))
        and (.ranges | ranges_ok)
        and (if $k == "hy2hop" then (.ranges | length > 0) else (.ranges == "") end)
-       and (if $k == "reality" then .old_path != .new_path else .old_path == .new_path end))
+       and (if $k == "reality" then (.old_path != .new_path and .tag != .newtag)
+            else (.old_path == .new_path and .tag == .newtag) end))
     ' "$1" >/dev/null 2>&1
 }
 
@@ -6045,6 +6365,7 @@ _port_txn_recover_locked() {
     # fail-stop。空目录/全部收敛才返回 0 —— "隔离"也是未收敛, 只是不再自动处理(复审 P1)。
     local failed=0
     for j in "$NODES_DIR"/*.porttxn; do
+        [ -L "$j" ] && { _warn "端口事务 journal 是符号链接, 保留现场待人工核对: $j"; failed=1; continue; }
         [ -f "$j" ] || continue
         # 1) 必须是可解析的 JSON
         if ! jq -e . "$j" >/dev/null 2>&1; then
@@ -6069,21 +6390,47 @@ _port_txn_recover_locked() {
         new_path=$(jq -r '.new_path' "$j" 2>/dev/null)
         ranges=$(jq -r '.ranges // ""' "$j" 2>/dev/null)
 
-        # (a) config 侧判据: 本事务的目标状态(tag + 端口)是否已在 config 里
-        cfg_tag="$tag"
-        [ "$kind" = "reality" ] && cfg_tag="$newtag"
-        committed=0
-        if [ -f "$CONFIG_FILE" ]; then
-            [ "$(jq -r --arg t "$cfg_tag" --argjson p "$newport" \
-                '[.inbounds[]? | select(.tag == $t and .port == $p)] | length > 0' \
-                "$CONFIG_FILE" 2>/dev/null)" = "true" ] && committed=1
+        # (a) config is the recovery authority; unreadable, malformed, or non-canonical states
+        # cannot be guessed as "not committed" because that could overwrite newer metadata.
+        local cfg_state
+        if ! jq -e 'type == "object" and (.inbounds | type == "array")' \
+            "$CONFIG_FILE" >/dev/null 2>&1; then
+            _warn "端口事务恢复无法读取有效 config.json, 保留 journal 与现场: $j"
+            failed=1
+            continue
         fi
+        if ! cfg_state=$(jq -er --arg ot "$tag" --arg nt "$newtag" \
+            --argjson op "$oldport" --argjson np "$newport" '
+            ([.inbounds[] | select(type == "object" and .tag == $ot and .port == $op)] | length) as $old_count
+            | ([.inbounds[] | select(type == "object" and .tag == $nt and .port == $np)] | length) as $new_count
+            | if $old_count == 1 and $new_count == 0 then "old"
+              elif $old_count == 0 and $new_count == 1 then "new"
+              else "unknown" end' "$CONFIG_FILE" 2>/dev/null); then
+            _warn "端口事务恢复无法判定 config.json 中的节点状态, 保留 journal: $j"
+            failed=1
+            continue
+        fi
+        case "$cfg_state" in
+            old) committed=0 ;;
+            new) committed=1 ;;
+            *)
+                _warn "端口事务恢复遇到非旧/新目标的 config 状态, 保留 journal 与现场: $j"
+                failed=1
+                continue ;;
+        esac
 
         # (b) 定位 metadata 当前文件(旧名优先), 并做事务身份校验
         cur_path=""
         for p in "$old_path" "$new_path"; do
+            if [ -L "$p" ]; then
+                _warn "端口事务元数据路径是符号链接, 保留 journal 与现场: $p"
+                failed=1
+                cur_path="unsafe"
+                break
+            fi
             [ -f "$p" ] && { cur_path="$p"; break; }
         done
+        [ "$cur_path" = unsafe ] && continue
         if [ -z "$cur_path" ]; then
             # 两个候选路径都没有元数据 —— 说不清的现场, 与其它非法 journal 同策: 隔离而非删除
             _ptx_journal_quarantine "$j" "对应的元数据文件已不存在"
@@ -6275,7 +6622,7 @@ _modify_port() {
             _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
             _press_any_key; return 1
         }
-        if ! _port_txn "$tag" "$meta" "$newport" "$newmeta"; then
+        if ! _port_txn "$tag" "$meta" "$newport" "$newmeta" "$oldport"; then
             _press_any_key; return 1
         fi
         # 链接已随 metadata 一次提交; 这里补 clash 派生缓存(传 old_name: 改名后必须删掉旧名
@@ -6318,7 +6665,7 @@ _modify_port() {
     rm -f "$tmpm"
     [ -n "$newmeta" ] || { _error "生成元数据失败"; _press_any_key; return 1; }
 
-    if ! _port_txn "$tag" "$meta" "$newport" "$newmeta"; then
+    if ! _port_txn "$tag" "$meta" "$newport" "$newmeta" "$oldport"; then
         _press_any_key; return 1
     fi
     # F1: config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
@@ -6329,6 +6676,53 @@ _modify_port() {
 }
 
 # ---------------------------------------------------------------------------
+_update_listen_commit() {
+    _with_config_lock _with_config_write_barrier _update_listen_commit_locked "$@"
+}
+
+_update_listen_commit_locked() {
+    local tag="$1" expected="$2" newlisten="$3" newaddr="$4" newlink="$5"
+    local meta="$NODES_DIR/${tag}.json" now old_inbound oldlisten had_listen
+    now=$(_node_identity "$tag") || { _error "无法重新读取节点身份, 监听未更新: $tag"; return 1; }
+    if [ "$now" != "$expected" ]; then
+        _error "节点内容已变化, 请重新选择监听地址: $tag"
+        return 1
+    fi
+    old_inbound=$(jq -c --arg t "$tag" '[.inbounds[]? | select(.tag == $t)]' "$CONFIG_FILE" 2>/dev/null) || return 1
+    [ "$(jq -r 'length' <<< "$old_inbound" 2>/dev/null)" = 1 ] || {
+        _error "config 中的节点已变化, 监听未更新: $tag"
+        return 1
+    }
+    had_listen=$(jq -r '.[0] | has("listen")' <<< "$old_inbound")
+    oldlisten=$(jq -c '.[0].listen' <<< "$old_inbound")
+    if ! _mutate_config --arg t "$tag" --arg l "$newlisten" \
+         '(.inbounds[] | select(.tag == $t) | .listen) = $l'; then
+        _error "监听修改失败, 已回滚"
+        return 1
+    fi
+    if [ -n "$newlink" ]; then
+        if _meta_update "$meta" '.listen=$l | .link_addr=$a
+            | (if has("preferred_addr") then .preferred_addr=$a else . end)
+            | .share_link=$link' \
+            --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink"; then
+            return 0
+        fi
+    else
+        if _meta_update "$meta" '.listen=$l | .link_addr=$a
+            | (if has("preferred_addr") then .preferred_addr=$a else . end)' \
+            --arg l "$newlisten" --arg a "$newaddr"; then
+            return 0
+        fi
+    fi
+    _error "监听元数据写入失败, 正在恢复 config 监听..."
+    if ! _mutate_config --arg t "$tag" --argjson old "$oldlisten" --argjson had "$had_listen" \
+        '(.inbounds[] | select(.tag == $t)) |= (if $had then .listen=$old else del(.listen) end)'; then
+        _error "config 监听回滚失败, 请手动检查节点与 metadata"
+    fi
+    return 1
+}
+
+
 # 更新监听(单节点 R7)
 # ---------------------------------------------------------------------------
 _update_listen() {
@@ -6356,6 +6750,8 @@ _update_listen() {
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
     local meta="$NODES_DIR/${tag}.json"
+    local listen_identity
+    listen_identity=$(_node_identity "$tag") || { _error "无法读取节点身份, 监听未更新"; _press_any_key; return 1; }
     local curlisten; curlisten=$(jq -r '.listen' "$meta")
     echo -e "  当前监听: ${CYAN}${curlisten}${NC}"
     echo -e "  可选: :: (双栈默认) / 0.0.0.0 / 127.0.0.1 (回环, 供 cloudflared/中转回源) / ::1 / 具体 IP"
@@ -6365,12 +6761,8 @@ _update_listen() {
         _warn "监听地址不合法"; _press_any_key; return
     fi
 
-    if ! _mutate_config --arg t "$tag" --arg l "$newlisten" \
-         '(.inbounds[] | select(.tag == $t) | .listen) = $l'; then
-        _error "监听修改失败, 已回滚"; _press_any_key; return
-    fi
+    # 联动链接服务器地址(R7 确认 A); 所有提示与验证必须先于 config 提交。
 
-    # 联动链接服务器地址(R7 确认 A)
     local proto oldaddr newaddr
     proto=$(jq -r '.protocol' "$meta")
     oldaddr=$(jq -r '.link_addr' "$meta")
@@ -6408,16 +6800,12 @@ _update_listen() {
     local oldlink newlink
     oldlink=$(jq -r '.share_link' "$meta" 2>/dev/null)
     newlink=$(_rewrite_link_addr "$oldlink" "$newaddr")
-    if [ -n "$newlink" ]; then
-        _meta_update "$meta" '.listen=$l | .link_addr=$a
-            | (if has("preferred_addr") then .preferred_addr=$a else . end)
-            | .share_link=$link' \
-            --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
-    else
+    if [ -z "$newlink" ]; then
         _warn "分享链接非标准格式(被采纳节点?), 仅更新监听与链接地址记录"
-        _meta_update "$meta" '.listen=$l | .link_addr=$a
-            | (if has("preferred_addr") then .preferred_addr=$a else . end)' \
-            --arg l "$newlisten" --arg a "$newaddr" || { _error "监听元数据写入失败"; _press_any_key; return 1; }
+    fi
+    if ! _update_listen_commit "$tag" "$listen_identity" "$newlisten" "$newaddr" "$newlink"; then
+        _press_any_key
+        return 1
     fi
     # F1: 监听/链接地址变化需同步 clash 条目的 server 字段(失败只提示, 不回滚权威状态)
     _sync_node_clash "$meta" || \

@@ -48,6 +48,38 @@ _pq_infra_failed() { [ -e "$(_pq_infra_flag_file)" ]; }
 # `out=$(_pq_run_bounded ...)`, 命令替换的子 shell 会把变量赋值丢掉 —— 变量形态的标志
 # 在真实调用路径上**永远读不到**(详见 _pq_infra_flag_file 上方说明)。
 # ---------------------------------------------------------------------------
+_pq_fallback_stop() {
+    local pid="$1" pidfile="$2" use_setsid="$3" child_pgid=""
+    if [ "$use_setsid" -eq 1 ]; then
+        # setsid --wait may fork under job control; let its wrapper record the real session leader.
+        if [ -n "$pidfile" ] && [ ! -s "$pidfile" ] && kill -0 "$pid" 2>/dev/null; then
+            sleep 1
+        fi
+        [ -n "$pidfile" ] && child_pgid=$(cat "$pidfile" 2>/dev/null || true)
+        if [[ "$child_pgid" =~ ^[0-9]+$ ]] && [ "$child_pgid" -gt 1 ]; then
+            kill -9 -- "-$child_pgid" 2>/dev/null || true
+        fi
+    elif command -v pkill >/dev/null 2>&1; then
+        pkill -9 -P "$pid" 2>/dev/null || true
+    fi
+    kill -9 "$pid" 2>/dev/null || true
+}
+
+_pq_fallback_cleanup() {
+    local rc=$?
+    trap - EXIT
+    trap '' HUP INT TERM
+    if [ -n "${_pq_bounded_pid:-}" ]; then
+        _pq_fallback_stop "$_pq_bounded_pid" "${_pq_bounded_pidfile:-}" "${_pq_bounded_use_setsid:-0}"
+        wait "$_pq_bounded_pid" 2>/dev/null || true
+    fi
+    [ -n "${_pq_bounded_tmp:-}" ] && rm -f "$_pq_bounded_tmp"
+    [ -n "${_pq_bounded_pidfile:-}" ] && rm -f "$_pq_bounded_pidfile"
+    exit "$rc"
+}
+
+_pq_fallback_signal() { exit "$1"; }
+
 _pq_run_bounded() {
     local secs="$1"; shift
     _pq_infra_clear
@@ -71,48 +103,41 @@ _pq_run_bounded() {
     fi
     # 走到这里有两种原因: 机器上没有 timeout, 或者有但不支持 -k(旧 busybox)。两条都需要
     # 真硬杀, 故共用下面的看门狗 —— 它的 kill -9 是不依赖 timeout 能力的。
-    local tmp rc
-    # mktemp 失败必须与"被包裹的命令失败"区分开(125): 否则调用方只会报
-    # "xray tls ping 失败", 真正的原因(无法建临时文件)被掩盖, 排障时白绕一圈。
-    tmp=$(mktemp) || { _pq_infra_mark; _warn "无法创建临时文件(磁盘满/只读?), 无法有界执行"; return 125; }
-    # 放进独立进程组再后台执行: 被包裹的是 env + xray, 若 env 未 exec(部分精简
-    # busybox)或命令自身 fork 子进程, 只 kill 直接子进程会留下孙进程继续占用资源。
-    # **进程组隔离必须用 setsid --wait。**裸 `setsid cmd &` 不可用** —— setsid 只在自身不是
-    # 进程组组长时 exec() 原地替换, 否则 fork 后立即退出, 于是 $! 是一个立刻死亡的 PID:
-    # 看门狗 `kill -0 $!` 第一次就失败 → 直接走到 wait → **rc=0 且输出为空**(调用方误报
-    # "tls ping 无输出"), 而真正的 xray 成为孤儿继续跑 —— 有界执行彻底失效。
-    # 实测: `set -m; setsid sleep 5 & pid=$!` 中 pid 立即死亡。
-    # `setsid --wait` 会等待子进程, 其 PID 就是可 wait/kill 的那个, 语义明确。
-    # 无 setsid 时直接后台执行(PID 同样明确), 超时用 pkill -P 兜底孙进程。
-    local use_setsid=0
+    (
+    local tmp rc use_setsid=0 pidfile="" i=0
+    local _pq_bounded_tmp="" _pq_bounded_pidfile="" _pq_bounded_pid="" _pq_bounded_use_setsid=0
+    # The fallback runs in this function's subshell so these traps never replace caller traps.
+    trap _pq_fallback_cleanup EXIT
+    trap '_pq_fallback_signal 129' HUP
+    trap '_pq_fallback_signal 130' INT
+    trap '_pq_fallback_signal 143' TERM
+    # mktemp failure is distinct from a wrapped command failure (125).
+    tmp=$(mktemp) || { _pq_infra_mark; _warn "无法创建临时文件(磁盘满/只读?), 无法有界执行"; exit 125; }
+    _pq_bounded_tmp=$tmp
     if command -v setsid >/dev/null 2>&1 && setsid --wait true >/dev/null 2>&1; then
         use_setsid=1
-    fi
-    if [ "$use_setsid" -eq 1 ]; then
-        setsid --wait "$@" > "$tmp" 2>/dev/null &
+        _pq_bounded_use_setsid=1
+        pidfile=$(mktemp) || { _pq_infra_mark; _warn "无法创建进程跟踪文件(磁盘满/只读?), 无法有界执行"; exit 125; }
+        _pq_bounded_pidfile=$pidfile
+        # The wrapper records the actual session leader: setsid --wait can fork under job control.
+        { setsid --wait sh -c 'printf "%s\n" "$$" > "$1"; shift; exec "$@"' _ "$pidfile" "$@" > "$tmp" 2>/dev/null & _pq_bounded_pid=$!; }
     else
-        "$@" > "$tmp" 2>/dev/null &
+        { "$@" > "$tmp" 2>/dev/null & _pq_bounded_pid=$!; }
     fi
-    local pid=$!
-    local i=0
-    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$secs" ]; do
+    while kill -0 "$_pq_bounded_pid" 2>/dev/null && [ "$i" -lt "$secs" ]; do
         sleep 1; i=$((i+1))
     done
-    if kill -0 "$pid" 2>/dev/null; then
-        # 先按进程组整组杀(setsid --wait 时子进程自成一组, pgid == pid); 失败退回单 PID。
-        # 最后补一次 pkill -P, 覆盖"命令自己 fork 了孙进程"的情况。
-        kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
-        if command -v pkill >/dev/null 2>&1; then
-            pkill -9 -P "$pid" 2>/dev/null || true
-        fi
-        wait "$pid" 2>/dev/null || true
-        rm -f "$tmp"
-        return 124
+    if kill -0 "$_pq_bounded_pid" 2>/dev/null; then
+        _pq_fallback_stop "$_pq_bounded_pid" "$pidfile" "$use_setsid"
+        wait "$_pq_bounded_pid" 2>/dev/null || true
+        _pq_bounded_pid=""
+        exit 124
     fi
-    wait "$pid"; rc=$?
+    if wait "$_pq_bounded_pid"; then rc=0; else rc=$?; fi
+    _pq_bounded_pid=""
     cat "$tmp" 2>/dev/null
-    rm -f "$tmp"
-    return "$rc"
+    exit "$rc"
+    )
 }
 
 # 从 mldsa65 输出里按标签取值(不按行序)。
@@ -139,13 +164,32 @@ _pq_field() {
     return 1
 }
 
+_pq_rawurl_decoded_length() {
+    local encoded="$1" decoded_len
+    decoded_len=$(set -o pipefail; printf '%s=' "$encoded" | tr '_-' '/+' | base64 -d 2>/dev/null | wc -c) || return 1
+    decoded_len="${decoded_len//[[:space:]]/}"
+    [[ "$decoded_len" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$decoded_len"
+}
+
 # ---------------------------------------------------------------------------
 # 检测 target 是否适合启用后量子签名,适合则生成 mldsa65 密钥对
 # 用法:_detect_reality_pq <target_domain:port>
 # 输出(通过全局变量,供 50-nodes 取用):
-#   PQ_SEED   / PQ_VERIFY  —— 满足条件时为密钥对;不满足时为空
-#   PQ_REASON —— 不满足时的原因(供回显)
-# 返回:0=已启用后量子;1=未启用(回显原因)
+#   PQ_SEED   / PQ_VERIFY  —— 满足条件时为密钥对;未启用时为空
+#   PQ_REASON —— 失败原因(供回显)
+#
+# **返回码是三态(2026-09-27 十二轮复审 P2)**: 原实现把"目标明确不支持 PQ"和"探测根本没
+# 成功"都压成 1, 调用方只能看到"非零 ⇒ 把 PQ 字段清空"。于是**一次临时网络超时**(tls ping
+# 失败)会让 `_reality_domain_menu` 删掉节点上已生效的 mldsa65Seed / mldsa65_verify —— 把
+# "结论未知"当成"明确不支持", 用一次失败的探测完成了一次不可逆的降级。两者的正确处置相反:
+#   0 = SUPPORTED     已生成密钥(PQ_SEED/PQ_VERIFY 非空)
+#   1 = UNSUPPORTED   探测**成功**且目标客观上不具备 PQ 能力(无 X25519MLKEM768 / 证书链
+#                     过短)⇒ 调用方可以安全地移除旧 PQ 字段
+#   2 = PROBE_FAILED  探测/取键失败或环境异常(xray 缺失、无法建临时文件、tls ping 非零或
+#                     空输出、mldsa65 失败、输出解析异常)⇒ **结论未知**, 调用方必须保持
+#                     现状(不改写/不删除已有 PQ 配置), 绝不能当成 1
+# 新节点创建路径不需要区分(1 与 2 都只是"这次不启用 PQ"), 只有"切换已有节点"的路径依赖它。
 # ---------------------------------------------------------------------------
 _detect_reality_pq() {
     local target="$1"
@@ -153,11 +197,11 @@ _detect_reality_pq() {
 
     [ -x "$XRAY_BIN" ] || {
         PQ_REASON="Xray 未安装,无法检测后量子"
-        return 1
+        return 2
     }
     [ -z "$target" ] && {
         PQ_REASON="未提供 target 域名"
-        return 1
+        return 2
     }
 
     _info "检测 Reality 后量子兼容性: $target"
@@ -176,18 +220,18 @@ _detect_reality_pq() {
         # **必须查标志文件而不是变量**: 上面那行是命令替换(子 shell), 变量形态的标志读不到
         # (2026-09-22 九轮 OCR #36 —— 旧写法使这一支成为死代码)。
         PQ_REASON="无法创建临时文件(磁盘满/只读?), 未能执行 tls ping"
-        _warn "$PQ_REASON"        # 与其它失败分支一致: 两个调用方都只看返回码, 不读 PQ_REASON
-        return 1
+        _warn "$PQ_REASON"        # 调用方按返回码分流(见函数头三态契约), 不读 PQ_REASON
+        return 2
     fi
     if [ "$ping_rc" -ne 0 ]; then
-        PQ_REASON="xray tls ping 失败(目标不可达/超时/xray 不支持 tls ping)"
+        PQ_REASON="xray tls ping 失败(目标不可达/超时/xray 不支持 tls ping), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
     if [ -z "$ping_out" ]; then
-        PQ_REASON="xray tls ping 无输出(目标不可达或 xray 不支持 tls ping)"
+        PQ_REASON="xray tls ping 无输出(目标不可达或 xray 不支持 tls ping), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
 
     if ! echo "$ping_out" | grep -q "X25519MLKEM768"; then
@@ -203,8 +247,15 @@ _detect_reality_pq() {
         | head -1 | sed 's/.*total length:[^0-9]*\([0-9][0-9]*\).*/\1/')
     [[ "$length" =~ ^[0-9]+$ ]] || length=""
 
-    if [ -z "$length" ] || [ "$length" -le 3500 ]; then
-        PQ_REASON="目标域名支持 X25519MLKEM768,但证书长度不足(${length:-未知} ≤ 3500),忽略 ML-DSA-65"
+    if [ -z "$length" ]; then
+        # 同一次 tls ping 已经打出 PQ 组名, 却取不到证书长度行 ⇒ 解析失败(输出被截断 / xray
+        # 输出格式变化)。这是"结论未知", 不是"证书太短" —— 后者才会真的移除已有 PQ 配置。
+        PQ_REASON="xray tls ping 输出缺少证书链长度, 无法判定 PQ 能力"
+        _warn "$PQ_REASON"
+        return 2
+    fi
+    if [ "$length" -le 3500 ]; then
+        PQ_REASON="目标域名支持 X25519MLKEM768,但证书长度不足(${length} ≤ 3500),忽略 ML-DSA-65"
         _tip "$PQ_REASON"
         return 1
     fi
@@ -217,37 +268,43 @@ _detect_reality_pq() {
         # 与 tls ping 侧同一口径: 查标志而不是比 125, 且必须经**文件**通道(见 #36)。
         PQ_REASON="无法创建临时文件(磁盘满/只读?), 未能执行 mldsa65"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
     if [ "$mldsa_rc" -ne 0 ] || [ -z "$mldsa_out" ]; then
-        PQ_REASON="xray mldsa65 生成失败"
+        PQ_REASON="xray mldsa65 生成失败, 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
     # 按**标签**取值, 不按行序: 旧写法 head -1/tail -1 在输出多一行横幅、少一行、或两行
     # 内容相同时会静默把 Seed/Verify 取成同一个值(实测单行输出即命中), 于是服务端私钥
     # 与客户端验证公钥相同 —— 节点看似创建成功, 后量子签名实际不可用。
-    PQ_SEED=$(_pq_field "$mldsa_out" seed)
-    PQ_VERIFY=$(_pq_field "$mldsa_out" verify)
+    local pq_seed pq_verify seed_bytes verify_bytes
+    pq_seed=$(_pq_field "$mldsa_out" seed) || pq_seed=""
+    pq_verify=$(_pq_field "$mldsa_out" verify) || pq_verify=""
 
-    # 形状校验: 二者都必须非空、互不相同, 且是合法 base64(ML-DSA-65 密钥以 base64 呈现)。
-    # 只做字符集与最小长度, 不硬编码具体长度 —— 避免核心更换参数时误伤。
-    if [ -z "$PQ_SEED" ] || [ -z "$PQ_VERIFY" ] || [ "$PQ_SEED" = "$PQ_VERIFY" ]; then
-        PQ_REASON="解析 mldsa65 输出失败(Seed/Verify 缺失或相同)"
+    if [ -z "$pq_seed" ] || [ -z "$pq_verify" ] || [ "$pq_seed" = "$pq_verify" ]; then
+        PQ_REASON="解析 mldsa65 输出失败(Seed/Verify 缺失或相同), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
-    # 同时接受标准与 URL-safe 字母表: 官方 docs 记的是 base64.StdEncoding, 但下游把
-    # pqv= 直接拼进分享链接(URL 上下文), 且不同版本/构建可能输出 URL-safe。放宽字母表
-    # 只是"不误拒合法密钥"; 形状约束仍由长度与"非空且互不相同"保证。
-    local _b64_re='^[A-Za-z0-9+/_-]+={0,2}$'
-    if [ "${#PQ_SEED}" -lt 16 ] || [ "${#PQ_VERIFY}" -lt 16 ] \
-       || ! [[ "$PQ_SEED" =~ $_b64_re ]] || ! [[ "$PQ_VERIFY" =~ $_b64_re ]]; then
-        PQ_REASON="mldsa65 输出格式异常(非合法 base64), 已放弃"
+    # Sampled Xray v25.9.11/v25.12.8/v26.3.27/v26.7.11/v26.9.9 emit RawURLEncoding: seed=32B, public key=1952B.
+    local _rawurl_re='^[A-Za-z0-9_-]+$'
+    if [ "${#pq_seed}" -ne 43 ] || [ "${#pq_verify}" -ne 2603 ] \
+       || ! [[ "$pq_seed" =~ $_rawurl_re ]] || ! [[ "$pq_verify" =~ $_rawurl_re ]]; then
+        PQ_REASON="mldsa65 输出格式异常(非预期的 RawURLEncoding 长度/字符集), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
+    fi
+    seed_bytes=$(_pq_rawurl_decoded_length "$pq_seed") || seed_bytes=""
+    verify_bytes=$(_pq_rawurl_decoded_length "$pq_verify") || verify_bytes=""
+    if [ "$seed_bytes" != 32 ] || [ "$verify_bytes" != 1952 ]; then
+        PQ_REASON="mldsa65 输出格式异常(Seed/Verify 解码长度不符), 无法判定 PQ 能力"
+        _warn "$PQ_REASON"
+        return 2
     fi
 
+    PQ_SEED=$pq_seed
+    PQ_VERIFY=$pq_verify
     _success "后量子签名已启用: mldsa65Seed / mldsa65Verify 已生成"
     return 0
 }
