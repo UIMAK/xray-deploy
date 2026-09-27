@@ -1,8 +1,11 @@
 #!/bin/bash
 # =============================================================================
 # lib/55-hysteria.sh — Official Hysteria2 Manager(官方 Hysteria2 服务端管理)
-# 与 Xray Hy2(lib/50-nodes.sh 的 hysteria2 协议)是完全独立的两个实现:
-# Xray Hy2     = Xray-core 实现的 hysteria2 协议, _hy2_* 函数族, config.json 模型
+# 与 Xray Hy2(lib/50-nodes.sh 的 hysteria2 节点类型)是完全独立的两个实现:
+# Xray Hy2     = Xray-core 的 `hysteria` 协议 —— 注意 `hysteria2` 是本项目的**节点类型键**
+#                (元数据值/模板名 hysteria2.server.jsonc/_detect_inbound_protocol 的映射结果),
+#                Xray 入站协议表里并没有 `hysteria2` 这个名字; config.json 里写的是
+#                "protocol":"hysteria" + "settings.version":2。_hy2_* 函数族, config.json 模型
 # Official Hy2 = HyNetworks/hysteria 官方 binary(旧组织名 apernet 已 301), _hysteria_* 函数族
 # 两者不得共享配置模型/binary/版本管理/服务/认证与链接生成逻辑。
 #
@@ -1971,9 +1974,10 @@ _hysteria_check_hop_conflicts() {
     fi
     [ -n "$hit" ] && { _error "以下端口已被本机监听, 与跳跃范围冲突:$hit"; return 1; }
     # b) Xray config 中 **UDP 能力** 的入站端口(P2-3: TCP-only 的 vless/reality/xhttp 等
-    # 不与 hysteria 的 UDP 范围冲突 —— TCP 443 与 UDP 443 可共存)。UDP 能力口径:
-    # hysteria2(QUIC)/dokodemo-door 原生 UDP; socks 需 settings.udp=true;
-    # mKCP/QUIC 传输走 UDP。
+    # 不与 hysteria 的 UDP 范围冲突 —— TCP 443 与 UDP 443 可共存)。
+    # **UDP 能力的唯一判据在 `_hysteria_xray_udp_port_ranges`**(那里逐项写明依据与核心源码
+    # 出处); 这里只做区间相交, 不再复述口径 —— 复述过的那份曾把 Xray 的协议键写成不存在的
+    # "hysteria2"、把 shadowsocks 的缺省 network 写成 "tcp,udp", 与实现漂移。
     if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
         while IFS=: read -r p_start p_end; do
             [ -n "$p_start" ] || continue
