@@ -50,8 +50,7 @@ ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.$$"
 # 枚举模块(此时本地根本没有 lib/), 只能靠这份静态清单下载; 而 xray-deploy.sh 靠它 source。
 # 两者漂移会造成"install.sh 认为安装完整、运行时却拒绝启动"(或反过来)。
 # 漂移由 tests/run-tests.sh 的"两份 LIB_MODULES 必须一致"断言守住, 改一处就会报红。
-# 注意: tests/ 按 2026-09-12 决策**不入库**(.gitignore), 所以该断言只在本仓库工作树内可见 ——
-# 从 GitHub 克隆的副本没有它, 改这里时请在本仓库内跑一次测试。
+# tests/ 自 2026-09-27 起随仓库发布, 克隆副本同样能跑该断言(套件只依赖本工作树)。
 LIB_MODULES="00-common 10-system 20-xray-core 30-geo 40-cloudflared 45-logrotate 50-nodes 51-reality-pq 55-hysteria 90-menu"
 TPL_NAMES="vless-tcp-reality-vision-tunnel vless-xhttp-reality-tunnel vless-tcp-reality-vision-direct vless-xhttp-reality-direct tunnel vless-enc vless-xhttp-cdn vless-ws-cdn shadowsocks hysteria2"
 
@@ -283,6 +282,48 @@ _manifest_relpaths() {
     for t in $TPL_NAMES; do printf 'templates/%s.server.jsonc\n' "$t"; done
 }
 
+# ---------------------------------------------------------------------------
+# 快照的两条**持久性**原语(2026-09-27 十二轮复审 P2)。
+#
+# 为什么必须有: `.KEEP` 在**所有** cp 之后才 rename 到位, 所以"cp 到一半掉电"留下的只是
+# `.KEEP.tmp.$$`(未标记目录, 会被清理)—— 那条路径本来是安全的。真正的洞在**顺序**上:
+# 缺落盘屏障时 rename 可能先于备份文件的数据块到达盘面。掉电后 `.KEEP` 已经存在并声明
+# `present lib/x.sh`, 而恢复目录里的 `lib/x.sh` 是零长度/半截 —— 恢复程序只检查"文件存在且
+# 不是 symlink", 于是把一个不完整的备份当成有效快照回滚上去。
+#
+# 两道屏障分工不同, 缺一不可: cmp 管"内容对得上"(cp 中途失败/ENOSPC 都能留下长度不符的
+# 文件), fsync 管"顺序对"(备份数据 + 目录项先落盘, `.KEEP` 这条记账才允许出现)。
+# rename 原子 ≠ 掉电持久 —— 项目其它事务已按这个标准做, 这里补齐同款。
+# ---------------------------------------------------------------------------
+_install_backup_identical() {   # <src> <dst>; 逐字节一致返回 0
+    if command -v cmp >/dev/null 2>&1; then
+        cmp -s "$1" "$2" 2>/dev/null
+        return $?
+    fi
+    # cmp 缺失(裁剪版 busybox)时退回长度比较: 强于"只看存在", 但发现不了等长损坏。
+    [ "$(wc -c < "$1" 2>/dev/null)" = "$(wc -c < "$2" 2>/dev/null)" ]
+}
+
+# 定向落盘。**不用裸 `sync` 兜底** —— 它把"这条路径没刷成功"伪造成成功, 与 90-menu 的
+# `_reset_fsync_strict` 同口径; 两种形式都不支持时返回 1, 由调用方决定降级还是放弃。
+_install_fsync() {   # <path>
+    [ -e "$1" ] || return 0
+    sync "$1" 2>/dev/null && return 0
+    sync -f "$1" 2>/dev/null && return 0
+    return 1
+}
+
+# 屏障失败**只告警一次**并继续: 快照内容已由 cmp 保证, 掉电屏障缺失是"少一层保护",
+# 不足以让安装整体失败(那会让不支持定向 sync 的机器永远装不上)。
+_install_fsync_or_warn() {   # <path>
+    _install_fsync "$1" && return 0
+    if [ "${_install_fsync_noted:-0}" -eq 0 ]; then
+        echo "[警告] 本机 sync 不支持定向刷新, 恢复快照缺少掉电持久化屏障"
+        _install_fsync_noted=1
+    fi
+    return 0
+}
+
 _install_backup() {
     local rel dest bak keep_tmp record_count=0 sums crc bytes
     # **先检查 .KEEP 再动手**(2026-09-22 七轮复审: 这条守卫此前只存在于
@@ -327,6 +368,12 @@ _install_backup() {
             mkdir -p "$(dirname "$bak")" 2>/dev/null || return 1
             cp -f "$dest" "$bak" 2>/dev/null || return 1
             [ -f "$bak" ] && [ ! -L "$bak" ] || return 1
+            # 内容必须与源**逐字节一致**才允许记账: 只判"文件存在"分不清"cp 只写了一半"
+            if ! _install_backup_identical "$dest" "$bak"; then
+                echo "[错误] 备份内容与源不一致(cp 未完整落盘?), 拒绝继续: $rel"
+                return 1
+            fi
+            _install_fsync_or_warn "$bak"
             printf 'present %s\n' "$rel" >> "$keep_tmp" 2>/dev/null || return 1
         else
             # A reused, unmarked rollback directory may still contain an old copy for a target
@@ -345,7 +392,13 @@ _install_backup() {
     read -r crc bytes _ <<< "$sums"
     [[ "$crc" =~ ^[0-9]+$ && "$bytes" =~ ^[0-9]+$ ]] || return 1
     printf 'complete %s %s %s\n' "$record_count" "$crc" "$bytes" >> "$keep_tmp" 2>/dev/null || return 1
+    # **提交前屏障**: 备份内容(上面逐个刷过)+ 清单文件 + 目录项先落盘, `.KEEP` 这条
+    # "提交记录"才允许出现在目录里; rename 之后再刷一次目录, 使"目录里存在 .KEEP ⇒ 它所
+    # 声明的备份全部完整"这一条成立(否则掉电后恢复程序会读到半截备份, 见上方说明)。
+    _install_fsync_or_warn "$keep_tmp"
+    _install_fsync_or_warn "$ROLLBACK_DIR"
     mv -f "$keep_tmp" "$ROLLBACK_DIR/.KEEP" 2>/dev/null || return 1
+    _install_fsync_or_warn "$ROLLBACK_DIR"
     _install_snapshot_read_entries "$ROLLBACK_DIR" 0 >/dev/null || {
         echo "[错误] 新建恢复快照校验失败: $ROLLBACK_DIR"
         return 1
@@ -700,6 +753,10 @@ download_all() {
         echo "[错误] 无法写入安装事务标记, 未改动任何文件"
         return 1
     }
+    # 标记也必须先落盘: 掉电后若没有它, 一个已经开始的落地过程会被当成"未开始"
+    # (`_install_recover_interrupted` 只认带标记的目录), 留下混合版本树。
+    _install_fsync_or_warn "$(_install_txn_marker)"
+    _install_fsync_or_warn "$ROLLBACK_DIR"
     local copy_ok=1 m
     _install_file "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || copy_ok=0
     chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || copy_ok=0
@@ -1483,6 +1540,9 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
         rm -rf "$ROLLBACK_DIR" 2>/dev/null
         echo "[错误] 无法写入安装事务标记, 未改动任何文件"; exit 1
     }
+    # 与远程路径逐字同口径: 标记先落盘, 掉电后恢复程序才认得出"落地已开始"(见远程侧说明)。
+    _install_fsync_or_warn "$(_install_txn_marker)"
+    _install_fsync_or_warn "$ROLLBACK_DIR"
     local_ok=1
     _install_file "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || local_ok=0
     # 与远程路径逐字同口径: 执行位设置失败必须走回滚(远程侧是 `chmod +x ... || copy_ok=0`)。

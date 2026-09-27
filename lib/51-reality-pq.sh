@@ -176,9 +176,20 @@ _pq_rawurl_decoded_length() {
 # 检测 target 是否适合启用后量子签名,适合则生成 mldsa65 密钥对
 # 用法:_detect_reality_pq <target_domain:port>
 # 输出(通过全局变量,供 50-nodes 取用):
-#   PQ_SEED   / PQ_VERIFY  —— 满足条件时为密钥对;不满足时为空
-#   PQ_REASON —— 不满足时的原因(供回显)
-# 返回:0=已启用后量子;1=未启用(回显原因)
+#   PQ_SEED   / PQ_VERIFY  —— 满足条件时为密钥对;未启用时为空
+#   PQ_REASON —— 失败原因(供回显)
+#
+# **返回码是三态(2026-09-27 十二轮复审 P2)**: 原实现把"目标明确不支持 PQ"和"探测根本没
+# 成功"都压成 1, 调用方只能看到"非零 ⇒ 把 PQ 字段清空"。于是**一次临时网络超时**(tls ping
+# 失败)会让 `_reality_domain_menu` 删掉节点上已生效的 mldsa65Seed / mldsa65_verify —— 把
+# "结论未知"当成"明确不支持", 用一次失败的探测完成了一次不可逆的降级。两者的正确处置相反:
+#   0 = SUPPORTED     已生成密钥(PQ_SEED/PQ_VERIFY 非空)
+#   1 = UNSUPPORTED   探测**成功**且目标客观上不具备 PQ 能力(无 X25519MLKEM768 / 证书链
+#                     过短)⇒ 调用方可以安全地移除旧 PQ 字段
+#   2 = PROBE_FAILED  探测/取键失败或环境异常(xray 缺失、无法建临时文件、tls ping 非零或
+#                     空输出、mldsa65 失败、输出解析异常)⇒ **结论未知**, 调用方必须保持
+#                     现状(不改写/不删除已有 PQ 配置), 绝不能当成 1
+# 新节点创建路径不需要区分(1 与 2 都只是"这次不启用 PQ"), 只有"切换已有节点"的路径依赖它。
 # ---------------------------------------------------------------------------
 _detect_reality_pq() {
     local target="$1"
@@ -186,11 +197,11 @@ _detect_reality_pq() {
 
     [ -x "$XRAY_BIN" ] || {
         PQ_REASON="Xray 未安装,无法检测后量子"
-        return 1
+        return 2
     }
     [ -z "$target" ] && {
         PQ_REASON="未提供 target 域名"
-        return 1
+        return 2
     }
 
     _info "检测 Reality 后量子兼容性: $target"
@@ -209,18 +220,18 @@ _detect_reality_pq() {
         # **必须查标志文件而不是变量**: 上面那行是命令替换(子 shell), 变量形态的标志读不到
         # (2026-09-22 九轮 OCR #36 —— 旧写法使这一支成为死代码)。
         PQ_REASON="无法创建临时文件(磁盘满/只读?), 未能执行 tls ping"
-        _warn "$PQ_REASON"        # 与其它失败分支一致: 两个调用方都只看返回码, 不读 PQ_REASON
-        return 1
+        _warn "$PQ_REASON"        # 调用方按返回码分流(见函数头三态契约), 不读 PQ_REASON
+        return 2
     fi
     if [ "$ping_rc" -ne 0 ]; then
-        PQ_REASON="xray tls ping 失败(目标不可达/超时/xray 不支持 tls ping)"
+        PQ_REASON="xray tls ping 失败(目标不可达/超时/xray 不支持 tls ping), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
     if [ -z "$ping_out" ]; then
-        PQ_REASON="xray tls ping 无输出(目标不可达或 xray 不支持 tls ping)"
+        PQ_REASON="xray tls ping 无输出(目标不可达或 xray 不支持 tls ping), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
 
     if ! echo "$ping_out" | grep -q "X25519MLKEM768"; then
@@ -236,8 +247,15 @@ _detect_reality_pq() {
         | head -1 | sed 's/.*total length:[^0-9]*\([0-9][0-9]*\).*/\1/')
     [[ "$length" =~ ^[0-9]+$ ]] || length=""
 
-    if [ -z "$length" ] || [ "$length" -le 3500 ]; then
-        PQ_REASON="目标域名支持 X25519MLKEM768,但证书长度不足(${length:-未知} ≤ 3500),忽略 ML-DSA-65"
+    if [ -z "$length" ]; then
+        # 同一次 tls ping 已经打出 PQ 组名, 却取不到证书长度行 ⇒ 解析失败(输出被截断 / xray
+        # 输出格式变化)。这是"结论未知", 不是"证书太短" —— 后者才会真的移除已有 PQ 配置。
+        PQ_REASON="xray tls ping 输出缺少证书链长度, 无法判定 PQ 能力"
+        _warn "$PQ_REASON"
+        return 2
+    fi
+    if [ "$length" -le 3500 ]; then
+        PQ_REASON="目标域名支持 X25519MLKEM768,但证书长度不足(${length} ≤ 3500),忽略 ML-DSA-65"
         _tip "$PQ_REASON"
         return 1
     fi
@@ -250,12 +268,12 @@ _detect_reality_pq() {
         # 与 tls ping 侧同一口径: 查标志而不是比 125, 且必须经**文件**通道(见 #36)。
         PQ_REASON="无法创建临时文件(磁盘满/只读?), 未能执行 mldsa65"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
     if [ "$mldsa_rc" -ne 0 ] || [ -z "$mldsa_out" ]; then
-        PQ_REASON="xray mldsa65 生成失败"
+        PQ_REASON="xray mldsa65 生成失败, 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
     # 按**标签**取值, 不按行序: 旧写法 head -1/tail -1 在输出多一行横幅、少一行、或两行
     # 内容相同时会静默把 Seed/Verify 取成同一个值(实测单行输出即命中), 于是服务端私钥
@@ -265,24 +283,24 @@ _detect_reality_pq() {
     pq_verify=$(_pq_field "$mldsa_out" verify) || pq_verify=""
 
     if [ -z "$pq_seed" ] || [ -z "$pq_verify" ] || [ "$pq_seed" = "$pq_verify" ]; then
-        PQ_REASON="解析 mldsa65 输出失败(Seed/Verify 缺失或相同)"
+        PQ_REASON="解析 mldsa65 输出失败(Seed/Verify 缺失或相同), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
     # Sampled Xray v25.9.11/v25.12.8/v26.3.27/v26.7.11/v26.9.9 emit RawURLEncoding: seed=32B, public key=1952B.
     local _rawurl_re='^[A-Za-z0-9_-]+$'
     if [ "${#pq_seed}" -ne 43 ] || [ "${#pq_verify}" -ne 2603 ] \
        || ! [[ "$pq_seed" =~ $_rawurl_re ]] || ! [[ "$pq_verify" =~ $_rawurl_re ]]; then
-        PQ_REASON="mldsa65 输出格式异常(非预期的 RawURLEncoding 长度/字符集), 已放弃"
+        PQ_REASON="mldsa65 输出格式异常(非预期的 RawURLEncoding 长度/字符集), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
     seed_bytes=$(_pq_rawurl_decoded_length "$pq_seed") || seed_bytes=""
     verify_bytes=$(_pq_rawurl_decoded_length "$pq_verify") || verify_bytes=""
     if [ "$seed_bytes" != 32 ] || [ "$verify_bytes" != 1952 ]; then
-        PQ_REASON="mldsa65 输出格式异常(Seed/Verify 解码长度不符), 已放弃"
+        PQ_REASON="mldsa65 输出格式异常(Seed/Verify 解码长度不符), 无法判定 PQ 能力"
         _warn "$PQ_REASON"
-        return 1
+        return 2
     fi
 
     PQ_SEED=$pq_seed

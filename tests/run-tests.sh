@@ -1,0 +1,668 @@
+#!/usr/bin/env bash
+# xray-deploy focused regression suite.
+# This suite intentionally tests observable behavior, not private source layout.
+set -u
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-deploy-test.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+PASS=0
+FAIL=0
+
+pass() { PASS=$((PASS + 1)); printf '  ok   - %s\n' "$1"; }
+fail() { FAIL=$((FAIL + 1)); printf '  FAIL - %s\n' "$1"; }
+check() { local name="$1"; shift; if "$@"; then pass "$name"; else fail "$name"; fi; }
+check_eq() {
+    local name="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then pass "$name"; else fail "$name (expected [$expected], got [$actual])"; fi
+}
+contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
+# Source all modules without running the entry point.
+. "$ROOT/lib/00-common.sh"
+. "$ROOT/lib/10-system.sh"
+. "$ROOT/lib/20-xray-core.sh"
+. "$ROOT/lib/30-geo.sh"
+. "$ROOT/lib/40-cloudflared.sh"
+. "$ROOT/lib/45-logrotate.sh"
+. "$ROOT/lib/50-nodes.sh"
+. "$ROOT/lib/51-reality-pq.sh"
+. "$ROOT/lib/55-hysteria.sh"
+. "$ROOT/lib/90-menu.sh"
+
+DEPLOY_DIR="$TMP/deploy"
+CONFIG_FILE="$DEPLOY_DIR/config.json"
+STATE_DIR="$DEPLOY_DIR/state"
+ASSET_DIR="$DEPLOY_DIR/assets"
+NODES_DIR="$DEPLOY_DIR/nodes"
+CERT_DIR="$DEPLOY_DIR/certs"
+BIN_DIR="$DEPLOY_DIR/bin"
+LOG_DIR="$DEPLOY_DIR/log"
+CLASH_YAML="$DEPLOY_DIR/clash.yaml"
+XRAY_BIN="$BIN_DIR/xray"
+CF_BIN="$TMP/cloudflared"
+HYSTERIA_DATA_DIR="$DEPLOY_DIR/hysteria"
+HYSTERIA_BACKUP_DIR="$DEPLOY_DIR/hysteria-backups"
+HYSTERIA_CERT_DIR="$DEPLOY_DIR/hysteria-certs"
+HYSTERIA_CONFIG="$HYSTERIA_DATA_DIR/hysteria.json"
+HYSTERIA_SERVER_META="$HYSTERIA_DATA_DIR/server_meta.json"
+HYSTERIA_NODE_META="$HYSTERIA_DATA_DIR/node.json"
+HYSTERIA_PID_FILE="$TMP/hysteria.pid"
+HYSTERIA_SVC="hysteria"
+INIT_SYSTEM=direct
+mkdir -p "$DEPLOY_DIR" "$STATE_DIR" "$ASSET_DIR" "$NODES_DIR" "$CERT_DIR" "$BIN_DIR" "$LOG_DIR" "$HYSTERIA_DATA_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR"
+_deploy_lock_root() { printf '%s' "$TMP/locks"; }
+mkdir -p "$TMP/locks"
+
+printf '== focused common behavior ==\n'
+check 'valid IPv4 accepted' _validate_listen 192.0.2.10
+check 'valid IPv6 accepted' _validate_listen 2001:db8::1
+if _validate_listen $'::1\ngarbage'; then fail 'multiline listen rejected'; else pass 'multiline listen rejected'; fi
+if _validate_listen 010.0.0.1; then fail 'leading-zero IPv4 rejected'; else pass 'leading-zero IPv4 rejected'; fi
+if _validate_port 0; then fail 'invalid port rejected'; else pass 'invalid port rejected'; fi
+_xray_current_version() { printf '26.9.9\n'; }
+check 'version compare' _xray_version_ge 26.4.25
+if _xray_version_ge 26.x.25 >/dev/null 2>&1; then fail 'version rejects malformed value'; else pass 'version rejects malformed value'; fi
+check_eq 'version tag canonicalization' v26.9.9 "$(_xray_canon_tag 26.9.9)"
+
+printf '== atomic JSON and locks ==\n'
+check 'atomic JSON write' _atomic_write_json "$DEPLOY_DIR/atomic.json" '{"ok":true}'
+if _atomic_write_json "$DEPLOY_DIR/bad.json" 'not-json' >/dev/null 2>&1; then fail 'atomic JSON rejects malformed input'; else pass 'atomic JSON rejects malformed input'; fi
+check 'config lock body runs' _with_config_lock bash -c 'test -d "$1"' _ "$DEPLOY_DIR"
+check 'core lock body runs' _with_core_lock bash -c 'test -d "$1"' _ "$DEPLOY_DIR"
+
+printf '== logrotate and Geo state ==\n'
+_state_set logrotate_frequency daily
+_state_set logrotate_retention 7
+_state_set logrotate_compress on
+LOGROTATE_CONF="$TMP/logrotate.conf"
+if _logrotate_render_config | grep -q 'rotate 7'; then pass 'logrotate renderer emits rotation count'; else fail 'logrotate renderer emits rotation count'; fi
+_state_set logrotate_retention 999999999999999999999999
+if _logrotate_render_config | grep -q 'rotate 30'; then pass 'long retention is bounded'; else fail 'long retention is bounded'; fi
+LOGROTATE_CONF="$TMP/logrotate-reapply.conf"
+_state_set logrotate_enabled on
+if _logrotate_enable >/dev/null 2>&1 && grep -q 'rotate 30' "$LOGROTATE_CONF"; then pass 'logrotate reapply repairs enabled config'; else fail 'logrotate reapply repairs enabled config'; fi
+
+GEO_TRANSITION_KEY=geo_transition
+_state_set "$GEO_TRANSITION_KEY" off_pending
+check_eq 'Geo off marker persists' off_pending "$(_state_get "$GEO_TRANSITION_KEY")"
+
+printf '== cloudflared credential handling ==\n'
+TOK1='eyJhIjoiYWFhYWFhYWFhYWFhYWFhYWFhYSJ9'
+TOK2='eyJhIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmIifQ=='
+redacted=$(_cf_redact_service_line "ExecStart=$CF_BIN tunnel run --token $TOK1 --token $TOK2")
+if contains "$TOK1" "$redacted" || contains "$TOK2" "$redacted"; then fail 'all repeated tokens are redacted'; else pass 'all repeated tokens are redacted'; fi
+
+printf '== cloudflared command ownership ==\n'
+CF_UNIT_SYSTEMD="$TMP/cloudflared.service"
+custom_bin="$TMP/custom-cloudflared"
+printf '#!/bin/sh\nexit 0\n' > "$custom_bin"; chmod +x "$custom_bin"
+printf 'ExecStart=%s tunnel run --token %s\n' "$custom_bin" "$TOK1" > "$CF_UNIT_SYSTEMD"
+_read_cf_state
+if _cf_managed_flags_only; then fail 'custom cloudflared executable rejected'; else pass 'custom cloudflared executable rejected'; fi
+rm -f "$CF_UNIT_SYSTEMD" "$custom_bin"
+
+iptables() {
+    case "$*" in
+        *' -S '*) printf '%s\n' '-A PREROUTING -p udp -m udp --dport 20000:30000 -m comment --comment xray-deploy-hy2-hop -j DNAT --to-destination :8443' ;;
+        *) return 0 ;;
+    esac
+}
+if _hy2_add_hop_rules 9443 25000 >/dev/null 2>&1; then fail 'overlapping IPv4 hop range rejected'; else pass 'overlapping IPv4 hop range rejected'; fi
+if (
+    iptables() { case "$*" in *' -S '*) return 0 ;; *) return 0 ;; esac; }
+    ip6tables() {
+        case "$*" in
+            *' -S '*) printf '%s\n' '-A PREROUTING -p udp --dport 20000:30000 -m comment --comment xray-deploy-hy2-hop -j DNAT --to-destination :8443' ;;
+            *) return 0 ;;
+        esac
+    }
+    _hy2_add_hop_rules 9443 25000 >/dev/null 2>&1
+); then fail 'overlapping IPv6 hop range rejected'; else pass 'overlapping IPv6 hop range rejected'; fi
+IP6_ADD_MARKER="$TMP/ip6-added"
+if (
+    iptables() { case "$*" in *' -S '*) return 0 ;; *) return 0 ;; esac; }
+    ip6tables() {
+        case "$*" in
+            *' -S '*) return 1 ;;
+            *) : > "$IP6_ADD_MARKER"; return 0 ;;
+        esac
+    }
+    _hy2_add_hop_rules 9443 30001 >/dev/null 2>&1
+) && [ ! -e "$IP6_ADD_MARKER" ]; then pass 'failed IPv6 snapshot skips IPv6 add'; else fail 'failed IPv6 snapshot skips IPv6 add'; fi
+
+printf '== cloudflared parser and absent-unit behavior ==\n'
+CF_BIN="$TMP/cloudflared-main"
+printf '#!/bin/sh\nexit 0\n' > "$CF_BIN"; chmod +x "$CF_BIN"
+CF_UNIT_SYSTEMD="$TMP/cloudflared.service"
+printf 'ExecStart=%s tunnel run "--metrics=127.0.0.1:2000" --token %s\n' "$CF_BIN" "$TOK1" > "$CF_UNIT_SYSTEMD"
+_read_cf_state
+if _cf_managed_flags_only; then fail 'quoted custom cloudflared flag rejected'; else pass 'quoted custom cloudflared flag rejected'; fi
+printf 'ExecStart=%s tunnel run extra-positional --token %s\n' "$CF_BIN" "$TOK1" > "$CF_UNIT_SYSTEMD"
+_read_cf_state
+if _cf_managed_flags_only; then fail 'extra cloudflared positional rejected'; else pass 'extra cloudflared positional rejected'; fi
+rm -f "$CF_UNIT_SYSTEMD" "$CF_BIN"
+if (
+    INIT_SYSTEM=systemd
+    CF_BIN="$TMP/cloudflared-uninstall"
+    CF_UNIT_SYSTEMD="$TMP/cloudflared-unit"
+    CF_UNIT_OPENRC="$TMP/cloudflared-init"
+    CF_STATE_AUTOUPDATE="$TMP/cf-auto"; CF_STATE_HTTP2="$TMP/cf-http2"; CF_STATE_EDGE_IP="$TMP/cf-edge"; CF_STATE_TOKEN="$TMP/cf-token"
+    printf '#!/bin/sh\nexit 0\n' > "$CF_BIN"; chmod +x "$CF_BIN"
+    : > "$CF_UNIT_SYSTEMD"
+    systemctl() {
+        case "$1" in
+            disable|daemon-reload) return 0 ;;
+            show) printf 'not-found\n'; return 0 ;;
+            is-enabled) printf 'not-found\n' >&2; return 1 ;;
+        esac
+    }
+    _cf_kill_all() { return 0; }
+    find() { return 0; }
+    _uninstall_cloudflared >/dev/null 2>&1
+); then pass 'cloudflared accepts stderr-only missing systemd unit'; else fail 'cloudflared accepts stderr-only missing systemd unit'; fi
+
+printf '{"name":"shared-name"}\n' > "$NODES_DIR/xray.json"
+if _hysteria_name_taken shared-name; then pass 'shared Clash name collision rejected'; else fail 'shared Clash name collision rejected'; fi
+rm -f "$NODES_DIR/xray.json"
+# 十二轮 P1: Xray Hy2 的协议键是 `hysteria`, 旧判据查的却是 Xray 里**不存在**的 "hysteria2"
+# ⇒ Hy2 节点落在跳跃范围内时被静默放行(该 UDP 端口随后被官方 REDIRECT 抢走)。
+# `.port` 又是 PortList(单端口 / 范围 / 逗号多段) ⇒ 必须按区间相交判定, 不能等值比较。
+# NODES_DIR 指向空目录, 使这些断言只检验 config 入站分支(分支 c 另有专测)。
+XH_PORT_CONFIG="$TMP/xray-portlist.json"
+XH_NODES_EMPTY="$TMP/xh-nodes-empty"
+mkdir -p "$XH_NODES_EMPTY"
+ss() { printf 'Netid State Local Address:Port Peer Address:Port\n'; }
+_xh_hop_conflict() {   # $1=入站 JSON, $2/$3=跳跃范围, $4=exclude; 判为冲突返回 0
+    local saved_cfg="$CONFIG_FILE" saved_nodes="$NODES_DIR" rc
+    printf '{"inbounds":[%s]}\n' "$1" > "$XH_PORT_CONFIG"
+    CONFIG_FILE="$XH_PORT_CONFIG"; NODES_DIR="$XH_NODES_EMPTY"
+    _hysteria_check_hop_conflicts "$2" "$3" ${4:+"$4"} >/dev/null 2>&1; rc=$?
+    CONFIG_FILE="$saved_cfg"; NODES_DIR="$saved_nodes"
+    [ "$rc" -ne 0 ]
+}
+check 'Xray hysteria PortList overlap rejected' _xh_hop_conflict \
+    '{"protocol":"hysteria","port":"30000,31000-32000"}' 31500 31500
+check 'Xray hysteria single port inside hop range rejected' _xh_hop_conflict \
+    '{"protocol":"hysteria","port":30000}' 20000 40000
+check 'Xray hysteria port range overlapping hop range rejected' _xh_hop_conflict \
+    '{"protocol":"hysteria","port":"30000-31000"}' 30500 32000
+if _xh_hop_conflict '{"protocol":"hysteria","port":443}' 20000 40000; then fail 'Xray hysteria outside hop range allowed'; else pass 'Xray hysteria outside hop range allowed'; fi
+if _xh_hop_conflict '{"protocol":"vless","port":31500,"streamSettings":{"network":"raw"}}' 20000 40000; then fail 'TCP-only Reality not flagged as UDP conflict'; else pass 'TCP-only Reality not flagged as UDP conflict'; fi
+if _xh_hop_conflict '{"protocol":"tunnel","port":31500,"settings":{"network":"tcp"}}' 20000 40000; then fail 'TCP-only tunnel not flagged as UDP conflict'; else pass 'TCP-only tunnel not flagged as UDP conflict'; fi
+check 'UDP-capable dokodemo-door flagged' _xh_hop_conflict \
+    '{"protocol":"dokodemo-door","port":31500,"settings":{"network":"tcp,udp"}}' 20000 40000
+check 'default-network shadowsocks flagged' _xh_hop_conflict \
+    '{"protocol":"shadowsocks","port":31500,"settings":{"method":"aes-256-gcm"}}' 20000 40000
+if _xh_hop_conflict '{"protocol":"shadowsocks","port":31500,"settings":{"network":"tcp"}}' 20000 40000; then fail 'TCP-only shadowsocks not flagged'; else pass 'TCP-only shadowsocks not flagged'; fi
+check 'mkcp transport inbound flagged' _xh_hop_conflict \
+    '{"protocol":"vless","port":31500,"streamSettings":{"network":"mkcp"}}' 20000 40000
+if _xh_hop_conflict '{"protocol":"hysteria","port":443}' 443 50000 443; then fail 'own listen port exempt from hop conflict'; else pass 'own listen port exempt from hop conflict'; fi
+CONFIG_FILE="$DEPLOY_DIR/config.json"
+
+SEED=$(head -c 32 /dev/zero | base64 | tr '+/' '-_' | tr -d '=')
+VERIFY=$(head -c 1952 /dev/zero | base64 | tr -d '=\n' | tr '+/' '-_')
+cat > "$XRAY_BIN" <<EOF
+#!/bin/sh
+case "\$1 \$2" in
+  "tls ping") printf '%s\\n%s\\n' 'X25519MLKEM768' "Certificate chain's total length: 4000" ;;
+  "mldsa65 ") printf 'Seed: %s\\nVerify: %s\\n' "$SEED" "$VERIFY" ;;
+  *) printf '26.9.9\\n' ;;
+esac
+EOF
+chmod +x "$XRAY_BIN"
+_pq_run_bounded() { local _secs="$1"; shift; "$@"; }
+if _detect_reality_pq example.test:443 >/dev/null 2>&1 && [ "${#PQ_SEED}" -eq 43 ] && [ "${#PQ_VERIFY}" -eq 2603 ]; then
+    pass 'PQ RawURL output accepted'
+else
+    fail 'PQ RawURL output accepted'
+fi
+printf '#!/bin/sh\nprintf "Seed: short\\nVerify: short\\n"\n' > "$XRAY_BIN"
+chmod +x "$XRAY_BIN"
+if _detect_reality_pq example.test:443 >/dev/null 2>&1 || [ -n "${PQ_SEED:-}" ] || [ -n "${PQ_VERIFY:-}" ]; then
+    fail 'PQ malformed output rejected and globals cleared'
+else
+    pass 'PQ malformed output rejected and globals cleared'
+fi
+
+# 十二轮 P2: 返回码三态 —— 只有"探测成功且目标客观上不支持"才是 1(调用方可安全移除旧 PQ);
+# 探测/取键失败或环境异常必须是 2(结论未知)。原实现把两者压成 1, 于是**一次临时网络超时**
+# 就会让域名切换删掉节点上已生效的 mldsa65Seed/mldsa65_verify。
+_pq_rc() {   # 输出 _detect_reality_pq 的返回码(0/1/2)
+    local rc=0
+    _detect_reality_pq example.test:443 >/dev/null 2>&1 || rc=$?
+    printf '%s' "$rc"
+}
+printf '#!/bin/sh\nexit 1\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+check_eq 'PQ tls ping failure is PROBE_FAILED' 2 "$(_pq_rc)"
+printf '#!/bin/sh\nprintf "no pq group here\\n"\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+check_eq 'PQ absent group is UNSUPPORTED' 1 "$(_pq_rc)"
+cat > "$XRAY_BIN" <<EOF
+#!/bin/sh
+printf '%s\\n%s\\n' 'X25519MLKEM768' "Certificate chain's total length: 3000"
+EOF
+chmod +x "$XRAY_BIN"
+check_eq 'PQ short certificate is UNSUPPORTED' 1 "$(_pq_rc)"
+cat > "$XRAY_BIN" <<EOF
+#!/bin/sh
+printf '%s\\n' 'X25519MLKEM768'
+EOF
+chmod +x "$XRAY_BIN"
+check_eq 'PQ missing chain length is PROBE_FAILED' 2 "$(_pq_rc)"
+cat > "$XRAY_BIN" <<EOF
+#!/bin/sh
+case "\$1 \$2" in
+  "tls ping") printf '%s\\n%s\\n' 'X25519MLKEM768' "Certificate chain's total length: 4000" ;;
+  *) exit 3 ;;
+esac
+EOF
+chmod +x "$XRAY_BIN"
+check_eq 'PQ key generation failure is PROBE_FAILED' 2 "$(_pq_rc)"
+
+printf '== Reality PQ probe failure must not downgrade a node ==\n'
+# 探针驱动真实的 `_reality_domain_menu`: 探测返回 2(PROBE_FAILED)时**不得**调用切换事务
+# (原实现的 `if _detect_reality_pq ...; then` 会把失败当成"新域名不支持 PQ"照常提交,
+# 事务内 `del(.mldsa65Seed)` 于是抹掉一个原本可用的 PQ 配置)。
+XH_PQ_MENU_OUT=$(
+    NODES_DIR="$TMP/pq-menu-nodes"
+    mkdir -p "$NODES_DIR"
+    printf '%s\n' '{"protocol":"vless-tcp-reality-vision","name":"pq-probe","sni":"old.example","mldsa65_verify":"oldverify","port":8443}' > "$NODES_DIR/pq-probe.json"
+    XH_TXN_MARKER="$TMP/pq-txn-marker"
+    _has_reality_nodes() { return 0; }
+    clear() { :; }
+    _reality_node_mode() { printf 'direct'; }
+    _sync_node_clash() { return 0; }
+    _press_any_key() { :; }
+    _hy2_select_node() { shift; printf '%s' "${1:-}"; }
+    _reality_domain_txn() { printf '%s|%s' "${4:-}" "${5:-}" > "$XH_TXN_MARKER"; return 0; }
+    _detect_reality_pq() {
+        case "${XH_PQ_RC:-2}" in
+            0) PQ_SEED="seed43"; PQ_VERIFY="verify2603"; return 0 ;;
+            1) return 1 ;;
+            *) return 2 ;;
+        esac
+    }
+    read() {
+        _n=$((_n + 1))
+        local v="${!#}"
+        case "$_n" in
+            1) printf -v "$v" '%s' 1 ;;
+            2) printf -v "$v" '%s' new.example ;;
+            *) return 1 ;;
+        esac
+        return 0
+    }
+    for XH_PQ_RC in 2 1 0; do
+        rm -f "$XH_TXN_MARKER"
+        _n=0
+        _reality_domain_menu >/dev/null 2>&1
+        if [ -e "$XH_TXN_MARKER" ]; then
+            printf 'rc=%s txn=yes args=%s\n' "$XH_PQ_RC" "$(cat "$XH_TXN_MARKER")"
+        else
+            printf 'rc=%s txn=no\n' "$XH_PQ_RC"
+        fi
+    done
+)
+if contains 'rc=2 txn=no' "$XH_PQ_MENU_OUT"; then
+    pass 'PQ probe failure cancels the domain switch'
+else
+    fail "PQ probe failure cancels the domain switch [$XH_PQ_MENU_OUT]"
+fi
+if contains 'rc=1 txn=yes args=|' "$XH_PQ_MENU_OUT"; then
+    pass 'PQ unsupported switches without PQ keys'
+else
+    fail "PQ unsupported switches without PQ keys [$XH_PQ_MENU_OUT]"
+fi
+if contains 'rc=0 txn=yes args=seed43|verify2603' "$XH_PQ_MENU_OUT"; then
+    pass 'PQ supported forwards generated keys'
+else
+    fail "PQ supported forwards generated keys [$XH_PQ_MENU_OUT]"
+fi
+
+printf '== guarded lifecycle behavior ==\n'
+# Startup migration adds native geodata without dropping the legacy rollback path.
+GEO_TRANSITION_KEY=geo_update_transition
+_state_set geo_cron on
+printf '{"inbounds":[]}\n' > "$CONFIG_FILE"
+: > "$ASSET_DIR/geosite.dat"
+: > "$ASSET_DIR/geoip.dat"
+if _auto_migrate_geo_autoupdate >/dev/null 2>&1 \
+   && [ "$(jq -r '.geodata.cron // empty' "$CONFIG_FILE")" = "$GEO_CRON_EXPR" ] \
+   && [ "$(_state_get geo_cron)" = on ]; then
+    pass 'Geo migration retains legacy fallback state'
+else
+    fail 'Geo migration retains legacy fallback state'
+fi
+
+# Restart must not start a second connector after incomplete process cleanup.
+if (
+    CF_START_SENTINEL="$TMP/cf-started"
+    INIT_SYSTEM=systemd
+    _cf_kill_all() { return 1; }
+    systemctl() { printf 'start\n' >> "$CF_START_SENTINEL"; }
+    sleep() { :; }
+    _cf_restart >/dev/null 2>&1 && exit 1
+    [ ! -e "$CF_START_SENTINEL" ]
+); then
+    pass 'cloudflared restart fails closed on cleanup error'
+else
+    fail 'cloudflared restart fails closed on cleanup error'
+fi
+
+# Without an authoritative liveness helper, stop is not proof of exit.
+if (
+    XRAY_STOP_SENTINEL="$TMP/xray-stop-called"
+    INIT_SYSTEM=direct
+    XRAY_DEPLOY_CORE_LOCK_HELD=1
+    unset -f _xray_is_running
+    _with_core_lock() { "$@"; }
+    _manage_xray() { printf 'stop\n' >> "$XRAY_STOP_SENTINEL"; }
+    _xray_stop_and_verify >/dev/null 2>&1 && exit 1
+    [ ! -e "$XRAY_STOP_SENTINEL" ]
+); then
+    pass 'Xray destructive stop refuses unverifiable liveness'
+else
+    fail 'Xray destructive stop refuses unverifiable liveness'
+fi
+
+printf '== logrotate state contracts ==\n'
+rm -f "$STATE_DIR/logrotate_enabled"
+check_eq 'missing logrotate state is unset' unset "$(_logrotate_enabled_state)"
+_state_set logrotate_enabled off
+check_eq 'explicit logrotate disable is retained' off "$(_logrotate_enabled_state)"
+if (
+    LOGROTATE_CONF="$TMP/logrotate-disabled.conf"
+    : > "$LOGROTATE_CONF"
+    _state_set() { return 1; }
+    _logrotate_disable >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 2 ] && [ ! -e "$LOGROTATE_CONF" ]
+); then
+    pass 'logrotate reports state-only disable failure'
+else
+    fail 'logrotate reports state-only disable failure'
+fi
+
+
+printf '== cross-backend config lock ==\n'
+LOCK_ROOT="$TMP/mixed-locks"
+mkdir -p "$LOCK_ROOT"
+_deploy_lock_root() { printf '%s' "$LOCK_ROOT"; }
+LOCK_FILE="$LOCK_ROOT/config.lock"
+LOCK_DIR="$LOCK_ROOT/config.lock.d"
+{ exec {TEST_LOCK_FD}>>"$LOCK_FILE"; } 2>/dev/null
+flock -n "$TEST_LOCK_FD"
+if _xray_primary_flock_marker_take "$TEST_LOCK_FD" "$LOCK_FILE" "$LOCK_DIR" 'test config'; then
+    if (
+        command() { [ "${1:-}" = -v ] && [ "${2:-}" = flock ] && return 1; builtin command "$@"; }
+        _with_config_lock :
+    ) >/dev/null 2>&1; then
+        fail 'mkdir backend excluded by active flock marker'
+    else
+        pass 'mkdir backend excluded by active flock marker'
+    fi
+    _xray_primary_flock_marker_release "$LOCK_FILE" "$LOCK_DIR" 'test config'
+else
+    fail 'flock backend creates exclusion marker'
+fi
+flock -u "$TEST_LOCK_FD"; eval "exec ${TEST_LOCK_FD}>&-"
+
+printf '== clash derivation runs under the config lock ==\n'
+# 十二轮 P2: clash.yaml 是 Xray 节点与官方 Hysteria 节点**共用**的派生文件, 追加/替换/去重
+# 都是读-改-写 ⇒ 不进 config lock 就会丢条目。探针把"写"缩短成记录锁状态, 观察写发生时
+# 是否持有 flock 后端见证标记 —— 见证目录只在持锁期间存在(`_xray_primary_flock_marker_take`)。
+CLASH_PROBE_META="$TMP/clash-probe.json"
+CLASH_PROBE_STATE="$TMP/clash-probe-state"
+printf '{"name":"lock-probe"}\n' > "$CLASH_PROBE_META"
+_clash_lock_probe() {   # $1=标签, 其余=被观察的调用; 输出 "<标签>=<held|free> rc=<rc> leak=<yes|no>"
+    local label="$1" rc after
+    shift
+    CLASH_YAML="$TMP/clash-probe-${label}.yaml"
+    printf 'proxies:\n  - {name: "lock-probe", type: vless}\n' > "$CLASH_YAML"
+    : > "$CLASH_PROBE_STATE"
+    _probe_lock_state() {
+        local d
+        d="$(_deploy_lock_root)/config.lock.d"
+        if [ -f "$d/.witness" ]; then printf 'held'; else printf 'free'; fi
+    }
+    _rebuild_clash_line() { printf '%s' '- {name: "lock-probe"}'; }
+    _hysteria_clash_line() { printf '%s' '- {name: "lock-probe"}'; }
+    _replace_node_in_yaml() { _probe_lock_state > "$CLASH_PROBE_STATE"; return 0; }
+    _add_node_to_yaml() { _probe_lock_state > "$CLASH_PROBE_STATE"; return 0; }
+    "$@" >/dev/null 2>&1; rc=$?
+    after=no
+    [ -e "$(_deploy_lock_root)/config.lock.d" ] && after=yes
+    printf '%s=%s rc=%s leak=%s\n' "$label" "$(cat "$CLASH_PROBE_STATE" 2>/dev/null)" "$rc" "$after"
+}
+XH_CLASH_PROBE=$(_clash_lock_probe xray _sync_node_clash "$CLASH_PROBE_META")
+XH_HY_PROBE=$(_clash_lock_probe hysteria _hysteria_sync_clash "$CLASH_PROBE_META")
+# 已持锁时的嵌套调用必须直接执行(经 XRAY_DEPLOY_LOCK_HELD), 不得再等一次锁(那会 14s 后失败)
+XH_NESTED_PROBE=$(_clash_lock_probe nested _with_config_lock _sync_node_clash "$CLASH_PROBE_META")
+check_eq 'Xray clash write holds the config lock' 'xray=held rc=0 leak=no' "$XH_CLASH_PROBE"
+check_eq 'Hysteria clash write holds the config lock' 'hysteria=held rc=0 leak=no' "$XH_HY_PROBE"
+check_eq 'nested clash sync is reentrant' 'nested=held rc=0 leak=no' "$XH_NESTED_PROBE"
+
+printf '== interrupted installer recovery ==\n'
+_test_extract_install_fn() {
+    awk -v fn="$1" '$0 ~ "^" fn "[[:space:]]*[(][)]" {p=1} p{print} p && /^}/{exit}' "$ROOT/install.sh"
+}
+(
+    set -u
+    DEPLOY_DIR="$TMP/recovery-deploy"
+    ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.4242"
+    LIB_MODULES=""; TPL_NAMES=""
+    mkdir -p "$DEPLOY_DIR" "$ROLLBACK_DIR"
+    eval "$(_test_extract_install_fn _manifest_relpaths)"
+    eval "$(_test_extract_install_fn _install_fsync)"
+    eval "$(_test_extract_install_fn _install_fsync_or_warn)"
+    eval "$(_test_extract_install_fn _install_backup_identical)"
+    eval "$(_test_extract_install_fn _install_backup)"
+    eval "$(_test_extract_install_fn _install_txn_marker)"
+    eval "$(_test_extract_install_fn _install_snapshot_read_entries)"
+    eval "$(_test_extract_install_fn _install_snapshot_validate)"
+    eval "$(_test_extract_install_fn _install_rollback)"
+    eval "$(_test_extract_install_fn _install_finish_transaction)"
+    eval "$(_test_extract_install_fn _install_recover_interrupted)"
+    printf 'old-version\n' > "$DEPLOY_DIR/VERSION"
+    _install_backup >/dev/null 2>&1
+    # Recovery must use the snapshot's persisted entries, not a changed current manifest.
+    LIB_MODULES="new-module.sh"; TPL_NAMES="new-template"
+    : > "$ROLLBACK_DIR/.INSTALLING"
+    printf 'mixed-version\n' > "$DEPLOY_DIR/VERSION"
+    _install_recover_interrupted >/dev/null 2>&1 || exit 1
+    [ "$(cat "$DEPLOY_DIR/VERSION")" = old-version ] || exit 1
+    [ ! -e "$ROLLBACK_DIR" ] || exit 1
+) && pass 'active installer transaction restores prior snapshot' || fail 'active installer transaction restores prior snapshot'
+(
+    set -u
+    DEPLOY_DIR="$TMP/incomplete-deploy"
+    ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.4243"
+    LIB_MODULES=""; TPL_NAMES=""
+    mkdir -p "$DEPLOY_DIR" "$ROLLBACK_DIR"
+    eval "$(_test_extract_install_fn _manifest_relpaths)"
+    eval "$(_test_extract_install_fn _install_fsync)"
+    eval "$(_test_extract_install_fn _install_fsync_or_warn)"
+    eval "$(_test_extract_install_fn _install_backup_identical)"
+    eval "$(_test_extract_install_fn _install_backup)"
+    eval "$(_test_extract_install_fn _install_txn_marker)"
+    eval "$(_test_extract_install_fn _install_snapshot_read_entries)"
+    eval "$(_test_extract_install_fn _install_snapshot_validate)"
+    eval "$(_test_extract_install_fn _install_rollback)"
+    eval "$(_test_extract_install_fn _install_finish_transaction)"
+    eval "$(_test_extract_install_fn _install_recover_interrupted)"
+    printf 'mixed-version\n' > "$DEPLOY_DIR/VERSION"
+    _install_backup >/dev/null 2>&1
+    rm -f "$ROLLBACK_DIR/VERSION"
+    : > "$ROLLBACK_DIR/.INSTALLING"
+    printf 'unexpected partial file\n' > "$DEPLOY_DIR/xray-deploy.sh"
+    _install_recover_interrupted >/dev/null 2>&1 && exit 1
+    [ -e "$ROLLBACK_DIR/.INSTALLING" ] && [ -e "$ROLLBACK_DIR/.KEEP" ]
+) && pass 'incomplete install snapshot stays blocked' || fail 'incomplete install snapshot stays blocked'
+
+(
+    set -u
+    DEPLOY_DIR="$TMP/empty-snapshot-deploy"
+    ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.4244"
+    LIB_MODULES=""; TPL_NAMES=""
+    mkdir -p "$DEPLOY_DIR" "$ROLLBACK_DIR"
+    printf 'live-version\n' > "$DEPLOY_DIR/VERSION"
+    eval "$(_test_extract_install_fn _manifest_relpaths)"
+    eval "$(_test_extract_install_fn _install_fsync)"
+    eval "$(_test_extract_install_fn _install_fsync_or_warn)"
+    eval "$(_test_extract_install_fn _install_backup_identical)"
+    eval "$(_test_extract_install_fn _install_snapshot_read_entries)"
+    eval "$(_test_extract_install_fn _install_snapshot_validate)"
+    eval "$(_test_extract_install_fn _install_recover_interrupted)"
+    : > "$ROLLBACK_DIR/.INSTALLING"
+    : > "$ROLLBACK_DIR/.KEEP"
+    _install_recover_interrupted >/dev/null 2>&1 && exit 1
+    [ "$(cat "$DEPLOY_DIR/VERSION")" = live-version ]
+) && pass 'empty active snapshot fails closed' || fail 'empty active snapshot fails closed'
+
+printf '== installer snapshot durability ==\n'
+# 十二轮 P2: `.KEEP` 是快照的**提交记录**, 而 rename 原子 ≠ 掉电持久。两条屏障各自可观测:
+#   · cp 之后立刻比对内容 —— 半截备份必须在记账之前就被拒绝;
+#   · 备份文件 + 目录项先落盘, `.KEEP` 才允许出现, rename 后目录项再刷一次。
+_installer_probe() {   # $1=探针编号(必须纯数字: 快照读取器按目录名后缀校验)
+    (
+        set -u
+        DEPLOY_DIR="$TMP/durable-deploy-$1"
+        ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.4242$1"
+        LIB_MODULES=""; TPL_NAMES=""
+        mkdir -p "$DEPLOY_DIR"
+        printf 'old-version\n' > "$DEPLOY_DIR/VERSION"
+        printf 'old-entry\n' > "$DEPLOY_DIR/xray-deploy.sh"
+        eval "$(_test_extract_install_fn _manifest_relpaths)"
+        eval "$(_test_extract_install_fn _install_fsync)"
+        eval "$(_test_extract_install_fn _install_fsync_or_warn)"
+        eval "$(_test_extract_install_fn _install_backup_identical)"
+        eval "$(_test_extract_install_fn _install_snapshot_rel_ok)"
+        eval "$(_test_extract_install_fn _install_snapshot_read_entries)"
+        eval "$(_test_extract_install_fn _install_backup)"
+        case "$1" in
+            1)
+                # cp "成功"但只写了半截内容 ⇒ 必须在写 present 记录之前被拒
+                cp() { printf 'half\n' > "${@: -1}"; return 0; }
+                _install_backup >/dev/null 2>&1 && exit 1
+                [ ! -e "$ROLLBACK_DIR/.KEEP" ] || exit 1
+                ;;
+            2)
+                SYNC_LOG="$TMP/durable-sync.log"; : > "$SYNC_LOG"
+                sync() {
+                    if [ -e "$ROLLBACK_DIR/.KEEP" ]; then
+                        printf 'post:%s\n' "${1:-}" >> "$SYNC_LOG"
+                    else
+                        printf 'pre:%s\n' "${1:-}" >> "$SYNC_LOG"
+                    fi
+                    return 0
+                }
+                _install_backup >/dev/null 2>&1 || exit 1
+                grep -qx "pre:${ROLLBACK_DIR}/xray-deploy.sh" "$SYNC_LOG" || exit 1
+                grep -qx "pre:${ROLLBACK_DIR}/VERSION" "$SYNC_LOG" || exit 1
+                grep -qx "pre:${ROLLBACK_DIR}" "$SYNC_LOG" || exit 1
+                grep -qx "post:${ROLLBACK_DIR}" "$SYNC_LOG" || exit 1
+                ;;
+            3)
+                sync() { return 1; }
+                out=$(_install_backup 2>&1) || exit 1
+                [ "$(printf '%s\n' "$out" | grep -c '不支持定向刷新')" -eq 1 ] || exit 1
+                ;;
+            *) exit 1 ;;
+        esac
+        exit 0
+    )
+}
+if _installer_probe 1; then pass 'incomplete backup copy is rejected before commit'; else fail 'incomplete backup copy is rejected before commit'; fi
+if _installer_probe 2; then pass 'snapshot fsync barriers bracket the .KEEP rename'; else fail 'snapshot fsync barriers bracket the .KEEP rename'; fi
+if _installer_probe 3; then pass 'missing targeted fsync degrades with one warning'; else fail 'missing targeted fsync degrades with one warning'; fi
+
+GEO_TRANSITION_KEY=geo_transition
+_state_set "$GEO_TRANSITION_KEY" off_pending
+GEO_SKIP_MARKER="$TMP/geo-download-called"
+(
+    _ensure_dirs() { return 0; }
+    _auto_migrate_geo_autoupdate() { : > "$GEO_SKIP_MARKER"; return 0; }
+    _http_download() { return 91; }
+    _geo_update
+) >/dev/null 2>&1
+if [ -e "$GEO_SKIP_MARKER" ]; then pass 'Geo off_pending skips legacy update'; else fail 'Geo off_pending skips legacy update'; fi
+rm -f "$GEO_SKIP_MARKER"
+(
+    _geo_transition_clear
+    _xray_version_ge() { return 0; }
+    _geo_remove_cron_line() { return 0; }
+    _state_set geo_cron on
+    printf '{"geodata":{"cron":"0 3 */3 * *"}}\n' > "$CONFIG_FILE"
+    _geo_finalize_legacy_cron >/dev/null 2>&1
+    [ "$(_state_get geo_cron)" = off ]
+) && pass 'Geo finalizer retires legacy fallback after update' || fail 'Geo finalizer retires legacy fallback after update'
+
+HYSTERIA_CERT="$TMP/selfsigned.pem"
+HYSTERIA_PIN=$(printf '%064d' 7)
+printf 'test cert\n' > "$HYSTERIA_CERT"
+printf '{"listen":":443","tls":{"cert":"%s"},"bandwidth":{"up":"100 mbps","down":"10 mbps"}}\n' "$HYSTERIA_CERT" > "$HYSTERIA_CONFIG"
+printf '{"tls_mode":"selfsigned","sni":"example.test","pin":"%s"}\n' "$HYSTERIA_PIN" > "$HYSTERIA_SERVER_META"
+printf '{"auth":"secret","name":"node-a","link_addr":"198.51.100.7","protocol":"hysteria2"}\n' > "$HYSTERIA_NODE_META"
+_hysteria_cert_pin() { [ -r "$1" ] || return 1; printf '%s' "$HYSTERIA_PIN"; }
+uri=$(_hysteria_build_link "$HYSTERIA_NODE_META" 2>/dev/null)
+if contains "pinSHA256=$HYSTERIA_PIN" "$uri"; then pass 'self-signed URI contains verified pin'; else fail 'self-signed URI contains verified pin'; fi
+line=$(_hysteria_clash_line "$HYSTERIA_NODE_META" 2>/dev/null)
+if contains "fingerprint: \"$HYSTERIA_PIN\"" "$line"; then pass 'Mihomo self-signed entry contains fingerprint'; else fail 'Mihomo self-signed entry contains fingerprint'; fi
+if contains 'down: "100 mbps"' "$line" && contains 'up: "10 mbps"' "$line"; then pass 'server bandwidth maps to client directions'; else fail 'server bandwidth maps to client directions'; fi
+BAD_HYSTERIA_PIN=$(printf '%064d' 8)
+printf '{"tls_mode":"selfsigned","sni":"example.test","pin":"%s"}\n' "$BAD_HYSTERIA_PIN" > "$HYSTERIA_SERVER_META"
+if _hysteria_build_link "$HYSTERIA_NODE_META" >/dev/null 2>&1; then fail 'mismatched self-signed pin blocks URI'; else pass 'mismatched self-signed pin blocks URI'; fi
+
+printf '== Hysteria terminal stop and reset quarantine ==\n'
+if (
+    INIT_SYSTEM=systemd
+    _hysteria_started=0
+    _manage_hysteria() {
+        case "$1" in
+            start|stop) return 0 ;;
+            status) _hysteria_started=$((_hysteria_started + 1)); if [ "$_hysteria_started" -le 3 ]; then printf 'running'; else printf 'activating'; fi ;;
+        esac
+    }
+    _hysteria_stop_and_verify() { : > "$TMP/hysteria-stop-verified"; return 1; }
+    _hysteria_validate_transient >/dev/null 2>&1 && exit 1
+    [ -e "$TMP/hysteria-stop-verified" ]
+); then pass 'transient Hysteria validation uses terminal stop verifier'; else fail 'transient Hysteria validation uses terminal stop verifier'; fi
+printf 'corrupt journal' > "$DEPLOY_DIR/.reset-journal.json.corrupt"
+printf 'snapshot' > "$DEPLOY_DIR/.reset-snapshot-sentinel"
+if _reset_config_recover_locked >/dev/null 2>&1; then fail 'reset quarantine stays fail-closed'; else pass 'reset quarantine stays fail-closed'; fi
+[ -e "$DEPLOY_DIR/.reset-snapshot-sentinel" ] || fail 'reset quarantine preserves snapshot'
+if (
+    sync() { return 1; }
+    _reset_fsync_strict "$TMP/reset-artifact" >/dev/null 2>&1
+); then fail 'reset strict fsync rejects targeted flush failure'; else pass 'reset strict fsync rejects targeted flush failure'; fi
+
+if (
+    INIT_SYSTEM=systemd
+    CF_BIN="$TMP/cloudflared-installed"
+    CF_UNIT_SYSTEMD="$TMP/cloudflared.service"
+    CF_UNIT_OPENRC="$TMP/cloudflared.init"
+    CF_STATE_AUTOUPDATE="$STATE_DIR/cf-autoupdate"
+    CF_STATE_HTTP2="$STATE_DIR/cf-http2"
+    CF_STATE_EDGE_IP="$STATE_DIR/cf-edge-ip"
+    CF_STATE_TOKEN="$STATE_DIR/cf-token"
+    : > "$CF_BIN"; : > "$CF_UNIT_SYSTEMD"
+    _cf_kill_all() { return 1; }
+    _uninstall_cloudflared >/dev/null 2>&1 && exit 1
+    [ -f "$CF_BIN" ] && [ -f "$CF_UNIT_SYSTEMD" ]
+); then pass 'cloudflared uninstall preserves service on unresolved cleanup'; else fail 'cloudflared uninstall preserves service on unresolved cleanup'; fi
+if (
+    CF_BIN="$TMP/cloudflared-dir"
+    mkdir -p "$CF_BIN"
+    _error() { :; }
+    if _install_cloudflared_bin >/dev/null 2>&1; then exit 1; fi
+    [ -d "$CF_BIN" ]
+); then pass 'cloudflared directory target rejected'; else fail 'cloudflared directory target rejected'; fi
+if (
+    LOGROTATE_CONF="$TMP/logrotate-repair.conf"
+    _state_set logrotate_enabled on
+    _logrotate_ensure_package() { return 0; }
+    _logrotate_enable >/dev/null 2>&1 && grep -q 'rotate 30' "$LOGROTATE_CONF"
+); then pass 'logrotate enabled state repairs missing config'; else fail 'logrotate enabled state repairs missing config'; fi
+
+printf 'passed %s, failed %s\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]
