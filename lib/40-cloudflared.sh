@@ -32,7 +32,11 @@ _cf_arch_tag() {
 # 安装 cloudflared 二进制
 # ---------------------------------------------------------------------------
 _install_cloudflared_bin() {
-    if [ -x "$CF_BIN" ]; then
+    if [ -d "$CF_BIN" ]; then
+        _error "cloudflared 目标路径是目录, 拒绝安装: $CF_BIN"
+        return 1
+    fi
+    if [ -f "$CF_BIN" ] && [ -x "$CF_BIN" ]; then
         _info "cloudflared 已安装: $("$CF_BIN" --version 2>&1 | head -n1)"
         return 0
     fi
@@ -136,7 +140,7 @@ _cf_token_valid() {
 #           CF_CUR_AUTOUPDATE_FLAG(启动行是否**显式**写了 autoupdate 标志)
 # ---------------------------------------------------------------------------
 _read_cf_state() {
-    CF_CUR_TOKEN=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_RAWLINE=""
+    CF_CUR_TOKEN=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_RAWLINE=""; CF_CUR_CMDLINE=""
     # F6: "启动行没有 autoupdate 标志" ≠ "自动更新关闭" —— cloudflared 缺省 autoupdate=on
     # (24h)。flag=no 时菜单按"默认开"显示, 且重建行不再无条件写 --no-autoupdate,
     # 避免对手动安装的 cloudflared 造成用户未要求的静默行为变更。
@@ -162,6 +166,7 @@ _read_cf_state() {
 $ln"
         fi
     done < "$svcfile"
+    CF_CUR_CMDLINE="$lines"
     # 诊断输出仍需要完整原文(仅用于 _cf_diagnose 展示, 不参与解析)
     CF_CUR_RAWLINE=$(cat "$svcfile" 2>/dev/null)
     # token: 优先在启动行里找 --token 后字段; 兜底同一批行里的裸 ey 开头串
@@ -238,11 +243,19 @@ _cf_mask_token() {
 # Redact service lines without assuming quotes are absent. For an unparseable credential-bearing
 # line, omit the complete line instead of risking a plaintext token in copy/pasted diagnostics.
 _cf_redact_service_line() {
-    local line="$1" token masked lower
+    local line="$1" token masked lower remaining
     if _cf_is_cmd_line "$line"; then
         token=$(_cf_extract_line_token "$line")
         if [ -n "$token" ]; then
             masked=$(_cf_mask_token "$token")
+            # After removing the parsed credential and its option marker, any remaining token
+            # marker or token-shaped value makes complete redaction uncertain: hide the line.
+            remaining="${line//"$token"/}"
+            remaining="${remaining/--token/}"
+            lower="${remaining,,}"
+            case "$lower" in
+                *token*|*ey????????????????????*) printf '[敏感配置行已隐藏]\n'; return 0 ;;
+            esac
             printf '%s\n' "${line//"$token"/$masked}"
             return 0
         fi
@@ -952,7 +965,9 @@ _cf_kill_all() {
         # (实测: 该分支曾是死代码), 函数最终报"所有进程已清理"并返回 0, 而真正属于我们、
         # 只是 exe 不可读的孤儿进程还活着 —— 正是这段代码要防的事。
         if ! readlink "/proc/$p/exe" >/dev/null 2>&1; then
-            unclear="$unclear $p"          # exe 读不到 => 归属无法确认
+            # PID 可能在 _cf_pids 扫描后退出; 不把已经消失的进程当作未清理残留。
+            [ -d "/proc/$p" ] || continue
+            unclear="$unclear $p"          # live PID 且 exe 读不到 => 归属无法确认
             continue
         fi
         # exe 可读: 走归属判定(三态)。**必须用 case 区分 1 与 2** —— 旧实现用 `if ...; then
@@ -975,6 +990,7 @@ _cf_kill_all() {
         # 不能宣称"已清理干净"。
         _warn "以下 cloudflared 进程归属无法确认(exe 不可读或 lib 版本过旧):${unclear}"
         _tip "它们可能仍属于本服务; 若隧道行为异常, 请手动确认"
+        return 1
     fi
     if [ "$_cf_strict_missing" -eq 1 ]; then
         # 归属判定降级: 进程状态**未被确认清理**, 不能对调用方谎报干净(_cf_restart 的
@@ -1025,14 +1041,35 @@ _cf_rollback_service() {
         _error "回滚后 cloudflared 重启失败: $svcfile"
         return 1
     fi
-    if ! _cf_is_running; then
+    if ! _cf_is_managed_running; then
         _error "回滚后 cloudflared 未运行: $svcfile"
         return 1
     fi
     return 0
 }
 
-# 判断 cloudflared 是否在运行(状态栏 + 诊断用)
+# Transactional success requires evidence tied to the managed unit; unlike _cf_is_running,
+# this never falls back to a machine-wide cloudflared scan.
+_cf_is_managed_running() {
+    local anchor pf
+    case "$INIT_SYSTEM" in
+        systemd)
+            anchor=$(systemctl show -p MainPID --value cloudflared 2>/dev/null) || return 1
+            [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] || return 1
+            _proc_named_under "$anchor" cloudflared
+            return $?
+            ;;
+        *)
+            for pf in /run/cloudflared.pid /var/run/cloudflared.pid; do
+                anchor=$(cat "$pf" 2>/dev/null) || continue
+                [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] || continue
+                [ -d "/proc/$anchor" ] || continue
+                _proc_named_under "$anchor" cloudflared && return 0
+            done
+            return 1
+            ;;
+    esac
+}
 _cf_is_running() {
     local anchor=""
     case "$INIT_SYSTEM" in
@@ -1128,7 +1165,7 @@ _install_cloudflared() {
     # service 文件(用户唯一的修复入口), 但不写 state、不留预修改快照。
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
-    if ! _cf_is_running; then
+    if ! _cf_is_managed_running; then
         rm -f "${svcfile}.bak" 2>/dev/null
         _error "cloudflared service 已写入但启动后未运行, 安装未完成(请检查 token / 查看服务日志)"
         _tip "service 文件已保留以便修复: $svcfile"
@@ -1152,47 +1189,80 @@ _install_cloudflared() {
 # 卸载 cloudflared(彻底清)
 # ---------------------------------------------------------------------------
 _uninstall_cloudflared() {
-    # 2026-09-12 三审(L1): /etc/cloudflared 凭据清理必须放在二进制存在性判断之前 ——
-    # 用户可能只删了二进制(或二进制损坏不可执行), 此时提前 return 会把 token 留在盘上(RT-3 同源)。
-    # 只删 token 文件 + 仅在目录已空时 rmdir —— 手工配置的 config.yml 永不被触碰。
-    if [ -f /etc/cloudflared/token ]; then
-        rm -f /etc/cloudflared/token
+    # Keep credentials and the service definition until process cleanup is verified.
+    # service uninstall may erase a custom executable path needed to retry ownership checks.
+    local kill_rc=0
+    _cf_kill_all || kill_rc=$?
+    if [ "$kill_rc" -ne 0 ]; then
+        _error "cloudflared 停止状态无法确认, 未卸载服务或删除凭据/二进制"
+        _tip "服务定义已保留; 修复进程清理后再重试卸载"
+        return 1
     fi
-    rmdir /etc/cloudflared 2>/dev/null || true
+    local cleanup_rc=0 service_rc=0 enabled runlevels d link
+    # Clear the standalone token only after the service process has been stopped; verify removal.
+    if [ -e /etc/cloudflared/token ] || [ -L /etc/cloudflared/token ]; then
+        rm -f /etc/cloudflared/token || cleanup_rc=1
+    fi
+    [ ! -e /etc/cloudflared/token ] && [ ! -L /etc/cloudflared/token ] || cleanup_rc=1
+    rmdir /etc/cloudflared 2>/dev/null || true  # Preserve any user-owned config.yml.
     if [ -x "$CF_BIN" ]; then
         _info "卸载 cloudflared..."
-        "$CF_BIN" service uninstall 2>/dev/null || true
+        "$CF_BIN" service uninstall 2>/dev/null || service_rc=$?
+        [ "$service_rc" -eq 0 ] || _warn "官方 service uninstall 返回失败, 继续核对手工清理结果"
     else
         _warn "cloudflared 二进制不存在(仅清理残留配置)"
     fi
-    # 确保进程彻底死掉再删文件（替换原来的裸 stop）。
-    # 2026-09-21 复审(P1): 返回值原本被丢弃 —— _cf_kill_all 在"仍有残留进程"时返回 1,
-    # 而本函数随后照样删二进制/unit 并报"已卸载"并返回 0。这直接违反 _uninstall_menu [3] 的
-    # 契约(它消费 cf_rc 并据此提示"卸载未完全成功"), 用户会看到"卸载完成"而进程还活着。
-    # 实测: 把 _cf_kill_all 打桩成 return 1, 本函数仍返回 0。
-    # 残留进程仍必须继续走完文件清理(半途 return 会留下指向已删二进制的孤儿 unit), 但
-    # 最终返回值要如实反映"进程没清干净"。
-    local kill_rc=0
-    _cf_kill_all || kill_rc=$?
-    # service 单元/pidfile 的清理**必须无条件执行**: 二进制缺失时提前 return 会留下一份
-    # 指向不存在二进制的孤儿 unit(systemd 每次开机都会尝试拉起并失败)。
     case "$INIT_SYSTEM" in
         systemd)
             systemctl disable cloudflared 2>/dev/null || true
-            rm -f "$CF_UNIT_SYSTEMD" "${CF_UNIT_SYSTEMD}.bak"
-            systemctl daemon-reload 2>/dev/null || true
+            rm -f "$CF_UNIT_SYSTEMD" "${CF_UNIT_SYSTEMD}.bak" || cleanup_rc=1
+            [ ! -e "$CF_UNIT_SYSTEMD" ] && [ ! -L "$CF_UNIT_SYSTEMD" ] \
+                && [ ! -e "${CF_UNIT_SYSTEMD}.bak" ] && [ ! -L "${CF_UNIT_SYSTEMD}.bak" ] || cleanup_rc=1
+            systemctl daemon-reload 2>/dev/null || cleanup_rc=1
+            local load_state
+            load_state=$(systemctl show -p LoadState --value cloudflared 2>/dev/null || true)
+            if [ "$load_state" = not-found ]; then
+                :
+            elif [ -n "$load_state" ]; then
+                enabled=$(systemctl is-enabled cloudflared 2>/dev/null || true)
+                case "$enabled" in
+                    disabled|masked|masked-runtime|static|indirect|not-found) ;;
+                    *) cleanup_rc=1 ;;
+                esac
+            else
+                _error "无法确认 cloudflared systemd unit 是否已移除"
+                cleanup_rc=1
+            fi
+            if command -v find >/dev/null 2>&1; then
+                for d in /etc/systemd/system /run/systemd/system; do
+                    [ -d "$d" ] || continue
+                    link=$(find "$d" -type l -name cloudflared.service -print -quit 2>/dev/null) || { cleanup_rc=1; continue; }
+                    [ -z "$link" ] || cleanup_rc=1
+                done
+            else
+                cleanup_rc=1
+            fi
             ;;
         openrc)
             rc-update del cloudflared default 2>/dev/null || true
-            rm -f "$CF_UNIT_OPENRC" "${CF_UNIT_OPENRC}.bak"
+            rm -f "$CF_UNIT_OPENRC" "${CF_UNIT_OPENRC}.bak" || cleanup_rc=1
+            [ ! -e "$CF_UNIT_OPENRC" ] && [ ! -L "$CF_UNIT_OPENRC" \
+                ] && [ ! -e "${CF_UNIT_OPENRC}.bak" ] && [ ! -L "${CF_UNIT_OPENRC}.bak" ] || cleanup_rc=1
+            runlevels=$(rc-update show 2>/dev/null) || cleanup_rc=1
+            case "$runlevels" in *cloudflared*) cleanup_rc=1 ;; esac
             ;;
     esac
-    rm -f /run/cloudflared.pid /var/run/cloudflared.pid 2>/dev/null
-    rm -f "$CF_BIN"
-    rm -f "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6"
-    if [ "$kill_rc" -ne 0 ]; then
-        _error "cloudflared 文件与状态已清除, 但仍有残留进程未能停止"
-        _tip "请用 ps 确认 cloudflared 进程并手动结束, 否则它仍占用隧道连接"
+    rm -f /run/cloudflared.pid /var/run/cloudflared.pid 2>/dev/null || cleanup_rc=1
+    [ ! -e /run/cloudflared.pid ] && [ ! -L /run/cloudflared.pid ] \
+        && [ ! -e /var/run/cloudflared.pid ] && [ ! -L /var/run/cloudflared.pid ] || cleanup_rc=1
+    rm -f "$CF_BIN" || cleanup_rc=1
+    [ ! -e "$CF_BIN" ] && [ ! -L "$CF_BIN" ] || cleanup_rc=1
+    rm -f "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6" || cleanup_rc=1
+    for _cf_state_file in "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6"; do
+        [ ! -e "$_cf_state_file" ] && [ ! -L "$_cf_state_file" ] || cleanup_rc=1
+    done
+    if [ "$cleanup_rc" -ne 0 ]; then
+        _error "cloudflared 卸载未完全完成, 请检查残留的服务、二进制或状态文件"
         return 1
     fi
     _success "cloudflared 已卸载(二进制/服务/状态已清除)"
@@ -1260,7 +1330,7 @@ _cf_switch_token() {
     local restarted_ok="no"
     # R38(M3): 统一走 _cf_is_running —— 它现在把判活绑定到 unit MainPID / pidfile 进程树,
     # 比裸 is-active 更严(is-active 在崩溃循环的 activating 窗口也会返回 0)
-    _cf_is_running && restarted_ok="yes"
+    _cf_is_managed_running && restarted_ok="yes"
     if [ "$restarted_ok" = "no" ]; then
         _warn "重启后服务未运行, 回滚 service 文件..."
         # R38(P1): 回滚结果必须如实反映——原写法在 _cf_rollback_service 返回 1 时仍无条件
@@ -1277,8 +1347,60 @@ _cf_switch_token() {
     _success "令牌已更新, cloudflared 已重启(隧道短暂中断)"
 }
 
-# ---------------------------------------------------------------------------
-# 切换 2 开关(autoupdate|http2): 读取当前状态, 反转目标开关, 用 _cf_build_cmdline 重组整行写回
+_cf_managed_line_only() {
+    local line="$1" expected="$2" word first i=0 n
+    case "$line" in *\"*|*\'*) return 1 ;; esac
+    case "$line" in
+        ExecStart=*|command=*|command_args=*|cmd=*) line=${line#*=} ;;
+    esac
+    read -ra _cf_words <<< "$line"
+    n=${#_cf_words[@]}
+    [ "$n" -gt 0 ] || return 1
+    first="${_cf_words[0]}"
+    if [ "$first" = "$expected" ]; then
+        i=1
+    elif [ "$first" = tunnel ]; then
+        i=0
+    else
+        return 1
+    fi
+    if [ "$i" -lt "$n" ]; then
+        case "${_cf_words[$i]}" in
+            --autoupdate-freq) [ "$((i+1))" -lt "$n" ] || return 1; [ "${_cf_words[$((i+1))]}" = 24h0m0s ] || return 1; i=$((i+2)) ;;
+            --no-autoupdate) i=$((i+1)) ;;
+        esac
+    fi
+    [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = tunnel ] && i=$((i+1))
+    if [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = --protocol ]; then
+        [ "$((i+1))" -lt "$n" ] && [ "${_cf_words[$((i+1))]}" = http2 ] || return 1
+        i=$((i+2))
+    fi
+    if [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = --edge-ip-version ]; then
+        [ "$((i+1))" -lt "$n" ] && case "${_cf_words[$((i+1))]}" in 4|6|auto) ;; *) return 1 ;; esac
+        i=$((i+2))
+    fi
+    [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = run ] || return 1
+    i=$((i+1))
+    [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = --token ] || return 1
+    i=$((i+1))
+    [ "$i" -lt "$n" ] || return 1
+    i=$((i+1))
+    [ "$i" -eq "$n" ] || return 1
+}
+
+_cf_managed_flags_only() {
+    local line svc_bin expected_bin actual_bin
+    svc_bin=$(_cf_service_bin "$(_cf_unit_path)" 2>/dev/null) || return 1
+    [ -n "$svc_bin" ] || return 1
+    expected_bin=$(readlink -f "$CF_BIN" 2>/dev/null || printf '%s' "$CF_BIN")
+    actual_bin=$(readlink -f "$svc_bin" 2>/dev/null || printf '%s' "$svc_bin")
+    [ "$actual_bin" = "$expected_bin" ] || return 1
+    while IFS= read -r line; do
+        _cf_managed_line_only "$line" "$expected_bin" || return 1
+    done <<< "${CF_CUR_CMDLINE:-}"
+    return 0
+}
+
 # (从头重建保证参数顺序: 全局标志 tunnel 连接标志 run --token)
 # 协议栈为四选一, 走 _cf_set_edge_ip(见下)
 # ---------------------------------------------------------------------------
@@ -1291,6 +1413,10 @@ _cf_toggle() {
         return 1
     fi
     _cf_token_valid "$CF_CUR_TOKEN" || { _error "service 中的 Token 格式非法, 请先重新录入令牌"; return 1; }
+    _cf_managed_flags_only || {
+        _warn "service 启动行含未托管参数, 为避免丢失自定义设置拒绝切换; 请先手动整理启动行"
+        return 1
+    }
     local cur
     case "$key" in
         # autoupdate 的"当前值"必须用与菜单显示同一个判据。启动行没写标志时 cloudflared
@@ -1329,7 +1455,7 @@ _cf_toggle() {
         fi
         return 1
     fi
-    if ! _cf_is_running; then
+    if ! _cf_is_managed_running; then
         _warn "切换后服务未运行, 回滚..."
         if _cf_rollback_service "$svcfile"; then
             _error "${key} 切换失败, 已回滚到原状态"
@@ -1355,6 +1481,10 @@ _cf_set_edge_ip() {
         return 1
     fi
     _cf_token_valid "$CF_CUR_TOKEN" || { _error "service 中的 Token 格式非法, 请先重新录入令牌"; return 1; }
+    _cf_managed_flags_only || {
+        _warn "service 启动行含未托管参数, 为避免丢失自定义设置拒绝切换; 请先手动整理启动行"
+        return 1
+    }
     local cur="${CF_CUR_EDGE_IP:-off}"
     echo
     echo -e "  ${CYAN}【切换协议栈】${NC}"
@@ -1400,7 +1530,7 @@ _cf_set_edge_ip() {
         fi
         return 1
     fi
-    if ! _cf_is_running; then
+    if ! _cf_is_managed_running; then
         _warn "切换后服务未运行, 回滚..."
         if _cf_rollback_service "$svcfile"; then
             _error "协议栈切换失败, 已回滚到原状态"
@@ -1471,7 +1601,14 @@ _cloudflared_menu() {
             2) _cf_toggle autoupdate ;;
             3) _cf_toggle http2 ;;
             4) _cf_set_edge_ip ;;
-            5) _cf_restart; if _cf_is_running; then _success "已重启"; else _warn "重启后服务未运行, 请检查状态"; fi ;;
+            5)
+                if _cf_restart && _cf_is_managed_running; then
+                    _success "已重启"
+                else
+                    _warn "重启失败或重启后服务未运行, 请检查状态"
+                fi
+                ;;
+
             6) _cf_diagnose ;;
             9) _uninstall_cloudflared ;;
             0) return ;;

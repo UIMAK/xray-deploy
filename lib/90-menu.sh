@@ -739,17 +739,53 @@ _reset_config() {
 #   prepared  -> 已开始移动 metadata/clash, 崩溃必须回滚(config 也回到副本)
 #   committed -> 重置后状态已生效, 崩溃只需清理快照与 journal
 # 快照目录用**固定名**: reset 全程持有 install+config 锁, 同一时刻只可能有一个 reset 事务。
-# journal 经 `_atomic_write_json` 提交(内部 fsync 文件 + 父目录), 掉电不会读到半写 phase。
+# prepared 前 flush 快照数据/目录; 每次 rename flush 目标与两侧目录; journal phase 写入使用严格 fsync 检查。
 # ---------------------------------------------------------------------------
 _reset_journal_path() { printf '%s' "$DEPLOY_DIR/.reset-journal.json"; }
 _reset_snapshot_path() { printf '%s' "$DEPLOY_DIR/.reset-snapshot"; }
 
+_reset_fsync_strict() {
+    local p="$1"
+    [ -n "$p" ] || return 0
+    # Do not fall back to bare `sync`: it can report success while the targeted writeback
+    # failed. `sync -f` is accepted only as the path-targeted capability fallback.
+    if sync "$p" >/dev/null 2>&1; then return 0; fi
+    if sync -f "$p" >/dev/null 2>&1; then return 0; fi
+    _error "无法确认 reset 持久化屏障: $p"
+    return 1
+}
+
+_reset_fsync_required() {
+    _reset_fsync_strict "$1" || { _error "reset 持久化屏障失败: $1"; return 1; }
+}
+
+_reset_fsync_rename() {   # <source> <destination>
+    local source="$1" destination="$2" source_dir destination_dir
+    source_dir=$(dirname "$source")
+    destination_dir=$(dirname "$destination")
+    _reset_fsync_required "$destination" || return 1
+    _reset_fsync_required "$source_dir" || return 1
+    [ "$destination_dir" = "$source_dir" ] || _reset_fsync_required "$destination_dir"
+}
+
+_reset_journal_quarantine_exists() {
+    local journal="$1" bad
+    [ -e "${journal}.corrupt" ] && return 0
+    for bad in "${journal}.corrupt."*; do
+        [ -e "$bad" ] && return 0
+    done
+    return 1
+}
+
 _reset_journal_quarantine() {   # <journal> <原因>
-    local journal="$1" why="$2" bad i=0
+    local journal="$1" why="$2" bad i=0 sync_failed=0
     bad="${journal}.corrupt"
     while [ -e "$bad" ]; do i=$((i+1)); bad="${journal}.corrupt.${i}"; done
     if mv "$journal" "$bad" 2>/dev/null; then
+        _reset_fsync_required "$bad" || sync_failed=1
+        _reset_fsync_required "$(dirname "$journal")" || sync_failed=1
         _warn "reset 事务日志${why}, 已隔离为 $bad; 快照保留在 $(_reset_snapshot_path) 供人工检查"
+        [ "$sync_failed" -eq 0 ] || _warn "隔离标记持久化屏障失败, 恢复将继续 fail-closed"
     else
         _warn "reset 事务日志${why}且隔离失败, 请人工检查: $journal"
     fi
@@ -762,7 +798,9 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_
     local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0
     if [ "$had_config" -eq 1 ]; then
         if [ -s "$stage/config.json" ]; then
-            if ! _atomic_write_json "$CONFIG_FILE" "$(cat "$stage/config.json" 2>/dev/null)"; then
+            if ! _atomic_write_json "$CONFIG_FILE" "$(cat "$stage/config.json" 2>/dev/null)" || \
+               ! _reset_fsync_required "$CONFIG_FILE" || \
+               ! _reset_fsync_required "$(dirname "$CONFIG_FILE")"; then
                 _error "配置回滚失败, 请手动从快照副本恢复: $stage/config.json"
                 ok=1
             fi
@@ -773,18 +811,31 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_
             ok=1
         fi
     else
-        rm -f "$CONFIG_FILE" 2>/dev/null || ok=1
+        if ! rm -f "$CONFIG_FILE" 2>/dev/null || ! _reset_fsync_required "$(dirname "$CONFIG_FILE")"; then ok=1; fi
     fi
     if [ "$nodes_moved" -eq 1 ]; then
-        rm -rf "$NODES_DIR" 2>/dev/null || ok=1
-        if ! mv "$stage/nodes" "$NODES_DIR" 2>/dev/null; then ok=1; fi
+        if ! rm -rf "$NODES_DIR" 2>/dev/null; then
+            ok=1
+        elif ! mv "$stage/nodes" "$NODES_DIR" 2>/dev/null; then
+            ok=1
+        elif ! _reset_fsync_rename "$stage/nodes" "$NODES_DIR"; then
+            ok=1
+        fi
     fi
     if [ "$clash_moved" -eq 1 ]; then
-        rm -f "$CLASH_YAML" 2>/dev/null || ok=1
-        if ! mv "$stage/clash.yaml" "$CLASH_YAML" 2>/dev/null; then ok=1; fi
+        if ! rm -f "$CLASH_YAML" 2>/dev/null; then
+            ok=1
+        elif ! mv "$stage/clash.yaml" "$CLASH_YAML" 2>/dev/null; then
+            ok=1
+        elif ! _reset_fsync_rename "$stage/clash.yaml" "$CLASH_YAML"; then
+            ok=1
+        fi
     fi
     if [ "$ok" -eq 0 ]; then
-        rm -rf "$stage" 2>/dev/null || ok=1
+        if ! rm -rf "$stage" 2>/dev/null || [ -e "$stage" ] || \
+           ! _reset_fsync_required "$(dirname "$stage")"; then
+            ok=1
+        fi
     fi
     return "$ok"
 }
@@ -794,7 +845,9 @@ _reset_journal_write() {   # <journal> <snapshot> <phase> <had_json> <specs_json
     local content
     content=$(jq -nc --arg snap "$2" --arg phase "$3" --argjson had "$4" --argjson specs "$5" \
         '{snapshot:$snap,phase:$phase,had_config:$had,hop_specs:$specs}') || return 1
-    _atomic_write_json "$1" "$content"
+    _atomic_write_json "$1" "$content" || return 1
+    _reset_fsync_required "$1" || return 1
+    _reset_fsync_required "$(dirname "$1")"
 }
 
 # 回补 journal 里记录的、本次 reset 已删除的端口跳跃规则(只补缺失项, 幂等)。
@@ -826,7 +879,10 @@ _reset_config_abort_locked() {   # <stage> <nodes_moved> <clash_moved> <had_conf
         _error "reset 回滚不完整, 快照与事务日志保留供下次启动重试: $stage"
         return 1
     fi
-    rm -f "$journal" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动收敛"
+    if ! rm -f "$journal" 2>/dev/null || ! _reset_fsync_required "$(dirname "$journal")"; then
+        _warn "reset 事务日志清理未能持久化, 下次启动会自动收敛"
+        return 1
+    fi
     _warn "已回滚, 重置未生效: 配置与节点数据均保持原样"
     return 0
 }
@@ -845,7 +901,18 @@ _reset_config_commit_finish_locked() {   # <journal> <snapshot> <had_json> <spec
         _warn "重置已应用且运行态已收敛, 但旧快照清理失败(下次启动会重试): $2"
         return 0
     fi
-    rm -f "$1" 2>/dev/null || _warn "reset 事务日志清理失败, 下次启动会自动清理"
+    if ! _reset_fsync_required "$(dirname "$2")"; then
+        _warn "快照删除未能持久化, runtime_verified 账本保留供下次启动重试"
+        return 1
+    fi
+    if ! rm -f "$1" 2>/dev/null; then
+        _warn "reset 事务日志清理失败, 下次启动会自动清理"
+        return 0
+    fi
+    if ! _reset_fsync_required "$(dirname "$1")"; then
+        _warn "reset 事务日志删除未能持久化, 请重试恢复检查"
+        return 1
+    fi
     return 0
 }
 
@@ -854,7 +921,8 @@ _reset_config_commit_finish_locked() {   # <journal> <snapshot> <had_json> <spec
 # deployment tree 内的文件, 只拿 config 锁会让 `install.sh --update` 与恢复交错。
 # 无账本且无快照时是纯读检查, 不加锁直接返回(避免每次启动都与并发安装互等)。
 _reset_config_recover() {
-    [ -e "$(_reset_journal_path)" ] || [ -e "$(_reset_snapshot_path)" ] || return 0
+    local journal; journal=$(_reset_journal_path)
+    [ -e "$journal" ] || [ -e "$(_reset_snapshot_path)" ] || _reset_journal_quarantine_exists "$journal" || return 0
     if declare -F _with_deploy_install_lock >/dev/null 2>&1; then
         _with_deploy_install_lock _with_config_lock _reset_config_recover_locked
     else
@@ -866,6 +934,10 @@ _reset_config_recover_locked() {
     local journal snapshot phase had_config nodes_moved=0 clash_moved=0
     journal=$(_reset_journal_path)
     snapshot=$(_reset_snapshot_path)
+    if _reset_journal_quarantine_exists "$journal"; then
+        _warn "发现已隔离的损坏 reset 事务日志, 保留快照并拒绝启动维护: ${journal}.corrupt*"
+        return 1
+    fi
     if [ ! -e "$journal" ]; then
         # journal 是提交顺序里的**最后**一个文件: 没有它, 快照只能是"写 journal 之前"的
         # 残骸或已提交后的清理残留, 两者都无权威可恢复, 直接清掉。
@@ -952,7 +1024,10 @@ _reset_config_recover_locked() {
             return 1
         fi
     fi
-    rm -f "$journal" 2>/dev/null || { _warn "reset journal 清理失败: $journal"; return 1; }
+    if ! rm -f "$journal" 2>/dev/null || ! _reset_fsync_required "$(dirname "$journal")"; then
+        _warn "reset journal 清理未能持久化, 下次启动会继续收敛"
+        return 1
+    fi
     _warn "检测到上次 reset 未提交, 已回滚到重置前的配置与节点"
     return 0
 }
@@ -981,6 +1056,11 @@ _reset_config_locked() {
         _error "无法创建 reset 恢复快照目录, 已取消重置以保护现有数据"
         return 1
     fi
+    if ! _reset_fsync_required "$snapshot" || ! _reset_fsync_required "$(dirname "$snapshot")"; then
+        _error "reset 恢复快照目录未能持久化, 已取消重置"
+        rm -rf "$snapshot" 2>/dev/null
+        return 1
+    fi
     if [ "$had_config" -eq 1 ]; then
         # config 副本是比 lastbak 更可靠的恢复源(lastbak 会被后续任何配置事务覆盖)。
         if ! cp -f "$CONFIG_FILE" "$snapshot/config.json" 2>/dev/null || [ ! -s "$snapshot/config.json" ]; then
@@ -988,6 +1068,16 @@ _reset_config_locked() {
             rm -rf "$snapshot" 2>/dev/null
             return 1
         fi
+        if ! _reset_fsync_required "$snapshot/config.json"; then
+            _error "reset 配置快照未能持久化, 已取消重置"
+            rm -rf "$snapshot" 2>/dev/null
+            return 1
+        fi
+    fi
+    if ! _reset_fsync_required "$snapshot" || ! _reset_fsync_required "$(dirname "$snapshot")"; then
+        _error "reset 快照目录内容未能持久化, 已取消重置"
+        rm -rf "$snapshot" 2>/dev/null
+        return 1
     fi
     # hop 清理会删除 iptables 规则, 属于"真实状态改动": 候选 spec 必须先写进账本,
     # 崩溃时由启动恢复回补(见 `_reset_config_replay_hop_specs_locked`)。
@@ -1040,8 +1130,18 @@ _reset_config_locked() {
             return 1
         fi
         nodes_moved=1
+        if ! _reset_fsync_rename "$NODES_DIR" "$snapshot/nodes"; then
+            _error "节点 metadata 快照移动未能持久化, 正在恢复重置前的快照"
+            _reset_config_abort_locked "$snapshot" 1 0 "$had_config"
+            return 1
+        fi
         if ! mkdir -p "$NODES_DIR" 2>/dev/null; then
             _error "无法重建节点 metadata 目录, 正在恢复重置前的快照"
+            _reset_config_abort_locked "$snapshot" 1 0 "$had_config"
+            return 1
+        fi
+        if ! _reset_fsync_required "$NODES_DIR" || ! _reset_fsync_required "$(dirname "$NODES_DIR")"; then
+            _error "新建节点 metadata 目录未能持久化, 正在恢复重置前的快照"
             _reset_config_abort_locked "$snapshot" 1 0 "$had_config"
             return 1
         fi
@@ -1053,6 +1153,11 @@ _reset_config_locked() {
             return 1
         fi
         clash_moved=1
+        if ! _reset_fsync_rename "$CLASH_YAML" "$snapshot/clash.yaml"; then
+            _error "clash 恢复快照移动未能持久化, 正在恢复重置前的快照"
+            _reset_config_abort_locked "$snapshot" "$nodes_moved" 1 "$had_config"
+            return 1
+        fi
     fi
     # 删掉 config 让 _init_config_if_empty 重建。
     # **重建失败必须回滚**(2026-09-22 九轮 OCR #41): 不滚会留下"既没有配置、也没有节点
@@ -1062,8 +1167,18 @@ _reset_config_locked() {
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
+    if ! _reset_fsync_required "$(dirname "$CONFIG_FILE")"; then
+        _error "旧 config.json 删除未能持久化, 正在恢复重置前的快照"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        return 1
+    fi
     if ! _init_config_if_empty; then
         _error "重建默认配置失败(只读/磁盘空间/jq 异常?), 正在回滚到重置前的配置"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        return 1
+    fi
+    if ! _reset_fsync_required "$CONFIG_FILE" || ! _reset_fsync_required "$(dirname "$CONFIG_FILE")"; then
+        _error "新 config.json 未能持久化, 正在恢复重置前的快照"
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
@@ -1074,11 +1189,16 @@ _reset_config_locked() {
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
+    if [ "$clash_moved" -eq 1 ] && \
+       { ! _reset_fsync_required "$CLASH_YAML" || ! _reset_fsync_required "$(dirname "$CLASH_YAML")"; }; then
+        _error "空 clash 配置未能持久化, 正在恢复重置前的快照"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        return 1
+    fi
     # COMMIT: phase 先 durable 落盘, 之后**绝不再回滚**; 任一步失败都留 committed journal
     # 给启动恢复做 cleanup。
     if ! _reset_journal_write "$journal" "$snapshot" "committed" "$had_json" "$specs_json"; then
-        _error "重置已应用但提交日志写入失败, 正在回滚"
-        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        _error "无法确认 reset committed 阶段已持久化; 保留 journal 与快照, 停止后续清理"
         return 1
     fi
     # **运行态收敛必须早于删除账本**(二十五轮 P1): 顺序是
@@ -1485,6 +1605,103 @@ _hy2_masq_set_string() {
 # ---------------------------------------------------------------------------
 # Hysteria2: 切换 brutal / bbr
 # ---------------------------------------------------------------------------
+_hy2_congestion_txn() {
+    _with_config_lock _hy2_congestion_txn_locked "$@"
+}
+
+_hy2_congestion_txn_locked() {
+    local tag="$1" operation="$2" new_cc="$3" up="$4" down="$5"
+    local meta="$NODES_DIR/${tag}.json" meta_prev cur_cc config_cc effective_up effective_down
+    # metadata 原文与 _mutate_config 写入前的 config 备份都在此 config lock 内取得。
+    if [ ! -s "$meta" ] || ! jq -e 'type == "object" and .protocol == "hysteria2"' "$meta" >/dev/null 2>&1; then
+        _error "Hy2 元数据已变化或损坏, 拒绝提交: $meta"
+        return 1
+    fi
+    if [ ! -s "$CONFIG_FILE" ] || ! jq -e --arg t "$tag" \
+        '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and $nodes[0].protocol == "hysteria")' \
+        "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "config.json 中找不到唯一的 Hy2 入站(${tag}), 请先同步/修复配置"
+        return 1
+    fi
+    meta_prev=$(cat "$meta" 2>/dev/null) || meta_prev=""
+    [ -n "$meta_prev" ] || { _error "无法快照 Hy2 元数据: $meta"; return 1; }
+    cur_cc=$(jq -r '.congestion // empty' "$meta" 2>/dev/null) || cur_cc=""
+    config_cc=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.congestion // empty' "$CONFIG_FILE" 2>/dev/null) || config_cc=""
+    case "$operation" in
+        congestion)
+            case "$new_cc" in bbr|brutal|force-brutal) ;; *) _error "无效拥塞模式: $new_cc"; return 1 ;; esac
+            if [ "$new_cc" = "$cur_cc" ] && [ "$new_cc" = "$config_cc" ]; then
+                _info "已是 ${new_cc} 模式, 无需切换"
+                return 3
+            fi
+            if [ "$new_cc" = "bbr" ]; then
+                if ! _mutate_config --arg t "$tag" \
+                    'if ([.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] | length) != 1 then error("Hy2 inbound changed") else (.inbounds[] | select(.tag == $t and .protocol == "hysteria") | .streamSettings.finalmask.quicParams) = {congestion: "bbr"} end'; then
+                    _error "切换失败, config 事务未成功; 请核对上方回滚状态"
+                    return 1
+                fi
+                if ! _meta_update "$meta" '.congestion="bbr" | del(.brutal_up) | del(.brutal_down)'; then
+                    _hy2_congestion_rollback "$meta" "$meta_prev"
+                    return $?
+                fi
+            else
+                if ! _mutate_config --arg t "$tag" --arg cc "$new_cc" --arg up "$up" --arg down "$down" \
+                    'if ([.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] | length) != 1 then error("Hy2 inbound changed") else (.inbounds[] | select(.tag == $t and .protocol == "hysteria") | .streamSettings.finalmask.quicParams) = ({congestion: $cc} + (if $up != "" then {brutalUp: $up} else {} end) + (if $down != "" then {brutalDown: $down} else {} end)) end'; then
+                    _error "切换失败, config 事务未成功; 请核对上方回滚状态"
+                    return 1
+                fi
+                if ! _meta_update "$meta" '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' --arg cc "$new_cc" --arg up "$up" --arg down "$down"; then
+                    _hy2_congestion_rollback "$meta" "$meta_prev"
+                    return $?
+                fi
+            fi
+            ;;
+        bandwidth)
+            if [ "$cur_cc" != "$config_cc" ]; then
+                _error "Hy2 config 与元数据拥塞模式不一致, 拒绝调整带宽: ${config_cc:-未知} / ${cur_cc:-未知}"
+                return 1
+            fi
+            case "$config_cc" in brutal|force-brutal) ;; *) _error "该节点当前为 ${config_cc:-未知} 模式, 非 brutal/force-brutal 无需设带宽"; return 1 ;; esac
+            effective_up="$up"
+            effective_down="$down"
+            [ -n "$effective_up" ] || effective_up=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalUp // empty' "$CONFIG_FILE" 2>/dev/null)
+            [ -n "$effective_down" ] || effective_down=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalDown // empty' "$CONFIG_FILE" 2>/dev/null)
+            if ! _mutate_config --arg t "$tag" --arg up "$effective_up" --arg down "$effective_down" \
+                'if ([.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] | length) != 1 then error("Hy2 inbound changed") else (.inbounds[] | select(.tag == $t and .protocol == "hysteria") | .streamSettings.finalmask.quicParams) |= (. + (if $up != "" then {brutalUp: $up} else {} end) + (if $down != "" then {brutalDown: $down} else {} end)) end'; then
+                _error "带宽调整失败, config 事务未成功; 请核对上方回滚状态"
+                return 1
+            fi
+            if ! _meta_update "$meta" '.brutal_up=$up | .brutal_down=$down' --arg up "$effective_up" --arg down "$effective_down"; then
+                _hy2_congestion_rollback "$meta" "$meta_prev"
+                return $?
+            fi
+            ;;
+        *) _error "未知 Hy2 拥塞事务: $operation"; return 1 ;;
+    esac
+    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+    return 0
+}
+
+_hy2_congestion_rollback() {
+    local meta="$1" meta_prev="$2" config_ok=0 meta_ok=0
+    if _restore_config && _restart_xray_verified; then
+        config_ok=1
+    else
+        _warn "Hy2 元数据写入失败后, config/runtime 回滚未完整完成"
+    fi
+    if _atomic_write_json "$meta" "$meta_prev"; then
+        meta_ok=1
+    else
+        _warn "Hy2 元数据回滚失败, 请手动核对: $meta"
+    fi
+    if [ "$config_ok" -eq 1 ] && [ "$meta_ok" -eq 1 ]; then
+        _error "Hy2 更新失败, config 与元数据已完整回滚"
+        return 1
+    fi
+    _error "Hy2 更新失败且回滚不完整, 请手动核对 ${CONFIG_FILE} 与 ${meta}"
+    return 2
+}
+
 _hy2_toggle_brutal() {
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
@@ -1526,61 +1743,36 @@ _hy2_toggle_brutal() {
         3) new_cc="force-brutal" ;;
         *) _warn "无效选择"; _press_any_key; return ;;
     esac
-    [ "$new_cc" = "$cur_cc" ] && { _info "已是 ${new_cc} 模式, 无需切换"; _press_any_key; return; }
-
-    case "$new_cc" in
-        bbr)
-            if ! _mutate_config --arg t "$tag" \
-                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = {congestion: "bbr"}'; then
-                _error "切换失败, 已回滚"; _press_any_key; return
-            fi
-            _meta_update "$meta" '.congestion=$cc | del(.brutal_up) | del(.brutal_down)' --arg cc "$new_cc" || { _error "元数据写入失败"; _press_any_key; return; }
-            _success "已切换为 bbr 模式"
+    local brutal_up="" brutal_down="" txn_rc
+    if [ "$new_cc" != "bbr" ]; then
+        echo -e "  ${YELLOW}${new_cc} 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
+        read -rp "  上传带宽 (回车不限): " brutal_up
+        read -rp "  下载带宽 (回车不限): " brutal_down
+        brutal_up=$(_normalize_bandwidth "$brutal_up")
+        brutal_down=$(_normalize_bandwidth "$brutal_down")
+    fi
+    # Config、metadata 与 _hy2_sync_derived 在事务锁内一起完成。
+    _hy2_congestion_txn "$tag" congestion "$new_cc" "$brutal_up" "$brutal_down"
+    txn_rc=$?
+    case "$txn_rc" in
+        0)
+            case "$new_cc" in
+                bbr) _success "已切换为 bbr 模式" ;;
+                brutal)
+                    _success "已切换为 brutal 模式"
+                    [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
+                    [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
+                    ;;
+                force-brutal)
+                    _success "已切换为 force-brutal 模式"
+                    _tip "force-brutal: 强制使用 brutalUp 固定发包速率, 无视对端协商"
+                    [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
+                    [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
+                    ;;
+            esac
             ;;
-        brutal)
-            echo -e "  ${YELLOW}brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
-            local brutal_up="" brutal_down=""
-            read -rp "  上传带宽 (回车不限): " brutal_up
-            read -rp "  下载带宽 (回车不限): " brutal_down
-            brutal_up=$(_normalize_bandwidth "$brutal_up")
-            brutal_down=$(_normalize_bandwidth "$brutal_down")
-            if ! _mutate_config --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
-                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
-                  ({congestion: "brutal"}
-                   + (if $up != "" then {brutalUp: $up} else {} end)
-                   + (if $down != "" then {brutalDown: $down} else {} end))'; then
-                _error "切换失败, 已回滚"; _press_any_key; return
-            fi
-            _meta_update "$meta" '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" || { _error "元数据写入失败"; _press_any_key; return; }
-            _success "已切换为 brutal 模式"
-            [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
-            [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
-            ;;
-        force-brutal)
-            echo -e "  ${YELLOW}force-brutal 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
-            local brutal_up="" brutal_down=""
-            read -rp "  上传带宽 (回车不限): " brutal_up
-            read -rp "  下载带宽 (回车不限): " brutal_down
-            brutal_up=$(_normalize_bandwidth "$brutal_up")
-            brutal_down=$(_normalize_bandwidth "$brutal_down")
-            if ! _mutate_config --arg t "$tag" --arg up "$brutal_up" --arg down "$brutal_down" \
-                 '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) =
-                  ({congestion: "force-brutal"}
-                   + (if $up != "" then {brutalUp: $up} else {} end)
-                   + (if $down != "" then {brutalDown: $down} else {} end))'; then
-                _error "切换失败, 已回滚"; _press_any_key; return
-            fi
-            _meta_update "$meta" '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' --arg cc "$new_cc" --arg up "$brutal_up" --arg down "$brutal_down" || { _error "元数据写入失败"; _press_any_key; return; }
-            _success "已切换为 force-brutal 模式"
-            _tip "force-brutal: 强制使用 brutalUp 固定发包速率, 无视对端协商"
-            [ -n "$brutal_up" ] && echo -e "  ${CYAN}上传:${NC} ${brutal_up}"
-            [ -n "$brutal_down" ] && echo -e "  ${CYAN}下载:${NC} ${brutal_down}"
-            ;;
+        2) _tip "本次 Hy2 更新回滚不完整, 请按上方提示人工核对" ;;
     esac
-    # 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived(50-nodes): gecko 节点的链接
-    # 无法用官方 hy2 URI 表达, 此时必须清空旧链接并**继续**同步 clash(clash 能完整承载该尺寸),
-    # 而不是在此以"重建失败"提前 return —— 那会把旧链接与旧 clash 条目一并留下(stale)。
-    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
     _press_any_key
 }
 
@@ -1624,23 +1816,22 @@ _hy2_adjust_bandwidth() {
     echo -e "  ${YELLOW}格式: 100 mbps / 10m / 1g  (回车保持不变)${NC}"
     local new_up new_down
     read -rp "  新上传带宽: " new_up
-    new_up=${new_up:-$cur_up}
     read -rp "  新下载带宽: " new_down
-    new_down=${new_down:-$cur_down}
     new_up=$(_normalize_bandwidth "$new_up")
     new_down=$(_normalize_bandwidth "$new_down")
 
-    if ! _mutate_config --arg t "$tag" --arg up "$new_up" --arg down "$new_down" \
-         '(.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) |=
-          (. + (if $up != "" then {brutalUp: $up} else {} end)
-               + (if $down != "" then {brutalDown: $down} else {} end))'; then
-        _error "带宽调整失败, 已回滚"; _press_any_key; return
-    fi
-    _meta_update "$meta" '.brutal_up=$up | .brutal_down=$down' --arg up "$new_up" --arg down "$new_down" || { _error "带宽元数据写入失败"; _press_any_key; return; }
-    # 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived(50-nodes) —— 与拥塞切换同源:
-    # 带宽变化会改变 clash 条目的 up/down 字段, gecko 节点则链接不可表达(清空 + 继续同步 clash)。
-    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
-    _success "带宽已更新: 上传=${new_up:-不限}  下载=${new_down:-不限}"
+    local txn_rc=0
+    # Blank inputs and _hy2_sync_derived are resolved from current state inside the transaction lock.
+    _hy2_congestion_txn "$tag" bandwidth "" "$new_up" "$new_down" || txn_rc=$?
+    case "$txn_rc" in
+        0)
+            new_up=$(jq -r '.brutal_up // empty' "$meta" 2>/dev/null)
+            new_down=$(jq -r '.brutal_down // empty' "$meta" 2>/dev/null)
+            _success "带宽已更新: 上传=${new_up:-不限}  下载=${new_down:-不限}"
+            ;;
+        2) _tip "本次 Hy2 更新回滚不完整, 请按上方提示人工核对" ;;
+        *) _press_any_key; return ;;
+    esac
     _press_any_key
 }
 
@@ -1651,10 +1842,95 @@ _hy2_adjust_bandwidth() {
 #   packetSize 为 Int32Range, 非空即启用 Gecko(QUIC 长包头额外分片填充), 上限 2048。
 # 注意: 官方文档没有 hysteriaSettings.obfs 字段; 链接侧 obfs/obfs-password 参数名
 # 来自 Hysteria 官方 URI-Scheme(Xray 文档未定义 hy2 分享链接)。
-# 服务端变更走 _mutate_config(事务 + verified-restart + 回滚); 元数据在 config 提交成功后写,
-# 失败时把 config 回滚为**改动前**的混淆形态(不是一律清空), 保持两侧一致
-# (顺序与 _hy2_toggle_brutal 一致; 回滚见 _hy2_obfs_rollback)。
+# 输入在锁外收集; `_hy2_obfs_txn_locked` 锁内复验入站/外来层并从实际 config 捕获回滚层。
+# config、metadata 与派生同步串行提交; metadata 失败时只回滚本脚本管理的混淆层。
 # ---------------------------------------------------------------------------
+_hy2_obfs_txn() {
+    _with_config_lock _hy2_obfs_txn_locked "$@"
+}
+
+_hy2_obfs_txn_locked() {
+    local tag="$1" meta="$2" choice="$3" otype="$4" opw="$5" osize="$6" omask="$7"
+    local meta_prev rollback_mask config_ok=0 meta_ok=0
+    # 实际混淆层/metadata 快照与 _mutate_config 的 config 备份都受此锁保护。
+    if [ ! -s "$meta" ] || ! jq -e 'type == "object" and .protocol == "hysteria2"' "$meta" >/dev/null 2>&1; then
+        _error "Hy2 元数据已变化或损坏, 拒绝提交: $meta"
+        return 1
+    fi
+    if [ ! -s "$CONFIG_FILE" ] || ! jq -e --arg t "$tag" \
+        '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and $nodes[0].protocol == "hysteria")' \
+        "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "config.json 中找不到唯一的 Hy2 入站(${tag}), 请先同步/修复配置"
+        return 1
+    fi
+    meta_prev=$(cat "$meta" 2>/dev/null) || meta_prev=""
+    [ -n "$meta_prev" ] || { _error "无法快照 Hy2 元数据: $meta"; return 1; }
+    rollback_mask=$(jq -c --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" \
+        '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] as $nodes
+         | if ($nodes | length) != 1 then error("Hy2 inbound changed")
+           else ($nodes[0].streamSettings.finalmask.udp // []
+                 | map(select(.type == $ourtype and (.settings // {})[$ourmark] == true))) as $ours
+                | if ($ours | length) > 1 then error("multiple managed UDP layers") else ($ours[0] // null) end
+           end' "$CONFIG_FILE" 2>/dev/null) || {
+        _error "无法读取 config 中本脚本实际管理的混淆层, 已取消"
+        return 1
+    }
+    case "$choice" in
+        1|2)
+            if _hy2_udp_has_foreign_salamander "$tag"; then
+                _error "该入站的 finalmask.udp 已存在**非本脚本写入**的 salamander 层;"
+                _error "继续启用会叠加成双重混淆(客户端只做一层, 必然连不上)。"
+                _tip "请先手工编辑 ${CONFIG_FILE} 移除或改名该层(本脚本写入的层带 settings.xd_managed=true)"
+                _tip "若只想关闭本脚本的混淆, 请选 [3](只删本脚本那层, 保留其它层)"
+                return 1
+            fi
+            ;;
+        3) ;;
+        *) _error "无效混淆选项: $choice"; return 1 ;;
+    esac
+    if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new "$omask" \
+        "$XD_UDP_JQ_UPSERT"; then
+        _error "混淆 config 事务失败, 请核对上方回滚状态"
+        return 1
+    fi
+    case "$choice" in
+        1|2)
+            if ! _meta_update "$meta" \
+                '.obfs_type=$t | .obfs_password=$p | .obfs_packet_size=(if $s == "" then null else $s end)' \
+                --arg t "$otype" --arg p "$opw" --arg s "$osize"; then
+                _error "混淆元数据写入失败, 正在回滚实际配置快照"
+            else
+                _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+                return 0
+            fi
+            ;;
+        3)
+            if ! _meta_update "$meta" 'del(.obfs_type) | del(.obfs_password) | del(.obfs_packet_size)'; then
+                _error "混淆元数据写入失败, 正在回滚实际配置快照"
+            else
+                _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+                return 0
+            fi
+            ;;
+    esac
+    if _hy2_obfs_rollback "$tag" "$rollback_mask"; then
+        config_ok=1
+    else
+        _warn "混淆配置回滚失败, 请手动核对: $CONFIG_FILE"
+    fi
+    if _atomic_write_json "$meta" "$meta_prev"; then
+        meta_ok=1
+    else
+        _warn "混淆元数据回滚失败, 请手动核对: $meta"
+    fi
+    if [ "$config_ok" -eq 1 ] && [ "$meta_ok" -eq 1 ]; then
+        _error "混淆事务失败, 配置与元数据已恢复到改动前"
+        return 1
+    fi
+    _error "混淆事务失败且回滚不完整, 请手动核对 ${CONFIG_FILE} 与 ${meta}"
+    return 2
+}
+
 _hy2_obfs_menu() {
     local choice
     clear
@@ -1681,22 +1957,10 @@ _hy2_obfs_menu() {
     local tag
     tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
 
-    # 入站必须真实存在于 config: 元数据在而 config 被手工改过时, 下面的
-    # `(.inbounds[] | select(.tag == $t)) |= …` 会匹配 0 条路径 —— jq 返回 0、
-    # 配置原样不动, _mutate_config 重启成功并报"已启用", 于是元数据与服务器再次分裂。
-    jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
-        || { _error "config.json 中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
-
     local meta="$NODES_DIR/${tag}.json"
-    local cur_type cur_pw cur_size
+    local cur_type cur_size
     cur_type=$(jq -r '.obfs_type // empty' "$meta")
-    cur_pw=$(jq -r '.obfs_password // empty' "$meta")
     cur_size=$(_hy2_obfs_size_get "$meta")
-    # 回滚目标 = **改动前**的混淆形态(不是"无混淆"): 元数据写失败时若一律回滚成
-    # udp:[], 一个正在用混淆工作的节点会被静默清成无混淆, 而链接/clash 仍写着 obfs
-    # ⇒ 所有已分发客户端立刻连不上。cur_type 为空时该表达式自然得到 [], 首次启用不受影响。
-    local rollback_mask
-    rollback_mask=$(_hy2_obfs_mask_block "$cur_type" "$cur_pw" "$cur_size") || rollback_mask="__INVALID__"
     echo
     if [ -n "$cur_type" ]; then
         echo -e "  当前: ${GREEN}${cur_type}${NC}${cur_size:+ (packetSize=${cur_size})}"
@@ -1714,18 +1978,6 @@ _hy2_obfs_menu() {
     case "${obfs_choice:-0}" in
         0) return ;;
         1|2)
-            # 启用/更换 的 fail-closed 闸门: 该入站若已有一层**不是我们写的** type=salamander,
-            # 追加我们那层会让 Xray 依次套两层 salamander(双重混淆, 客户端只做一层 ⇒ 必然
-            # 连不上)。不替用户猜(既不吃掉别人的层, 也不硬套), 交人工处理。
-            # **只挡 1|2, 不挡 3**: 关闭只剔除我们自己带标记的那层、保留别人的层, 是完全
-            # 安全的操作 —— 在菜单入口无条件拦截会让用户连自己那层都删不掉(实测缺陷)。
-            if _hy2_udp_has_foreign_salamander "$tag"; then
-                _error "该入站的 finalmask.udp 已存在**非本脚本写入**的 salamander 层;"
-                _error "继续启用会叠加成双重混淆(客户端只做一层, 必然连不上)。"
-                _tip "请先手工编辑 ${CONFIG_FILE} 移除或改名该层(本脚本写入的层带 settings.xd_managed=true)"
-                _tip "若只想关闭本脚本的混淆, 请选 [3](只删本脚本那层, 保留其它层)"
-                _press_any_key; return
-            fi
             otype="salamander"
             opw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
             read -rp "  混淆密码 (回车随机): " opw_in
@@ -1752,44 +2004,25 @@ _hy2_obfs_menu() {
                 osize=$(_hy2_obfs_size_canon "$osize") || { _error "packetSize 规范化失败"; _press_any_key; return; }
             fi
             omask=$(_hy2_obfs_mask_block "$otype" "$opw" "$osize") || { _error "混淆参数构造失败"; _press_any_key; return; }
-            # 只管理**我们自己那一层**(见 XD_UDP_JQ_UPSERT): 用户/其它工具可能在同一
-            # udp 数组里放了别的伪装层(含别人的 salamander 层), 只按 type 匹配会吃掉它们。
-            # 归属由我们写入的 settings.xd_managed 标记判定。
-            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new "$omask" \
-                 "$XD_UDP_JQ_UPSERT"; then
-                _error "混淆启用失败, 已回滚"; _press_any_key; return
-            fi
-            if ! _meta_update "$meta" \
-                 '.obfs_type=$t | .obfs_password=$p | .obfs_packet_size=(if $s == "" then null else $s end)' \
-                 --arg t "$otype" --arg p "$opw" --arg s "$osize"; then
-                # config 已提交而元数据未落地 → 回滚 config(回到**改动前**的形态), 否则链接/clash 与服务器行为不一致
-                _hy2_obfs_rollback "$tag" "$rollback_mask" \
-                    || _error "元数据写入失败, 且配置回滚失败, 请手工检查 ${CONFIG_FILE}"
-                _error "混淆元数据写入失败, 已回滚配置"
-                _press_any_key; return
-            fi
-            _success "混淆已启用 (${otype}${osize:+ · packetSize=${osize}})"
             ;;
         3)
-            if ! _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new null \
-                 "$XD_UDP_JQ_UPSERT"; then
-                _error "关闭混淆失败, 已回滚"; _press_any_key; return
-            fi
-            if ! _meta_update "$meta" 'del(.obfs_type) | del(.obfs_password) | del(.obfs_packet_size)'; then
-                _hy2_obfs_rollback "$tag" "$rollback_mask" \
-                    || _error "元数据写入失败, 且配置回滚失败, 请手工检查 ${CONFIG_FILE}"
-                _error "混淆元数据写入失败, 已回滚配置"
-                _press_any_key; return
-            fi
-            _success "混淆已关闭"
+            omask="null"
             ;;
         *) _warn "无效选择"; _press_any_key; return ;;
     esac
-    # 服务器级变更 → 派生状态(链接 + clash)走**唯一入口** _hy2_sync_derived(50-nodes):
-    # 与创建/改端口/拥塞切换/带宽调整同源。链接重建的两种失败在 helper 内区分 ——
-    #   (a) gecko(带尺寸) ⇒ 官方 hy2 URI 无法表达: 清空旧链接 + **继续**同步 clash(能完整承载该尺寸);
-    #   (b) 元数据缺字段 ⇒ **保留**旧链接, 如实报告, 不做破坏性写入。
-    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+    local txn_rc=0
+    # `_hy2_obfs_txn_locked` rechecks `_hy2_udp_has_foreign_salamander "$tag"` only for enable; if it refuses, it points users to the safe [3] close action.
+    _hy2_obfs_txn "$tag" "$meta" "$obfs_choice" "$otype" "$opw" "$osize" "$omask" || txn_rc=$?
+    case "$txn_rc" in
+        0)
+            if [ "$obfs_choice" = "3" ]; then
+                _success "混淆已关闭"
+            else
+                _success "混淆已启用 (${otype}${osize:+ · packetSize=${osize}})"
+            fi
+            ;;
+        2) _tip "本次混淆回滚不完整, 请按上方提示人工核对" ;;
+    esac
     _press_any_key
 }
 
@@ -1824,34 +2057,42 @@ _hy2_obfs_rollback() {
 # 还原源:
 #   · config —— `_mutate_config` 在改动前自己调过 `_backup_config`, 故
 #     `$BACKUP_DIR/config.json.lastbak` 正是切换前那一份, 直接用 `_restore_config`。
-#   · metadata —— 调用方在提交前把原文读进 `_reality_meta_prev`(节点元数据很小, 不必落盘)。
+#   · metadata —— `_reality_domain_txn_locked` 在持锁后把原文读入内存, 供本事务回滚。
 # 还原后必须重新确认服务稳定(`_restart_xray_verified`), 因为它才是我方"新配置可用"的判据。
 #
 # 参数: <meta 路径> <metadata 原文>
 # 调用者: **必须**在 `_reality_domain_txn_locked` 的锁域内(见下面"锁域"一节)。
 # ---------------------------------------------------------------------------
 _reality_switch_rollback() {
-    local meta="$1" meta_prev="${2:-}"
+    local meta="$1" meta_prev="${2:-}" config_ok=0 runtime_ok=0 meta_ok=0
     # 锁域是这里的前提: `_restore_config` 读的是**共享**的 `config.json.lastbak`, 而它由
-    # `_backup_config` 在每次 config 写入前覆盖。锁外调用时, 另一会话只要在"`_mutate_config`
-    # 返回"与"后置步骤失败"之间改过 config, `lastbak` 就已经不是本次事务前的那一份, 回滚会把
-    # 别人**已提交**的改动一起抹掉(十轮 P1-③)。锁域内则保证该快照自始至终属于本次事务。
+    # `_backup_config` 在每次 config 写入前覆盖。锁域内保证该快照自始至终属于本次事务。
     if _restore_config; then
-        _restart_xray_verified >/dev/null 2>&1 || \
-            _warn "配置已还原, 但 xray 未能稳定重启, 请查看状态"
-        if [ -n "$meta_prev" ]; then
-            _atomic_write_json "$meta" "$meta_prev" 2>/dev/null || \
-                _warn "元数据还原失败, 请手动核对: $meta"
+        config_ok=1
+        if _restart_xray_verified >/dev/null 2>&1; then
+            runtime_ok=1
         else
-            _warn "没有元数据快照可还原, 请手动核对: $meta"
+            _warn "配置已还原, 但 xray 未能稳定重启, 请查看状态"
         fi
-        _error "域名切换未完成(后置步骤失败), 配置与元数据已还原到切换前"
-        return 0
     else
-        _error "后置步骤失败, 且配置回滚失败 —— 请手动核对 $CONFIG_FILE 与 $meta"
-        _tip "可用备份: $BACKUP_DIR/config.json.lastbak"
-        return 1
+        _warn "配置回滚失败, 请手动核对: $CONFIG_FILE"
     fi
+    if [ -n "$meta_prev" ]; then
+        if _atomic_write_json "$meta" "$meta_prev" 2>/dev/null; then
+            meta_ok=1
+        else
+            _warn "元数据还原失败, 请手动核对: $meta"
+        fi
+    else
+        _warn "没有元数据快照可还原, 请手动核对: $meta"
+    fi
+    if [ "$config_ok" -eq 1 ] && [ "$runtime_ok" -eq 1 ] && [ "$meta_ok" -eq 1 ]; then
+        _error "域名切换未完成(后置步骤失败), 配置、运行态与元数据均已还原"
+        return 0
+    fi
+    _error "域名切换失败且回滚不完整, 请手动核对 $CONFIG_FILE 与 $meta"
+    _tip "可用备份: $BACKUP_DIR/config.json.lastbak"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1865,12 +2106,10 @@ _reality_switch_rollback() {
 # 漏了同一层保护。
 #
 # 锁域范围: config 提交 → metadata → 链接重建 → 失败回滚, 全部在 `_with_config_lock` 内。
-# **网络步骤(后量子检测)刻意留在锁外** —— 它可能耗时十几秒, 拿它占着全局 config 锁会让
-# 并发的另一会话全部撞 15s 锁超时。锁内只有本地文件写入与一次服务重启确认, 与端口事务同量级。
+# 提问与后量子网络探测留在锁外; topology、tunnel tag 与 rollback metadata 在锁内刷新。
 # `_mutate_config` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 不会自锁死(与 _reality_port_txn 同款)。
 #
-# 参数: <tag> <meta> <new_sni> <pq_seed> <pq_verify> <rmode> <tunnel_tag>
-#       <new_tunnel_tag> <reality_target> <meta_prev>
+# 参数: <tag> <meta> <new_sni> <pq_seed> <pq_verify> <allow_missing_tunnel>
 # 返回: 0 = 提交成功;
 #       1 = 失败但已完整回滚(原因已打印, 调用方无需再回滚);
 #       2 = 失败且回滚不完整(原因与人工核对点已打印);
@@ -1890,9 +2129,56 @@ _reality_domain_txn() {
 }
 
 _reality_domain_txn_locked() {
-    local tag="$1" meta="$2" new_sni="$3" pq_seed="$4" pq_verify="$5" rmode="$6" \
-          tunnel_tag="$7" new_tunnel_tag="$8" reality_target="$9" meta_prev="${10}"
-    # 提交 config。失败时 `_mutate_config` 已自行回滚并重启, metadata 尚未改动 ⇒ 无需额外回滚。
+    local tag="$1" meta="$2" new_sni="$3" pq_seed="$4" pq_verify="$5" allow_missing_tunnel="${6:-0}"
+    local meta_prev rmode tunnel_tag="" tunnel_port="" node_port="" new_tunnel_tag="" reality_target=""
+    if [ ! -s "$meta" ] || ! jq -e 'type == "object" and (.protocol == "vless-tcp-reality-vision" or .protocol == "vless-xhttp-reality")' \
+        "$meta" >/dev/null 2>&1; then
+        _error "Reality 元数据已变化或损坏, 拒绝提交: $meta"
+        return 1
+    fi
+    if ! jq -e --arg t "$tag" \
+        '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and ($nodes[0].streamSettings.realitySettings | type) == "object")' \
+        "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "config.json 中找不到唯一的 Reality 入站(${tag}), 请先同步/修复配置"
+        return 1
+    fi
+    meta_prev=$(cat "$meta" 2>/dev/null) || meta_prev=""
+    [ -n "$meta_prev" ] || { _error "无法快照 Reality 元数据: $meta"; return 1; }
+    rmode=$(_reality_node_mode "$tag") || rmode=""
+    case "$rmode" in direct|tunnel) ;; *) _error "无法确认 Reality 节点拓扑, 已取消域名切换"; return 1 ;; esac
+    if [ "$rmode" = "direct" ]; then
+        reality_target="${new_sni}:443"
+    else
+        tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null) || tunnel_tag=""
+        if [ -z "$tunnel_tag" ]; then
+            if [ "$allow_missing_tunnel" != "1" ]; then
+                _error "Reality 拓扑已变化且缺少 tunnel_tag, 未获得跳过 tunnel 更新的确认; 请重试"
+                return 1
+            fi
+        else
+            if ! jq -e --arg t "$tunnel_tag" \
+                '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and $nodes[0].protocol == "tunnel")' \
+                "$CONFIG_FILE" >/dev/null 2>&1; then
+                _error "Reality 元数据中的 tunnel_tag 不对应唯一 tunnel 入站(${tunnel_tag}), 拒绝切换"
+                return 1
+            fi
+            tunnel_port=$(jq -r '.tunnel_port // empty' "$meta" 2>/dev/null) || tunnel_port=""
+            node_port=$(jq -r '.port // empty' "$meta" 2>/dev/null) || node_port=""
+            if [[ ! "$tunnel_port" =~ ^[0-9]+$ ]] || [[ ! "$node_port" =~ ^[0-9]+$ ]]; then
+                _error "Reality tunnel 端口元数据非法, 拒绝切换"
+                return 1
+            fi
+            new_tunnel_tag=$(_gen_tunnel_tag "$new_sni" "$tunnel_port" "$node_port") || new_tunnel_tag=""
+            [ -n "$new_tunnel_tag" ] || { _error "无法生成新 tunnel tag, 已取消域名切换"; return 1; }
+            if [ "$new_tunnel_tag" != "$tunnel_tag" ] && \
+               jq -e --arg t "$new_tunnel_tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+                _error "新 tunnel tag 已被其他入站占用(${new_tunnel_tag}), 拒绝切换"
+                return 1
+            fi
+        fi
+    fi
+    # 仅 config/metadata 提交与本地重启验证持锁; 用户确认与后量子网络探测都在锁外完成。
+    # `_mutate_config` 的备份与 metadata 原文快照均在此临界区内, 回滚不会覆盖并发会话。
     if [ -n "$pq_seed" ]; then
         _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
              --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
@@ -2012,44 +2298,21 @@ _reality_domain_menu() {
         _info "新域名支持后量子签名"
     fi
 
-    # R42: 模式决定要改哪些字段 —— 直连节点的 target 就是伪装站, 换域名必须连 target 一起改
-    # (否则 serverNames 是新域名而 target 仍连旧站, 客户端 SNI 与真实握手对象不一致);
-    # tunnel 节点的 target 恒指向本地 tunnel 入站, 只改 tunnel 的转发地址与路由 domain。
-    #
-    # R44: tunnel 的转发地址**必须同时写两套字段名**(与 templates/tunnel.server.jsonc 同源)。
-    # 已发布核心(v24.12.31 → v26.3.27)的 json tag 是 address/port/network, main 分支与
-    # Xray-docs-next 改成了 rewriteAddress/rewritePort/allowedNetwork。只写一套会在另一类核心上
-    # 被静默忽略 —— 未识别字段不报错, 但 dest.Address 变 nil、dest.Port 变 0, dokodemo 回落到
-    # LocalHostIP + 监听端口本身 ⇒ tunnel 自环。这里只改**已存在**的键(`if has(...)`), 避免给
-    # 老节点凭空添加它本来没有的字段。
-    local rmode; rmode=$(_reality_node_mode "$tag")
-    local tunnel_tag="" tunnel_port node_port new_tunnel_tag="" reality_target=""
-    if [ "$rmode" = "direct" ]; then
-        reality_target="$new_target"
-    else
-        tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
-        if [ -z "$tunnel_tag" ]; then
+    # 仅为决定是否需要用户确认而在锁外读取拓扑; 切换事务会在锁内重新读取并校验所有状态。
+    local preflight_mode allow_missing_tunnel=0 preflight_tunnel_tag=""
+    preflight_mode=$(_reality_node_mode "$tag")
+    if [ "$preflight_mode" != "direct" ]; then
+        preflight_tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
+        if [ -z "$preflight_tunnel_tag" ]; then
             _warn "该节点缺少 tunnel_tag 元数据(可能为旧版本创建或手动添加)"
             _warn "域名切换将仅更新 Reality inbound, 不会更新 tunnel inbound 和路由规则"
             read -rp "  继续? [y/N]: " ans
-            case "$ans" in y|Y) ;; *) _info "已取消"; _press_any_key; continue ;; esac
-            new_tunnel_tag=""
-        else
-            tunnel_port=$(jq -r '.tunnel_port' "$meta")
-            node_port=$(jq -r '.port' "$meta")
-            # R39(P2): 与创建路径统一走 _gen_tunnel_tag(tag 长度封顶)
-            new_tunnel_tag=$(_gen_tunnel_tag "$new_sni" "$tunnel_port" "$node_port")
+            case "$ans" in y|Y) allow_missing_tunnel=1 ;; *) _info "已取消"; _press_any_key; continue ;; esac
         fi
     fi
-    # 提交前留住 metadata 原文: 后置步骤失败时要连同 config 一起还原(#43)
-    local _reality_meta_prev=""
-    _reality_meta_prev=$(cat "$meta" 2>/dev/null) || _reality_meta_prev=""
 
-    # config 提交 + metadata + 链接重建 + 失败回滚 —— 一个整体事务, 全程持 config 锁(十轮 P1-③)。
-    # 旧写法只有中间那一次 `_mutate_config` 在锁内, 后置步骤失败时的回滚读的是**共享**的
-    # lastbak, 可能已被并发会话覆盖 ⇒ 回滚会抹掉别人已提交的改动。
-    _reality_domain_txn "$tag" "$meta" "$new_sni" "$pq_seed" "$pq_verify" "$rmode" \
-        "$tunnel_tag" "$new_tunnel_tag" "$reality_target" "$_reality_meta_prev"
+    # config、metadata、拓扑与回滚快照均在 config lock 内复核; 提问和后量子网络探测留在锁外。
+    _reality_domain_txn "$tag" "$meta" "$new_sni" "$pq_seed" "$pq_verify" "$allow_missing_tunnel"
     local txn_rc=$?
     if [ "$txn_rc" -ne 0 ]; then
         # 1 = 失败但已完整回滚 / 2 = 回滚不完整 / 3 = 权威状态已提交但链接未更新。
@@ -2058,7 +2321,8 @@ _reality_domain_menu() {
         _press_any_key; continue
     fi
     # 成功路径: 分享链接即 metadata 里刚原子提交的那一份
-    local newlink=""
+    local newlink="" result_mode actual_target
+    result_mode=$(_reality_node_mode "$tag")
     newlink=$(jq -r '.share_link // empty' "$meta" 2>/dev/null)
     [ -n "$newlink" ] || _warn "未能读回新分享链接, 请用 [查看节点] 查看: $meta"
     # F1: servername(域名)变化需同步 clash 派生缓存, 否则订阅仍指向旧伪装域名。
@@ -2069,9 +2333,10 @@ _reality_domain_menu() {
         _tip "可重新执行一次本操作, 或删除后重建该节点以重建 clash 条目"
     fi
 
-    _success "Reality 域名已切换: ${cur_sni} → ${new_sni}"
-    if [ "$rmode" = "direct" ]; then
-        _tip "直连模式: realitySettings.target 已同步为 ${new_target}"
+    _success "Reality 域名已切换为: ${new_sni}"
+    if [ "$result_mode" = "direct" ]; then
+        actual_target=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' "$CONFIG_FILE" 2>/dev/null)
+        [ -n "$actual_target" ] && _tip "直连模式: realitySettings.target 当前为 ${actual_target}"
     fi
     _tip "客户端须更新 SNI 为 ${new_sni} (pbk/sid 不变)"
     [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"

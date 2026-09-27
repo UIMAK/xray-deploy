@@ -200,10 +200,88 @@ _hysteria_pick_asset() {
 # 解析资产 → 下载临时文件(同目录, 供原子 mv) → 官方 hashes.txt SHA256 校验 + 可执行自检
 # + 版本匹配(三层, 见下) → 备份旧 binary → 停服 → 原子替换 → 启动 → verified → commit;
 # 任一步失败恢复旧 binary 并重启旧版。配置与节点不受影响(官方 binary 更新不改配置语义)。
+# Commit a verified staged binary while serialized with official-Hysteria state changes.
+_hysteria_install_commit_locked() {
+    local tmp="$1" want="$2" asset="$3" was_running=0 backup="" old_ver="" old_asset="" state now_ver
+    state=$(_hysteria_runtime_state) || { rm -f "$tmp"; return 1; }
+    if _hysteria_installed; then
+        backup=$(mktemp "$BIN_DIR/.hysteria.rollback.XXXXXX") \
+            || { rm -f "$tmp"; _error "回滚备份文件创建失败, 已中止"; return 1; }
+        if ! cp -p "$HYSTERIA_BIN" "$backup" || ! cmp -s "$HYSTERIA_BIN" "$backup"; then
+            rm -f "$tmp" "$backup"
+            _error "旧核心备份失败, 已中止"
+            return 1
+        fi
+        old_ver=$(_hysteria_current_version)
+        old_asset=$(_state_get hysteria_asset 2>/dev/null)
+        if [ "$state" = "running" ]; then
+            was_running=1
+            _hysteria_stop_and_verify || {
+                rm -f "$tmp" "$backup"
+                _error "停止服务失败(进程或 supervisor 状态未收敛), 已中止升级"
+                return 1
+            }
+        fi
+        if ! mv -f "$tmp" "$HYSTERIA_BIN"; then
+            rm -f "$tmp"
+            [ "$was_running" -eq 1 ] && _manage_hysteria start >/dev/null 2>&1
+            rm -f "$backup"
+            _error "核心替换失败, 旧核心未变动"
+            return 1
+        fi
+    else
+        if [ "$state" != "stopped" ]; then
+            rm -f "$tmp"
+            _error "服务不是已确认 stopped, 拒绝首次发布 Hysteria 核心"
+            return 1
+        fi
+        if ! mv -f "$tmp" "$HYSTERIA_BIN"; then
+            rm -f "$tmp"
+            _error "核心安装失败"
+            return 1
+        fi
+        chmod 755 "$HYSTERIA_BIN" 2>/dev/null
+    fi
+    _state_set hysteria_version "$want" || _warn "版本记录写入失败(不影响运行)"
+    _state_set hysteria_asset "$asset" || _warn "资产记录写入失败(不影响运行, AVX 兜底将按 CPU 弱推断)"
+    if [ "$was_running" -eq 1 ]; then
+        if _hysteria_restart_verified; then
+            _success "官方 Hysteria2 核心已升级: ${want}"
+        elif _hysteria_avx_runtime_retry "$want" "$asset"; then
+            [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
+            return 0
+        else
+            _error "升级后启动失败, 回滚旧核心..."
+            if [ -n "$backup" ] && [ -s "$backup" ] && mv -f "$backup" "$HYSTERIA_BIN" 2>/dev/null; then
+                now_ver=$(_hysteria_current_version)
+                if _hysteria_restart_verified; then
+                    if [ -n "$old_ver" ] && [ "$now_ver" != "$old_ver" ]; then
+                        _error "已恢复运行但版本不符(期望 ${old_ver}, 实际 ${now_ver:-未知}), 请人工核对 $HYSTERIA_BIN"
+                    else
+                        _warn "已回滚旧核心并恢复运行(${now_ver:-未知})"
+                    fi
+                else
+                    _error "旧核心文件已恢复, 但服务仍无法恢复运行"
+                fi
+                _state_set hysteria_version "$old_ver" 2>/dev/null || true
+                _state_set hysteria_asset "$old_asset" 2>/dev/null || true
+            else
+                _error "核心回滚失败; 保留备份供人工恢复: ${backup:-缺失}"
+                _tip "请核对 $HYSTERIA_BIN 与服务状态, 不要删除回滚备份"
+            fi
+            return 1
+        fi
+    else
+        _success "官方 Hysteria2 核心已安装: ${want}"
+    fi
+    [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
+    return 0
+}
+
 # 用法: _hysteria_download_install <version|latest>
 # ---------------------------------------------------------------------------
 _hysteria_download_install() {
-    local want="$1" asset url tmp ver was_running=0 backup="" old_ver="" old_asset=""
+    local want="$1" asset url tmp ver
     [ -n "$want" ] || { _error "未指定目标版本"; return 1; }
     asset=$(_hysteria_pick_asset) || { _error "不支持的 CPU 架构: $(uname -m)"; return 1; }
     if [ "$want" = "latest" ]; then
@@ -259,78 +337,10 @@ _hysteria_download_install() {
         _error "下载内容校验失败(期望 ${want}, 实际 ${ver:-无法执行}), 已放弃替换"
         return 1
     fi
-    if _hysteria_installed; then
-        # 备份名必须**每次调用唯一**: 运行期 AVX 兜底会在本函数内嵌套再调一次, 固定名
-        # ".hysteria.rollback.$$" 会被内层覆盖并在内层收尾时删除 —— 外层回滚就失去旧
-        # binary(嵌套同 PID, $$ 不区分层级)。
-        backup=$(mktemp "$BIN_DIR/.hysteria.rollback.XXXXXX") \
-            || { rm -f "$tmp"; _error "回滚备份文件创建失败, 已中止"; return 1; }
-        cp -p "$HYSTERIA_BIN" "$backup" || { rm -f "$tmp" "$backup"; _error "旧核心备份失败, 已中止"; return 1; }
-        # 记录旧版本/旧资产, 回滚后据此校验"确实恢复到了旧版本"而不只是"服务在跑"
-        old_ver=$(_hysteria_current_version)
-        old_asset=$(_state_get hysteria_asset 2>/dev/null)
-        if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
-            was_running=1
-            # 升级替换 binary 前统一用 stop_and_verify —— 确认旧进程真正退出
-            # (exe 兜底强杀), 避免"旧进程仍持有旧 inode + 新 binary 已就位"的中间态
-            _hysteria_stop_and_verify || { _error "停止服务失败(进程未退出), 已中止升级"; rm -f "$backup"; return 1; }
-        fi
-        if ! mv -f "$tmp" "$HYSTERIA_BIN"; then
-            rm -f "$tmp"
-            [ "$was_running" -eq 1 ] && _manage_hysteria start >/dev/null 2>&1
-            [ -n "$backup" ] && rm -f "$backup"
-            _error "核心替换失败, 旧核心未变动"
-            return 1
-        fi
-    else
-        if ! mv -f "$tmp" "$HYSTERIA_BIN"; then
-            rm -f "$tmp"
-            _error "核心安装失败"
-            return 1
-        fi
-        chmod 755 "$HYSTERIA_BIN" 2>/dev/null
+    if ! _with_config_lock _hysteria_install_commit_locked "$tmp" "$want" "$asset"; then
+        rm -f "$tmp"
+        return 1
     fi
-    _state_set hysteria_version "$want" || _warn "版本记录写入失败(不影响运行)"
-    # 记录**实际安装的资产名**(观察值, 不是用户配置): 运行期 AVX 兜底据此判断当前 binary
-    # 是不是 AVX 变体 —— 不能靠 CPU 能力反推(自检兜底可能已把变体换成普通版)。写失败只降级
-    # 不阻断: 兜底侧对缺失记录有第二来源(CPU 弱推断, 见 _hysteria_avx_runtime_retry)。
-    _state_set hysteria_asset "$asset" || _warn "资产记录写入失败(不影响运行, AVX 兜底将按 CPU 弱推断)"
-    if [ "$was_running" -eq 1 ]; then
-        if _hysteria_restart_verified; then
-            _success "官方 Hysteria2 核心已升级: ${want}"
-        else
-            # 自检只跑 `version` 子命令, 不覆盖热路径 AVX 指令。装的是 AVX 变体且启动
-            # 失败时, 先换普通 amd64 重装重试, 再考虑回滚旧核心。
-            if _hysteria_avx_runtime_retry "$want" "$asset"; then
-                [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
-                return 0
-            fi
-            _error "升级后启动失败, 回滚旧核心..."
-            if [ -n "$backup" ] && mv -f "$backup" "$HYSTERIA_BIN" 2>/dev/null; then
-                # 恢复后既验证服务运行, 也验证版本确实回到旧版(防备份错/替换错)
-                local now_ver=""
-                if _hysteria_restart_verified; then
-                    now_ver=$(_hysteria_current_version)
-                    if [ -n "$old_ver" ] && [ "$now_ver" != "$old_ver" ]; then
-                        _error "已恢复运行但版本不符(期望 ${old_ver}, 实际 ${now_ver:-未知}), 请人工核对 $HYSTERIA_BIN"
-                    else
-                        _warn "已回滚旧核心并恢复运行(${now_ver:-未知})"
-                    fi
-                else
-                    _error "回滚后仍启动失败, 请手动查看日志"
-                fi
-            else
-                _error "回滚失败(备份不可用?), 请手动恢复 ${backup}"
-            fi
-            _state_set hysteria_version "$old_ver" 2>/dev/null || true
-            _state_set hysteria_asset "$old_asset" 2>/dev/null || true
-            [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
-            return 1
-        fi
-    else
-        _success "官方 Hysteria2 核心已安装: ${want}"
-    fi
-    [ -n "$backup" ] && rm -f "$backup" 2>/dev/null
     return 0
 }
 
@@ -411,6 +421,26 @@ _hysteria_core_menu() {
 # 运行的核心始终是 $HYSTERIA_BIN。Alpine 不因官方安装脚本要求 systemd 而被排除)
 # ---------------------------------------------------------------------------
 
+_hysteria_openrc_status_unknown() {
+    local anchor comm
+    anchor=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null)
+    if [ -z "$anchor" ]; then
+        { [ -e "$HYSTERIA_PID_FILE" ] || [ -L "$HYSTERIA_PID_FILE" ]; } && return 0
+        return 1
+    fi
+    [ -d "/proc/$anchor" ] || return 1
+    comm=$(cat "/proc/$anchor/comm" 2>/dev/null)
+    case "$comm" in
+        supervise-daemo*)
+            _proc_named_under "$anchor" hysteria && return 1
+            _hysteria_proc_tree_has_bin "$anchor" && return 1
+            return 0
+            ;;
+        "") return 0 ;;
+    esac
+    return 1
+}
+
 _hysteria_is_running() {
     # 结构复刻 _xray_is_running 的三分支判活(该函数是项目加固最重的函数, 不参数化共用,
     # 避免"为了 DRY 动它"引入回归):
@@ -474,10 +504,18 @@ _hysteria_is_running() {
             ;;
         openrc)
             # openrc: pidfile 是 supervise-daemon 父进程(其 exe 不是 hysteria), 不能用 exe
-            # 直接校验 anchor, 需沿 ppid 链回溯业务子进程(与 _xray_is_running 同口径)
+            # 直接校验 anchor, 需沿 ppid 链回溯业务子进程(与 _xray_is_running 同口径)。
+            # live supervisor 即使子进程暂时不存在/归属无法证明也不能报 stopped: 它可能处于
+            # respawn-wait, 且 kill helper 会在归属未知时保留 pidfile 供人工复核。
             anchor=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null)
+            if [ -z "$anchor" ] && { [ -e "$HYSTERIA_PID_FILE" ] || [ -L "$HYSTERIA_PID_FILE" ]; }; then
+                return 0
+            fi
             if [ -n "$anchor" ] && [ -d "/proc/$anchor" ]; then
                 _proc_named_under "$anchor" hysteria && return 0
+                case "$(cat "/proc/$anchor/comm" 2>/dev/null)" in
+                    supervise-daemo*|"") return 0 ;;
+                esac
             fi
             ;;
     esac
@@ -595,7 +633,11 @@ _manage_hysteria() {
                     _hysteria_kill_stale_supervisor
                     _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1 9>&-
                     rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
-                status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
+                status)
+                    if _hysteria_openrc_status_unknown; then echo "unknown"
+                    elif _hysteria_is_running; then echo "running"
+                    else echo "stopped"; fi
+                    ;;
             esac
             ;;
         direct)
@@ -648,6 +690,15 @@ _manage_hysteria() {
     esac
 }
 
+_hysteria_runtime_state() {
+    local state
+    state=$(_manage_hysteria status 2>/dev/null)
+    case "$state" in
+        running|stopped) printf '%s' "$state" ;;
+        *) _error "官方 Hysteria 服务状态未知(${state:-无状态}), 拒绝假定 stopped"; return 1 ;;
+    esac
+}
+
 # openrc 状态机与 supervise-daemon 脱同步清理(2026-09-13 Alpine 实测): 子进程 FATAL 后
 # supervisor 进入 respawn-wait 仍存活, openrc 却标 service stopped; 此后 start 被
 # "already running" 拒绝, 服务永远起不来。stop 后若 pidfile 仍指向存活的 supervise-daemo
@@ -660,22 +711,56 @@ _hysteria_kill_stale_supervisor() {
     # openrc 的 pidfile 由 supervise-daemon 写(纯 PID); 用统一解析器取第一字段, 兼容 direct
     # 的 "PID starttime" 形态。
     a=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
-    [ -n "$a" ] || return 0
-    [ -d "/proc/$a" ] || { rm -f "$HYSTERIA_PID_FILE"; return 0; }
+    if [ -z "$a" ]; then
+        if [ -e "$HYSTERIA_PID_FILE" ] || [ -L "$HYSTERIA_PID_FILE" ]; then
+            _warn "OpenRC pidfile 存在但无法解析, 保留证据并拒绝判定 stopped: $HYSTERIA_PID_FILE"
+            return 1
+        fi
+        return 0
+    fi
+    if [ ! -d "/proc/$a" ]; then
+        rm -f "$HYSTERIA_PID_FILE" && [ ! -e "$HYSTERIA_PID_FILE" ] && [ ! -L "$HYSTERIA_PID_FILE" ] || {
+            _warn "无法清理已退出 supervisor 的 pidfile, 保留现场: $HYSTERIA_PID_FILE"
+            return 1
+        }
+        return 0
+    fi
     c=$(cat "/proc/$a/comm" 2>/dev/null)
     case "$c" in
         supervise-daemo*)
-            if _hysteria_proc_tree_has_bin "$a"; then
-                # openrc 不记录 starttime(纯 PID pidfile), 故在属主复核**之后立刻**抓一次身份
-                # 传入 helper, 把"复核→kill"窗口压到最小; 抓不到时 helper 退化为自读(已声明残余)。
-                st=$(_proc_starttime "$a") || st=""
-                _xd_kill_pid_graceful "$a" 5 "$st"
-            else
-                _warn "pidfile 指向的 supervise-daemon(pid=$a) 未管理本项目的 hysteria, 不杀(可能是他方服务)"
+            if ! _hysteria_proc_tree_has_bin "$a"; then
+                _warn "无法确认 pidfile 中 supervisor(pid=$a) 属于本项目; 保留 pidfile, 不报告 stopped"
+                return 1
+            fi
+            # openrc 不记录 starttime(纯 PID pidfile), 故在属主复核**之后立刻**抓一次身份
+            # 传入 helper, 把"复核→kill"窗口压到最小; 抓不到时 helper 退化为自读(已声明残余)。
+            st=$(_proc_starttime "$a") || st=""
+            _xd_kill_pid_graceful "$a" 5 "$st" || {
+                _warn "无法确认 supervisor(pid=$a) 已退出, 保留 pidfile"
+                return 1
+            }
+            if [ -d "/proc/$a" ]; then
+                current_st=$(_proc_starttime "$a" 2>/dev/null) || current_st=""
+                # A live PID with unreadable starttime is unknown, not stopped. Only a
+                # provably replaced PID may clear the stale pidfile.
+                if [ -z "$st" ] || [ -z "$current_st" ] || [ "$current_st" = "$st" ]; then
+                    _warn "supervisor(pid=$a) 仍存活或身份无法确认, 保留 pidfile"
+                    return 1
+                fi
             fi
             ;;
+        "")
+            _warn "无法读取 pidfile 进程(pid=$a) 的 comm, 保留证据并拒绝判定 stopped"
+            return 1
+            ;;
+        *)
+            # PID 已被非 supervisor 进程复用, pidfile 是明确陈旧记录, 可安全移除。
+            ;;
     esac
-    rm -f "$HYSTERIA_PID_FILE"
+    rm -f "$HYSTERIA_PID_FILE" && [ ! -e "$HYSTERIA_PID_FILE" ] && [ ! -L "$HYSTERIA_PID_FILE" ] || {
+        _warn "无法移除过期 OpenRC pidfile: $HYSTERIA_PID_FILE"
+        return 1
+    }
     return 0
 }
 
@@ -734,19 +819,17 @@ _hysteria_validate_transient() {
         fi
     done
     if [ "$stable" -ne 1 ]; then
-        _manage_hysteria stop 2>/dev/null
+        if ! _hysteria_stop_and_verify >/dev/null 2>&1; then
+            _error "瞬态验证未通过, 且无法确认服务已停止"
+        fi
         return 1
     fi
-    _manage_hysteria stop 2>/dev/null
-    for i in 1 2 3 4; do
-        sleep 1
-        [ "$(_manage_hysteria status 2>/dev/null)" != "running" ] && return 0
-    done
-    # 停不回去必须**返回失败** —— 原实现 warn 后 return 0, 上层据此判定
-    # 事务成功, 而用户原状态 stopped 已被改成 running, 直接违反"不改变运行状态"契约。
-    _error "瞬态验证后服务未能停止, 运行状态已被改变(原为 stopped)"
-    _tip "请人工检查并停止: ${HYSTERIA_BIN} / $( [ "$INIT_SYSTEM" = systemd ] && echo "systemctl stop ${HYSTERIA_SVC}" || echo "rc-service ${HYSTERIA_SVC} stop" )"
-    return 1
+    if ! _hysteria_stop_and_verify >/dev/null 2>&1; then
+        _error "瞬态验证后服务未能确认停止, 运行状态已被改变或未知(原为 stopped)"
+        _tip "请人工检查并停止: ${HYSTERIA_BIN} / $( [ "$INIT_SYSTEM" = systemd ] && echo "systemctl stop ${HYSTERIA_SVC}" || echo "rc-service ${HYSTERIA_SVC} stop" )"
+        return 1
+    fi
+    return 0
 }
 
 _hysteria_create_systemd_service() {
@@ -869,18 +952,29 @@ _hysteria_config_preflight() {
 }
 
 _hysteria_backup_config() {
-    [ -f "$HYSTERIA_CONFIG" ] || return 0
+    [ -f "$HYSTERIA_CONFIG" ] && [ -s "$HYSTERIA_CONFIG" ] || {
+        _error "配置不存在或为空, 无法创建回滚备份"
+        return 1
+    }
     mkdir -p "$HYSTERIA_BACKUP_DIR" || return 1
     local tmp old i=0
     # busybox/musl mktemp 要求模板以 XXXXXX 结尾, 后缀放在 X 之前
     tmp=$(mktemp "${HYSTERIA_BACKUP_DIR}/hysteria.json.bak.XXXXXX") || return 1
     cp -f "$HYSTERIA_CONFIG" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    [ -s "$tmp" ] || { rm -f "$tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
+    [ -s "$tmp" ] && jq -e 'type == "object"' "$tmp" >/dev/null 2>&1 || {
+        rm -f "$tmp"
+        _error "配置备份缺失、为空或不可解析, 备份失败"
+        return 1
+    }
     chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     local last_tmp
     last_tmp=$(mktemp "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak.XXXXXX") || { rm -f "$tmp"; return 1; }
     cp -f "$HYSTERIA_CONFIG" "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
-    [ -s "$last_tmp" ] || { rm -f "$tmp" "$last_tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
+    [ -s "$last_tmp" ] && jq -e 'type == "object"' "$last_tmp" >/dev/null 2>&1 || {
+        rm -f "$tmp" "$last_tmp"
+        _error "回滚备份缺失、为空或不可解析, 备份失败"
+        return 1
+    }
     chmod 600 "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     mv -f "$last_tmp" "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     for old in $(ls -1t "$HYSTERIA_BACKUP_DIR" 2>/dev/null | grep '^hysteria.json.bak.'); do
@@ -892,8 +986,9 @@ _hysteria_backup_config() {
 
 _hysteria_restore_config() {
     [ -f "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" ] || return 1
-    [ -s "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" ] || {
-        _error "备份文件为空, 无法回滚(${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak)"
+    [ -s "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" ] \
+      && jq -e 'type == "object"' "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" >/dev/null 2>&1 || {
+        _error "回滚备份缺失、为空或不可解析, 无法回滚(${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak)"
         return 1
     }
     local content
@@ -908,7 +1003,7 @@ _hysteria_restore_config() {
 _hysteria_config_txn_locked() {
     _hysteria_config_preflight || return 1
     # 事务不得隐式改变用户运行状态 —— stopped 时只做瞬态验证
-    local was_running; was_running=$(_manage_hysteria status 2>/dev/null)
+    local was_running; was_running=$(_hysteria_runtime_state) || return 1
     if ! _hysteria_backup_config; then
         _error "配置备份失败, 中止操作"
         return 1
@@ -986,7 +1081,7 @@ _hysteria_server_txn_locked() {
     _hysteria_config_preflight || return 1
     [ "$#" -ge 2 ] || { _error "server_txn 参数不足(config_filter, meta_filter)"; return 1; }
     local config_filter="$1" meta_filter="$2"; shift 2
-    local was_running; was_running=$(_manage_hysteria status 2>/dev/null)
+    local was_running; was_running=$(_hysteria_runtime_state) || return 1
     if ! _hysteria_backup_config; then
         _error "配置备份失败, 中止操作"
         return 1
@@ -1016,33 +1111,38 @@ _hysteria_server_txn_locked() {
         if [ -f "$HYSTERIA_SERVER_META" ]; then
             meta_had=1
             meta_bak=$(mktemp "${HYSTERIA_SERVER_META}.bak.XXXXXX") || {
-                _hysteria_restore_config; _hysteria_recover_to_state "$was_running"
-                _error "无法创建元数据备份"; return 1
+                _hysteria_server_txn_rollback_after_change "$was_running" 0 0 "" "无法创建元数据备份"
+                return 1
             }
-            if ! cp -p "$HYSTERIA_SERVER_META" "$meta_bak"; then
+            if ! cp -p "$HYSTERIA_SERVER_META" "$meta_bak" \
+               || ! cmp -s "$HYSTERIA_SERVER_META" "$meta_bak"; then
                 rm -f "$meta_bak"
-                _hysteria_restore_config; _hysteria_recover_to_state "$was_running"
-                _error "元数据备份失败"; return 1
+                _hysteria_server_txn_rollback_after_change "$was_running" 0 0 "" "元数据备份失败"
+                return 1
             fi
-            chmod 600 "$meta_bak" 2>/dev/null
+            if ! chmod 600 "$meta_bak" 2>/dev/null; then
+                rm -f "$meta_bak"
+                _hysteria_server_txn_rollback_after_change "$was_running" 0 0 "" "元数据备份权限设置失败"
+                return 1
+            fi
         fi
         if [ ! -f "$HYSTERIA_SERVER_META" ]; then
             # meta 文件不存在(meta_had=0): 尝试以 {} 起步; 该创建本身计入可回滚变更
-            if ! _atomic_write_json "$HYSTERIA_SERVER_META" '{}'; then
-                _hysteria_restore_config; _hysteria_recover_to_state "$was_running"
-                _error "server_meta 初始化失败, 已回滚配置"; return 1
-            fi
             meta_created=1
+            if ! _atomic_write_json "$HYSTERIA_SERVER_META" '{}'; then
+                _hysteria_server_txn_rollback_after_change "$was_running" 0 1 "" "server_meta 初始化失败"
+                return 1
+            fi
         fi
         local newmeta
         if ! newmeta=$(jq "${@}" "$meta_filter" "$HYSTERIA_SERVER_META" 2>/dev/null) || [ -z "$newmeta" ]; then
-            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
-            _error "server_meta 变换失败, 已回滚配置"
+            _hysteria_server_txn_rollback_after_change "$was_running" "$meta_had" "$meta_created" "$meta_bak" \
+                "server_meta 变换失败"
             return 1
         fi
         if ! _atomic_write_json "$HYSTERIA_SERVER_META" "$newmeta"; then
-            _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak"
-            _error "server_meta 提交失败, 已回滚配置"
+            _hysteria_server_txn_rollback_after_change "$was_running" "$meta_had" "$meta_created" "$meta_bak" \
+                "server_meta 提交失败"
             return 1
         fi
     fi
@@ -1100,19 +1200,38 @@ _hysteria_server_txn_locked() {
 # (原实现无条件 return 0, 无法区分"回滚完成"与"回滚失败但已告警")。
 _hysteria_server_txn_rollback() {
     local meta_had="$1" meta_created="$2" meta_bak="$3" mc rc=0
-    if [ "$meta_had" -eq 1 ] && [ -s "$meta_bak" ]; then
-        mc=$(cat "$meta_bak" 2>/dev/null)
-        if [ -n "$mc" ] && _atomic_write_json "$HYSTERIA_SERVER_META" "$mc"; then
-            rc=0
-        else
-            _warn "server_meta 回滚失败, 请人工核对 $HYSTERIA_SERVER_META"
+    if [ "$meta_had" -eq 1 ]; then
+        if [ -z "$meta_bak" ] || [ ! -f "$meta_bak" ] || [ ! -s "$meta_bak" ] \
+           || ! jq -e 'type == "object"' "$meta_bak" >/dev/null 2>&1; then
+            _warn "server_meta 回滚备份缺失或不可用, 保留现场并请人工核对 $HYSTERIA_SERVER_META"
+            rc=1
+        elif ! mc=$(cat "$meta_bak" 2>/dev/null) || [ -z "$mc" ] \
+             || ! _atomic_write_json "$HYSTERIA_SERVER_META" "$mc"; then
+            _warn "server_meta 回滚失败, 保留备份 $meta_bak 并请人工核对 $HYSTERIA_SERVER_META"
             rc=1
         fi
     elif [ "$meta_created" -eq 1 ]; then
         if rm -f "$HYSTERIA_SERVER_META"; then rc=0; else _warn "server_meta 删除失败, 请人工核对"; rc=1; fi
     fi
-    [ -n "$meta_bak" ] && { rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"; }
+    if [ "$rc" -eq 0 ] && [ -n "$meta_bak" ]; then
+        rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"
+    fi
     return "$rc"
+}
+
+_hysteria_server_txn_rollback_after_change() {
+    local was_running="$1" meta_had="$2" meta_created="$3" meta_bak="$4" reason="$5"
+    local cfg_ok=0 meta_ok=0 state_ok=0
+    _hysteria_restore_config && cfg_ok=1
+    _hysteria_server_txn_rollback "$meta_had" "$meta_created" "$meta_bak" && meta_ok=1
+    _hysteria_recover_to_state "$was_running" && state_ok=1
+    if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ] || [ "$state_ok" -ne 1 ]; then
+        _error "${reason}后回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败) service=$([ "$state_ok" -eq 1 ] && echo 已恢复 || echo 失败))"
+        _tip "请人工核对: $HYSTERIA_CONFIG 与 $HYSTERIA_SERVER_META; 回滚备份如有保留请勿删除"
+    else
+        _error "${reason}, 已回滚配置与元数据"
+    fi
+    return 1
 }
 
 _hysteria_server_txn() {
@@ -1158,7 +1277,7 @@ _hysteria_node_txn_txn_wrapper() {
 _hysteria_node_txn_locked() {
     local config_filter="$1" meta_file="$2" meta_op="$3" meta_content="${4:-}"; shift 4
     _hysteria_config_preflight || return 1
-    local was_running; was_running=$(_manage_hysteria status 2>/dev/null)
+    local was_running; was_running=$(_hysteria_runtime_state) || return 1
     if ! _hysteria_backup_config; then
         _error "配置备份失败, 中止操作"
         return 1
@@ -1171,12 +1290,13 @@ _hysteria_node_txn_locked() {
     if [ -f "$meta_file" ]; then
         meta_had=1
         meta_bak=$(mktemp "${meta_file}.bak.XXXXXX") || { _error "无法备份节点元数据"; return 1; }
-        if ! cp -p "$meta_file" "$meta_bak"; then
+        if ! cp -p "$meta_file" "$meta_bak" \
+           || ! cmp -s "$meta_file" "$meta_bak" \
+           || ! chmod 600 "$meta_bak" 2>/dev/null; then
             rm -f "$meta_bak"
-            _error "无法备份节点元数据"
+            _error "无法完整备份节点元数据"
             return 1
         fi
-        chmod 600 "$meta_bak" 2>/dev/null
     fi
     # --- 阶段 1: config 变更(此前的失败 = 一切未变) ---
     local tmp
@@ -1198,18 +1318,21 @@ _hysteria_node_txn_locked() {
     # 节点侧回滚 helper(meta 还原/删除 + clash 派生同步)。返回真实状态:
     # 0=已还原; 1=未能还原(调用方据此判 degraded, 不再假定"回滚完成")
     _hysteria_node_txn_meta_rollback() {
-        local rc=0
-        if [ "$meta_had" -eq 1 ] && [ -s "$meta_bak" ]; then
-            local mc
-            mc=$(cat "$meta_bak" 2>/dev/null)
-            if [ -n "$mc" ] && _atomic_write_json "$meta_file" "$mc"; then
-                # clash 是**可再生派生缓存**: 同步失败不回滚权威状态, 也不把"元数据已还原"
-                # 升级成 degraded(_hysteria_sync_clash 内部已 _warn 说明手工修法)
-                _hysteria_sync_clash "$meta_file" || true
-            else
-                _warn "节点元数据回滚失败, 请人工核对 $meta_file"
-                rc=1
+        local rc=0 mc
+        if [ "$meta_had" -eq 1 ]; then
+            if [ -z "$meta_bak" ] || [ ! -f "$meta_bak" ] || [ ! -s "$meta_bak" ] \
+               || ! jq -e 'type == "object"' "$meta_bak" >/dev/null 2>&1; then
+                _warn "节点元数据回滚备份缺失或不可用, 保留当前文件并请人工核对: $meta_file (备份: ${meta_bak:-缺失})"
+                return 1
             fi
+            if ! mc=$(cat "$meta_bak" 2>/dev/null) || [ -z "$mc" ] \
+               || ! _atomic_write_json "$meta_file" "$mc"; then
+                _warn "节点元数据回滚失败, 保留备份 $meta_bak 并请人工核对 $meta_file"
+                return 1
+            fi
+            # clash 是**可再生派生缓存**: 同步失败不回滚权威状态, 也不把"元数据已还原"
+            # 升级成 degraded(_hysteria_sync_clash 内部已 _warn 说明手工修法)
+            _hysteria_sync_clash "$meta_file" || true
         else
             if rm -f "$meta_file"; then
                 if [ -n "$node_name" ]; then
@@ -1226,20 +1349,40 @@ _hysteria_node_txn_locked() {
     # --- 阶段 2: 节点元数据变更 ---
     if [ "$meta_op" = "create" ]; then
         if ! _atomic_write_json "$meta_file" "$meta_content"; then
-            rm -f "$meta_bak"
-            _hysteria_restore_config
-            _hysteria_recover_to_state "$was_running"
-            _error "节点元数据写入失败, 已回滚配置"
+            _error "节点元数据写入失败, 回滚配置与节点状态"
+            local cfg_ok=0 meta_ok=0 state_ok=0
+            _hysteria_restore_config && cfg_ok=1
+            _hysteria_node_txn_meta_rollback && meta_ok=1
+            _hysteria_recover_to_state "$was_running" && state_ok=1
+            if [ "$meta_ok" -eq 1 ] && [ -n "$meta_bak" ]; then
+                rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
+            fi
+            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ] || [ "$state_ok" -ne 1 ]; then
+                _error "节点元数据失败后回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败) service=$([ "$state_ok" -eq 1 ] && echo 已恢复 || echo 失败))"
+                _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file; 保留的回滚备份请勿删除: ${meta_bak:-无}"
+            else
+                _error "节点元数据写入失败, 已回滚配置与节点状态"
+            fi
             return 1
         fi
     elif [ "$meta_op" = "delete" ]; then
         # rm 失败必须 fail-closed —— 否则 config 已删用户而 metadata
         # 仍存在(权限/immutable/只读 fs/IO 错误), 事务却报成功, 留下幽灵节点。
         if ! rm -f "$meta_file"; then
-            _error "节点元数据删除失败(权限/只读?), 回滚配置"
-            _hysteria_restore_config
-            _hysteria_recover_to_state "$was_running"
-            rm -f "$meta_bak" 2>/dev/null
+            _error "节点元数据删除失败(权限/只读?), 回滚配置与节点状态"
+            local cfg_ok=0 meta_ok=0 state_ok=0
+            _hysteria_restore_config && cfg_ok=1
+            _hysteria_node_txn_meta_rollback && meta_ok=1
+            _hysteria_recover_to_state "$was_running" && state_ok=1
+            if [ "$meta_ok" -eq 1 ] && [ -n "$meta_bak" ]; then
+                rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
+            fi
+            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ] || [ "$state_ok" -ne 1 ]; then
+                _error "节点元数据删除失败后回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败) service=$([ "$state_ok" -eq 1 ] && echo 已恢复 || echo 失败))"
+                _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file; 保留的回滚备份请勿删除: ${meta_bak:-无}"
+            else
+                _error "节点元数据删除失败, 已回滚配置与节点状态"
+            fi
             return 1
         fi
     fi
@@ -1252,10 +1395,12 @@ _hysteria_node_txn_locked() {
             _hysteria_restore_config && cfg_ok=1
             local meta_ok=0
             _hysteria_node_txn_meta_rollback && meta_ok=1
-            rm -f "$meta_bak" 2>/dev/null
+            if [ "$meta_ok" -eq 1 ] && [ -n "$meta_bak" ]; then
+                rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
+            fi
             if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ]; then
                 _error "回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败)), 已进入降级状态"
-                _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file"
+                _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file; 保留的回滚备份请勿删除: ${meta_bak:-无}"
                 return 1
             fi
             if _hysteria_restart_verified; then
@@ -1273,10 +1418,12 @@ _hysteria_node_txn_locked() {
             _hysteria_restore_config && cfg_ok=1
             local meta_ok=0
             _hysteria_node_txn_meta_rollback && meta_ok=1
-            rm -f "$meta_bak" 2>/dev/null
+            if [ "$meta_ok" -eq 1 ] && [ -n "$meta_bak" ]; then
+                rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
+            fi
             if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ]; then
                 _error "回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败)), 已进入降级状态"
-                _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file"
+                _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file; 保留的回滚备份请勿删除: ${meta_bak:-无}"
                 return 1
             fi
             if _hysteria_validate_transient; then
@@ -1313,6 +1460,39 @@ _hysteria_server_txn_txn_wrapper() {
         _hysteria_server_txn_locked "$config_filter" "$meta_filter"
     fi
 }
+
+_hysteria_tls_server_txn_locked() {
+    [ "$#" -ge 3 ] || { _error "TLS transaction 参数不足"; return 1; }
+    local stage="$1" rc=0 was_running pair_ok=0 state_ok=0
+    was_running=$(_hysteria_runtime_state) || return 1
+    shift
+    if ! _hysteria_tls_pair_begin "$stage"; then
+        _hysteria_tls_pair_finish no "$stage" || true
+        return 1
+    fi
+    _hysteria_server_txn_txn_wrapper "$@" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        _hysteria_tls_pair_finish yes "$stage" || return 1
+        return 0
+    fi
+    # The inner server transaction may already have restored/restarted the old config while
+    # the new certificate was still published. Restore the pair first, then reload the old
+    # service state so it cannot keep the new cert with the old pin.
+    _hysteria_tls_pair_finish no "$stage" && pair_ok=1
+    if [ "$pair_ok" -eq 1 ]; then
+        _hysteria_recover_to_state "$was_running" && state_ok=1
+    fi
+    if [ "$pair_ok" -ne 1 ] || [ "$state_ok" -ne 1 ]; then
+        _error "TLS 事务回滚未完成(pair=$([ "$pair_ok" -eq 1 ] && echo 已还原 || echo 失败) service=$([ "$state_ok" -eq 1 ] && echo 已恢复 || echo 失败)), 已保留恢复现场"
+        return 1
+    fi
+    return "$rc"
+}
+
+_hysteria_tls_server_txn() {
+    _with_config_lock _hysteria_tls_server_txn_locked "$@"
+}
+
 
 # 服务器是否已完成初始化(配置存在 + jq 可解析 + auth 段就绪)。三态判定:
 # 官方 auth.type 有 password/userpass/http/command 四种, 绝不能把"存在但非本 Manager 模型"
@@ -1405,6 +1585,106 @@ _hysteria_gate() {
     return 1
 }
 
+# 自签证书导出用的 pin 必须来自当前 TLS 证书, 且与已记录 pin 一致。
+_hysteria_tls_verified_pin() {
+    local cert expected actual
+    cert=$(_hysteria_config_get 'tls.cert')
+    [ -n "$cert" ] && [ -r "$cert" ] || return 1
+    actual=$(_hysteria_cert_pin "$cert") || return 1
+    [[ "$actual" =~ ^[a-f0-9]{64}$ ]] || return 1
+    expected=$(_hysteria_meta_get pin)
+    [ -n "$expected" ] || return 1
+    expected=${expected,,}
+    [[ "$expected" =~ ^[a-f0-9]{64}$ ]] && [ "$expected" = "$actual" ] || return 1
+    printf '%s' "$actual"
+}
+
+_hysteria_tls_pair_begin() {
+    local stage="$1" src dst snap had_cert=0 had_key=0
+    HYSTERIA_TLS_SNAPSHOT_DIR=""
+    HYSTERIA_TLS_HAD_CERT=0
+    HYSTERIA_TLS_HAD_KEY=0
+    HYSTERIA_TLS_PUBLISHED=0
+    [ -n "$stage" ] || return 0
+    [ -s "$stage/cert.pem" ] && [ -s "$stage/key.pem" ] || {
+        _error "暂存自签证书或私钥缺失/为空"
+        return 1
+    }
+    mkdir -p "$HYSTERIA_CERT_DIR" || return 1
+    snap=$(mktemp -d "${HYSTERIA_CERT_DIR}/.tls-snapshot.XXXXXX") || return 1
+    HYSTERIA_TLS_SNAPSHOT_DIR="$snap"
+    # Snapshot both existing files completely before publishing either new file.
+    for src in cert key; do
+        case "$src" in
+            cert) dst="$HYSTERIA_CERT_DIR/cert.pem" ;;
+            key)  dst="$HYSTERIA_CERT_DIR/key.pem" ;;
+        esac
+        if [ -e "$dst" ] || [ -L "$dst" ]; then
+            [ -f "$dst" ] && [ -s "$dst" ] || { _error "现有 TLS 文件不可用, 中止替换: $dst"; return 1; }
+            cp -p "$dst" "$snap/$src.pem" 2>/dev/null \
+                && cmp -s "$dst" "$snap/$src.pem" || { _error "TLS 回滚快照失败: $dst"; return 1; }
+            [ "$src" = cert ] && had_cert=1 || had_key=1
+        fi
+    done
+    HYSTERIA_TLS_HAD_CERT=$had_cert
+    HYSTERIA_TLS_HAD_KEY=$had_key
+    chmod 600 "$stage/key.pem" 2>/dev/null || { _error "无法保护暂存 TLS 私钥"; return 1; }
+    mv -f "$stage/cert.pem" "$HYSTERIA_CERT_DIR/cert.pem" || { _error "TLS 证书发布失败"; return 1; }
+    HYSTERIA_TLS_PUBLISHED=1
+    mv -f "$stage/key.pem" "$HYSTERIA_CERT_DIR/key.pem" || { _error "TLS 私钥发布失败"; return 1; }
+    return 0
+}
+
+_hysteria_tls_pair_restore() {
+    local dst src had tmp rc=0
+    [ -n "${HYSTERIA_TLS_SNAPSHOT_DIR:-}" ] || return 0
+    for src in cert key; do
+        case "$src" in
+            cert) dst="$HYSTERIA_CERT_DIR/cert.pem"; had="$HYSTERIA_TLS_HAD_CERT" ;;
+            key)  dst="$HYSTERIA_CERT_DIR/key.pem"; had="$HYSTERIA_TLS_HAD_KEY" ;;
+        esac
+        if [ "$had" -eq 1 ]; then
+            [ -s "$HYSTERIA_TLS_SNAPSHOT_DIR/$src.pem" ] || { rc=1; continue; }
+            tmp=$(mktemp "${dst}.restore.XXXXXX") || { rc=1; continue; }
+            if cp -p "$HYSTERIA_TLS_SNAPSHOT_DIR/$src.pem" "$tmp" 2>/dev/null \
+               && cmp -s "$HYSTERIA_TLS_SNAPSHOT_DIR/$src.pem" "$tmp" \
+               && mv -f "$tmp" "$dst"; then
+                :
+            else
+                rm -f "$tmp"
+                rc=1
+            fi
+        else
+            rm -f "$dst" 2>/dev/null || rc=1
+            { [ ! -e "$dst" ] && [ ! -L "$dst" ]; } || rc=1
+        fi
+    done
+    return "$rc"
+}
+
+_hysteria_tls_pair_finish() {
+    local commit="$1" stage="${2:-}" snap="${HYSTERIA_TLS_SNAPSHOT_DIR:-}"
+    if [ "$commit" = "yes" ]; then
+        [ -z "$snap" ] || rm -rf "$snap" 2>/dev/null || _warn "TLS 旧文件快照清理失败, 请人工清理: $snap"
+        [ -z "$stage" ] || rm -rf "$stage" 2>/dev/null || _warn "TLS 暂存目录清理失败: $stage"
+        return 0
+    fi
+    if [ "${HYSTERIA_TLS_PUBLISHED:-0}" -ne 1 ]; then
+        [ -z "$snap" ] || rm -rf "$snap" 2>/dev/null || _warn "TLS 准备快照清理失败: $snap"
+        [ -z "$stage" ] || rm -rf "$stage" 2>/dev/null || _warn "TLS 暂存目录清理失败: $stage"
+        return 0
+    fi
+    if _hysteria_tls_pair_restore; then
+        [ -z "$snap" ] || rm -rf "$snap" 2>/dev/null || _warn "TLS 回滚快照清理失败: $snap"
+        [ -z "$stage" ] || rm -rf "$stage" 2>/dev/null || _warn "TLS 暂存目录清理失败: $stage"
+        return 0
+    fi
+    _error "TLS 文件回滚失败; 已保留快照与暂存现场, 请人工核对: ${snap:-无快照} ${stage:-}"
+    return 1
+}
+
+
+
 # manager 自有元数据(server_meta.json)读写; 文件不存在时输出空
 _hysteria_meta_get() {
     local key="$1" val=""
@@ -1440,6 +1720,7 @@ _hysteria_cert_pin() {
 # 输出全局: HY_TLS_JSON(jq -n 片段字符串) HY_TLS_MODE HY_TLS_SNI HY_TLS_PIN
 # 用户取消 → 返回 1
 _hysteria_prompt_tls() {
+    HY_TLS_STAGE_DIR=""
     # arr/first/doms/d 原为 ACME 分支内的 local; 现该分支被重问循环包裹, 循环体内不能声明
     # (每次迭代重新 local 会遮蔽外层, 且 do 块里的 local 在部分 shell 下语义不一致),
     # 故统一提升到函数级声明 —— 与 why/ans2 同口径。
@@ -1474,15 +1755,33 @@ _hysteria_prompt_tls() {
                 [ -z "$why" ] && break
                 _error "$why"
             done
+            HY_TLS_STAGE_DIR=$(mktemp -d "${HYSTERIA_CERT_DIR}/.tls-stage.XXXXXX") || {
+                _error "无法创建自签 TLS 暂存目录"
+                return 1
+            }
             if ! "$HYSTERIA_BIN" cert --host "$host" \
-                 --cert "$HYSTERIA_CERT_DIR/cert.pem" --key "$HYSTERIA_CERT_DIR/key.pem" \
+                 --cert "$HY_TLS_STAGE_DIR/cert.pem" --key "$HY_TLS_STAGE_DIR/key.pem" \
                  --overwrite >/dev/null 2>&1; then
+                rm -rf "$HY_TLS_STAGE_DIR"
+                HY_TLS_STAGE_DIR=""
                 _error "证书生成失败(hysteria cert)"
                 return 1
             fi
-            chmod 600 "$HYSTERIA_CERT_DIR/key.pem" 2>/dev/null || true
-            pin=$(_hysteria_cert_pin "$HYSTERIA_CERT_DIR/cert.pem") || pin=""
-            # 自签场景官方样例口径: sniGuard disable + 客户端 insecure+pin 并用
+            if [ ! -s "$HY_TLS_STAGE_DIR/cert.pem" ] || [ ! -s "$HY_TLS_STAGE_DIR/key.pem" ] \
+               || ! chmod 600 "$HY_TLS_STAGE_DIR/key.pem" 2>/dev/null; then
+                rm -rf "$HY_TLS_STAGE_DIR"
+                HY_TLS_STAGE_DIR=""
+                _error "自签 TLS 证书或私钥不可用, 已放弃"
+                return 1
+            fi
+            pin=$(_hysteria_cert_pin "$HY_TLS_STAGE_DIR/cert.pem") || pin=""
+            [[ "$pin" =~ ^[a-f0-9]{64}$ ]] || {
+                rm -rf "$HY_TLS_STAGE_DIR"
+                HY_TLS_STAGE_DIR=""
+                _error "无法计算有效的自签证书 SHA-256 pin"
+                return 1
+            }
+            # 自签证书先暂存; 发布与 config/server_meta 在同一回滚安全事务中完成。
             HY_TLS_JSON=$(jq -n --arg c "$HYSTERIA_CERT_DIR/cert.pem" --arg k "$HYSTERIA_CERT_DIR/key.pem" \
                 '{tls: {cert: $c, key: $k, sniGuard: "disable"}}')
             HY_TLS_MODE="selfsigned"; HY_TLS_SNI="$host"; HY_TLS_PIN="$pin"
@@ -1835,10 +2134,12 @@ _hysteria_tls_menu() {
     fi
     # 统一事务(评审 P1-4): 官方配置与 manager 元数据(tls_mode/sni/pin)作为一个整体
     # 提交/回滚, 杜绝"config=新 TLS / server_meta=旧 TLS"的漂移
-    if ! _hysteria_server_txn --argjson blk "$HY_TLS_JSON" \
+    local tls_stage="${HY_TLS_STAGE_DIR:-}"
+    if ! _hysteria_tls_server_txn "$tls_stage" --argjson blk "$HY_TLS_JSON" \
          --arg m "$HY_TLS_MODE" --arg s "$HY_TLS_SNI" --arg p "$HY_TLS_PIN" \
          '. + $blk | if $blk | has("tls") then del(.acme) else del(.tls) end' \
          '.tls_mode=$m | .sni=$s | .pin=$p'; then
+        [ -n "$tls_stage" ] && [ -d "$tls_stage" ] && _warn "TLS 暂存现场已保留: $tls_stage"
         _error "TLS 设置失败"
         _press_any_key
         return 0
@@ -1956,6 +2257,7 @@ _hysteria_bandwidth_menu() {
                      | if (.bandwidth | length) == 0 then del(.bandwidth) else . end'; then
                 _error "带宽设置失败"
             else
+                _hysteria_rebuild_all_links || _warn "带宽已更新, 但 clash 派生条目同步失败"
                 _success "带宽已更新: up=${up:-不限} down=${down:-不限}"
             fi
             ;;
@@ -1963,6 +2265,7 @@ _hysteria_bandwidth_menu() {
             if ! _hysteria_config_txn 'del(.bandwidth)'; then
                 _error "清除失败"
             else
+                _hysteria_rebuild_all_links || _warn "带宽限制已清除, 但 clash 派生条目同步失败"
                 _success "带宽限制已清除"
             fi
             ;;
@@ -2317,12 +2620,12 @@ _hysteria_build_link() {
     sni=$(_hysteria_meta_get sni)
     pin=$(_hysteria_meta_get pin)
     if [ "$tls_mode" = "selfsigned" ]; then
-        # 自签: insecure=1 必须配 pinSHA256(官方 MITM 警告); pin 缺失时从证书现算
-        if [ -z "$pin" ] && [ -f "$HYSTERIA_CERT_DIR/cert.pem" ]; then
-            pin=$(_hysteria_cert_pin "$HYSTERIA_CERT_DIR/cert.pem") || pin=""
-        fi
-        params="insecure=1"
-        [ -n "$pin" ] && params="${params}&pinSHA256=${pin}"
+        # insecure=1 缺少与当前证书一致的有效 pin 会禁用身份校验, 故拒绝导出。
+        pin=$(_hysteria_tls_verified_pin) || {
+            _warn "自签证书缺少有效且已验证的 SHA-256 pin, 拒绝生成不安全分享链接"
+            return 1
+        }
+        params="insecure=1&pinSHA256=${pin}"
     fi
     [ -n "$sni" ] && params="${params}${params:+&}sni=$(_url_encode "$sni")"
     # 混淆: 类型与密码都按官方 URI 的泛化参数写(obfs / obfs-password), 不写死 salamander。
@@ -2403,7 +2706,14 @@ _hysteria_clash_line() {
     local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$auth")\""
     local sni; sni=$(_hysteria_meta_get sni)
     [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
-    [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ] && line="${line}, skip-cert-verify: true"
+    if [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ]; then
+        local tls_pin
+        tls_pin=$(_hysteria_tls_verified_pin) || {
+            _error "自签证书缺少有效且已验证的 SHA-256 pin, 拒绝导出不安全的 Mihomo 条目"
+            return 1
+        }
+        line="${line}, skip-cert-verify: true, fingerprint: \"$tls_pin\""
+    fi
     if [ -n "$o_type" ]; then
         o_pw=$(_hysteria_obfs_get password)
         line="${line}, obfs: ${o_type}, obfs-password: \"$(_yaml_dq "$o_pw")\""
@@ -2414,11 +2724,12 @@ _hysteria_clash_line() {
         [ -n "$o_min" ] && line="${line}, obfs-min-packet-size: ${o_min}"
         [ -n "$o_max" ] && line="${line}, obfs-max-packet-size: ${o_max}"
     fi
-    local up down
-    up=$(jq -r '.bandwidth.up // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    down=$(jq -r '.bandwidth.down // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    [ -n "$up" ] && line="${line}, up: \"$(_yaml_dq "$up")\""
-    [ -n "$down" ] && line="${line}, down: \"$(_yaml_dq "$down")\""
+    local server_up server_down
+    server_up=$(jq -r '.bandwidth.up // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
+    server_down=$(jq -r '.bandwidth.down // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
+    # Official server up limits client downloads; server down limits client uploads.
+    [ -n "$server_up" ] && line="${line}, down: \"$(_yaml_dq "$server_up")\""
+    [ -n "$server_down" ] && line="${line}, up: \"$(_yaml_dq "$server_down")\""
     case "$port_part" in
         *-*) line="${line}, ports: \"${port_part}\"" ;;
     esac
@@ -2469,10 +2780,21 @@ _hysteria_remove_clash_by_name() {
 # 节点显示名是否已被占用(clash.yaml 按 name 删除/替换, 重名会串条目; 与 Xray 侧
 # _ensure_unique_name 同一约束, 作用域是 hysteria 自己的节点元数据)
 _hysteria_name_taken() {
-    local name="$1" n
-    [ -f "$HYSTERIA_NODE_META" ] || return 1
-    n=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null) || return 1
-    [ -n "$n" ] && [ "$n" = "$name" ] && return 0
+    local name="$1" n f
+    if [ -f "$HYSTERIA_NODE_META" ]; then
+        n=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null) || n=""
+        [ -n "$n" ] && [ "$n" = "$name" ] && return 0
+    fi
+    # Clash is shared with Xray and manual entries; reject collisions in both its current contents
+    # and the authoritative Xray node store so a stale/missing Clash cache cannot permit overwrite.
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        n=$(jq -r '.name // empty' "$f" 2>/dev/null) || n=""
+        [ -n "$n" ] && [ "$n" = "$name" ] && return 0
+    done
+    if [ -f "$CLASH_YAML" ] && grep -qF "name: \"$(_yaml_dq "$name")\"" "$CLASH_YAML" 2>/dev/null; then
+        return 0
+    fi
     return 1
 }
 
@@ -2642,6 +2964,8 @@ _hysteria_hop_reason() {
     fi
     if [ "$st" -eq "$en" ]; then
         printf '%s' "跳跃范围至少需要两个端口(${st}-${en} 只有一个端口, 不构成跳跃; 请留空表示不启用)"
+
+
         return
     fi
     parsed=$(_parse_hop_ranges "$hop" 2>/dev/null) || { printf '%s' "范围格式非法: ${hop}"; return; }
@@ -2708,7 +3032,172 @@ _hysteria_bandwidth_reason() {
 # ("empty auth type" / "empty auth password"), 因此**认证密码必须与配置同时落地**
 # ——本向导包含唯一认证密码的创建, 成功返回后服务器即可用。
 # 失败回滚已发生的步骤并返回 1。
+
+# Copy a pre-existing manager file before bootstrap; an empty stdout means it was absent.
+_hysteria_snapshot_file() {
+    local file="$1" snap
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then return 0; fi
+    [ -f "$file" ] && [ ! -L "$file" ] || { _error "初始化目标不是普通文件, 拒绝覆盖: $file"; return 1; }
+    snap=$(mktemp "${file}.bootstrap.XXXXXX") || return 1
+    if ! cp -p "$file" "$snap" 2>/dev/null || ! cmp -s "$file" "$snap" \
+       || ! chmod 600 "$snap" 2>/dev/null; then
+        rm -f "$snap"
+        _error "初始化回滚快照失败: $file"
+        return 1
+    fi
+    printf '%s' "$snap"
+}
+
+_hysteria_restore_snapshot_file() {
+    local file="$1" snap="$2" tmp
+    if [ -n "$snap" ]; then
+        [ -f "$snap" ] || { _error "必需的初始化回滚备份缺失: $snap"; return 1; }
+        tmp=$(mktemp "${file}.restore.XXXXXX") || return 1
+        if ! cp -p "$snap" "$tmp" 2>/dev/null || ! cmp -s "$snap" "$tmp" \
+           || ! mv -f "$tmp" "$file" || ! cmp -s "$snap" "$file"; then
+            rm -f "$tmp"
+            _error "初始化回滚失败, 保留备份 $snap (目标: $file)"
+            return 1
+        fi
+        return 0
+    fi
+    rm -f "$file" 2>/dev/null && [ ! -e "$file" ] && [ ! -L "$file" ] || {
+        _error "初始化回滚无法移除新建文件: $file"
+        return 1
+    }
+}
+
+# Config/meta/certificate/service commit after all user input has completed.
+_hysteria_bootstrap_locked() {
+    local config_json="$1" server_meta_json="$2" node_meta_json="$3" stage="$4"
+    local server_bak="" node_bak="" tmp_meta="" was_running
+    _hysteria_ensure_dirs || return 1
+    if [ -e "$HYSTERIA_CONFIG" ] || [ -L "$HYSTERIA_CONFIG" ]; then
+        _error "锁内复核发现 Hysteria 配置已存在, 中止 bootstrap, 不覆盖现有配置"
+        return 1
+    fi
+    was_running=$(_hysteria_runtime_state) || return 1
+    if [ "$was_running" != "stopped" ]; then
+        _error "锁内复核发现官方 Hysteria 仍在运行但配置缺失, 拒绝覆盖运行状态; 请先人工核对服务"
+        return 1
+    fi
+    local node_name
+    node_name=$(jq -r '.name // empty' <<< "$node_meta_json" 2>/dev/null) || node_name=""
+    [ -n "$node_name" ] || { _error "初始化节点名称无效"; return 1; }
+    if _hysteria_name_taken "$node_name"; then
+        _error "锁内复核发现名称已存在于共享 Clash 空间: $node_name"
+        return 1
+    fi
+    server_bak=$(_hysteria_snapshot_file "$HYSTERIA_SERVER_META") || return 1
+    node_bak=$(_hysteria_snapshot_file "$HYSTERIA_NODE_META") || {
+        [ -z "$server_bak" ] || rm -f "$server_bak"
+        return 1
+    }
+    if ! _hysteria_tls_pair_begin "$stage"; then
+        _hysteria_tls_pair_finish no "$stage" || _error "TLS 快照/回滚未收敛, 请人工核对"
+        [ -z "$server_bak" ] || rm -f "$server_bak"
+        [ -z "$node_bak" ] || rm -f "$node_bak"
+        return 1
+    fi
+    _hysteria_bootstrap_rollback() {
+        local reason="$1" cfg_ok=0 server_ok=0 node_ok=0 tls_ok=0
+        [ -z "$tmp_meta" ] || rm -f "$tmp_meta"
+        _hysteria_restore_snapshot_file "$HYSTERIA_CONFIG" "" && cfg_ok=1
+        _hysteria_restore_snapshot_file "$HYSTERIA_SERVER_META" "$server_bak" && server_ok=1
+        _hysteria_restore_snapshot_file "$HYSTERIA_NODE_META" "$node_bak" && node_ok=1
+        if [ -n "$stage" ]; then
+            _hysteria_tls_pair_finish no "$stage" && tls_ok=1
+        else
+            tls_ok=1
+        fi
+        if [ "$cfg_ok" -eq 1 ] && [ "$server_ok" -eq 1 ] && [ "$node_ok" -eq 1 ] && [ "$tls_ok" -eq 1 ]; then
+            [ -z "$server_bak" ] || rm -f "$server_bak" 2>/dev/null || _warn "初始化快照清理失败: $server_bak"
+            [ -z "$node_bak" ] || rm -f "$node_bak" 2>/dev/null || _warn "初始化快照清理失败: $node_bak"
+            if [ "$reason" = "配置写入失败" ]; then
+                _error "配置写入失败, 已取消初始化"
+            else
+                _error "$reason, 初始化文件已回滚"
+            fi
+        else
+            _error "$reason, 初始化回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) server_meta=$([ "$server_ok" -eq 1 ] && echo 已还原 || echo 失败) node_meta=$([ "$node_ok" -eq 1 ] && echo 已还原 || echo 失败) TLS=$([ "$tls_ok" -eq 1 ] && echo 已还原 || echo 失败))"
+            _tip "请人工核对 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META; 保留的快照请勿删除: ${server_bak:-无} ${node_bak:-无} ${HYSTERIA_TLS_SNAPSHOT_DIR:-}"
+        fi
+        return 1
+    }
+    if ! _atomic_write_json "$HYSTERIA_CONFIG" "$config_json"; then
+        _hysteria_bootstrap_rollback "配置写入失败"
+        return 1
+    fi
+    if ! _atomic_write_json "$HYSTERIA_SERVER_META" "$server_meta_json"; then
+        _hysteria_bootstrap_rollback "服务器元数据写入失败"
+        return 1
+    fi
+    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
+        _hysteria_bootstrap_rollback "临时节点元数据创建失败"
+        return 1
+    }
+    if ! _atomic_write_json "$tmp_meta" "$node_meta_json" \
+       || ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
+        _hysteria_bootstrap_rollback "节点元数据预检失败"
+        return 1
+    fi
+    if ! _atomic_write_json "$HYSTERIA_NODE_META" "$node_meta_json"; then
+        _hysteria_bootstrap_rollback "节点元数据写入失败"
+        return 1
+    fi
+    rm -f "$tmp_meta"; tmp_meta=""
+    if ! _hysteria_create_service; then
+        _error "service 创建失败(daemon-reload/权限?), 回滚初始化"
+        if ! _hysteria_cleanup_service_units; then
+            _error "service 定义清理失败, 保留配置/元数据/TLS快照供人工恢复"
+            _tip "请人工清理 service 后核对 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META; 快照: ${server_bak:-无} ${node_bak:-无} ${HYSTERIA_TLS_SNAPSHOT_DIR:-}"
+            return 1
+        fi
+        rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+        _hysteria_bootstrap_rollback "service 创建失败"
+        return 1
+    fi
+    if [ "$INIT_SYSTEM" != "direct" ]; then
+        if ! _hysteria_restart_verified \
+           && ! _hysteria_avx_runtime_retry "$(_hysteria_cached_version)" "$(_state_get hysteria_asset 2>/dev/null)"; then
+            _error "Hysteria 服务启动失败, 回滚初始化"
+            if ! _hysteria_stop_and_verify; then
+                _error "服务未能确认停止, 保留配置/元数据/TLS及回滚快照, 拒绝删除现场"
+                _tip "请人工核对 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META; 快照: ${server_bak:-无} ${node_bak:-无} ${HYSTERIA_TLS_SNAPSHOT_DIR:-}"
+                return 1
+            fi
+            if ! _hysteria_cleanup_service_units; then
+                _error "service 定义清理失败, 保留配置/元数据/TLS及回滚快照供人工恢复"
+                _tip "请人工核对 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META; 快照: ${server_bak:-无} ${node_bak:-无} ${HYSTERIA_TLS_SNAPSHOT_DIR:-}"
+                return 1
+            fi
+            rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+            _hysteria_bootstrap_rollback "服务启动失败"
+            return 1
+        fi
+    else
+        if ! _manage_hysteria start; then
+            if ! _hysteria_avx_runtime_retry "$(_hysteria_cached_version)" "$(_state_get hysteria_asset 2>/dev/null)"; then
+                _error "Hysteria 启动失败, 回滚初始化"
+                if ! _hysteria_stop_and_verify; then
+                    _error "服务未能确认停止, 保留配置/元数据/TLS及回滚快照, 拒绝删除现场"
+                    _tip "请人工核对 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META; 快照: ${server_bak:-无} ${node_bak:-无} ${HYSTERIA_TLS_SNAPSHOT_DIR:-}"
+                    return 1
+                fi
+                _hysteria_bootstrap_rollback "服务启动失败"
+                return 1
+            fi
+        fi
+    fi
+    if [ -n "$stage" ]; then _hysteria_tls_pair_finish yes "$stage" || return 1; fi
+    [ -z "$server_bak" ] || rm -f "$server_bak" 2>/dev/null || _warn "初始化快照清理失败: $server_bak"
+    [ -z "$node_bak" ] || rm -f "$node_bak" 2>/dev/null || _warn "初始化快照清理失败: $node_bak"
+    _hysteria_sync_clash "$HYSTERIA_NODE_META" || true
+    return 0
+}
+
 _hysteria_bootstrap() {
+    # 配置写入失败的既有提示“配置写入失败, 已取消初始化”只在锁内回滚完成后输出。
     local port hop parsed lo hi listen tls_json tls_mode tls_sni tls_pin
     local obfs_pw="" obfs_type="" masq_url="" up="" down="" addr
     local auth name def_name cc_type cc_profile
@@ -2963,108 +3452,25 @@ _hysteria_bootstrap() {
         _error "配置组装异常(auth.password 为空), 已中止"
         return 1
     }
-    _hysteria_ensure_dirs || return 1
-    if ! _atomic_write_json "$HYSTERIA_CONFIG" "$config_json"; then
-        _error "配置写入失败, 已取消初始化"
-        return 1
-    fi
-    # server_meta 单次原子提交(P2-1): 逐次 _meta_set 会在中途失败时留下半成品元数据
-    # (config 已删而 server_meta 残留旧值); 初始化语义下整份构建 + 一次原子写。
-    local server_meta_json
+    local server_meta_json node_meta_json stage="${HY_TLS_STAGE_DIR:-}"
     server_meta_json=$(jq -n --arg a "$addr" --arg m "$tls_mode" --arg s "$tls_sni" \
         --arg p "$tls_pin" --arg c "$(date '+%Y-%m-%d')" \
         '{link_addr:$a, tls_mode:$m, sni:$s, pin:$p, created:$c}') || {
-        _error "服务器元数据组装失败"; rm -f "$HYSTERIA_CONFIG"; return 1
-    }
-    if ! _atomic_write_json "$HYSTERIA_SERVER_META" "$server_meta_json"; then
-        _error "服务器元数据写入失败"
-        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
-        return 1
-    fi
-
-    # 7.5) 节点元数据 + 分享链接: 必须在**启动服务之前**落地 ——
-    # 否则 service 已 running 而节点元数据缺失时, Hysteria 侧凭据可用但 Manager
-    # 完全看不到该节点(幽灵节点), 且此处失败不回滚会让初始化停在半成品状态。
-    # 链接构建须喂真实临时文件 —— <(process substitution) 的 fd 带 CLOEXEC,
-    # 函数内部 $(jq ...) 子进程打不开 /dev/fd/63(实测), 与 _hy2_gen_newmeta 同款模式。
-    # 链接派生失败必须中止初始化(不得固化空链接); share_link 不再持久化(动态派生)。
-    # 0.16.15 起预检只查完整性(元数据字段 + listen 可解析), 不再把"URI 表达不了 gecko
-    # 自定义尺寸"当作初始化失败 —— 那是**呈现**缺口, 不该阻断服务器初始化。
-    local meta_json tmp_meta
-    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
-        _error "临时节点元数据创建失败, 回滚初始化"
-        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
+        _error "服务器元数据组装失败"
         return 1
     }
-    if ! jq -n --arg a "$auth" --arg n "$name" --arg addr "$addr" \
-         '{auth:$a,name:$n,link_addr:$addr}' > "$tmp_meta" 2>/dev/null; then
-        rm -f "$tmp_meta"
-        _error "临时节点元数据构建失败, 回滚初始化"
-        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
+    node_meta_json=$(jq -n --arg a "$auth" --arg n "$name" --arg addr "$addr" \
+        --arg created "$(date '+%Y-%m-%d')" \
+        '{auth:$a,name:$n,link_addr:$addr,created:$created}') || {
+        _error "节点元数据组装失败"
+        return 1
+    }
+    # 所有提示/输入均在锁外; 锁内重新检查配置状态, 并将证书、config、server_meta、node_meta
+    # 与 service 初始化作为一个官方 Hysteria 提交阶段串行化(不经过 Xray config-write gate)。
+    if ! _with_config_lock _hysteria_bootstrap_locked "$config_json" "$server_meta_json" "$node_meta_json" "$stage"; then
+        [ -z "$stage" ] || [ ! -d "$stage" ] || _warn "自签 TLS 暂存现场保留供核对: $stage"
         return 1
     fi
-    if ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
-        rm -f "$tmp_meta"
-        _error "分享链接预检失败, 回滚初始化"
-        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
-        return 1
-    fi
-    rm -f "$tmp_meta"
-    meta_json=$(jq -n --arg a "$auth" --arg n "$name" \
-        --arg addr "$addr" --arg created "$(date '+%Y-%m-%d')" \
-        '{auth:$a,name:$n,link_addr:$addr,created:$created}')
-    if ! _atomic_write_json "$HYSTERIA_NODE_META" "$meta_json"; then
-        _error "节点元数据写入失败, 回滚初始化(配置/元数据)"
-        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META"
-        return 1
-    fi
-
-    # 8) 服务(创建结果必须消费: P2-3 —— 创建失败 ≠ 启动失败, 报错要指向真实步骤)
-    if ! _hysteria_create_service; then
-        _error "service 创建失败(daemon-reload/权限?), 回滚初始化"
-        # service 定义未能清理干净时**保留**配置/元数据供人工恢复,
-        # 而不是删掉文件留下"unit 残留 + config 缺失"的不可恢复状态
-        if ! _hysteria_cleanup_service_units; then
-            _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
-            _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META"
-            return 1
-        fi
-        rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META"
-        rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
-        return 1
-    fi
-    if [ "$INIT_SYSTEM" != "direct" ]; then
-        if ! _hysteria_restart_verified; then
-            # P2-1(十五轮评审): 装机后的**真实启动**失败也可能是 AVX 变体在本机不可执行
-            # (下载自检只跑 `version`)。先自动换普通 amd64 重装重试一次, 再谈回滚 ——
-            # 否则"cpuinfo 报 avx 但热路径 SIGILL"会让用户在初始化阶段被永久挡住。
-            if ! _hysteria_avx_runtime_retry "$(_hysteria_cached_version)" "$(_state_get hysteria_asset 2>/dev/null)"; then
-                _error "Hysteria 服务启动失败, 回滚初始化(配置/服务)..."
-                _hysteria_stop_and_verify >/dev/null 2>&1 || _warn "停止服务时仍有残留进程, 请人工核对"
-                if ! _hysteria_cleanup_service_units; then
-                    _error "service 定义清理失败, 已保留配置与元数据以便人工恢复(不删除)"
-                    _tip "请人工清理 service 后, 删除 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META"
-                    return 1
-                fi
-                rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META"
-                rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
-                _warn "初始化已回滚"
-                return 1
-            fi
-        fi
-    else
-        # direct 模式无 service: 启动并做 1s 存活检查
-        if ! _manage_hysteria start; then
-            if ! _hysteria_avx_runtime_retry "$(_hysteria_cached_version)" "$(_state_get hysteria_asset 2>/dev/null)"; then
-                rm -f "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META"
-                _error "启动失败, 已回滚配置"
-                return 1
-            fi
-        fi
-    fi
-
-    # 9) clash 派生缓存(可再生; 失败仅告警, 不影响节点本体 —— helper 内部已 _warn)
-    _hysteria_sync_clash "$HYSTERIA_NODE_META" || true
     _success "官方 Hysteria2 服务器已初始化: $(_hysteria_listen_display), TLS=$(_hysteria_tls_desc)"
     _hysteria_print_link "$HYSTERIA_NODE_META" || true
     return 0
@@ -3080,8 +3486,58 @@ _hysteria_bootstrap() {
 #   2) 配置可运行 + node.json 缺失 → **接管**: 用配置里现成的认证密码重建节点元数据
 #      (绝不改动认证段 —— 凭据是用户已经在用的, 换掉会让已分发的链接全部失效)
 #   3) 配置不可运行/不存在 → bootstrap 新建(含认证密码)
+_hysteria_adopt_node_locked() {
+    local meta_json="$1" auth="$2" addr="$3" addr_need_save="$4" repair_broken="$5" tmp_meta node_name
+    _hysteria_gate || return 1
+    _hysteria_server_initialized || { _error "锁内复核发现服务器不再处于可接管状态, 请重试"; return 1; }
+    if _hysteria_node_exists; then
+        _error "锁内复核发现节点已被其他会话接管, 未覆盖现有元数据"
+        return 1
+    fi
+    if _hysteria_node_file_present; then
+        if [ "$repair_broken" != "1" ] || ! _hysteria_node_broken; then
+            _error "锁内复核发现节点元数据状态已变化, 未覆盖: $HYSTERIA_NODE_META"
+            return 1
+        fi
+    fi
+    if [ "$(_hysteria_config_password)" != "$auth" ]; then
+        _error "锁内复核发现服务器认证密码已变化, 取消接管以免写入过期凭据"
+        return 1
+    fi
+    node_name=$(jq -r '.name // empty' <<< "$meta_json" 2>/dev/null) || node_name=""
+    [ -n "$node_name" ] || { _error "节点名称无效"; return 1; }
+    if _hysteria_name_taken "$node_name"; then
+        _error "锁内复核发现名称已占用共享 Clash 空间: $node_name"
+        return 1
+    fi
+    if [ "$addr_need_save" -eq 1 ] && [ -n "$(_hysteria_meta_get link_addr)" ]; then
+        _error "连接地址已被其他会话更新, 拒绝提交过期节点地址; 请重试"
+        return 1
+    fi
+    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
+        _error "临时节点元数据创建失败, 节点未创建"
+        return 1
+    }
+    if ! _atomic_write_json "$tmp_meta" "$meta_json" \
+       || ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
+        rm -f "$tmp_meta"
+        _error "锁内分享链接预检失败, 节点未创建"
+        return 1
+    fi
+    rm -f "$tmp_meta"
+    if ! _atomic_write_json "$HYSTERIA_NODE_META" "$meta_json"; then
+        _error "节点元数据写入失败, 节点未创建"
+        return 1
+    fi
+    if [ "$addr_need_save" -eq 1 ]; then
+        _hysteria_meta_set link_addr "$addr" \
+            || _warn "连接地址未同步到 server_meta(节点已创建, 连接地址已保存在节点元数据中, 不影响链接与 clash 条目)"
+    fi
+    _hysteria_sync_clash "$HYSTERIA_NODE_META" || _warn "clash 条目同步失败(可手工编辑 ${CLASH_YAML})"
+}
+
 _hysteria_add_node() {
-    local auth name meta_json addr
+    local auth name meta_json addr repair_broken=0
     _hysteria_ensure_dirs || return 1
     if ! _hysteria_server_initialized; then
         # bootstrap 含认证密码创建(官方 binary 拒绝空密码, 不可先建空服务器)
@@ -3108,12 +3564,8 @@ _hysteria_add_node() {
             y|Y) ;;
             *) _info "已取消(损坏文件保留, 可手工核对后重试)"; _press_any_key; return 0 ;;
         esac
-        if ! rm -f "$HYSTERIA_NODE_META"; then
-            _error "损坏的节点元数据删除失败(权限/只读?), 已取消"
-            _press_any_key
-            return 1
-        fi
-        _info "已移除损坏的节点元数据, 继续重建"
+        repair_broken=1
+        _info "确认后将在锁内以新节点元数据原子替换损坏记录"
     fi
     # 情形 2: 服务器已有认证凭据但 Manager 侧无节点记录(手工部署过 / 删过节点记录)。
     # **接管**: 复用现成密码重建元数据, 不改 hysteria.json 的认证段。
@@ -3148,48 +3600,19 @@ _hysteria_add_node() {
     else
         _info "沿用已有客户端连接地址: ${addr}"
     fi
-    # 预检(元数据完整性 + listen 可解析), 失败不得固化半成品节点
-    local tmp_meta
-    tmp_meta=$(mktemp "${HYSTERIA_DATA_DIR}/.tmpmeta.XXXXXX") || {
-        _error "临时节点元数据创建失败, 节点未创建"
+    meta_json=$(jq -n --arg a "$auth" --arg n "$name" --arg ad "$addr" \
+        --arg created "$(date '+%Y-%m-%d')" \
+        '{auth:$a,name:$n,link_addr:$ad,created:$created}') || {
+        _error "节点元数据组装失败"
         _press_any_key
         return 1
     }
-    if ! jq -n --arg a "$auth" --arg n "$name" --arg ad "$addr" \
-         '{auth:$a,name:$n,link_addr:$ad}' > "$tmp_meta" 2>/dev/null; then
-        rm -f "$tmp_meta"
-        _error "临时节点元数据构建失败, 节点未创建"
+    # 锁内复核配置密码/节点状态并完成元数据与 clash 提交; 所有交互仍在锁外。
+    if ! _with_config_lock _hysteria_adopt_node_locked \
+        "$meta_json" "$auth" "$addr" "$addr_need_save" "$repair_broken"; then
         _press_any_key
         return 1
     fi
-    if ! _hysteria_link_preflight "$tmp_meta" >/dev/null; then
-        rm -f "$tmp_meta"
-        _error "分享链接预检失败, 节点未创建"
-        _tip "请先确认 hysteria.json 的 listen/tls 等服务器级字段完整"
-        _press_any_key
-        return 1
-    fi
-    rm -f "$tmp_meta"
-    meta_json=$(jq -n --arg a "$auth" --arg n "$name" --arg ad "$addr" \
-        --arg created "$(date '+%Y-%m-%d')" \
-        '{auth:$a,name:$n,link_addr:$ad,created:$created}')
-    # 节点元数据是 Manager 侧权威状态, 与 config 无关 → 直接原子写(无需 config 事务:
-    # 本路径**不改 hysteria.json**, 没有需要回滚的配置变更)
-    if ! _atomic_write_json "$HYSTERIA_NODE_META" "$meta_json"; then
-        _error "节点元数据写入失败, 节点未创建(server_meta 未改动, 无部分状态)"
-        _press_any_key
-        return 1
-    fi
-    # 节点元数据已落地后才回写 server_meta(顺序不可交换, 见上)。
-    # 失败文案必须准确(外部复审 P2): 此时 node.json **已含** link_addr, 而
-    # `_hysteria_node_exists` 已为真 → 下次 [2] 走"已有节点"分支, **不会再询问地址**。
-    # 所以不能说"下次会重新询问"; 该字段在本路径也只是缓存 —— 链接/clash 一律从
-    # node.json 读 link_addr, server_meta.link_addr 全项目仅此一处消费(接管时复用)。
-    if [ "$addr_need_save" -eq 1 ]; then
-        _hysteria_meta_set link_addr "$addr" \
-            || _warn "连接地址未同步到 server_meta(节点已创建, 连接地址已保存在节点元数据中, 不影响链接与 clash 条目)"
-    fi
-    _hysteria_sync_clash "$HYSTERIA_NODE_META" || _warn "clash 条目同步失败(可手工编辑 ${CLASH_YAML})"
     _success "节点 [${name}] 已接管(认证密码沿用服务器现有值)"
     _hysteria_print_link "$HYSTERIA_NODE_META" || true
     _press_any_key
@@ -3266,8 +3689,47 @@ _hysteria_view_nodes() {
 #     失败时配置已删、服务已停(用户目的已达成), 残留 unit 只影响下次开机且会被下次 [2]
 #     重新写入覆盖(自愈), 故只告警不中止 —— 与 [14] 卸载的"清理失败保留现场"口径一致。
 #   - 任何"配置删除之前"的中止(停服失败)都不改变运行状态; 删配置失败则恢复原运行状态。
+_hysteria_delete_node_locked() {
+    local name="" was_running
+    _hysteria_gate || return 1
+    if ! _hysteria_config_exists; then
+        _error "锁内复核发现服务器配置已不存在, 不执行删除"
+        return 1
+    fi
+    if _hysteria_node_file_present; then
+        if _hysteria_node_exists; then
+            name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
+        else
+            _warn "节点元数据已损坏(无法解析或缺少必要字段), 读不到节点名"
+        fi
+    fi
+    [ -n "$name" ] || _warn "无法确定原节点名称, 未能自动清理 clash 派生条目(如需清理请手工编辑 ${CLASH_YAML})"
+    was_running=$(_hysteria_runtime_state) || return 1
+    if ! _hysteria_stop_and_verify; then
+        _error "服务未能停止或 supervisor 状态未知(进程/证据未清除), 已中止(配置未删除)"
+        _tip "请先解决服务状态后重试; hysteria.json 与 OpenRC pidfile 均已保留"
+        return 1
+    fi
+    if ! rm -f "$HYSTERIA_CONFIG" || [ -e "$HYSTERIA_CONFIG" ] || [ -L "$HYSTERIA_CONFIG" ]; then
+        _error "服务器配置删除失败(权限/只读?), 已中止"
+        _tip "请人工核对: $HYSTERIA_CONFIG"
+        _hysteria_recover_to_state "$was_running" || _warn "原运行状态恢复失败, 请人工检查服务状态"
+        return 1
+    fi
+    if ! rm -f "$HYSTERIA_NODE_META"; then
+        _warn "节点记录删除失败(权限/只读?): $HYSTERIA_NODE_META"
+        _tip "服务器配置已删除; 下次用 [2] 添加节点 会重新初始化服务器并重新生成节点记录"
+        _tip "如需立即清除该残留记录, 可手工删除: $HYSTERIA_NODE_META"
+    fi
+    _hysteria_cleanup_service_units \
+        || _warn "service 定义清理失败(配置已删除, 服务已停止): 残留 unit 可能在下次开机尝试启动并失败, 请按上方提示人工清理"
+    [ -n "$name" ] && { _hysteria_remove_clash_by_name "$name" || true; }
+    _success "服务器配置已删除, 服务已停止(核心 binary 保留)"
+}
+
 _hysteria_delete_node() {
-    local name="" ans was_running
+    # The locked helper runs `rm -f "$HYSTERIA_CONFIG"` after verified stop; it intentionally retains $HYSTERIA_SERVER_META.
+    local name="" ans
     _hysteria_gate || { _press_any_key; return; }
     clear
     echo; echo -e "  ${CYAN}【删除 Hysteria2 (官方) 服务器配置】${NC}"
@@ -3276,11 +3738,6 @@ _hysteria_delete_node() {
         _press_any_key
         return
     fi
-    # 节点名(clash 条目按 name 删除): 记录缺失/损坏时如实说明, 但不影响删除动作本身 ——
-    # 本操作删的是服务器配置, 记录只是顺带清掉的 Manager 侧缓存。
-    # **读不到名字时不得静默跳过 clash 清理**(外部复审): clash.yaml 是按 name 删除的,
-    # 没有名字就删不掉, 而用户会以为"删除节点"已把订阅条目一并清掉 —— 留下幽灵条目。
-    # 故显式告警 + 指路手工清理, 而不是无声略过。
     if _hysteria_node_file_present; then
         if _hysteria_node_exists; then
             name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
@@ -3299,48 +3756,16 @@ _hysteria_delete_node() {
     echo -e "  ${YELLOW}所有已分发的分享链接/客户端配置会立即失效${NC}"
     echo -e "  ${CYAN}核心 binary 与 server_meta/证书保留; 之后可用 [2] 添加节点 重新初始化${NC}"
     echo -e "  ${YELLOW}如需连核心一并移除请用 [14] 卸载 Hysteria${NC}"
-    read -rp "  确认删除服务器配置并停止服务? [y/N]: " ans
+    read -rp "  确认删除服务器配置并停止服务? [y/N]: " ans || return 0
     case "$ans" in
         y|Y) ;;
         *) _info "已取消"; _press_any_key; return ;;
     esac
-    # 保留(本函数刻意不删): $HYSTERIA_SERVER_META(Manager 侧缓存: link_addr/TLS 选择) /
-    # 核心 binary / 自签证书 —— 重新初始化可复用, 无需重新下载或重签; 彻底移除走 [14] 卸载。
-    was_running=$(_manage_hysteria status 2>/dev/null)
-    # 1) 先停服: 内存立即释放; 且保证没有进程继续持有即将删除的配置。
-    #    失败说明进程仍在(运行状态未变), 故无需"恢复"—— 直接中止。
-    if ! _hysteria_stop_and_verify; then
-        _error "服务未能停止(进程未退出), 已中止(配置未删除)"
-        _tip "请先停止服务(菜单 [6] 服务管理)后重试"
+    # Input stays outside the lock; current config and service state are revalidated inside.
+    if ! _with_config_lock _hysteria_delete_node_locked; then
         _press_any_key
         return 1
     fi
-    # 2) 删服务器配置(用户目的)。**必须先于 service 定义清理**(见上方顺序契约):
-    #    失败 ⇒ 中止并恢复原运行状态(此时 unit 仍在, 重启有效)。
-    if ! rm -f "$HYSTERIA_CONFIG"; then
-        _error "服务器配置删除失败(权限/只读?), 已中止"
-        _tip "请人工核对: $HYSTERIA_CONFIG"
-        _hysteria_recover_to_state "$was_running" || _warn "原运行状态恢复失败, 请人工检查服务状态"
-        _press_any_key
-        return 1
-    fi
-    # 3) 节点记录(Manager 侧缓存): 失败仅告警。**文案必须与真实控制流一致**(外部复审):
-    #    配置已删 ⇒ _hysteria_server_initialized 为假 ⇒ 下次 [2] 走的是 **bootstrap
-    #    重新初始化**(而 bootstrap 会整份重写 node.json), 不是"接管时覆盖"。故如实说明
-    #    "重新初始化并重新生成记录", 并补一条手工删除路径。
-    if ! rm -f "$HYSTERIA_NODE_META"; then
-        _warn "节点记录删除失败(权限/只读?): $HYSTERIA_NODE_META"
-        _tip "服务器配置已删除; 下次用 [2] 添加节点 会重新初始化服务器并重新生成节点记录"
-        _tip "如需立即清除该残留记录, 可手工删除: $HYSTERIA_NODE_META"
-    fi
-    # 4) 清 service 定义 + logrotate 片段: 配置已删、服务已停(用户目的已达成), 失败只告警 ——
-    #    残留 unit 仅影响下次开机(缺配置启动失败, 且被 systemd 启动限流自行停下), 且下次
-    #    [2] 重新初始化时会重写该 unit(自愈)。这里**不**回滚配置删除(回滚等于丢掉用户要的结果)。
-    _hysteria_cleanup_service_units \
-        || _warn "service 定义清理失败(配置已删除, 服务已停止): 残留 unit 可能在下次开机尝试启动并失败, 请按上方提示人工清理"
-    # 5) 派生缓存(clash 条目): 可再生, 失败仅告警(helper 内部已给出人工修法)
-    [ -n "$name" ] && { _hysteria_remove_clash_by_name "$name" || true; }
-    _success "服务器配置已删除, 服务已停止(核心 binary 保留)"
     _press_any_key
     return 0
 }
@@ -3399,7 +3824,12 @@ _hysteria_service_menu() {
     local choice
     clear
     echo; echo -e "  ${CYAN}【服务管理】${NC}"
-    echo -e "  状态: $([ "$(_manage_hysteria status 2>/dev/null)" = "running" ] && echo "${GREEN}运行中${NC}" || echo "${RED}已停止${NC}")  (init: ${INIT_SYSTEM})"
+    local svc_state; svc_state=$(_manage_hysteria status 2>/dev/null)
+    case "$svc_state" in
+        running) echo -e "  状态: ${GREEN}运行中${NC}  (init: ${INIT_SYSTEM})" ;;
+        stopped) echo -e "  状态: ${RED}已停止${NC}  (init: ${INIT_SYSTEM})" ;;
+        *) echo -e "  状态: ${YELLOW}未知(保留服务证据)${NC}  (init: ${INIT_SYSTEM})" ;;
+    esac
     echo
     echo -e "  ${GREEN}[1]${NC} 启动"
     echo -e "  ${GREEN}[2]${NC} 停止"
@@ -3471,8 +3901,14 @@ _hysteria_stopped_state() {
             _proc_any_named hysteria "$HYSTERIA_BIN" && return 1
             return 0
             ;;
-        *)
-            # openrc/direct: pidfile 已由 _manage_hysteria stop 清理; 用 exe 归属确认无进程
+        openrc)
+            # 即使业务子进程已退出, live/无法识别的 supervisor 仍可能在 respawn-wait。
+            # stop helper 未能确认归属时会保留 pidfile; 该证据存在即不得报告 stopped。
+            { [ ! -e "$HYSTERIA_PID_FILE" ] && [ ! -L "$HYSTERIA_PID_FILE" ]; } || return 1
+            _proc_any_named hysteria "$HYSTERIA_BIN" && return 1
+            return 0
+            ;;
+        direct)
             _proc_any_named hysteria "$HYSTERIA_BIN" && return 1
             return 0
             ;;
@@ -3586,16 +4022,22 @@ _hysteria_cleanup_service_units() {
     return "$ok"
 }
 
-# 独立卸载(菜单 [13]): 停服(确认进程退出) → 删 service → 删派生缓存条目 → 删 binary/配置/数据/证书/日志/state
+# Prompt outside the lock; all stop/removal/derived-cache mutations are revalidated and serialized inside.
 _hysteria_uninstall() {
-    local ans f name
+    local ans
     _hysteria_installed || [ -f "/etc/systemd/system/${HYSTERIA_SVC}.service" ] || [ -f "/etc/init.d/${HYSTERIA_SVC}" ] \
         || { _warn "官方 Hysteria2 未安装"; _press_any_key; return 0; }
     echo; read -rp "  确认卸载官方 Hysteria2(删除核心/配置/全部节点数据, 不可恢复)? [y/N]: " ans
     case "$ans" in
-        y|Y) ;;
+        y|Y) _with_config_lock _hysteria_uninstall_locked ;;
         *) _info "已取消"; _press_any_key; return 0 ;;
     esac
+}
+
+_hysteria_uninstall_locked() {
+    local f name
+    _hysteria_installed || [ -f "/etc/systemd/system/${HYSTERIA_SVC}.service" ] || [ -f "/etc/init.d/${HYSTERIA_SVC}" ] \
+        || { _warn "官方 Hysteria2 已被其他会话移除"; return 0; }
     _hysteria_stop_and_verify || { _error "hysteria 进程未退出, 已中止卸载以避免孤儿进程(文件未删除), 请手动停止后重试"; _press_any_key; return 1; }
     # service 定义清理失败必须**中止卸载并保留文件** —— 原写法 warn 后
     # 继续 rm, 会留下"unit 残留 + binary/config 缺失"(unit 仍 enabled 时下次开机尝试启动一个

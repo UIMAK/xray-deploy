@@ -284,7 +284,7 @@ _manifest_relpaths() {
 }
 
 _install_backup() {
-    local rel dest bak
+    local rel dest bak keep_tmp record_count=0 sums crc bytes
     # **先检查 .KEEP 再动手**(2026-09-22 七轮复审: 这条守卫此前只存在于
     # `_install_cleanup_stale`, 而本函数的调用方在调用前还有一次**无条件**的
     # `rm -rf "$ROLLBACK_DIR"` —— 于是"标记目录永不被自动删"的契约被从旁边绕过)。
@@ -300,61 +300,227 @@ _install_backup() {
     # 代价是处于该状态的用户必须先按提示删掉那个目录才能继续安装。
     # 文档措辞必须是"拒绝并给出确切命令", 不得写成"自动处理/透明兼容"(2026-09-22 与
     # 并行会话核对后确认)。
-    if [ -e "$ROLLBACK_DIR/.KEEP" ]; then
-        echo "[错误] 恢复目录 $ROLLBACK_DIR 内存在 .KEEP 标记(上次安装保留的更新前文件), 拒绝覆盖"
-        echo "       请先确认不再需要其中的文件, 手动删除该目录后重试:"
-        echo "         rm -rf \"$ROLLBACK_DIR\""
+    if [ -L "$ROLLBACK_DIR" ] || { [ -e "$ROLLBACK_DIR" ] && [ ! -d "$ROLLBACK_DIR" ]; }; then
+        echo "[错误] 恢复路径 $ROLLBACK_DIR 不是普通目录, 拒绝使用"
         return 2
     fi
-    # 必须先建目录: 首次安装(目标全不存在)时循环里一次 `mkdir -p` 都不会执行, 目录不存在
-    # 则下面的标记写入必然失败 ⇒ 首次安装被误判为"备份失败"而中止(实测踩到)。
+    if [ -e "$ROLLBACK_DIR/.KEEP" ] || [ -L "$ROLLBACK_DIR/.KEEP" ] \
+       || [ -e "$ROLLBACK_DIR/.INSTALLING" ] || [ -L "$ROLLBACK_DIR/.INSTALLING" ]; then
+        echo "[错误] 恢复目录 $ROLLBACK_DIR 包含已标记快照/事务, 拒绝覆盖"
+        echo "       请先核对该恢复目录后再重试"
+        return 2
+    fi
+    # An interruption during backup can leave unmarked stale files. Never reuse them:
+    # their old copies could contradict newly recorded `absent` entries.
+    if [ -e "$ROLLBACK_DIR" ]; then
+        rm -rf "$ROLLBACK_DIR" 2>/dev/null || return 1
+        [ ! -e "$ROLLBACK_DIR" ] && [ ! -L "$ROLLBACK_DIR" ] || return 1
+    fi
     mkdir -p "$ROLLBACK_DIR" 2>/dev/null || return 1
+    keep_tmp="$ROLLBACK_DIR/.KEEP.tmp.$$"
+    printf '%s\n' 'xray-install-backup-v2' > "$keep_tmp" 2>/dev/null || return 1
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
         dest="$DEPLOY_DIR/$rel"
-        [ -e "$dest" ] || continue          # 本次新建的, 回滚时删掉即可
         bak="$ROLLBACK_DIR/$rel"
-        mkdir -p "$(dirname "$bak")" 2>/dev/null || return 1
-        cp -f "$dest" "$bak" 2>/dev/null || return 1
+        if [ -e "$dest" ] || [ -L "$dest" ]; then
+            mkdir -p "$(dirname "$bak")" 2>/dev/null || return 1
+            cp -f "$dest" "$bak" 2>/dev/null || return 1
+            [ -f "$bak" ] && [ ! -L "$bak" ] || return 1
+            printf 'present %s\n' "$rel" >> "$keep_tmp" 2>/dev/null || return 1
+        else
+            # A reused, unmarked rollback directory may still contain an old copy for a target
+            # that is absent now. Remove that stale copy before committing the presence record.
+            if [ -e "$bak" ] || [ -L "$bak" ]; then
+                [ -f "$bak" ] && [ ! -L "$bak" ] || return 1
+                rm -f "$bak" 2>/dev/null || return 1
+                [ ! -e "$bak" ] && [ ! -L "$bak" ] || return 1
+            fi
+            printf 'absent %s\n' "$rel" >> "$keep_tmp" 2>/dev/null || return 1
+        fi
+        record_count=$((record_count + 1))
     done <<< "$(_manifest_relpaths)"
-    # 恢复标记**必须是最后一步**(2026-09-21 七轮复审 P1)。
-    #
-    # 为什么: `_install_cleanup_stale` 只能靠"目录名里的 PID 是否存活"猜目录的用途, 而
-    # **上一次安装进程早已退出** —— 于是本函数保留的恢复源与可丢弃的 SIGKILL 残留对它是
-    # 逐字节不可区分的(都是"目录存在 + PID 已死"), 一起被 `rm -rf`。实测复现: 回滚失败保留
-    # 的目录在**下一次** `install.sh` 启动时被删, 而错误提示恰好让用户去跑那次安装。
-    # 正向标记把"这份备份可能还需要"变成**目录自身携带的事实**, 不再依赖外部线索。
-    #
-    # 为什么写在**最后**: 不变量必须是"标记存在 ⇔ 备份完整"。若先立标记而备份只完成一半,
-    # 后续 `_install_rollback` 会把"备份里没有"的条目当成"本次新建"而 `rm -f` 掉**既有的
-    # 健康文件**(见本函数下方 _install_rollback 的分支)。写在最后使该残局不可能出现。
-    #
-    # 位置也覆盖了 SIGKILL 分支: 本函数在**第一次改动目标文件之前**返回, 因此进程在落地
-    # 中途被强杀时标记已经在盘上, 恢复源同样受保护。
-    : > "$ROLLBACK_DIR/.KEEP" 2>/dev/null || {
-        echo "[错误] 无法写入恢复标记 $ROLLBACK_DIR/.KEEP(磁盘空间/权限?), 未改动任何文件"
+    [ "$record_count" -ge 2 ] || return 1
+    sums=$(sed '1d' "$keep_tmp" | cksum) || return 1
+    read -r crc bytes _ <<< "$sums"
+    [[ "$crc" =~ ^[0-9]+$ && "$bytes" =~ ^[0-9]+$ ]] || return 1
+    printf 'complete %s %s %s\n' "$record_count" "$crc" "$bytes" >> "$keep_tmp" 2>/dev/null || return 1
+    mv -f "$keep_tmp" "$ROLLBACK_DIR/.KEEP" 2>/dev/null || return 1
+    _install_snapshot_read_entries "$ROLLBACK_DIR" 0 >/dev/null || {
+        echo "[错误] 新建恢复快照校验失败: $ROLLBACK_DIR"
         return 1
     }
     return 0
 }
 
+_install_txn_marker() { printf '%s/.INSTALLING' "$ROLLBACK_DIR"; }
+
+_install_snapshot_rel_ok() {
+    local rel="$1" base
+    case "$rel" in
+        xray-deploy.sh|VERSION) return 0 ;;
+        lib/*.sh)
+            base="${rel#lib/}"
+            [[ "$base" =~ ^[A-Za-z0-9_-]+\.sh$ ]] || return 1
+            ;;
+        templates/*.server.jsonc)
+            base="${rel#templates/}"
+            [[ "$base" =~ ^[A-Za-z0-9_-]+\.server\.jsonc$ ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+_install_snapshot_read_entries() {
+    local d="$1" require_marker="${2:-1}" name suffix keep line footer_line marker
+    local state rel extra count=0 seen='|' entries='' sums crc bytes
+    local declared_count declared_crc declared_bytes saw_entrypoint=0 saw_version=0 trailer=0
+    name="${d##*/}"
+    case "$name" in .install-rollback.*) suffix="${name#.install-rollback.}" ;; *) return 1 ;; esac
+    case "$suffix" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$d" = "$DEPLOY_DIR/$name" ] || return 1
+    [ -d "$d" ] && [ ! -L "$d" ] || return 1
+    marker="$d/.INSTALLING"
+    if [ "$require_marker" = 1 ]; then [ -f "$marker" ] && [ ! -L "$marker" ] || return 1; fi
+    keep="$d/.KEEP"
+    [ -f "$keep" ] && [ ! -L "$keep" ] && [ -s "$keep" ] || return 1
+    exec 3< "$keep" || return 1
+    IFS= read -r line <&3 || { exec 3<&-; return 1; }
+    if [ "$line" != xray-install-backup-v2 ]; then
+        exec 3<&-
+        echo "[错误] 旧版或未校验的恢复清单不能自动恢复, 保留现场供人工处理: $keep" >&2
+        return 1
+    fi
+    while IFS= read -r line <&3 || [ -n "$line" ]; do
+        case "$line" in complete\ *) footer_line="$line"; trailer=1; break ;; esac
+        [[ "$line" =~ ^(present|absent)[[:space:]]([^[:space:]]+)$ ]] || { exec 3<&-; return 1; }
+        state="${BASH_REMATCH[1]}"; rel="${BASH_REMATCH[2]}"
+        _install_snapshot_rel_ok "$rel" || { exec 3<&-; return 1; }
+        case "$seen" in *"|$rel|"*) exec 3<&-; return 1 ;; esac
+        seen+="$rel|"
+        case "$rel" in
+            xray-deploy.sh) saw_entrypoint=1 ;;
+            VERSION) saw_version=1 ;;
+            lib/*)
+                [ ! -L "$d/lib" ] && [ ! -L "$DEPLOY_DIR/lib" ] || { exec 3<&-; return 1; }
+                ;;
+            templates/*)
+                [ ! -L "$d/templates" ] && [ ! -L "$DEPLOY_DIR/templates" ] || { exec 3<&-; return 1; }
+                ;;
+        esac
+        case "$state" in
+            present) [ -f "$d/$rel" ] && [ ! -L "$d/$rel" ] || { exec 3<&-; return 1; } ;;
+            absent) [ ! -e "$d/$rel" ] && [ ! -L "$d/$rel" ] || { exec 3<&-; return 1; } ;;
+            *) exec 3<&-; return 1 ;;
+        esac
+        entries+="$state $rel"$'\n'
+        count=$((count + 1))
+    done
+    [ "$trailer" -eq 1 ] || { exec 3<&-; return 1; }
+    if IFS= read -r extra <&3 || [ -n "$extra" ]; then exec 3<&-; return 1; fi
+    exec 3<&-
+    [ "$count" -ge 2 ] && [ "$saw_entrypoint" -eq 1 ] && [ "$saw_version" -eq 1 ] || return 1
+    read -r marker declared_count declared_crc declared_bytes extra <<< "$footer_line"
+    [ "$marker" = complete ] && [ -z "${extra:-}" ] || return 1
+    [[ "$declared_count" =~ ^[0-9]+$ && "$declared_crc" =~ ^[0-9]+$ && "$declared_bytes" =~ ^[0-9]+$ ]] || return 1
+    [ "$declared_count" -eq "$count" ] || return 1
+    sums=$(printf '%s' "$entries" | cksum) || return 1
+    read -r crc bytes _ <<< "$sums"
+    [ "$crc" = "$declared_crc" ] && [ "$bytes" = "$declared_bytes" ] || return 1
+    printf '%s' "$entries"
+}
+
+_install_snapshot_validate() {
+    _install_snapshot_read_entries "$1" 1 >/dev/null
+}
+
+_install_finish_transaction() {
+    local marker
+    marker="$(_install_txn_marker)"
+    rm -f "$marker" 2>/dev/null || return 1
+    [ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
+    if ! rm -f "$ROLLBACK_DIR/.KEEP" 2>/dev/null || [ -e "$ROLLBACK_DIR/.KEEP" ] || [ -L "$ROLLBACK_DIR/.KEEP" ]; then
+        echo "[警告] 安装事务已收尾, 但恢复目录清理失败, 保留: $ROLLBACK_DIR"
+        return 0
+    fi
+    rm -rf "$ROLLBACK_DIR" 2>/dev/null || true
+    return 0
+}
+
+
+_install_recover_interrupted() {
+    local d old_rb found=0 marker suffix
+    for d in "$DEPLOY_DIR"/.install-rollback.*; do
+        [ -e "$d" ] || [ -L "$d" ] || continue
+        suffix="${d##*.install-rollback.}"
+        case "$suffix" in ''|*[!0-9]*) continue ;; esac
+        marker="$d/.INSTALLING"
+        [ -e "$marker" ] || [ -L "$marker" ] || continue
+        found=1
+        if ! _install_snapshot_validate "$d"; then
+            echo "[错误] 未完成安装事务的恢复快照无效, 保留现场并中止: $d"
+            return 1
+        fi
+        old_rb="$ROLLBACK_DIR"
+        ROLLBACK_DIR="$d"
+        echo "[警告] 发现未完成安装事务, 正在恢复更新前文件: $d"
+        if _install_rollback && _install_finish_transaction; then
+            :
+        else
+            echo "[错误] 未完成安装事务恢复失败, 保留恢复目录: $d"
+            ROLLBACK_DIR="$old_rb"
+            return 1
+        fi
+        ROLLBACK_DIR="$old_rb"
+    done
+    [ "$found" -eq 0 ] || echo "[信息] 未完成安装事务已恢复"
+    return 0
+}
+
+_install_abort_signal() {
+    local code="$1" marker
+    marker="$(_install_txn_marker)"
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+        if _install_rollback; then
+            _install_finish_transaction || echo "[错误] 信号回滚已完成, 但无法清除事务标记; 保留恢复目录: $ROLLBACK_DIR"
+        fi
+    fi
+    exit "$code"
+}
+
 _install_rollback() {
-    local rel dest bak bad=""
-    while IFS= read -r rel; do
-        [ -n "$rel" ] || continue
+    local rel dest bak bad="" state entries line tmp
+    entries=$(_install_snapshot_read_entries "$ROLLBACK_DIR" 1) || {
+        echo "[错误] 回滚快照无效, 保留现场: $ROLLBACK_DIR"
+        return 1
+    }
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        IFS=' ' read -r state rel extra <<< "$line"
+        [ -n "$state" ] && [ -n "$rel" ] && [ -z "${extra:-}" ] || return 1
         dest="$DEPLOY_DIR/$rel"
         bak="$ROLLBACK_DIR/$rel"
-        if [ -e "$bak" ]; then
-            cp -f "$bak" "$dest" 2>/dev/null || bad="$bad $rel"
-        else
-            # 备份里没有 => 本次新建的, 删掉即回到"未安装"
-            [ -e "$dest" ] || continue
-            rm -f "$dest" 2>/dev/null || bad="$bad $rel"
-        fi
-    done <<< "$(_manifest_relpaths)"
+        case "$state" in
+            present)
+                tmp="${dest}.restore.$$"
+                mkdir -p "$(dirname "$dest")" 2>/dev/null || { bad="$bad $rel"; continue; }
+                if ! cp -p "$bak" "$tmp" 2>/dev/null || ! cmp -s "$bak" "$tmp" 2>/dev/null \
+                   || ! mv -f "$tmp" "$dest" 2>/dev/null; then
+                    rm -f "$tmp" 2>/dev/null
+                    bad="$bad $rel"
+                fi
+                ;;
+            absent)
+                if [ -e "$dest" ] || [ -L "$dest" ]; then
+                    rm -f "$dest" 2>/dev/null || bad="$bad $rel"
+                fi
+                [ ! -e "$dest" ] && [ ! -L "$dest" ] || bad="$bad $rel"
+                ;;
+            *) return 1 ;;
+        esac
+    done <<< "$entries"
     if [ -n "$bad" ]; then
-        # 回滚**不提前 return**, 逐项尽力恢复后汇总(见上方设计说明)。失败项必须点名 ——
-        # 只说"回滚失败"会让用户不知道该核对哪些文件。
         echo "[错误] 回滚未完成, 以下文件可能处于不一致状态:${bad}"
         echo "       请人工核对 $DEPLOY_DIR 或重跑 install.sh --update"
         return 1
@@ -529,6 +695,11 @@ download_all() {
         echo "[错误] 备份现有安装失败(磁盘空间/权限?), 未改动任何文件"
         return 1
     fi
+    : > "$(_install_txn_marker)" 2>/dev/null || {
+        rm -rf "$stage" "$ROLLBACK_DIR" 2>/dev/null
+        echo "[错误] 无法写入安装事务标记, 未改动任何文件"
+        return 1
+    }
     local copy_ok=1 m
     _install_file "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || copy_ok=0
     chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || copy_ok=0
@@ -549,16 +720,22 @@ download_all() {
         # 原始字节。删掉它就等于"回滚失败还销毁唯一副本"(项目在 hysteria 证书快照上有同款
         # 明文契约)。成功路径才清理。
         if _install_rollback; then
-            rm -rf "$ROLLBACK_DIR" 2>/dev/null
+            _install_finish_transaction || {
+                echo "[错误] 回滚完成, 但事务标记无法清除; 保留备份目录: $ROLLBACK_DIR"
+                return 1
+            }
         else
             echo "[错误] 回滚未完全成功, 已保留备份目录: $ROLLBACK_DIR"
             echo "       请人工从该目录恢复, 或重跑 install.sh --update"
         fi
         return 1
     fi
-    rm -rf "$ROLLBACK_DIR" 2>/dev/null
-    # 清单在**全部落地并复核通过之后**生成; 失败路径不写(与其余文件同一批被回滚覆盖)。
+    # Commit verification is complete; try the advisory manifest before clearing the marker.
     _manifest_write || true
+    _install_finish_transaction || {
+        echo "[错误] 更新文件已复核, 但事务标记无法清除; 保留备份目录: $ROLLBACK_DIR"
+        return 1
+    }
     return 0
 }
 
@@ -638,6 +815,7 @@ INSTALL_LEGACY1_LOCK_DIR="${INSTALL_LOCK_PARENT}/.${INSTALL_LOCK_NAME}.install.l
 INSTALL_LEGACY_LOCK_FILE="$DEPLOY_DIR/.install.lock.fd"
 INSTALL_LEGACY_LOCK_DIR="$DEPLOY_DIR/.install.lock"
 INSTALL_LOCK_HELD=0
+INSTALL_PRIMARY_MARKER_HELD=0
 INSTALL_LOCK_FD=""
 INSTALL_LEGACY_LOCK_FD=""
 INSTALL_LEGACY_LOCK_DIR_HELD=0
@@ -705,6 +883,66 @@ _install_lock_mkdir_release() {   # <锁目录>; 归属校验后才删
     local d="$1" p
     p=$(_install_lock_owner_pid "$d")
     [ "$p" = "$$" ] && rm -rf "$d" 2>/dev/null
+    return 0
+}
+
+# 与 flock 主锁配对的目录 marker: mkdir 退路先占位再 /proc 复查 flock FD;
+# flock 持有者也在进入发布区前占有同一目录, 并以 lock-file inode 见证安全自愈自身 SIGKILL 残留。
+_install_primary_marker_take() {  # caller already holds INSTALL_LOCK_FD
+    local devino witness owner i
+    devino=$(_install_lock_devino "$INSTALL_LOCK_FILE") || devino=""
+    [ -n "$devino" ] || { echo "[错误] 无法读取安装 flock 文件标识, 安装中止"; return 1; }
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+        if mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+            owner="${BASHPID:-$$}"
+            if printf '%s\n' "$owner" > "$INSTALL_LOCK_DIR/pid" 2>/dev/null \
+               && printf '%s\n' "$devino" > "$INSTALL_LOCK_DIR/.witness" 2>/dev/null \
+               && [ "$(cat "$INSTALL_LOCK_DIR/.witness" 2>/dev/null)" = "$devino" ]; then
+                INSTALL_PRIMARY_MARKER_HELD=1
+                return 0
+            fi
+            [ "$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null)" = "$owner" ] && rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null
+            echo "[错误] 无法建立安装锁跨后端见证标记, 安装中止"
+            return 1
+        fi
+        if [ -d "$INSTALL_LOCK_DIR" ] && [ ! -L "$INSTALL_LOCK_DIR" ] \
+           && [ -f "$INSTALL_LOCK_DIR/.witness" ] && [ ! -L "$INSTALL_LOCK_DIR/.witness" ]; then
+            witness=$(cat "$INSTALL_LOCK_DIR/.witness" 2>/dev/null) || witness=""
+            if [ "$witness" = "$devino" ]; then
+                if rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null \
+                   && [ ! -e "$INSTALL_LOCK_DIR" ] && [ ! -L "$INSTALL_LOCK_DIR" ]; then
+                    continue
+                fi
+                echo "[错误] 无法清理安装锁陈旧 flock 见证, 安装中止"
+                return 1
+            fi
+            echo "[错误] 安装锁见证身份不符, 拒绝接管: $INSTALL_LOCK_DIR"
+            return 1
+        fi
+        sleep 1
+    done
+    echo "[错误] 等待安装 mkdir 后端互斥超时或发现残留锁: $INSTALL_LOCK_DIR"
+    return 1
+}
+
+_install_primary_marker_release() {
+    [ "${INSTALL_PRIMARY_MARKER_HELD:-0}" = "1" ] || return 0
+    local devino owner witness
+    owner=$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null) || owner=""
+    witness=$(cat "$INSTALL_LOCK_DIR/.witness" 2>/dev/null) || witness=""
+    devino=$(_install_lock_devino "$INSTALL_LOCK_FILE") || devino=""
+    if [ "$owner" != "${BASHPID:-$$}" ] || [ -z "$devino" ] || [ "$witness" != "$devino" ]; then
+        echo "[错误] 安装锁见证归属/身份校验失败, 保留: $INSTALL_LOCK_DIR"
+        INSTALL_PRIMARY_MARKER_HELD=0
+        return 1
+    fi
+    if ! rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null \
+       || [ -e "$INSTALL_LOCK_DIR" ] || [ -L "$INSTALL_LOCK_DIR" ]; then
+        echo "[错误] 无法删除安装锁见证: $INSTALL_LOCK_DIR"
+        INSTALL_PRIMARY_MARKER_HELD=0
+        return 1
+    fi
+    INSTALL_PRIMARY_MARKER_HELD=0
     return 0
 }
 
@@ -899,17 +1137,15 @@ _install_lock_legacy_mkdir_take() {   # <file> <dir> <heldvar> <label>
                 ;;
         esac
     fi
-    if [ -e "$ldir" ]; then
-        # 旧 mkdir 目录存在 ⇒ 交给 mkdir 助手拒绝并保留现场(绝不接管别人的锁)
-        _install_lock_mkdir_take "$ldir" "$label" || return 1
-    fi
+    # 无论路径当前是否存在, 只取锁一次。若旧持有者在等待期间释放, 这次 mkdir 会成功;
+    # 不能再立刻第二次取同一目录, 否则会把自己的 pid 当成竞争者并留下未登记锁。
     _install_lock_mkdir_take "$ldir" "$label" || return 1
     eval "$heldvar=1"
     return 0
 }
 
 _install_lock_acquire() {
-    local lockdir=""
+    local lockdir="" lrc
     lockdir=$(dirname "$INSTALL_LOCK_FILE")
     [ -n "$lockdir" ] || lockdir="/"
     mkdir -p "$lockdir" 2>/dev/null || {
@@ -933,6 +1169,10 @@ _install_lock_acquire() {
         if flock -n "$INSTALL_LOCK_FD" 2>/dev/null; then
             INSTALL_LOCK_HELD=1
             printf '%s\n' "$$" >&"$INSTALL_LOCK_FD" 2>/dev/null || true   # 仅供诊断, 权威在 fd
+            if ! _install_primary_marker_take; then
+                _install_lock_release
+                return 1
+            fi
             # **(P1, 复审) 先扫已删除部署树上的旧进程**: L2 旧锁文件在部署树内, 旧版卸载执行
             # `rm -rf "$DEPLOY_DIR"` 后路径消失, 但旧进程的 fd/flock 仍在(已删除 inode) ——
             # "路径不存在" **不能** 解释成"没有旧版进程"。该扫描必须在 `mkdir -p "$DEPLOY_DIR"`
@@ -979,6 +1219,19 @@ _install_lock_acquire() {
     # 主锁取到**之后**才创建部署目录: 旧版锁路径就在该目录内, 必须等目录可写再取第二把。
     _install_lock_mkdir_take "$INSTALL_LOCK_DIR" "安装锁" || return 1
     INSTALL_LOCK_HELD=1
+    if ! declare -F _install_legacy_flock_active >/dev/null 2>&1; then
+        echo "[错误] 无法确认安装 flock 主锁是否空闲(缺少 /proc 检查助手), 安装中止"
+        _install_lock_release
+        return 1
+    fi
+    _install_legacy_flock_active "$INSTALL_LOCK_FILE"; lrc=$?
+    case "$lrc" in
+        0|2)
+            echo "[错误] 安装 flock 主锁被占用或无法确认, 安装中止"
+            _install_lock_release
+            return 1
+            ;;
+    esac
     # (P1) 同 flock 分支: L2 路径不存在 ⇒ 先扫已删除部署树, 再创建部署目录。
     if [ ! -e "$INSTALL_LEGACY_LOCK_FILE" ] && [ ! -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
         if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
@@ -1014,7 +1267,17 @@ _install_lock_acquire() {
 
 _install_lock_release() {
     [ "${INSTALL_LOCK_HELD:-0}" = "1" ] || return 0
-    # 先释放旧版协调用的锁(fd 与 mkdir 标记), 再放主锁 —— 顺序与获取相反。
+    local rc=0
+    # 删除旧版 mkdir 见证时必须仍持有配对的 flock 文件锁; 否则新 flock 持有者可在
+    # marker 尚在时进入, 随后被本进程误删见证, 让旧 mkdir writer 与它并发。
+    if [ "${INSTALL_LEGACY1_LOCK_DIR_HELD:-0}" = "1" ]; then
+        _install_lock_mkdir_release "$INSTALL_LEGACY1_LOCK_DIR"
+        INSTALL_LEGACY1_LOCK_DIR_HELD=0
+    fi
+    if [ "${INSTALL_LEGACY_LOCK_DIR_HELD:-0}" = "1" ]; then
+        _install_lock_mkdir_release "$INSTALL_LEGACY_LOCK_DIR"
+        INSTALL_LEGACY_LOCK_DIR_HELD=0
+    fi
     if [ -n "${INSTALL_LEGACY1_LOCK_FD:-}" ]; then
         flock -u "$INSTALL_LEGACY1_LOCK_FD" 2>/dev/null
         eval "exec ${INSTALL_LEGACY1_LOCK_FD}>&-" 2>/dev/null
@@ -1025,13 +1288,8 @@ _install_lock_release() {
         eval "exec ${INSTALL_LEGACY_LOCK_FD}>&-" 2>/dev/null
         INSTALL_LEGACY_LOCK_FD=""
     fi
-    if [ "${INSTALL_LEGACY1_LOCK_DIR_HELD:-0}" = "1" ]; then
-        _install_lock_mkdir_release "$INSTALL_LEGACY1_LOCK_DIR"
-        INSTALL_LEGACY1_LOCK_DIR_HELD=0
-    fi
-    if [ "${INSTALL_LEGACY_LOCK_DIR_HELD:-0}" = "1" ]; then
-        _install_lock_mkdir_release "$INSTALL_LEGACY_LOCK_DIR"
-        INSTALL_LEGACY_LOCK_DIR_HELD=0
+    if [ "${INSTALL_PRIMARY_MARKER_HELD:-0}" = "1" ]; then
+        _install_primary_marker_release || rc=1
     fi
     if [ -n "${INSTALL_LOCK_FD:-}" ]; then
         # flock 路径: 释放由 fd 承担。**不删锁文件** —— 删了会让"路径不存在"与"仍有进程
@@ -1044,7 +1302,7 @@ _install_lock_release() {
         _install_lock_mkdir_release "$INSTALL_LOCK_DIR"
     fi
     INSTALL_LOCK_HELD=0
-    return 0
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -1109,7 +1367,14 @@ INSTALL_LOCK_FILE="${INSTALL_LOCK_ROOT}/install.lock.fd"
 # SIGKILL 两条都覆盖不到 => flock 路径由内核自动释放兜住; mkdir 退路则提示人工清理。
 # ---------------------------------------------------------------------------
 trap '_install_lock_release' EXIT
+trap '_install_abort_signal 130' INT
+trap '_install_abort_signal 143' TERM HUP
 if ! _install_lock_acquire; then
+    exit 1
+fi
+
+# Recover any prior publication interrupted after its complete rollback snapshot was created.
+if ! _install_recover_interrupted; then
     exit 1
 fi
 
@@ -1214,6 +1479,10 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
         rm -rf "$ROLLBACK_DIR" 2>/dev/null
         echo "[错误] 备份现有安装失败(磁盘空间/权限?), 未改动任何文件"; exit 1
     fi
+    : > "$(_install_txn_marker)" 2>/dev/null || {
+        rm -rf "$ROLLBACK_DIR" 2>/dev/null
+        echo "[错误] 无法写入安装事务标记, 未改动任何文件"; exit 1
+    }
     local_ok=1
     _install_file "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || local_ok=0
     # 与远程路径逐字同口径: 执行位设置失败必须走回滚(远程侧是 `chmod +x ... || copy_ok=0`)。
@@ -1232,15 +1501,21 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
         echo "[错误] 本地源落地/复核失败, 正在回滚到更新前状态..."
         # 与远程路径同口径: 回滚失败保留备份目录(唯一恢复源), 成功才清理。
         if _install_rollback; then
-            rm -rf "$ROLLBACK_DIR" 2>/dev/null
+            _install_finish_transaction || {
+                echo "[错误] 回滚完成, 但事务标记无法清除; 保留备份目录: $ROLLBACK_DIR"
+                exit 1
+            }
         else
             echo "[错误] 回滚未完全成功, 已保留备份目录: $ROLLBACK_DIR"
             echo "       请人工从该目录恢复, 或重跑 install.sh --update"
         fi
         exit 1
     fi
-    rm -rf "$ROLLBACK_DIR" 2>/dev/null
     _manifest_write || true
+    _install_finish_transaction || {
+        echo "[错误] 本地文件已复核, 但事务标记无法清除; 保留备份目录: $ROLLBACK_DIR"
+        exit 1
+    }
 else
     # 用户**显式**要求本地安装却没有本地源时, 必须硬失败而不是静默拉网络 ——
     # 那正是"以为在用本地源、实际在装网络版"的误导(与上面的 --update/--local 互斥同一动机)。
