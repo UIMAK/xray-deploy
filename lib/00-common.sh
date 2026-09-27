@@ -42,6 +42,65 @@ _deploy_lock_root() {
     printf '%s' "/var/lock/xray-deploy"
 }
 
+
+# Primary lock interlock: flock holders also own the fallback directory; mkdir holders
+# reserve it first and then inspect open flock descriptors. This closes the mixed-backend
+# check/acquire race without changing either backend's normal stale-lock policy.
+_xray_primary_flock_marker_take() {  # <fd> <lock-file> <fallback-dir> <label>; caller holds flock
+    local fd="$1" lock_file="$2" lock_dir="$3" label="$4" devino witness owner i
+    [ -n "$fd" ] && [ -e "$lock_file" ] || { _error "${label} flock 文件/FD 不可用"; return 1; }
+    devino=$(stat -c '%d:%i' "$lock_file" 2>/dev/null) || devino=""
+    [ -n "$devino" ] || { _error "无法读取${label} flock 文件标识, 放弃操作"; return 1; }
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+        if mkdir "$lock_dir" 2>/dev/null; then
+            owner="${BASHPID:-$$}"
+            if printf '%s\n' "$owner" > "$lock_dir/pid" 2>/dev/null \
+               && printf '%s\n' "$devino" > "$lock_dir/.witness" 2>/dev/null \
+               && [ "$(cat "$lock_dir/.witness" 2>/dev/null)" = "$devino" ]; then
+                return 0
+            fi
+            [ "$(cat "$lock_dir/pid" 2>/dev/null)" = "$owner" ] && rm -rf "$lock_dir" 2>/dev/null
+            _error "无法建立${label}跨后端见证标记: $lock_dir"
+            return 1
+        fi
+        if [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] \
+           && [ -f "$lock_dir/.witness" ] && [ ! -L "$lock_dir/.witness" ]; then
+            witness=$(cat "$lock_dir/.witness" 2>/dev/null) || witness=""
+            if [ "$witness" = "$devino" ]; then
+                # Exclusive flock proves no previous flock owner remains; mkdir-only owners
+                # never write this inode witness, so only our interrupted marker is removable.
+                if rm -rf "$lock_dir" 2>/dev/null && [ ! -e "$lock_dir" ] && [ ! -L "$lock_dir" ]; then
+                    continue
+                fi
+                _error "无法清理${label}陈旧 flock 见证标记: $lock_dir"
+                return 1
+            fi
+            _error "${label}锁目录见证身份不符, 拒绝接管: $lock_dir"
+            return 1
+        fi
+        sleep 1
+    done
+    _error "等待${label} mkdir 后端互斥超时或发现残留锁: $lock_dir"
+    return 1
+}
+
+_xray_primary_flock_marker_release() {  # <lock-file> <fallback-dir> <label>
+    local lock_file="$1" lock_dir="$2" label="$3" devino owner witness
+    [ -d "$lock_dir" ] || { _error "${label}见证目录丢失: $lock_dir"; return 1; }
+    owner=$(cat "$lock_dir/pid" 2>/dev/null) || owner=""
+    witness=$(cat "$lock_dir/.witness" 2>/dev/null) || witness=""
+    devino=$(stat -c '%d:%i' "$lock_file" 2>/dev/null) || devino=""
+    if [ "$owner" != "${BASHPID:-$$}" ] || [ -z "$devino" ] || [ "$witness" != "$devino" ]; then
+        _error "${label}见证标记归属/身份校验失败, 保留: $lock_dir"
+        return 1
+    fi
+    if ! rm -rf "$lock_dir" 2>/dev/null || [ -e "$lock_dir" ] || [ -L "$lock_dir" ]; then
+        _error "无法删除${label}见证标记: $lock_dir"
+        return 1
+    fi
+    return 0
+}
+
 # 脚本自身
 export CMD_NAME="xd"                            # 快捷命令名(用户确认)
 
@@ -301,15 +360,21 @@ _is_ipv6_literal() {
 # 接受 ::、0.0.0.0、127.0.0.1、::1、具体 IPv4/IPv6;非法返回非 0
 # ---------------------------------------------------------------------------
 _validate_listen() {
-    local addr="$1"
+    local addr="$1" oct
     [ -z "$addr" ] && return 1
+    case "$addr" in
+        *[[:space:]]*) return 1 ;;
+    esac
     case "$addr" in
         "::"|"0.0.0.0"|"127.0.0.1"|"::1") return 0 ;;
     esac
-    # IPv4 字面量(每段 0-255; 裸 [0-9]+ 会放行 999.1.1.1, xray 启动才报错)
+    # IPv4 字面量(规范十进制八位组, 每段 0-255; 拒绝前导零, 避免 bash 八进制解释)
     if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
-        (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) && return 0
-        return 1
+        for oct in "${BASH_REMATCH[@]:1}"; do
+            [[ "$oct" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+            (( oct <= 255 )) || return 1
+        done
+        return 0
     fi
     # IPv6 字面量(严格校验, 见 _is_ipv6_literal)
     _is_ipv6_literal "$addr" && return 0
@@ -1080,7 +1145,7 @@ _press_any_key() {
 # **跨版本协调**: 覆盖 L1/L2 × flock文件/mkdir目录 四种组合, 复用 `_xray_legacy_lock_name`
 # 的无-flock 分支; 缺该助手时 fail-closed。
 _with_config_lock_mkdir() {
-    local deploy_path="${DEPLOY_DIR%/}" lock_dir rc owner
+    local deploy_path="${DEPLOY_DIR%/}" lock_dir lock_file rc owner lrc
     local legacy_lock_file legacy_lock_dir legacy1_lock_file legacy1_lock_dir
     local legacy_fd="" legacy_dir="" legacy1_fd="" legacy1_dir=""
     case "$deploy_path" in
@@ -1095,6 +1160,7 @@ _with_config_lock_mkdir() {
     legacy_lock_dir="$deploy_path/.config.lock.d"
     legacy1_lock_file="${deploy_path%/*}/.${deploy_path##*/}.config.lock"
     legacy1_lock_dir="${deploy_path%/*}/.${deploy_path##*/}.config.lock.d"
+    lock_file="$(_deploy_lock_root)/config.lock"
     lock_dir="$(_deploy_lock_root)/config.lock.d"
     mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || {
         _error "无法创建配置锁目录 $(dirname "$lock_dir")(权限/只读文件系统?), 放弃本次修改"
@@ -1112,6 +1178,19 @@ _with_config_lock_mkdir() {
         _error "无法写入配置锁持有者记录 $lock_dir/pid(磁盘空间/权限?), 放弃本次修改"
         return 1
     fi
+    if ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
+        _error "无法确认配置 flock 主锁是否空闲(缺少 /proc 检查助手), 放弃本次修改"
+        rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null
+        return 1
+    fi
+    _xray_legacy_flock_active "$lock_file"; lrc=$?
+    case "$lrc" in
+        0|2)
+            _error "配置 flock 主锁被占用或无法确认, 放弃本次修改"
+            rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null
+            return 1
+            ;;
+    esac
     if [ ! -d "$deploy_path" ]; then
         _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $deploy_path"
         rm -f "$lock_dir/pid" 2>/dev/null
@@ -1190,9 +1269,10 @@ _with_config_lock() {
         _with_config_lock_mkdir "$@"
         return $?
     fi
-    local config_lock_file legacy1_lock_file legacy_lock_file
+    local config_lock_file config_lock_dir legacy1_lock_file legacy_lock_file
     local legacy1_lock_dir legacy_lock_dir
     config_lock_file="$(_deploy_lock_root)/config.lock"
+    config_lock_dir="$(_deploy_lock_root)/config.lock.d"
     legacy1_lock_file="${DEPLOY_DIR%/*}/.${DEPLOY_DIR##*/}.config.lock"
     legacy1_lock_dir="${DEPLOY_DIR%/*}/.${DEPLOY_DIR##*/}.config.lock.d"
     legacy_lock_file="$DEPLOY_DIR/.config.lock"
@@ -1219,6 +1299,11 @@ _with_config_lock() {
             _error "等待配置锁超时(15s), 可能有其他 xd 会话正在修改配置"
             exit 1
         fi
+        if ! _xray_primary_flock_marker_take 9 "$config_lock_file" "$config_lock_dir" "配置锁"; then
+            flock -u 9 2>/dev/null || :
+            exit 1
+        fi
+        trap '_xray_primary_flock_marker_release "$config_lock_file" "$config_lock_dir" "配置锁" || exit 1; flock -u 9 2>/dev/null || :' EXIT
         # 主锁已在手, 此时才判部署树是否存在(锁内真实状态): 不存在 ⇒ 确实没有部署
         # (或刚被卸载), fail-closed 不重建。
         if [ ! -d "$DEPLOY_DIR" ]; then
