@@ -30,6 +30,7 @@ _detect_os_family() {
         # 等 20+ 个大写变量注入调用者作用域。当前 4 个调用点都是命令替换(污染限于子 shell),
         # 但函数本身没有任何防护, 一次裸调用就会静默覆盖同名变量。
         (
+            unset ID ID_LIKE
             . /etc/os-release 2>/dev/null
             # R38(M2): 必须用 ${ID:-} —— 入口有 set -u, 而部分裁剪镜像/自制 rootfs 的
             # os-release 只写 NAME/PRETTY_NAME 而没有 ID=; 裸 "$ID" 会让子 shell 以
@@ -131,7 +132,7 @@ _pkg_install() {
 # 每次启动轻量探测(command -v), 仅缺依赖时安装; 安装后复核, 返回真实成败
 # ---------------------------------------------------------------------------
 _ensure_base_deps() {
-    local missing=()
+    local c missing=()
     command -v curl   >/dev/null 2>&1 || missing+=(curl)
     command -v wget   >/dev/null 2>&1 || missing+=(wget)
     command -v jq     >/dev/null 2>&1 || missing+=(jq)

@@ -180,6 +180,13 @@ _logrotate_restore_prev() {
     return 1
 }
 
+# 先去除前导零, 只允许短规范值进入 Bash 算术(避免任意长输入溢出)。
+_logrotate_retention_digits() {
+    local ret="$1"
+    [[ "$ret" =~ ^0*([0-9]+)$ ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
 # 渲染应有的配置内容到 stdout(参数校验与生成的唯一来源)
 _logrotate_render_config() {
     local freq ret comp
@@ -193,18 +200,16 @@ _logrotate_render_config() {
         *) freq="daily" ;;
     esac
 
-    # 验证 ret 为数字 1-30
+    # 去前导零后才比较/渲染; 长于两位时直接夹到上限, 不进入 Bash 算术。
     : "${ret:=7}"
-    [[ "$ret" =~ ^[0-9]+$ ]] || ret=7
-    # 归一化为十进制再比较/渲染。前导零值("08"/"09"/"099")有两个独立危害:
-    #   1) 算术比较把它们当八进制 → "08" 直接报 "value too great for base", 比较失败,
-    #      夹取分支不执行, 前导零原样留到下面的渲染;
-    #   2) logrotate 拒绝解析带前导零的份数(实测 "bad rotation count '08'") ——
-    #      写一次就永久破坏轮换, 而 _logrotate_config_in_sync 用同一份渲染比对, 仍报"已同步",
-    #      状态页显示健康。故归一化必须发生在比较与渲染这两个出口之前。
-    ret=$((10#$ret))
-    [ "$ret" -lt 1 ] && ret=1
-    [ "$ret" -gt 30 ] && ret=30
+    ret=$(_logrotate_retention_digits "$ret") || ret=7
+    if [ "${#ret}" -gt 2 ]; then
+        ret=30
+    else
+        ret=$((10#$ret))
+        [ "$ret" -lt 1 ] && ret=1
+        [ "$ret" -gt 30 ] && ret=30
+    fi
 
     local compress_line="compress"
     [ "$comp" = "off" ] && compress_line="nocompress"
@@ -411,9 +416,9 @@ _logrotate_status() {
     # 状态页必须区分"期望"与"事实": state 是期望, /etc/logrotate.d 里的文件才是
     # logrotate 实际执行的参数。参数写失败会留下"state 新、文件旧", 若这里只回显 state,
     # 用户看到的是自己想要的值而非真实生效的值(复审 4)。
-    if [ "$enabled" = "on" ] && [ -f "$LOGROTATE_CONF" ] && ! _logrotate_config_in_sync; then
-        echo -e "  ${YELLOW}⚠ 上面的参数尚未同步到 ${LOGROTATE_CONF}, logrotate 仍按旧参数执行${NC}"
-        echo -e "  ${SKYBLUE}(在 [2]/[3]/[4] 里再选一次同样的值即可重试写入)${NC}"
+    if [ "$enabled" = "on" ] && { [ ! -f "$LOGROTATE_CONF" ] || ! _logrotate_config_in_sync; }; then
+        echo -e "  ${YELLOW}⚠ 当前保存设置尚未完整写入 ${LOGROTATE_CONF}, logrotate 可能未按预期执行${NC}"
+        echo -e "  ${SKYBLUE}(选择 [7] 重新应用当前保存设置即可重试)${NC}"
     fi
 
     if [ "$enabled" = "on" ] && [ -f "$LOGROTATE_CONF" ]; then
@@ -594,8 +599,10 @@ _logrotate_menu() {
         # unset 与 off 在这里可以合并成同一个动作("启用"), 因为菜单是用户主动操作:
         # 无论此前是没记录还是显式关闭, 用户点了启用就该启用, 且 _logrotate_enable
         # 会把 state 一并写正。这与自动联动路径不同 —— 那里必须拒绝对 unset 动手。
-        if [ "$enabled" = "on" ]; then
+        if [ "$enabled" = "on" ] && [ -f "$LOGROTATE_CONF" ]; then
             echo -e "  ${GREEN}[1]${NC} 禁用 logrotate"
+        elif [ "$enabled" = "on" ]; then
+            echo -e "  ${GREEN}[1]${NC} 修复配置文件并重新应用已启用状态"
         elif [ "$enabled" = "off" ]; then
             echo -e "  ${GREEN}[1]${NC} 启用 logrotate"
         elif [ -f "$LOGROTATE_CONF" ]; then
@@ -609,6 +616,7 @@ _logrotate_menu() {
         echo -e "  ${GREEN}[4]${NC} 压缩"
         echo -e "  ${GREEN}[5]${NC} 查看配置文件"
         echo -e "  ${GREEN}[6]${NC} 日志级别 (loglevel, 小内存优化)"
+        echo -e "  ${GREEN}[7]${NC} 重新应用当前保存设置"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
@@ -622,7 +630,7 @@ _logrotate_menu() {
                 # 同样按三态 rc 分流: rc=2 表示轮换已按用户意图改变、只是 state 没记上,
                 # 报"已生效但状态未记录"比笼统报失败准确(后者会让用户误以为动作没做成)。
                 local trc=0
-                if [ "$enabled" = "on" ]; then
+                if [ "$enabled" = "on" ] && [ -f "$LOGROTATE_CONF" ]; then
                     _logrotate_disable || trc=$?
                     case "$trc" in
                         0) _success "logrotate 已禁用" ;;
@@ -703,11 +711,11 @@ _logrotate_menu() {
                 read -rp "  请输入保留份数 (1-30, 回车取消): " new_ret
                 [ -z "$new_ret" ] && { _info "已取消"; _press_any_key; continue; }
                 : "${new_ret:=7}"
-                [[ "$new_ret" =~ ^[0-9]+$ ]] || { _warn "请输入有效数字"; _press_any_key; continue; }
-                # 先归一化为十进制: 前导零在算术比较里会被当八进制("08" 报 value too great
-                # for base), 且归一化后的值才是要落进 state/配置的值 —— 否则 "08" 会被原样
-                # 写入, logrotate 拒绝解析, 轮换永久失效。
-                new_ret=$((10#$new_ret))
+                local ret_digits
+                ret_digits=$(_logrotate_retention_digits "$new_ret") || { _warn "请输入有效数字"; _press_any_key; continue; }
+                # 仅两位以内的规范数字进入算术; 超范围的长输入先拒绝, 不触发整数溢出。
+                [ "${#ret_digits}" -gt 2 ] && { _warn "最多保留 30 份"; _press_any_key; continue; }
+                new_ret=$((10#$ret_digits))
                 [ "$new_ret" -lt 1 ] && { _warn "最少保留 1 份"; _press_any_key; continue; }
                 [ "$new_ret" -gt 30 ] && { _warn "最多保留 30 份"; _press_any_key; continue; }
                 # 同上: 同值跳过必须以"文件也已同步"为前提, 否则写失败后无法直接重试
@@ -755,7 +763,7 @@ _logrotate_menu() {
                         _success "压缩已${comp_label}开启"
                     else
                         _error "压缩已记录为「${comp_label}」, 但配置文件更新失败, 轮换仍按旧参数执行"
-                        _tip "请重试, 或检查 ${LOGROTATE_CONF} 是否可写"
+                        _tip "选择 [7] 重新应用当前保存设置重试, 或检查 ${LOGROTATE_CONF} 是否可写"
                     fi
                 else
                     _success "压缩已${comp_label}开启 (logrotate 当前禁用, 启用后生效)"
@@ -778,6 +786,23 @@ _logrotate_menu() {
             6)
                 # 日志级别(含 none 时的 logrotate 联动)
                 _loglevel_menu
+                ;;
+            7)
+                if [ "$enabled" = "on" ]; then
+                    local rrc=0
+                    _logrotate_enable || rrc=$?
+                    case "$rrc" in
+                        0) _success "已重新应用当前保存的 logrotate 设置" ;;
+                        2) _warn "设置已应用, 但状态持久化失败" ;;
+                        *)
+                            _error "重新应用设置失败, logrotate 配置未更新"
+                            _tip "请检查 ${LOGROTATE_CONF} 是否可写后重试 [7]"
+                            ;;
+                    esac
+                else
+                    _warn "logrotate 当前未记录为启用, 未写入配置; 按 [1] 可主动启用"
+                fi
+                _press_any_key
                 ;;
             *)
                 _warn "无效选择"

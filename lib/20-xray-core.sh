@@ -775,22 +775,34 @@ _xray_legacy_lock_identity_ok() {   # <fd> <见证fd>; 0 = 同一 inode
 _xray_devino() { stat -c '%d:%i' "$1" 2>/dev/null; }
 
 _xray_legacy_lock_release() {   # <fd变量名> <mkdir变量名>
-    local fdvar="$1" dirvar="$2" ef d
+    local fdvar="$1" dirvar="$2" ef d owner rc=0
+    eval "d=\${${dirvar}:-}"
+    if [ -n "$d" ]; then
+        owner=$(cat "$d/pid" 2>/dev/null) || owner=""
+        if [ "$owner" = "$$" ]; then
+            # 先删本进程确认持有的旧 mkdir 见证, 再解 flock; 反序会让新 flock 持有者
+            # 在旧 marker 尚未释放时误判/接管, 留下跨后端交错窗口。
+            if ! rm -rf "$d" 2>/dev/null || [ -e "$d" ] || [ -L "$d" ]; then
+                _error "无法移除本进程持有的旧锁见证目录: $d"
+                rc=1
+            else
+                eval "$dirvar=\"\""
+            fi
+        elif [ -e "$d" ] || [ -L "$d" ]; then
+            _error "旧锁见证目录归属不匹配, 保留: $d"
+            rc=1
+            eval "$dirvar=\"\""
+        else
+            eval "$dirvar=\"\""
+        fi
+    fi
     eval "ef=\${${fdvar}:-}"
     if [ -n "$ef" ]; then
         flock -u "$ef" 2>/dev/null
         eval "exec ${ef}>&-" 2>/dev/null
         eval "$fdvar=\"\""
     fi
-    eval "d=\${${dirvar}:-}"
-    if [ -n "$d" ]; then
-        if [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ]; then
-            # 目录内有 .witness(flock 路径)或仅 pid(无 flock 退路); 归属校验通过后整体删除。
-            rm -rf "$d" 2>/dev/null
-        fi
-        eval "$dirvar=\"\""
-    fi
-    return 0
+    return "$rc"
 }
 
 # 旧版进程不认识部署目录外的新锁, 可能已持目录内锁并把整棵部署树删掉; 此时在路径上重建同名
@@ -823,7 +835,7 @@ _xray_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持有
 
 _with_core_lock() {
     local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lockf fallback_dir
-    local legacy_lockf legacy_fallback_dir legacy1_lockf legacy1_fallback_dir i locked=0 rc owner
+    local legacy_lockf legacy_fallback_dir legacy1_lockf legacy1_fallback_dir i locked=0 rc owner lrc
     local XD_CORE_LEGACY_FLOCK_FD="" XD_CORE_LEGACY_DIR=""
     local XD_CORE_LEGACY1_FLOCK_FD="" XD_CORE_LEGACY1_DIR=""
     case "$deploy_path" in
@@ -922,6 +934,14 @@ _with_core_lock() {
                 return 1
             fi
         fi
+        if ! _xray_primary_flock_marker_take "$CORE_LOCK_FD" "$lockf" "$fallback_dir" "核心锁"; then
+            _xray_legacy_lock_release XD_CORE_LEGACY1_FLOCK_FD XD_CORE_LEGACY1_DIR
+            _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
+            _xray_core_lock_fd_reset
+            return 1
+        fi
+
+
 
         # 子 shell 内执行: 使 CORE_LOCK_FD 与 HELD 标记的作用域跟着这次加锁一起消失,
         # 调用方不必手工回滚环境(与 _with_config_lock 同款做法)。
@@ -933,6 +953,7 @@ _with_core_lock() {
         rc=$?
         _xray_legacy_lock_release XD_CORE_LEGACY1_FLOCK_FD XD_CORE_LEGACY1_DIR
         _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
+        _xray_primary_flock_marker_release "$lockf" "$fallback_dir" "核心锁" || rc=1
         _xray_core_lock_fd_reset
         return "$rc"
     fi
@@ -954,6 +975,19 @@ _with_core_lock() {
         _error "无法写入核心锁持有者记录 $fallback_dir/pid, 放弃本次操作"
         return 1
     fi
+    if ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
+        _error "无法确认核心 flock 主锁是否空闲(缺少 /proc 检查助手), 放弃本次操作"
+        rm -f "$fallback_dir/pid" 2>/dev/null; rmdir "$fallback_dir" 2>/dev/null
+        return 1
+    fi
+    _xray_legacy_flock_active "$lockf"; lrc=$?
+    case "$lrc" in
+        0|2)
+            _error "核心 flock 主锁被占用或无法确认, 放弃本次操作"
+            rm -f "$fallback_dir/pid" 2>/dev/null; rmdir "$fallback_dir" 2>/dev/null
+            return 1
+            ;;
+    esac
     # 同 flock 路径: 目录存在性在**锁内**判定(锁外判断会与并发卸载竞态), 锁内不存在则 fail-closed
     # 退出且不重建目录。
     if [ ! -d "$deploy_path" ]; then
@@ -1012,7 +1046,7 @@ _with_core_lock() {
 _with_deploy_install_lock() {
     local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lock_dir lock_file
     local legacy_lock_file legacy_lock_dir legacy1_lock_file legacy1_lock_dir
-    local DEPLOY_INSTALL_LOCK_FD="" i locked=0 owner tmp rc
+    local DEPLOY_INSTALL_LOCK_FD="" i locked=0 owner tmp rc lrc
     local XD_INSTALL_LEGACY_FLOCK_FD="" XD_INSTALL_LEGACY_DIR=""
     local XD_INSTALL_LEGACY1_FLOCK_FD="" XD_INSTALL_LEGACY1_DIR=""
     case "$deploy_path" in
@@ -1057,6 +1091,10 @@ _with_deploy_install_lock() {
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
+        if ! _xray_primary_flock_marker_take "$DEPLOY_INSTALL_LOCK_FD" "$lock_file" "$lock_dir" "安装锁"; then
+            eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+            return 1
+        fi
         # 主锁已在手再建部署目录 —— 旧版安装锁文件在**目录内**, 旧版进程也必须先建目录才能取它,
         # 故"主锁→建目录→旧锁"不存在"目录刚被卸载删掉 / 旧进程刚建好目录"的漏网窗口; 卸载期间
         # 才启动的等待者会在释放主锁后照常继续, 而不是因目录一度不存在而失败。
@@ -1067,12 +1105,14 @@ _with_deploy_install_lock() {
             if _xray_legacy_deleted_tree_active "$deploy_path"; then
                 _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
                 _tip "等旧版会话退出后重试"
+                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
                 eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
                 return 1
             fi
         fi
         if ! mkdir -p "$deploy_path" 2>/dev/null; then
             _error "无法创建部署目录 $deploy_path, 放弃本次操作"
+            _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
@@ -1081,6 +1121,7 @@ _with_deploy_install_lock() {
         if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
             if ! _xray_legacy_lock_name XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR \
                 "$legacy_lock_file" "$legacy_lock_dir" "安装锁"; then
+                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
                 eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
                 return 1
             fi
@@ -1090,6 +1131,7 @@ _with_deploy_install_lock() {
                 _error "旧版安装锁文件在获取后被替换/删除(部署目录正被卸载?): $legacy_lock_file"
                 _tip "等对方结束后重试; 本次不做任何落地"
                 _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
+                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
                 eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
                 return 1
             fi
@@ -1098,6 +1140,7 @@ _with_deploy_install_lock() {
             if ! _xray_legacy_lock_name XD_INSTALL_LEGACY1_FLOCK_FD XD_INSTALL_LEGACY1_DIR \
                 "$legacy1_lock_file" "$legacy1_lock_dir" "旧版L1安装锁"; then
                 _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
+                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
                 eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
                 return 1
             fi
@@ -1105,6 +1148,7 @@ _with_deploy_install_lock() {
                 _error "旧版L1安装锁文件在获取后被替换/删除(部署目录正被卸载?): $legacy1_lock_file"
                 _xray_legacy_lock_release XD_INSTALL_LEGACY1_FLOCK_FD XD_INSTALL_LEGACY1_DIR
                 _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
+                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
                 eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
                 return 1
             fi
@@ -1117,6 +1161,7 @@ _with_deploy_install_lock() {
         rc=$?
         _xray_legacy_lock_release XD_INSTALL_LEGACY1_FLOCK_FD XD_INSTALL_LEGACY1_DIR
         _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
+        _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || rc=1
         eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
         return "$rc"
     fi
@@ -1132,6 +1177,19 @@ _with_deploy_install_lock() {
                 _error "无法写入安装锁持有者记录 $lock_dir/pid, 放弃本次卸载"
                 return 1
             fi
+            if ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
+                _error "无法确认安装 flock 主锁是否空闲(缺少 /proc 检查助手), 放弃本次卸载"
+                rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null
+                return 1
+            fi
+            _xray_legacy_flock_active "$lock_file"; lrc=$?
+            case "$lrc" in
+                0|2)
+                    _error "安装 flock 主锁被占用或无法确认, 放弃本次卸载"
+                    rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null
+                    return 1
+                    ;;
+            esac
             # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过); (P1) L2 不存在时补删除树扫描, 再建目录。
             if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ]; then
                 if _xray_legacy_deleted_tree_active "$deploy_path"; then
@@ -1183,6 +1241,8 @@ _with_deploy_install_lock() {
         fi
         if [ ! -d "$lock_dir" ]; then
             _error "安装锁路径被非目录对象占用: $lock_dir"
+
+
             _tip "请手动检查该路径后重试本次卸载"
             return 1
         fi
@@ -1240,6 +1300,60 @@ _with_deploy_install_lock() {
 _xray_core_journal_path() { printf '%s' "$STATE_DIR/coretxn.json"; }
 _xray_core_blocked_path() { printf '%s' "$STATE_DIR/coretxn.blocked"; }
 _xray_core_path_present() { [ -e "$1" ] || [ -L "$1" ]; }
+
+_xray_core_fsync_file_dir() {  # best-effort durability for an artifact and its containing directory
+    local p="$1"
+    [ -n "$p" ] || return 0
+    if _xray_core_path_present "$p"; then _fsync_path "$p" || :; fi
+    _fsync_path "$(dirname "$p")" || :
+    return 0
+}
+
+_xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
+    local j="$1" binbak stage sprev gip gsp operation f
+    binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
+    stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
+    sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
+    gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
+    gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
+    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || return 1
+    for f in "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "$gip" "$gsp"; do
+        _xray_core_path_present "$f" && _xray_core_fsync_file_dir "$f"
+    done
+    case "$operation" in
+        core) _xray_core_fsync_file_dir "$stage/xray" ;;
+        geo)
+            _xray_core_fsync_file_dir "$stage/geoip.dat"
+            _xray_core_fsync_file_dir "$stage/geosite.dat"
+            ;;
+    esac
+    _xray_core_fsync_file_dir "$stage"
+    return 0
+}
+
+_xray_core_production_fsync() {  # <journal>; best effort before terminal phase/cleanup
+    local j="$1" operation bin unit
+    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || return 1
+    case "$operation" in
+        core)
+            bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
+            unit=$(jq -r '.unit // empty' "$j" 2>/dev/null) || unit=""
+            _xray_core_fsync_file_dir "$bin"
+            _xray_core_fsync_file_dir "$ASSET_DIR/geoip.dat"
+            _xray_core_fsync_file_dir "$ASSET_DIR/geosite.dat"
+            [ -z "$unit" ] || _xray_core_fsync_file_dir "$unit"
+            _xray_core_fsync_file_dir "$STATE_DIR/version"
+            _xray_core_fsync_file_dir "$STATE_DIR/channel"
+            ;;
+        geo)
+            _xray_core_fsync_file_dir "$ASSET_DIR/geoip.dat"
+            _xray_core_fsync_file_dir "$ASSET_DIR/geosite.dat"
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
 
 _xray_core_sha256_file() {
     local file="$1" hash
@@ -1440,6 +1554,12 @@ _xray_core_journal_phase() {
     if [ "$next" = snapshotted ]; then
         _xray_core_journal_ok "$j" && _xray_core_snapshots_ok "$j" || {
             _error "恢复源未完整通过最终校验, 不推进 snapshotted"; return 1; }
+        _xray_core_snapshots_fsync "$j" || {
+            _error "无法枚举 coretxn 恢复源, 不推进 snapshotted"; return 1; }
+    elif [ "$next" = committed ] || [ "$next" = rolled_back ]; then
+        # Terminal phase means the changed production files are settled before recovery sources may be deleted.
+        _xray_core_production_fsync "$j" || {
+            _error "无法枚举 coretxn 生产路径, 不推进终态 phase=$next"; return 1; }
     fi
     if ! _meta_update "$j" '.phase=$p' --arg p "$next" 2>/dev/null; then
         _error "核心事务阶段推进失败: ${next}(磁盘空间/IO?), 未继续操作"
@@ -1453,6 +1573,7 @@ _xray_core_journal_drop() {
     local j; j=$(_xray_core_journal_path)
     rm -f "$j" 2>/dev/null || return 1
     ! _xray_core_path_present "$j" || { _error "核心事务账本删除失败, 仍存在: $j"; return 1; }
+    _fsync_path "$(dirname "$j")" || :
     return 0
 }
 
@@ -1716,15 +1837,19 @@ _xray_core_cleanup_sources() {  # <journal>
     [ -n "$stage" ] && rm -rf "$stage" 2>/dev/null
     for f in "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "$gip" "$gsp"; do
         _xray_core_path_present "$f" && left=1
+        [ -n "$f" ] && _fsync_path "$(dirname "$f")" || :
     done
     [ -z "$stage" ] || ! _xray_core_path_present "$stage" || left=1
+    [ -z "$stage" ] || _fsync_path "$(dirname "$stage")" || :
     [ "$left" -eq 0 ] || { _error "事务快照清理未完成, 保留账本供重试"; return 1; }
     return 0
 }
 _xray_core_cleanup_after_commit() {  # <journal>
     local j="$1"
-    # committed / rolled_back 都不可逆: 只清理 transaction-owned artifacts; 源/marker/journal
-    # 任一残留都返回失败, 保留 terminal journal 让下次启动继续 cleanup。
+    # committed / rolled_back 都不可逆: 在删除恢复源前再刷一次生产态, 覆盖旧版本遗留的终态账本。
+    _xray_core_production_fsync "$j" || return 1
+    # 只清理 transaction-owned artifacts; 源/marker/journal 任一残留都返回失败,
+    # 保留 terminal journal 让下次启动继续 cleanup。
     _xray_core_cleanup_sources "$j" || return 1
     _xray_core_journal_drop || return 1
     return 0
@@ -3190,11 +3315,40 @@ _restart_xray_verified() {
 #   · `systemctl stop` 返回 0 不等于进程已退出(Type=simple 下 systemd 可能仍在收尾);
 #   · 停失败时旧实现照样继续删 unit 与部署目录 —— 残局是"进程仍监听端口 + 二进制/配置已删",
 #     用户既停不掉也起不来(已实测复现)。
-# 判活用 `_xray_is_running`(R40 统一入口), **不用**裸 `systemctl is-active`/`rc-service status`
-# —— 那两者在崩溃窗口里都会说谎(见 CLAUDE.md 的"Unified liveness"段)。
-# `_xray_is_running` 缺失(混装旧 lib)时无法证明进程已经退出。破坏性卸载必须拒绝继续,
-# 而不是把能力缺失伪装成停止成功。
+# 常规 liveness 仍由 `_xray_is_running` 统一判定, 不改 status 语义; 破坏性路径另用下方正向
+# stopped 判据, 避免把 systemd 查询失败/过渡态当成停止。缺 `_xray_is_running`(混装旧 lib)
+# 时仍拒绝破坏性操作, 不把能力缺失伪装成停止成功。
 # ---------------------------------------------------------------------------
+# 破坏性操作必须有正向停止证据; systemd 查询失败/未知不得等同于已停止。
+# 返回 0=确认停止, 1=仍运行/过渡, 2=无法观察。
+_xray_stopped_state() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            local load active mainpid
+            load=$(systemctl show -p LoadState --value xray 2>/dev/null) || return 2
+            case "$load" in
+                not-found)
+                    [ -d /proc ] || return 2
+                    _proc_any_named xray "$XRAY_BIN" && return 1
+                    return 0
+                    ;;
+                loaded|masked) ;;
+                *) return 2 ;;
+            esac
+            active=$(systemctl show -p ActiveState --value xray 2>/dev/null) || return 2
+            case "$active" in
+                inactive|failed) ;;
+                *) return 1 ;;
+            esac
+            mainpid=$(systemctl show -p MainPID --value xray 2>/dev/null) || return 2
+            [[ "$mainpid" =~ ^[0-9]+$ ]] || return 2
+            [ "$mainpid" = "0" ] && return 0
+            return 1
+            ;;
+        *) return 2 ;;
+    esac
+}
+
 _xray_stop_and_verify() {
     # stop 与完整 liveness 确认不可被核心 transaction 的 restart 插入。
     if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
@@ -3210,7 +3364,11 @@ _xray_stop_and_verify() {
     _manage_xray stop >/dev/null 2>&1 || true
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        _xray_is_running || return 0
+        if [ "${INIT_SYSTEM:-}" = systemd ]; then
+            _xray_stopped_state && return 0
+        else
+            _xray_is_running || return 0
+        fi
         sleep 1
     done
     return 1
@@ -3253,6 +3411,14 @@ _uninstall_xray_locked() {
             return 1
         fi
     fi
+    # 官方 Hysteria2 前置清理可因停止/服务定义失败而中止, 因此必须早于 Xray unit、快捷命令与
+    # 二进制 symlink 的删除; 否则 abort 会留下 Hysteria 孤儿服务但已失去管理入口。
+    if declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
+        if ! _hysteria_cleanup_before_uninstall; then
+            _error "官方 Hysteria2 清理未完成, 已中止 Xray 卸载(部署数据与 Xray 管理入口保留), 请处理后重试"
+            return 1
+        fi
+    fi
     case "$INIT_SYSTEM" in
         systemd)
             systemctl disable xray 2>/dev/null
@@ -3282,15 +3448,6 @@ _uninstall_xray_locked() {
     # 删快捷命令(xd) + xray symlink
     rm -f /usr/local/bin/"$CMD_NAME"
     [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ] && rm -f /usr/local/bin/xray
-    # 官方 Hysteria2 前置清理(其数据目录随 DEPLOY_DIR 一并删除, 但 service 定义在系统目录,
-    # 不先停服删 unit 会留下指向已删 binary 的孤儿服务; declare -F 守卫兼容混装旧版)。
-    # 0.16.3: 停止必须确认进程真正退出 —— 仍存活时中止整个卸载(防孤儿进程), 由用户处理。
-    if declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
-        if ! _hysteria_cleanup_before_uninstall; then
-            _error "官方 Hysteria2 进程未能停止, 已中止卸载(文件未删除), 请手动处理后重试"
-            return 1
-        fi
-    fi
     # 清理 logrotate 配置
     if declare -F _logrotate_cleanup >/dev/null 2>&1; then
         _logrotate_cleanup
