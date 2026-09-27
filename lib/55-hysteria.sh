@@ -1912,13 +1912,18 @@ _hysteria_listen_port_part() {
 # 列出 Xray config 中**具备 UDP 监听能力**的入站端口, 展开为 `start:end` 行(PortList:
 # "443" / "443-500" / "443,8443-9000")。官方 Hysteria 的端口跳跃会在该 UDP 范围上建
 # REDIRECT 规则, 范围内**任何** UDP 监听都会被劫持 ⇒ 判据必须覆盖所有 UDP 能力的入站:
-#   · protocol `hysteria` —— Xray Hy2 的协议键就是它(本项目模板实测), 而 Xray 里不存在
-#     `hysteria2` 这个键 ⇒ 漏掉它会让 Xray Hy2 节点落在跳跃范围内时静默通过(端口被抢);
+#   · protocol `hysteria` —— Xray Hy2 的协议键就是它(本项目模板实测; `infra/conf/xray.go`
+#     的入站协议表里只有 `hysteria`, **没有 `hysteria2`**) ⇒ 漏掉它会让 Xray Hy2 节点落在
+#     跳跃范围内时静默通过(端口被抢);
 #   · `streamSettings.network` 为 mkcp/quic —— 传输层本身走 UDP;
-#   · `dokodemo-door`/`tunnel` 的 `settings.network` 含 udp —— 本项目 tunnel 模板写死
-#     `"network": "tcp"`, TCP-only 不冲突 ⇒ 对它无条件判冲突是假阳性(会挡住合法跳跃范围);
+#   · `dokodemo-door`/`tunnel` 的 `settings.network` 含 udp —— 缺字段按核心的 nil ⇒ TCP
+#     规则; 本项目 tunnel 模板还写死了 `"network": "tcp"`, TCP-only 不冲突 ⇒ 对它无条件
+#     判冲突是假阳性(会挡住合法跳跃范围);
 #   · `socks` 且 `settings.udp == true`;
-#   · `shadowsocks` 的 `settings.network` 含 udp(Xray 默认 "tcp,udp", 缺字段即 UDP 能力)。
+#   · `shadowsocks` 的 `settings.network` 含 udp —— **缺字段时默认是纯 TCP**: 核心
+#     `infra/conf/common.go` 的 `(*NetworkList).Build()` 对 nil 返回 `[net.Network_TCP]`,
+#     官方文档 inbounds/shadowsocks.md 亦为"默认 tcp"。把它当 "tcp,udp" 会凭空判出一个
+#     UDP 监听, 从而挡住本来合法的跳跃范围(十三轮复审)。
 _hysteria_xray_udp_port_ranges() {
     [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 0
     local s e
@@ -1929,14 +1934,13 @@ _hysteria_xray_udp_port_ranges() {
         .inbounds[]? | select(.port != null)
         | select(
             (.protocol // "") == "hysteria"
-            or (.protocol // "") == "hysteria2"
             or ((.streamSettings.network // "") == "mkcp")
             or ((.streamSettings.network // "") == "quic")
             or ((.protocol // "") == "socks" and ((.settings.udp // false) == true))
             or (((.protocol // "") == "dokodemo-door" or (.protocol // "") == "tunnel")
                 and (((.settings.network // "tcp") | tostring) | test("udp")))
             or ((.protocol // "") == "shadowsocks"
-                and (((.settings.network // "tcp,udp") | tostring) | test("udp")))
+                and (((.settings.network // "tcp") | tostring) | test("udp")))
           )
         | (.port | tostring) | split(",")[]
         | if test("^[0-9]+-[0-9]+$") then sub("-"; ":")
