@@ -135,6 +135,14 @@ printf '== cloudflared parser and absent-unit behavior ==\n'
 CF_BIN="$TMP/cloudflared-main"
 printf '#!/bin/sh\nexit 0\n' > "$CF_BIN"; chmod +x "$CF_BIN"
 CF_UNIT_SYSTEMD="$TMP/cloudflared.service"
+printf 'ExecStart=%s --no-autoupdate tunnel --protocol http2 run --token %s\n' "$CF_BIN" "$TOK1" > "$CF_UNIT_SYSTEMD"
+INIT_SYSTEM=systemd
+_read_cf_state
+if [ "$CF_CUR_AUTOUPDATE" = off ] && [ "$CF_CUR_HTTP2" = on ] && _cf_managed_flags_only; then
+    pass 'managed cloudflared service flags accepted'
+else
+    fail 'managed cloudflared service flags accepted'
+fi
 printf 'ExecStart=%s tunnel run "--metrics=127.0.0.1:2000" --token %s\n' "$CF_BIN" "$TOK1" > "$CF_UNIT_SYSTEMD"
 _read_cf_state
 if _cf_managed_flags_only; then fail 'quoted custom cloudflared flag rejected'; else pass 'quoted custom cloudflared flag rejected'; fi
@@ -142,6 +150,7 @@ printf 'ExecStart=%s tunnel run extra-positional --token %s\n' "$CF_BIN" "$TOK1"
 _read_cf_state
 if _cf_managed_flags_only; then fail 'extra cloudflared positional rejected'; else pass 'extra cloudflared positional rejected'; fi
 rm -f "$CF_UNIT_SYSTEMD" "$CF_BIN"
+INIT_SYSTEM=direct
 if (
     INIT_SYSTEM=systemd
     CF_BIN="$TMP/cloudflared-uninstall"

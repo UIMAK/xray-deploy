@@ -162,8 +162,12 @@ _read_cf_state() {
     local lines="" ln
     while IFS= read -r ln || [ -n "$ln" ]; do
         if _cf_is_cmd_line "$ln"; then
-            lines="$lines
+            if [ -n "$lines" ]; then
+                lines="$lines
 $ln"
+            else
+                lines="$ln"
+            fi
         fi
     done < "$svcfile"
     CF_CUR_CMDLINE="$lines"
