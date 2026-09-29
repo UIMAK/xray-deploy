@@ -671,8 +671,7 @@ if (
     INIT_SYSTEM=systemd
     systemctl() {
         case "$*" in
-            'show -p TimeoutStopFailureMode --value cloudflared') printf 'terminate\n' ;;
-            'show -p TimeoutStopUSec --value cloudflared')        printf '1min 30s\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
         esac
         return 0
     }
@@ -720,25 +719,29 @@ else
     fail 'cloudflared treats an unbounded or unreadable systemd stop timeout as no cap'
 fi
 
-# NOTE: there is deliberately no assertion for TimeoutStopFailureMode. Real systemd only accepts
-# `terminate` and `kill`; `TimeoutStopFailureMode=continue` is rejected outright (systemd 259:
-# "Failed to parse TimeoutStopFailureMode=continue, ignoring: Invalid argument"), so the effective
-# value is always a terminating mode and a finite TimeoutStopUSec is always a genuine upper bound.
-# _cf_systemd_stop_timeout_seconds therefore does not consult that property at all. Keeping the
-# query (and a `case ... continue) return 1` branch for it) was dead code: mutation testing showed
-# deleting the branch changed no observable behaviour, because `infinity` is already rejected by
-# the timespan parser.
+# NOTE: there is deliberately no assertion for TimeoutStopFailureMode. Real systemd accepts
+# `terminate`, `abort` (since v246) and `kill`, and all three terminate the process when the stop
+# timeout expires — verified on systemd 259: each legal value parses without error, and both
+# `terminate` and `abort` ended a SIGTERM-ignoring process once TimeoutStopUSec elapsed. Illegal
+# values are rejected outright ("Failed to parse TimeoutStopFailureMode=continue, ignoring:
+# Invalid argument") and the effective value stays `terminate`. The effective mode therefore always
+# terminates, so a finite TimeoutStopUSec is always a genuine upper bound and
+# _cf_systemd_stop_timeout_seconds does not consult that property at all. Keeping the query (with a
+# `case ... continue) return 1` branch) was dead code: mutation testing showed deleting the branch
+# changed no observable behaviour, because `infinity` is already rejected by the timespan parser.
 
 # The contract check: a systemd stop timeout SHORTER than grace+margin means cloudflared gets
 # killed by systemd before its own grace period elapses, so the promise "we waited out the
 # configured grace period" is false. It must be reported, not silently tolerated — and an equal
 # or longer bound must stay silent (no noise on the default 90s setup).
+# `_cf_pids_owned` reports an owned process here, i.e. there IS something to stop, so the check
+# must not short-circuit on "nothing to stop".
 if (
     INIT_SYSTEM=systemd
+    _cf_pids_owned() { printf '4242\n'; }
     systemctl() {
         case "$*" in
-            'show -p TimeoutStopFailureMode --value cloudflared') printf 'terminate\n' ;;
-            'show -p TimeoutStopUSec --value cloudflared')        printf '1min 30s\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
         esac
         return 0
     }
@@ -752,25 +755,111 @@ else
     fail 'cloudflared reports a systemd stop timeout shorter than the grace deadline'
 fi
 
-# ...and _cf_kill_all must actually perform that check. Without this assertion the whole
-# helper could be dead code and every other assertion would still pass.
-# Scenario: unit configured with `--grace-period 120s` (deadline 125s) while systemd's effective
-# stop timeout is the 90s manager default. A removal of the call makes this silent.
+# ...but an ALREADY-STOPPED cloudflared must NOT produce that warning, even with a very short stop
+# timeout: nothing is going to be waited for, so a shorter bound truncates nothing and the message
+# is pure noise (real-systemd repro: unit inactive + TimeoutStopSec=5s still warned).
 if (
     INIT_SYSTEM=systemd
-    CF_TOS_UNIT="$TMP/cf-tos.service"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 120s run --token x\n' > "$CF_TOS_UNIT"
-    rm() { :; }
-    _cf_unit_path() { printf '%s' "$CF_TOS_UNIT"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
     _cf_pids_owned() { :; }
     systemctl() {
         case "$*" in
             'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
             'show -p MainPID --value cloudflared')     printf '0\n' ;;
-            'show -p TimeoutStopFailureMode --value cloudflared') printf 'terminate\n' ;;
-            'show -p TimeoutStopUSec --value cloudflared')        printf '1min 30s\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
+        esac
+        return 0
+    }
+    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && [ -z "$out" ]
+); then
+    pass 'cloudflared stays silent about the stop timeout when nothing needs stopping'
+else
+    fail 'cloudflared stays silent about the stop timeout when nothing needs stopping'
+fi
+
+# A unit mid-transition (still deactivating) is NOT "nothing to stop" — and an unreadable state must
+# not be optimistically treated as stopped either. Both must still warn.
+if (
+    INIT_SYSTEM=systemd
+    _cf_pids_owned() { :; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
+        esac
+        return 0
+    }
+    out=$(_cf_check_stop_timeout_covers 125 2>&1); a=$?
+    # Unit state UNREADABLE while the bound is still readable: must still warn. "Cannot read the
+    # state" is not evidence that nothing needs stopping (same fail-closed contract as
+    # _cf_unit_stopped). Only the state queries fail here — the bound stays readable, so the
+    # comparison is still possible and the warning must be produced.
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
+            *) return 1 ;;
+        esac
+        return 0
+    }
+    out2=$(_cf_check_stop_timeout_covers 125 2>&1); b=$?
+    # Bound UNREADABLE: no number, so no claim can be made — this is the rc 2 "no cap" contract.
+    # Remaining silent here is correct, NOT fail-open: we have nothing to compare.
+    systemctl() { return 1; }
+    out3=$(_cf_check_stop_timeout_covers 125 2>&1); c=$?
+    [ "$a" -eq 1 ] && [ "$b" -eq 1 ] && [ "$c" -eq 0 ] && [ -z "$out3" ] \
+        && contains '短于宽限期' "$out" && contains '短于宽限期' "$out2"
+); then
+    pass 'cloudflared still warns when the unit is transitioning or its state is unreadable'
+else
+    fail 'cloudflared still warns when the unit is transitioning or its state is unreadable'
+fi
+
+# The check is systemd-only: on OpenRC (or any non-systemd host) it must not run at all — no
+# warning, and no `systemctl` call whatsoever. Without this assertion the guard is unobservable,
+# because a missing or bus-less `systemctl` also ends up at "no cap" and stays silent *by accident*;
+# a host that ships a working-looking `systemctl` shim would then emit a bogus warning.
+if (
+    INIT_SYSTEM=openrc
+    CF_OPENRC_CALLED="$TMP/cf-openrc-called"
+    rm -f "$CF_OPENRC_CALLED"
+    _cf_pids_owned() { printf '4242\n'; }   # something IS running, so only the guard can silence it
+    systemctl() { printf 'called\n' >> "$CF_OPENRC_CALLED"; printf '5s\n'; return 0; }
+    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && [ -z "$out" ] && [ ! -e "$CF_OPENRC_CALLED" ]
+); then
+    pass 'cloudflared stop-timeout check is systemd-only and never queries systemctl elsewhere'
+else
+    fail 'cloudflared stop-timeout check is systemd-only and never queries systemctl elsewhere'
+fi
+
+# ...and _cf_kill_all must actually perform that check. Without this assertion the whole
+# helper could be dead code and every other assertion would still pass.
+# Scenario: unit configured with `--grace-period 120s` (deadline 125s) while systemd's effective
+# stop timeout is the 90s manager default, and a real process must be stopped for the check to be
+# reachable. A removal of the call makes this silent.
+if (
+    INIT_SYSTEM=systemd
+    CF_TOS_UNIT="$TMP/cf-tos.service"
+    CF_TOS_POLLS="$TMP/cf-tos-polls"
+    : > "$CF_TOS_POLLS"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 120s run --token x\n' > "$CF_TOS_UNIT"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$CF_TOS_UNIT"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    # Report one owned process on the first scan only: that makes the stop-timeout check reachable
+    # (there is something to stop) while keeping the wait loop bounded and fast.
+    _cf_pids_owned() {
+        printf 'poll\n' >> "$CF_TOS_POLLS"
+        [ "$(wc -l < "$CF_TOS_POLLS")" -le 1 ] && printf '4242\n'
+        return 0
+    }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
         esac
         return 0
     }
@@ -804,10 +893,11 @@ if (
     _cf_kill_all >/dev/null 2>&1
     calls=$(cat "$CF_STOP_SENTINEL" 2>/dev/null)
     # The stop request must be the first *mutating* action and the wait must then key on
-    # ActiveState. (Read-only `show` queries may precede it: the grace deadline is now read
-    # from systemd's effective configuration before the stop is issued.)
+    # ActiveState. (Read-only `show` queries may precede it: the grace deadline and the
+    # "is anything actually running" pre-check are both read from systemd before the stop.)
+    # So compare the stop against the first ActiveState query *after* it — that is the wait.
     stop_line=$(grep -n -m1 -- '--no-block stop cloudflared' "$CF_STOP_SENTINEL" | cut -d: -f1)
-    active_line=$(grep -n -m1 'show -p ActiveState --value cloudflared' "$CF_STOP_SENTINEL" | cut -d: -f1)
+    active_line=$(awk -v s="$stop_line" 'NR>s && /show -p ActiveState --value cloudflared/ { print NR; exit }' "$CF_STOP_SENTINEL")
     [ -n "$stop_line" ] && [ -n "$active_line" ] && [ "$stop_line" -lt "$active_line" ] \
         && ! contains 'is-active' "$calls"
 ); then

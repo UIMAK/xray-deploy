@@ -1194,10 +1194,13 @@ _cf_systemd_span_seconds() {
 #   rc 2 = 读不到(无 systemd / 旧版 / bus 不通) -> 不施加任何上限(维持原有行为)
 _cf_systemd_stop_timeout_seconds() {
     local span
-    # 不查 TimeoutStopFailureMode: 该属性只接受 terminate|kill —— 实测 systemd 259 对
-    # `TimeoutStopFailureMode=continue` 会在 journal 里报 "Failed to parse
-    # TimeoutStopFailureMode=continue, ignoring: Invalid argument" 并保持 terminate。
-    # 于是"到点后 systemd 会不会真的终止进程"永远为真, 有限值就一定是真正的上界。
+    # 不查 TimeoutStopFailureMode: 该属性接受 terminate|abort|kill(abort 自 systemd v246
+    # 起存在), 三者都会在停止超时到点时**终止进程**。实测 systemd 259: 三个合法值都无解析
+    # 错误; terminate 与 abort 都在 TimeoutStopUSec 到点后结束了忽略 SIGTERM 的进程;
+    # 非法值(如 continue)被直接拒绝, journal 里报 "Failed to parse
+    # TimeoutStopFailureMode=continue, ignoring: Invalid argument", 有效值保持 terminate。
+    # 所以"到点后 systemd 会真的终止进程"恒成立, 只要 TimeoutStopUSec 是有限值, 它就是
+    # 真正的上界 —— 无需再查该属性。
     # `infinity` 与任何非数字形态都被 timespan 解析器拒掉 -> rc 1 -> 不施加任何上限。
     span=$(systemctl show -p TimeoutStopUSec --value cloudflared 2>/dev/null) || return 2
     [ -n "$span" ] || return 2
@@ -1212,10 +1215,27 @@ _cf_systemd_stop_timeout_seconds() {
 # 脚本只能在 systemd 允许的窗口内尊重宽限期, 窗口本身必须由 unit 的 TimeoutStopSec 保证。
 # 只告警、不改 unit: 自动改写 systemd 停止超时属于改变系统行为, 不该由一次菜单停止动作
 # 顺手完成(与 `_cf_managed_line_only` 拒绝改写未托管启动行同一取舍)。
-#   rc 0 = 上界足够(或读不到/无有限上界, 维持原有行为不打扰用户); rc 1 = 上界更短, 已告警
+#
+# **只在确实有东西要停时才检查**(复审第七轮 P2-2): cloudflared 已处于停止终态且没有本脚本
+# 归属的进程时, 这次调用根本不会等待任何进程, TimeoutStopSec 再短也截断不了什么 —— 此时
+# 告警纯属噪声(实测: unit 为 inactive + TimeoutStopSec=5s + 默认宽限期, 仍会打出"停止超时
+# 短于宽限期"且没有任何待停进程)。
+#   rc 0 = 上界足够 / 无需检查(读不到、无有限上界、或没有待停对象); rc 1 = 上界更短, 已告警
 _cf_check_stop_timeout_covers() {
-    local want="$1" have
+    local want="$1" have st_rc=0
     [ "${INIT_SYSTEM:-}" = systemd ] || return 0
+    # 先问 unit 是否已到停止终态(一次 show, 比扫进程便宜), 只有它说"已停止"时才需要再确认
+    # 有没有归属进程残留 —— 顺序不可颠倒: 反过来会在热路径上多做一次进程扫描。
+    # 判据与 _cf_wait_exit 的"还有没有要等的对象"一致。
+    _cf_unit_stopped || st_rc=$?
+    # rc 0 = inactive/failed 且 MainPID=0。再确认没有本脚本归属的孤儿进程(那种情况第 3 步仍要
+    # 等它退出), 两者都成立才算"这次没有待停对象"。
+    # rc 1(仍在运行/过渡态)必须继续检查 —— 确实要等。
+    # rc 2(状态读不到)也继续检查: 无法排除"其实要停", 与 _cf_unit_stopped 的 fail-closed
+    # 口径一致("读不到"不等于"已停止"), 宁可多一条告警也不假装无需等待。
+    if [ "$st_rc" -eq 0 ] && [ -z "$(_cf_pids_owned)" ]; then
+        return 0
+    fi
     have=$(_cf_systemd_stop_timeout_seconds) || return 0
     [ "$have" -ge "$want" ] && return 0
     _warn "systemd 的停止超时(${have}s)短于宽限期 + 余量(${want}s), cloudflared 可能在其宽限期走完前就被 systemd 终止"
