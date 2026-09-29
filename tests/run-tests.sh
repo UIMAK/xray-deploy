@@ -637,6 +637,152 @@ else
     fail 'cloudflared grace duration parser handles Go duration literals'
 fi
 
+# systemd prints its OWN timespan format (`1min 30s`), not a Go duration (`1m30s`) — the two
+# grammars are disjoint, so the Go parser cannot be reused. These literals are copied from real
+# `systemctl show -p TimeoutStopUSec --value` output on systemd 259. Minimum 1s so a non-zero
+# sub-second span cannot collapse to 0 and silently disable the bound.
+# Negative control: reusing _cf_duration_seconds here fails on every `min` form.
+if (
+    [ "$(_cf_systemd_span_seconds '1min 30s')"   -eq 90 ] \
+        && [ "$(_cf_systemd_span_seconds '1min')"     -eq 60 ] \
+        && [ "$(_cf_systemd_span_seconds '1h 30min')" -eq 5400 ] \
+        && [ "$(_cf_systemd_span_seconds '3min 20s')" -eq 200 ] \
+        && [ "$(_cf_systemd_span_seconds '2min 3.456789s')" -eq 124 ] \
+        && [ "$(_cf_systemd_span_seconds '1.500000s')" -eq 2 ] \
+        && [ "$(_cf_systemd_span_seconds '500ms')"    -eq 1 ] \
+        && [ "$(_cf_systemd_span_seconds '100ms')"    -eq 1 ] \
+        && [ "$(_cf_systemd_span_seconds '1us')"      -eq 1 ] \
+        && [ "$(_cf_systemd_span_seconds '59s')"      -eq 59 ] \
+        && [ "$(_cf_systemd_span_seconds '1w')"       -eq 604800 ] \
+        && [ "$(_cf_systemd_span_seconds '1month')"   -eq 2629800 ] \
+        && [ "$(_cf_systemd_span_seconds '1y')"       -eq 31557600 ] \
+        && ! _cf_systemd_span_seconds '1m30s'  >/dev/null 2>&1 \
+        && ! _cf_systemd_span_seconds 'infinity' >/dev/null 2>&1 \
+        && ! _cf_systemd_span_seconds ''       >/dev/null 2>&1
+); then
+    pass 'cloudflared systemd timespan parser handles systemd time-span literals'
+else
+    fail 'cloudflared systemd timespan parser handles systemd time-span literals'
+fi
+
+# The effective systemd stop timeout (including the manager default — the official unit sets no
+# TimeoutStopSec) must be readable as a number, so it can be compared against our own deadline.
+if (
+    INIT_SYSTEM=systemd
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopFailureMode --value cloudflared') printf 'terminate\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared')        printf '1min 30s\n' ;;
+        esac
+        return 0
+    }
+    [ "$(_cf_systemd_stop_timeout_seconds)" -eq 90 ]
+); then
+    pass 'cloudflared reads the effective systemd stop timeout'
+else
+    fail 'cloudflared reads the effective systemd stop timeout'
+fi
+
+# `infinity` must NOT become a number: systemd will not terminate the process on its own, so our
+# own deadline is the only bound and must not be shortened. Anything unreadable — a failing query
+# or an empty property value — is likewise "no cap" (rc 2) rather than a bogus number: a 0 here
+# would make every grace window look covered and silence the contract check.
+# (The TimeoutStopFailureMode stubs are deliberately absent: the helper no longer reads it.)
+if (
+    INIT_SYSTEM=systemd
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') printf 'infinity\n' ;;
+        esac
+        return 0
+    }
+    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; a=$?
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') return 1 ;;
+        esac
+        return 0
+    }
+    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; b=$?
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') printf '\n' ;;
+        esac
+        return 0
+    }
+    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; c=$?
+    systemctl() { return 1; }
+    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; d=$?
+    [ "$a" -eq 1 ] && [ "$b" -eq 2 ] && [ "$c" -eq 2 ] && [ "$d" -eq 2 ]
+); then
+    pass 'cloudflared treats an unbounded or unreadable systemd stop timeout as no cap'
+else
+    fail 'cloudflared treats an unbounded or unreadable systemd stop timeout as no cap'
+fi
+
+# NOTE: there is deliberately no assertion for TimeoutStopFailureMode. Real systemd only accepts
+# `terminate` and `kill`; `TimeoutStopFailureMode=continue` is rejected outright (systemd 259:
+# "Failed to parse TimeoutStopFailureMode=continue, ignoring: Invalid argument"), so the effective
+# value is always a terminating mode and a finite TimeoutStopUSec is always a genuine upper bound.
+# _cf_systemd_stop_timeout_seconds therefore does not consult that property at all. Keeping the
+# query (and a `case ... continue) return 1` branch for it) was dead code: mutation testing showed
+# deleting the branch changed no observable behaviour, because `infinity` is already rejected by
+# the timespan parser.
+
+# The contract check: a systemd stop timeout SHORTER than grace+margin means cloudflared gets
+# killed by systemd before its own grace period elapses, so the promise "we waited out the
+# configured grace period" is false. It must be reported, not silently tolerated — and an equal
+# or longer bound must stay silent (no noise on the default 90s setup).
+if (
+    INIT_SYSTEM=systemd
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopFailureMode --value cloudflared') printf 'terminate\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared')        printf '1min 30s\n' ;;
+        esac
+        return 0
+    }
+    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
+    quiet=$(_cf_check_stop_timeout_covers 90 2>&1); rc_eq=$?
+    [ "$rc" -eq 1 ] && [ "$rc_eq" -eq 0 ] && [ -z "$quiet" ] \
+        && contains '短于宽限期' "$out"
+); then
+    pass 'cloudflared reports a systemd stop timeout shorter than the grace deadline'
+else
+    fail 'cloudflared reports a systemd stop timeout shorter than the grace deadline'
+fi
+
+# ...and _cf_kill_all must actually perform that check. Without this assertion the whole
+# helper could be dead code and every other assertion would still pass.
+# Scenario: unit configured with `--grace-period 120s` (deadline 125s) while systemd's effective
+# stop timeout is the 90s manager default. A removal of the call makes this silent.
+if (
+    INIT_SYSTEM=systemd
+    CF_TOS_UNIT="$TMP/cf-tos.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 120s run --token x\n' > "$CF_TOS_UNIT"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$CF_TOS_UNIT"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { :; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+            'show -p TimeoutStopFailureMode --value cloudflared') printf 'terminate\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared')        printf '1min 30s\n' ;;
+        esac
+        return 0
+    }
+    sleep() { :; }
+    out=$(_cf_kill_all 2>&1)
+    contains '短于宽限期' "$out"
+); then
+    pass 'cloudflared kill-all surfaces a systemd stop timeout that undercuts the grace period'
+else
+    fail 'cloudflared kill-all surfaces a systemd stop timeout that undercuts the grace period'
+fi
+
 # systemd stop must be asynchronous, and the wait must key on ActiveState. `is-active`
 # reports "deactivating" as stopped, so it cannot answer "has the stop finished".
 if (

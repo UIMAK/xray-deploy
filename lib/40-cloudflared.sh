@@ -20,10 +20,14 @@ CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 安装时的 token
 # cloudflared 收到 SIGTERM 后的优雅退出窗口: 停止接受新请求, 等在途请求结束
 # (官方 `--grace-period` 默认 30s, 也可由 TUNNEL_GRACE_PERIOD 覆盖)。_cf_kill_all
 # 必须在这个窗口内等它**自然退出**, 提前 SIGKILL 会硬断正在处理的隧道请求。
-# **窗口长度以 service 自己的配置为准**(见 _cf_grace_seconds), 这里只有默认值与余量 ——
+# **窗口长度以 service 自己的配置为准**(见 _cf_grace_wait_seconds), 这里只有默认值与余量 ——
 # 写死一个数字就等价于"用户配了 60s 优雅退出、脚本仍在 35s 强杀", 与"3s 强杀"是同一个
 # 错误, 只是窗口大了一点。余量只作为"等到什么时候才允许升级到 SIGKILL"的上界, 停完即
 # 返回, 不是固定等待。
+# 注意这个窗口**不是**最终上界: 更外层还有 systemd 自己的停止超时(官方 unit 未设
+# TimeoutStopSec, 由 manager 的 DefaultTimeoutStopSec 决定), 它更短时 cloudflared 会被
+# systemd 提前终止。脚本无法单方面改变它, 只能如实告知 —— 见
+# _cf_systemd_stop_timeout_seconds / _cf_check_stop_timeout_covers。
 CF_GRACE_DEFAULT=30    # 官方 --grace-period 默认值
 CF_GRACE_MARGIN=5      # 余量: 不在宽限期到点的同一瞬间强杀
 CF_GRACE_MAX=300       # 上限: 防病态配置(cloudflared 自身只接受 <=3 分钟, 4h 只可能是手写错误)
@@ -1130,6 +1134,97 @@ _cf_grace_wait_seconds() {
 }
 
 # ---------------------------------------------------------------------------
+# systemd 的 time span 文本 -> 向上取整的秒数。
+# **不能复用 _cf_duration_seconds**: 那读的是 Go 时长字面量(`1m30s`), 而 systemd 打印的是
+# **它自己的**格式, 实测 `systemctl show -p TimeoutStopUSec --value` 输出形如 `1min 30s` /
+# `1h 30min` / `2min 3.456789s` / `1.500000s` / `500ms` / `1us` / `1w` / `1month` / `1y` /
+# `infinity` —— 按量级由大到小、空格分隔, 小数只出现在最后一段。`1min 30s` 会被 Go 解析器
+# 直接拒掉(它不认 `min`), 因此必须另写一个, 单位常量取自 systemd-analyze 自身。
+#   rc 0 = 输出秒数(nonzero 不足 1 秒按 1 计, 与向上取整契约一致); rc 1 = 不是合法 span
+_cf_systemd_span_seconds() {
+    local span="$1" tok int frac unit scale div mult total_us=0 nonzero=0
+    [ -n "$span" ] || return 1
+    for tok in $span; do
+        [[ "$tok" =~ ^([0-9]+)(\.([0-9]+))?(us|ms|s|min|h|d|w|month|y)$ ]] || return 1
+        int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"; unit="${BASH_REMATCH[4]}"
+        [ "${#int}" -le 9 ] || return 1
+        case "$unit" in
+            us)    mult=1 ;;
+            ms)    mult=1000 ;;
+            s)     mult=1000000 ;;
+            min)   mult=60000000 ;;
+            h)     mult=3600000000 ;;
+            d)     mult=86400000000 ;;
+            w)     mult=604800000000 ;;
+            month) mult=2629800000000 ;;
+            y)     mult=31557600000000 ;;
+        esac
+        case "$int" in *[!0]*) nonzero=1 ;; esac
+        total_us=$(( total_us + 10#$int * mult ))
+        if [ -n "$frac" ]; then
+            case "$frac" in *[!0]*) nonzero=1 ;; esac
+            scale="${#frac}"
+            # format_timespan 的小数最多 6 位; 更长的只可能是伪造输入, 截断即可。
+            [ "$scale" -gt 6 ] && { frac="${frac:0:6}"; scale=6; }
+            case "$scale" in
+                1) div=10 ;; 2) div=100 ;; 3) div=1000 ;;
+                4) div=10000 ;; 5) div=100000 ;; *) div=1000000 ;;
+            esac
+            total_us=$(( total_us + 10#$frac * mult / div ))
+        fi
+    done
+    # 溢出会绕成负数: 必须判非法, 否则会算出一个远小于真实值的秒数。
+    [ "$total_us" -lt 0 ] && return 1
+    [ "$total_us" -eq 0 ] && [ "$nonzero" -eq 1 ] && total_us=1
+    printf '%s' "$(( (total_us + 999999) / 1000000 ))"
+}
+
+# systemd 实际会施加的停止超时(`TimeoutStopUSec`, **含 manager 默认值**)。
+# 这是比 cloudflared 宽限期**更外层**的一道边界: 官方 unit(cmd/cloudflared/linux_service.go
+# 的 systemd 模板)只写 `TimeoutStartSec=15`, **没有 `TimeoutStopSec`**, 于是这一层完全由
+# manager 的 `DefaultTimeoutStopSec` 决定(实测本机 90s = `1min 30s`)。到点后 systemd 会
+# **自行终止** cloudflared, 不管它的 `--grace-period` 还剩多久 —— 所以 xray-deploy 宣称的
+# "等完实际配置的宽限期"在某些配置下是空话(grace 120s + 默认 90s: 90s 就被切断)。
+#
+# 不查 `LoadState`: 与 `_cf_systemd_grace_raw` 不同, 这个上界只有在**真有进程活着**时才会
+# 被用到(unit 不存在/未运行时 `_cf_wait_exit` 立即返回 0, 根本走不到上限), 所以"是不是
+# loaded"不影响结论, 少一次 `systemctl show` 更适合热路径。
+#   rc 0 = 输出秒数(有限上界)
+#   rc 1 = systemd 明确表示没有有限上界(`infinity`) -> 不施加任何上限
+#   rc 2 = 读不到(无 systemd / 旧版 / bus 不通) -> 不施加任何上限(维持原有行为)
+_cf_systemd_stop_timeout_seconds() {
+    local span
+    # 不查 TimeoutStopFailureMode: 该属性只接受 terminate|kill —— 实测 systemd 259 对
+    # `TimeoutStopFailureMode=continue` 会在 journal 里报 "Failed to parse
+    # TimeoutStopFailureMode=continue, ignoring: Invalid argument" 并保持 terminate。
+    # 于是"到点后 systemd 会不会真的终止进程"永远为真, 有限值就一定是真正的上界。
+    # `infinity` 与任何非数字形态都被 timespan 解析器拒掉 -> rc 1 -> 不施加任何上限。
+    span=$(systemctl show -p TimeoutStopUSec --value cloudflared 2>/dev/null) || return 2
+    [ -n "$span" ] || return 2
+    _cf_systemd_span_seconds "$span" || return 1
+}
+
+# systemd 施加的停止超时是否会**早于**我们自己的升级时点。
+# 官方 unit 没有 `TimeoutStopSec`, 所以这一层由 manager 的 `DefaultTimeoutStopSec` 决定;
+# 若它比"宽限期 + 余量"更短, 那么 cloudflared 会在自己的 `--grace-period` 走完之前就被
+# systemd 终止 —— 此时脚本宣称的"按实际配置的宽限期等完"只是空话, 必须**显式说出来**,
+# 而不是安静地等一个永远不会由我们触发的时点。这是设计契约的一部分:
+# 脚本只能在 systemd 允许的窗口内尊重宽限期, 窗口本身必须由 unit 的 TimeoutStopSec 保证。
+# 只告警、不改 unit: 自动改写 systemd 停止超时属于改变系统行为, 不该由一次菜单停止动作
+# 顺手完成(与 `_cf_managed_line_only` 拒绝改写未托管启动行同一取舍)。
+#   rc 0 = 上界足够(或读不到/无有限上界, 维持原有行为不打扰用户); rc 1 = 上界更短, 已告警
+_cf_check_stop_timeout_covers() {
+    local want="$1" have
+    [ "${INIT_SYSTEM:-}" = systemd ] || return 0
+    have=$(_cf_systemd_stop_timeout_seconds) || return 0
+    [ "$have" -ge "$want" ] && return 0
+    _warn "systemd 的停止超时(${have}s)短于宽限期 + 余量(${want}s), cloudflared 可能在其宽限期走完前就被 systemd 终止"
+    _tip "如需完整等待宽限期, 请提高 unit 的 TimeoutStopSec(当前生效值 ${have}s)"
+    _tip "可用 systemctl edit cloudflared 添加 [Service] TimeoutStopSec=<秒数> 后重试"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # systemd unit 是否已进入"停止终态"。
 # **不得用 `systemctl is-active` 判"停完了没有"**: stop 进行中 unit 处于 deactivating,
 # 而 is-active 只认 active —— 它会**立刻**返回非 0, 于是等待形同不存在, 调用方紧接着就
@@ -1209,6 +1304,12 @@ _cf_kill_all() {
             # 返回非 0 让等待形同不存在; 紧接着第 3 步的 SIGKILL 就会打断 cloudflared 的
             # 优雅退出, 硬断在途隧道请求。
             _cf_grace=$(_cf_grace_wait_seconds)
+            # 更外层还有一道 systemd 自己的停止超时(官方 unit 未设 TimeoutStopSec, 由
+            # manager 的 DefaultTimeoutStopSec 决定)。它更短时, cloudflared 会在宽限期走完
+            # 之前就被 systemd 终止 —— 此时"等完实际配置的宽限期"是空话, 必须明说而不能
+            # 假装等到(见 _cf_check_stop_timeout_covers)。只告警, 不影响返回码: 这是我们
+            # 无法单方面改变的系统配置, 不该因它把一次正常停止判成失败。
+            _cf_check_stop_timeout_covers "$_cf_grace" || true
             systemctl --no-block stop cloudflared 2>/dev/null || true
             _cf_wait_exit "$_cf_grace"; rc=$?
             case "$rc" in
