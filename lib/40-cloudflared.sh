@@ -1391,6 +1391,30 @@ _cf_kill_all() {
         _tip "通常是容器内无 systemd 或 systemctl 不可用; 请手动确认服务状态"
         return 1
     fi
+    # 最终复验: "进程都没了"不等于"unit 已停止"。systemd 可以先回收主进程(MainPID=0)
+    # 再继续跑 ExecStop/ExecStopPost 与 cgroup 收尾, 期间 unit 一直是 deactivating ——
+    # 此时我们手上一个 cloudflared 进程都扫不到, 第 3 步("有 pids 才处理")整段跳过, 于是
+    # 上面所有判断都放行, 函数报"已清理"并返回 0, 而同一次停止事务其实还没结束。
+    # 真实危害与第 4 轮 P2 同源: _cf_restart 会在 2s 后 systemctl start, 与仍在进行的
+    # stop job 竞争(启动被合并丢弃, 或刚停就被 `Restart=on-failure` 拉起)。
+    # 第 4 轮 P1 修的是"读不到状态"(rc 2), 这里补上"读得到、但没停完"(rc 1) —— 两者都是
+    # 没有'已进入停止终态'的正向证据, 都不能算成功(与 _cf_unit_stopped 契约同口径)。
+    # 必须**重新读一次**而不能复用第 1 步的结论: 第 1 步超时可能只是因为进程还在跑, 而第 3
+    # 步的 SIGTERM 之后它已经干净退出, 那种情形终态确实达成了, 报失败会平白拦住正常重启。
+    if [ "$INIT_SYSTEM" = systemd ]; then
+        local _cf_term_rc=0
+        _cf_unit_stopped || _cf_term_rc=$?
+        case "$_cf_term_rc" in
+            0) ;;
+            2) _warn "cloudflared 进程已无, 但停止终态无法复验(systemd 状态读不到)"
+               _tip "请手动确认 cloudflared service 状态"
+               return 1 ;;
+            *) _warn "cloudflared 进程已无, 但 systemd unit 未进入停止终态(inactive/failed 之外)"
+               _tip "unit 若长期停在 deactivating, 请检查 ExecStop/ExecStopPost 与 TimeoutStopSec"
+               _tip "可用 systemctl status cloudflared 查看当前 ActiveState"
+               return 1 ;;
+        esac
+    fi
     _info "cloudflared 所有进程已清理"
     return 0
 }
