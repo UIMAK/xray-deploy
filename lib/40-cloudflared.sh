@@ -17,6 +17,13 @@ CF_STATE_HTTP2="$STATE_DIR/cf_http2"               # on|off
 CF_STATE_EDGE_IP="$STATE_DIR/cf_edge_ip"           # off|4|6|auto
 CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 安装时的 token
 
+# cloudflared 收到 SIGTERM 后的优雅退出窗口: 停止接受新请求, 等在途请求结束
+# (官方 `--grace-period` 默认 30s, 也可由 TUNNEL_GRACE_PERIOD 覆盖)。_cf_kill_all
+# 必须在这个窗口内等它**自然退出**, 提前 SIGKILL 会硬断正在处理的隧道请求。
+# 这里留 5s 余量, 只作为"等到什么时候才允许升级到 SIGKILL"的上界 —— 停完即返回,
+# 不是固定等待。
+CF_STOP_GRACE=35
+
 # ---------------------------------------------------------------------------
 # 架构 -> cloudflared 下载资产名
 # ---------------------------------------------------------------------------
@@ -855,6 +862,49 @@ _cf_exe_owned() {
 }
 
 # ---------------------------------------------------------------------------
+# systemd unit 是否已进入"停止终态"。
+# **不得用 `systemctl is-active` 判"停完了没有"**: stop 进行中 unit 处于 deactivating,
+# 而 is-active 只认 active —— 它会**立刻**返回非 0, 于是等待形同不存在, 调用方紧接着就
+# 对一个仍在优雅退出的 cloudflared 发 SIGKILL, 硬断在途隧道请求(官方 --grace-period
+# 默认 30s)。与 _xray_stopped_state / _hysteria_stopped_state 同口径。
+#   rc 0 = 已停止终态(inactive/failed 且 MainPID=0)
+#   rc 1 = 仍在运行或处于过渡态(active/activating/deactivating/reloading)
+#   rc 2 = 读不到状态(容器内无 systemd / 旧版无 --value): 不据此断言任何事
+_cf_unit_stopped() {
+    local active mainpid
+    active=$(systemctl show -p ActiveState --value cloudflared 2>/dev/null) || return 2
+    [ -n "$active" ] || return 2
+    case "$active" in
+        inactive|failed) ;;
+        *) return 1 ;;
+    esac
+    mainpid=$(systemctl show -p MainPID --value cloudflared 2>/dev/null) || return 2
+    [ "$mainpid" = "0" ] || return 1
+    return 0
+}
+
+# 等 cloudflared 真正退出: 正常情况**立即**返回, 最坏消耗 <max> 秒。
+# 这是"正常退出检测"那一半 —— 强制清理(SIGTERM/SIGKILL)在它超时之后才允许发生。
+#   rc 0 = 已确认退出(或状态不可读, 不据此拖延); rc 1 = 超时仍有存活
+_cf_wait_exit() {
+    local max="$1" i=0
+    while [ "$i" -lt "$max" ]; do
+        if [ -z "$(_cf_pids_owned)" ]; then
+            # 进程没了还不够: systemd 可能仍在 deactivating(收尾 cgroup), 此时立刻返回
+            # 会让后续流程与被杀进程的收尾重叠。状态读不到(rc 2)则不拖延。
+            if [ "$INIT_SYSTEM" != systemd ]; then return 0; fi
+            _cf_unit_stopped
+            case "$?" in
+                1) ;;            # 过渡态: 继续等
+                *) return 0 ;;   # inactive/failed 或不可读
+            esac
+        fi
+        sleep 1; i=$((i+1))
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # 强力杀干净所有 cloudflared 进程(防止 PID 残留导致的进程泄漏)
 # openrc 的 rc-service stop 经常杀不干净, 必须内核级 kill 兜底
 # ---------------------------------------------------------------------------
@@ -867,14 +917,15 @@ _cf_kill_all() {
     # 1. 按实际 init 系统走正确的 stop，并等待进程真正退出
     case "$INIT_SYSTEM" in
         systemd)
-            # 异步请求停止, 避免 systemctl stop 在 TimeoutStopSec 内同步阻塞(常见默认 90s);
-            # 下方进程扫描与有界轮询仍负责确认/清理。
+            # 异步请求停止: 同步 `systemctl stop` 会阻塞在 unit 的 TimeoutStopSec
+            # (DefaultTimeoutStopSec 常见默认 90s)。
+            # 请求发出后**必须按 ActiveState 等**, 不能拿 `is-active` 当"停完了"的判据 ——
+            # stop 进行中 unit 处于 deactivating, 而 is-active 只认 active, 会**立刻**
+            # 返回非 0 让等待形同不存在; 紧接着第 3 步的 SIGKILL 就会打断 cloudflared 的
+            # 优雅退出(官方 --grace-period 默认 30s), 硬断在途隧道请求。
             systemctl --no-block stop cloudflared 2>/dev/null || true
-            # 等 systemd 真正把进程杀掉（最多等 15s，避免无限阻塞）
-            i=0
-            while systemctl is-active --quiet cloudflared 2>/dev/null && [ "$i" -lt 15 ]; do
-                sleep 1; i=$((i+1))
-            done
+            _cf_wait_exit "$CF_STOP_GRACE" \
+                || _warn "cloudflared 在 ${CF_STOP_GRACE}s 内未进入停止终态, 转为按进程归属强制清理"
             ;;
         openrc)
             rc-service cloudflared stop 2>/dev/null || true
@@ -922,29 +973,28 @@ _cf_kill_all() {
         rm -f "$pf" 2>/dev/null
     done
 
-    # 3. 扫残留进程：先 SIGTERM（给 cloudflared 时间向 CF 边缘发送断开信号），最多等 3s 再 SIGKILL
+    # 3. 扫残留进程：先 SIGTERM（给 cloudflared 时间向 CF 边缘发送断开信号 + 完成优雅退出），
+    #    等到 CF_STOP_GRACE 仍存活才 SIGKILL。
     # R38(P2): 统一走 _cf_pids 家族, 不再用 pgrep/ps 两套逻辑。
     # 2026-09-20: 这里用 _cf_pids_owned(exe 限定到 $CF_BIN)而不是全机 comm 扫描 ——
     # 判活可以接受"把别人的隧道算成我们的", 杀进程不能(会 SIGKILL 掉用户自己装的
     # cloudflared)。无关的同名进程留给第 4 步只告警, 由用户判断。
+    # 2026-09-28 复审(P1): 这里原本固定等 3s 就 SIGKILL, 而 cloudflared 收到 SIGTERM 后要
+    # 走官方 --grace-period(默认 30s)等**在途隧道请求**结束才退出 —— 3s 强杀会硬断正在
+    # 处理的请求。改成等自然退出, 上限才是允许升级到 SIGKILL 的时点(停完即返回)。
     pids=$(_cf_pids_owned)
     if [ -n "$pids" ]; then
         for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
-        # 正常退出时不再固定等满 3 秒; 仅残留进程需要消耗宽限期。
-        for i in 1 2 3; do
+        if ! _cf_wait_exit "$CF_STOP_GRACE"; then
+            # 到这里才允许强杀: 优雅窗口已给足, 进程仍未退出。
+            _warn "cloudflared 残留进程在 ${CF_STOP_GRACE}s 内未退出, 发送 SIGKILL"
             pids=$(_cf_pids_owned)
-            [ -z "$pids" ] && break
-            sleep 1
-        done
-        # 再扫一次, 仍存活的才发 SIGKILL。
-        pids=$(_cf_pids_owned)
-        if [ -n "$pids" ]; then
             for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
-            # SIGKILL exits are immediate; only spend the bounded second if a PID remains.
-            for i in 1; do
-                pids=$(_cf_pids_owned)
-                [ -z "$pids" ] && break
-                sleep 1
+            # SIGKILL 不可捕获, 退出是立即的; 只在实际仍扫到 PID 时才消耗这一秒。
+            i=0
+            while [ "$i" -lt 5 ]; do
+                [ -z "$(_cf_pids_owned)" ] && break
+                sleep 1; i=$((i+1))
             done
         fi
     fi
