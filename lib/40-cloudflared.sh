@@ -867,7 +867,9 @@ _cf_kill_all() {
     # 1. 按实际 init 系统走正确的 stop，并等待进程真正退出
     case "$INIT_SYSTEM" in
         systemd)
-            systemctl stop cloudflared 2>/dev/null || true
+            # 异步请求停止, 避免 systemctl stop 在 TimeoutStopSec 内同步阻塞(常见默认 90s);
+            # 下方进程扫描与有界轮询仍负责确认/清理。
+            systemctl --no-block stop cloudflared 2>/dev/null || true
             # 等 systemd 真正把进程杀掉（最多等 15s，避免无限阻塞）
             i=0
             while systemctl is-active --quiet cloudflared 2>/dev/null && [ "$i" -lt 15 ]; do
@@ -876,7 +878,6 @@ _cf_kill_all() {
             ;;
         openrc)
             rc-service cloudflared stop 2>/dev/null || true
-            sleep 2
             ;;
     esac
 
@@ -921,7 +922,7 @@ _cf_kill_all() {
         rm -f "$pf" 2>/dev/null
     done
 
-    # 3. 扫残留进程：先 SIGTERM（给 cloudflared 时间向 CF 边缘发送断开信号），等 3s，再 SIGKILL
+    # 3. 扫残留进程：先 SIGTERM（给 cloudflared 时间向 CF 边缘发送断开信号），最多等 3s 再 SIGKILL
     # R38(P2): 统一走 _cf_pids 家族, 不再用 pgrep/ps 两套逻辑。
     # 2026-09-20: 这里用 _cf_pids_owned(exe 限定到 $CF_BIN)而不是全机 comm 扫描 ——
     # 判活可以接受"把别人的隧道算成我们的", 杀进程不能(会 SIGKILL 掉用户自己装的
@@ -929,11 +930,23 @@ _cf_kill_all() {
     pids=$(_cf_pids_owned)
     if [ -n "$pids" ]; then
         for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
-        sleep 3
-        # 再扫一次，还活着的直接 SIGKILL
+        # 正常退出时不再固定等满 3 秒; 仅残留进程需要消耗宽限期。
+        for i in 1 2 3; do
+            pids=$(_cf_pids_owned)
+            [ -z "$pids" ] && break
+            sleep 1
+        done
+        # 再扫一次, 仍存活的才发 SIGKILL。
         pids=$(_cf_pids_owned)
-        for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
-        sleep 1
+        if [ -n "$pids" ]; then
+            for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+            # SIGKILL exits are immediate; only spend the bounded second if a PID remains.
+            for i in 1; do
+                pids=$(_cf_pids_owned)
+                [ -z "$pids" ] && break
+                sleep 1
+            done
+        fi
     fi
 
     # 4. 最终确认
@@ -1008,7 +1021,7 @@ _cf_kill_all() {
 }
 
 # 重启 cloudflared service(先杀干净所有, 等 CF 边缘回收旧 session, 再重新 start)
-# 返回 start 命令的真实结果; 调用方仍应再做真实 liveness(_cf_is_running)确认
+# 保留重启前 2s 的 edge 回收间隔; 启动后不固定 sleep, 调用方立即做真实 liveness 确认。
 _cf_restart() {
     # An incomplete cleanup/ownership decision can create a second connector,
     # so restart is fail-closed until all managed processes are accounted for.
@@ -1016,15 +1029,20 @@ _cf_restart() {
         _error "cloudflared 停止流程未完成, 为避免启动第二个实例已取消重启"
         return 1
     fi
-    sleep 2   # 等 CF 边缘感知旧 connector 断开
-    local rc=1
+    sleep 2   # 保留既有的 edge connector 回收窗口
+    local rc=1 i
     case "$INIT_SYSTEM" in
         systemd) systemctl start cloudflared 2>/dev/null; rc=$? ;;
         openrc)  rc-service cloudflared start 2>/dev/null; rc=$? ;;
         *) return 1 ;;
     esac
-    sleep 3   # 等新进程建立连接后再做后续检测
-    return "$rc"
+    [ "$rc" -eq 0 ] || return "$rc"
+    # 服务已能启动时立即继续; 慢机器最多等 5 秒, 而不是固定睡满 3 秒。
+    for ((i=0; i<6; i++)); do
+        _cf_is_managed_running && return 0
+        [ "$i" -lt 5 ] && sleep 1
+    done
+    return 1
 }
 
 # 从 .bak 回滚 service 文件并尽力恢复服务: restore -> (systemd) reload -> restart。
