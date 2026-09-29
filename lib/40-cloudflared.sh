@@ -20,9 +20,14 @@ CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 安装时的 token
 # cloudflared 收到 SIGTERM 后的优雅退出窗口: 停止接受新请求, 等在途请求结束
 # (官方 `--grace-period` 默认 30s, 也可由 TUNNEL_GRACE_PERIOD 覆盖)。_cf_kill_all
 # 必须在这个窗口内等它**自然退出**, 提前 SIGKILL 会硬断正在处理的隧道请求。
-# 这里留 5s 余量, 只作为"等到什么时候才允许升级到 SIGKILL"的上界 —— 停完即返回,
-# 不是固定等待。
-CF_STOP_GRACE=35
+# **窗口长度以 service 自己的配置为准**(见 _cf_grace_seconds), 这里只有默认值与余量 ——
+# 写死一个数字就等价于"用户配了 60s 优雅退出、脚本仍在 35s 强杀", 与"3s 强杀"是同一个
+# 错误, 只是窗口大了一点。余量只作为"等到什么时候才允许升级到 SIGKILL"的上界, 停完即
+# 返回, 不是固定等待。
+CF_GRACE_DEFAULT=30    # 官方 --grace-period 默认值
+CF_GRACE_MARGIN=5      # 余量: 不在宽限期到点的同一瞬间强杀
+CF_GRACE_MAX=300       # 上限: 防病态配置(如 --grace-period 4h)把停止流程挂住数小时
+CF_STOP_REVERIFY=5     # 强杀后复验 systemd 停止终态的上界(进程已死, 只剩 unit 事务)
 
 # ---------------------------------------------------------------------------
 # 架构 -> cloudflared 下载资产名
@@ -862,6 +867,91 @@ _cf_exe_owned() {
 }
 
 # ---------------------------------------------------------------------------
+# 用户实际配置的优雅退出宽限期(原始字面量, 如 `60s` / `2m`)。
+# cloudflared 支持 `--grace-period <PERIOD>` 与 `TUNNEL_GRACE_PERIOD` 覆盖官方默认 30s,
+# 两者都写在 service 文件里 —— 脚本必须读它, **不能写死一个数字**: 用户配了 60s 而脚本
+# 35s 强杀, 与"3s 强杀"是同一个错误(提前 SIGKILL 一个仍在 drain 在途请求的 cloudflared),
+# 只是窗口大了一点。命令行 flag 优先于环境变量(urfave/cli 的 altsrc 语义: 环境变量只提供
+# 默认值, 显式 flag 覆盖它)。输出非空 = 用户配过; 空/rc 1 = 没配, 由调用方用官方默认值。
+# ---------------------------------------------------------------------------
+_cf_grace_config() {
+    local svcfile="$1" ln arr=() i w v
+    [ -f "$svcfile" ] || return 1
+    # 1. 启动行里的 --grace-period <PERIOD> / --grace-period=<PERIOD>(优先)
+    while IFS= read -r ln || [ -n "$ln" ]; do
+        _cf_is_cmd_line "$ln" || continue
+        arr=(); read -ra arr <<< "$ln"
+        for ((i=0; i<${#arr[@]}; i++)); do
+            w="${arr[$i]}"
+            case "$w" in
+                --grace-period=*) printf '%s' "${w#--grace-period=}"; return 0 ;;
+                --grace-period)
+                    [ "$((i+1))" -lt "${#arr[@]}" ] && { printf '%s' "${arr[$((i+1))]}"; return 0; } ;;
+            esac
+        done
+    done < "$svcfile"
+    # 2. 环境变量: systemd `Environment=TUNNEL_GRACE_PERIOD=60s`(可带引号), openrc 的
+    #    `export TUNNEL_GRACE_PERIOD=60s`。这些行不是启动行(_cf_is_cmd_line 认不出), 故单独扫。
+    while IFS= read -r ln || [ -n "$ln" ]; do
+        case "$ln" in '#'*|'') continue ;; esac
+        v="${ln#*TUNNEL_GRACE_PERIOD=}"
+        [ "$v" != "$ln" ] || continue
+        v="${v%%[[:space:]]*}"      # 值到引号/空白为止
+        v="${v%\"}"; v="${v#\"}"    # 两种引号形态都剥掉
+        [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    done < "$svcfile"
+    return 1
+}
+
+# Go 时长字面量("30s" / "1m30s" / "500ms") -> 向上取整的秒数。纯 bash 整数运算:
+# 目标机可能是 busybox(无 bc), 且这里不能依赖 GNU date 的 -d 解析。
+_cf_duration_seconds() {
+    local rest="$1" total_ms=0 int frac unit ms scale div
+    [ -n "$rest" ] || return 1
+    while [ -n "$rest" ]; do
+        [[ "$rest" =~ ^([0-9]+)(\.([0-9]+))?(ns|us|µs|ms|s|m|h)(.*)$ ]] || return 1
+        int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"
+        unit="${BASH_REMATCH[4]}"; rest="${BASH_REMATCH[5]}"
+        case "$unit" in
+            ns|us|µs) ms=0 ;;
+            ms) ms=1 ;;
+            s)  ms=1000 ;;
+            m)  ms=60000 ;;
+            h)  ms=3600000 ;;
+        esac
+        total_ms=$(( total_ms + 10#$int * ms ))
+        if [ -n "$frac" ] && [ "$ms" -gt 0 ]; then
+            # 小数部分按千分之一为最小精度(毫秒级足够, 上限是给 SIGKILL 的时点)
+            scale="${#frac}"
+            [ "$scale" -gt 3 ] && { frac="${frac:0:3}"; scale=3; }
+            case "$scale" in 1) div=10 ;; 2) div=100 ;; *) div=1000 ;; esac
+            total_ms=$(( total_ms + 10#$frac * ms / div ))
+        fi
+    done
+    printf '%s' "$(( (total_ms + 999) / 1000 ))"
+}
+
+# 允许升级到 SIGKILL 之前应当等待的秒数 = **用户实际配置的宽限期** + 余量。
+# 余量不是"多睡一会": 宽限期到点与收到 SIGKILL 撞在同一瞬间会让 cloudflared 来不及把
+# 最后一轮 in-flight 请求收尾。没配任何宽限期时才用官方默认 30s。
+_cf_grace_wait_seconds() {
+    local raw secs
+    raw=$(_cf_grace_config "$(_cf_unit_path)") || raw=""
+    if [ -n "$raw" ]; then
+        if ! secs=$(_cf_duration_seconds "$raw"); then
+            _warn "无法解析 service 中的宽限期 '$raw', 按官方默认 ${CF_GRACE_DEFAULT}s 处理"
+            secs="$CF_GRACE_DEFAULT"
+        fi
+    else
+        secs="$CF_GRACE_DEFAULT"
+    fi
+    # 病态配置(如 --grace-period 4h)不得把停止流程挂住数小时; systemd 自己的
+    # TimeoutStopSec 会先兜底。上限只影响强杀时点, 不影响干净停止(停完即返回)。
+    [ "$secs" -gt "$CF_GRACE_MAX" ] && secs="$CF_GRACE_MAX"
+    printf '%s' "$(( secs + CF_GRACE_MARGIN ))"
+}
+
+# ---------------------------------------------------------------------------
 # systemd unit 是否已进入"停止终态"。
 # **不得用 `systemctl is-active` 判"停完了没有"**: stop 进行中 unit 处于 deactivating,
 # 而 is-active 只认 active —— 它会**立刻**返回非 0, 于是等待形同不存在, 调用方紧接着就
@@ -913,6 +1003,9 @@ _cf_kill_all() {
     # 严格归属判定不可用(混装旧 lib)的标志: 此时我们**无法确认**任何进程的归属,
     # 进程状态未被确认清理, 最终必须 return 1 —— 不能对调用方谎报"已清理干净"。
     local _cf_strict_missing=0
+    # 允许升级到 SIGKILL 的时点 = 用户实际配置的宽限期 + 余量(见 _cf_grace_wait_seconds)。
+    # 只在需要等待时才解析一次; 干净停止的路径上它不产生任何等待。
+    local _cf_grace=""
 
     # 1. 按实际 init 系统走正确的 stop，并等待进程真正退出
     case "$INIT_SYSTEM" in
@@ -922,10 +1015,11 @@ _cf_kill_all() {
             # 请求发出后**必须按 ActiveState 等**, 不能拿 `is-active` 当"停完了"的判据 ——
             # stop 进行中 unit 处于 deactivating, 而 is-active 只认 active, 会**立刻**
             # 返回非 0 让等待形同不存在; 紧接着第 3 步的 SIGKILL 就会打断 cloudflared 的
-            # 优雅退出(官方 --grace-period 默认 30s), 硬断在途隧道请求。
+            # 优雅退出, 硬断在途隧道请求。
+            _cf_grace=$(_cf_grace_wait_seconds)
             systemctl --no-block stop cloudflared 2>/dev/null || true
-            _cf_wait_exit "$CF_STOP_GRACE" \
-                || _warn "cloudflared 在 ${CF_STOP_GRACE}s 内未进入停止终态, 转为按进程归属强制清理"
+            _cf_wait_exit "$_cf_grace" \
+                || _warn "cloudflared 在 ${_cf_grace}s 内未进入停止终态, 转为按进程归属强制清理"
             ;;
         openrc)
             rc-service cloudflared stop 2>/dev/null || true
@@ -974,7 +1068,7 @@ _cf_kill_all() {
     done
 
     # 3. 扫残留进程：先 SIGTERM（给 cloudflared 时间向 CF 边缘发送断开信号 + 完成优雅退出），
-    #    等到 CF_STOP_GRACE 仍存活才 SIGKILL。
+    #    等到宽限期仍存活才 SIGKILL。
     # R38(P2): 统一走 _cf_pids 家族, 不再用 pgrep/ps 两套逻辑。
     # 2026-09-20: 这里用 _cf_pids_owned(exe 限定到 $CF_BIN)而不是全机 comm 扫描 ——
     # 判活可以接受"把别人的隧道算成我们的", 杀进程不能(会 SIGKILL 掉用户自己装的
@@ -982,12 +1076,17 @@ _cf_kill_all() {
     # 2026-09-28 复审(P1): 这里原本固定等 3s 就 SIGKILL, 而 cloudflared 收到 SIGTERM 后要
     # 走官方 --grace-period(默认 30s)等**在途隧道请求**结束才退出 —— 3s 强杀会硬断正在
     # 处理的请求。改成等自然退出, 上限才是允许升级到 SIGKILL 的时点(停完即返回)。
+    # 2026-09-29 复审(P1): 上限本身也必须来自 service 的**实际配置**(_cf_grace_wait_seconds
+    # 读 --grace-period / TUNNEL_GRACE_PERIOD), 不能再写死一个数字: 用户配 60s 而我们 35s
+    # 强杀, 与 3s 强杀是同一个错误, 只是窗口大一点。
     pids=$(_cf_pids_owned)
     if [ -n "$pids" ]; then
+        # step 1 已经解析过一次; openrc 或 step 1 未走的路径在此补算(幂等且不产生等待)。
+        [ -n "$_cf_grace" ] || _cf_grace=$(_cf_grace_wait_seconds)
         for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
-        if ! _cf_wait_exit "$CF_STOP_GRACE"; then
+        if ! _cf_wait_exit "$_cf_grace"; then
             # 到这里才允许强杀: 优雅窗口已给足, 进程仍未退出。
-            _warn "cloudflared 残留进程在 ${CF_STOP_GRACE}s 内未退出, 发送 SIGKILL"
+            _warn "cloudflared 残留进程在 ${_cf_grace}s 内未退出, 发送 SIGKILL"
             pids=$(_cf_pids_owned)
             for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
             # SIGKILL 不可捕获, 退出是立即的; 只在实际仍扫到 PID 时才消耗这一秒。
@@ -996,6 +1095,18 @@ _cf_kill_all() {
                 [ -z "$(_cf_pids_owned)" ] && break
                 sleep 1; i=$((i+1))
             done
+            # 2026-09-29 复审(P2): 进程消失 **不等于** unit 已停止。官方 unit 是
+            # `Restart=on-failure`, 而 SIGKILL 的退出信号正是 failure —— systemd 可能已经
+            # 排好了重启 job, 也可能仍有 stop job 在收尾 cgroup(此时 MainPID 已为 0 但
+            # ActiveState 仍是 deactivating)。若就这样返回 0, _cf_restart 会在 2s 后
+            # `systemctl start`, 与尚未结束的 stop/restart job 竞争, 出现"刚杀完又被拉起"
+            # 或 start 被 job 合并丢弃。按 _hysteria_stop_and_verify 的既有做法
+            # (lib/55-hysteria.sh:3971): **再 stop 一次**, 然后才复核终态, 顺序不可交换。
+            if [ "$INIT_SYSTEM" = systemd ]; then
+                systemctl --no-block stop cloudflared 2>/dev/null || true
+                _cf_wait_exit "$CF_STOP_REVERIFY" \
+                    || _warn "SIGKILL 后 systemd 未在 ${CF_STOP_REVERIFY}s 内进入停止终态"
+            fi
         fi
     fi
 
