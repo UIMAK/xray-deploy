@@ -428,6 +428,92 @@ else
     fail 'cloudflared grace deadline reads --grace-period and TUNNEL_GRACE_PERIOD'
 fi
 
+# systemd applies its own quoting rules to ExecStart= before handing words to the process, so
+# `--grace-period "60s"` really means 60s. read -ra does NOT unquote; the literal would arrive
+# as `"60s"`, _cf_duration_seconds would reject it and the deadline would silently fall back to
+# the 30s default -- the very "configured 60s, killed at 35s" bug this change exists to fix.
+# Negative control: stripping quotes only from the whole word (or not at all) breaks the
+# inline forms, whose quotes sit *around the value*, not around the argument.
+if (
+    CF_Q_SPACED="$TMP/cf-grace-q-spaced.service"
+    CF_Q_SPACED_S="$TMP/cf-grace-q-spaced-s.service"
+    CF_Q_INLINE="$TMP/cf-grace-q-inline.service"
+    CF_Q_INLINE_S="$TMP/cf-grace-q-inline-s.service"
+    CF_Q_OPENRC="$TMP/cf-grace-q-openrc.conf"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period "60s" run --token x\n' > "$CF_Q_SPACED"
+    printf "[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period '60s' run --token x\n" > "$CF_Q_SPACED_S"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period="60s" run --token x\n' > "$CF_Q_INLINE"
+    printf "[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period='60s' run --token x\n" > "$CF_Q_INLINE_S"
+    printf 'command_args="--grace-period 60s run --token x"\n' > "$CF_Q_OPENRC"
+    _cf_unit_path() { printf '%s' "$CF_Q_SPACED"; };   a=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_Q_SPACED_S"; }; b=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_Q_INLINE"; };   c=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_Q_INLINE_S"; }; d=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_Q_OPENRC"; };   e=$(_cf_grace_wait_seconds)
+    [ "$a" -eq 65 ] && [ "$b" -eq 65 ] && [ "$c" -eq 65 ] && [ "$d" -eq 65 ] && [ "$e" -eq 65 ]
+); then
+    pass 'cloudflared grace deadline unquotes systemd and openrc arguments'
+else
+    fail 'cloudflared grace deadline unquotes systemd and openrc arguments'
+fi
+
+# systemd also feeds variables in from EnvironmentFile=, so TUNNEL_GRACE_PERIOD may live in
+# /etc/default/cloudflared rather than in the unit. Scanning only the unit text would report
+# "not configured" and fall back to the 30s default. A `-` prefix means "missing file is fine".
+if (
+    CF_EF_UNIT="$TMP/cf-grace-ef.service"
+    CF_EF_UNIT_ARGS="$TMP/cf-grace-ef-args.service"
+    CF_EF_UNIT_DASH="$TMP/cf-grace-ef-dash.service"
+    CF_EF_FILE="$TMP/cf-grace-ef.env"
+    printf 'TUNNEL_GRACE_PERIOD=75s\n' > "$CF_EF_FILE"
+    printf '[Service]\nEnvironmentFile=%s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE" > "$CF_EF_UNIT"
+    printf '[Service]\nEnvironmentFile=-%s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE.nope" > "$CF_EF_UNIT_DASH"
+    printf '[Service]\nEnvironmentFile="%s"\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE" > "$CF_EF_UNIT_ARGS"
+    _cf_unit_path() { printf '%s' "$CF_EF_UNIT"; };      a=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_EF_UNIT_ARGS"; }; b=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_EF_UNIT_DASH"; }; c=$(_cf_grace_wait_seconds)
+    [ "$a" -eq 80 ] && [ "$b" -eq 80 ] && [ "$c" -eq "$(( CF_GRACE_DEFAULT + CF_GRACE_MARGIN ))" ]
+); then
+    pass 'cloudflared grace deadline follows EnvironmentFile when the unit uses one'
+else
+    fail 'cloudflared grace deadline follows EnvironmentFile when the unit uses one'
+fi
+
+# Go time.Duration accepts ns/us/µs and the contract here is round-UP-to-seconds, so a
+# sub-millisecond value must not collapse to 0s. Bare "0" is a valid Go duration
+# (ParseDuration special-cases it) meaning "do not wait for in-flight requests"; unrecognised
+# literals still have to be rejected so the caller falls back to the official default.
+if (
+    [ "$(_cf_duration_seconds 500us)"  -eq 1 ] \
+        && [ "$(_cf_duration_seconds 999us)"  -eq 1 ] \
+        && [ "$(_cf_duration_seconds 1ns)"    -eq 1 ] \
+        && [ "$(_cf_duration_seconds 999ns)"  -eq 1 ] \
+        && [ "$(_cf_duration_seconds 1500us)" -eq 1 ] \
+        && [ "$(_cf_duration_seconds 1.5s)"   -eq 2 ] \
+        && [ "$(_cf_duration_seconds 2s1ns)"  -eq 3 ] \
+        && [ "$(_cf_duration_seconds 1m500us)" -eq 61 ] \
+        && [ "$(_cf_duration_seconds 0)"      -eq 0 ] \
+        && ! _cf_duration_seconds '30' >/dev/null 2>&1
+); then
+    pass 'cloudflared grace duration parser rounds sub-second units up'
+else
+    fail 'cloudflared grace duration parser rounds sub-second units up'
+fi
+
+# `--grace-period 0` means "shut down without waiting for in-flight requests", so it must be
+# parsed as 0 rather than rejected (which would fall back to 30s). The margin stays as the
+# SIGTERM->SIGKILL escalation ceiling: the process still has to deregister its connector.
+if (
+    CF_ZERO_UNIT="$TMP/cf-grace-zero.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 0 run --token x\n' > "$CF_ZERO_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_ZERO_UNIT"; }
+    [ "$(_cf_grace_wait_seconds)" -eq "$CF_GRACE_MARGIN" ]
+); then
+    pass 'cloudflared grace-period 0 keeps only the escalation margin'
+else
+    fail 'cloudflared grace-period 0 keeps only the escalation margin'
+fi
+
 # A pathological value (e.g. a hand-written `--grace-period 4h`) must not stall a stop for
 # hours; systemd's own TimeoutStopSec is the real backstop.
 if (

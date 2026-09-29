@@ -26,7 +26,7 @@ CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 安装时的 token
 # 返回, 不是固定等待。
 CF_GRACE_DEFAULT=30    # 官方 --grace-period 默认值
 CF_GRACE_MARGIN=5      # 余量: 不在宽限期到点的同一瞬间强杀
-CF_GRACE_MAX=300       # 上限: 防病态配置(如 --grace-period 4h)把停止流程挂住数小时
+CF_GRACE_MAX=300       # 上限: 防病态配置(cloudflared 自身只接受 <=3 分钟, 4h 只可能是手写错误)
 CF_STOP_REVERIFY=5     # 强杀后复验 systemd 停止终态的上界(进程已死, 只剩 unit 事务)
 
 # ---------------------------------------------------------------------------
@@ -867,6 +867,33 @@ _cf_exe_owned() {
 }
 
 # ---------------------------------------------------------------------------
+# 剥掉值两端的引号(systemd 的 `ExecStart=`/`Environment=` 都支持引号, 传给进程前会去掉)。
+# read -ra 只按空白切词、**不做任何引号处理**, 所以必须自己剥:
+#   --grace-period "60s"   -> 词是 `"60s"`    (成对)
+#   --grace-period="60s"   -> 词是 `"60s"`
+#   Environment="V=90s"    -> 词是 `90s"`     (只有尾引号, 首引号在 `Environment="` 里)
+#   command_args="--grace-period 60s" -> 词是 `"--grace-period` / `60s"` (openrc)
+# 两端**各自独立**剥(不做成对匹配), 上面前三种形态才能统一处理。值里出现引号只可能是
+# 配置本身有误, 剥掉即可。
+# ---------------------------------------------------------------------------
+_cf_strip_quotes() {
+    local w="$1"
+    while :; do
+        case "$w" in \"*|\'*) w="${w#?}" ;; *) break ;; esac
+    done
+    while :; do
+        case "$w" in *\"|*\') w="${w%?}" ;; *) break ;; esac
+    done
+    printf '%s' "$w"
+}
+
+# 去掉行首空白(systemd 允许缩进, 缩进的 `#` 仍是注释)。
+_cf_ltrim() {
+    local s="$1"
+    printf '%s' "${s#"${s%%[![:space:]]*}"}"
+}
+
+# ---------------------------------------------------------------------------
 # 用户实际配置的优雅退出宽限期(原始字面量, 如 `60s` / `2m`)。
 # cloudflared 支持 `--grace-period <PERIOD>` 与 `TUNNEL_GRACE_PERIOD` 覆盖官方默认 30s,
 # 两者都写在 service 文件里 —— 脚本必须读它, **不能写死一个数字**: 用户配了 60s 而脚本
@@ -875,60 +902,115 @@ _cf_exe_owned() {
 # 默认值, 显式 flag 覆盖它)。输出非空 = 用户配过; 空/rc 1 = 没配, 由调用方用官方默认值。
 # ---------------------------------------------------------------------------
 _cf_grace_config() {
-    local svcfile="$1" ln arr=() i w v
+    local svcfile="$1" ln arr=() i w v efpath efv
     [ -f "$svcfile" ] || return 1
-    # 1. 启动行里的 --grace-period <PERIOD> / --grace-period=<PERIOD>(优先)
+    # 1. 启动行里的 --grace-period <PERIOD> / --grace-period=<PERIOD>(优先)。
+    #    先按 _cf_is_cmd_line 过滤, 注释行 / ExecStop= 行里的 --grace-period 不算生效配置。
     while IFS= read -r ln || [ -n "$ln" ]; do
         _cf_is_cmd_line "$ln" || continue
+        ln=$(_cf_ltrim "$ln")
+        # openrc 的 `command_args="--grace-period 60s run"`、systemd 的 `ExecStart=…`: 字段前缀
+        # 会粘在第一个词上, 先摘掉, 后面的引号处理才能统一。
+        case "$ln" in
+            ExecStart=*|command_args=*|cmd=*|command=*) ln="${ln#*=}" ;;
+        esac
         arr=(); read -ra arr <<< "$ln"
         for ((i=0; i<${#arr[@]}; i++)); do
-            w="${arr[$i]}"
+            w=$(_cf_strip_quotes "${arr[$i]}")
             case "$w" in
-                --grace-period=*) printf '%s' "${w#--grace-period=}"; return 0 ;;
+                --grace-period=*) _cf_strip_quotes "${w#--grace-period=}"; return 0 ;;
                 --grace-period)
-                    [ "$((i+1))" -lt "${#arr[@]}" ] && { printf '%s' "${arr[$((i+1))]}"; return 0; } ;;
+                    if [ "$((i+1))" -lt "${#arr[@]}" ]; then
+                        v=$(_cf_strip_quotes "${arr[$((i+1))]}")
+                        [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+                    fi ;;
             esac
         done
     done < "$svcfile"
     # 2. 环境变量: systemd `Environment=TUNNEL_GRACE_PERIOD=60s`(可带引号), openrc 的
     #    `export TUNNEL_GRACE_PERIOD=60s`。这些行不是启动行(_cf_is_cmd_line 认不出), 故单独扫。
     while IFS= read -r ln || [ -n "$ln" ]; do
+        ln=$(_cf_ltrim "$ln")
         case "$ln" in '#'*|'') continue ;; esac
         v="${ln#*TUNNEL_GRACE_PERIOD=}"
         [ "$v" != "$ln" ] || continue
         v="${v%%[[:space:]]*}"      # 值到引号/空白为止
-        v="${v%\"}"; v="${v#\"}"    # 两种引号形态都剥掉
+        v=$(_cf_strip_quotes "$v")
         [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    done < "$svcfile"
+    # 3. systemd `EnvironmentFile=<path>`(前缀 `-` 表示文件缺失不算错): 变量是 PID 1 从该
+    #    文件读入再传给进程的, 只扫 unit 文本会漏掉 —— 把 TUNNEL_GRACE_PERIOD 写在
+    #    /etc/default/cloudflared 里是完全正常的形态。通配路径不展开(YAGNI: 极少见,
+    #    展开错了反而会把不生效的值当成生效配置)。
+    while IFS= read -r ln || [ -n "$ln" ]; do
+        ln=$(_cf_ltrim "$ln")
+        case "$ln" in '#'*|'') continue ;; esac
+        case "$ln" in EnvironmentFile=*) efpath="${ln#EnvironmentFile=}" ;; *) continue ;; esac
+        efpath=$(_cf_strip_quotes "$efpath")
+        efpath=$(_cf_ltrim "$efpath")
+        efpath="${efpath%"${efpath##*[![:space:]]}"}"
+        case "$efpath" in -*) efpath="${efpath#-}" ;; esac
+        case "$efpath" in ''|*'*'*|*'?'*|*'['*) continue ;; esac
+        [ -f "$efpath" ] || continue
+        while IFS= read -r efv || [ -n "$efv" ]; do
+            efv=$(_cf_ltrim "$efv")
+            case "$efv" in '#'*|'') continue ;; esac
+            v="${efv#*TUNNEL_GRACE_PERIOD=}"
+            [ "$v" != "$efv" ] || continue
+            v="${v%%[[:space:]]*}"
+            v=$(_cf_strip_quotes "$v")
+            [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+        done < "$efpath"
     done < "$svcfile"
     return 1
 }
 
-# Go 时长字面量("30s" / "1m30s" / "500ms") -> 向上取整的秒数。纯 bash 整数运算:
+# Go 时长字面量("30s" / "1m30s" / "500ms" / "1.5m") -> 向上取整的秒数。纯 bash 整数运算:
 # 目标机可能是 busybox(无 bc), 且这里不能依赖 GNU date 的 -d 解析。
+# 累加单位是**纳秒**: 官方 flag 是 Go time.Duration, ns/us/µs 都是合法单位, 用毫秒累加会把
+# 500us 这类不足 1ms 的值算成 0s, 而这里的契约是"向上取整"—— 非零时长至少 1 秒。
 _cf_duration_seconds() {
-    local rest="$1" total_ms=0 int frac unit ms scale div
+    local rest="$1" total_ns=0 int frac unit ns=0 scale div nonzero=0
     [ -n "$rest" ] || return 1
+    # Go 的 ParseDuration 特例: 裸 "0" 是合法时长(无单位), cloudflared 用它表示"不为在途
+    # 请求等待"(waitToShutdown 里 `if gracePeriod > 0` 才起 ticker)。不认它就会解析失败并
+    # 回退到默认 30s, 白白多等并打出一条误导性的告警。
+    case "$rest" in 0) printf '0'; return 0 ;; esac
     while [ -n "$rest" ]; do
         [[ "$rest" =~ ^([0-9]+)(\.([0-9]+))?(ns|us|µs|ms|s|m|h)(.*)$ ]] || return 1
         int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"
         unit="${BASH_REMATCH[4]}"; rest="${BASH_REMATCH[5]}"
+        # 位数上限: 纳秒累加必须留在 bash 的 64 位整数里(999999h 已是 3.6e18ns)。
+        # Go 自己的 ParseDuration 对溢出同样报错, 这里也判非法 -> 回退默认值。
+        [ "${#int}" -le 6 ] || return 1
         case "$unit" in
-            ns|us|µs) ms=0 ;;
-            ms) ms=1 ;;
-            s)  ms=1000 ;;
-            m)  ms=60000 ;;
-            h)  ms=3600000 ;;
+            ns)    ns=1 ;;
+            us|µs) ns=1000 ;;
+            ms)    ns=1000000 ;;
+            s)     ns=1000000000 ;;
+            m)     ns=60000000000 ;;
+            h)     ns=3600000000000 ;;
         esac
-        total_ms=$(( total_ms + 10#$int * ms ))
-        if [ -n "$frac" ] && [ "$ms" -gt 0 ]; then
-            # 小数部分按千分之一为最小精度(毫秒级足够, 上限是给 SIGKILL 的时点)
+        case "$int" in *[!0]*) nonzero=1 ;; esac
+        total_ns=$(( total_ns + 10#$int * ns ))
+        if [ -n "$frac" ]; then
+            case "$frac" in *[!0]*) nonzero=1 ;; esac
             scale="${#frac}"
-            [ "$scale" -gt 3 ] && { frac="${frac:0:3}"; scale=3; }
-            case "$scale" in 1) div=10 ;; 2) div=100 ;; *) div=1000 ;; esac
-            total_ms=$(( total_ms + 10#$frac * ms / div ))
+            [ "$scale" -gt 9 ] && { frac="${frac:0:9}"; scale=9; }
+            case "$scale" in
+                1) div=10 ;; 2) div=100 ;; 3) div=1000 ;; 4) div=10000 ;;
+                5) div=100000 ;; 6) div=1000000 ;; 7) div=10000000 ;;
+                8) div=100000000 ;; *) div=1000000000 ;;
+            esac
+            total_ns=$(( total_ns + 10#$frac * ns / div ))
         fi
     done
-    printf '%s' "$(( (total_ms + 999) / 1000 ))"
+    # 溢出(字面量里有多段天量单位)会绕成负数: 必须判非法, 否则会算出一个远小于配置的秒数,
+    # 又回到"提前 SIGKILL"。
+    [ "$total_ns" -lt 0 ] && return 1
+    # 非零但不足 1 秒(含被整数除法吃掉的不足 1ns 部分) -> 至少 1 秒, 与"向上取整"一致。
+    [ "$total_ns" -eq 0 ] && [ "$nonzero" -eq 1 ] && total_ns=1
+    printf '%s' "$(( (total_ns + 999999999) / 1000000000 ))"
 }
 
 # 允许升级到 SIGKILL 之前应当等待的秒数 = **用户实际配置的宽限期** + 余量。
@@ -945,9 +1027,12 @@ _cf_grace_wait_seconds() {
     else
         secs="$CF_GRACE_DEFAULT"
     fi
-    # 病态配置(如 --grace-period 4h)不得把停止流程挂住数小时; systemd 自己的
-    # TimeoutStopSec 会先兜底。上限只影响强杀时点, 不影响干净停止(停完即返回)。
+    # 病态配置不得把停止流程挂住数小时; cloudflared 自身只接受 <=3 分钟
+    # (connection.MaxGracePeriod), 这里再留一道保险。上限只影响强杀时点。
     [ "$secs" -gt "$CF_GRACE_MAX" ] && secs="$CF_GRACE_MAX"
+    # 余量对**任何**配置都成立, 包括 --grace-period 0: 0 的语义是"不为在途请求等待", 不是
+    # "收到 SIGTERM 就立刻 SIGKILL" —— 进程仍需要时间处理信号并注销 connector, 余量是
+    # SIGTERM→SIGKILL 的**最小间隔下界**; 它是上界而不是固定等待, 进程一退出即返回。
     printf '%s' "$(( secs + CF_GRACE_MARGIN ))"
 }
 
