@@ -386,28 +386,105 @@ else
     fail 'cloudflared clean restart skips fixed post-start delay'
 fi
 
-# systemd stop must be asynchronous; _cf_kill_all still performs its own bounded verification.
+# The graceful window must cover cloudflared's own --grace-period default (30s), otherwise
+# the stop path would SIGKILL a process that is still draining in-flight tunnel requests.
+check 'cloudflared stop grace window covers the 30s graceful shutdown default' \
+    test "$CF_STOP_GRACE" -ge 30
+
+# systemd stop must be asynchronous, and the wait must key on ActiveState. `is-active`
+# reports "deactivating" as stopped, so it cannot answer "has the stop finished".
 if (
     INIT_SYSTEM=systemd
-    CF_UNIT_SYSTEMD="$TMP/cloudflared-stop.service"
     CF_STOP_SENTINEL="$TMP/cf-stop-request"
     rm() { :; }
-    _cf_unit_path() { printf '%s' "$CF_UNIT_SYSTEMD"; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-stop.service"; }
     _cf_service_bin() { printf '%s' "$CF_BIN"; }
     _cf_pids() { :; }
     _cf_pids_owned() { :; }
     systemctl() {
         printf '%s\n' "$*" >> "$CF_STOP_SENTINEL"
-        [ "$*" = '--no-block stop cloudflared' ] && return 0
-        [ "$*" = 'is-active --quiet cloudflared' ] && return 1
-        return 1
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+        esac
+        return 0
     }
-    _cf_kill_all >/dev/null 2>&1 \
-        && [ "$(head -n 1 "$CF_STOP_SENTINEL")" = '--no-block stop cloudflared' ]
+    _cf_kill_all >/dev/null 2>&1
+    calls=$(cat "$CF_STOP_SENTINEL" 2>/dev/null)
+    [ "$(head -n 1 "$CF_STOP_SENTINEL")" = '--no-block stop cloudflared' ] \
+        && contains 'show -p ActiveState --value cloudflared' "$calls" \
+        && ! contains 'is-active' "$calls"
 ); then
-    pass 'cloudflared systemd stop request is nonblocking'
+    pass 'cloudflared systemd stop is nonblocking and waits on ActiveState'
 else
-    fail 'cloudflared systemd stop request is nonblocking'
+    fail 'cloudflared systemd stop is nonblocking and waits on ActiveState'
+fi
+
+# A unit that is still deactivating must be waited out, and the graceful shutdown must not
+# be cut short by a signal while it drains. Negative control: an `is-active`-based wait sees
+# "deactivating" as stopped, proceeds instantly, and SIGTERMs the still-draining process.
+if (
+    INIT_SYSTEM=systemd
+    CF_POLLS="$TMP/cf-deact-polls"
+    CF_SLEEPS="$TMP/cf-deact-sleeps"
+    CF_SIGNALS="$TMP/cf-deact-signals"
+    : > "$CF_POLLS"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-deact.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() {
+        printf 'poll\n' >> "$CF_POLLS"
+        [ "$(wc -l < "$CF_POLLS")" -le 2 ] && printf '4242\n'
+        return 0
+    }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared')
+                if [ "$(wc -l < "$CF_POLLS")" -ge 3 ]; then printf 'inactive\n'; else printf 'deactivating\n'; fi ;;
+            'show -p MainPID --value cloudflared')
+                if [ "$(wc -l < "$CF_POLLS")" -ge 3 ]; then printf '0\n'; else printf '4242\n'; fi ;;
+        esac
+        return 0
+    }
+    kill() { printf '%s\n' "$1" >> "$CF_SIGNALS"; return 0; }
+    sleep() { printf '1\n' >> "$CF_SLEEPS"; }
+    _cf_kill_all >/dev/null 2>&1
+    [ "$(wc -l < "$CF_SLEEPS")" -eq 2 ] && [ ! -s "$CF_SIGNALS" ]
+); then
+    pass 'cloudflared stop waits through deactivating without signalling'
+else
+    fail 'cloudflared stop waits through deactivating without signalling'
+fi
+
+# SIGKILL is a last resort: it must only fire after cloudflared's graceful window elapsed,
+# and SIGTERM must come first. Negative control: the old fixed 3s window kills far too early.
+if (
+    INIT_SYSTEM=systemd
+    CF_EVENTS="$TMP/cf-grace-events"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-grace.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { printf '4242\n'; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
+            'show -p MainPID --value cloudflared')     printf '4242\n' ;;
+        esac
+        return 0
+    }
+    kill() { printf 'kill %s\n' "$1" >> "$CF_EVENTS"; return 0; }
+    sleep() { printf 'sleep\n' >> "$CF_EVENTS"; }
+    _cf_kill_all >/dev/null 2>&1
+    sleeps_before_sigkill=$(awk '/^kill -9$/ { print n; exit } /^sleep$/ { n++ }' "$CF_EVENTS")
+    [ -n "$sleeps_before_sigkill" ] \
+        && [ "$sleeps_before_sigkill" -ge "$CF_STOP_GRACE" ] \
+        && [ "$(grep -m1 '^kill' "$CF_EVENTS")" = 'kill -15' ]
+); then
+    pass 'cloudflared SIGKILL only after the graceful window, SIGTERM first'
+else
+    fail 'cloudflared SIGKILL only after the graceful window, SIGTERM first'
 fi
 
 # The OpenRC stop path must not pay a blind fixed delay either: the owned-process
