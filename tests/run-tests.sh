@@ -849,6 +849,72 @@ else
     fail 'cloudflared kill-all refuses to claim cleanup when the unit state is unreadable'
 fi
 
+# The mirror image of the previous case: here the unit state IS readable, and it says the stop
+# has NOT finished. systemd reaps the main process first (MainPID=0) and then keeps running
+# ExecStop/ExecStopPost and cgroup teardown, so the unit stays `deactivating` while ZERO
+# cloudflared processes exist. Step 3 is guarded by `[ -n "$pids" ]`, so that entire branch is
+# skipped; before the fix every remaining check then passed and the function reported
+# "所有进程已清理" (rc 0) although the stop transaction was still open — and `_cf_restart`
+# `systemctl start`s 2s later, racing that job.
+# Reproduced on real systemd (slow ExecStopPost): pids_owned=[] , _cf_unit_stopped=1 ,
+# _cf_wait_exit=1 , _cf_kill_all=0 while ActiveState was still deactivating.
+# Negative control: removing the final re-verification block makes this return 0.
+if (
+    INIT_SYSTEM=systemd
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-transition.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { :; }            # every process is already gone
+    _cf_grace_wait_seconds() { printf '%s' 2; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+        esac
+        return 0
+    }
+    sleep() { :; }
+    _cf_kill_all >/dev/null 2>&1
+    [ "$?" -ne 0 ]
+); then
+    pass 'cloudflared kill-all refuses to claim cleanup while the unit is still deactivating'
+else
+    fail 'cloudflared kill-all refuses to claim cleanup while the unit is still deactivating'
+fi
+
+# A stop that timed out in step 1 but then converged must still succeed: the final re-verify
+# has to re-read the state rather than reuse step 1's verdict. Here the unit is deactivating
+# while processes are alive (step 1 times out), then goes inactive after the SIGTERM.
+# A fix that simply propagated step 1's rc=1 would fail this and block every normal restart.
+if (
+    INIT_SYSTEM=systemd
+    CF_CONVERGE_LOG="$TMP/cf-converge-log"
+    rm() { :; }
+    : > "$CF_CONVERGE_LOG"
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-converge.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { grep -q 'kill -15' "$CF_CONVERGE_LOG" || printf '4242\n'; }
+    _cf_grace_wait_seconds() { printf '%s' 2; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared')
+                if grep -q 'kill -15' "$CF_CONVERGE_LOG"; then printf 'inactive\n'; else printf 'deactivating\n'; fi ;;
+            'show -p MainPID --value cloudflared')
+                if grep -q 'kill -15' "$CF_CONVERGE_LOG"; then printf '0\n'; else printf '4242\n'; fi ;;
+        esac
+        return 0
+    }
+    kill() { printf 'kill %s\n' "$1" >> "$CF_CONVERGE_LOG"; return 0; }
+    sleep() { :; }
+    _cf_kill_all >/dev/null 2>&1
+); then
+    pass 'cloudflared stop that converges after the graceful signal still reports success'
+else
+    fail 'cloudflared stop that converges after the graceful signal still reports success'
+fi
+
 # The OpenRC stop path must not pay a blind fixed delay either: the owned-process
 # cleanup below already confirms that nothing survived the stop request.
 if (
