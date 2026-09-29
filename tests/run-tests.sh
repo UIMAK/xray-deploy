@@ -368,6 +368,92 @@ else
     fail 'cloudflared restart fails closed on cleanup error'
 fi
 
+# A clean cloudflared start should not pay the old fixed 3-second post-start delay.
+if (
+    CF_START_SENTINEL="$TMP/cf-fast-start"
+    CF_SLEEP_SENTINEL="$TMP/cf-fast-sleeps"
+    INIT_SYSTEM=systemd
+    _cf_kill_all() { return 0; }
+    _cf_is_managed_running() { return 0; }
+    systemctl() { [ "$1" = start ] && printf 'start\n' >> "$CF_START_SENTINEL"; }
+    sleep() { printf '%s\n' "$1" >> "$CF_SLEEP_SENTINEL"; }
+    _cf_restart >/dev/null 2>&1 && [ "$(cat "$CF_START_SENTINEL")" = start ] \
+        && [ "$(wc -l < "$CF_SLEEP_SENTINEL")" -eq 1 ] \
+        && [ "$(cat "$CF_SLEEP_SENTINEL")" = 2 ]
+); then
+    pass 'cloudflared clean restart skips fixed post-start delay'
+else
+    fail 'cloudflared clean restart skips fixed post-start delay'
+fi
+
+# systemd stop must be asynchronous; _cf_kill_all still performs its own bounded verification.
+if (
+    INIT_SYSTEM=systemd
+    CF_UNIT_SYSTEMD="$TMP/cloudflared-stop.service"
+    CF_STOP_SENTINEL="$TMP/cf-stop-request"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$CF_UNIT_SYSTEMD"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { :; }
+    systemctl() {
+        printf '%s\n' "$*" >> "$CF_STOP_SENTINEL"
+        [ "$*" = '--no-block stop cloudflared' ] && return 0
+        [ "$*" = 'is-active --quiet cloudflared' ] && return 1
+        return 1
+    }
+    _cf_kill_all >/dev/null 2>&1 \
+        && [ "$(head -n 1 "$CF_STOP_SENTINEL")" = '--no-block stop cloudflared' ]
+); then
+    pass 'cloudflared systemd stop request is nonblocking'
+else
+    fail 'cloudflared systemd stop request is nonblocking'
+fi
+
+# The OpenRC stop path must not pay a blind fixed delay either: the owned-process
+# cleanup below already confirms that nothing survived the stop request.
+if (
+    INIT_SYSTEM=openrc
+    CF_OPENRC_SLEEPS="$TMP/cf-openrc-sleeps"
+    CF_OPENRC_STOPPED="$TMP/cf-openrc-stopped"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-openrc.conf"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids_owned() { :; }
+    _cf_pids() { :; }
+    rc-service() { printf '%s\n' "$*" >> "$CF_OPENRC_STOPPED"; }
+    sleep() { printf '%s\n' "$1" >> "$CF_OPENRC_SLEEPS"; }
+    _cf_kill_all >/dev/null 2>&1 \
+        && [ "$(cat "$CF_OPENRC_STOPPED")" = 'cloudflared stop' ] \
+        && [ ! -s "$CF_OPENRC_SLEEPS" ]
+); then
+    pass 'cloudflared openrc stop skips fixed wait when already clean'
+else
+    fail 'cloudflared openrc stop skips fixed wait when already clean'
+fi
+
+# A delayed init-system start waits for readiness, not a blind fixed delay.
+if (
+    CF_SLEEP_SENTINEL="$TMP/cf-delayed-sleeps"
+    CF_READY_COUNT="$TMP/cf-ready-count"
+    INIT_SYSTEM=systemd
+    : > "$CF_READY_COUNT"
+    _cf_kill_all() { return 0; }
+    _cf_is_managed_running() {
+        local n; n=$(wc -l < "$CF_READY_COUNT"); n=$((n+1)); printf '%s\n' "$n" >> "$CF_READY_COUNT"
+        [ "$n" -ge 2 ]
+    }
+    systemctl() { [ "$1" = start ]; }
+    sleep() { printf '%s\n' "$1" >> "$CF_SLEEP_SENTINEL"; }
+    _cf_restart >/dev/null 2>&1 \
+        && [ "$(wc -l < "$CF_SLEEP_SENTINEL")" -eq 2 ] \
+        && [ "$(tail -n 1 "$CF_SLEEP_SENTINEL")" = 1 ]
+); then
+    pass 'cloudflared restart polls delayed service readiness'
+else
+    fail 'cloudflared restart polls delayed service readiness'
+fi
+
 # Without an authoritative liveness helper, stop is not proof of exit.
 if (
     XRAY_STOP_SENTINEL="$TMP/xray-stop-called"
