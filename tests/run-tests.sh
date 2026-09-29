@@ -368,6 +368,833 @@ else
     fail 'cloudflared restart fails closed on cleanup error'
 fi
 
+# A clean cloudflared start should not pay the old fixed 3-second post-start delay.
+if (
+    CF_START_SENTINEL="$TMP/cf-fast-start"
+    CF_SLEEP_SENTINEL="$TMP/cf-fast-sleeps"
+    INIT_SYSTEM=systemd
+    _cf_kill_all() { return 0; }
+    _cf_is_managed_running() { return 0; }
+    systemctl() { [ "$1" = start ] && printf 'start\n' >> "$CF_START_SENTINEL"; }
+    sleep() { printf '%s\n' "$1" >> "$CF_SLEEP_SENTINEL"; }
+    _cf_restart >/dev/null 2>&1 && [ "$(cat "$CF_START_SENTINEL")" = start ] \
+        && [ "$(wc -l < "$CF_SLEEP_SENTINEL")" -eq 1 ] \
+        && [ "$(cat "$CF_SLEEP_SENTINEL")" = 2 ]
+); then
+    pass 'cloudflared clean restart skips fixed post-start delay'
+else
+    fail 'cloudflared clean restart skips fixed post-start delay'
+fi
+
+# The SIGKILL deadline is not a hardcoded number: it must come from the grace period the
+# service actually runs with, because a unit may carry `--grace-period 60s` (or
+# TUNNEL_GRACE_PERIOD) and SIGKILLing at a constant 35s cuts a still-draining tunnel short --
+# the same bug as the original 3s window, only wider.
+# The wait is an upper bound: a clean stop returns as soon as the unit is terminal.
+if (
+    CF_CFG_DEFAULT="$TMP/cf-grace-default.service"
+    : > "$CF_CFG_DEFAULT"
+    _cf_unit_path() { printf '%s' "$CF_CFG_DEFAULT"; }
+    got=$(_cf_grace_wait_seconds)
+    [ "$got" -eq "$(( CF_GRACE_DEFAULT + CF_GRACE_MARGIN ))" ]
+); then
+    pass 'cloudflared stop deadline follows the configured grace period, default 30s'
+else
+    fail 'cloudflared stop deadline follows the configured grace period, default 30s'
+fi
+
+if (
+    CF_CFG_SPACED="$TMP/cf-grace-spaced.service"
+    CF_CFG_INLINE="$TMP/cf-grace-inline.service"
+    CF_CFG_ENV="$TMP/cf-grace-env.service"
+    CF_CFG_COMMENT="$TMP/cf-grace-comment.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 60s run --token x\n' > "$CF_CFG_SPACED"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period=45s run --token x\n' > "$CF_CFG_INLINE"
+    printf '[Service]\nEnvironment="TUNNEL_GRACE_PERIOD=90s"\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' > "$CF_CFG_ENV"
+    printf '[Service]\n# ExecStart=/usr/local/bin/cloudflared tunnel --grace-period 600s run --token x\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' > "$CF_CFG_COMMENT"
+    _cf_unit_path() { printf '%s' "$CF_CFG_SPACED"; }
+    a=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_CFG_INLINE"; }
+    b=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_CFG_ENV"; }
+    c=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_CFG_COMMENT"; }
+    d=$(_cf_grace_wait_seconds)
+    [ "$a" -eq 65 ] && [ "$b" -eq 50 ] && [ "$c" -eq 95 ] \
+        && [ "$d" -eq "$(( CF_GRACE_DEFAULT + CF_GRACE_MARGIN ))" ]
+); then
+    pass 'cloudflared grace deadline reads --grace-period and TUNNEL_GRACE_PERIOD'
+else
+    fail 'cloudflared grace deadline reads --grace-period and TUNNEL_GRACE_PERIOD'
+fi
+
+# systemd applies its own quoting rules to ExecStart= before handing words to the process, so
+# `--grace-period "60s"` really means 60s. read -ra does NOT unquote; the literal would arrive
+# as `"60s"`, _cf_duration_seconds would reject it and the deadline would silently fall back to
+# the 30s default -- the very "configured 60s, killed at 35s" bug this change exists to fix.
+# Negative control: stripping quotes only from the whole word (or not at all) breaks the
+# inline forms, whose quotes sit *around the value*, not around the argument.
+if (
+    CF_Q_SPACED="$TMP/cf-grace-q-spaced.service"
+    CF_Q_SPACED_S="$TMP/cf-grace-q-spaced-s.service"
+    CF_Q_INLINE="$TMP/cf-grace-q-inline.service"
+    CF_Q_INLINE_S="$TMP/cf-grace-q-inline-s.service"
+    CF_Q_OPENRC="$TMP/cf-grace-q-openrc.conf"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period "60s" run --token x\n' > "$CF_Q_SPACED"
+    printf "[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period '60s' run --token x\n" > "$CF_Q_SPACED_S"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period="60s" run --token x\n' > "$CF_Q_INLINE"
+    printf "[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period='60s' run --token x\n" > "$CF_Q_INLINE_S"
+    printf 'command_args="--grace-period 60s run --token x"\n' > "$CF_Q_OPENRC"
+    _cf_unit_path() { printf '%s' "$CF_Q_SPACED"; };   a=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_Q_SPACED_S"; }; b=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_Q_INLINE"; };   c=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_Q_INLINE_S"; }; d=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_Q_OPENRC"; };   e=$(_cf_grace_wait_seconds)
+    [ "$a" -eq 65 ] && [ "$b" -eq 65 ] && [ "$c" -eq 65 ] && [ "$d" -eq 65 ] && [ "$e" -eq 65 ]
+); then
+    pass 'cloudflared grace deadline unquotes systemd and openrc arguments'
+else
+    fail 'cloudflared grace deadline unquotes systemd and openrc arguments'
+fi
+
+# systemd also feeds variables in from EnvironmentFile=, so TUNNEL_GRACE_PERIOD may live in
+# /etc/default/cloudflared rather than in the unit. Scanning only the unit text would report
+# "not configured" and fall back to the 30s default. A `-` prefix means "missing file is fine".
+if (
+    CF_EF_UNIT="$TMP/cf-grace-ef.service"
+    CF_EF_UNIT_ARGS="$TMP/cf-grace-ef-args.service"
+    CF_EF_UNIT_DASH="$TMP/cf-grace-ef-dash.service"
+    CF_EF_FILE="$TMP/cf-grace-ef.env"
+    printf 'TUNNEL_GRACE_PERIOD=75s\n' > "$CF_EF_FILE"
+    printf '[Service]\nEnvironmentFile=%s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE" > "$CF_EF_UNIT"
+    printf '[Service]\nEnvironmentFile=-%s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE.nope" > "$CF_EF_UNIT_DASH"
+    printf '[Service]\nEnvironmentFile="%s"\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE" > "$CF_EF_UNIT_ARGS"
+    _cf_unit_path() { printf '%s' "$CF_EF_UNIT"; };      a=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_EF_UNIT_ARGS"; }; b=$(_cf_grace_wait_seconds)
+    _cf_unit_path() { printf '%s' "$CF_EF_UNIT_DASH"; }; c=$(_cf_grace_wait_seconds)
+    [ "$a" -eq 80 ] && [ "$b" -eq 80 ] && [ "$c" -eq "$(( CF_GRACE_DEFAULT + CF_GRACE_MARGIN ))" ]
+); then
+    pass 'cloudflared grace deadline follows EnvironmentFile when the unit uses one'
+else
+    fail 'cloudflared grace deadline follows EnvironmentFile when the unit uses one'
+fi
+
+# The unit FILE is not the effective configuration: drop-ins, repeated `Environment=` (later
+# wins) and `EnvironmentFile=` (which overrides `Environment=`) all change what the process
+# really runs with. Reading the text alone would report 30s while systemd hands the process
+# 90s -- i.e. SIGKILLing a still-draining tunnel at 35s, the original bug in a new disguise.
+# systemd is the authority, so on systemd we read `systemctl show` and ignore the text.
+# Negative control: a text-only implementation reads the unit file below and returns 35.
+if (
+    INIT_SYSTEM=systemd
+    CF_EFF_UNIT="$TMP/cf-eff.service"
+    # Deliberately WRONG (stale) text: the effective value comes from the drop-in.
+    printf '[Service]\nEnvironment=TUNNEL_GRACE_PERIOD=30s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' > "$CF_EFF_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_EFF_UNIT"; }
+    systemctl() {
+        case "$*" in
+            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
+            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
+            'show -p EnvironmentFiles --value cloudflared') printf '\n' ;;
+            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=90s\n' ;;
+        esac
+        return 0
+    }
+    [ "$(_cf_grace_wait_seconds)" -eq 95 ]
+); then
+    pass 'cloudflared grace deadline comes from the systemd effective configuration'
+else
+    fail 'cloudflared grace deadline comes from the systemd effective configuration'
+fi
+
+# systemd resolves the launch line itself: a drop-in that overrides `ExecStart=` replaces the
+# main unit's line entirely, and the argv it reports is already unquoted (verified against real
+# systemd: a unit line `--grace-period "45s"` is reported as `--grace-period 45s`). The flag
+# still outranks the environment variable.
+if (
+    INIT_SYSTEM=systemd
+    CF_EFF2_UNIT="$TMP/cf-eff2.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 30s run --token x\n' > "$CF_EFF2_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_EFF2_UNIT"; }
+    systemctl() {
+        case "$*" in
+            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
+            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel --grace-period 60s run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
+            'show -p EnvironmentFiles --value cloudflared') printf '\n' ;;
+            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=30s\n' ;;
+        esac
+        return 0
+    }
+    [ "$(_cf_grace_wait_seconds)" -eq 65 ]
+); then
+    pass 'cloudflared grace deadline prefers the systemd-resolved launch line over the environment'
+else
+    fail 'cloudflared grace deadline prefers the systemd-resolved launch line over the environment'
+fi
+
+# Settings from EnvironmentFile= OVERRIDE Environment=, and later files override earlier ones.
+# The file list only exists in systemd's view (a drop-in may add it), so the text cannot be
+# used to enumerate it. Here the file says 120s while Environment says 30s.
+if (
+    INIT_SYSTEM=systemd
+    CF_EFF3_UNIT="$TMP/cf-eff3.service"
+    CF_EFF3_ENV="$TMP/cf-eff3.env"
+    : > "$CF_EFF3_UNIT"
+    printf '# leading comment\nTUNNEL_GRACE_PERIOD=30s\nTUNNEL_GRACE_PERIOD=120s\n' > "$CF_EFF3_ENV"
+    _cf_unit_path() { printf '%s' "$CF_EFF3_UNIT"; }
+    systemctl() {
+        case "$*" in
+            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
+            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
+            'show -p EnvironmentFiles --value cloudflared') printf '%s (ignore_errors=no)\n' "$CF_EFF3_ENV" ;;
+            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=30s\n' ;;
+        esac
+        return 0
+    }
+    # 120s (last assignment in the file wins) beats the Environment= 30s -> 125
+    [ "$(_cf_grace_wait_seconds)" -eq 125 ]
+); then
+    pass 'cloudflared grace deadline honours EnvironmentFile precedence and last-assignment-wins'
+else
+    fail 'cloudflared grace deadline honours EnvironmentFile precedence and last-assignment-wins'
+fi
+
+# An unreadable effective configuration must fall back to the unit text, not to the default:
+# `systemctl show` failing (container without a bus, old systemctl) is not evidence that the
+# user configured nothing.
+if (
+    INIT_SYSTEM=systemd
+    CF_EFF4_UNIT="$TMP/cf-eff4.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 80s run --token x\n' > "$CF_EFF4_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_EFF4_UNIT"; }
+    systemctl() { return 1; }   # no bus
+    [ "$(_cf_grace_wait_seconds)" -eq 85 ]
+); then
+    pass 'cloudflared grace deadline falls back to the unit text when systemd is unreadable'
+else
+    fail 'cloudflared grace deadline falls back to the unit text when systemd is unreadable'
+fi
+
+# Go time.Duration accepts ns/us/µs and the contract here is round-UP-to-seconds, so a
+# sub-millisecond value must not collapse to 0s. Bare "0" is a valid Go duration
+# (ParseDuration special-cases it) meaning "do not wait for in-flight requests"; unrecognised
+# literals still have to be rejected so the caller falls back to the official default.
+if (
+    [ "$(_cf_duration_seconds 500us)"  -eq 1 ] \
+        && [ "$(_cf_duration_seconds 999us)"  -eq 1 ] \
+        && [ "$(_cf_duration_seconds 1ns)"    -eq 1 ] \
+        && [ "$(_cf_duration_seconds 999ns)"  -eq 1 ] \
+        && [ "$(_cf_duration_seconds 1500us)" -eq 1 ] \
+        && [ "$(_cf_duration_seconds 1.5s)"   -eq 2 ] \
+        && [ "$(_cf_duration_seconds 2s1ns)"  -eq 3 ] \
+        && [ "$(_cf_duration_seconds 1m500us)" -eq 61 ] \
+        && [ "$(_cf_duration_seconds 0)"      -eq 0 ] \
+        && ! _cf_duration_seconds '30' >/dev/null 2>&1
+); then
+    pass 'cloudflared grace duration parser rounds sub-second units up'
+else
+    fail 'cloudflared grace duration parser rounds sub-second units up'
+fi
+
+# `--grace-period 0` means "shut down without waiting for in-flight requests", so it must be
+# parsed as 0 rather than rejected (which would fall back to 30s). The margin stays as the
+# SIGTERM->SIGKILL escalation ceiling: the process still has to deregister its connector.
+if (
+    CF_ZERO_UNIT="$TMP/cf-grace-zero.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 0 run --token x\n' > "$CF_ZERO_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_ZERO_UNIT"; }
+    [ "$(_cf_grace_wait_seconds)" -eq "$CF_GRACE_MARGIN" ]
+); then
+    pass 'cloudflared grace-period 0 keeps only the escalation margin'
+else
+    fail 'cloudflared grace-period 0 keeps only the escalation margin'
+fi
+
+# A pathological value (e.g. a hand-written `--grace-period 4h`) must not stall a stop for
+# hours; systemd's own TimeoutStopSec is the real backstop.
+if (
+    CF_CFG_HUGE="$TMP/cf-grace-huge.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 4h run --token x\n' > "$CF_CFG_HUGE"
+    _cf_unit_path() { printf '%s' "$CF_CFG_HUGE"; }
+    [ "$(_cf_grace_wait_seconds)" -eq "$(( CF_GRACE_MAX + CF_GRACE_MARGIN ))" ]
+); then
+    pass 'cloudflared grace deadline is capped for pathological configurations'
+else
+    fail 'cloudflared grace deadline is capped for pathological configurations'
+fi
+
+# Go duration literals must be parsed without bc/GNU date (target hosts may be busybox).
+if (
+    [ "$(_cf_duration_seconds 30s)"   -eq 30 ]  \
+        && [ "$(_cf_duration_seconds 1m30s)" -eq 90 ]  \
+        && [ "$(_cf_duration_seconds 2m)"    -eq 120 ] \
+        && [ "$(_cf_duration_seconds 500ms)" -eq 1 ]   \
+        && [ "$(_cf_duration_seconds 1.5m)"  -eq 90 ]  \
+        && ! _cf_duration_seconds 'abc' >/dev/null 2>&1
+); then
+    pass 'cloudflared grace duration parser handles Go duration literals'
+else
+    fail 'cloudflared grace duration parser handles Go duration literals'
+fi
+
+# systemd prints its OWN timespan format (`1min 30s`), not a Go duration (`1m30s`) — the two
+# grammars are disjoint, so the Go parser cannot be reused. These literals are copied from real
+# `systemctl show -p TimeoutStopUSec --value` output on systemd 259. Minimum 1s so a non-zero
+# sub-second span cannot collapse to 0 and silently disable the bound.
+# Negative control: reusing _cf_duration_seconds here fails on every `min` form.
+if (
+    [ "$(_cf_systemd_span_seconds '1min 30s')"   -eq 90 ] \
+        && [ "$(_cf_systemd_span_seconds '1min')"     -eq 60 ] \
+        && [ "$(_cf_systemd_span_seconds '1h 30min')" -eq 5400 ] \
+        && [ "$(_cf_systemd_span_seconds '3min 20s')" -eq 200 ] \
+        && [ "$(_cf_systemd_span_seconds '2min 3.456789s')" -eq 124 ] \
+        && [ "$(_cf_systemd_span_seconds '1.500000s')" -eq 2 ] \
+        && [ "$(_cf_systemd_span_seconds '500ms')"    -eq 1 ] \
+        && [ "$(_cf_systemd_span_seconds '100ms')"    -eq 1 ] \
+        && [ "$(_cf_systemd_span_seconds '1us')"      -eq 1 ] \
+        && [ "$(_cf_systemd_span_seconds '59s')"      -eq 59 ] \
+        && [ "$(_cf_systemd_span_seconds '1w')"       -eq 604800 ] \
+        && [ "$(_cf_systemd_span_seconds '1month')"   -eq 2629800 ] \
+        && [ "$(_cf_systemd_span_seconds '1y')"       -eq 31557600 ] \
+        && ! _cf_systemd_span_seconds '1m30s'  >/dev/null 2>&1 \
+        && ! _cf_systemd_span_seconds 'infinity' >/dev/null 2>&1 \
+        && ! _cf_systemd_span_seconds ''       >/dev/null 2>&1
+); then
+    pass 'cloudflared systemd timespan parser handles systemd time-span literals'
+else
+    fail 'cloudflared systemd timespan parser handles systemd time-span literals'
+fi
+
+# The effective systemd stop timeout (including the manager default — the official unit sets no
+# TimeoutStopSec) must be readable as a number, so it can be compared against our own deadline.
+if (
+    INIT_SYSTEM=systemd
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
+        esac
+        return 0
+    }
+    [ "$(_cf_systemd_stop_timeout_seconds)" -eq 90 ]
+); then
+    pass 'cloudflared reads the effective systemd stop timeout'
+else
+    fail 'cloudflared reads the effective systemd stop timeout'
+fi
+
+# `infinity` must NOT become a number: systemd will not terminate the process on its own, so our
+# own deadline is the only bound and must not be shortened. Anything unreadable — a failing query
+# or an empty property value — is likewise "no cap" (rc 2) rather than a bogus number: a 0 here
+# would make every grace window look covered and silence the contract check.
+# (The TimeoutStopFailureMode stubs are deliberately absent: the helper no longer reads it.)
+if (
+    INIT_SYSTEM=systemd
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') printf 'infinity\n' ;;
+        esac
+        return 0
+    }
+    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; a=$?
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') return 1 ;;
+        esac
+        return 0
+    }
+    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; b=$?
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') printf '\n' ;;
+        esac
+        return 0
+    }
+    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; c=$?
+    systemctl() { return 1; }
+    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; d=$?
+    [ "$a" -eq 1 ] && [ "$b" -eq 2 ] && [ "$c" -eq 2 ] && [ "$d" -eq 2 ]
+); then
+    pass 'cloudflared treats an unbounded or unreadable systemd stop timeout as no cap'
+else
+    fail 'cloudflared treats an unbounded or unreadable systemd stop timeout as no cap'
+fi
+
+# NOTE: there is deliberately no assertion for TimeoutStopFailureMode. Real systemd accepts
+# `terminate`, `abort` (since v246) and `kill`, and all three terminate the process when the stop
+# timeout expires — verified on systemd 259: each legal value parses without error, and both
+# `terminate` and `abort` ended a SIGTERM-ignoring process once TimeoutStopUSec elapsed. Illegal
+# values are rejected outright ("Failed to parse TimeoutStopFailureMode=continue, ignoring:
+# Invalid argument") and the effective value stays `terminate`. The effective mode therefore always
+# terminates, so a finite TimeoutStopUSec is always a genuine upper bound and
+# _cf_systemd_stop_timeout_seconds does not consult that property at all. Keeping the query (with a
+# `case ... continue) return 1` branch) was dead code: mutation testing showed deleting the branch
+# changed no observable behaviour, because `infinity` is already rejected by the timespan parser.
+
+# The contract check: a systemd stop timeout SHORTER than grace+margin means cloudflared gets
+# killed by systemd before its own grace period elapses, so the promise "we waited out the
+# configured grace period" is false. It must be reported, not silently tolerated — and an equal
+# or longer bound must stay silent (no noise on the default 90s setup).
+# `_cf_pids_owned` reports an owned process here, i.e. there IS something to stop, so the check
+# must not short-circuit on "nothing to stop".
+if (
+    INIT_SYSTEM=systemd
+    _cf_pids_owned() { printf '4242\n'; }
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
+        esac
+        return 0
+    }
+    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
+    quiet=$(_cf_check_stop_timeout_covers 90 2>&1); rc_eq=$?
+    [ "$rc" -eq 1 ] && [ "$rc_eq" -eq 0 ] && [ -z "$quiet" ] \
+        && contains '短于宽限期' "$out"
+); then
+    pass 'cloudflared reports a systemd stop timeout shorter than the grace deadline'
+else
+    fail 'cloudflared reports a systemd stop timeout shorter than the grace deadline'
+fi
+
+# ...but an ALREADY-STOPPED cloudflared must NOT produce that warning, even with a very short stop
+# timeout: nothing is going to be waited for, so a shorter bound truncates nothing and the message
+# is pure noise (real-systemd repro: unit inactive + TimeoutStopSec=5s still warned).
+if (
+    INIT_SYSTEM=systemd
+    _cf_pids_owned() { :; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
+        esac
+        return 0
+    }
+    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && [ -z "$out" ]
+); then
+    pass 'cloudflared stays silent about the stop timeout when nothing needs stopping'
+else
+    fail 'cloudflared stays silent about the stop timeout when nothing needs stopping'
+fi
+
+# A unit mid-transition (still deactivating) is NOT "nothing to stop" — and an unreadable state must
+# not be optimistically treated as stopped either. Both must still warn.
+if (
+    INIT_SYSTEM=systemd
+    _cf_pids_owned() { :; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
+        esac
+        return 0
+    }
+    out=$(_cf_check_stop_timeout_covers 125 2>&1); a=$?
+    # Unit state UNREADABLE while the bound is still readable: must still warn. "Cannot read the
+    # state" is not evidence that nothing needs stopping (same fail-closed contract as
+    # _cf_unit_stopped). Only the state queries fail here — the bound stays readable, so the
+    # comparison is still possible and the warning must be produced.
+    systemctl() {
+        case "$*" in
+            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
+            *) return 1 ;;
+        esac
+        return 0
+    }
+    out2=$(_cf_check_stop_timeout_covers 125 2>&1); b=$?
+    # Bound UNREADABLE: no number, so no claim can be made — this is the rc 2 "no cap" contract.
+    # Remaining silent here is correct, NOT fail-open: we have nothing to compare.
+    systemctl() { return 1; }
+    out3=$(_cf_check_stop_timeout_covers 125 2>&1); c=$?
+    [ "$a" -eq 1 ] && [ "$b" -eq 1 ] && [ "$c" -eq 0 ] && [ -z "$out3" ] \
+        && contains '短于宽限期' "$out" && contains '短于宽限期' "$out2"
+); then
+    pass 'cloudflared still warns when the unit is transitioning or its state is unreadable'
+else
+    fail 'cloudflared still warns when the unit is transitioning or its state is unreadable'
+fi
+
+# The check is systemd-only: on OpenRC (or any non-systemd host) it must not run at all — no
+# warning, and no `systemctl` call whatsoever. Without this assertion the guard is unobservable,
+# because a missing or bus-less `systemctl` also ends up at "no cap" and stays silent *by accident*;
+# a host that ships a working-looking `systemctl` shim would then emit a bogus warning.
+if (
+    INIT_SYSTEM=openrc
+    CF_OPENRC_CALLED="$TMP/cf-openrc-called"
+    rm -f "$CF_OPENRC_CALLED"
+    _cf_pids_owned() { printf '4242\n'; }   # something IS running, so only the guard can silence it
+    systemctl() { printf 'called\n' >> "$CF_OPENRC_CALLED"; printf '5s\n'; return 0; }
+    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && [ -z "$out" ] && [ ! -e "$CF_OPENRC_CALLED" ]
+); then
+    pass 'cloudflared stop-timeout check is systemd-only and never queries systemctl elsewhere'
+else
+    fail 'cloudflared stop-timeout check is systemd-only and never queries systemctl elsewhere'
+fi
+
+# ...and _cf_kill_all must actually perform that check. Without this assertion the whole
+# helper could be dead code and every other assertion would still pass.
+# Scenario: unit configured with `--grace-period 120s` (deadline 125s) while systemd's effective
+# stop timeout is the 90s manager default, and a real process must be stopped for the check to be
+# reachable. A removal of the call makes this silent.
+if (
+    INIT_SYSTEM=systemd
+    CF_TOS_UNIT="$TMP/cf-tos.service"
+    CF_TOS_POLLS="$TMP/cf-tos-polls"
+    : > "$CF_TOS_POLLS"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 120s run --token x\n' > "$CF_TOS_UNIT"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$CF_TOS_UNIT"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    # Report one owned process on the first scan only: that makes the stop-timeout check reachable
+    # (there is something to stop) while keeping the wait loop bounded and fast.
+    _cf_pids_owned() {
+        printf 'poll\n' >> "$CF_TOS_POLLS"
+        [ "$(wc -l < "$CF_TOS_POLLS")" -le 1 ] && printf '4242\n'
+        return 0
+    }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
+        esac
+        return 0
+    }
+    sleep() { :; }
+    out=$(_cf_kill_all 2>&1)
+    contains '短于宽限期' "$out"
+); then
+    pass 'cloudflared kill-all surfaces a systemd stop timeout that undercuts the grace period'
+else
+    fail 'cloudflared kill-all surfaces a systemd stop timeout that undercuts the grace period'
+fi
+
+# systemd stop must be asynchronous, and the wait must key on ActiveState. `is-active`
+# reports "deactivating" as stopped, so it cannot answer "has the stop finished".
+if (
+    INIT_SYSTEM=systemd
+    CF_STOP_SENTINEL="$TMP/cf-stop-request"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-stop.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { :; }
+    systemctl() {
+        printf '%s\n' "$*" >> "$CF_STOP_SENTINEL"
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+        esac
+        return 0
+    }
+    _cf_kill_all >/dev/null 2>&1
+    calls=$(cat "$CF_STOP_SENTINEL" 2>/dev/null)
+    # The stop request must be the first *mutating* action and the wait must then key on
+    # ActiveState. (Read-only `show` queries may precede it: the grace deadline and the
+    # "is anything actually running" pre-check are both read from systemd before the stop.)
+    # So compare the stop against the first ActiveState query *after* it — that is the wait.
+    stop_line=$(grep -n -m1 -- '--no-block stop cloudflared' "$CF_STOP_SENTINEL" | cut -d: -f1)
+    active_line=$(awk -v s="$stop_line" 'NR>s && /show -p ActiveState --value cloudflared/ { print NR; exit }' "$CF_STOP_SENTINEL")
+    [ -n "$stop_line" ] && [ -n "$active_line" ] && [ "$stop_line" -lt "$active_line" ] \
+        && ! contains 'is-active' "$calls"
+); then
+    pass 'cloudflared systemd stop is nonblocking and waits on ActiveState'
+else
+    fail 'cloudflared systemd stop is nonblocking and waits on ActiveState'
+fi
+
+# A unit that is still deactivating must be waited out, and the graceful shutdown must not
+# be cut short by a signal while it drains. Negative control: an `is-active`-based wait sees
+# "deactivating" as stopped, proceeds instantly, and SIGTERMs the still-draining process.
+if (
+    INIT_SYSTEM=systemd
+    CF_POLLS="$TMP/cf-deact-polls"
+    CF_SLEEPS="$TMP/cf-deact-sleeps"
+    CF_SIGNALS="$TMP/cf-deact-signals"
+    : > "$CF_POLLS"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-deact.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() {
+        printf 'poll\n' >> "$CF_POLLS"
+        [ "$(wc -l < "$CF_POLLS")" -le 2 ] && printf '4242\n'
+        return 0
+    }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared')
+                if [ "$(wc -l < "$CF_POLLS")" -ge 3 ]; then printf 'inactive\n'; else printf 'deactivating\n'; fi ;;
+            'show -p MainPID --value cloudflared')
+                if [ "$(wc -l < "$CF_POLLS")" -ge 3 ]; then printf '0\n'; else printf '4242\n'; fi ;;
+        esac
+        return 0
+    }
+    kill() { printf '%s\n' "$1" >> "$CF_SIGNALS"; return 0; }
+    sleep() { printf '1\n' >> "$CF_SLEEPS"; }
+    _cf_kill_all >/dev/null 2>&1
+    [ "$(wc -l < "$CF_SLEEPS")" -eq 2 ] && [ ! -s "$CF_SIGNALS" ]
+); then
+    pass 'cloudflared stop waits through deactivating without signalling'
+else
+    fail 'cloudflared stop waits through deactivating without signalling'
+fi
+
+# SIGKILL is a last resort: it must only fire after the grace period cloudflared was actually
+# started with elapsed, and SIGTERM must come first. The unit here carries `--grace-period 60s`,
+# so a hardcoded 35s deadline (or the old fixed 3s window) fails this assertion -- the process
+# would be SIGKILLed while still draining in-flight tunnel requests.
+if (
+    INIT_SYSTEM=systemd
+    CF_EVENTS="$TMP/cf-grace-events"
+    CF_GRACE_UNIT="$TMP/cloudflared-grace.service"
+    rm() { :; }
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 60s run --token x\n' > "$CF_GRACE_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_GRACE_UNIT"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { printf '4242\n'; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
+            'show -p MainPID --value cloudflared')     printf '4242\n' ;;
+        esac
+        return 0
+    }
+    kill() { printf 'kill %s\n' "$1" >> "$CF_EVENTS"; return 0; }
+    sleep() { printf 'sleep\n' >> "$CF_EVENTS"; }
+    _cf_kill_all >/dev/null 2>&1
+    sleeps_before_sigkill=$(awk '/^kill -9$/ { print n; exit } /^sleep$/ { n++ }' "$CF_EVENTS")
+    [ -n "$sleeps_before_sigkill" ] \
+        && [ "$sleeps_before_sigkill" -ge 65 ] \
+        && [ "$(grep -m1 '^kill' "$CF_EVENTS")" = 'kill -15' ]
+); then
+    pass 'cloudflared SIGKILL only after the configured grace window, SIGTERM first'
+else
+    fail 'cloudflared SIGKILL only after the configured grace window, SIGTERM first'
+fi
+
+# A process disappearing is NOT proof that the unit finished stopping. After SIGKILL the unit
+# can still be deactivating (cgroup teardown) and, because cloudflared's own unit is
+# `Restart=on-failure`, systemd may already have queued a restart. Declaring "stopped" here
+# makes _cf_restart `systemctl start` 2s later race that job. So: stop again, then re-verify.
+# Negative control: without the re-stop the sentinel stays empty.
+if (
+    INIT_SYSTEM=systemd
+    CF_REVERIFY_LOG="$TMP/cf-reverify-log"
+    CF_REVERIFY_UNIT="$TMP/cloudflared-reverify.service"
+    rm() { :; }
+    : > "$CF_REVERIFY_LOG"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 5s run --token x\n' > "$CF_REVERIFY_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_REVERIFY_UNIT"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    # Still owned before the SIGKILL, gone afterwards.
+    _cf_pids_owned() { grep -q 'kill -9' "$CF_REVERIFY_LOG" || printf '4242\n'; }
+    systemctl() {
+        printf '%s\n' "$*" >> "$CF_REVERIFY_LOG"
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
+            'show -p MainPID --value cloudflared')     printf '4242\n' ;;
+        esac
+        return 0
+    }
+    kill() { printf 'kill %s\n' "$1" >> "$CF_REVERIFY_LOG"; return 0; }
+    sleep() { :; }
+    _cf_kill_all >/dev/null 2>&1
+    # order: ... kill -9 ... then a second `--no-block stop cloudflared` after it
+    after_kill=$(sed -n '/^kill -9$/,$p' "$CF_REVERIFY_LOG")
+    contains '--no-block stop cloudflared' "$after_kill" \
+        && contains 'show -p ActiveState --value cloudflared' "$after_kill"
+); then
+    pass 'cloudflared re-verifies the systemd stop terminal state after SIGKILL'
+else
+    fail 'cloudflared re-verifies the systemd stop terminal state after SIGKILL'
+fi
+
+# ...and if the unit refuses to reach a terminal state within that re-verification window, the
+# stop must not silently claim success either.
+if (
+    INIT_SYSTEM=systemd
+    CF_REVERIFY_TIMEOUT="$TMP/cf-reverify-timeout"
+    CF_REVERIFY_UNIT2="$TMP/cloudflared-reverify2.service"
+    rm() { :; }
+    : > "$CF_REVERIFY_TIMEOUT"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 5s run --token x\n' > "$CF_REVERIFY_UNIT2"
+    _cf_unit_path() { printf '%s' "$CF_REVERIFY_UNIT2"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { grep -q 'kill -9' "$CF_REVERIFY_TIMEOUT" || printf '4242\n'; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
+            'show -p MainPID --value cloudflared')     printf '4242\n' ;;
+        esac
+        return 0
+    }
+    kill() { printf 'kill %s\n' "$1" >> "$CF_REVERIFY_TIMEOUT"; return 0; }
+    sleep() { printf 's\n' >> "$CF_REVERIFY_TIMEOUT"; }
+    _cf_kill_all >/dev/null 2>&1
+    # The re-verification wait is bounded (CF_STOP_REVERIFY), not unbounded.
+    rewait=$(awk '/^kill -9$/{f=1;next} f&&/^s$/{n++} END{print n+0}' "$CF_REVERIFY_TIMEOUT")
+    [ "$rewait" -le "$CF_STOP_REVERIFY" ] && [ "$rewait" -ge 1 ]
+); then
+    pass 'cloudflared post-SIGKILL verification is bounded'
+else
+    fail 'cloudflared post-SIGKILL verification is bounded'
+fi
+
+# "Cannot read the unit state" is NOT "the unit has stopped". _cf_unit_stopped documents rc 2 as
+# "do not conclude anything", so folding 2 into the success branch lets `_cf_kill_all` announce a
+# clean stop it never verified -- and _cf_restart would then start a second connector.
+# Negative control: restoring `*) return 0` makes this return 0 and the assertion fails.
+if (
+    INIT_SYSTEM=systemd
+    _cf_pids_owned() { :; }
+    systemctl() { return 1; }   # bus unavailable / state unreadable
+    sleep() { :; }
+    _cf_wait_exit 3 >/dev/null 2>&1
+    [ "$?" -ne 0 ]
+); then
+    pass 'cloudflared wait exit treats an unreadable unit state as unverified'
+else
+    fail 'cloudflared wait exit treats an unreadable unit state as unverified'
+fi
+
+# ...and that unverified verdict must reach the caller: with every process gone but the unit
+# state unreadable, _cf_kill_all must NOT report success. Otherwise _cf_restart starts a second
+# cloudflared and _uninstall_cloudflared deletes the service definition/credentials on the
+# strength of a check that never answered.
+if (
+    INIT_SYSTEM=systemd
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-unreadable.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { :; }
+    systemctl() { return 1; }
+    sleep() { :; }
+    _cf_kill_all >/dev/null 2>&1
+    [ "$?" -ne 0 ]
+); then
+    pass 'cloudflared kill-all refuses to claim cleanup when the unit state is unreadable'
+else
+    fail 'cloudflared kill-all refuses to claim cleanup when the unit state is unreadable'
+fi
+
+# The mirror image of the previous case: here the unit state IS readable, and it says the stop
+# has NOT finished. systemd reaps the main process first (MainPID=0) and then keeps running
+# ExecStop/ExecStopPost and cgroup teardown, so the unit stays `deactivating` while ZERO
+# cloudflared processes exist. Step 3 is guarded by `[ -n "$pids" ]`, so that entire branch is
+# skipped; before the fix every remaining check then passed and the function reported
+# "所有进程已清理" (rc 0) although the stop transaction was still open — and `_cf_restart`
+# `systemctl start`s 2s later, racing that job.
+# Reproduced on real systemd (slow ExecStopPost): pids_owned=[] , _cf_unit_stopped=1 ,
+# _cf_wait_exit=1 , _cf_kill_all=0 while ActiveState was still deactivating.
+# Negative control: removing the final re-verification block makes this return 0.
+if (
+    INIT_SYSTEM=systemd
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-transition.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { :; }            # every process is already gone
+    _cf_grace_wait_seconds() { printf '%s' 2; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
+            'show -p MainPID --value cloudflared')     printf '0\n' ;;
+        esac
+        return 0
+    }
+    sleep() { :; }
+    _cf_kill_all >/dev/null 2>&1
+    [ "$?" -ne 0 ]
+); then
+    pass 'cloudflared kill-all refuses to claim cleanup while the unit is still deactivating'
+else
+    fail 'cloudflared kill-all refuses to claim cleanup while the unit is still deactivating'
+fi
+
+# A stop that timed out in step 1 but then converged must still succeed: the final re-verify
+# has to re-read the state rather than reuse step 1's verdict. Here the unit is deactivating
+# while processes are alive (step 1 times out), then goes inactive after the SIGTERM.
+# A fix that simply propagated step 1's rc=1 would fail this and block every normal restart.
+if (
+    INIT_SYSTEM=systemd
+    CF_CONVERGE_LOG="$TMP/cf-converge-log"
+    rm() { :; }
+    : > "$CF_CONVERGE_LOG"
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-converge.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { grep -q 'kill -15' "$CF_CONVERGE_LOG" || printf '4242\n'; }
+    _cf_grace_wait_seconds() { printf '%s' 2; }
+    systemctl() {
+        case "$*" in
+            'show -p ActiveState --value cloudflared')
+                if grep -q 'kill -15' "$CF_CONVERGE_LOG"; then printf 'inactive\n'; else printf 'deactivating\n'; fi ;;
+            'show -p MainPID --value cloudflared')
+                if grep -q 'kill -15' "$CF_CONVERGE_LOG"; then printf '0\n'; else printf '4242\n'; fi ;;
+        esac
+        return 0
+    }
+    kill() { printf 'kill %s\n' "$1" >> "$CF_CONVERGE_LOG"; return 0; }
+    sleep() { :; }
+    _cf_kill_all >/dev/null 2>&1
+); then
+    pass 'cloudflared stop that converges after the graceful signal still reports success'
+else
+    fail 'cloudflared stop that converges after the graceful signal still reports success'
+fi
+
+# The OpenRC stop path must not pay a blind fixed delay either: the owned-process
+# cleanup below already confirms that nothing survived the stop request.
+if (
+    INIT_SYSTEM=openrc
+    CF_OPENRC_SLEEPS="$TMP/cf-openrc-sleeps"
+    CF_OPENRC_STOPPED="$TMP/cf-openrc-stopped"
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-openrc.conf"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids_owned() { :; }
+    _cf_pids() { :; }
+    rc-service() { printf '%s\n' "$*" >> "$CF_OPENRC_STOPPED"; }
+    sleep() { printf '%s\n' "$1" >> "$CF_OPENRC_SLEEPS"; }
+    _cf_kill_all >/dev/null 2>&1 \
+        && [ "$(cat "$CF_OPENRC_STOPPED")" = 'cloudflared stop' ] \
+        && [ ! -s "$CF_OPENRC_SLEEPS" ]
+); then
+    pass 'cloudflared openrc stop skips fixed wait when already clean'
+else
+    fail 'cloudflared openrc stop skips fixed wait when already clean'
+fi
+
+# A delayed init-system start waits for readiness, not a blind fixed delay.
+if (
+    CF_SLEEP_SENTINEL="$TMP/cf-delayed-sleeps"
+    CF_READY_COUNT="$TMP/cf-ready-count"
+    INIT_SYSTEM=systemd
+    : > "$CF_READY_COUNT"
+    _cf_kill_all() { return 0; }
+    _cf_is_managed_running() {
+        local n; n=$(wc -l < "$CF_READY_COUNT"); n=$((n+1)); printf '%s\n' "$n" >> "$CF_READY_COUNT"
+        [ "$n" -ge 2 ]
+    }
+    systemctl() { [ "$1" = start ]; }
+    sleep() { printf '%s\n' "$1" >> "$CF_SLEEP_SENTINEL"; }
+    _cf_restart >/dev/null 2>&1 \
+        && [ "$(wc -l < "$CF_SLEEP_SENTINEL")" -eq 2 ] \
+        && [ "$(tail -n 1 "$CF_SLEEP_SENTINEL")" = 1 ]
+); then
+    pass 'cloudflared restart polls delayed service readiness'
+else
+    fail 'cloudflared restart polls delayed service readiness'
+fi
+
 # Without an authoritative liveness helper, stop is not proof of exit.
 if (
     XRAY_STOP_SENTINEL="$TMP/xray-stop-called"
