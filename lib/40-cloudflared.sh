@@ -893,6 +893,93 @@ _cf_ltrim() {
     printf '%s' "${s#"${s%%[![:space:]]*}"}"
 }
 
+# 从 EnvironmentFile= 指定的文件里取 TUNNEL_GRACE_PERIOD 的值。
+# systemd.exec(5): 空行/无 `=` 的行/`#` 与 `;` 开头的行忽略, 行首行尾空白丢弃, 同一变量
+# 出现多次时**后面的覆盖前面的**。
+# 该手册描述的完整语法(单/双引号跨行、反斜杠续行)不在这里实现: 这个文件里放的是一个时长
+# 字面量(`TUNNEL_GRACE_PERIOD=60s`), 多行引号形态对它没有现实意义。解析不出时返回非 0,
+# 由上层回退官方默认值并告警(第四轮复审已把该项降级为 P2)。
+_cf_env_file_value() {
+    local f="$1" ln v out=""
+    [ -f "$f" ] || return 1
+    while IFS= read -r ln || [ -n "$ln" ]; do
+        ln=$(_cf_ltrim "$ln")
+        case "$ln" in '#'*|';'*|'') continue ;; esac
+        v="${ln#*TUNNEL_GRACE_PERIOD=}"
+        [ "$v" != "$ln" ] || continue
+        v="${v%%[[:space:]]*}"
+        v=$(_cf_strip_quotes "$v")
+        [ -n "$v" ] && out="$v"
+    done < "$f"
+    [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# systemd 的**有效配置**里的宽限期: 直接问 systemd, 不自己拼 unit 文本。
+#
+# 为什么文本解析不够(第四轮复审 P1): 生效值与主 unit 文件的文本不是一回事 ——
+#   · drop-in(`/etc/systemd/system/cloudflared.service.d/*.conf`, 官方文档现在直接推荐
+#     `systemctl edit`)可以覆盖 `Environment=` 与 `ExecStart=`;
+#   · `Environment=` 写多次时**后写的覆盖先写的**;
+#   · `EnvironmentFile=` 里的值**覆盖** `Environment=`(systemd.exec(5): "Settings from
+#     these files override settings made with Environment="), 多个文件按书写顺序、
+#     后面的覆盖前面的;
+#   · `ExecStart=` 的引号由 systemd 剥掉后的 argv 才是真正传给进程的。
+# 只扫主 unit 文本会在这些情形下读到**过小**的值 ⇒ 又变成"实际 60s / 脚本判 30s /
+# 35s SIGKILL", 与本 PR 要修的原始 bug 同形。
+#
+# `systemctl show` 给的就是合并结果: -p ExecStart 的 argv[] 已无引号; -p Environment 是
+# **去重后**的最终环境(实测 drop-in 的 60s 覆盖主 unit 的 30s)。注意 -p Environment
+# **不含** EnvironmentFile 的值, 那部分仍必须自己读文件(实测: 进程拿到 222s 而
+# show -p Environment 仍是 30s)。
+#   rc 0 = 输出有效字面量; rc 1 = systemd 明确回答"没配"; rc 2 = 读不到有效配置
+#   (systemctl 不可用 / bus 不通 / 旧版无 --value / unit 未加载)
+# ---------------------------------------------------------------------------
+_cf_systemd_grace_raw() {
+    local load argv envs efs w v="" efp vf arr=() i
+    load=$(systemctl show -p LoadState --value cloudflared 2>/dev/null) || return 2
+    # 只有 loaded 才算"systemd 承认了这份有效配置"。not-found(没有该 unit)、
+    # bad-setting(配置非法, 起不来)、masked 等一律回退文本解析: 宁可多读到值, 不可漏读。
+    [ "$load" = loaded ] || return 2
+    # 1. 启动行。显式 flag 优先于环境变量(urfave/cli altsrc 语义: 环境变量只提供默认值)。
+    #    argv[] 由 systemd 解析, 引号已剥, 无需再 _cf_strip_quotes。
+    argv=$(systemctl show -p ExecStart --value cloudflared 2>/dev/null) || return 2
+    case "$argv" in
+        *'argv[]='*) argv="${argv#*argv[]=}" ;;
+        *) argv="" ;;
+    esac
+    argv="${argv%%; ignore_errors=*}"
+    if [ -n "$argv" ]; then
+        arr=(); read -ra arr <<< "$argv"
+        for ((i=0; i<${#arr[@]}; i++)); do
+            w="${arr[$i]}"
+            case "$w" in
+                --grace-period=*) v="${w#--grace-period=}" ;;
+                --grace-period) [ "$((i+1))" -lt "${#arr[@]}" ] && v="${arr[$((i+1))]}" ;;
+            esac
+        done
+    fi
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    # 2. EnvironmentFile= 的值覆盖 Environment=, 且后列的文件覆盖先列的 -> 取最后一个有效值。
+    efs=$(systemctl show -p EnvironmentFiles --value cloudflared 2>/dev/null) || efs=""
+    while IFS= read -r efp || [ -n "$efp" ]; do
+        [ -n "$efp" ] || continue
+        efp="${efp% (ignore_errors=*)}"
+        # 通配路径不展开: 展开错了会把不生效的值当成生效配置(与旧实现一致)。
+        case "$efp" in ''|*'*'*|*'?'*|*'['*) continue ;; esac
+        if vf=$(_cf_env_file_value "$efp"); then v="$vf"; fi
+    done <<< "$efs"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    # 3. Environment=(已去重、已是最终生效值)
+    envs=$(systemctl show -p Environment --value cloudflared 2>/dev/null) || envs=""
+    for w in $envs; do
+        case "$w" in TUNNEL_GRACE_PERIOD=*) v="${w#TUNNEL_GRACE_PERIOD=}" ;; esac
+    done
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # 用户实际配置的优雅退出宽限期(原始字面量, 如 `60s` / `2m`)。
 # cloudflared 支持 `--grace-period <PERIOD>` 与 `TUNNEL_GRACE_PERIOD` 覆盖官方默认 30s,
@@ -902,7 +989,22 @@ _cf_ltrim() {
 # 默认值, 显式 flag 覆盖它)。输出非空 = 用户配过; 空/rc 1 = 没配, 由调用方用官方默认值。
 # ---------------------------------------------------------------------------
 _cf_grace_config() {
-    local svcfile="$1" ln arr=() i w v efpath efv
+    local svcfile="$1" ln arr=() i w v efpath efv eff rc
+    # systemd: **问 systemd 的有效配置**, 不自己拼 unit 文本(第四轮复审 P1)。
+    # `_cf_systemd_grace_raw` 已覆盖 drop-in、多重 Environment= 的后写覆盖、
+    # EnvironmentFile 覆盖 Environment 的次序, 以及 ExecStart 由 systemd 剥引号后的 argv。
+    # rc 1 = systemd 明确回答"没配"(它是权威, 直接采信, 不再回退文本);
+    # rc 2 = 读不到有效配置(容器无 bus / 旧版 systemctl / unit 未加载) -> 回退下面的文本
+    #        解析。文本解析是有效配置的**子集**, 只在拿不到权威答案时使用。
+    if [ "${INIT_SYSTEM:-}" = systemd ]; then
+        # 必须先把返回码接住: `if cmd; then …; fi` 之后 `$?` 是 **if 语句本身**的状态
+        # (条件为假且无 else 时恒为 0), 不是 cmd 的。
+        eff=$(_cf_systemd_grace_raw); rc=$?
+        case "$rc" in
+            0) printf '%s' "$eff"; return 0 ;;
+            1) return 1 ;;   # systemd 是权威: 它说没配就是没配, 不再回退文本
+        esac
+    fi
     [ -f "$svcfile" ] || return 1
     # 1. 启动行里的 --grace-period <PERIOD> / --grace-period=<PERIOD>(优先)。
     #    先按 _cf_is_cmd_line 过滤, 注释行 / ExecStop= 行里的 --grace-period 不算生效配置。
@@ -938,8 +1040,8 @@ _cf_grace_config() {
         v=$(_cf_strip_quotes "$v")
         [ -n "$v" ] && { printf '%s' "$v"; return 0; }
     done < "$svcfile"
-    # 3. systemd `EnvironmentFile=<path>`(前缀 `-` 表示文件缺失不算错): 变量是 PID 1 从该
-    #    文件读入再传给进程的, 只扫 unit 文本会漏掉 —— 把 TUNNEL_GRACE_PERIOD 写在
+    # 3. `EnvironmentFile=<path>`(前缀 `-` 表示文件缺失不算错): 变量是 PID 1 从该文件读入
+    #    再传给进程的, 只扫 unit 文本会漏掉 —— 把 TUNNEL_GRACE_PERIOD 写在
     #    /etc/default/cloudflared 里是完全正常的形态。通配路径不展开(YAGNI: 极少见,
     #    展开错了反而会把不生效的值当成生效配置)。
     while IFS= read -r ln || [ -n "$ln" ]; do
@@ -951,16 +1053,7 @@ _cf_grace_config() {
         efpath="${efpath%"${efpath##*[![:space:]]}"}"
         case "$efpath" in -*) efpath="${efpath#-}" ;; esac
         case "$efpath" in ''|*'*'*|*'?'*|*'['*) continue ;; esac
-        [ -f "$efpath" ] || continue
-        while IFS= read -r efv || [ -n "$efv" ]; do
-            efv=$(_cf_ltrim "$efv")
-            case "$efv" in '#'*|'') continue ;; esac
-            v="${efv#*TUNNEL_GRACE_PERIOD=}"
-            [ "$v" != "$efv" ] || continue
-            v="${v%%[[:space:]]*}"
-            v=$(_cf_strip_quotes "$v")
-            [ -n "$v" ] && { printf '%s' "$v"; return 0; }
-        done < "$efpath"
+        if vf=$(_cf_env_file_value "$efpath"); then printf '%s' "$vf"; return 0; fi
     done < "$svcfile"
     return 1
 }
@@ -1060,18 +1153,28 @@ _cf_unit_stopped() {
 
 # 等 cloudflared 真正退出: 正常情况**立即**返回, 最坏消耗 <max> 秒。
 # 这是"正常退出检测"那一半 —— 强制清理(SIGTERM/SIGKILL)在它超时之后才允许发生。
-#   rc 0 = 已确认退出(或状态不可读, 不据此拖延); rc 1 = 超时仍有存活
+#   rc 0 = 已确认退出(进程已无且 unit 处于停止终态)
+#   rc 1 = 超时: 仍有存活进程或 unit 处于过渡态
+#   rc 2 = **无法观察**(进程已无, 但读不到 unit 状态): 既不算成功, 也不拖延
+#
+# 第三态是第四轮复审修的 P1: 旧实现把 `_cf_unit_stopped` 的 rc 2 归进 `*) return 0`,
+# 即"读不到 systemd 状态"被当成"已停止" —— 与 `_cf_unit_stopped` 自己声明的契约
+# (rc 2 = 不据此断言任何事)以及 `_xray_stopped_state` / `_hysteria_stop_and_verify` 的
+# fail-closed 口径直接矛盾, 调用方会据此宣称清理成功。
+# 立刻返回 2(而不是等满 max 秒)不会缩短任何进程的优雅窗口: 这段代码只在
+# `_cf_pids_owned` **已经为空**时才会去读状态; 只要还有存活进程就继续等到期限。
 _cf_wait_exit() {
-    local max="$1" i=0
+    local max="$1" i=0 rc
     while [ "$i" -lt "$max" ]; do
         if [ -z "$(_cf_pids_owned)" ]; then
             # 进程没了还不够: systemd 可能仍在 deactivating(收尾 cgroup), 此时立刻返回
-            # 会让后续流程与被杀进程的收尾重叠。状态读不到(rc 2)则不拖延。
+            # 会让后续流程与被杀进程的收尾重叠。
             if [ "$INIT_SYSTEM" != systemd ]; then return 0; fi
-            _cf_unit_stopped
-            case "$?" in
+            _cf_unit_stopped; rc=$?
+            case "$rc" in
+                0) return 0 ;;   # inactive/failed 且 MainPID=0
                 1) ;;            # 过渡态: 继续等
-                *) return 0 ;;   # inactive/failed 或不可读
+                *) return 2 ;;   # 读不到状态: 不下"已停止"的结论
             esac
         fi
         sleep 1; i=$((i+1))
@@ -1084,10 +1187,14 @@ _cf_wait_exit() {
 # openrc 的 rc-service stop 经常杀不干净, 必须内核级 kill 兜底
 # ---------------------------------------------------------------------------
 _cf_kill_all() {
-    local pids="" pid i
+    local pids="" pid i rc
     # 严格归属判定不可用(混装旧 lib)的标志: 此时我们**无法确认**任何进程的归属,
     # 进程状态未被确认清理, 最终必须 return 1 —— 不能对调用方谎报"已清理干净"。
     local _cf_strict_missing=0
+    # 停止终态**无法观察**的标志(_cf_wait_exit 的 rc 2)。进程可能真的没了, 但 unit 状态
+    # 读不到 => 我们没有证据说它已停止。与 _cf_strict_missing 同理, 最终必须 return 1:
+    # "读不到"不等于"已停止"(第四轮复审 P1)。
+    local _cf_unit_unreadable=0
     # 允许升级到 SIGKILL 的时点 = 用户实际配置的宽限期 + 余量(见 _cf_grace_wait_seconds)。
     # 只在需要等待时才解析一次; 干净停止的路径上它不产生任何等待。
     local _cf_grace=""
@@ -1103,8 +1210,13 @@ _cf_kill_all() {
             # 优雅退出, 硬断在途隧道请求。
             _cf_grace=$(_cf_grace_wait_seconds)
             systemctl --no-block stop cloudflared 2>/dev/null || true
-            _cf_wait_exit "$_cf_grace" \
-                || _warn "cloudflared 在 ${_cf_grace}s 内未进入停止终态, 转为按进程归属强制清理"
+            _cf_wait_exit "$_cf_grace"; rc=$?
+            case "$rc" in
+                0) ;;
+                2) _cf_unit_unreadable=1
+                   _warn "无法读取 systemd 中 cloudflared 的状态, 本次停止将不宣称已进入停止终态" ;;
+                *) _warn "cloudflared 在 ${_cf_grace}s 内未进入停止终态, 转为按进程归属强制清理" ;;
+            esac
             ;;
         openrc)
             rc-service cloudflared stop 2>/dev/null || true
@@ -1169,7 +1281,14 @@ _cf_kill_all() {
         # step 1 已经解析过一次; openrc 或 step 1 未走的路径在此补算(幂等且不产生等待)。
         [ -n "$_cf_grace" ] || _cf_grace=$(_cf_grace_wait_seconds)
         for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
-        if ! _cf_wait_exit "$_cf_grace"; then
+        _cf_wait_exit "$_cf_grace"; rc=$?
+        if [ "$rc" -eq 2 ]; then
+            # 进程已全部退出, 只是读不到 unit 状态: **没有**需要强杀的对象, 所以不进入
+            # SIGKILL 分支(那会打出一条误导性的"残留进程未退出"告警), 只记下事实, 由第 4 步
+            # 折算成"未确认清理"的返回码。
+            _cf_unit_unreadable=1
+            _warn "无法读取 systemd 中 cloudflared 的状态, 无法确认其已进入停止终态"
+        elif [ "$rc" -eq 1 ]; then
             # 到这里才允许强杀: 优雅窗口已给足, 进程仍未退出。
             _warn "cloudflared 残留进程在 ${_cf_grace}s 内未退出, 发送 SIGKILL"
             pids=$(_cf_pids_owned)
@@ -1189,8 +1308,10 @@ _cf_kill_all() {
             # (lib/55-hysteria.sh:3971): **再 stop 一次**, 然后才复核终态, 顺序不可交换。
             if [ "$INIT_SYSTEM" = systemd ]; then
                 systemctl --no-block stop cloudflared 2>/dev/null || true
-                _cf_wait_exit "$CF_STOP_REVERIFY" \
+                _cf_wait_exit "$CF_STOP_REVERIFY"; rc=$?
+                [ "$rc" -eq 0 ] \
                     || _warn "SIGKILL 后 systemd 未在 ${CF_STOP_REVERIFY}s 内进入停止终态"
+                [ "$rc" -eq 2 ] && _cf_unit_unreadable=1
             fi
         fi
     fi
@@ -1260,6 +1381,14 @@ _cf_kill_all() {
         # `|| _warn` 与 _uninstall_cloudflared 的 kill_rc 契约都依赖这个返回码的真实性)。
         _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认 cloudflared 进程归属"
         _tip "请重跑 install.sh --update 同步模块后重试"
+        return 1
+    fi
+    if [ "$_cf_unit_unreadable" -eq 1 ]; then
+        # 进程都没了, 但读不到 unit 状态 => 没有"已进入停止终态"的证据。这**不是**"仍有
+        # 残留进程", 也不是"已清理干净": 对调用方必须报未确认(_cf_restart 会因此拒绝启动
+        # 第二个实例, _uninstall_cloudflared 会因此保留服务定义与凭据)。
+        _warn "cloudflared 进程已无, 但无法读取 systemd 状态, 停止终态未获确认"
+        _tip "通常是容器内无 systemd 或 systemctl 不可用; 请手动确认服务状态"
         return 1
     fi
     _info "cloudflared 所有进程已清理"

@@ -479,6 +479,102 @@ else
     fail 'cloudflared grace deadline follows EnvironmentFile when the unit uses one'
 fi
 
+# The unit FILE is not the effective configuration: drop-ins, repeated `Environment=` (later
+# wins) and `EnvironmentFile=` (which overrides `Environment=`) all change what the process
+# really runs with. Reading the text alone would report 30s while systemd hands the process
+# 90s -- i.e. SIGKILLing a still-draining tunnel at 35s, the original bug in a new disguise.
+# systemd is the authority, so on systemd we read `systemctl show` and ignore the text.
+# Negative control: a text-only implementation reads the unit file below and returns 35.
+if (
+    INIT_SYSTEM=systemd
+    CF_EFF_UNIT="$TMP/cf-eff.service"
+    # Deliberately WRONG (stale) text: the effective value comes from the drop-in.
+    printf '[Service]\nEnvironment=TUNNEL_GRACE_PERIOD=30s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' > "$CF_EFF_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_EFF_UNIT"; }
+    systemctl() {
+        case "$*" in
+            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
+            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
+            'show -p EnvironmentFiles --value cloudflared') printf '\n' ;;
+            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=90s\n' ;;
+        esac
+        return 0
+    }
+    [ "$(_cf_grace_wait_seconds)" -eq 95 ]
+); then
+    pass 'cloudflared grace deadline comes from the systemd effective configuration'
+else
+    fail 'cloudflared grace deadline comes from the systemd effective configuration'
+fi
+
+# systemd resolves the launch line itself: a drop-in that overrides `ExecStart=` replaces the
+# main unit's line entirely, and the argv it reports is already unquoted (verified against real
+# systemd: a unit line `--grace-period "45s"` is reported as `--grace-period 45s`). The flag
+# still outranks the environment variable.
+if (
+    INIT_SYSTEM=systemd
+    CF_EFF2_UNIT="$TMP/cf-eff2.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 30s run --token x\n' > "$CF_EFF2_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_EFF2_UNIT"; }
+    systemctl() {
+        case "$*" in
+            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
+            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel --grace-period 60s run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
+            'show -p EnvironmentFiles --value cloudflared') printf '\n' ;;
+            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=30s\n' ;;
+        esac
+        return 0
+    }
+    [ "$(_cf_grace_wait_seconds)" -eq 65 ]
+); then
+    pass 'cloudflared grace deadline prefers the systemd-resolved launch line over the environment'
+else
+    fail 'cloudflared grace deadline prefers the systemd-resolved launch line over the environment'
+fi
+
+# Settings from EnvironmentFile= OVERRIDE Environment=, and later files override earlier ones.
+# The file list only exists in systemd's view (a drop-in may add it), so the text cannot be
+# used to enumerate it. Here the file says 120s while Environment says 30s.
+if (
+    INIT_SYSTEM=systemd
+    CF_EFF3_UNIT="$TMP/cf-eff3.service"
+    CF_EFF3_ENV="$TMP/cf-eff3.env"
+    : > "$CF_EFF3_UNIT"
+    printf '# leading comment\nTUNNEL_GRACE_PERIOD=30s\nTUNNEL_GRACE_PERIOD=120s\n' > "$CF_EFF3_ENV"
+    _cf_unit_path() { printf '%s' "$CF_EFF3_UNIT"; }
+    systemctl() {
+        case "$*" in
+            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
+            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
+            'show -p EnvironmentFiles --value cloudflared') printf '%s (ignore_errors=no)\n' "$CF_EFF3_ENV" ;;
+            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=30s\n' ;;
+        esac
+        return 0
+    }
+    # 120s (last assignment in the file wins) beats the Environment= 30s -> 125
+    [ "$(_cf_grace_wait_seconds)" -eq 125 ]
+); then
+    pass 'cloudflared grace deadline honours EnvironmentFile precedence and last-assignment-wins'
+else
+    fail 'cloudflared grace deadline honours EnvironmentFile precedence and last-assignment-wins'
+fi
+
+# An unreadable effective configuration must fall back to the unit text, not to the default:
+# `systemctl show` failing (container without a bus, old systemctl) is not evidence that the
+# user configured nothing.
+if (
+    INIT_SYSTEM=systemd
+    CF_EFF4_UNIT="$TMP/cf-eff4.service"
+    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 80s run --token x\n' > "$CF_EFF4_UNIT"
+    _cf_unit_path() { printf '%s' "$CF_EFF4_UNIT"; }
+    systemctl() { return 1; }   # no bus
+    [ "$(_cf_grace_wait_seconds)" -eq 85 ]
+); then
+    pass 'cloudflared grace deadline falls back to the unit text when systemd is unreadable'
+else
+    fail 'cloudflared grace deadline falls back to the unit text when systemd is unreadable'
+fi
+
 # Go time.Duration accepts ns/us/µs and the contract here is round-UP-to-seconds, so a
 # sub-millisecond value must not collapse to 0s. Bare "0" is a valid Go duration
 # (ParseDuration special-cases it) meaning "do not wait for in-flight requests"; unrecognised
@@ -561,8 +657,12 @@ if (
     }
     _cf_kill_all >/dev/null 2>&1
     calls=$(cat "$CF_STOP_SENTINEL" 2>/dev/null)
-    [ "$(head -n 1 "$CF_STOP_SENTINEL")" = '--no-block stop cloudflared' ] \
-        && contains 'show -p ActiveState --value cloudflared' "$calls" \
+    # The stop request must be the first *mutating* action and the wait must then key on
+    # ActiveState. (Read-only `show` queries may precede it: the grace deadline is now read
+    # from systemd's effective configuration before the stop is issued.)
+    stop_line=$(grep -n -m1 -- '--no-block stop cloudflared' "$CF_STOP_SENTINEL" | cut -d: -f1)
+    active_line=$(grep -n -m1 'show -p ActiveState --value cloudflared' "$CF_STOP_SENTINEL" | cut -d: -f1)
+    [ -n "$stop_line" ] && [ -n "$active_line" ] && [ "$stop_line" -lt "$active_line" ] \
         && ! contains 'is-active' "$calls"
 ); then
     pass 'cloudflared systemd stop is nonblocking and waits on ActiveState'
@@ -709,6 +809,44 @@ if (
     pass 'cloudflared post-SIGKILL verification is bounded'
 else
     fail 'cloudflared post-SIGKILL verification is bounded'
+fi
+
+# "Cannot read the unit state" is NOT "the unit has stopped". _cf_unit_stopped documents rc 2 as
+# "do not conclude anything", so folding 2 into the success branch lets `_cf_kill_all` announce a
+# clean stop it never verified -- and _cf_restart would then start a second connector.
+# Negative control: restoring `*) return 0` makes this return 0 and the assertion fails.
+if (
+    INIT_SYSTEM=systemd
+    _cf_pids_owned() { :; }
+    systemctl() { return 1; }   # bus unavailable / state unreadable
+    sleep() { :; }
+    _cf_wait_exit 3 >/dev/null 2>&1
+    [ "$?" -ne 0 ]
+); then
+    pass 'cloudflared wait exit treats an unreadable unit state as unverified'
+else
+    fail 'cloudflared wait exit treats an unreadable unit state as unverified'
+fi
+
+# ...and that unverified verdict must reach the caller: with every process gone but the unit
+# state unreadable, _cf_kill_all must NOT report success. Otherwise _cf_restart starts a second
+# cloudflared and _uninstall_cloudflared deletes the service definition/credentials on the
+# strength of a check that never answered.
+if (
+    INIT_SYSTEM=systemd
+    rm() { :; }
+    _cf_unit_path() { printf '%s' "$TMP/cloudflared-unreadable.service"; }
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_pids() { :; }
+    _cf_pids_owned() { :; }
+    systemctl() { return 1; }
+    sleep() { :; }
+    _cf_kill_all >/dev/null 2>&1
+    [ "$?" -ne 0 ]
+); then
+    pass 'cloudflared kill-all refuses to claim cleanup when the unit state is unreadable'
+else
+    fail 'cloudflared kill-all refuses to claim cleanup when the unit state is unreadable'
 fi
 
 # The OpenRC stop path must not pay a blind fixed delay either: the owned-process
