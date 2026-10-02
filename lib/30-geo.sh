@@ -7,6 +7,7 @@
 # 调 xd geo-update)。落点 $ASSET_DIR(config env 的 XRAY_LOCATION_ASSET 指向)。
 # 注意: assets.file 构建时要求已存在(geodata.go StatAsset); 启用前必须确保 dat 在
 # assets/ 下(安装自带 / [1] 立即更新一次)。
+# DNS 设置: 管理 confs/04_dns.json(dns 模块); 写盘前先用真核心 -test 预检候选配置。
 # ============================================================================
 
 GEO_CRON_MARKER="# xray-deploy-geo-update"
@@ -29,7 +30,7 @@ _geo_transition_clear() {
 }
 
 # ---------------------------------------------------------------------------
-# 生成 config.json 的 geodata 段(R45), 结构见 docs/config/geodata.md: cron(5 字段) +
+# 生成配置的 geodata 段(R45), 结构见 docs/config/geodata.md: cron(5 字段) +
 # assets[](url 必须 HTTPS)。outbound 省略 → 下载走路由模块(默认 github 直连); 输出必须
 # 是合法 JSON(供 --argjson)。
 # ---------------------------------------------------------------------------
@@ -42,15 +43,15 @@ _geo_geodata_json() {
 }
 
 # ---------------------------------------------------------------------------
-# 自动更新状态与机制(R45): 真相源 config.json 的 .geodata.cron 非空 = 内置更新开启(Xray
+# 自动更新状态与机制(R45): 真相源配置的 .geodata.cron 非空 = 内置更新开启(Xray
 # 定时, 无需系统 cron); 无 geodata 时回退读 state geo_cron(=on 表示旧 cron 方案在跑)。
 # _geo_auto_mechanism 输出恒为 builtin|cron|off(唯一查询点), _geo_auto_state 复用后输出
 # on|off —— 单一来源, 避免 jq 查询漂移。
 # ---------------------------------------------------------------------------
 _geo_auto_mechanism() {
     local c=""
-    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
-        c=$(jq -r '.geodata.cron // empty' "$CONFIG_FILE" 2>/dev/null)
+    if _config_present && command -v jq >/dev/null 2>&1; then
+        c=$(_config_jq -r '.geodata.cron // empty' 2>/dev/null)
     fi
     [ -n "$c" ] && { echo "builtin"; return 0; }
     [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] && { echo "cron"; return 0; }
@@ -208,8 +209,8 @@ _geo_finalize_legacy_cron_locked() {
     [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
     [ "$(_geo_transition_get)" = "off_pending" ] && return 0
     [ -x "$XRAY_BIN" ] && _xray_version_ge "26.4.25" || return 0
-    [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 0
-    [ "$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null)" = "1" ] || return 0
+    _config_present && command -v jq >/dev/null 2>&1 || return 0
+    [ "$(_config_jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' 2>/dev/null)" = "1" ] || return 0
 
     if ! _geo_remove_cron_line; then
         _warn "Geo 数据已更新, 但旧系统 cron 兜底未能移除; 下次成功更新会重试"
@@ -272,11 +273,11 @@ _geo_set_auto_update() {
                 return 1
             fi
             local has_geo=0 off_failed=0
-            if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
+            if _config_present; then
                 if ! command -v jq >/dev/null 2>&1; then
                     _warn "无法检查 config 中的 geodata, 保留关闭重试标记"
                     off_failed=1
-                elif ! has_geo=$(jq -r 'if has("geodata") then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null); then
+                elif ! has_geo=$(_config_jq -r 'if has("geodata") then 1 else 0 end' 2>/dev/null); then
                     _warn "无法读取 config 中的 geodata, 保留关闭重试标记"
                     off_failed=1
                     has_geo=unknown
@@ -395,7 +396,7 @@ _auto_migrate_geo_autoupdate() {
     if [ "$transition" != "off_pending" ] && [ "$(_state_get geo_cron 2>/dev/null)" != "on" ]; then
         return 0
     fi
-    [ -f "$CONFIG_FILE" ] || [ "$transition" = "off_pending" ] || return 0
+    _config_present || [ "$transition" = "off_pending" ] || return 0
     _with_config_lock _auto_migrate_geo_autoupdate_locked
 }
 _auto_migrate_geo_autoupdate_locked() {
@@ -403,7 +404,7 @@ _auto_migrate_geo_autoupdate_locked() {
     if [ "$transition" != "off_pending" ] && [ "$(_state_get geo_cron 2>/dev/null)" != "on" ]; then
         return 0
     fi
-    [ -f "$CONFIG_FILE" ] || [ "$transition" = "off_pending" ] || return 0
+    _config_present || [ "$transition" = "off_pending" ] || return 0
     _with_config_write_barrier _auto_migrate_geo_autoupdate_write
 }
 
@@ -414,9 +415,9 @@ _auto_migrate_geo_autoupdate_write() {
     fi
     local transition has_geo=0 content
     transition=$(_geo_transition_get)
-    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
+    if _config_present; then
         command -v jq >/dev/null 2>&1 || return 1
-        has_geo=$(jq -r 'if has("geodata") then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null) || return 1
+        has_geo=$(_config_jq -r 'if has("geodata") then 1 else 0 end' 2>/dev/null) || return 1
     fi
 
     if [ "$transition" = "off_pending" ]; then
@@ -439,9 +440,9 @@ _auto_migrate_geo_autoupdate_write() {
     fi
 
     [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
-    [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 0
+    _config_present && command -v jq >/dev/null 2>&1 || return 0
     local has_enabled_gd
-    has_enabled_gd=$(jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' "$CONFIG_FILE" 2>/dev/null) || return 0
+    has_enabled_gd=$(_config_jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' 2>/dev/null) || return 0
     # 已写入的 geodata 可能尚未加载进运行中的 Xray. 保留 legacy cron/state; _geo_update
     # 负责在首次成功提交并收敛 runtime 后清理, 而启动迁移本身绝不重启服务。
     [ "$has_enabled_gd" = "1" ] && return 0
@@ -450,9 +451,9 @@ _auto_migrate_geo_autoupdate_write() {
        && [ -f "$ASSET_DIR/geosite.dat" ] && [ -f "$ASSET_DIR/geoip.dat" ]; then
         local gd
         gd=$(_geo_geodata_json) || return 0
-        content=$(jq --argjson gd "$gd" '.geodata = $gd' "$CONFIG_FILE" 2>/dev/null) || return 0
+        content=$(_config_jq --argjson gd "$gd" '.geodata = $gd' 2>/dev/null) || return 0
         [ -n "$content" ] || return 0
-        if _atomic_write_json "$CONFIG_FILE" "$content" 2>/dev/null; then
+        if _config_write_merged "$content" 2>/dev/null; then
             _info "已写入 Geo 内置定时($GEO_CRON_EXPR); 暂保留旧系统 cron, 首次成功更新后切换"
         fi
     fi
@@ -476,8 +477,8 @@ _geo_remove_cron_line() {
 # ---------------------------------------------------------------------------
 _geo_next_run_hint() {
     local c=""
-    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
-        c=$(jq -r '.geodata.cron // empty' "$CONFIG_FILE" 2>/dev/null)
+    if _config_present && command -v jq >/dev/null 2>&1; then
+        c=$(_config_jq -r '.geodata.cron // empty' 2>/dev/null)
     fi
     if [ -n "$c" ]; then
         echo "Xray 内置定时: ${c} (每月 1/4/7/.../31 号 03:00, 热重载)"
@@ -503,7 +504,7 @@ _route_preflight() {
     if [ -z "${XRAY_DEFAULT_ROUTING_RULES_JSON:-}" ] || [ -z "${XRAY_PRIVATE_BLOCK_RULE_JSON:-}" ] \
        || [ -z "${XRAY_PRIVATE_BLOCK_RULE_TAG:-}" ]; then
         _error "缺少默认规则常量(lib/00-common.sh 可能是旧版本), 无法修改路由规则"
-        _tip "请在运维菜单执行 [检测脚本更新] 完整更新一次后重试"
+        _tip "请在主菜单执行 [检测脚本更新] 完整更新一次后重试"
         return 1
     fi
     return 0
@@ -515,12 +516,12 @@ _route_preflight() {
 # "0 0 0 0 0" 并返回 1(调用方据此显示"无法读取")。
 # ---------------------------------------------------------------------------
 _route_rules_stats() {
-    if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1; then
+    if ! _config_present || ! command -v jq >/dev/null 2>&1; then
         printf '0 0 0 0 0'
         return 1
     fi
     local out
-    out=$(jq -r "
+    out=$(_config_jq -r "
         [.routing.rules[]?] as \$r
         | [
             (\$r | length),
@@ -528,7 +529,7 @@ _route_rules_stats() {
             ([\$r[] | select(.inboundTag? != null)] | length),
             ([\$r[] | select((.ruleTag? // null) == \"${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}\")] | length),
             ([\$r[] | select(.inboundTag? != null and (${GEO_RULE_REF_JQ}))] | length)
-          ] | @tsv" "$CONFIG_FILE" 2>/dev/null) || { printf '0 0 0 0 0'; return 1; }
+          ] | @tsv" 2>/dev/null) || { printf '0 0 0 0 0'; return 1; }
     [ -n "$out" ] || { printf '0 0 0 0 0'; return 1; }
     # @tsv 用制表符分隔, 转成空格便于调用方 read -r 拆分
     printf '%s' "$out" | tr '\t' ' '
@@ -539,7 +540,7 @@ _route_rules_stats() {
 # while allowing traffic, omitting CIDRs, duplicating the marker, or sitting after a catch-all.
 _route_private_block_valid() {
     [ -n "${XRAY_PRIVATE_BLOCK_RULE_JSON:-}" ] || return 1
-    jq -e --arg tag "${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}" \
+    _config_jq -e --arg tag "${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}" \
         --argjson expected "$XRAY_PRIVATE_BLOCK_RULE_JSON" '
         ([.routing.rules[]?] ) as $r
         | [range(0; ($r|length)) as $i
@@ -550,7 +551,7 @@ _route_private_block_valid() {
           else ($r[$marks[0]] == $expected)
                and (($generic|length) == 0 or $marks[0] < $generic[0])
           end
-    ' "$CONFIG_FILE" >/dev/null 2>&1
+    ' >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -558,17 +559,17 @@ _route_private_block_valid() {
 # 但手改过的配置可能有 —— 精简 routing 不足以免除 dat 加载, 必须如实告警。
 # ---------------------------------------------------------------------------
 _route_dns_geo_count() {
-    if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ] || ! command -v jq >/dev/null 2>&1; then
+    if ! _config_present || ! command -v jq >/dev/null 2>&1; then
         printf '0'
         return 1
     fi
     local n
-    n=$(jq -r '
+    n=$(_config_jq -r '
         [.dns?.servers[]? | select(type == "object")
          | (.domains? // [])[]?, (.expectedIPs? // [])[]?, (.expectIPs? // [])[]?]
         | map(select(type == "string")) | map(ltrimstr("!"))
         | map(select(startswith("geosite:") or startswith("geoip:") or startswith("ext:")))
-        | length' "$CONFIG_FILE" 2>/dev/null) || { printf '0'; return 1; }
+        | length' 2>/dev/null) || { printf '0'; return 1; }
     [[ "$n" =~ ^[0-9]+$ ]] || n=0
     printf '%s' "$n"
     return 0
@@ -659,7 +660,7 @@ _route_rules_menu() {
             if [ "$dnsgeo" -gt 0 ]; then
                 echo
                 _warn "dns 段还有 ${dnsgeo} 处 geo 引用, 精简路由规则不足以完全免除 dat 加载"
-                _tip "如需彻底省内存, 请手工编辑 ${CONFIG_FILE} 的 dns 段去掉 geosite:/geoip:/ext: 引用"
+                _tip "如需彻底省内存, 请手工编辑 ${CONFIG_DIR}/04_dns.json 去掉 geosite:/geoip:/ext: 引用"
             fi
         fi
         echo
@@ -770,3 +771,208 @@ _geo_menu() {
     esac
     _press_any_key
 }
+
+# =============================================================================
+# DNS 设置 — 管理 confs/04_dns.json 的 dns 段
+#
+# 只改 .dns 一个字段, 其余字段原样保留。写盘复用通用事务路径(_mutate_config:
+# 备份 → jq → 拆回 confs → 重启校验 → 失败回滚), 但**多一道预检**: 先把候选配置拆进
+# 临时目录, 用真核心 `xray -test -confdir` 校验, 通过才写盘 —— 手输地址写错时不会把
+# 一份正在工作的配置换成起不来的。
+#
+# 上游地址按需求存成**普通字符串**(不打 tag), 保持 04_dns.json 可读。默认上游都是
+# https+local:// 直连 DoH; 手输的纯 IP 走默认第一条出站(direct), 无需改 routing。
+# =============================================================================
+
+# 展示用摘要: 输出 "<上游列表>|<解析策略>"。无 dns 段/解析失败时上游与策略都为空。
+_dns_summary() {
+    if ! _config_present || ! command -v jq >/dev/null 2>&1; then
+        printf '|'
+        return 1
+    fi
+    local out
+    out=$(_config_jq -r '
+        (.dns | if type == "object" then . else {} end) as $d
+        | [($d.servers // [])[]?
+           | if type == "string" then .
+             elif type == "object" and has("address") then .address
+             else empty end] as $s
+        | [($s | join(", ")), ($d.queryStrategy // "")] | @tsv' 2>/dev/null)
+    [ -n "$out" ] || { printf '|'; return 1; }
+    printf '%s' "$out" | tr '\t' '|'
+}
+
+# 候选配置预检 + 落地。参数与 _config_jq 一致(选项在前, filter 在最后)。
+_dns_apply() {
+    [ "$#" -ge 1 ] || return 1
+    local filter="${!#}" cand content
+    local opts=()
+    [ "$#" -gt 1 ] && opts=("${@:1:$#-1}")
+    _config_edit_preflight "修改 DNS 配置" || return 1
+    if [ "${#opts[@]}" -gt 0 ]; then
+        content=$(_config_jq "${opts[@]}" "$filter" 2>/dev/null)
+    else
+        content=$(_config_jq "$filter" 2>/dev/null)
+    fi
+    [ -n "$content" ] || { _error "生成 DNS 配置失败, 已保留原配置"; return 1; }
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    cand=$(mktemp -d "${STATE_DIR}/dns-preview.XXXXXX") || { _error "无法创建临时目录, 已保留原配置"; return 1; }
+    if ! _config_write_merged "$content" "$cand"; then
+        rm -rf "$cand"
+        _error "生成候选配置失败, 已保留原配置"
+        return 1
+    fi
+    echo
+    _info "先用临时配置运行 xray -test..."
+    if ! _xray_test_config_dir "$cand"; then
+        rm -rf "$cand"
+        _error "配置检查未通过, 已保留原配置"
+        return 1
+    fi
+    rm -rf "$cand"
+    if [ "${#opts[@]}" -gt 0 ]; then
+        _mutate_config "${opts[@]}" "$filter" || { _error "写入 DNS 配置失败, 已保留原配置"; return 1; }
+    else
+        _mutate_config "$filter" || { _error "写入 DNS 配置失败, 已保留原配置"; return 1; }
+    fi
+    return 0
+}
+
+_dns_view() {
+    clear
+    echo
+    echo -e "  ${CYAN}【DNS 配置】${NC}"
+    echo -e "  字段 dns, 文件 ${CONFIG_DIR}/04_dns.json"
+    echo
+    if ! _config_present; then
+        _warn "配置不存在"
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        _warn "jq 不可用, 无法查看"
+        return 0
+    fi
+    _config_jq '.dns // null' 2>/dev/null || _warn "读取 DNS 配置失败"
+    return 0
+}
+
+_dns_set_servers() {
+    _config_edit_preflight "修改 DNS 配置" || return 1
+    echo
+    echo -e "  ${CYAN}选择上游 DNS 服务器${NC}"
+    echo -e "  当前上游: $(_dns_summary | cut -d'|' -f1)"
+    echo
+    echo -e "  ${GREEN}[1]${NC} 1.1.1.1 (Cloudflare)"
+    echo -e "  ${GREEN}[2]${NC} 8.8.8.8 (Google)"
+    echo -e "  ${GREEN}[3]${NC} https://cloudflare-dns.com/dns-query (Cloudflare DoH)"
+    echo -e "  ${GREEN}[4]${NC} https://dns.google/dns-query (Google DoH)"
+    echo -e "  ${GREEN}[5]${NC} 手动输入"
+    echo -e "  ${GREEN}[0]${NC} 取消"
+    local c addr=""
+    read -rp "  请选择: " c || return 0
+    case "${c:-0}" in
+        1) addr="1.1.1.1" ;;
+        2) addr="8.8.8.8" ;;
+        3) addr="https://cloudflare-dns.com/dns-query" ;;
+        4) addr="https://dns.google/dns-query" ;;
+        5) read -rp "  请输入 DNS 地址(如 1.1.1.1 或 https://dns.google/dns-query): " addr || return 0 ;;
+        0) return 0 ;;
+        *) _warn "无效选择"; return 1 ;;
+    esac
+    addr="${addr//[[:space:]]/}"
+    [ -n "$addr" ] || { _warn "地址为空, 已取消"; return 1; }
+    _dns_apply --arg a "$addr" '.dns = ((.dns | if type == "object" then . else {} end) + {servers: [$a]})' || return 1
+    _success "DNS 上游已更新为: $addr"
+}
+
+_dns_set_strategy() {
+    _config_edit_preflight "修改 DNS 配置" || return 1
+    echo
+    echo -e "  ${CYAN}选择解析策略 queryStrategy${NC}"
+    echo -e "  当前策略: $(_dns_summary | cut -d'|' -f2)"
+    echo
+    echo -e "  ${GREEN}[1]${NC} UseIP   (IPv4 + IPv6, 默认)"
+    echo -e "  ${GREEN}[2]${NC} UseIPv4 (只解析 IPv4)"
+    echo -e "  ${GREEN}[3]${NC} UseIPv6 (只解析 IPv6)"
+    echo -e "  ${GREEN}[0]${NC} 取消"
+    local c s=""
+    read -rp "  请选择: " c || return 0
+    case "${c:-0}" in
+        1) s="UseIP" ;;
+        2) s="UseIPv4" ;;
+        3) s="UseIPv6" ;;
+        0) return 0 ;;
+        *) _warn "无效选择"; return 1 ;;
+    esac
+    _dns_apply --arg s "$s" '.dns = ((.dns | if type == "object" then . else {} end) + {queryStrategy: $s})' || return 1
+    _success "解析策略已更新为: $s"
+}
+
+_dns_restore_default() {
+    _config_edit_preflight "修改 DNS 配置" || return 1
+    if [ -z "${XRAY_DEFAULT_DNS_JSON:-}" ]; then
+        _error "缺少默认 DNS 常量(lib/00-common.sh 可能是旧版本), 无法恢复默认"
+        _tip "请先在主菜单执行 [检测脚本更新] 完整更新一次后重试"
+        return 1
+    fi
+    local ans
+    read -rp "  确认恢复默认 DNS(三个 https+local:// DoH 上游)? [y/N]: " ans
+    case "$ans" in
+        y|Y) ;;
+        *) _info "已取消"; return 0 ;;
+    esac
+    _dns_apply --argjson d "$XRAY_DEFAULT_DNS_JSON" '.dns = $d' || return 1
+    _success "已恢复默认 DNS"
+}
+
+_dns_delete() {
+    _config_edit_preflight "修改 DNS 配置" || return 1
+    local ans
+    read -rp "  确认删除 DNS 配置(改用系统默认 DNS)? [y/N]: " ans
+    case "$ans" in
+        y|Y) ;;
+        *) _info "已取消"; return 0 ;;
+    esac
+    _dns_apply 'del(.dns)' || return 1
+    _success "已删除 DNS 配置(改用系统默认 DNS)"
+}
+
+_dns_menu() {
+    local choice
+    while true; do
+        clear
+        echo
+        echo -e "  ${CYAN}【DNS 设置】${NC}"
+        local summary servers strategy
+        summary=$(_dns_summary)
+        servers="${summary%%|*}"
+        strategy="${summary##*|}"
+        if _config_present && command -v jq >/dev/null 2>&1 && _config_jq -e 'has("dns")' >/dev/null 2>&1; then
+            echo -e "  配置状态: ${GREEN}已配置${NC} (${CONFIG_DIR}/04_dns.json)"
+        else
+            echo -e "  配置状态: ${YELLOW}未配置(用系统默认 DNS)${NC}"
+        fi
+        echo -e "  当前上游: ${servers:-未设置}"
+        echo -e "  解析策略: ${strategy:-未设置}"
+        echo
+        echo -e "  ${GREEN}[1]${NC} 设置上游 DNS 服务器"
+        echo -e "  ${GREEN}[2]${NC} 设置解析策略"
+        echo -e "  ${GREEN}[3]${NC} 恢复默认 DNS"
+        echo -e "  ${GREEN}[4]${NC} 删除 DNS 配置"
+        echo -e "  ${GREEN}[5]${NC} 查看完整 DNS 配置"
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        echo
+        read -rp "  请选择: " choice || return 0
+        case "${choice:-0}" in
+            1) _dns_set_servers ;;
+            2) _dns_set_strategy ;;
+            3) _dns_restore_default ;;
+            4) _dns_delete ;;
+            5) _dns_view ;;
+            0) return ;;
+            *) _warn "无效选择" ;;
+        esac
+        _press_any_key
+    done
+}
+

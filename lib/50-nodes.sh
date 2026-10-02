@@ -215,10 +215,10 @@ XD_UDP_JQ_DROP="$XD_UDP_JQ_UPSERT"
 # 用法: _hy2_udp_has_foreign_salamander <tag>; rc=0 表示存在
 _hy2_udp_has_foreign_salamander() {
     local tag="$1"
-    jq -e --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" \
+    _config_jq -e --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" \
         '[.inbounds[]? | select(.tag == $t) | (.streamSettings.finalmask.udp // [])[]
           | select(.type == $ourtype and (.settings // {})[$ourmark] != true)] | length > 0' \
-        "$CONFIG_FILE" >/dev/null 2>&1
+        >/dev/null 2>&1
 }
 
 # 从 (type, password, packetSize) 构造 finalmask.udp 数组字面量; 层带**归属标记**
@@ -350,8 +350,8 @@ _hy2_masq_trim() {
 # 用法: _hy2_masq_get <tag> <type|dir|url|rewriteHost|xForwarded|insecure|content|statusCode>
 _hy2_masq_get() {
     local tag="$1" field="$2"
-    [ -f "$CONFIG_FILE" ] || return 0
-    jq -r --arg t "$tag" --arg k "$field" '
+    _config_present || return 0
+    _config_jq -r --arg t "$tag" --arg k "$field" '
         (.inbounds[]? | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade) as $m
         | if ($m | type) != "object" then ""
           else (if $k == "type" then ($m.type // "")
@@ -363,15 +363,15 @@ _hy2_masq_get() {
                 elif $k == "insecure" then (($m.insecure // false) | tostring)
                 elif $k == "xForwarded" then (($m.xForwarded // false) | tostring)
                 else "" end) | tostring
-          end' "$CONFIG_FILE" 2>/dev/null
+          end' 2>/dev/null
 }
 
 # 当前伪装的一句话描述(菜单唯一展示入口; 单次 jq, 避免"同一状态两处各自解释")。
 # type 按核心口径**不区分大小写**(hub.go: strings.ToLower(config.MasqType))。
 _hy2_masq_desc() {
     local tag="$1"
-    [ -f "$CONFIG_FILE" ] || return 0
-    jq -r --arg t "$tag" '
+    _config_present || return 0
+    _config_jq -r --arg t "$tag" '
         (.inbounds[]? | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade) as $m
         | if ($m | type) != "object" then "默认 404 页面"
           else
@@ -385,7 +385,7 @@ _hy2_masq_desc() {
               elif $ty == "string" then "固定字符串: \(($m.content // "") | length) 字符, HTTP \(if (($m.statusCode // 0) | tostring) != "0" then (($m.statusCode) | tostring) else "200" end)"
                    + (if (($m.headers // {}) | length) > 0 then ", \((($m.headers) | length) | tostring) 个响应头" else "" end)
               else "未知类型 \($ty) —— 核心会拒绝启动, 请改正或改回默认 404" end
-          end' "$CONFIG_FILE" 2>/dev/null
+          end' 2>/dev/null
 }
 
 # 三个输入校验器: 输出**原因文本**(空串 = 合法), 与 _hy2_obfs_size_invalid 同口径 ——
@@ -1060,7 +1060,7 @@ _hy2_hop_txn_locked() {
     requested_ranges="$*"
     if [ "$op" = add ]; then
         [ -z "$current_ranges" ] || { _error "节点端口跳跃状态已变化, 请重新选择"; return 1; }
-        if ! jq -e --arg t "$tag" --argjson p "$port" '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria" and .port == $p)] | length == 1' "$CONFIG_FILE" >/dev/null 2>&1; then
+        if ! _config_jq -e --arg t "$tag" --argjson p "$port" '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria" and .port == $p)] | length == 1' >/dev/null 2>&1; then
             _error "config 中的节点已变化, 拒绝启用端口跳跃"
             return 1
         fi
@@ -1077,7 +1077,7 @@ _hy2_hop_txn_locked() {
         [ -n "$current_ranges" ] && [ "$current_ranges" = "$requested_ranges" ] || {
             _error "节点端口跳跃范围已变化, 请重新选择"; return 1;
         }
-        if ! jq -e --arg t "$tag" --argjson p "$port" '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria" and .port == $p)] | length == 1' "$CONFIG_FILE" >/dev/null 2>&1; then
+        if ! _config_jq -e --arg t "$tag" --argjson p "$port" '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria" and .port == $p)] | length == 1' >/dev/null 2>&1; then
             _error "config 中的节点已变化, 拒绝禁用端口跳跃"
             return 1
         fi
@@ -1256,7 +1256,7 @@ _hy2_hop_teardown_all() {
         # 端口找不到(或误删)DNAT 规则。仅当 config 存在该 inbound 时强制; config 已无该 inbound
         # 说明已是孤儿/外部删除, metadata.port 仍是当初 add 用的正确清理目标。
         local cfg_port
-        cfg_port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' "$CONFIG_FILE" 2>/dev/null)
+        cfg_port=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
         if [ -n "$cfg_port" ] && [ "$cfg_port" != "$hop_port" ]; then
             _error "节点元数据端口($hop_port)与 config 监听端口($cfg_port)不一致, 无法安全删除: $tag"
             _HY2_HOP_SKIP+=("$tag")
@@ -1441,9 +1441,9 @@ _hy2_port_txn_locked() {
         _error "节点端口跳跃范围已变化, 请重新选择端口: $tag"
         return 1
     fi
-    if ! jq -e --arg t "$tag" --argjson p "$oldport" \
+    if ! _config_jq -e --arg t "$tag" --argjson p "$oldport" \
         '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria" and .port == $p)] | length == 1' \
-        "$CONFIG_FILE" >/dev/null 2>&1; then
+        >/dev/null 2>&1; then
         _error "config 中的 Hysteria2 端口已变化, 拒绝开始端口事务: $tag"
         return 1
     fi
@@ -1885,13 +1885,13 @@ _gen_free_tunnel_port() {
     return 0
 }
 
-# 检查端口是否已存在于 config.json
+# 检查端口是否已存在于配置
 _check_port_in_config() {
     local port="$1"
     # 入口校验: port 必须为数字 (M15: --argjson 对非数字行为未定义)
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
-    [ -f "$CONFIG_FILE" ] || return 1
-    jq -e --argjson p "$port" '.inbounds[] | select(.port == $p)' "$CONFIG_FILE" >/dev/null 2>&1
+    _config_present || return 1
+    _config_jq -e --argjson p "$port" '.inbounds[] | select(.port == $p)' >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -1986,7 +1986,7 @@ _render_template() {
 }
 
 # ---------------------------------------------------------------------------
-# 统一的 config.json 修改流程: backup → jq → 重排 → verified-restart → 失败回滚
+# 统一的配置修改流程: backup → 合并 jq → 拆回 confs → verified-restart → 失败回滚
 # 用法:_mutate_config [--arg/--argjson ...] <jq_filter>
 # 参数: jq 选项在前, jq filter 在最后(必须)
 # 所有 config 修改应通过此函数, 不再各自实现 backup/test/rollback。
@@ -2022,31 +2022,21 @@ _mutate_config_write() {
         _error "配置备份失败,中止操作"
         return 1
     fi
-    local tmp
-    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || { _error "无法创建临时配置"; return 1; }
-    # 获取最后一个参数(用户 filter), 其余是 jq 选项
-    local user_filter="${!#}"
-    # 应用 filter 后, 按官方字段顺序重排顶层字段(字段列表定义在 00-common XRAY_TOP_FIELDS_JSON)
-    local reorder="| . as \$c | (${XRAY_TOP_FIELDS_JSON}) as \$known | (reduce \$known[] as \$k ({}; .[\$k] = \$c[\$k]) | with_entries(select(.value != null))) as \$ordered | (\$c | to_entries | map(select(.key as \$k | \$known | index(\$k) | not)) | from_entries) as \$extra | \$ordered + \$extra"
-    local combined="${user_filter} ${reorder}"
-    # 构建参数列表: 去掉最后一个(filter), 追加合并后的 filter
-    local args=("${@:1:$#-1}" "${combined}")
-    if ! jq "${args[@]}" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
+    # 用户 filter 是最后一个参数, 其余是 jq 选项 —— 原样转给 _config_jq(它在合并视图上跑 jq)
+    local content user_filter="${!#}"
+    local args=("${@:1:$#-1}" "$user_filter")
+    if ! content=$(_config_jq "${args[@]}" 2>/dev/null); then
         # 2026-09-12 三审: 仅失败路径重放一次拿 jq stderr(正常路径零开销),
         # 否则用户只见一句"jq 处理失败", 无法定位是哪段过滤/哪份手改配置出的问题。
-        local jq_err; jq_err=$(jq "${args[@]}" "$CONFIG_FILE" 2>&1 >/dev/null | head -3)
+        local jq_err; jq_err=$(_config_jq "${args[@]}" 2>&1 >/dev/null | head -3)
         _error "jq 处理失败: ${jq_err:-未知错误}"
         return 1
     fi
-    if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"; _error "生成的配置为空"; return 1
-    fi
-    # R23: mv 失败必须显式中止 — 否则旧 config 仍在, _restart_xray_verified 用旧配置重启成功,
-    # 会被误判为"新配置已提交"(静默假成功)。mv 失败时旧 config 未动, 直接 return 1。
-    if ! mv -f "$tmp" "$CONFIG_FILE"; then
-        rm -f "$tmp"
-        _error "配置替换失败, 保留旧配置"
+    [ -n "$content" ] || { _error "生成的配置为空"; return 1; }
+    # 拆回 confs(逐字段原子写)。有文件写失败时现场可能半新半旧, 直接用本次备份整体恢复。
+    if ! _config_write_merged "$content"; then
+        _error "配置写入失败, 正在回滚"
+        _restore_config || _error "回滚失败($BACKUP_DIR/confs.lastbak 不存在或恢复出错)"
         return 1
     fi
     # 低内存 VPS: 不预跑 xray -test(会与运行实例同时加载两份二进制+geo 触发 OOM),
@@ -2054,7 +2044,7 @@ _mutate_config_write() {
     if ! _restart_xray_verified; then
         _error "xray 启动失败,回滚配置"
         if ! _restore_config; then
-            _error "回滚失败(config.json.lastbak 不存在或恢复出错),未尝试重启"
+            _error "回滚失败($BACKUP_DIR/confs.lastbak 不存在或恢复出错),未尝试重启"
             return 1
         fi
         if _restart_xray_verified; then
@@ -2067,7 +2057,7 @@ _mutate_config_write() {
     return 0
 }
 
-# 把渲染好的 inbound 加入 config.json
+# 把渲染好的 inbound 加入配置
 _commit_inbound() {
     local inbound="$1"
     _mutate_config --argjson nb "$inbound" '.inbounds += [$nb]' || return 1
@@ -2099,7 +2089,7 @@ _commit_node_txn_locked() {
     # 锁内占用校验(三十二轮 P1/P2): 锁外的"端口空闲/名称唯一"都是 TOCTOU 检查 —— 并发会话可以
     # 在两次检查之间提交同名/同 tag 节点。这里在真正写入前再验一次, 冲突则整个事务拒绝。
     if [ -e "$NODES_DIR/${tag}.json" ] || \
-       jq -e --arg t "$tag" '[.inbounds[]? | select((.tag // "") == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+       _config_jq -e --arg t "$tag" '[.inbounds[]? | select((.tag // "") == $t)] | length > 0' >/dev/null 2>&1; then
         _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消: ${tag}"
         return 1
     fi
@@ -2114,7 +2104,7 @@ _commit_node_txn_locked() {
         _error "元数据写入失败, 正在回滚入站: $tag"
         _mutate_config --arg t "$tag" \
             '.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))' || \
-            _error "回滚入站失败, 请手动检查 config.json: $tag"
+            _error "回滚入站失败, 请手动检查配置: $tag"
         return 1
     fi
     [ -n "$clash_line" ] && { _add_node_to_yaml "$clash_line" "$name" || true; }
@@ -2144,7 +2134,7 @@ _commit_hy2_node_txn_locked() {
 
     # (1) 锁内占用校验 —— 必须在任何证书操作之前, 冲突直接返回且不碰共享证书路径。
     if [ -e "$NODES_DIR/${tag}.json" ] || \
-       jq -e --arg t "$tag" '[.inbounds[]? | select((.tag // "") == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+       _config_jq -e --arg t "$tag" '[.inbounds[]? | select((.tag // "") == $t)] | length > 0' >/dev/null 2>&1; then
         _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消且未生成证书: ${tag}"
         return 1
     fi
@@ -2242,9 +2232,9 @@ _commit_reality_node_txn_locked() {
     local tag="$1" tunnel="$2" reality="$3" tunnel_tag="$4" domain="$5" meta_json="$6" clash_line="${7:-}" name="${8:-}"
     # 锁内占用校验(三十二轮 P1/P2): tag 与 tunnel_tag 都必须仍空闲; name 也必须仍唯一。
     if [ -e "$NODES_DIR/${tag}.json" ] || \
-       jq -e --arg t "$tag" --arg tt "$tunnel_tag" \
+       _config_jq -e --arg t "$tag" --arg tt "$tunnel_tag" \
           '[.inbounds[]? | select((.tag // "") == $t or (.tag // "") == $tt)] | length > 0' \
-          "$CONFIG_FILE" >/dev/null 2>&1; then
+          >/dev/null 2>&1; then
         _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消: ${tag}"
         return 1
     fi
@@ -2262,7 +2252,7 @@ _commit_reality_node_txn_locked() {
             '.inbounds |= map(select((type != "object") or ((.tag // "") as $x | ($x != $t and $x != $tg))))
              | .routing.rules |= map(select((type != "object") or .inboundTag == null
                    or ([.inboundTag[]? | . as $it | ($it != $tg)] | all)))' || \
-            _error "回滚入站/路由失败, 请手动检查 config.json: $tag"
+            _error "回滚入站/路由失败, 请手动检查配置: $tag"
         return 1
     fi
     [ -n "$clash_line" ] && { _add_node_to_yaml "$clash_line" "$name" || true; }
@@ -2340,7 +2330,7 @@ _reality_node_mode() {
     meta="$NODES_DIR/${tag}.json"
 
     # 第 1 步: config 归类(实际状态)
-    target=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' "$CONFIG_FILE" 2>/dev/null) || target=""
+    target=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' 2>/dev/null) || target=""
     case "$target" in
         *:*) ;;
         *) printf 'tunnel'; return 0 ;;
@@ -2407,7 +2397,7 @@ _is_reality_loopback_host() {
 # 用法: _save_node_meta <tag> <json_object>
 #
 # **刻意不接"未收敛事务"写闸门/屏障**(复审 P2-2): ① 它写的是**元数据声明**, 权威状态是
-# config.json; 事务提交路径在闸门化的 config 提交**之后**才调用它, 再拒绝只会制造
+# 配置; 事务提交路径在闸门化的 config 提交**之后**才调用它, 再拒绝只会制造
 # config/metadata 分裂(回滚路径 _mutate_config 本身也被闸门拦下); metadata-only 的采纳路径
 # 已在 _adopt_single_inbound_write 的屏障+闸门内。② 通用原语 `_meta_update` 还被事务账本
 # (coretxn / reset journal)使用, 加写闸门会自锁账本机制。③ core recovery 不读写节点 metadata,
@@ -2433,7 +2423,7 @@ _save_node_meta() {
 # 改为跳过并告警, 只有"确实读到同名"才拒绝。
 # R39(P2) 语义声明 —— **存在损坏 metadata 时唯一性降级为 best-effort**: 损坏文件里可能恰好
 # 存着同名节点而本函数无从得知, 故不能声称"name 全局唯一"。影响面仅限 clash.yaml(可再生的
-# 派生导出, 按 name 删除时可能同时删掉两条同名条目), 不影响 config.json 与节点本体。
+# 派生导出, 按 name 删除时可能同时删掉两条同名条目), 不影响配置与节点本体。
 # 取舍: "一个坏文件让所有新建失败"的代价远大于"极小概率的派生缓存重名"。调用方需要严格
 # 唯一时必须先修复/移除损坏的 metadata(本函数已把数量告知用户)。
 # 返回: 0 唯一(或无法确认); 1 确实已存在(调用方应中止创建)
@@ -2503,15 +2493,15 @@ _node_identity() {
     local tag="$1" meta tt cfg
     meta=$(jq -S -c . "$NODES_DIR/${tag}.json" 2>/dev/null) || return 1
     tt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
-    cfg=$(jq -S -c --arg t "$tag" --arg tt "$tt" \
+    cfg=$(_config_jq -S -c --arg t "$tag" --arg tt "$tt" \
         '[.inbounds[]? | select((.tag // "") == $t or ($tt != "" and (.tag // "") == $tt))]' \
-        "$CONFIG_FILE" 2>/dev/null) || return 1
+        2>/dev/null) || return 1
     printf '%s\n%s\n' "$meta" "${cfg:-[]}" | \
         { if command -v cksum >/dev/null 2>&1; then cksum | awk '{print $1":"$2}'; else sha256sum | awk '{print $1}'; fi; }
 }
 
 # ---------------------------------------------------------------------------
-# 列出 config.json 中有元数据文件的入站 tag 集合(含 tunnel_tag)
+# 列出配置中有元数据文件的入站 tag 集合(含 tunnel_tag)
 # 输出: 每行一个 tag
 # ---------------------------------------------------------------------------
 _known_tags() {
@@ -2548,17 +2538,17 @@ _tag_is_managed() {
 }
 
 # ---------------------------------------------------------------------------
-# 给 config.json 中无 tag 的入站自动分配 tag:
+# 给配置中无 tag 的入站自动分配 tag:
 # 有 port: manual-<port> (如 manual-443); Unix socket: manual-<socket文件名去后缀>
 # ---------------------------------------------------------------------------
 # 三十三轮 P1: "读入站 → 计算新 tag → 原子写回"的 RMW 必须持 config lock, 否则与并发节点
 # 事务互相覆盖(启动期自动执行, 是真实竞态面)。锁可重入, 其它持锁路径调用不会自锁。
 _auto_tag_tagless_inbounds() {
-    [ -f "$CONFIG_FILE" ] || return 0
+    _config_present || return 0
     _with_config_lock _auto_tag_tagless_inbounds_locked
 }
 _auto_tag_tagless_inbounds_locked() {
-    [ -f "$CONFIG_FILE" ] || return 0
+    _config_present || return 0
     # 检查与写入同处 core lock 临界区(复审 P1); 手工 [同步配置] 也走这里。
     _with_config_write_barrier _auto_tag_tagless_inbounds_write
 }
@@ -2571,8 +2561,8 @@ _auto_tag_tagless_inbounds_write() {
     fi
     # 一次性读取所有入站的 tag/port/listen, 减少 jq 调用
     local inbounds_info
-    inbounds_info=$(jq -c '[.inbounds | to_entries[] | {idx: .key, tag: (.value.tag // ""), port: (.value.port // 0), listen: (.value.listen // "")}]' "$CONFIG_FILE" 2>/dev/null) || {
-        _warn "启动期自动分配 inbound tag 失败: 无法解析 $CONFIG_FILE"
+    inbounds_info=$(_config_jq -c '[.inbounds | to_entries[] | {idx: .key, tag: (.value.tag // ""), port: (.value.port // 0), listen: (.value.listen // "")}]' 2>/dev/null) || {
+        _warn "启动期自动分配 inbound tag 失败: 无法解析 $CONFIG_DIR"
         return 1
     }
     [ -z "$inbounds_info" ] || [ "$inbounds_info" = "[]" ] && return 0
@@ -2612,11 +2602,11 @@ _auto_tag_tagless_inbounds_write() {
 
         # 原子写 config(静默补 tag 不应触发 _mutate_config 的重启; 任一写入失败中止本轮启动维护)
         local newcfg
-        newcfg=$(jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t' "$CONFIG_FILE") || {
+        newcfg=$(_config_jq --arg t "$new_tag" --argjson i "$idx" '.inbounds[$i].tag = $t') || {
             _warn "启动期为 inbound[$idx] 生成 tag 失败"
             return 1
         }
-        _atomic_write_json "$CONFIG_FILE" "$newcfg" || {
+        _config_write_merged "$newcfg" || {
             _warn "启动期写入 inbound tag 失败: $new_tag"
             return 1
         }
@@ -2640,7 +2630,7 @@ _find_reality_tunnel_tag() {
     proto=$(_detect_inbound_protocol "$tag")
     case "$proto" in vless-tcp-reality-vision|vless-xhttp-reality) ;; *) return 1 ;; esac
     local target tport n ttag=""
-    target=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' "$CONFIG_FILE" 2>/dev/null)
+    target=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' 2>/dev/null)
     if [ -n "$target" ]; then
         # R42: 先判 target 主机是否回环 —— 非回环即 direct 模式(target = <sni>:443), 本就无
         # tunnel 可关联, 必须 return 1(无关联)。若继续往下用 tport=443 去数 tunnel 入站,
@@ -2657,10 +2647,10 @@ _find_reality_tunnel_tag() {
         # 歧义(>1)返回 2 由调用方拒绝, 无匹配(=0)视为无关联返回 1, 均不再用 tag 后缀重绑。
         tport="${target##*:}"
         [[ "$tport" =~ ^[0-9]+$ ]] || return 1
-        n=$(jq -r --argjson p "$tport" '[.inbounds[] | select(.protocol == "tunnel") | select(.port == $p)] | length' "$CONFIG_FILE" 2>/dev/null)
+        n=$(_config_jq -r --argjson p "$tport" '[.inbounds[] | select(.protocol == "tunnel") | select(.port == $p)] | length' 2>/dev/null)
         [[ "$n" =~ ^[0-9]+$ ]] || return 1
         if [ "$n" -eq 1 ]; then
-            ttag=$(jq -r --argjson p "$tport" '[.inbounds[] | select(.protocol == "tunnel") | select(.port == $p) | .tag][0]' "$CONFIG_FILE" 2>/dev/null)
+            ttag=$(_config_jq -r --argjson p "$tport" '[.inbounds[] | select(.protocol == "tunnel") | select(.port == $p) | .tag][0]' 2>/dev/null)
             printf '%s' "$ttag"
             return 0
         fi
@@ -2669,12 +2659,12 @@ _find_reality_tunnel_tag() {
     fi
     # target 缺失(旧版/手工配置) → legacy tag 后缀 fallback, 同样 count==1 才绑定
     local pport
-    pport=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' "$CONFIG_FILE" 2>/dev/null)
+    pport=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
     [[ "$pport" =~ ^[0-9]+$ ]] || return 1
-    n=$(jq -r --arg sfx "-${pport}" '[.inbounds[] | select(.protocol == "tunnel") | select(.tag | endswith($sfx))] | length' "$CONFIG_FILE" 2>/dev/null)
+    n=$(_config_jq -r --arg sfx "-${pport}" '[.inbounds[] | select(.protocol == "tunnel") | select(.tag | endswith($sfx))] | length' 2>/dev/null)
     [[ "$n" =~ ^[0-9]+$ ]] || return 1
     if [ "$n" -eq 1 ]; then
-        ttag=$(jq -r --arg sfx "-${pport}" '[.inbounds[] | select(.protocol == "tunnel") | select(.tag | endswith($sfx)) | .tag][0]' "$CONFIG_FILE" 2>/dev/null)
+        ttag=$(_config_jq -r --arg sfx "-${pport}" '[.inbounds[] | select(.protocol == "tunnel") | select(.tag | endswith($sfx)) | .tag][0]' 2>/dev/null)
         printf '%s' "$ttag"
         return 0
     fi
@@ -2716,9 +2706,9 @@ _node_protocol_safe() {
 # 否则删 parent Reality + 一个 tunnel 会留下同 port 兄弟 tunnel(半套)。
 _tunnel_port_ambiguous() {
     local tag="$1" port n
-    port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' "$CONFIG_FILE" 2>/dev/null)
+    port=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
-    n=$(jq -r --argjson p "$port" '[.inbounds[] | select(.protocol == "tunnel") | select(.port == $p)] | length' "$CONFIG_FILE" 2>/dev/null)
+    n=$(_config_jq -r --argjson p "$port" '[.inbounds[] | select(.protocol == "tunnel") | select(.port == $p)] | length' 2>/dev/null)
     [[ "$n" =~ ^[0-9]+$ ]] || return 1
     [ "$n" -gt 1 ]
 }
@@ -2737,19 +2727,19 @@ _find_reality_for_tunnel_tag() {
     local tag="$1" proto tport target
     proto=$(_detect_inbound_protocol "$tag")
     [ "$proto" = "tunnel" ] || return 0
-    tport=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' "$CONFIG_FILE" 2>/dev/null)
+    tport=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
     [[ "$tport" =~ ^[0-9]+$ ]] || return 0
     target="127.0.0.1:${tport}"
-    jq -r --arg target "$target" \
+    _config_jq -r --arg target "$target" \
         '[.inbounds[] | select(.protocol == "vless") | select((.streamSettings.realitySettings.target // "") == $target) | .tag][]' \
-        "$CONFIG_FILE" 2>/dev/null
+        2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
 _reality_tunnel_has_surviving_refs() {
     local tunnel_tag="$1" refs rt removed found tunnel_count
     shift
-    tunnel_count=$(jq -r --arg t "$tunnel_tag" '[.inbounds[]? | select(.tag == $t and .protocol == "tunnel")] | length' "$CONFIG_FILE" 2>/dev/null) || return 2
+    tunnel_count=$(_config_jq -r --arg t "$tunnel_tag" '[.inbounds[]? | select(.tag == $t and .protocol == "tunnel")] | length' 2>/dev/null) || return 2
     [ "$tunnel_count" = 1 ] || return 2
     if ! refs=$(_find_reality_for_tunnel_tag "$tunnel_tag"); then
         return 2
@@ -2766,7 +2756,7 @@ _reality_tunnel_has_surviving_refs() {
 }
 
 
-# 采纳单个入站: 从 config.json 推断元数据, 创建 nodes/*.json
+# 采纳单个入站: 从配置推断元数据, 创建 nodes/*.json
 # 返回 0 = 成功, 1 = 跳过(tunnel)
 # ---------------------------------------------------------------------------
 # 三十三轮 P1: 采纳会在锁外写出 metadata —— 与并发删除/重置交错时会重建出"config 无此入站 /
@@ -2795,15 +2785,15 @@ _adopt_single_inbound_write() {
         return 1
     fi
 
-    port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // 0' "$CONFIG_FILE" 2>/dev/null)
+    port=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // 0' 2>/dev/null)
     [[ "$port" =~ ^[0-9]+$ ]] || port=0
-    listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
+    listen=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' 2>/dev/null)
     [ -z "$listen" ] && listen="::"
 
     local uuid=""
-    uuid=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.clients[0].id // empty' "$CONFIG_FILE" 2>/dev/null)
+    uuid=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.clients[0].id // empty' 2>/dev/null)
     local sni=""
-    sni=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.serverNames[0] // empty' "$CONFIG_FILE" 2>/dev/null)
+    sni=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.serverNames[0] // empty' 2>/dev/null)
 
     # R23: Reality 多 inbound — 重建 tunnel_tag(唯一关联键, 见 _find_reality_tunnel_tag)。
     # R28(P1): 关联歧义(rc2)必须拒绝采纳——否则 tunnel_tag="" 会把坏配置"合法化",
@@ -2862,18 +2852,18 @@ _adopt_single_inbound_write() {
 # 三十三轮 P1: 扫描(枚举孤儿) → 判断 → 采纳 必须整体在 config lock 内, 锁内重新枚举 ——
 # 否则锁外扫到的 orphan 可能在取锁前已被并发事务删除, 采纳又把它写成 metadata。
 _auto_adopt_orphans() {
-    [ -f "$CONFIG_FILE" ] || return 0
+    _config_present || return 0
     _with_config_lock _auto_adopt_orphans_locked
 }
 _auto_adopt_orphans_locked() {
-    [ -f "$CONFIG_FILE" ] || return 0
+    _config_present || return 0
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
     local known_list
     known_list=$(_known_tags)
 
     local tags_json
-    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null) || {
-        _warn "启动期自动采纳孤儿入站失败: 无法解析 $CONFIG_FILE"
+    tags_json=$(_config_jq -c '[.inbounds[]?.tag // empty]' 2>/dev/null) || {
+        _warn "启动期自动采纳孤儿入站失败: 无法解析 $CONFIG_DIR"
         return 1
     }
     [ -z "$tags_json" ] || [ "$tags_json" = "[]" ] && return 0
@@ -2900,14 +2890,14 @@ _auto_adopt_orphans_locked() {
 }
 
 # ---------------------------------------------------------------------------
-# 检测 config.json 中的孤儿入站(手动添加,无元数据)
+# 检测配置中的孤儿入站(手动添加,无元数据)
 # 返回 0 = 有孤儿, 1 = 无
 # ---------------------------------------------------------------------------
 _has_orphan_inbounds() {
-    [ -f "$CONFIG_FILE" ] || return 1
+    _config_present || return 1
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
     local tags_json
-    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null) || return 1
+    tags_json=$(_config_jq -c '[.inbounds[]?.tag // empty]' 2>/dev/null) || return 1
     [ -z "$tags_json" ] && return 1
     [ "$tags_json" = "[]" ] && return 1
     local known_list
@@ -2923,16 +2913,16 @@ _has_orphan_inbounds() {
 }
 
 # ---------------------------------------------------------------------------
-# 从 config.json 入站推断协议类型(按 tag)
+# 从配置入站推断协议类型(按 tag)
 # ---------------------------------------------------------------------------
 _detect_inbound_protocol() {
     local tag="$1"
     local proto security net
-    proto=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .protocol' "$CONFIG_FILE" 2>/dev/null)
+    proto=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .protocol' 2>/dev/null)
     [ "$proto" = "tunnel" ] && { echo "tunnel"; return; }
     if [ "$proto" = "vless" ]; then
-        security=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.security // "none"' "$CONFIG_FILE" 2>/dev/null)
-        net=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.network // "raw"' "$CONFIG_FILE" 2>/dev/null)
+        security=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.security // "none"' 2>/dev/null)
+        net=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.network // "raw"' 2>/dev/null)
         case "$security" in
             reality)
                 case "$net" in
@@ -2943,7 +2933,7 @@ _detect_inbound_protocol() {
             *)
                 # 检测 VLESS+ENC: 有 decryption 字段且 network=raw
                 local dec
-                dec=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.decryption // empty' "$CONFIG_FILE" 2>/dev/null)
+                dec=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.decryption // empty' 2>/dev/null)
                 if [ -n "$dec" ] && [ "$dec" != "none" ] && [ "$net" = "raw" ]; then
                     echo "vless-enc"
                 else
@@ -2971,10 +2961,10 @@ _sync_config_check() {
     clear
     echo
     echo -e "  ${CYAN}【同步配置入站】${NC}"
-    echo -e "  扫描 config.json 中未由脚本管理的入站..."
+    echo -e "  扫描配置中未由脚本管理的入站..."
     echo
 
-    [ -f "$CONFIG_FILE" ] || { _warn "config.json 不存在"; _press_any_key; return; }
+    _config_present || { _warn "配置不存在"; _press_any_key; return; }
     [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
 
     # 先自动给无 tag 入站分配 tag(幂等, 已分配的不变)。失败时后续孤儿扫描没有可靠输入
@@ -2985,9 +2975,9 @@ _sync_config_check() {
     fi
 
     local tags_json
-    tags_json=$(jq -c '[.inbounds[]?.tag // empty]' "$CONFIG_FILE" 2>/dev/null)
+    tags_json=$(_config_jq -c '[.inbounds[]?.tag // empty]' 2>/dev/null)
     if [ -z "$tags_json" ] || [ "$tags_json" = "[]" ]; then
-        _info "config.json 无任何入站"
+        _info "配置中无任何入站"
         _press_any_key; return
     fi
 
@@ -3016,14 +3006,14 @@ _sync_config_check() {
     for tag in "${orphans[@]}"; do
         local proto port listen
         proto=$(_detect_inbound_protocol "$tag")
-        port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // "-"' "$CONFIG_FILE" 2>/dev/null)
-        listen=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' "$CONFIG_FILE" 2>/dev/null)
+        port=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // "-"' 2>/dev/null)
+        listen=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' 2>/dev/null)
         [ ${#tag} -gt 28 ] && tag="${tag:0:25}..."
         printf "  %-3s %-30s %-16s %-7s %-8s\n" "[$i]" "$tag" "$proto" "$port" "$listen"
         i=$((i+1))
     done
     echo
-    echo -e "  ${GREEN}[1]${NC} 从 config.json 移除选中入站"
+    echo -e "  ${GREEN}[1]${NC} 从配置移除选中入站"
     echo -e "  ${GREEN}[2]${NC} 移除全部未跟踪入站"
     echo -e "  ${GREEN}[3]${NC} 采纳为脚本管理节点(创建元数据)"
     echo -e "  ${GREEN}[0]${NC} 取消"
@@ -3062,7 +3052,7 @@ _sync_config_check() {
 }
 
 # ---------------------------------------------------------------------------
-# 从 config.json 移除孤儿入站 + 关联路由规则
+# 从配置移除孤儿入站 + 关联路由规则
 # ---------------------------------------------------------------------------
 _remove_orphan_inbounds() {
     _with_config_lock _remove_orphan_inbounds_locked "$@"
@@ -3071,8 +3061,8 @@ _remove_orphan_inbounds() {
 _remove_orphan_inbounds_locked() {
     local tags=("$@")
     [ ${#tags[@]} -eq 0 ] && return 0
-    if ! jq -e 'type == "object" and (.inbounds | type == "array")' "$CONFIG_FILE" >/dev/null 2>&1; then
-        _error "config.json 不可读或结构无效, 无法安全移除孤儿入站"
+    if ! _config_jq -e 'type == "object" and (.inbounds | type == "array")' >/dev/null 2>&1; then
+        _error "配置不可读或结构无效, 无法安全移除孤儿入站"
         return 1
     fi
 
@@ -3090,8 +3080,8 @@ _remove_orphan_inbounds_locked() {
     local safe=() excluded=() managed=()
     local tag ttag trc rtags rt
     for tag in "${tags[@]}"; do
-        if ! jq -e --arg t "$tag" 'any(.inbounds[]?; (.tag // "") == $t)' \
-            "$CONFIG_FILE" >/dev/null 2>&1; then
+        if ! _config_jq -e --arg t "$tag" 'any(.inbounds[]?; (.tag // "") == $t)' \
+            >/dev/null 2>&1; then
             excluded+=("$tag")
             continue
         fi
@@ -3172,7 +3162,7 @@ _remove_orphan_inbounds_locked() {
 }
 
 # ---------------------------------------------------------------------------
-# 采纳孤儿入站: 从 config.json 推断元数据, 创建 nodes/*.json
+# 采纳孤儿入站: 从配置推断元数据, 创建 nodes/*.json
 # ---------------------------------------------------------------------------
 _adopt_orphan_inbounds() {
     local tags=("$@")
@@ -3203,10 +3193,10 @@ _adopt_orphan_inbounds() {
 _add_node() {
     clear
     # 规约(backend/quality-guidelines「Don't: hardcode a menu number in a message emitted from
-    # another module」): 运维/核心区的编号由 _main_menu 按 _core/_ops_start 现算, 写死字面量
-    # 只在下一次插入菜单项前正确 —— 这里原本写死 `[8]`, 而 [8] 现已是「Hysteria2 管理」。
+    # another module」): 主菜单编号是 lib/90-menu.sh 渲染时的字面量, 只有它准写编号; 其他模块
+    # 写死编号只在下一次插入菜单项前正确 —— 这里原本写死 `[8]`, 而 [8] 现已是「Hysteria2 管理」。
     # 只点名目的地, 不写编号。
-    [ -x "$XRAY_BIN" ] || { _error "Xray 未安装,请先到主菜单的 [安装/更新或切换 Xray 核心] 安装核心"; _press_any_key; return 1; }
+    [ -x "$XRAY_BIN" ] || { _error "Xray 未安装,请先到主菜单的 [Xray 核心管理] 安装核心"; _press_any_key; return 1; }
     _ensure_dirs || return 1
     echo
     echo -e "  ${CYAN}【添加节点 — 选择协议】${NC}"
@@ -4341,7 +4331,7 @@ _hy2_env_get() {
 # 最终环境, 返回 2(UNKNOWN)。Xray 的 EnvConfig 是 map[string]string 且 Config.Build() 会逐个
 # os.Setenv, 任一失败配置即构建失败; 此时"未知 ⇒ 禁止 purge"比"回落 shell env 猜一个"安全。
 _hy2_cert_env_ok() {
-    [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] || return 0
+    _config_present || return 0
     local t
     # 四重校验, 缺一不可(JSON 类型 → Go 反序列化 → os.Setenv 可应用, 逐层收窄):
     #  ① 必须用 `has("env")` 显式区分"键不存在"与 `"env": false` —— jq 的 `//` 把 false 也当
@@ -4355,7 +4345,7 @@ _hy2_cert_env_ok() {
     #     (main 分支实测)。Go 的 unix 规则: key **非空**且**不含 `=`、不含 NUL**; value 不得含 NUL。
     #     ⇒ 空 key / 含 `=` 的 key / 含 NUL 的 key 或 value 一律按"配置损坏"处理, 否则会拿一个
     #     Xray 实际应用不了的 env 去推 cert root。空 value 合法(等价"设为空串")。
-    t=$(jq -r 'if has("env") then
+    t=$(_config_jq -r 'if has("env") then
             if .env == null then "null"
             elif (.env | type) != "object" then "invalid"
             elif (.env | all(to_entries[];
@@ -4367,7 +4357,7 @@ _hy2_cert_env_ok() {
                                    else false end)
                  )) then "object"
             else "invalid" end
-        else "null" end' "$CONFIG_FILE" 2>/dev/null) || return 2
+        else "null" end' 2>/dev/null) || return 2
     case "$t" in
         null|object) return 0 ;;
         *) return 2 ;;
@@ -4380,12 +4370,12 @@ _hy2_env_final() {
     # 配置损坏(.env 类型非法 / config 无法解析)⇒ 未知, 不回落进程环境(返回 2)
     _hy2_cert_env_ok || return 2
     [ -n "$name" ] || return 1
-    if [ -n "${CONFIG_FILE:-}" ] && [ -f "$CONFIG_FILE" ] \
-       && jq -e --arg k "$name" '(.env // {}) | has($k)' "$CONFIG_FILE" >/dev/null 2>&1; then
+    if _config_present \
+       && _config_jq -e --arg k "$name" '(.env // {}) | has($k)' >/dev/null 2>&1; then
         # jq -j 输出裸字符串且不补结尾换行(jq -r 会补一个), 再用 NUL 终止读取进变量 ⇒ 逐字节精确。
         # 这对"值本身以换行结尾"是必需的: jq -r + 命令替换会把那些换行全部吃掉。
         # 其中值取 // "" —— value 为 null 时 Go 取 string 零值, 即"存在但为空", 与 Xray 一致。
-        IFS= read -r -d '' kv < <( { jq -j --arg k "$name" '(.env // {}) | (.[$k] // "")' "$CONFIG_FILE" 2>/dev/null; printf '\0'; } ) || return 2
+        IFS= read -r -d '' kv < <( { _config_jq -j --arg k "$name" '(.env // {}) | (.[$k] // "")' 2>/dev/null; printf '\0'; } ) || return 2
         _HY2_ENV_VAL="$kv"
         return 0
     fi
@@ -4675,7 +4665,7 @@ _hy2_self_cert_dir() {
     cand=$(_hy2_realpath "$cand") || cand="$CERT_DIR/$tag"
     # 该入站引用的每个 cert/key 都必须 canonicalize 到 cand 之下(多证书/共享目录/外部链接
     # 一律判为"归属不明确" ⇒ 返回 1, 不进入 purge)
-    refs=$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' "$CONFIG_FILE" 2>/dev/null) || return 1
+    refs=$(_config_jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' 2>/dev/null) || return 1
     # 引用按候选基准展开, 但**删除目标只由实际生效基准(及本节点目录)决定** —— 并集只扩大
     # "保留"范围, 拿它决定"该删哪个目录"会在 config.env 与进程环境冲突时指向 Xray 实际并未
     # 使用的目录。候选间结论冲突(有的说"是本节点目录", 有的说"材料在 CERT_DIR 之外")⇒ 拒绝。
@@ -4725,7 +4715,7 @@ _hy2_cert_dir_referenced() {
     # certificateFile 与 keyFile **都要扫**: 引用模型是"证书目录是否仍被 config 使用",
     # 而 Xray 的 CertificateObject 是 cert+key 两个文件, 只扫 cert 会漏掉
     # "存活节点 B 的 keyFile 指向 A/key.pem" ⇒ rm -rf A 会删掉 B 正在用的私钥。
-    refs=$(jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' "$CONFIG_FILE" 2>/dev/null) || return 0
+    refs=$(_config_jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' 2>/dev/null) || return 0
     [ -n "$refs" ] || return 1
     local dreal cbase_real
     dreal=$(_hy2_realpath "$dir") || dreal=""
@@ -5287,7 +5277,7 @@ _rebuild_clash_line() {
             password=$(jq -r '.password // empty' "$meta")
             [ -n "$method" ] && [ -n "$password" ] || return 1
             local tag; tag=$(jq -r '.tag // empty' "$meta" 2>/dev/null)
-            [ -n "$tag" ] && net=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.network // "tcp,udp"' "$CONFIG_FILE" 2>/dev/null)
+            [ -n "$tag" ] && net=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.network // "tcp,udp"' 2>/dev/null)
             [[ "$net" == *"udp"* ]] && udp_clash=", udp: true"
             printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${udp_clash}}"
             ;;
@@ -5877,7 +5867,7 @@ _delete_node_apply_single() {
             # 仅当 config 存在该 inbound 时强制(真实删除流 inbound 必在 config; config 已无该
             # inbound 说明已是孤儿/外部删除, metadata.port 仍是当初 add 用的正确清理目标)。
             local cfg_port
-            cfg_port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' "$CONFIG_FILE" 2>/dev/null)
+            cfg_port=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
             if [ -n "$cfg_port" ] && [ "$cfg_port" != "$hop_port" ]; then
                 _error "节点元数据端口($hop_port)与 config 监听端口($cfg_port)不一致, 无法安全删除: $tag"
                 return 1
@@ -5936,9 +5926,9 @@ _reality_port_txn_locked() {
         _error "Reality 节点元数据已变化, 请重新选择端口: $tag"
         return 1
     fi
-    if ! jq -e --arg t "$tag" --argjson p "$oldport" \
+    if ! _config_jq -e --arg t "$tag" --argjson p "$oldport" \
         '[.inbounds[]? | select(.tag == $t and .protocol == "vless" and .port == $p and .streamSettings.realitySettings != null)] | length == 1' \
-        "$CONFIG_FILE" >/dev/null 2>&1; then
+        >/dev/null 2>&1; then
         _error "config 中的 Reality 节点已变化, 拒绝开始端口事务: $tag"
         return 1
     fi
@@ -5958,7 +5948,7 @@ _reality_port_txn_locked() {
             tunnel_tag=$(_find_reality_tunnel_tag "$tag"); trc=$?
             if [ "$trc" != "0" ]; then
                 _error "无法唯一关联 Reality tunnel (rc=${trc}), 无法安全修改端口: $tag"
-                _tip "请检查 config.json 的 realitySettings.target 与 tunnel 入站, 或删除后重建节点"
+                _tip "请检查配置的 realitySettings.target 与 tunnel 入站, 或删除后重建节点"
                 return 1
             fi
         else
@@ -5967,11 +5957,11 @@ _reality_port_txn_locked() {
             # 否则 fail-closed(避免 tunnel/路由漏改)。无 tunnel_tag 的节点走上面的
             # _find_reality_tunnel_tag 推导, 推导失败/歧义同样 fail-closed, 绝不进入
             # "仅改端口"的通用路径(R41 的全部 tunnel 模式分支都是 fail-closed)。
-            if ! jq -e --arg tg "$tunnel_tag" \
+            if ! _config_jq -e --arg tg "$tunnel_tag" \
                 '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
-                "$CONFIG_FILE" >/dev/null 2>&1; then
+                >/dev/null 2>&1; then
                 _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
-                _tip "请检查 config.json 或使用 [采纳孤儿入站] 修复元数据"
+                _tip "请检查配置或使用 [采纳孤儿入站] 修复元数据"
                 return 1
             fi
         fi
@@ -6217,7 +6207,7 @@ _port_txn_locked() {
         _error "节点端口已变化, 请重新选择端口: $tag"
         return 1
     fi
-    if [ -f "$CONFIG_FILE" ] && ! jq -e --arg t "$tag" --argjson p "$oldport" '[.inbounds[]? | select(.tag == $t and .port == $p)] | length == 1' "$CONFIG_FILE" >/dev/null 2>&1; then
+    if _config_present && ! _config_jq -e --arg t "$tag" --argjson p "$oldport" '[.inbounds[]? | select(.tag == $t and .port == $p)] | length == 1' >/dev/null 2>&1; then
         _error "config 中的节点端口已变化, 拒绝开始端口事务: $tag"
         return 1
     fi
@@ -6393,20 +6383,20 @@ _port_txn_recover_locked() {
         # (a) config is the recovery authority; unreadable, malformed, or non-canonical states
         # cannot be guessed as "not committed" because that could overwrite newer metadata.
         local cfg_state
-        if ! jq -e 'type == "object" and (.inbounds | type == "array")' \
-            "$CONFIG_FILE" >/dev/null 2>&1; then
-            _warn "端口事务恢复无法读取有效 config.json, 保留 journal 与现场: $j"
+        if ! _config_jq -e 'type == "object" and (.inbounds | type == "array")' \
+            >/dev/null 2>&1; then
+            _warn "端口事务恢复无法读取有效配置, 保留 journal 与现场: $j"
             failed=1
             continue
         fi
-        if ! cfg_state=$(jq -er --arg ot "$tag" --arg nt "$newtag" \
+        if ! cfg_state=$(_config_jq -er --arg ot "$tag" --arg nt "$newtag" \
             --argjson op "$oldport" --argjson np "$newport" '
             ([.inbounds[] | select(type == "object" and .tag == $ot and .port == $op)] | length) as $old_count
             | ([.inbounds[] | select(type == "object" and .tag == $nt and .port == $np)] | length) as $new_count
             | if $old_count == 1 and $new_count == 0 then "old"
               elif $old_count == 0 and $new_count == 1 then "new"
-              else "unknown" end' "$CONFIG_FILE" 2>/dev/null); then
-            _warn "端口事务恢复无法判定 config.json 中的节点状态, 保留 journal: $j"
+              else "unknown" end' 2>/dev/null); then
+            _warn "端口事务恢复无法判定配置中的节点状态, 保留 journal: $j"
             failed=1
             continue
         fi
@@ -6688,7 +6678,7 @@ _update_listen_commit_locked() {
         _error "节点内容已变化, 请重新选择监听地址: $tag"
         return 1
     fi
-    old_inbound=$(jq -c --arg t "$tag" '[.inbounds[]? | select(.tag == $t)]' "$CONFIG_FILE" 2>/dev/null) || return 1
+    old_inbound=$(_config_jq -c --arg t "$tag" '[.inbounds[]? | select(.tag == $t)]' 2>/dev/null) || return 1
     [ "$(jq -r 'length' <<< "$old_inbound" 2>/dev/null)" = 1 ] || {
         _error "config 中的节点已变化, 监听未更新: $tag"
         return 1

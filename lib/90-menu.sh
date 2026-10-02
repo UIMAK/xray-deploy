@@ -4,14 +4,45 @@
 # 串接所有模块, 渲染菜单, 调度用户选择
 # ============================================================================
 
+# 字符串的终端显示宽度(列数)。
+# 判据: ASCII(<0x80) 1 列; 首字节 0xC0-0xDF(2 字节字符) 1 列; 首字节 ≥0xE0(3/4 字节字符,
+# 汉字在此) 2 列; 续字节 0x80-0xBF 0 列。
+# **不能**用 (字节数 - 字符数) / 2 估算: 2 字节字符个数为奇数时会多算 1 列("a··" 会算成 4
+# 而不是 3), 双栏因此错位。按字节类判定与终端实际渲染一致。
+# LC_ALL=C 让 od 的输出与 IFS 分词不受 locale 影响(只取字节值)。
+_menu_display_width() {
+    local s="$1" w=0 b
+    for b in $(printf '%s' "$s" | LC_ALL=C od -An -tu1 -v 2>/dev/null); do
+        if [ "$b" -ge 224 ]; then w=$((w + 2))
+        elif [ "$b" -ge 192 ]; then w=$((w + 1))
+        elif [ "$b" -ge 128 ]; then :
+        else w=$((w + 1))
+        fi
+    done
+    printf '%s' "$w"
+}
+
+# 双栏菜单的一行。左列按**显示宽度**补空格(而不是 printf 的字符宽度), 右列(可省)接在后面。
+# 宽度只按纯文本算: 颜色转义序列的字节不能计入, 否则每格会多出十几列。
+# 用法: _menu_row <左编号> <左名称> [<右编号> <右名称>]
+MENU_COL_WIDTH=22
+_menu_row() {
+    local lnum="$1" lname="$2" rnum="${3:-}" rname="${4:-}"
+    local pad ltxt="" rtxt=""
+    pad=$((MENU_COL_WIDTH - $(_menu_display_width "  [${lnum}] ${lname}")))
+    [ "$pad" -lt 1 ] && pad=1
+    ltxt="  ${GREEN}[${lnum}]${NC} ${lname}"
+    [ -n "$rnum" ] && rtxt="${GREEN}[${rnum}]${NC} ${rname}"
+    # %b 而不是 %s: 颜色变量里存的是字面 `\033[0;32m`, 需要 printf 解释转义
+    # (原来的 echo -e 就负责这件事; 用 %s 会原样打出反斜杠序列)。
+    printf '%b%*s%b\n' "$ltxt" "$pad" "" "$rtxt"
+}
+
 # 标题(居中)
 _print_logo() {
     local title="Xray 部署管理脚本 (xray-deploy)"
-    local char_count byte_count cjk_chars display_w
-    char_count=$(printf '%s' "$title" | wc -m | tr -d '[:space:]')
-    byte_count=$(printf '%s' "$title" | wc -c | tr -d '[:space:]')
-    cjk_chars=$(( (byte_count - char_count) / 2 ))
-    display_w=$(( char_count + cjk_chars ))
+    local display_w
+    display_w=$(_menu_display_width "$title")
     local inner=$(( display_w + 8 ))
     [ "$inner" -lt 40 ] && inner=40
     local pad=$(( (inner - display_w) / 2 ))
@@ -72,7 +103,7 @@ _print_status_bar() {
         hyline="  Hysteria2 v${hver#v}: ${hst}"
     fi
 
-    # Geo(真相源: config.json 的 geodata.cron, 兼容旧 state)
+    # Geo(真相源: confs/14_geodata.json 的 geodata.cron, 兼容旧 state)
     local geostate; geostate=$(_geo_auto_state 2>/dev/null); [ -z "$geostate" ] && geostate="off"
     local geostr
     [ "$geostate" = "on" ] && geostr="${GREEN}● 自动${NC}" || geostr="${RED}○ 手动${NC}"
@@ -146,15 +177,15 @@ _main_menu() {
         exit 1
     fi
     # 启动期维护链(严格按此顺序):
-    #   reset 崩溃恢复 → 核心事务崩溃恢复 → 端口事务崩溃恢复 → 自动补 tag
-    #   → 自动采纳孤儿入站 → 注入 config env(R45) → 迁移 Geo 自动更新(R45) → 格式化配置
+    #   reset 崩溃恢复 → 核心事务崩溃恢复 → 端口事务崩溃恢复 → 旧单文件配置迁移
+    #   → 自动补 tag → 自动采纳孤儿入站 → 注入 config env(R45) → 迁移 Geo 自动更新(R45)
     # 各恢复/迁移步骤都用 declare -F 守卫: 可选维护 helper 缺失时跳过; 事务恢复失败或任一
     # 维护步骤失败, 则 fail-stop 停止后续步骤。**全局写闸门不在这里**: 未收敛的
     # core/reset 事务由各 config/metadata 写路径的账本闸门(_core_txn_allow_config_write /
     # _mutate_config 的 reset 检查)持续拒绝, 直到重启收敛后自动解除 —— 菜单变量只负责
     # 启动链的顺序, 不承担"挡住用户操作"的责任。
     # reset 恢复放在最前: 半截 reset 的 live 状态可能是"config 空/缺 + nodes 空 + 快照藏着
-    # 旧 metadata", 先收敛再让 adopt/normalize 基于稳定状态工作。
+    # 旧 metadata", 先收敛再让 adopt/迁移 基于稳定状态工作。
     # 核心恢复紧随其后且**先于一切 config 写入**(复审 P1): 它可能重启服务, 且失败时运行态
     # 未知, 半收敛的现场不允许再被 auto_tag/adopt 们叠加修改。
     RESET_RECOVERY_FAILED=0
@@ -188,6 +219,18 @@ _main_menu() {
         STARTUP_MAINT_BLOCKED=1
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
+        # **旧单文件迁移必须先于 porttxn 恢复**: 未迁移的旧部署里 confs 是空的(合并视图
+        # 没有 .inbounds), 此时若遗留 *.porttxn, _port_txn_recover 会报"无法读取有效配置"
+        # 并 fail-stop ⇒ 迁移永远排在被跳过的位置, 每次启动都报"维护失败"。迁移只读旧
+        # config.json、写 confs、改名 .bak, 不依赖任何事务收敛, 放在这里是安全的。
+        if declare -F _config_migrate_legacy >/dev/null 2>&1; then
+            if ! _config_migrate_legacy; then
+                STARTUP_MAINT_BLOCKED=1
+                _error "旧单文件配置迁移失败: 已停止后续启动维护, 请检查后重启脚本"
+            fi
+        fi
+    fi
+    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
         # **端口事务恢复必须最先**(先于任何 config 写入): 遗留的 *.porttxn 是未收敛现场,
         # 统一写闸门会拒绝所有普通 config 写入, 若不先收敛, 下面的 auto_tag/adopt 会被
         # 闸门挡下并误报为"维护失败"。**必须消费返回码**(复审 P1): 未收敛(隔离/保留待人工)
@@ -214,7 +257,6 @@ _main_menu() {
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
         if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
         if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
-        _normalize_config_format
     fi
     local choice
 
@@ -225,86 +267,57 @@ _main_menu() {
         _print_status_bar
 
         echo -e "  ${CYAN}【节点管理】${NC}"
-        echo -e "  ${GREEN}[1]${NC} 添加节点"
-        echo -e "  ${GREEN}[2]${NC} 查看节点"
-        echo -e "  ${GREEN}[3]${NC} 删除节点"
-        echo -e "  ${GREEN}[4]${NC} 修改端口"
-        echo -e "  ${GREEN}[5]${NC} 更新监听"
-        echo -e "  ${GREEN}[6]${NC} Xray Hy2 管理"
-        echo -e "  ${GREEN}[7]${NC} Reality 域名管理"
-        echo -e "  ${GREEN}[8]${NC} Hysteria2 管理"
+        _menu_row 1 "添加节点"      2 "查看节点"
+        _menu_row 3 "删除节点"      4 "修改端口"
+        _menu_row 5 "更新监听"      6 "Reality 域名管理"
         echo
-        echo -e "  ${CYAN}【核心与服务】${NC}"
-        local _core=9
-        local _ops_start=$((_core+3))
-        printf "  ${GREEN}[%d]${NC} 安装/更新或切换 Xray 核心\n" "$_core"
-        printf "  ${GREEN}[%d]${NC} Geo 数据自动更新\n" $((_core+1))
-        printf "  ${GREEN}[%d]${NC} cloudflared 管理\n" $((_core+2))
+        echo -e "  ${CYAN}【协议管理】${NC}"
+        _menu_row 7 "Xray Hy2 管理" 8 "Hysteria2 管理"
+        _menu_row 9 "cloudflared 管理"
         echo
-        echo -e "  ${CYAN}【运维】${NC}"
-        printf "  ${GREEN}[%2d]${NC} 检测脚本更新\n" "$_ops_start"
-        printf "  ${GREEN}[%2d]${NC} 重启 Xray\n" $((_ops_start+1))
-        printf "  ${GREEN}[%2d]${NC} 停止 Xray\n" $((_ops_start+2))
-        printf "  ${GREEN}[%2d]${NC} 查看状态\n" $((_ops_start+3))
-        printf "  ${GREEN}[%2d]${NC} 查看日志\n" $((_ops_start+4))
-        printf "  ${GREEN}[%2d]${NC} 日志轮换\n" $((_ops_start+5))
-        printf "  ${GREEN}[%2d]${NC} 定时重启\n" $((_ops_start+6))
-        printf "  ${GREEN}[%2d]${NC} 检查配置\n" $((_ops_start+7))
-        printf "  ${GREEN}[%2d]${NC} 卸载\n" $((_ops_start+8))
+        echo -e "  ${CYAN}【服务控制】${NC}"
+        _menu_row 10 "重启 Xray"    11 "停止 Xray"
+        _menu_row 12 "查看状态"     13 "查看日志"
+        _menu_row 14 "日志轮换"     15 "定时重启"
+        echo
+        echo -e "  ${CYAN}【配置与更新】${NC}"
+        _menu_row 16 "检查配置"     17 "DNS 设置"
+        _menu_row 18 "Geo 自动更新" 19 "检测脚本更新"
+        echo
+        echo -e "  ${CYAN}【核心管理】${NC}"
+        _menu_row 20 "Xray 核心管理" 21 "卸载"
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
         read -rp "  请选择: " choice || exit 0
-        # 节点管理(固定编号 1-5)
+        # 编号连续且固定(1-21 + 0): 新增功能追加到最后一组的末尾, 不重排既有编号
+        # (用户已记住的编号必须稳定)。分组只影响显示, 与调度无关。
         case "$choice" in
             1) _add_node; continue ;;
             2) _view_nodes; continue ;;
             3) _delete_node; continue ;;
             4) _modify_port; continue ;;
             5) _update_listen; continue ;;
+            6) _reality_domain_menu; continue ;;
+            7) _hy2_manage_menu; continue ;;
+            8) _hysteria_menu; continue ;;
+            9) _cloudflared_menu; continue ;;
+            10) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
+                _press_any_key ;;
+            11) _manage_xray stop; _success "已停止"; _press_any_key ;;
+            12) _view_status ;;
+            13) _view_log ;;
+            14) _logrotate_menu ;;
+            15) _timed_restart_menu ;;
+            16) _check_config ;;
+            17) _dns_menu ;;
+            18) _geo_menu ;;
+            19) _check_script_update ;;
+            20) _xray_core_menu ;;
+            21) _uninstall_menu ;;
+            0) echo -e "${CYAN}再见${NC}"; exit 0 ;;
+            *) _warn "无效选择"; _press_any_key ;;
         esac
-        # 条件管理入口
-        if [ "$choice" = "6" ]; then
-            _hy2_manage_menu; continue
-        fi
-        if [ "$choice" = "7" ]; then
-            _reality_domain_menu; continue
-        fi
-        if [ "$choice" = "8" ]; then
-            _hysteria_menu; continue
-        fi
-        # 动态编号: 核心与服务 / 运维
-        _ops_start=$((_core+3))
-        if [ "$choice" = "$_core" ]; then
-            _xray_core_menu
-        elif [ "$choice" = "$((_core+1))" ]; then
-            _geo_menu
-        elif [ "$choice" = "$((_core+2))" ]; then
-            _cloudflared_menu
-        elif [ "$choice" = "$_ops_start" ]; then
-            _check_script_update
-        elif [ "$choice" = "$((_ops_start+1))" ]; then
-            if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
-            _press_any_key
-        elif [ "$choice" = "$((_ops_start+2))" ]; then
-            _manage_xray stop; _success "已停止"; _press_any_key
-        elif [ "$choice" = "$((_ops_start+3))" ]; then
-            _view_status
-        elif [ "$choice" = "$((_ops_start+4))" ]; then
-            _view_log
-        elif [ "$choice" = "$((_ops_start+5))" ]; then
-            _logrotate_menu
-        elif [ "$choice" = "$((_ops_start+6))" ]; then
-            _timed_restart_menu
-        elif [ "$choice" = "$((_ops_start+7))" ]; then
-            _check_config
-        elif [ "$choice" = "$((_ops_start+8))" ]; then
-            _uninstall_menu
-        elif [ "$choice" = "0" ]; then
-            echo -e "${CYAN}再见${NC}"; exit 0
-        else
-            _warn "无效选择"; _press_any_key
-        fi
     done
 }
 
@@ -353,9 +366,8 @@ _view_log() {
     # declare -F 探测: 混装版本(20-xray-core 是旧版)时静默跳过提示, 不影响看日志本身。
     if declare -F _xray_loglevel_get >/dev/null 2>&1 && [ "$(_xray_loglevel_get 2>/dev/null)" = "none" ]; then
         _warn "当前日志级别为 none: access.log 与 error.log 均已停止写入, 以下仅为历史内容"
-        # 按名字而不是编号指路: 运维段编号由 _main_menu 的 _core/_ops_start 动态算出,
-        # 写死 [16] 会在编号变动后变成错误提示(50-nodes.sh 的 "[6] 安装 Xray" 就这么过期过)。
-        _tip "如需恢复记录, 请到运维菜单的 [日志轮换] → [日志级别] 选择 error/warning 等级别"
+        # 按名字而不是编号指路: 编号在菜单重排后会变(50-nodes.sh 的 "[6] 安装 Xray" 就这么过期过)。
+        _tip "如需恢复记录, 请到主菜单 [日志轮换] → [日志级别] 选择 error/warning 等级别"
         echo
     fi
     local logf="$LOG_DIR/error.log"
@@ -379,8 +391,7 @@ _check_config() {
     clear
     echo
     if [ ! -x "$XRAY_BIN" ]; then _warn "Xray 未安装"; _press_any_key; return; fi
-    if [ ! -f "$CONFIG_FILE" ]; then _warn "配置文件不存在"; _press_any_key; return; fi
-    _normalize_config_format
+    if ! _config_present; then _warn "配置文件不存在"; _press_any_key; return; fi
     _info "运行 xray -test..."
     if _xray_test_config; then
         _success "配置校验通过"
@@ -648,7 +659,7 @@ _uninstall_menu() {
     clear
     echo
     echo -e "  ${RED}【卸载 / 重置】${NC}"
-    echo -e "  ${GREEN}[1]${NC} 重置 config.json 为默认(含 routing 规则, 清空节点)"
+    echo -e "  ${GREEN}[1]${NC} 重置配置为默认(含 routing 规则, 清空节点)"
     echo -e "  ${GREEN}[2]${NC} 仅卸载 Xray"
     echo -e "  ${GREEN}[3]${NC} 卸载 Xray + cloudflared"
     echo -e "  ${GREEN}[0]${NC} 取消"
@@ -695,7 +706,7 @@ _uninstall_menu() {
 }
 
 # ---------------------------------------------------------------------------
-# 重置 config.json 为默认(含 routing 规则, 清空节点); 保留 Xray 二进制
+# 重置配置为默认(含 routing 规则, 清空节点); 保留 Xray 二进制
 # ---------------------------------------------------------------------------
 # 破坏性部分必须整体位于 config lock 内: backup、hop 清理、config 替换、metadata 清理和
 # restart 之间不能让普通节点事务插入, 否则并发创建的节点会被 reset 在 rm config/nodes 时抹掉。
@@ -709,11 +720,11 @@ _reset_config() {
         _tip "请先安装 jq(主菜单启动时也会自动尝试安装), 再执行重置"
         return 1
     fi
-    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
+    if _config_present; then
         local ncount ans
         ncount=$(_node_count 2>/dev/null)
         echo -e "  ${YELLOW}当前有 ${ncount} 个节点, 重置将清空所有节点配置${NC}"
-        read -rp "  确认清空并重置 config.json? [y/N]: " ans
+        read -rp "  确认清空并重置全部配置? [y/N]: " ans
         case "$ans" in
             y|Y) ;;
             *) _info "已取消"; return 0 ;;
@@ -795,23 +806,28 @@ _reset_journal_quarantine() {   # <journal> <原因>
 # 回滚"未提交的 reset"的文件系统侧。config 优先用快照里的副本恢复(不依赖会被后续事务
 # 覆盖的 lastbak); 重置前没有 config 时回滚即恢复"无配置"。
 _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_config>
-    local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0
+    local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0 f content=""
     if [ "$had_config" -eq 1 ]; then
-        if [ -s "$stage/config.json" ]; then
-            if ! _atomic_write_json "$CONFIG_FILE" "$(cat "$stage/config.json" 2>/dev/null)" || \
-               ! _reset_fsync_required "$CONFIG_FILE" || \
-               ! _reset_fsync_required "$(dirname "$CONFIG_FILE")"; then
-                _error "配置回滚失败, 请手动从快照副本恢复: $stage/config.json"
+        if ls -1 "$stage/confs"/*.json >/dev/null 2>&1; then
+            content=$(cat "$stage/confs"/*.json 2>/dev/null | jq -s 'reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))') || content=""
+            if [ -z "$content" ] || ! _config_write_merged "$content"; then
+                _error "配置回滚失败, 请手动从快照副本恢复: $stage/confs"
                 ok=1
+            else
+                for f in "$CONFIG_DIR"/*.json; do
+                    [ -f "$f" ] || continue
+                    _reset_fsync_required "$f" || ok=1
+                done
+                _reset_fsync_required "$CONFIG_DIR" || ok=1
             fi
         else
             # **不得退回 lastbak**(二十五轮 P2): 它不是 transaction-ID 绑定的恢复源, 可能已被
             # 后续事务覆盖。自己的副本丢失/为空 ⇒ UNKNOWN, 停止恢复并保留现场供人工处理。
-            _error "事务快照中的配置副本缺失或为空, 无法确认恢复源; 已保留现场供人工检查: $stage/config.json"
+            _error "事务快照中的配置副本缺失或为空, 无法确认恢复源; 已保留现场供人工检查: $stage/confs"
             ok=1
         fi
     else
-        if ! rm -f "$CONFIG_FILE" 2>/dev/null || ! _reset_fsync_required "$(dirname "$CONFIG_FILE")"; then ok=1; fi
+        if ! rm -rf "$CONFIG_DIR" 2>/dev/null || ! _reset_fsync_required "$DEPLOY_DIR"; then ok=1; fi
     fi
     if [ "$nodes_moved" -eq 1 ]; then
         if ! rm -rf "$NODES_DIR" 2>/dev/null; then
@@ -961,7 +977,7 @@ _reset_config_recover_locked() {
     fi
     # **严格 schema**(二十四轮 P1): 缺字段/类型不对一律 quarantine, 绝不"猜成默认值"。
     # 旧写法 `if .had_config == true then 1 else 0 end` 会把缺失/null/字符串/数字全部映射成
-    # 0(= 重置前没有 config), 于是恢复可能 `rm -f "$CONFIG_FILE"` —— 用损坏的账本做出破坏性
+    # 0(= 重置前没有 config), 于是恢复可能 `rm -f "$CONFIG_DIR"` —— 用损坏的账本做出破坏性
     # 决策。对齐 design: had_config 必须是 boolean, hop_specs 必须是 array(可为空)。
     if ! jq -e '(.had_config | type) == "boolean"' "$journal" >/dev/null 2>&1; then
         _reset_journal_quarantine "$journal" "had_config 缺失或非布尔"
@@ -1041,7 +1057,7 @@ _reset_config_locked() {
         _error "上次 reset 的残局未能收敛, 已取消本次重置(现场保留供人工检查)"
         return 1
     fi
-    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
+    if _config_present; then
         had_config=1
         # 2026-09-12 三审(M1): 重置是清空全部节点数据的破坏性操作, 备份失败(磁盘满/IO 错误)
         # 必须中止 —— 原写法忽略返回值, 备份失败仍 rm config, 用户在无备份情况下丢失全部节点。
@@ -1063,12 +1079,13 @@ _reset_config_locked() {
     fi
     if [ "$had_config" -eq 1 ]; then
         # config 副本是比 lastbak 更可靠的恢复源(lastbak 会被后续任何配置事务覆盖)。
-        if ! cp -f "$CONFIG_FILE" "$snapshot/config.json" 2>/dev/null || [ ! -s "$snapshot/config.json" ]; then
+        if ! mkdir -p "$snapshot/confs" 2>/dev/null || ! cp -f "$CONFIG_DIR"/*.json "$snapshot/confs"/ 2>/dev/null \
+           || ! ls -1 "$snapshot/confs"/*.json >/dev/null 2>&1; then
             _error "无法保存重置前的配置快照, 已取消重置以保护现有数据"
             rm -rf "$snapshot" 2>/dev/null
             return 1
         fi
-        if ! _reset_fsync_required "$snapshot/config.json"; then
+        if ! _reset_fsync_required "$snapshot/confs"; then
             _error "reset 配置快照未能持久化, 已取消重置"
             rm -rf "$snapshot" 2>/dev/null
             return 1
@@ -1159,16 +1176,16 @@ _reset_config_locked() {
             return 1
         fi
     fi
-    # 删掉 config 让 _init_config_if_empty 重建。
+    # 删掉 confs 让 _init_config_if_empty 重建。
     # **重建失败必须回滚**(2026-09-22 九轮 OCR #41): 不滚会留下"既没有配置、也没有节点
-    # 元数据"; 回滚源是快照里的 config 副本与 metadata/clash, 失败时保留 journal 供启动重试。
-    if ! rm -f "$CONFIG_FILE" 2>/dev/null; then
-        _error "无法删除旧 config.json, 已取消重置以保护现有数据"
+    # 元数据"; 回滚源是快照里的 confs 副本与 metadata/clash, 失败时保留 journal 供启动重试。
+    if ! rm -rf "$CONFIG_DIR" 2>/dev/null; then
+        _error "无法删除旧配置目录, 已取消重置以保护现有数据"
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
-    if ! _reset_fsync_required "$(dirname "$CONFIG_FILE")"; then
-        _error "旧 config.json 删除未能持久化, 正在恢复重置前的快照"
+    if ! _reset_fsync_required "$DEPLOY_DIR"; then
+        _error "旧配置目录删除未能持久化, 正在恢复重置前的快照"
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
@@ -1177,8 +1194,8 @@ _reset_config_locked() {
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
-    if ! _reset_fsync_required "$CONFIG_FILE" || ! _reset_fsync_required "$(dirname "$CONFIG_FILE")"; then
-        _error "新 config.json 未能持久化, 正在恢复重置前的快照"
+    if ! _reset_fsync_required "$CONFIG_DIR" || ! _reset_fsync_required "$DEPLOY_DIR"; then
+        _error "新配置未能持久化, 正在恢复重置前的快照"
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
@@ -1216,7 +1233,7 @@ _reset_config_locked() {
         _warn "重置已应用且运行态已收敛, 但事务收尾未完成(runtime_verified 写入失败); 现场已保留"
         return 1
     fi
-    _success "config.json 已重置(含 routing 规则), 节点已清空"
+    _success "配置已重置(含 routing 规则), 节点已清空"
 }
 
 # ---------------------------------------------------------------------------
@@ -1363,7 +1380,7 @@ _hy2_manage_menu() {
 # 用户可以只开其一, 也可以都开。
 #
 # 节点选择与 [5] 同口径: 多节点时必须先选节点(要求 7 —— 绝不能改错节点), 且提交前校验
-# 该入站**真实存在于 config.json**: 元数据在而 config 被手工改过时, jq 会匹配 0 条路径并
+# 该入站**真实存在于配置中**: 元数据在而 config 被手工改过时, jq 会匹配 0 条路径并
 # 返回 0, _mutate_config 重启成功却什么都没改, 菜单却报"已设置"。
 # ---------------------------------------------------------------------------
 # 节点编号解析的唯一入口(成功时 stdout 输出 tag; 失败返回 1)。
@@ -1424,8 +1441,8 @@ _hy2_masq_menu() {
     tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
 
     # 入站必须真实存在于 config(见文件头注释: 否则 jq 0 命中而菜单报成功)
-    jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1 \
-        || { _error "config.json 中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
+    _config_jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' >/dev/null 2>&1 \
+        || { _error "配置中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
 
     while true; do
         local cur_desc
@@ -1523,7 +1540,7 @@ _hy2_masq_set_proxy() {
                 *) _error "无效输入: ${ans}(请输入 y 或 n, 直接回车 = N)" ;;
             esac
         done
-        [ "$ins" = "true" ] && _warn "已跳过证书校验: 中间人可替换回源内容(仅在自签/证书不匹配时需要)"
+        [ "$ins" = "true" ] && _warn "已跳过目标站点证书校验(仅在自签/证书不匹配时需要)"
     fi
     # xForwarded 仅 >= v26.9.8 支持; 门控通过时才问, 避免让用户选一个会被静默忽略的开关
     if _hy2_masq_unix_supported; then
@@ -1617,16 +1634,16 @@ _hy2_congestion_txn_locked() {
         _error "Hy2 元数据已变化或损坏, 拒绝提交: $meta"
         return 1
     fi
-    if [ ! -s "$CONFIG_FILE" ] || ! jq -e --arg t "$tag" \
+    if ! _config_present || ! _config_jq -e --arg t "$tag" \
         '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and $nodes[0].protocol == "hysteria")' \
-        "$CONFIG_FILE" >/dev/null 2>&1; then
-        _error "config.json 中找不到唯一的 Hy2 入站(${tag}), 请先同步/修复配置"
+        >/dev/null 2>&1; then
+        _error "配置中找不到唯一的 Hy2 入站(${tag}), 请先同步/修复配置"
         return 1
     fi
     meta_prev=$(cat "$meta" 2>/dev/null) || meta_prev=""
     [ -n "$meta_prev" ] || { _error "无法快照 Hy2 元数据: $meta"; return 1; }
     cur_cc=$(jq -r '.congestion // empty' "$meta" 2>/dev/null) || cur_cc=""
-    config_cc=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.congestion // empty' "$CONFIG_FILE" 2>/dev/null) || config_cc=""
+    config_cc=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.congestion // empty' 2>/dev/null) || config_cc=""
     case "$operation" in
         congestion)
             case "$new_cc" in bbr|brutal|force-brutal) ;; *) _error "无效拥塞模式: $new_cc"; return 1 ;; esac
@@ -1664,8 +1681,8 @@ _hy2_congestion_txn_locked() {
             case "$config_cc" in brutal|force-brutal) ;; *) _error "该节点当前为 ${config_cc:-未知} 模式, 非 brutal/force-brutal 无需设带宽"; return 1 ;; esac
             effective_up="$up"
             effective_down="$down"
-            [ -n "$effective_up" ] || effective_up=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalUp // empty' "$CONFIG_FILE" 2>/dev/null)
-            [ -n "$effective_down" ] || effective_down=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalDown // empty' "$CONFIG_FILE" 2>/dev/null)
+            [ -n "$effective_up" ] || effective_up=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalUp // empty' 2>/dev/null)
+            [ -n "$effective_down" ] || effective_down=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalDown // empty' 2>/dev/null)
             if ! _mutate_config --arg t "$tag" --arg up "$effective_up" --arg down "$effective_down" \
                 'if ([.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] | length) != 1 then error("Hy2 inbound changed") else (.inbounds[] | select(.tag == $t and .protocol == "hysteria") | .streamSettings.finalmask.quicParams) |= (. + (if $up != "" then {brutalUp: $up} else {} end) + (if $down != "" then {brutalDown: $down} else {} end)) end'; then
                 _error "带宽调整失败, config 事务未成功; 请核对上方回滚状态"
@@ -1698,7 +1715,7 @@ _hy2_congestion_rollback() {
         _error "Hy2 更新失败, config 与元数据已完整回滚"
         return 1
     fi
-    _error "Hy2 更新失败且回滚不完整, 请手动核对 ${CONFIG_FILE} 与 ${meta}"
+    _error "Hy2 更新失败且回滚不完整, 请手动核对 ${CONFIG_DIR} 与 ${meta}"
     return 2
 }
 
@@ -1857,21 +1874,21 @@ _hy2_obfs_txn_locked() {
         _error "Hy2 元数据已变化或损坏, 拒绝提交: $meta"
         return 1
     fi
-    if [ ! -s "$CONFIG_FILE" ] || ! jq -e --arg t "$tag" \
+    if ! _config_present || ! _config_jq -e --arg t "$tag" \
         '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and $nodes[0].protocol == "hysteria")' \
-        "$CONFIG_FILE" >/dev/null 2>&1; then
-        _error "config.json 中找不到唯一的 Hy2 入站(${tag}), 请先同步/修复配置"
+        >/dev/null 2>&1; then
+        _error "配置中找不到唯一的 Hy2 入站(${tag}), 请先同步/修复配置"
         return 1
     fi
     meta_prev=$(cat "$meta" 2>/dev/null) || meta_prev=""
     [ -n "$meta_prev" ] || { _error "无法快照 Hy2 元数据: $meta"; return 1; }
-    rollback_mask=$(jq -c --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" \
+    rollback_mask=$(_config_jq -c --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" \
         '[.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] as $nodes
          | if ($nodes | length) != 1 then error("Hy2 inbound changed")
            else ($nodes[0].streamSettings.finalmask.udp // []
                  | map(select(.type == $ourtype and (.settings // {})[$ourmark] == true))) as $ours
                 | if ($ours | length) > 1 then error("multiple managed UDP layers") else ($ours[0] // null) end
-           end' "$CONFIG_FILE" 2>/dev/null) || {
+           end' 2>/dev/null) || {
         _error "无法读取 config 中本脚本实际管理的混淆层, 已取消"
         return 1
     }
@@ -1880,7 +1897,7 @@ _hy2_obfs_txn_locked() {
             if _hy2_udp_has_foreign_salamander "$tag"; then
                 _error "该入站的 finalmask.udp 已存在**非本脚本写入**的 salamander 层;"
                 _error "继续启用会叠加成双重混淆(客户端只做一层, 必然连不上)。"
-                _tip "请先手工编辑 ${CONFIG_FILE} 移除或改名该层(本脚本写入的层带 settings.xd_managed=true)"
+                _tip "请先手工编辑 ${CONFIG_DIR} 移除或改名该层(本脚本写入的层带 settings.xd_managed=true)"
                 _tip "若只想关闭本脚本的混淆, 请选 [3](只删本脚本那层, 保留其它层)"
                 return 1
             fi
@@ -1916,7 +1933,7 @@ _hy2_obfs_txn_locked() {
     if _hy2_obfs_rollback "$tag" "$rollback_mask"; then
         config_ok=1
     else
-        _warn "混淆配置回滚失败, 请手动核对: $CONFIG_FILE"
+        _warn "混淆配置回滚失败, 请手动核对: $CONFIG_DIR"
     fi
     if _atomic_write_json "$meta" "$meta_prev"; then
         meta_ok=1
@@ -1927,7 +1944,7 @@ _hy2_obfs_txn_locked() {
         _error "混淆事务失败, 配置与元数据已恢复到改动前"
         return 1
     fi
-    _error "混淆事务失败且回滚不完整, 请手动核对 ${CONFIG_FILE} 与 ${meta}"
+    _error "混淆事务失败且回滚不完整, 请手动核对 ${CONFIG_DIR} 与 ${meta}"
     return 2
 }
 
@@ -2034,7 +2051,7 @@ _hy2_obfs_menu() {
 _hy2_obfs_rollback() {
     local tag="$1" mask="$2"
     if [ "$mask" = "__INVALID__" ]; then
-        _error "改动前的混淆元数据无法解析, 未回滚配置(请手工核对 ${CONFIG_FILE})"
+        _error "改动前的混淆元数据无法解析, 未回滚配置(请手工核对 ${CONFIG_DIR})"
         return 1
     fi
     if [ -z "$mask" ]; then
@@ -2056,7 +2073,7 @@ _hy2_obfs_rollback() {
 #
 # 还原源:
 #   · config —— `_mutate_config` 在改动前自己调过 `_backup_config`, 故
-#     `$BACKUP_DIR/config.json.lastbak` 正是切换前那一份, 直接用 `_restore_config`。
+#     `$BACKUP_DIR/confs.lastbak` 正是切换前那一份, 直接用 `_restore_config`。
 #   · metadata —— `_reality_domain_txn_locked` 在持锁后把原文读入内存, 供本事务回滚。
 # 还原后必须重新确认服务稳定(`_restart_xray_verified`), 因为它才是我方"新配置可用"的判据。
 #
@@ -2065,7 +2082,7 @@ _hy2_obfs_rollback() {
 # ---------------------------------------------------------------------------
 _reality_switch_rollback() {
     local meta="$1" meta_prev="${2:-}" config_ok=0 runtime_ok=0 meta_ok=0
-    # 锁域是这里的前提: `_restore_config` 读的是**共享**的 `config.json.lastbak`, 而它由
+    # 锁域是这里的前提: `_restore_config` 读的是**共享**的 `confs.lastbak`, 而它由
     # `_backup_config` 在每次 config 写入前覆盖。锁域内保证该快照自始至终属于本次事务。
     if _restore_config; then
         config_ok=1
@@ -2075,7 +2092,7 @@ _reality_switch_rollback() {
             _warn "配置已还原, 但 xray 未能稳定重启, 请查看状态"
         fi
     else
-        _warn "配置回滚失败, 请手动核对: $CONFIG_FILE"
+        _warn "配置回滚失败, 请手动核对: $CONFIG_DIR"
     fi
     if [ -n "$meta_prev" ]; then
         if _atomic_write_json "$meta" "$meta_prev" 2>/dev/null; then
@@ -2090,15 +2107,15 @@ _reality_switch_rollback() {
         _error "域名切换未完成(后置步骤失败), 配置、运行态与元数据均已还原"
         return 0
     fi
-    _error "域名切换失败且回滚不完整, 请手动核对 $CONFIG_FILE 与 $meta"
-    _tip "可用备份: $BACKUP_DIR/config.json.lastbak"
+    _error "域名切换失败且回滚不完整, 请手动核对 $CONFIG_DIR 与 $meta"
+    _tip "可用备份: $BACKUP_DIR/confs.lastbak"
     return 1
 }
 
 # ---------------------------------------------------------------------------
 # Reality 域名切换的**整个提交事务**(2026-09-22 十轮 P1-③)。
 #
-# 九轮把"后置失败回滚"做出来了, 但回滚源是**共享的** `config.json.lastbak`, 而该文件只在
+# 九轮把"后置失败回滚"做出来了, 但回滚源是**共享的** `confs.lastbak`, 而该文件只在
 # `_mutate_config` 内部被锁保护 —— 事务的其余部分(metadata 写入、链接重建、失败回滚)都在
 # 锁**外**。于是并发场景: A 的 `_mutate_config` 提交并释放锁 → B 修改 config(覆盖 lastbak)
 # → A 的后置步骤失败 → A 用 **B 的快照**回滚, 把 B 已提交的改动静默抹掉(丢失更新)。
@@ -2136,10 +2153,10 @@ _reality_domain_txn_locked() {
         _error "Reality 元数据已变化或损坏, 拒绝提交: $meta"
         return 1
     fi
-    if ! jq -e --arg t "$tag" \
+    if ! _config_jq -e --arg t "$tag" \
         '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and ($nodes[0].streamSettings.realitySettings | type) == "object")' \
-        "$CONFIG_FILE" >/dev/null 2>&1; then
-        _error "config.json 中找不到唯一的 Reality 入站(${tag}), 请先同步/修复配置"
+        >/dev/null 2>&1; then
+        _error "配置中找不到唯一的 Reality 入站(${tag}), 请先同步/修复配置"
         return 1
     fi
     meta_prev=$(cat "$meta" 2>/dev/null) || meta_prev=""
@@ -2156,9 +2173,9 @@ _reality_domain_txn_locked() {
                 return 1
             fi
         else
-            if ! jq -e --arg t "$tunnel_tag" \
+            if ! _config_jq -e --arg t "$tunnel_tag" \
                 '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and $nodes[0].protocol == "tunnel")' \
-                "$CONFIG_FILE" >/dev/null 2>&1; then
+                >/dev/null 2>&1; then
                 _error "Reality 元数据中的 tunnel_tag 不对应唯一 tunnel 入站(${tunnel_tag}), 拒绝切换"
                 return 1
             fi
@@ -2171,7 +2188,7 @@ _reality_domain_txn_locked() {
             new_tunnel_tag=$(_gen_tunnel_tag "$new_sni" "$tunnel_port" "$node_port") || new_tunnel_tag=""
             [ -n "$new_tunnel_tag" ] || { _error "无法生成新 tunnel tag, 已取消域名切换"; return 1; }
             if [ "$new_tunnel_tag" != "$tunnel_tag" ] && \
-               jq -e --arg t "$new_tunnel_tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+               _config_jq -e --arg t "$new_tunnel_tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' >/dev/null 2>&1; then
                 _error "新 tunnel tag 已被其他入站占用(${new_tunnel_tag}), 拒绝切换"
                 return 1
             fi
@@ -2352,7 +2369,7 @@ _reality_domain_menu() {
 
     _success "Reality 域名已切换为: ${new_sni}"
     if [ "$result_mode" = "direct" ]; then
-        actual_target=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' "$CONFIG_FILE" 2>/dev/null)
+        actual_target=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' 2>/dev/null)
         [ -n "$actual_target" ] && _tip "直连模式: realitySettings.target 当前为 ${actual_target}"
     fi
     _tip "客户端须更新 SNI 为 ${new_sni} (pbk/sid 不变)"

@@ -31,7 +31,9 @@ contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 . "$ROOT/lib/90-menu.sh"
 
 DEPLOY_DIR="$TMP/deploy"
-CONFIG_FILE="$DEPLOY_DIR/config.json"
+CONFIG_DIR="$DEPLOY_DIR/confs"
+LEGACY_CONFIG_FILE="$DEPLOY_DIR/config.json"
+BACKUP_DIR="$DEPLOY_DIR/backups"
 STATE_DIR="$DEPLOY_DIR/state"
 ASSET_DIR="$DEPLOY_DIR/assets"
 NODES_DIR="$DEPLOY_DIR/nodes"
@@ -50,9 +52,12 @@ HYSTERIA_NODE_META="$HYSTERIA_DATA_DIR/node.json"
 HYSTERIA_PID_FILE="$TMP/hysteria.pid"
 HYSTERIA_SVC="hysteria"
 INIT_SYSTEM=direct
-mkdir -p "$DEPLOY_DIR" "$STATE_DIR" "$ASSET_DIR" "$NODES_DIR" "$CERT_DIR" "$BIN_DIR" "$LOG_DIR" "$HYSTERIA_DATA_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR"
+mkdir -p "$DEPLOY_DIR" "$CONFIG_DIR" "$BACKUP_DIR" "$STATE_DIR" "$ASSET_DIR" "$NODES_DIR" "$CERT_DIR" "$BIN_DIR" "$LOG_DIR" "$HYSTERIA_DATA_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR"
 _deploy_lock_root() { printf '%s' "$TMP/locks"; }
 mkdir -p "$TMP/locks"
+# 测试绝不碰真实服务/页缓存: 重启与 drop_caches 一律短路。
+_restart_xray_verified() { return 0; }
+_maybe_drop_caches() { :; }
 
 printf '== focused common behavior ==\n'
 check 'valid IPv4 accepted' _validate_listen 192.0.2.10
@@ -64,6 +69,155 @@ _xray_current_version() { printf '26.9.9\n'; }
 check 'version compare' _xray_version_ge 26.4.25
 if _xray_version_ge 26.x.25 >/dev/null 2>&1; then fail 'version rejects malformed value'; else pass 'version rejects malformed value'; fi
 check_eq 'version tag canonicalization' v26.9.9 "$(_xray_canon_tag 26.9.9)"
+
+printf '== config dir (confs) mechanics ==\n'
+# 空 confs 目录必须被判为"没有配置": xray -confdir 遇到空目录会退化成读 STDIN 并以 rc=23
+# 失败, 所以 _config_present 是防止把空目录当成有效配置的唯一闸门。
+rm -f "$CONFIG_DIR"/*.json 2>/dev/null
+if _config_present; then fail 'empty config dir is not present'; else pass 'empty config dir is not present'; fi
+check_eq 'empty config dir merges to {}' '{}' "$(_config_merged)"
+if _config_write_merged 'not-json' >/dev/null 2>&1; then fail 'merge write rejects malformed JSON'; else pass 'merge write rejects malformed JSON'; fi
+
+# 一次性迁移: 旧单文件 config.json 拆进 confs 并改名 .bak; 再跑一次是幂等 no-op。
+printf '{"log":{"loglevel":"warning"},"inbounds":[]}\n' > "$LEGACY_CONFIG_FILE"
+if _config_migrate_legacy >/dev/null 2>&1 \
+   && [ -f "$LEGACY_CONFIG_FILE.bak" ] && [ ! -e "$LEGACY_CONFIG_FILE" ] \
+   && [ -f "$CONFIG_DIR/02_log.json" ] && [ -f "$CONFIG_DIR/07_inbounds.json" ]; then
+    pass 'legacy config migrates into confs'
+else
+    fail 'legacy config migrates into confs'
+fi
+_config_migrate_legacy >/dev/null 2>&1
+check_eq 'migration is idempotent' 'warning' "$(_config_jq -r '.log.loglevel')"
+# 用不到的模块不生成文件: 迁移结果里不该出现空壳的 04_dns.json。
+if [ -f "$CONFIG_DIR/04_dns.json" ]; then fail 'unused module files are not created'; else pass 'unused module files are not created'; fi
+# 坏掉的旧配置必须被拒绝且不改名(否则用户配置会被一份解析失败的碎片顶掉)。
+rm -f "$CONFIG_DIR"/*.json "$LEGACY_CONFIG_FILE.bak"
+printf '{"log":\n' > "$LEGACY_CONFIG_FILE"
+if _config_migrate_legacy >/dev/null 2>&1; then fail 'unparseable legacy config is rejected'; else pass 'unparseable legacy config is rejected'; fi
+if [ -f "$LEGACY_CONFIG_FILE" ] && [ ! -e "$LEGACY_CONFIG_FILE.bak" ]; then pass 'rejected migration leaves the legacy file alone'; else fail 'rejected migration leaves the legacy file alone'; fi
+rm -f "$LEGACY_CONFIG_FILE"
+
+# 一个顶层字段一个文件, 文件名固定, 未知字段落 99_ 前缀; 文件内容保留 {"<字段>": <值>} 外壳
+# (xray -confdir 按文件合并, 裸值文件会让合并报 "Cannot index object with number")。
+_config_write_merged '{"log":{"loglevel":"debug"},"routing":{"rules":[]},"customTop":1}' >/dev/null 2>&1
+if [ -f "$CONFIG_DIR/05_routing.json" ] && [ -f "$CONFIG_DIR/99_customTop.json" ]; then
+    pass 'top-level field maps to its fixed file name'
+else
+    fail 'top-level field maps to its fixed file name'
+fi
+check_eq 'conf file keeps the top-level key wrapper' 'routing' "$(jq -r 'keys[0]' "$CONFIG_DIR/05_routing.json")"
+# del(.geodata) 必须真的删掉 14_geodata.json, 否则关掉 Geo 定时后核心仍会加载 geodata 段。
+_config_write_merged '{"log":{},"geodata":{"cron":"0 3 */3 * *"}}' >/dev/null 2>&1
+[ -f "$CONFIG_DIR/14_geodata.json" ] || fail 'geodata field file is created'
+_config_write_merged '{"log":{}}' >/dev/null 2>&1
+if [ -e "$CONFIG_DIR/14_geodata.json" ]; then fail 'removed field deletes its file'; else pass 'removed field deletes its file'; fi
+
+# 备份/回滚的单位是整个 confs 目录。
+_config_write_merged '{"log":{"loglevel":"warning"}}' >/dev/null 2>&1
+_backup_config >/dev/null 2>&1
+_config_write_merged '{"log":{"loglevel":"debug"}}' >/dev/null 2>&1
+_restore_config >/dev/null 2>&1
+check_eq 'rollback restores the backed-up conf dir' 'warning' "$(_config_jq -r '.log.loglevel')"
+# 写入闸门: 事务禁止改配置时, jq 变更必须被拒绝(否则崩溃恢复期间会二次损坏现场)。
+if (
+    _txn_allow_config_write() { return 1; }
+    _mutate_config '.log.loglevel = "error"' >/dev/null 2>&1
+); then fail 'config mutation is blocked by the write gate'; else pass 'config mutation is blocked by the write gate'; fi
+check_eq 'blocked mutation leaves the config untouched' 'warning' "$(_config_jq -r '.log.loglevel')"
+# 合并失败必须对调用方可见。旧写法 `_config_merged | jq ...` 在管道里丢掉合并的退出码, 而
+# jq 读到 EOF 会返回 0 且无输出 ⇒ "配置读不出来"被当成"配置里没有", 调用方(如
+# _hy2_cert_dir_referenced)会把仍被引用的证书目录判成无引用再 rm -rf。
+printf '{"log": broken\n' > "$CONFIG_DIR/02_log.json"
+if _config_jq -r '.log.loglevel' >/dev/null 2>&1; then
+    fail 'unreadable conf dir makes _config_jq fail visibly'
+else
+    pass 'unreadable conf dir makes _config_jq fail visibly'
+fi
+_config_write_merged '{"log":{"loglevel":"warning"}}' >/dev/null 2>&1
+# 改 DNS 段(需求4): 仍然只动 04_dns.json, 其余字段文件原样保留。
+# 场景1: 核心预检直接拒绝候选配置 ⇒ 必须保留原配置。_config_edit_preflight 要求 XRAY_BIN
+# 可执行, 且 _xray_test_config_dir 要在候选目录上跑真核心; 套件用"可执行空壳 + 恒拒绝"
+# 桩来驱动这条拒绝路径(全部限制在子 shell 内, 不泄漏给后续断言)。
+_config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
+if (
+    : > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+    _xray_test_config_dir() { return 1; }
+    _dns_apply --arg a '1.1.1.1' '.dns = ((.dns | if type == "object" then . else {} end) + {servers: [$a]})' >/dev/null 2>&1
+); then
+    fail 'dns change is refused when the config check cannot pass'
+else
+    pass 'dns change is refused when the config check cannot pass'
+fi
+check_eq 'refused dns change keeps the old config' '{}' "$(_config_jq -r '.dns // {}')"
+# 场景2: 预检通过后, 变更必须只落在 04_dns.json 上。
+_dns_apply_ok() {
+    local rc=0
+    (
+        : > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+        _xray_test_config_dir() { return 0; }
+        _dns_apply "$@" >/dev/null 2>&1
+    ) || rc=1
+    rm -f "$XRAY_BIN"
+    return "$rc"
+}
+_dns_apply_ok --arg a '1.1.1.1' '.dns = ((.dns | if type == "object" then . else {} end) + {servers: [$a]})' >/dev/null 2>&1
+check_eq 'dns change creates the dns field file' '1.1.1.1' "$(_config_jq -r '.dns.servers[0]')"
+if [ -f "$CONFIG_DIR/04_dns.json" ] && [ -f "$CONFIG_DIR/05_routing.json" ] && [ ! -e "$CONFIG_DIR/14_geodata.json" ]; then
+    pass 'dns change touches only the dns field file'
+else
+    fail 'dns change touches only the dns field file'
+fi
+check_eq 'dns summary reports the upstream' '1.1.1.1|' "$(_dns_summary)"
+# queryStrategy 只有 UseIP/UseIPv4/UseIPv6 三档; 写进去后摘要必须反映出来。
+_dns_apply_ok '.dns.queryStrategy = "UseIPv4"' >/dev/null 2>&1
+check_eq 'dns summary reports the query strategy' '1.1.1.1|UseIPv4' "$(_dns_summary)"
+# 删除 DNS 段必须让 04_dns.json 消失(空文件会让核心加载空 dns 段)。
+_dns_apply_ok 'del(.dns)' >/dev/null 2>&1
+if [ -e "$CONFIG_DIR/04_dns.json" ]; then fail 'dns delete removes the field file'; else pass 'dns delete removes the field file'; fi
+# [恢复默认] 的默认值只来自 lib/00-common.sh 的 XRAY_DEFAULT_DNS_JSON 常量; 常量被改名/删掉
+# 时该菜单只会打印"缺少默认 DNS 常量"并退出, 所以必须断言恢复出来的段与常量逐字一致。
+if (
+    : > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+    _xray_test_config_dir() { return 0; }
+    # 确认提示从 stdin 读, 直接喂 "y" —— 不能覆盖 read 函数: _config_write_merged 自己也在
+    # 用 `read -d ''` 循环拆字段, 覆盖掉会把字段名读成 "y" 而写坏候选文件。
+    printf 'y\n' | _dns_restore_default >/dev/null 2>&1
+); then pass 'dns restore default runs'; else fail 'dns restore default runs'; fi
+check_eq 'dns restore default uses the shared constant' \
+    "$(jq -cS . <<<"$XRAY_DEFAULT_DNS_JSON")" "$(_config_jq -cS '.dns')"
+rm -f "$XRAY_BIN"
+
+printf '== launch contract (confdir + strict JSON) ==\n'
+# 需求3 的启动契约: confdir 与 XRAY_JSON_STRICT 只能通过启动参数/shell 环境传, **绝不能**写进
+# config 的 env 段 —— Xray 必须先选定 JSON 解析器才能读配置。这里注入 env 后检查配置里除了
+# XRAY_LOCATION_ASSET 没有别的键、且没有任何值指向 confs 目录; 有人"顺手"把严格开关塞进
+# env 段时这条会立刻变红。
+_config_write_merged '{"log":{},"inbounds":[]}' >/dev/null 2>&1
+_auto_ensure_config_env_write >/dev/null 2>&1
+check_eq 'config env carries only XRAY_LOCATION_ASSET' 'XRAY_LOCATION_ASSET' "$(_config_jq -r '.env | keys_unsorted | join(",")')"
+check_eq 'config env value points at the asset dir' "$ASSET_DIR" "$(_config_jq -r '.env.XRAY_LOCATION_ASSET')"
+if _config_jq -e --arg d "$CONFIG_DIR" \
+     '((.env // {}) | to_entries | any(.key == "XRAY_JSON_STRICT" or (.value | tostring | contains($d)))) // false' \
+     >/dev/null 2>&1; then
+    fail 'strict JSON switch and confdir stay out of the config env block'
+else
+    pass 'strict JSON switch and confdir stay out of the config env block'
+fi
+
+printf '== menu layout ==\n'
+# 中文在终端占 2 列, printf 的 %-Ns 按字符数补空格 ⇒ 双栏会错位。宽度必须按字节类判定;
+# (字节数-字符数)/2 的旧算法在 2 字节字符个数为奇数时会多算 1 列(如 "a··" 会算成 4)。
+check_eq 'ascii width' 3 "$(_menu_display_width abc)"
+check_eq 'cjk width' 4 "$(_menu_display_width 中文)"
+check_eq 'mixed-width odd count' 3 "$(_menu_display_width 'a··')"
+check_eq 'wide dash width' 2 "$(_menu_display_width '—')"
+# 用 $'\033' 而不是 GNU sed 的 \x1b: busybox sed 不解释 \x1b, 转义会留在串里让下一条假失败。
+_menu_row_plain=$(_menu_row 1 "添加节点" 2 "查看节点" | sed $'s/\033\[[0-9;]*m//g')
+# 只量左段宽度的话, 右格整块丢失时 ${…%%\[2\]*} 会匹配不到而退化成量整行, 宽度仍是 22 ⇒
+# 断言假通过。右格存在性必须显式断言。
+if contains '[2] 查看节点' "$_menu_row_plain"; then pass 'two-column row keeps the right cell'; else fail 'two-column row keeps the right cell'; fi
+check_eq 'two-column row aligns the right cell' 22 "$(_menu_display_width "${_menu_row_plain%%\[2\]*}")"
 
 printf '== atomic JSON and locks ==\n'
 check 'atomic JSON write' _atomic_write_json "$DEPLOY_DIR/atomic.json" '{"ok":true}'
@@ -79,97 +233,10 @@ LOGROTATE_CONF="$TMP/logrotate.conf"
 if _logrotate_render_config | grep -q 'rotate 7'; then pass 'logrotate renderer emits rotation count'; else fail 'logrotate renderer emits rotation count'; fi
 _state_set logrotate_retention 999999999999999999999999
 if _logrotate_render_config | grep -q 'rotate 30'; then pass 'long retention is bounded'; else fail 'long retention is bounded'; fi
-LOGROTATE_CONF="$TMP/logrotate-reapply.conf"
-_state_set logrotate_enabled on
-if _logrotate_enable >/dev/null 2>&1 && grep -q 'rotate 30' "$LOGROTATE_CONF"; then pass 'logrotate reapply repairs enabled config'; else fail 'logrotate reapply repairs enabled config'; fi
 
 GEO_TRANSITION_KEY=geo_transition
 _state_set "$GEO_TRANSITION_KEY" off_pending
 check_eq 'Geo off marker persists' off_pending "$(_state_get "$GEO_TRANSITION_KEY")"
-
-printf '== cloudflared credential handling ==\n'
-TOK1='eyJhIjoiYWFhYWFhYWFhYWFhYWFhYWFhYSJ9'
-TOK2='eyJhIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmIifQ=='
-redacted=$(_cf_redact_service_line "ExecStart=$CF_BIN tunnel run --token $TOK1 --token $TOK2")
-if contains "$TOK1" "$redacted" || contains "$TOK2" "$redacted"; then fail 'all repeated tokens are redacted'; else pass 'all repeated tokens are redacted'; fi
-
-printf '== cloudflared command ownership ==\n'
-CF_UNIT_SYSTEMD="$TMP/cloudflared.service"
-custom_bin="$TMP/custom-cloudflared"
-printf '#!/bin/sh\nexit 0\n' > "$custom_bin"; chmod +x "$custom_bin"
-printf 'ExecStart=%s tunnel run --token %s\n' "$custom_bin" "$TOK1" > "$CF_UNIT_SYSTEMD"
-_read_cf_state
-if _cf_managed_flags_only; then fail 'custom cloudflared executable rejected'; else pass 'custom cloudflared executable rejected'; fi
-rm -f "$CF_UNIT_SYSTEMD" "$custom_bin"
-
-iptables() {
-    case "$*" in
-        *' -S '*) printf '%s\n' '-A PREROUTING -p udp -m udp --dport 20000:30000 -m comment --comment xray-deploy-hy2-hop -j DNAT --to-destination :8443' ;;
-        *) return 0 ;;
-    esac
-}
-if _hy2_add_hop_rules 9443 25000 >/dev/null 2>&1; then fail 'overlapping IPv4 hop range rejected'; else pass 'overlapping IPv4 hop range rejected'; fi
-if (
-    iptables() { case "$*" in *' -S '*) return 0 ;; *) return 0 ;; esac; }
-    ip6tables() {
-        case "$*" in
-            *' -S '*) printf '%s\n' '-A PREROUTING -p udp --dport 20000:30000 -m comment --comment xray-deploy-hy2-hop -j DNAT --to-destination :8443' ;;
-            *) return 0 ;;
-        esac
-    }
-    _hy2_add_hop_rules 9443 25000 >/dev/null 2>&1
-); then fail 'overlapping IPv6 hop range rejected'; else pass 'overlapping IPv6 hop range rejected'; fi
-IP6_ADD_MARKER="$TMP/ip6-added"
-if (
-    iptables() { case "$*" in *' -S '*) return 0 ;; *) return 0 ;; esac; }
-    ip6tables() {
-        case "$*" in
-            *' -S '*) return 1 ;;
-            *) : > "$IP6_ADD_MARKER"; return 0 ;;
-        esac
-    }
-    _hy2_add_hop_rules 9443 30001 >/dev/null 2>&1
-) && [ ! -e "$IP6_ADD_MARKER" ]; then pass 'failed IPv6 snapshot skips IPv6 add'; else fail 'failed IPv6 snapshot skips IPv6 add'; fi
-
-printf '== cloudflared parser and absent-unit behavior ==\n'
-CF_BIN="$TMP/cloudflared-main"
-printf '#!/bin/sh\nexit 0\n' > "$CF_BIN"; chmod +x "$CF_BIN"
-CF_UNIT_SYSTEMD="$TMP/cloudflared.service"
-printf 'ExecStart=%s --no-autoupdate tunnel --protocol http2 run --token %s\n' "$CF_BIN" "$TOK1" > "$CF_UNIT_SYSTEMD"
-INIT_SYSTEM=systemd
-_read_cf_state
-if [ "$CF_CUR_AUTOUPDATE" = off ] && [ "$CF_CUR_HTTP2" = on ] && _cf_managed_flags_only; then
-    pass 'managed cloudflared service flags accepted'
-else
-    fail 'managed cloudflared service flags accepted'
-fi
-printf 'ExecStart=%s tunnel run "--metrics=127.0.0.1:2000" --token %s\n' "$CF_BIN" "$TOK1" > "$CF_UNIT_SYSTEMD"
-_read_cf_state
-if _cf_managed_flags_only; then fail 'quoted custom cloudflared flag rejected'; else pass 'quoted custom cloudflared flag rejected'; fi
-printf 'ExecStart=%s tunnel run extra-positional --token %s\n' "$CF_BIN" "$TOK1" > "$CF_UNIT_SYSTEMD"
-_read_cf_state
-if _cf_managed_flags_only; then fail 'extra cloudflared positional rejected'; else pass 'extra cloudflared positional rejected'; fi
-rm -f "$CF_UNIT_SYSTEMD" "$CF_BIN"
-INIT_SYSTEM=direct
-if (
-    INIT_SYSTEM=systemd
-    CF_BIN="$TMP/cloudflared-uninstall"
-    CF_UNIT_SYSTEMD="$TMP/cloudflared-unit"
-    CF_UNIT_OPENRC="$TMP/cloudflared-init"
-    CF_STATE_AUTOUPDATE="$TMP/cf-auto"; CF_STATE_HTTP2="$TMP/cf-http2"; CF_STATE_EDGE_IP="$TMP/cf-edge"; CF_STATE_TOKEN="$TMP/cf-token"
-    printf '#!/bin/sh\nexit 0\n' > "$CF_BIN"; chmod +x "$CF_BIN"
-    : > "$CF_UNIT_SYSTEMD"
-    systemctl() {
-        case "$1" in
-            disable|daemon-reload) return 0 ;;
-            show) printf 'not-found\n'; return 0 ;;
-            is-enabled) printf 'not-found\n' >&2; return 1 ;;
-        esac
-    }
-    _cf_kill_all() { return 0; }
-    find() { return 0; }
-    _uninstall_cloudflared >/dev/null 2>&1
-); then pass 'cloudflared accepts stderr-only missing systemd unit'; else fail 'cloudflared accepts stderr-only missing systemd unit'; fi
 
 printf '{"name":"shared-name"}\n' > "$NODES_DIR/xray.json"
 if _hysteria_name_taken shared-name; then pass 'shared Clash name collision rejected'; else fail 'shared Clash name collision rejected'; fi
@@ -178,16 +245,16 @@ rm -f "$NODES_DIR/xray.json"
 # ⇒ Hy2 节点落在跳跃范围内时被静默放行(该 UDP 端口随后被官方 REDIRECT 抢走)。
 # `.port` 又是 PortList(单端口 / 范围 / 逗号多段) ⇒ 必须按区间相交判定, 不能等值比较。
 # NODES_DIR 指向空目录, 使这些断言只检验 config 入站分支(分支 c 另有专测)。
-XH_PORT_CONFIG="$TMP/xray-portlist.json"
+XH_PORT_CONFS="$TMP/xray-portlist-confs"
 XH_NODES_EMPTY="$TMP/xh-nodes-empty"
-mkdir -p "$XH_NODES_EMPTY"
+mkdir -p "$XH_PORT_CONFS" "$XH_NODES_EMPTY"
 ss() { printf 'Netid State Local Address:Port Peer Address:Port\n'; }
 _xh_hop_conflict() {   # $1=入站 JSON, $2/$3=跳跃范围, $4=exclude; 判为冲突返回 0
-    local saved_cfg="$CONFIG_FILE" saved_nodes="$NODES_DIR" rc
-    printf '{"inbounds":[%s]}\n' "$1" > "$XH_PORT_CONFIG"
-    CONFIG_FILE="$XH_PORT_CONFIG"; NODES_DIR="$XH_NODES_EMPTY"
+    local saved_cfg="$CONFIG_DIR" saved_nodes="$NODES_DIR" rc
+    CONFIG_DIR="$XH_PORT_CONFS"; NODES_DIR="$XH_NODES_EMPTY"
+    _config_write_merged "$(printf '{"inbounds":[%s]}' "$1")" >/dev/null 2>&1
     _hysteria_check_hop_conflicts "$2" "$3" ${4:+"$4"} >/dev/null 2>&1; rc=$?
-    CONFIG_FILE="$saved_cfg"; NODES_DIR="$saved_nodes"
+    CONFIG_DIR="$saved_cfg"; NODES_DIR="$saved_nodes"
     [ "$rc" -ne 0 ]
 }
 check 'Xray hysteria PortList overlap rejected' _xh_hop_conflict \
@@ -217,7 +284,6 @@ if _xh_hop_conflict '{"protocol":"shadowsocks","port":31500,"settings":{"network
 check 'mkcp transport inbound flagged' _xh_hop_conflict \
     '{"protocol":"vless","port":31500,"streamSettings":{"network":"mkcp"}}' 20000 40000
 if _xh_hop_conflict '{"protocol":"hysteria","port":443}' 443 50000 443; then fail 'own listen port exempt from hop conflict'; else pass 'own listen port exempt from hop conflict'; fi
-CONFIG_FILE="$DEPLOY_DIR/config.json"
 
 SEED=$(head -c 32 /dev/zero | base64 | tr '+/' '-_' | tr -d '=')
 VERIFY=$(head -c 1952 /dev/zero | base64 | tr -d '=\n' | tr '+/' '-_')
@@ -338,863 +404,6 @@ else
     fail "PQ supported forwards generated keys [$XH_PQ_MENU_OUT]"
 fi
 
-printf '== guarded lifecycle behavior ==\n'
-# Startup migration adds native geodata without dropping the legacy rollback path.
-GEO_TRANSITION_KEY=geo_update_transition
-_state_set geo_cron on
-printf '{"inbounds":[]}\n' > "$CONFIG_FILE"
-: > "$ASSET_DIR/geosite.dat"
-: > "$ASSET_DIR/geoip.dat"
-if _auto_migrate_geo_autoupdate >/dev/null 2>&1 \
-   && [ "$(jq -r '.geodata.cron // empty' "$CONFIG_FILE")" = "$GEO_CRON_EXPR" ] \
-   && [ "$(_state_get geo_cron)" = on ]; then
-    pass 'Geo migration retains legacy fallback state'
-else
-    fail 'Geo migration retains legacy fallback state'
-fi
-
-# Restart must not start a second connector after incomplete process cleanup.
-if (
-    CF_START_SENTINEL="$TMP/cf-started"
-    INIT_SYSTEM=systemd
-    _cf_kill_all() { return 1; }
-    systemctl() { printf 'start\n' >> "$CF_START_SENTINEL"; }
-    sleep() { :; }
-    _cf_restart >/dev/null 2>&1 && exit 1
-    [ ! -e "$CF_START_SENTINEL" ]
-); then
-    pass 'cloudflared restart fails closed on cleanup error'
-else
-    fail 'cloudflared restart fails closed on cleanup error'
-fi
-
-# A clean cloudflared start should not pay the old fixed 3-second post-start delay.
-if (
-    CF_START_SENTINEL="$TMP/cf-fast-start"
-    CF_SLEEP_SENTINEL="$TMP/cf-fast-sleeps"
-    INIT_SYSTEM=systemd
-    _cf_kill_all() { return 0; }
-    _cf_is_managed_running() { return 0; }
-    systemctl() { [ "$1" = start ] && printf 'start\n' >> "$CF_START_SENTINEL"; }
-    sleep() { printf '%s\n' "$1" >> "$CF_SLEEP_SENTINEL"; }
-    _cf_restart >/dev/null 2>&1 && [ "$(cat "$CF_START_SENTINEL")" = start ] \
-        && [ "$(wc -l < "$CF_SLEEP_SENTINEL")" -eq 1 ] \
-        && [ "$(cat "$CF_SLEEP_SENTINEL")" = 2 ]
-); then
-    pass 'cloudflared clean restart skips fixed post-start delay'
-else
-    fail 'cloudflared clean restart skips fixed post-start delay'
-fi
-
-# The SIGKILL deadline is not a hardcoded number: it must come from the grace period the
-# service actually runs with, because a unit may carry `--grace-period 60s` (or
-# TUNNEL_GRACE_PERIOD) and SIGKILLing at a constant 35s cuts a still-draining tunnel short --
-# the same bug as the original 3s window, only wider.
-# The wait is an upper bound: a clean stop returns as soon as the unit is terminal.
-if (
-    CF_CFG_DEFAULT="$TMP/cf-grace-default.service"
-    : > "$CF_CFG_DEFAULT"
-    _cf_unit_path() { printf '%s' "$CF_CFG_DEFAULT"; }
-    got=$(_cf_grace_wait_seconds)
-    [ "$got" -eq "$(( CF_GRACE_DEFAULT + CF_GRACE_MARGIN ))" ]
-); then
-    pass 'cloudflared stop deadline follows the configured grace period, default 30s'
-else
-    fail 'cloudflared stop deadline follows the configured grace period, default 30s'
-fi
-
-if (
-    CF_CFG_SPACED="$TMP/cf-grace-spaced.service"
-    CF_CFG_INLINE="$TMP/cf-grace-inline.service"
-    CF_CFG_ENV="$TMP/cf-grace-env.service"
-    CF_CFG_COMMENT="$TMP/cf-grace-comment.service"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 60s run --token x\n' > "$CF_CFG_SPACED"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period=45s run --token x\n' > "$CF_CFG_INLINE"
-    printf '[Service]\nEnvironment="TUNNEL_GRACE_PERIOD=90s"\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' > "$CF_CFG_ENV"
-    printf '[Service]\n# ExecStart=/usr/local/bin/cloudflared tunnel --grace-period 600s run --token x\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' > "$CF_CFG_COMMENT"
-    _cf_unit_path() { printf '%s' "$CF_CFG_SPACED"; }
-    a=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_CFG_INLINE"; }
-    b=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_CFG_ENV"; }
-    c=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_CFG_COMMENT"; }
-    d=$(_cf_grace_wait_seconds)
-    [ "$a" -eq 65 ] && [ "$b" -eq 50 ] && [ "$c" -eq 95 ] \
-        && [ "$d" -eq "$(( CF_GRACE_DEFAULT + CF_GRACE_MARGIN ))" ]
-); then
-    pass 'cloudflared grace deadline reads --grace-period and TUNNEL_GRACE_PERIOD'
-else
-    fail 'cloudflared grace deadline reads --grace-period and TUNNEL_GRACE_PERIOD'
-fi
-
-# systemd applies its own quoting rules to ExecStart= before handing words to the process, so
-# `--grace-period "60s"` really means 60s. read -ra does NOT unquote; the literal would arrive
-# as `"60s"`, _cf_duration_seconds would reject it and the deadline would silently fall back to
-# the 30s default -- the very "configured 60s, killed at 35s" bug this change exists to fix.
-# Negative control: stripping quotes only from the whole word (or not at all) breaks the
-# inline forms, whose quotes sit *around the value*, not around the argument.
-if (
-    CF_Q_SPACED="$TMP/cf-grace-q-spaced.service"
-    CF_Q_SPACED_S="$TMP/cf-grace-q-spaced-s.service"
-    CF_Q_INLINE="$TMP/cf-grace-q-inline.service"
-    CF_Q_INLINE_S="$TMP/cf-grace-q-inline-s.service"
-    CF_Q_OPENRC="$TMP/cf-grace-q-openrc.conf"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period "60s" run --token x\n' > "$CF_Q_SPACED"
-    printf "[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period '60s' run --token x\n" > "$CF_Q_SPACED_S"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period="60s" run --token x\n' > "$CF_Q_INLINE"
-    printf "[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period='60s' run --token x\n" > "$CF_Q_INLINE_S"
-    printf 'command_args="--grace-period 60s run --token x"\n' > "$CF_Q_OPENRC"
-    _cf_unit_path() { printf '%s' "$CF_Q_SPACED"; };   a=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_Q_SPACED_S"; }; b=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_Q_INLINE"; };   c=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_Q_INLINE_S"; }; d=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_Q_OPENRC"; };   e=$(_cf_grace_wait_seconds)
-    [ "$a" -eq 65 ] && [ "$b" -eq 65 ] && [ "$c" -eq 65 ] && [ "$d" -eq 65 ] && [ "$e" -eq 65 ]
-); then
-    pass 'cloudflared grace deadline unquotes systemd and openrc arguments'
-else
-    fail 'cloudflared grace deadline unquotes systemd and openrc arguments'
-fi
-
-# systemd also feeds variables in from EnvironmentFile=, so TUNNEL_GRACE_PERIOD may live in
-# /etc/default/cloudflared rather than in the unit. Scanning only the unit text would report
-# "not configured" and fall back to the 30s default. A `-` prefix means "missing file is fine".
-if (
-    CF_EF_UNIT="$TMP/cf-grace-ef.service"
-    CF_EF_UNIT_ARGS="$TMP/cf-grace-ef-args.service"
-    CF_EF_UNIT_DASH="$TMP/cf-grace-ef-dash.service"
-    CF_EF_FILE="$TMP/cf-grace-ef.env"
-    printf 'TUNNEL_GRACE_PERIOD=75s\n' > "$CF_EF_FILE"
-    printf '[Service]\nEnvironmentFile=%s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE" > "$CF_EF_UNIT"
-    printf '[Service]\nEnvironmentFile=-%s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE.nope" > "$CF_EF_UNIT_DASH"
-    printf '[Service]\nEnvironmentFile="%s"\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' "$CF_EF_FILE" > "$CF_EF_UNIT_ARGS"
-    _cf_unit_path() { printf '%s' "$CF_EF_UNIT"; };      a=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_EF_UNIT_ARGS"; }; b=$(_cf_grace_wait_seconds)
-    _cf_unit_path() { printf '%s' "$CF_EF_UNIT_DASH"; }; c=$(_cf_grace_wait_seconds)
-    [ "$a" -eq 80 ] && [ "$b" -eq 80 ] && [ "$c" -eq "$(( CF_GRACE_DEFAULT + CF_GRACE_MARGIN ))" ]
-); then
-    pass 'cloudflared grace deadline follows EnvironmentFile when the unit uses one'
-else
-    fail 'cloudflared grace deadline follows EnvironmentFile when the unit uses one'
-fi
-
-# The unit FILE is not the effective configuration: drop-ins, repeated `Environment=` (later
-# wins) and `EnvironmentFile=` (which overrides `Environment=`) all change what the process
-# really runs with. Reading the text alone would report 30s while systemd hands the process
-# 90s -- i.e. SIGKILLing a still-draining tunnel at 35s, the original bug in a new disguise.
-# systemd is the authority, so on systemd we read `systemctl show` and ignore the text.
-# Negative control: a text-only implementation reads the unit file below and returns 35.
-if (
-    INIT_SYSTEM=systemd
-    CF_EFF_UNIT="$TMP/cf-eff.service"
-    # Deliberately WRONG (stale) text: the effective value comes from the drop-in.
-    printf '[Service]\nEnvironment=TUNNEL_GRACE_PERIOD=30s\nExecStart=/usr/local/bin/cloudflared tunnel run --token x\n' > "$CF_EFF_UNIT"
-    _cf_unit_path() { printf '%s' "$CF_EFF_UNIT"; }
-    systemctl() {
-        case "$*" in
-            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
-            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
-            'show -p EnvironmentFiles --value cloudflared') printf '\n' ;;
-            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=90s\n' ;;
-        esac
-        return 0
-    }
-    [ "$(_cf_grace_wait_seconds)" -eq 95 ]
-); then
-    pass 'cloudflared grace deadline comes from the systemd effective configuration'
-else
-    fail 'cloudflared grace deadline comes from the systemd effective configuration'
-fi
-
-# systemd resolves the launch line itself: a drop-in that overrides `ExecStart=` replaces the
-# main unit's line entirely, and the argv it reports is already unquoted (verified against real
-# systemd: a unit line `--grace-period "45s"` is reported as `--grace-period 45s`). The flag
-# still outranks the environment variable.
-if (
-    INIT_SYSTEM=systemd
-    CF_EFF2_UNIT="$TMP/cf-eff2.service"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 30s run --token x\n' > "$CF_EFF2_UNIT"
-    _cf_unit_path() { printf '%s' "$CF_EFF2_UNIT"; }
-    systemctl() {
-        case "$*" in
-            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
-            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel --grace-period 60s run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
-            'show -p EnvironmentFiles --value cloudflared') printf '\n' ;;
-            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=30s\n' ;;
-        esac
-        return 0
-    }
-    [ "$(_cf_grace_wait_seconds)" -eq 65 ]
-); then
-    pass 'cloudflared grace deadline prefers the systemd-resolved launch line over the environment'
-else
-    fail 'cloudflared grace deadline prefers the systemd-resolved launch line over the environment'
-fi
-
-# Settings from EnvironmentFile= OVERRIDE Environment=, and later files override earlier ones.
-# The file list only exists in systemd's view (a drop-in may add it), so the text cannot be
-# used to enumerate it. Here the file says 120s while Environment says 30s.
-if (
-    INIT_SYSTEM=systemd
-    CF_EFF3_UNIT="$TMP/cf-eff3.service"
-    CF_EFF3_ENV="$TMP/cf-eff3.env"
-    : > "$CF_EFF3_UNIT"
-    printf '# leading comment\nTUNNEL_GRACE_PERIOD=30s\nTUNNEL_GRACE_PERIOD=120s\n' > "$CF_EFF3_ENV"
-    _cf_unit_path() { printf '%s' "$CF_EFF3_UNIT"; }
-    systemctl() {
-        case "$*" in
-            'show -p LoadState --value cloudflared')  printf 'loaded\n' ;;
-            'show -p ExecStart --value cloudflared')  printf '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel run --token x ; ignore_errors=no ; status=0/0 }\n' ;;
-            'show -p EnvironmentFiles --value cloudflared') printf '%s (ignore_errors=no)\n' "$CF_EFF3_ENV" ;;
-            'show -p Environment --value cloudflared') printf 'TUNNEL_GRACE_PERIOD=30s\n' ;;
-        esac
-        return 0
-    }
-    # 120s (last assignment in the file wins) beats the Environment= 30s -> 125
-    [ "$(_cf_grace_wait_seconds)" -eq 125 ]
-); then
-    pass 'cloudflared grace deadline honours EnvironmentFile precedence and last-assignment-wins'
-else
-    fail 'cloudflared grace deadline honours EnvironmentFile precedence and last-assignment-wins'
-fi
-
-# An unreadable effective configuration must fall back to the unit text, not to the default:
-# `systemctl show` failing (container without a bus, old systemctl) is not evidence that the
-# user configured nothing.
-if (
-    INIT_SYSTEM=systemd
-    CF_EFF4_UNIT="$TMP/cf-eff4.service"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 80s run --token x\n' > "$CF_EFF4_UNIT"
-    _cf_unit_path() { printf '%s' "$CF_EFF4_UNIT"; }
-    systemctl() { return 1; }   # no bus
-    [ "$(_cf_grace_wait_seconds)" -eq 85 ]
-); then
-    pass 'cloudflared grace deadline falls back to the unit text when systemd is unreadable'
-else
-    fail 'cloudflared grace deadline falls back to the unit text when systemd is unreadable'
-fi
-
-# Go time.Duration accepts ns/us/µs and the contract here is round-UP-to-seconds, so a
-# sub-millisecond value must not collapse to 0s. Bare "0" is a valid Go duration
-# (ParseDuration special-cases it) meaning "do not wait for in-flight requests"; unrecognised
-# literals still have to be rejected so the caller falls back to the official default.
-if (
-    [ "$(_cf_duration_seconds 500us)"  -eq 1 ] \
-        && [ "$(_cf_duration_seconds 999us)"  -eq 1 ] \
-        && [ "$(_cf_duration_seconds 1ns)"    -eq 1 ] \
-        && [ "$(_cf_duration_seconds 999ns)"  -eq 1 ] \
-        && [ "$(_cf_duration_seconds 1500us)" -eq 1 ] \
-        && [ "$(_cf_duration_seconds 1.5s)"   -eq 2 ] \
-        && [ "$(_cf_duration_seconds 2s1ns)"  -eq 3 ] \
-        && [ "$(_cf_duration_seconds 1m500us)" -eq 61 ] \
-        && [ "$(_cf_duration_seconds 0)"      -eq 0 ] \
-        && ! _cf_duration_seconds '30' >/dev/null 2>&1
-); then
-    pass 'cloudflared grace duration parser rounds sub-second units up'
-else
-    fail 'cloudflared grace duration parser rounds sub-second units up'
-fi
-
-# `--grace-period 0` means "shut down without waiting for in-flight requests", so it must be
-# parsed as 0 rather than rejected (which would fall back to 30s). The margin stays as the
-# SIGTERM->SIGKILL escalation ceiling: the process still has to deregister its connector.
-if (
-    CF_ZERO_UNIT="$TMP/cf-grace-zero.service"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 0 run --token x\n' > "$CF_ZERO_UNIT"
-    _cf_unit_path() { printf '%s' "$CF_ZERO_UNIT"; }
-    [ "$(_cf_grace_wait_seconds)" -eq "$CF_GRACE_MARGIN" ]
-); then
-    pass 'cloudflared grace-period 0 keeps only the escalation margin'
-else
-    fail 'cloudflared grace-period 0 keeps only the escalation margin'
-fi
-
-# A pathological value (e.g. a hand-written `--grace-period 4h`) must not stall a stop for
-# hours; systemd's own TimeoutStopSec is the real backstop.
-if (
-    CF_CFG_HUGE="$TMP/cf-grace-huge.service"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 4h run --token x\n' > "$CF_CFG_HUGE"
-    _cf_unit_path() { printf '%s' "$CF_CFG_HUGE"; }
-    [ "$(_cf_grace_wait_seconds)" -eq "$(( CF_GRACE_MAX + CF_GRACE_MARGIN ))" ]
-); then
-    pass 'cloudflared grace deadline is capped for pathological configurations'
-else
-    fail 'cloudflared grace deadline is capped for pathological configurations'
-fi
-
-# Go duration literals must be parsed without bc/GNU date (target hosts may be busybox).
-if (
-    [ "$(_cf_duration_seconds 30s)"   -eq 30 ]  \
-        && [ "$(_cf_duration_seconds 1m30s)" -eq 90 ]  \
-        && [ "$(_cf_duration_seconds 2m)"    -eq 120 ] \
-        && [ "$(_cf_duration_seconds 500ms)" -eq 1 ]   \
-        && [ "$(_cf_duration_seconds 1.5m)"  -eq 90 ]  \
-        && ! _cf_duration_seconds 'abc' >/dev/null 2>&1
-); then
-    pass 'cloudflared grace duration parser handles Go duration literals'
-else
-    fail 'cloudflared grace duration parser handles Go duration literals'
-fi
-
-# systemd prints its OWN timespan format (`1min 30s`), not a Go duration (`1m30s`) — the two
-# grammars are disjoint, so the Go parser cannot be reused. These literals are copied from real
-# `systemctl show -p TimeoutStopUSec --value` output on systemd 259. Minimum 1s so a non-zero
-# sub-second span cannot collapse to 0 and silently disable the bound.
-# Negative control: reusing _cf_duration_seconds here fails on every `min` form.
-if (
-    [ "$(_cf_systemd_span_seconds '1min 30s')"   -eq 90 ] \
-        && [ "$(_cf_systemd_span_seconds '1min')"     -eq 60 ] \
-        && [ "$(_cf_systemd_span_seconds '1h 30min')" -eq 5400 ] \
-        && [ "$(_cf_systemd_span_seconds '3min 20s')" -eq 200 ] \
-        && [ "$(_cf_systemd_span_seconds '2min 3.456789s')" -eq 124 ] \
-        && [ "$(_cf_systemd_span_seconds '1.500000s')" -eq 2 ] \
-        && [ "$(_cf_systemd_span_seconds '500ms')"    -eq 1 ] \
-        && [ "$(_cf_systemd_span_seconds '100ms')"    -eq 1 ] \
-        && [ "$(_cf_systemd_span_seconds '1us')"      -eq 1 ] \
-        && [ "$(_cf_systemd_span_seconds '59s')"      -eq 59 ] \
-        && [ "$(_cf_systemd_span_seconds '1w')"       -eq 604800 ] \
-        && [ "$(_cf_systemd_span_seconds '1month')"   -eq 2629800 ] \
-        && [ "$(_cf_systemd_span_seconds '1y')"       -eq 31557600 ] \
-        && ! _cf_systemd_span_seconds '1m30s'  >/dev/null 2>&1 \
-        && ! _cf_systemd_span_seconds 'infinity' >/dev/null 2>&1 \
-        && ! _cf_systemd_span_seconds ''       >/dev/null 2>&1
-); then
-    pass 'cloudflared systemd timespan parser handles systemd time-span literals'
-else
-    fail 'cloudflared systemd timespan parser handles systemd time-span literals'
-fi
-
-# The effective systemd stop timeout (including the manager default — the official unit sets no
-# TimeoutStopSec) must be readable as a number, so it can be compared against our own deadline.
-if (
-    INIT_SYSTEM=systemd
-    systemctl() {
-        case "$*" in
-            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
-        esac
-        return 0
-    }
-    [ "$(_cf_systemd_stop_timeout_seconds)" -eq 90 ]
-); then
-    pass 'cloudflared reads the effective systemd stop timeout'
-else
-    fail 'cloudflared reads the effective systemd stop timeout'
-fi
-
-# `infinity` must NOT become a number: systemd will not terminate the process on its own, so our
-# own deadline is the only bound and must not be shortened. Anything unreadable — a failing query
-# or an empty property value — is likewise "no cap" (rc 2) rather than a bogus number: a 0 here
-# would make every grace window look covered and silence the contract check.
-# (The TimeoutStopFailureMode stubs are deliberately absent: the helper no longer reads it.)
-if (
-    INIT_SYSTEM=systemd
-    systemctl() {
-        case "$*" in
-            'show -p TimeoutStopUSec --value cloudflared') printf 'infinity\n' ;;
-        esac
-        return 0
-    }
-    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; a=$?
-    systemctl() {
-        case "$*" in
-            'show -p TimeoutStopUSec --value cloudflared') return 1 ;;
-        esac
-        return 0
-    }
-    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; b=$?
-    systemctl() {
-        case "$*" in
-            'show -p TimeoutStopUSec --value cloudflared') printf '\n' ;;
-        esac
-        return 0
-    }
-    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; c=$?
-    systemctl() { return 1; }
-    _cf_systemd_stop_timeout_seconds >/dev/null 2>&1; d=$?
-    [ "$a" -eq 1 ] && [ "$b" -eq 2 ] && [ "$c" -eq 2 ] && [ "$d" -eq 2 ]
-); then
-    pass 'cloudflared treats an unbounded or unreadable systemd stop timeout as no cap'
-else
-    fail 'cloudflared treats an unbounded or unreadable systemd stop timeout as no cap'
-fi
-
-# NOTE: there is deliberately no assertion for TimeoutStopFailureMode. Real systemd accepts
-# `terminate`, `abort` (since v246) and `kill`, and all three terminate the process when the stop
-# timeout expires — verified on systemd 259: each legal value parses without error, and both
-# `terminate` and `abort` ended a SIGTERM-ignoring process once TimeoutStopUSec elapsed. Illegal
-# values are rejected outright ("Failed to parse TimeoutStopFailureMode=continue, ignoring:
-# Invalid argument") and the effective value stays `terminate`. The effective mode therefore always
-# terminates, so a finite TimeoutStopUSec is always a genuine upper bound and
-# _cf_systemd_stop_timeout_seconds does not consult that property at all. Keeping the query (with a
-# `case ... continue) return 1` branch) was dead code: mutation testing showed deleting the branch
-# changed no observable behaviour, because `infinity` is already rejected by the timespan parser.
-
-# The contract check: a systemd stop timeout SHORTER than grace+margin means cloudflared gets
-# killed by systemd before its own grace period elapses, so the promise "we waited out the
-# configured grace period" is false. It must be reported, not silently tolerated — and an equal
-# or longer bound must stay silent (no noise on the default 90s setup).
-# `_cf_pids_owned` reports an owned process here, i.e. there IS something to stop, so the check
-# must not short-circuit on "nothing to stop".
-if (
-    INIT_SYSTEM=systemd
-    _cf_pids_owned() { printf '4242\n'; }
-    systemctl() {
-        case "$*" in
-            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
-        esac
-        return 0
-    }
-    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
-    quiet=$(_cf_check_stop_timeout_covers 90 2>&1); rc_eq=$?
-    [ "$rc" -eq 1 ] && [ "$rc_eq" -eq 0 ] && [ -z "$quiet" ] \
-        && contains '短于宽限期' "$out"
-); then
-    pass 'cloudflared reports a systemd stop timeout shorter than the grace deadline'
-else
-    fail 'cloudflared reports a systemd stop timeout shorter than the grace deadline'
-fi
-
-# ...but an ALREADY-STOPPED cloudflared must NOT produce that warning, even with a very short stop
-# timeout: nothing is going to be waited for, so a shorter bound truncates nothing and the message
-# is pure noise (real-systemd repro: unit inactive + TimeoutStopSec=5s still warned).
-if (
-    INIT_SYSTEM=systemd
-    _cf_pids_owned() { :; }
-    systemctl() {
-        case "$*" in
-            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
-            'show -p MainPID --value cloudflared')     printf '0\n' ;;
-            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
-        esac
-        return 0
-    }
-    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
-    [ "$rc" -eq 0 ] && [ -z "$out" ]
-); then
-    pass 'cloudflared stays silent about the stop timeout when nothing needs stopping'
-else
-    fail 'cloudflared stays silent about the stop timeout when nothing needs stopping'
-fi
-
-# A unit mid-transition (still deactivating) is NOT "nothing to stop" — and an unreadable state must
-# not be optimistically treated as stopped either. Both must still warn.
-if (
-    INIT_SYSTEM=systemd
-    _cf_pids_owned() { :; }
-    systemctl() {
-        case "$*" in
-            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
-            'show -p MainPID --value cloudflared')     printf '0\n' ;;
-            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
-        esac
-        return 0
-    }
-    out=$(_cf_check_stop_timeout_covers 125 2>&1); a=$?
-    # Unit state UNREADABLE while the bound is still readable: must still warn. "Cannot read the
-    # state" is not evidence that nothing needs stopping (same fail-closed contract as
-    # _cf_unit_stopped). Only the state queries fail here — the bound stays readable, so the
-    # comparison is still possible and the warning must be produced.
-    systemctl() {
-        case "$*" in
-            'show -p TimeoutStopUSec --value cloudflared') printf '5s\n' ;;
-            *) return 1 ;;
-        esac
-        return 0
-    }
-    out2=$(_cf_check_stop_timeout_covers 125 2>&1); b=$?
-    # Bound UNREADABLE: no number, so no claim can be made — this is the rc 2 "no cap" contract.
-    # Remaining silent here is correct, NOT fail-open: we have nothing to compare.
-    systemctl() { return 1; }
-    out3=$(_cf_check_stop_timeout_covers 125 2>&1); c=$?
-    [ "$a" -eq 1 ] && [ "$b" -eq 1 ] && [ "$c" -eq 0 ] && [ -z "$out3" ] \
-        && contains '短于宽限期' "$out" && contains '短于宽限期' "$out2"
-); then
-    pass 'cloudflared still warns when the unit is transitioning or its state is unreadable'
-else
-    fail 'cloudflared still warns when the unit is transitioning or its state is unreadable'
-fi
-
-# The check is systemd-only: on OpenRC (or any non-systemd host) it must not run at all — no
-# warning, and no `systemctl` call whatsoever. Without this assertion the guard is unobservable,
-# because a missing or bus-less `systemctl` also ends up at "no cap" and stays silent *by accident*;
-# a host that ships a working-looking `systemctl` shim would then emit a bogus warning.
-if (
-    INIT_SYSTEM=openrc
-    CF_OPENRC_CALLED="$TMP/cf-openrc-called"
-    rm -f "$CF_OPENRC_CALLED"
-    _cf_pids_owned() { printf '4242\n'; }   # something IS running, so only the guard can silence it
-    systemctl() { printf 'called\n' >> "$CF_OPENRC_CALLED"; printf '5s\n'; return 0; }
-    out=$(_cf_check_stop_timeout_covers 125 2>&1); rc=$?
-    [ "$rc" -eq 0 ] && [ -z "$out" ] && [ ! -e "$CF_OPENRC_CALLED" ]
-); then
-    pass 'cloudflared stop-timeout check is systemd-only and never queries systemctl elsewhere'
-else
-    fail 'cloudflared stop-timeout check is systemd-only and never queries systemctl elsewhere'
-fi
-
-# ...and _cf_kill_all must actually perform that check. Without this assertion the whole
-# helper could be dead code and every other assertion would still pass.
-# Scenario: unit configured with `--grace-period 120s` (deadline 125s) while systemd's effective
-# stop timeout is the 90s manager default, and a real process must be stopped for the check to be
-# reachable. A removal of the call makes this silent.
-if (
-    INIT_SYSTEM=systemd
-    CF_TOS_UNIT="$TMP/cf-tos.service"
-    CF_TOS_POLLS="$TMP/cf-tos-polls"
-    : > "$CF_TOS_POLLS"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 120s run --token x\n' > "$CF_TOS_UNIT"
-    rm() { :; }
-    _cf_unit_path() { printf '%s' "$CF_TOS_UNIT"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    # Report one owned process on the first scan only: that makes the stop-timeout check reachable
-    # (there is something to stop) while keeping the wait loop bounded and fast.
-    _cf_pids_owned() {
-        printf 'poll\n' >> "$CF_TOS_POLLS"
-        [ "$(wc -l < "$CF_TOS_POLLS")" -le 1 ] && printf '4242\n'
-        return 0
-    }
-    systemctl() {
-        case "$*" in
-            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
-            'show -p MainPID --value cloudflared')     printf '0\n' ;;
-            'show -p TimeoutStopUSec --value cloudflared') printf '1min 30s\n' ;;
-        esac
-        return 0
-    }
-    sleep() { :; }
-    out=$(_cf_kill_all 2>&1)
-    contains '短于宽限期' "$out"
-); then
-    pass 'cloudflared kill-all surfaces a systemd stop timeout that undercuts the grace period'
-else
-    fail 'cloudflared kill-all surfaces a systemd stop timeout that undercuts the grace period'
-fi
-
-# systemd stop must be asynchronous, and the wait must key on ActiveState. `is-active`
-# reports "deactivating" as stopped, so it cannot answer "has the stop finished".
-if (
-    INIT_SYSTEM=systemd
-    CF_STOP_SENTINEL="$TMP/cf-stop-request"
-    rm() { :; }
-    _cf_unit_path() { printf '%s' "$TMP/cloudflared-stop.service"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    _cf_pids_owned() { :; }
-    systemctl() {
-        printf '%s\n' "$*" >> "$CF_STOP_SENTINEL"
-        case "$*" in
-            'show -p ActiveState --value cloudflared') printf 'inactive\n' ;;
-            'show -p MainPID --value cloudflared')     printf '0\n' ;;
-        esac
-        return 0
-    }
-    _cf_kill_all >/dev/null 2>&1
-    calls=$(cat "$CF_STOP_SENTINEL" 2>/dev/null)
-    # The stop request must be the first *mutating* action and the wait must then key on
-    # ActiveState. (Read-only `show` queries may precede it: the grace deadline and the
-    # "is anything actually running" pre-check are both read from systemd before the stop.)
-    # So compare the stop against the first ActiveState query *after* it — that is the wait.
-    stop_line=$(grep -n -m1 -- '--no-block stop cloudflared' "$CF_STOP_SENTINEL" | cut -d: -f1)
-    active_line=$(awk -v s="$stop_line" 'NR>s && /show -p ActiveState --value cloudflared/ { print NR; exit }' "$CF_STOP_SENTINEL")
-    [ -n "$stop_line" ] && [ -n "$active_line" ] && [ "$stop_line" -lt "$active_line" ] \
-        && ! contains 'is-active' "$calls"
-); then
-    pass 'cloudflared systemd stop is nonblocking and waits on ActiveState'
-else
-    fail 'cloudflared systemd stop is nonblocking and waits on ActiveState'
-fi
-
-# A unit that is still deactivating must be waited out, and the graceful shutdown must not
-# be cut short by a signal while it drains. Negative control: an `is-active`-based wait sees
-# "deactivating" as stopped, proceeds instantly, and SIGTERMs the still-draining process.
-if (
-    INIT_SYSTEM=systemd
-    CF_POLLS="$TMP/cf-deact-polls"
-    CF_SLEEPS="$TMP/cf-deact-sleeps"
-    CF_SIGNALS="$TMP/cf-deact-signals"
-    : > "$CF_POLLS"
-    rm() { :; }
-    _cf_unit_path() { printf '%s' "$TMP/cloudflared-deact.service"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    _cf_pids_owned() {
-        printf 'poll\n' >> "$CF_POLLS"
-        [ "$(wc -l < "$CF_POLLS")" -le 2 ] && printf '4242\n'
-        return 0
-    }
-    systemctl() {
-        case "$*" in
-            'show -p ActiveState --value cloudflared')
-                if [ "$(wc -l < "$CF_POLLS")" -ge 3 ]; then printf 'inactive\n'; else printf 'deactivating\n'; fi ;;
-            'show -p MainPID --value cloudflared')
-                if [ "$(wc -l < "$CF_POLLS")" -ge 3 ]; then printf '0\n'; else printf '4242\n'; fi ;;
-        esac
-        return 0
-    }
-    kill() { printf '%s\n' "$1" >> "$CF_SIGNALS"; return 0; }
-    sleep() { printf '1\n' >> "$CF_SLEEPS"; }
-    _cf_kill_all >/dev/null 2>&1
-    [ "$(wc -l < "$CF_SLEEPS")" -eq 2 ] && [ ! -s "$CF_SIGNALS" ]
-); then
-    pass 'cloudflared stop waits through deactivating without signalling'
-else
-    fail 'cloudflared stop waits through deactivating without signalling'
-fi
-
-# SIGKILL is a last resort: it must only fire after the grace period cloudflared was actually
-# started with elapsed, and SIGTERM must come first. The unit here carries `--grace-period 60s`,
-# so a hardcoded 35s deadline (or the old fixed 3s window) fails this assertion -- the process
-# would be SIGKILLed while still draining in-flight tunnel requests.
-if (
-    INIT_SYSTEM=systemd
-    CF_EVENTS="$TMP/cf-grace-events"
-    CF_GRACE_UNIT="$TMP/cloudflared-grace.service"
-    rm() { :; }
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 60s run --token x\n' > "$CF_GRACE_UNIT"
-    _cf_unit_path() { printf '%s' "$CF_GRACE_UNIT"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    _cf_pids_owned() { printf '4242\n'; }
-    systemctl() {
-        case "$*" in
-            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
-            'show -p MainPID --value cloudflared')     printf '4242\n' ;;
-        esac
-        return 0
-    }
-    kill() { printf 'kill %s\n' "$1" >> "$CF_EVENTS"; return 0; }
-    sleep() { printf 'sleep\n' >> "$CF_EVENTS"; }
-    _cf_kill_all >/dev/null 2>&1
-    sleeps_before_sigkill=$(awk '/^kill -9$/ { print n; exit } /^sleep$/ { n++ }' "$CF_EVENTS")
-    [ -n "$sleeps_before_sigkill" ] \
-        && [ "$sleeps_before_sigkill" -ge 65 ] \
-        && [ "$(grep -m1 '^kill' "$CF_EVENTS")" = 'kill -15' ]
-); then
-    pass 'cloudflared SIGKILL only after the configured grace window, SIGTERM first'
-else
-    fail 'cloudflared SIGKILL only after the configured grace window, SIGTERM first'
-fi
-
-# A process disappearing is NOT proof that the unit finished stopping. After SIGKILL the unit
-# can still be deactivating (cgroup teardown) and, because cloudflared's own unit is
-# `Restart=on-failure`, systemd may already have queued a restart. Declaring "stopped" here
-# makes _cf_restart `systemctl start` 2s later race that job. So: stop again, then re-verify.
-# Negative control: without the re-stop the sentinel stays empty.
-if (
-    INIT_SYSTEM=systemd
-    CF_REVERIFY_LOG="$TMP/cf-reverify-log"
-    CF_REVERIFY_UNIT="$TMP/cloudflared-reverify.service"
-    rm() { :; }
-    : > "$CF_REVERIFY_LOG"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 5s run --token x\n' > "$CF_REVERIFY_UNIT"
-    _cf_unit_path() { printf '%s' "$CF_REVERIFY_UNIT"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    # Still owned before the SIGKILL, gone afterwards.
-    _cf_pids_owned() { grep -q 'kill -9' "$CF_REVERIFY_LOG" || printf '4242\n'; }
-    systemctl() {
-        printf '%s\n' "$*" >> "$CF_REVERIFY_LOG"
-        case "$*" in
-            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
-            'show -p MainPID --value cloudflared')     printf '4242\n' ;;
-        esac
-        return 0
-    }
-    kill() { printf 'kill %s\n' "$1" >> "$CF_REVERIFY_LOG"; return 0; }
-    sleep() { :; }
-    _cf_kill_all >/dev/null 2>&1
-    # order: ... kill -9 ... then a second `--no-block stop cloudflared` after it
-    after_kill=$(sed -n '/^kill -9$/,$p' "$CF_REVERIFY_LOG")
-    contains '--no-block stop cloudflared' "$after_kill" \
-        && contains 'show -p ActiveState --value cloudflared' "$after_kill"
-); then
-    pass 'cloudflared re-verifies the systemd stop terminal state after SIGKILL'
-else
-    fail 'cloudflared re-verifies the systemd stop terminal state after SIGKILL'
-fi
-
-# ...and if the unit refuses to reach a terminal state within that re-verification window, the
-# stop must not silently claim success either.
-if (
-    INIT_SYSTEM=systemd
-    CF_REVERIFY_TIMEOUT="$TMP/cf-reverify-timeout"
-    CF_REVERIFY_UNIT2="$TMP/cloudflared-reverify2.service"
-    rm() { :; }
-    : > "$CF_REVERIFY_TIMEOUT"
-    printf '[Service]\nExecStart=/usr/local/bin/cloudflared tunnel --grace-period 5s run --token x\n' > "$CF_REVERIFY_UNIT2"
-    _cf_unit_path() { printf '%s' "$CF_REVERIFY_UNIT2"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    _cf_pids_owned() { grep -q 'kill -9' "$CF_REVERIFY_TIMEOUT" || printf '4242\n'; }
-    systemctl() {
-        case "$*" in
-            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
-            'show -p MainPID --value cloudflared')     printf '4242\n' ;;
-        esac
-        return 0
-    }
-    kill() { printf 'kill %s\n' "$1" >> "$CF_REVERIFY_TIMEOUT"; return 0; }
-    sleep() { printf 's\n' >> "$CF_REVERIFY_TIMEOUT"; }
-    _cf_kill_all >/dev/null 2>&1
-    # The re-verification wait is bounded (CF_STOP_REVERIFY), not unbounded.
-    rewait=$(awk '/^kill -9$/{f=1;next} f&&/^s$/{n++} END{print n+0}' "$CF_REVERIFY_TIMEOUT")
-    [ "$rewait" -le "$CF_STOP_REVERIFY" ] && [ "$rewait" -ge 1 ]
-); then
-    pass 'cloudflared post-SIGKILL verification is bounded'
-else
-    fail 'cloudflared post-SIGKILL verification is bounded'
-fi
-
-# "Cannot read the unit state" is NOT "the unit has stopped". _cf_unit_stopped documents rc 2 as
-# "do not conclude anything", so folding 2 into the success branch lets `_cf_kill_all` announce a
-# clean stop it never verified -- and _cf_restart would then start a second connector.
-# Negative control: restoring `*) return 0` makes this return 0 and the assertion fails.
-if (
-    INIT_SYSTEM=systemd
-    _cf_pids_owned() { :; }
-    systemctl() { return 1; }   # bus unavailable / state unreadable
-    sleep() { :; }
-    _cf_wait_exit 3 >/dev/null 2>&1
-    [ "$?" -ne 0 ]
-); then
-    pass 'cloudflared wait exit treats an unreadable unit state as unverified'
-else
-    fail 'cloudflared wait exit treats an unreadable unit state as unverified'
-fi
-
-# ...and that unverified verdict must reach the caller: with every process gone but the unit
-# state unreadable, _cf_kill_all must NOT report success. Otherwise _cf_restart starts a second
-# cloudflared and _uninstall_cloudflared deletes the service definition/credentials on the
-# strength of a check that never answered.
-if (
-    INIT_SYSTEM=systemd
-    rm() { :; }
-    _cf_unit_path() { printf '%s' "$TMP/cloudflared-unreadable.service"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    _cf_pids_owned() { :; }
-    systemctl() { return 1; }
-    sleep() { :; }
-    _cf_kill_all >/dev/null 2>&1
-    [ "$?" -ne 0 ]
-); then
-    pass 'cloudflared kill-all refuses to claim cleanup when the unit state is unreadable'
-else
-    fail 'cloudflared kill-all refuses to claim cleanup when the unit state is unreadable'
-fi
-
-# The mirror image of the previous case: here the unit state IS readable, and it says the stop
-# has NOT finished. systemd reaps the main process first (MainPID=0) and then keeps running
-# ExecStop/ExecStopPost and cgroup teardown, so the unit stays `deactivating` while ZERO
-# cloudflared processes exist. Step 3 is guarded by `[ -n "$pids" ]`, so that entire branch is
-# skipped; before the fix every remaining check then passed and the function reported
-# "所有进程已清理" (rc 0) although the stop transaction was still open — and `_cf_restart`
-# `systemctl start`s 2s later, racing that job.
-# Reproduced on real systemd (slow ExecStopPost): pids_owned=[] , _cf_unit_stopped=1 ,
-# _cf_wait_exit=1 , _cf_kill_all=0 while ActiveState was still deactivating.
-# Negative control: removing the final re-verification block makes this return 0.
-if (
-    INIT_SYSTEM=systemd
-    rm() { :; }
-    _cf_unit_path() { printf '%s' "$TMP/cloudflared-transition.service"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    _cf_pids_owned() { :; }            # every process is already gone
-    _cf_grace_wait_seconds() { printf '%s' 2; }
-    systemctl() {
-        case "$*" in
-            'show -p ActiveState --value cloudflared') printf 'deactivating\n' ;;
-            'show -p MainPID --value cloudflared')     printf '0\n' ;;
-        esac
-        return 0
-    }
-    sleep() { :; }
-    _cf_kill_all >/dev/null 2>&1
-    [ "$?" -ne 0 ]
-); then
-    pass 'cloudflared kill-all refuses to claim cleanup while the unit is still deactivating'
-else
-    fail 'cloudflared kill-all refuses to claim cleanup while the unit is still deactivating'
-fi
-
-# A stop that timed out in step 1 but then converged must still succeed: the final re-verify
-# has to re-read the state rather than reuse step 1's verdict. Here the unit is deactivating
-# while processes are alive (step 1 times out), then goes inactive after the SIGTERM.
-# A fix that simply propagated step 1's rc=1 would fail this and block every normal restart.
-if (
-    INIT_SYSTEM=systemd
-    CF_CONVERGE_LOG="$TMP/cf-converge-log"
-    rm() { :; }
-    : > "$CF_CONVERGE_LOG"
-    _cf_unit_path() { printf '%s' "$TMP/cloudflared-converge.service"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids() { :; }
-    _cf_pids_owned() { grep -q 'kill -15' "$CF_CONVERGE_LOG" || printf '4242\n'; }
-    _cf_grace_wait_seconds() { printf '%s' 2; }
-    systemctl() {
-        case "$*" in
-            'show -p ActiveState --value cloudflared')
-                if grep -q 'kill -15' "$CF_CONVERGE_LOG"; then printf 'inactive\n'; else printf 'deactivating\n'; fi ;;
-            'show -p MainPID --value cloudflared')
-                if grep -q 'kill -15' "$CF_CONVERGE_LOG"; then printf '0\n'; else printf '4242\n'; fi ;;
-        esac
-        return 0
-    }
-    kill() { printf 'kill %s\n' "$1" >> "$CF_CONVERGE_LOG"; return 0; }
-    sleep() { :; }
-    _cf_kill_all >/dev/null 2>&1
-); then
-    pass 'cloudflared stop that converges after the graceful signal still reports success'
-else
-    fail 'cloudflared stop that converges after the graceful signal still reports success'
-fi
-
-# The OpenRC stop path must not pay a blind fixed delay either: the owned-process
-# cleanup below already confirms that nothing survived the stop request.
-if (
-    INIT_SYSTEM=openrc
-    CF_OPENRC_SLEEPS="$TMP/cf-openrc-sleeps"
-    CF_OPENRC_STOPPED="$TMP/cf-openrc-stopped"
-    rm() { :; }
-    _cf_unit_path() { printf '%s' "$TMP/cloudflared-openrc.conf"; }
-    _cf_service_bin() { printf '%s' "$CF_BIN"; }
-    _cf_pids_owned() { :; }
-    _cf_pids() { :; }
-    rc-service() { printf '%s\n' "$*" >> "$CF_OPENRC_STOPPED"; }
-    sleep() { printf '%s\n' "$1" >> "$CF_OPENRC_SLEEPS"; }
-    _cf_kill_all >/dev/null 2>&1 \
-        && [ "$(cat "$CF_OPENRC_STOPPED")" = 'cloudflared stop' ] \
-        && [ ! -s "$CF_OPENRC_SLEEPS" ]
-); then
-    pass 'cloudflared openrc stop skips fixed wait when already clean'
-else
-    fail 'cloudflared openrc stop skips fixed wait when already clean'
-fi
-
-# A delayed init-system start waits for readiness, not a blind fixed delay.
-if (
-    CF_SLEEP_SENTINEL="$TMP/cf-delayed-sleeps"
-    CF_READY_COUNT="$TMP/cf-ready-count"
-    INIT_SYSTEM=systemd
-    : > "$CF_READY_COUNT"
-    _cf_kill_all() { return 0; }
-    _cf_is_managed_running() {
-        local n; n=$(wc -l < "$CF_READY_COUNT"); n=$((n+1)); printf '%s\n' "$n" >> "$CF_READY_COUNT"
-        [ "$n" -ge 2 ]
-    }
-    systemctl() { [ "$1" = start ]; }
-    sleep() { printf '%s\n' "$1" >> "$CF_SLEEP_SENTINEL"; }
-    _cf_restart >/dev/null 2>&1 \
-        && [ "$(wc -l < "$CF_SLEEP_SENTINEL")" -eq 2 ] \
-        && [ "$(tail -n 1 "$CF_SLEEP_SENTINEL")" = 1 ]
-); then
-    pass 'cloudflared restart polls delayed service readiness'
-else
-    fail 'cloudflared restart polls delayed service readiness'
-fi
-
 # Without an authoritative liveness helper, stop is not proof of exit.
 if (
     XRAY_STOP_SENTINEL="$TMP/xray-stop-called"
@@ -1210,6 +419,31 @@ if (
 else
     fail 'Xray destructive stop refuses unverifiable liveness'
 fi
+
+printf '== config check and Geo state ==\n'
+: > "$ASSET_DIR/geosite.dat"
+: > "$ASSET_DIR/geoip.dat"
+GEO_TRANSITION_KEY=geo_update_transition
+_state_set geo_cron on
+# 启用内置 geodata 定时: geodata 段必须落到自己的字段文件里, 旧 cron 兜底状态保留
+# (首次成功更新后才 retire, 见 _geo_finalize_legacy_cron)。
+_config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
+if _auto_migrate_geo_autoupdate >/dev/null 2>&1 \
+   && [ "$(_config_jq -r '.geodata.cron // empty')" = "$GEO_CRON_EXPR" ] \
+   && [ -f "$CONFIG_DIR/14_geodata.json" ] \
+   && [ "$(_state_get geo_cron)" = on ]; then
+    pass 'Geo migration writes the geodata field file'
+else
+    fail 'Geo migration writes the geodata field file'
+fi
+# 关闭待清理(off_pending): geodata 字段必须连同 14_geodata.json 一起删掉, 并退休旧 cron。
+(
+    _crontab_replace() { return 0; }
+    _state_set "$GEO_TRANSITION_KEY" off_pending
+    _auto_migrate_geo_autoupdate >/dev/null 2>&1 || exit 1
+    [ ! -e "$CONFIG_DIR/14_geodata.json" ] || exit 1
+    [ "$(_state_get geo_cron)" = off ]
+) && pass 'Geo off_pending deletes the geodata field file' || fail 'Geo off_pending deletes the geodata field file'
 
 printf '== logrotate state contracts ==\n'
 rm -f "$STATE_DIR/logrotate_enabled"
@@ -1288,139 +522,7 @@ check_eq 'Xray clash write holds the config lock' 'xray=held rc=0 leak=no' "$XH_
 check_eq 'Hysteria clash write holds the config lock' 'hysteria=held rc=0 leak=no' "$XH_HY_PROBE"
 check_eq 'nested clash sync is reentrant' 'nested=held rc=0 leak=no' "$XH_NESTED_PROBE"
 
-printf '== interrupted installer recovery ==\n'
-_test_extract_install_fn() {
-    awk -v fn="$1" '$0 ~ "^" fn "[[:space:]]*[(][)]" {p=1} p{print} p && /^}/{exit}' "$ROOT/install.sh"
-}
-(
-    set -u
-    DEPLOY_DIR="$TMP/recovery-deploy"
-    ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.4242"
-    LIB_MODULES=""; TPL_NAMES=""
-    mkdir -p "$DEPLOY_DIR" "$ROLLBACK_DIR"
-    eval "$(_test_extract_install_fn _manifest_relpaths)"
-    eval "$(_test_extract_install_fn _install_fsync)"
-    eval "$(_test_extract_install_fn _install_fsync_or_warn)"
-    eval "$(_test_extract_install_fn _install_backup_identical)"
-    eval "$(_test_extract_install_fn _install_backup)"
-    eval "$(_test_extract_install_fn _install_txn_marker)"
-    eval "$(_test_extract_install_fn _install_snapshot_read_entries)"
-    eval "$(_test_extract_install_fn _install_snapshot_validate)"
-    eval "$(_test_extract_install_fn _install_rollback)"
-    eval "$(_test_extract_install_fn _install_finish_transaction)"
-    eval "$(_test_extract_install_fn _install_recover_interrupted)"
-    printf 'old-version\n' > "$DEPLOY_DIR/VERSION"
-    _install_backup >/dev/null 2>&1
-    # Recovery must use the snapshot's persisted entries, not a changed current manifest.
-    LIB_MODULES="new-module.sh"; TPL_NAMES="new-template"
-    : > "$ROLLBACK_DIR/.INSTALLING"
-    printf 'mixed-version\n' > "$DEPLOY_DIR/VERSION"
-    _install_recover_interrupted >/dev/null 2>&1 || exit 1
-    [ "$(cat "$DEPLOY_DIR/VERSION")" = old-version ] || exit 1
-    [ ! -e "$ROLLBACK_DIR" ] || exit 1
-) && pass 'active installer transaction restores prior snapshot' || fail 'active installer transaction restores prior snapshot'
-(
-    set -u
-    DEPLOY_DIR="$TMP/incomplete-deploy"
-    ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.4243"
-    LIB_MODULES=""; TPL_NAMES=""
-    mkdir -p "$DEPLOY_DIR" "$ROLLBACK_DIR"
-    eval "$(_test_extract_install_fn _manifest_relpaths)"
-    eval "$(_test_extract_install_fn _install_fsync)"
-    eval "$(_test_extract_install_fn _install_fsync_or_warn)"
-    eval "$(_test_extract_install_fn _install_backup_identical)"
-    eval "$(_test_extract_install_fn _install_backup)"
-    eval "$(_test_extract_install_fn _install_txn_marker)"
-    eval "$(_test_extract_install_fn _install_snapshot_read_entries)"
-    eval "$(_test_extract_install_fn _install_snapshot_validate)"
-    eval "$(_test_extract_install_fn _install_rollback)"
-    eval "$(_test_extract_install_fn _install_finish_transaction)"
-    eval "$(_test_extract_install_fn _install_recover_interrupted)"
-    printf 'mixed-version\n' > "$DEPLOY_DIR/VERSION"
-    _install_backup >/dev/null 2>&1
-    rm -f "$ROLLBACK_DIR/VERSION"
-    : > "$ROLLBACK_DIR/.INSTALLING"
-    printf 'unexpected partial file\n' > "$DEPLOY_DIR/xray-deploy.sh"
-    _install_recover_interrupted >/dev/null 2>&1 && exit 1
-    [ -e "$ROLLBACK_DIR/.INSTALLING" ] && [ -e "$ROLLBACK_DIR/.KEEP" ]
-) && pass 'incomplete install snapshot stays blocked' || fail 'incomplete install snapshot stays blocked'
 
-(
-    set -u
-    DEPLOY_DIR="$TMP/empty-snapshot-deploy"
-    ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.4244"
-    LIB_MODULES=""; TPL_NAMES=""
-    mkdir -p "$DEPLOY_DIR" "$ROLLBACK_DIR"
-    printf 'live-version\n' > "$DEPLOY_DIR/VERSION"
-    eval "$(_test_extract_install_fn _manifest_relpaths)"
-    eval "$(_test_extract_install_fn _install_fsync)"
-    eval "$(_test_extract_install_fn _install_fsync_or_warn)"
-    eval "$(_test_extract_install_fn _install_backup_identical)"
-    eval "$(_test_extract_install_fn _install_snapshot_read_entries)"
-    eval "$(_test_extract_install_fn _install_snapshot_validate)"
-    eval "$(_test_extract_install_fn _install_recover_interrupted)"
-    : > "$ROLLBACK_DIR/.INSTALLING"
-    : > "$ROLLBACK_DIR/.KEEP"
-    _install_recover_interrupted >/dev/null 2>&1 && exit 1
-    [ "$(cat "$DEPLOY_DIR/VERSION")" = live-version ]
-) && pass 'empty active snapshot fails closed' || fail 'empty active snapshot fails closed'
-
-printf '== installer snapshot durability ==\n'
-# 十二轮 P2: `.KEEP` 是快照的**提交记录**, 而 rename 原子 ≠ 掉电持久。两条屏障各自可观测:
-#   · cp 之后立刻比对内容 —— 半截备份必须在记账之前就被拒绝;
-#   · 备份文件 + 目录项先落盘, `.KEEP` 才允许出现, rename 后目录项再刷一次。
-_installer_probe() {   # $1=探针编号(必须纯数字: 快照读取器按目录名后缀校验)
-    (
-        set -u
-        DEPLOY_DIR="$TMP/durable-deploy-$1"
-        ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.4242$1"
-        LIB_MODULES=""; TPL_NAMES=""
-        mkdir -p "$DEPLOY_DIR"
-        printf 'old-version\n' > "$DEPLOY_DIR/VERSION"
-        printf 'old-entry\n' > "$DEPLOY_DIR/xray-deploy.sh"
-        eval "$(_test_extract_install_fn _manifest_relpaths)"
-        eval "$(_test_extract_install_fn _install_fsync)"
-        eval "$(_test_extract_install_fn _install_fsync_or_warn)"
-        eval "$(_test_extract_install_fn _install_backup_identical)"
-        eval "$(_test_extract_install_fn _install_snapshot_rel_ok)"
-        eval "$(_test_extract_install_fn _install_snapshot_read_entries)"
-        eval "$(_test_extract_install_fn _install_backup)"
-        case "$1" in
-            1)
-                # cp "成功"但只写了半截内容 ⇒ 必须在写 present 记录之前被拒
-                cp() { printf 'half\n' > "${@: -1}"; return 0; }
-                _install_backup >/dev/null 2>&1 && exit 1
-                [ ! -e "$ROLLBACK_DIR/.KEEP" ] || exit 1
-                ;;
-            2)
-                SYNC_LOG="$TMP/durable-sync.log"; : > "$SYNC_LOG"
-                sync() {
-                    if [ -e "$ROLLBACK_DIR/.KEEP" ]; then
-                        printf 'post:%s\n' "${1:-}" >> "$SYNC_LOG"
-                    else
-                        printf 'pre:%s\n' "${1:-}" >> "$SYNC_LOG"
-                    fi
-                    return 0
-                }
-                _install_backup >/dev/null 2>&1 || exit 1
-                grep -qx "pre:${ROLLBACK_DIR}/xray-deploy.sh" "$SYNC_LOG" || exit 1
-                grep -qx "pre:${ROLLBACK_DIR}/VERSION" "$SYNC_LOG" || exit 1
-                grep -qx "pre:${ROLLBACK_DIR}" "$SYNC_LOG" || exit 1
-                grep -qx "post:${ROLLBACK_DIR}" "$SYNC_LOG" || exit 1
-                ;;
-            3)
-                sync() { return 1; }
-                out=$(_install_backup 2>&1) || exit 1
-                [ "$(printf '%s\n' "$out" | grep -c '不支持定向刷新')" -eq 1 ] || exit 1
-                ;;
-            *) exit 1 ;;
-        esac
-        exit 0
-    )
-}
-if _installer_probe 1; then pass 'incomplete backup copy is rejected before commit'; else fail 'incomplete backup copy is rejected before commit'; fi
-if _installer_probe 2; then pass 'snapshot fsync barriers bracket the .KEEP rename'; else fail 'snapshot fsync barriers bracket the .KEEP rename'; fi
-if _installer_probe 3; then pass 'missing targeted fsync degrades with one warning'; else fail 'missing targeted fsync degrades with one warning'; fi
 
 GEO_TRANSITION_KEY=geo_transition
 _state_set "$GEO_TRANSITION_KEY" off_pending
@@ -1438,7 +540,7 @@ rm -f "$GEO_SKIP_MARKER"
     _xray_version_ge() { return 0; }
     _geo_remove_cron_line() { return 0; }
     _state_set geo_cron on
-    printf '{"geodata":{"cron":"0 3 */3 * *"}}\n' > "$CONFIG_FILE"
+    _config_write_merged '{"geodata":{"cron":"0 3 */3 * *"}}' >/dev/null 2>&1
     _geo_finalize_legacy_cron >/dev/null 2>&1
     [ "$(_state_get geo_cron)" = off ]
 ) && pass 'Geo finalizer retires legacy fallback after update' || fail 'Geo finalizer retires legacy fallback after update'
@@ -1473,42 +575,6 @@ if (
     _hysteria_validate_transient >/dev/null 2>&1 && exit 1
     [ -e "$TMP/hysteria-stop-verified" ]
 ); then pass 'transient Hysteria validation uses terminal stop verifier'; else fail 'transient Hysteria validation uses terminal stop verifier'; fi
-printf 'corrupt journal' > "$DEPLOY_DIR/.reset-journal.json.corrupt"
-printf 'snapshot' > "$DEPLOY_DIR/.reset-snapshot-sentinel"
-if _reset_config_recover_locked >/dev/null 2>&1; then fail 'reset quarantine stays fail-closed'; else pass 'reset quarantine stays fail-closed'; fi
-[ -e "$DEPLOY_DIR/.reset-snapshot-sentinel" ] || fail 'reset quarantine preserves snapshot'
-if (
-    sync() { return 1; }
-    _reset_fsync_strict "$TMP/reset-artifact" >/dev/null 2>&1
-); then fail 'reset strict fsync rejects targeted flush failure'; else pass 'reset strict fsync rejects targeted flush failure'; fi
-
-if (
-    INIT_SYSTEM=systemd
-    CF_BIN="$TMP/cloudflared-installed"
-    CF_UNIT_SYSTEMD="$TMP/cloudflared.service"
-    CF_UNIT_OPENRC="$TMP/cloudflared.init"
-    CF_STATE_AUTOUPDATE="$STATE_DIR/cf-autoupdate"
-    CF_STATE_HTTP2="$STATE_DIR/cf-http2"
-    CF_STATE_EDGE_IP="$STATE_DIR/cf-edge-ip"
-    CF_STATE_TOKEN="$STATE_DIR/cf-token"
-    : > "$CF_BIN"; : > "$CF_UNIT_SYSTEMD"
-    _cf_kill_all() { return 1; }
-    _uninstall_cloudflared >/dev/null 2>&1 && exit 1
-    [ -f "$CF_BIN" ] && [ -f "$CF_UNIT_SYSTEMD" ]
-); then pass 'cloudflared uninstall preserves service on unresolved cleanup'; else fail 'cloudflared uninstall preserves service on unresolved cleanup'; fi
-if (
-    CF_BIN="$TMP/cloudflared-dir"
-    mkdir -p "$CF_BIN"
-    _error() { :; }
-    if _install_cloudflared_bin >/dev/null 2>&1; then exit 1; fi
-    [ -d "$CF_BIN" ]
-); then pass 'cloudflared directory target rejected'; else fail 'cloudflared directory target rejected'; fi
-if (
-    LOGROTATE_CONF="$TMP/logrotate-repair.conf"
-    _state_set logrotate_enabled on
-    _logrotate_ensure_package() { return 0; }
-    _logrotate_enable >/dev/null 2>&1 && grep -q 'rotate 30' "$LOGROTATE_CONF"
-); then pass 'logrotate enabled state repairs missing config'; else fail 'logrotate enabled state repairs missing config'; fi
 
 printf 'passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -9,28 +9,10 @@
 
 set -u
 
-# 规范上游 base —— **唯一**的上游字面量来源(2026-09-22 七轮复审 D8)。
-# 旧写法把同一个 URL 写了两遍(L12 与 L14), 只改一处会让 `REMOTE_BASE != REMOTE_BASE_DEFAULT`
-# 永久为真 => 钉 commit 的逻辑静默失效(永不钉), 且不报任何错。派生而非复制, 使**镜像**只改
-# 一处即可, 固定 URL 也由它派生(见 `_resolve_remote_base`), 不再有第三份硬编码。
-#
-# **"fork/镜像只改一处"的适用边界(2026-09-22 八轮复审 P2, 必须说清)**:
-#   · **镜像**(同一仓库内容、仅换下载入口, 如反代 raw.githubusercontent)⇒ 本默认值**不用改**,
-#     只设 `XRAY_DEPLOY_RAW=<镜像基址>` 即可; 那条路径根本不碰 API。
-#   · **fork**(不同仓库、有自己的 commit)⇒ 必须设 `XRAY_DEPLOY_RAW=<fork 的 raw 基址>`,
-#     **不要**改 `REMOTE_BASE_DEFAULT`。因为取 SHA 的 API 地址由下一行的 `REMOTE_API_COMMIT`
-#     决定(当前写死上游 UIMAK), 而钉住的 URL 由 `REMOTE_BASE_DEFAULT` 派生 —— 只改后者会让它
-#     取到**上游** SHA 再拼成 `<fork>/<上游sha>`, 22 个 GET 全 404 ⇒ 安装中止。
-#     即: **`REMOTE_BASE_DEFAULT` 一旦改动, 必须同步改 `REMOTE_API_COMMIT`**; 这层约束无法由
-#     `XRAY_DEPLOY_RAW` 覆盖。仅当二者指向同一仓库时,"只改一处"才成立。
+# 规范上游 base —— **唯一**的上游字面量来源。
+# 派生而非复制, 使镜像只改一处即可(`XRAY_DEPLOY_RAW` 覆盖下载入口)。
 REMOTE_BASE_DEFAULT="https://raw.githubusercontent.com/UIMAK/xray-deploy/main"
 REMOTE_BASE="${XRAY_DEPLOY_RAW:-$REMOTE_BASE_DEFAULT}"
-REMOTE_API_COMMIT="https://api.github.com/repos/UIMAK/xray-deploy/commits/main"
-# 本次下载所用的 commit SHA(未固定时为空)。**必须在此处初始化**: 旧写法在
-# `_resolve_remote_base` 内部无条件 `REMOTE_BASE_REF=""`, 从而"顺便"完成了初始化;
-# 改成幂等提前返回后这个副作用消失, 而本脚本 `set -u`, 任何裸读 `$REMOTE_BASE_REF`
-# (测试、_manifest_write、未来的调用点)都会因 unbound 直接报错(实测)。
-REMOTE_BASE_REF=""
 
 CMD_NAME="xd"
 INSTALL_BIN="/usr/local/bin/${CMD_NAME}"
@@ -39,9 +21,7 @@ INSTALL_LIB_DIR="$DEPLOY_DIR/lib"
 INSTALL_TPL_DIR="$DEPLOY_DIR/templates"
 
 # 整版本原子更新用的路径(见 _install_backup/_install_rollback 上方的设计说明)。
-# MANIFEST: 安装成功后生成的版本一致性清单(每行 `<sha256>  <relpath>`), 由 xray-deploy.sh
-#   在 source 之前独立校验(只告警不阻断)。ROLLBACK_DIR: 本次安装的备份目录, 带 $$ 防并发覆盖。
-MANIFEST="$DEPLOY_DIR/.manifest"
+# ROLLBACK_DIR: 本次安装的备份目录, 带 $$ 防并发覆盖。
 ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.$$"
 
 # 模块与模板完整列表。
@@ -92,90 +72,6 @@ if [ "${#need[@]}" -gt 0 ]; then
         command -v "$c" >/dev/null 2>&1 || echo "[警告] 依赖 $c 安装失败, 脚本将尝试继续(菜单启动时会再次尝试安装)"
     done
 fi
-
-# ---------------------------------------------------------------------------
-# 远端源快照一致: 把 22 个逐个 HTTP 请求固定到**同一个 commit**(2026-09-21 七轮复审 P2)。
-#
-# 问题: REMOTE_BASE 指向 `.../main`(移动分支 ref), 而主脚本/VERSION/10 lib/10 模板是**各自
-# 一次** HTTP GET。若期间恰好有 push, 请求 1..8 可能看到 commit A、9..22 看到 commit B ⇒
-# stage 里是**跨 commit 的混合树**。每个 GET 都返回 200, 所以 `fail>0` 的中止逻辑不触发;
-# 而 `_manifest_write` 只对**最终落地的字节**做哈希, 无法察觉"这些字节来自不同 commit"。
-# 本地落地的事务一致性解决的是"全部新或全部旧", 解决不了"新旧来自不同版本"。
-#
-# 修法: 下载前先解析 main 的 commit SHA, 全部文件从 `<repo>/<sha>/...` 取。
-#
-# 三条约束(均由实测得出):
-#   · **仅在默认上游时固定**。`XRAY_DEPLOY_RAW` 指向镜像/私有 fork 时**必须原样不动, 且不调
-#     api.github.com** —— 镜像没有义务携带上游 sha, 强行固定会让每一次下载 404 并因
-#     `fail>0` 中止整个安装(lib/90-menu.sh 也已声明该覆盖是"用户自负责的受信源")。
-#   · **fail-open**。GitHub 未认证 API 限额 60/h/IP, 共享出口的 NAT VPS 可能已耗尽;
-#     任何一步失败(非 200 / 空 body / 无 jq / 无 curl+wget / sha 形状不对)都**回退到 main**,
-#     绝不中止安装 —— 最坏情况只是退回到"逐个请求"的旧行为, 不引入新的失败点。
-#   · **必须校验 40 位十六进制**再拼进 URL(防畸形 ref 与注入)。
-# 用 `printf`(而非 echo)输出, 因为本函数在 `$(...)` 里被调用, 而 echo 会解释 `-n` 等转义。
-#
-# **直接改全局变量, 不走命令替换** —— `$(...)` 在子 shell 里执行, 函数里对 REMOTE_BASE_REF
-# 的赋值传不回调用方, 于是清单里的 provenance 会静默丢失。故本函数无 stdout 输出。
-# ---------------------------------------------------------------------------
-_resolve_remote_base() {
-    # 已钉住 => 幂等返回(2026-09-22 七轮复审 D9)。
-    # 旧写法在开头无条件 `REMOTE_BASE_REF=""`, 而钉住后 `REMOTE_BASE != REMOTE_BASE_DEFAULT`,
-    # 第二次调用会在下面的守卫处提前返回 ⇒ BASE 仍钉住而 REF 被清空: 装的是固定 commit,
-    # 清单里的 provenance 行却消失。判据必须是"**已钉住**"(REF 非空), 而不是 BASE 是否等于默认。
-    if [ -n "${REMOTE_BASE_REF:-}" ]; then return 0; fi
-    # 用户覆盖了源 => 不解析, 不调用 API
-    if [ -n "${XRAY_DEPLOY_RAW:-}" ] || [ "$REMOTE_BASE" != "$REMOTE_BASE_DEFAULT" ]; then
-        return 0
-    fi
-    local body sha
-    if command -v curl >/dev/null 2>&1; then
-        body=$(curl -fsSL --max-time 15 "$REMOTE_API_COMMIT" 2>/dev/null)
-    elif command -v wget >/dev/null 2>&1; then
-        body=$(wget -q -T 15 -O- "$REMOTE_API_COMMIT" 2>/dev/null)
-    else
-        body=""
-    fi
-    # jq 是首选; 无 jq 时用 BRE grep 兜底(与 20-xray-core 的 _xray_fetch_tag 同一取舍:
-    # busybox 上 grep -E 行为不一致, 故只用基础正则)。
-    #
-    # **只有顶层 `sha` 才是 commit; 嵌套的 `sha`(commit.tree.sha / parents[].sha /
-    # files[].sha)不是, 绝不能钉住它们**(2026-09-22 七轮复审 D4 的完整形态)。
-    # 两条路径的行为边界必须说清(实测, 不得含糊成"结构上不可能"):
-    #   · **jq 路径(真实环境)**: `.sha` 由 jq 按 JSON 结构解析, 只要存在顶层 `sha` 就一定取到
-    #     它, 与嵌套 sha 出现在前在后无关 —— 实测 `{"commit":{"tree":{"sha":T}},"sha":S}`
-    #     取到 S(正确), 只有嵌套而无顶层时为空(正确)。
-    #   · **无 jq 兜底**: 只能词法匹配, 规则是"**压平后第一个键**必须是 `sha`"。故
-    #     `{"commit":{"tree":{"sha":T}},"sha":S}`(嵌套在前、顶层在后)会**取不到** ⇒ 回退 main。
-    #     这是**保守方向**(退回逐个请求的旧行为, 不引入新的失败点), 不是漏判; 但它的确是
-    #     规则不是证明 —— 若将来 GitHub 把顶层 `sha` 移到首位之后, 这条兜底会静默降级为不钉。
-    # 旧写法的两个实测缺陷(都据此修掉):
-    #   · `grep '"sha"' | head -1 | sed 's/.*"sha".../'` 的 sed **贪婪**且 `head -1` 只选**行**
-    #     ⇒ 单行(压缩)响应下锚定行内**最后一个** "sha"。实测真实 GitHub 载荷压行后取到
-    #     `files[].sha`, 40 位形状校验照样通过, 22 个 GET 全 404 ⇒ `fail>0` ⇒ 安装中止
-    #     (即实际 fail-closed, 与注释声明的 fail-open 相反)。
-    #   · 仅"压平后取第一个含 sha 的记录"仍不够: `{"commit":{"tree":{"sha":…}}}` 没有顶层 sha,
-    #     而首个含 sha 的记录是 tree 对象 ⇒ 照样钉住一个**不是 commit 的对象**(实测)。
-    # 故兜底改为 `sed -n` 只在**载荷首键**位置匹配: `"sha"` 必须出现在压平后的第一行且其前
-    # 除 `{` 与空白外没有别的键。非顶层 / 无顶层 sha / 错误体 / 数组一律**无输出** ⇒
-    # 走下面的形状校验 ⇒ 回退 main(fail-open)。
-    if command -v jq >/dev/null 2>&1; then
-        sha=$(printf '%s' "$body" | jq -r '.sha // empty' 2>/dev/null)
-    fi
-    if [ -z "${sha:-}" ] || [ "$sha" = "null" ]; then
-        sha=$(printf '%s' "$body" | tr -d '\n' | tr ',' '\n' | head -1 \
-              | sed -n 's/^[[:space:]]*{[[:space:]]*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p')
-    fi
-    # 形状校验: 不是 40 位十六进制一律放弃(绝不把畸形值拼进 URL)。失败即回退 main, 不中止。
-    case "${sha:-}" in
-        *[!0-9a-fA-F]*|'') return 0 ;;
-    esac
-    [ "${#sha}" -eq 40 ] || return 0
-    REMOTE_BASE_REF="$sha"
-    # 固定 URL 由 REMOTE_BASE_DEFAULT **派生**(去掉末尾 ref 段), 不再写第三份字面量 ——
-    # 否则改字面量实现的 fork/镜像会被静默改回上游仓库(实测: 三处字面量只改前两处时,
-    # 拼出的仍是 UIMAK 仓库; 三处全改则拼出 `UIMAK/xray-deploy/<fork-sha>` ⇒ 全 404)。
-    REMOTE_BASE="${REMOTE_BASE_DEFAULT%/*}/$sha"
-}
 
 # ---------------------------------------------------------------------------
 # 下载文件(优先 curl, 兜底 wget, 带重试)
@@ -275,7 +171,7 @@ _verify_installed() {
 # (LIB_DIR="$SCRIPT_DIR/lib"), 换不掉正在执行的脚本自身; 改造入口解析/service ExecStart/
 # 卸载路径的触及面远大于收益。本函数已直接满足"部分更新失败不留混合版本"。
 # ---------------------------------------------------------------------------
-_manifest_relpaths() {
+_install_relpaths() {
     local m t
     printf '%s\n' 'xray-deploy.sh' 'VERSION'
     for m in $LIB_MODULES; do printf 'lib/%s.sh\n' "$m"; done
@@ -386,7 +282,7 @@ _install_backup() {
             printf 'absent %s\n' "$rel" >> "$keep_tmp" 2>/dev/null || return 1
         fi
         record_count=$((record_count + 1))
-    done <<< "$(_manifest_relpaths)"
+    done <<< "$(_install_relpaths)"
     [ "$record_count" -ge 2 ] || return 1
     sums=$(sed '1d' "$keep_tmp" | cksum) || return 1
     read -r crc bytes _ <<< "$sums"
@@ -581,34 +477,6 @@ _install_rollback() {
     return 0
 }
 
-_manifest_write() {
-    # sha256sum 缺失(极简 busybox)时静默跳过 —— 旧装机(无清单)行为不变, 只少一层保护。
-    command -v sha256sum >/dev/null 2>&1 || return 0
-    local rel h tmp="$MANIFEST.tmp.$$"
-    : > "$tmp" 2>/dev/null || { echo "[警告] 无法写入安装清单: $MANIFEST"; return 1; }
-    # provenance: 记录本次下载所用的 commit SHA(若已固定)。
-    # **必须是单个无空白 token**: 读取端(xray-deploy.sh)用 `while read -r _mh _mp` 逐行取
-    # 两个字段, `[ -n "$_mp" ] || continue` 跳过第二字段为空的行。写成 `# commit <sha>` 会让
-    # `_mp="commit"`, 于是对不存在的路径 `commit` 求 sha256 得到空值 ⇒ **假告警**。
-    # `#commit=<sha>` 无空白 ⇒ 被现有守卫自然跳过, **旧读者零改动兼容**。
-    # 注意: 记录 sha 只提供可追溯性, **不能**检测跨 commit 混合 —— 那靠 _resolve_remote_base。
-    if [ -n "${REMOTE_BASE_REF:-}" ]; then
-        printf '#commit=%s\n' "$REMOTE_BASE_REF" >> "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
-    fi
-    while IFS= read -r rel; do
-        [ -n "$rel" ] || continue
-        h=$(sha256sum "$DEPLOY_DIR/$rel" 2>/dev/null | awk '{print $1}')
-        if [ -z "$h" ]; then
-            rm -f "$tmp" 2>/dev/null
-            echo "[警告] 安装清单生成失败: $rel"
-            return 1
-        fi
-        printf '%s  %s\n' "$h" "$rel" >> "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
-    done <<< "$(_manifest_relpaths)"
-    mv -f "$tmp" "$MANIFEST" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; echo "[警告] 安装清单落盘失败"; return 1; }
-    return 0
-}
-
 _install_cleanup_stale() {
     # SIGKILL 残留的回滚目录(SIGKILL 时回滚代码没机会执行): 内容是旧文件的副本, 无害但会堆积。
     #
@@ -662,9 +530,6 @@ _install_cleanup_stale() {
 # ---------------------------------------------------------------------------
 download_all() {
     local ok=0 fail=0
-    # 先解析远端 base(可能被固定到某个 commit SHA)。**直接改全局变量**: 函数无 stdout,
-    # 因为命令替换会在子 shell 里跑, REMOTE_BASE_REF 的赋值传不回来。失败即保持 main, 不中止。
-    _resolve_remote_base
     # 下载到临时 staging 目录, 全部成功后再 atomic 复制到目标路径 (S7)
     #
     # mktemp 失败必须**立即中止**: stage 为空串时下面所有路径拼接都会退化成绝对根路径 ——
@@ -787,8 +652,6 @@ download_all() {
         fi
         return 1
     fi
-    # Commit verification is complete; try the advisory manifest before clearing the marker.
-    _manifest_write || true
     _install_finish_transaction || {
         echo "[错误] 更新文件已复核, 但事务标记无法清除; 保留备份目录: $ROLLBACK_DIR"
         return 1
@@ -1571,7 +1434,6 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
         fi
         exit 1
     fi
-    _manifest_write || true
     _install_finish_transaction || {
         echo "[错误] 本地文件已复核, 但事务标记无法清除; 保留备份目录: $ROLLBACK_DIR"
         exit 1
