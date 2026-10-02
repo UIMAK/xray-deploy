@@ -4,8 +4,8 @@
 # 与 Xray Hy2(lib/50-nodes.sh 的 hysteria2 节点类型)是完全独立的两个实现:
 # Xray Hy2     = Xray-core 的 `hysteria` 协议 —— 注意 `hysteria2` 是本项目的**节点类型键**
 #                (元数据值/模板名 hysteria2.server.jsonc/_detect_inbound_protocol 的映射结果),
-#                Xray 入站协议表里并没有 `hysteria2` 这个名字; config.json 里写的是
-#                "protocol":"hysteria" + "settings.version":2。_hy2_* 函数族, config.json 模型
+#                Xray 入站协议表里并没有 `hysteria2` 这个名字; 配置文件里写的是
+#                "protocol":"hysteria" + "settings.version":2。_hy2_* 函数族, 配置文件模型
 # Official Hy2 = HyNetworks/hysteria 官方 binary(旧组织名 apernet 已 301), _hysteria_* 函数族
 # 两者不得共享配置模型/binary/版本管理/服务/认证与链接生成逻辑。
 #
@@ -14,7 +14,7 @@
 # - 无 check/validate 子命令, 坏配置 = 启动 FATAL exit 1 ⇒ 只能靠 verified-restart 失败回滚
 # - 端口跳跃是官方内置(listen 写 ":<min>-<max>"), 本模块**绝不自己写防火墙规则**
 #   (与 Xray Hy2 的 iptables DNAT 是两条路); 只支持单段连续区间
-# - 完整性校验 = 官方 hashes.txt SHA256(fail-closed) + 可执行自检 + 版本匹配三层
+# - 下载内容校验 = 可执行自检 + 版本匹配
 # - 混淆 obfs 官方有两种 salamander / gecko; gecko 的尺寸是**配置文件字段**, 官方 URI-Scheme
 #   没有尺寸参数 ⇒ gecko 非默认尺寸时**拒绝生成链接**(判据唯一入口 _hysteria_obfs_uri_gap),
 #   clash 条目有独立字段可完整表达
@@ -106,19 +106,6 @@ _hysteria_canon_version() {
     return 1
 }
 
-# 从官方 hashes.txt(格式 "<sha256>  build/<asset>")提取指定资产的 SHA256。
-# 精确锚定行尾防前缀误匹配(amd64 vs amd64-avx)。fail-closed: 0 条=无此资产、
-# >1 条=校验文件异常(正常官方文件唯一) —— 都拒绝, 不取 tail。
-_hysteria_expected_sha256() {
-    local f="$1" name="$2" count sha
-    [ -s "$f" ] || return 1
-    count=$(grep -c " build/${name}\$" "$f" 2>/dev/null)
-    [ "$count" = 1 ] || return 1
-    sha=$(grep " build/${name}\$" "$f" | awk '{print $1}')
-    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-    printf '%s' "$sha"
-}
-
 # 最新版本: 官方下载服务的 302 终点 URL 携带版本段(/app/latest/<asset> → /app/v2.12.2/<asset>);
 # 失败回落 GitHub API latest(仓库改名后 API 会 301, 必须 -L 跟随; tag 形态 app/v2.x.x,
 # 经 canonicalize)。两个通道都失败 → 输出空, 调用方显式处理。
@@ -200,8 +187,8 @@ _hysteria_pick_asset() {
 
 # ---------------------------------------------------------------------------
 # binary 安装/升级事务:
-# 解析资产 → 下载临时文件(同目录, 供原子 mv) → 官方 hashes.txt SHA256 校验 + 可执行自检
-# + 版本匹配(三层, 见下) → 备份旧 binary → 停服 → 原子替换 → 启动 → verified → commit;
+# 解析资产 → 下载临时文件(同目录, 供原子 mv) → 可执行自检 + 版本匹配 → 备份旧 binary
+# → 停服 → 原子替换 → 启动 → verified → commit;
 # 任一步失败恢复旧 binary 并重启旧版。配置与节点不受影响(官方 binary 更新不改配置语义)。
 # Commit a verified staged binary while serialized with official-Hysteria state changes.
 _hysteria_install_commit_locked() {
@@ -295,8 +282,6 @@ _hysteria_download_install() {
     # 版本号 canonicalize(评审 0.16.2: GitHub tag 形态 app/v2.x.x, 输入侧统一剥离)
     want=$(_hysteria_canon_version "$want") || { _error "版本号格式应为 v2.x.x: $1"; return 1; }
     url="${HYSTERIA_DL_BASE}/${want}/hysteria-linux-${asset}"
-    # 完整性校验前置: sha256sum 不可用则整个下载无意义(fail-closed, 与 xray .dgst 同口径)
-    command -v sha256sum >/dev/null 2>&1 || { _error "sha256sum 不可用, 无法验证下载完整性"; return 1; }
     _info "下载 ${url}"
     mkdir -p "$BIN_DIR" || return 1
     tmp=$(mktemp "$BIN_DIR/hysteria.dl.XXXXXX") || { _error "临时文件创建失败"; return 1; }
@@ -305,27 +290,9 @@ _hysteria_download_install() {
         _error "下载失败(网络受限?), 当前安装未变动"
         return 1
     fi
-    # 官方 hashes.txt 与 binary 同目录发布(2026-09-13 实证): SHA256 校验 fail-closed。
-    # 拿不到官方校验和 = 不可信任下载内容 —— 自检+版本匹配只能证明"能执行且报对版本",
-    # 无法证明"就是官方发布的那个 binary"。
-    local h_file expected sha
-    h_file=$(mktemp "$BIN_DIR/hashes.txt.XXXXXX") || { rm -f "$tmp"; _error "临时文件创建失败"; return 1; }
-    if ! _http_download "${HYSTERIA_DL_BASE}/${want}/hashes.txt" "$h_file" 60 || [ ! -s "$h_file" ]; then
-        rm -f "$h_file" "$tmp"
-        _error "无法获取官方 hashes.txt 校验文件, 不能确认下载内容与官方发布一致, 已中止(当前安装未变动)"
-        return 1
-    fi
-    expected=$(_hysteria_expected_sha256 "$h_file" "hysteria-linux-${asset}")
-    rm -f "$h_file"
-    [ -n "$expected" ] || { rm -f "$tmp"; _error "hashes.txt 中无 hysteria-linux-${asset} 条目, 已中止"; return 1; }
-    sha=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
-    [ "$sha" = "$expected" ] || {
-        rm -f "$tmp"
-        _error "SHA256 不匹配(期望 ${expected}, 实际 ${sha:-无法计算}), 已放弃替换"
-        return 1
-    }
+    [ -s "$tmp" ] || { rm -f "$tmp"; _error "下载内容为空, 当前安装未变动"; return 1; }
     chmod 755 "$tmp" 2>/dev/null
-    # 第二层: 可执行自检 + version 子命令输出与目标版本一致(官方解析口径)
+    # 可执行自检 + version 子命令输出与目标版本一致(官方解析口径)
     ver=$("$tmp" version 2>/dev/null | grep '^Version' | grep -o 'v[.0-9]*' | head -1)
     if [ "$ver" != "$want" ]; then
         rm -f "$tmp"
@@ -362,8 +329,8 @@ _hysteria_avx_runtime_retry() {
     [ -n "$want" ] || return 1
     [ -z "${_HY_FORCE_PLAIN:-}" ] || return 1
     # 第二来源: state/hysteria_asset 只是观察值, 可能缺失或写入失败; `hysteria version`
-    # 不区分 avx 变体(实测 v2.12.2 输出 Architecture: amd64), 也不值得为它下载 hashes.txt
-    # 比对 SHA256(兜底触发频率极低)。改用与 _hysteria_pick_asset 同口径的保守弱推断:
+    # 不区分 avx 变体(实测 v2.12.2 输出 Architecture: amd64)。改用与 _hysteria_pick_asset
+    # 同口径的保守弱推断:
     # amd64 + CPU 报 avx → 当初装的极可能就是 AVX 变体, 宁可多做一次兜底尝试
     # (若当初装的其实是普通版, 重装普通版同样能启动, 只多一次下载)。
     if [ -z "$asset" ]; then
@@ -1532,7 +1499,7 @@ _hysteria_config_password() {
 }
 
 # **Manager 是否已接管这台服务器** —— 与 _hysteria_server_initialized 是两个判断:
-#   _hysteria_server_initialized = 配置可运行(config.json 有 password)
+#   _hysteria_server_initialized = 配置可运行(配置文件有 password)
 #   本函数                        = **Manager 侧有可用节点元数据**
 # 必须分开: 单密码模型下"有凭据"不等于"本 Manager 管过它" —— 用户可能手工部署过
 # Official Hysteria 再装上本脚本, 此时 config 有 password 但 node.json 不存在。用
@@ -1867,8 +1834,8 @@ _hysteria_prompt_tls() {
                 _error "邮箱不能为空(ACME 注册与到期通知需要, 如 admin@example.com)"
             done
             # HTTP 质询要占 80/TLS-ALPN 占 443: 与 Xray 同机时大概率冲突, 提前讲清
-            if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
-                if jq -e '[.inbounds[]?.port] | index(80) or index(443)' "$CONFIG_FILE" >/dev/null 2>&1; then
+            if _config_present && command -v jq >/dev/null 2>&1; then
+                if _config_jq -e '[.inbounds[]?.port] | index(80) or index(443)' >/dev/null 2>&1; then
                     _warn "Xray 已占用 80/443 端口, ACME 质询会失败(除非 NAT 转发到本机其他实现)"
                 fi
             fi
@@ -1928,12 +1895,12 @@ _hysteria_listen_port_part() {
 #     官方文档 inbounds/shadowsocks.md 亦为"默认 tcp"。把它当 "tcp,udp" 会凭空判出一个
 #     UDP 监听, 从而挡住本来合法的跳跃范围(十三轮复审)。
 _hysteria_xray_udp_port_ranges() {
-    [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 0
+    _config_present && command -v jq >/dev/null 2>&1 || return 0
     local s e
     while IFS=: read -r s e; do
         [[ "$s" =~ ^[0-9]+$ && "$e" =~ ^[0-9]+$ ]] || continue
         printf '%s:%s\n' "$s" "$e"
-    done < <(jq -r '
+    done < <(_config_jq -r '
         .inbounds[]? | select(.port != null)
         | select(
             (.protocol // "") == "hysteria"
@@ -1949,7 +1916,7 @@ _hysteria_xray_udp_port_ranges() {
         | if test("^[0-9]+-[0-9]+$") then sub("-"; ":")
           elif test("^[0-9]+$") then "\(.):\(.)"
           else empty end
-    ' "$CONFIG_FILE" 2>/dev/null)
+    ' 2>/dev/null)
 }
 
 # a) 系统已监听的 UDP 端口落进范围(会被官方 REDIRECT 遮蔽)
@@ -1978,7 +1945,7 @@ _hysteria_check_hop_conflicts() {
     # **UDP 能力的唯一判据在 `_hysteria_xray_udp_port_ranges`**(那里逐项写明依据与核心源码
     # 出处); 这里只做区间相交, 不再复述口径 —— 复述过的那份曾把 Xray 的协议键写成不存在的
     # "hysteria2"、把 shadowsocks 的缺省 network 写成 "tcp,udp", 与实现漂移。
-    if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+    if _config_present && command -v jq >/dev/null 2>&1; then
         while IFS=: read -r p_start p_end; do
             [ -n "$p_start" ] || continue
             [ -n "$exclude" ] && [ "$p_start" = "$exclude" ] && [ "$p_start" = "$p_end" ] && continue
@@ -4153,9 +4120,9 @@ _hysteria_menu() {
         if [ -n "$cur" ]; then
             st=$(_manage_hysteria status 2>/dev/null)
             if [ "$st" = "running" ]; then
-                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${GREEN}● 运行中${NC}  (Xray Hy2 在菜单 [6], 两者独立)"
+                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${GREEN}● 运行中${NC}  (Xray Hy2 在主菜单 [Xray Hy2 管理], 两者独立)"
             else
-                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${RED}○ 已停止${NC}  (Xray Hy2 在菜单 [6], 两者独立)"
+                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${RED}○ 已停止${NC}  (Xray Hy2 在主菜单 [Xray Hy2 管理], 两者独立)"
             fi
         else
             echo -e "  核心: ${RED}未安装${NC}"

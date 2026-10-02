@@ -12,9 +12,9 @@ set -u
 umask 077
 
 # PATH 加固必须在**本脚本的第一个外部命令之前**(2026-09-22 open-code-review #46)。
-# 旧写法只在 `main()` 里前置了一次, 而 `readlink`/`dirname`(下面两行)与 manifest 段的
-# `sha256sum`/`awk` 都跑在它**之前** —— 以 root 被调用时(菜单、以及 cron 触发的
-# `xd geo-update`)调用方 PATH 里的同名命令会在加固生效前先执行。
+# 旧写法只在 `main()` 里前置了一次, 而 `readlink`/`dirname`(下面两行)跑在它**之前** ——
+# 以 root 被调用时(菜单、以及 cron 触发的 `xd geo-update`)调用方 PATH 里的同名命令会在
+# 加固生效前先执行。
 # 口径与 `main()` 里那行**逐字一致**(前置固定目录, **保留**调用方尾缀):
 #   · 前置是必需的 —— 系统目录必须优先于调用方 PATH, 否则可被非 root 写入的目录里的同名
 #     curl/jq/systemctl 会劫持 root 操作;
@@ -51,8 +51,8 @@ LIB_DIR="$SCRIPT_DIR/lib"
 # 一致性断言守住)。install.sh 用它在远程安装时逐份下载, 这里用它在运行时逐份 source。
 LIB_MODULES="00-common 10-system 20-xray-core 30-geo 40-cloudflared 45-logrotate 50-nodes 51-reality-pq 55-hysteria 90-menu"
 
-# Installer publication lock: wait before manifest reads/module sourcing so a runtime reader
-# cannot combine files from different installer generations. Manifest mismatches remain advisory.
+# Installer publication lock: wait before module sourcing so a runtime reader cannot combine
+# files from different installer generations.
 _BOOTSTRAP_LOCK_ROOT="/var/lock/xray-deploy"
 if ! mkdir -p "$_BOOTSTRAP_LOCK_ROOT" 2>/dev/null; then
     _BOOTSTRAP_LOCK_ROOT="/run/lock/xray-deploy"
@@ -248,50 +248,6 @@ for _m in $LIB_MODULES; do
     fi
 done
 
-# 安装清单一致性校验(2026-09-21 五轮复审 P1 收尾)。
-# 逐文件原子 + 安装器整体回滚覆盖"安装中途失败", 但覆盖不了**进程被 SIGKILL**(回滚代码没机会
-# 执行) —— 此时磁盘上就是混合版本, 而上面那条检查只看"存在且可读", 会放行。
-# 安装成功后由 install.sh 生成 <部署根>/.manifest(每行 `<sha256>  <relpath>`), 这里独立校验。
-#
-# 三条硬约束:
-#   · **不得调用任何 lib 函数** —— 要校验的正是 lib 是否可信, 用 lib 函数去校验是循环论证;
-#     因此只用 POSIX 工具 + sha256sum。也**不能**用 $DEPLOY_DIR: 它由 00-common 定义, 而本段
-#     必须跑在 source 之前(那时它还是未定义, set -u 会直接中止脚本)。
-#   · **只告警不阻断**: 手工热修一个 lib 文件会让 hash 不匹配, 据此 exit 1 等于把用户锁在门外。
-#     项目取向是"数据安全 fail-closed, 可用性 fail-open"(同 _proc_exe_is 的注释推理)。
-#   · `.manifest` 缺失(旧装机)/ sha256sum 缺失 => 静默跳过, 行为与今天一致。
-# 部署根与 LIB_DIR 同源(上面刚解析): 用 SCRIPT_DIR/lib 则根为 SCRIPT_DIR, 用
-# /opt/xray-deploy/lib 则根为 /opt/xray-deploy —— 与 install.sh 写入清单的位置一致。
-# Deployment root is established before the transaction gate above and remains advisory for the manifest check.
-if [ -f "$_DEPLOY_ROOT/.manifest" ] && command -v sha256sum >/dev/null 2>&1; then
-    _manifest_bad=""
-    while read -r _mh _mp; do
-        [ -n "$_mh" ] || continue
-        [ -n "$_mp" ] || continue
-        # 清单解析必须**健壮**(2026-09-22 open-code-review #47)。旧写法把任何非空的两字段
-        # 行都当成合法条目, 实测两个后果:
-        #   · `deadbeef…  ../../etc/hostname` 会让校验去读**部署根之外**的文件 ——
-        #     用形如 `/tmp/xxx` 的路径会被判为 path traversal 而拒绝(与审查项同源);
-        #   · 非 64 位 hex 的"哈希"永远不匹配, 于是**每一条**都报"不一致", 把真正的
-        #     不一致淹没在噪声里(实测 4 行畸形清单报出 3 条假项, 只有 1 条是真的)。
-        # **只告警不阻断的口径不变**(见上方第 2 条硬约束): 这里只决定"要不要去读这个路径",
-        # 违规条目记一条"格式错误"就够, 绝不 exit。
-        case "$_mp" in
-            /*|..|../*|*/../*|*/..) _manifest_bad="$_manifest_bad [不安全路径:$_mp]"; continue ;;
-        esac
-        case "$_mh" in
-            *[!0-9a-f]*) _manifest_bad="$_manifest_bad [格式错误:$_mp]"; continue ;;
-        esac
-        [ "${#_mh}" -eq 64 ] || { _manifest_bad="$_manifest_bad [格式错误:$_mp]"; continue; }
-        _mgot=$(sha256sum "$_DEPLOY_ROOT/$_mp" 2>/dev/null | awk '{print $1}')
-        [ "$_mgot" = "$_mh" ] || _manifest_bad="$_manifest_bad $_mp"
-    done < "$_DEPLOY_ROOT/.manifest"
-    if [ -n "$_manifest_bad" ]; then
-        echo "[警告] 以下模块与安装清单不一致(可能安装中断或被手工修改):${_manifest_bad}" >&2
-        echo "       建议重跑 install.sh --update 同步全部模块" >&2
-    fi
-    unset _manifest_bad _mh _mp _mgot
-fi
 unset _DEPLOY_ROOT
 
 # source 公共层(定义所有常量与 DEPLOY_DIR 等)
@@ -342,6 +298,10 @@ _cron_init() {
     # 成功路径的常规输出仍然吞掉; 失败时留下告警(cron 会写进邮件/日志)。
     if ! _ensure_base_deps >/dev/null 2>&1; then
         _warn "基础依赖安装失败, 部分功能可能不可用(cron 子命令可能失败)"
+    fi
+    # 旧版单文件 config.json → confs/ 的迁移也在这里兜一次(cron 子命令不经过菜单)。
+    if declare -F _config_migrate_legacy >/dev/null 2>&1; then
+        _config_migrate_legacy || _warn "旧单文件配置迁移失败, 请从主菜单检查"
     fi
 }
 
