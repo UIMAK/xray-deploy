@@ -453,7 +453,7 @@ _loglevel_menu() {
     # 缺失的 _xray_loglevel_valid 会返回 127 让流程报"无效日志级别: warning", 提示误导。
     if ! declare -F _xray_loglevel_get >/dev/null 2>&1 || ! declare -F _xray_loglevel_valid >/dev/null 2>&1; then
         _error "缺少日志级别读写函数(lib/20-xray-core.sh 可能是旧版本), 无法切换"
-        _tip "请在运维菜单执行 [检测脚本更新] 完整更新一次后重试"
+        _tip "请在主菜单执行 [检测脚本更新] 完整更新一次后重试"
         _press_any_key; return
     fi
 

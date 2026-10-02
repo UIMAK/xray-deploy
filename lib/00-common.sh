@@ -11,7 +11,8 @@
 export DEPLOY_DIR="/opt/xray-deploy"
 export BIN_DIR="$DEPLOY_DIR/bin"
 export ASSET_DIR="$DEPLOY_DIR/assets"          # 资源目录(geoip.dat/geosite.dat)
-export CONFIG_FILE="$DEPLOY_DIR/config.json"
+export CONFIG_DIR="$DEPLOY_DIR/confs"          # 多文件配置目录: 一个顶层字段一个文件
+export LEGACY_CONFIG_FILE="$DEPLOY_DIR/config.json"   # 旧版单文件配置; 仅迁移时读一次
 export NODES_DIR="$DEPLOY_DIR/nodes"           # 每节点元数据
 export CERT_DIR="$DEPLOY_DIR/certs"
 export LOG_DIR="$DEPLOY_DIR/logs"
@@ -19,7 +20,7 @@ export STATE_DIR="$DEPLOY_DIR/state"
 export BACKUP_DIR="$STATE_DIR/backup"
 
 export XRAY_BIN="$BIN_DIR/xray"
-# XRAY_LOCATION_ASSET: 优先 config.json 的 env 段(核心 ≥ v26.7.11); 旧核心由 service 文件注入
+# XRAY_LOCATION_ASSET: 核心 ≥ v26.7.11 读 config 的 env 段, 旧核心由 service 文件注入
 # (见 20-xray-core)。这里只是脚本自身调用(xray -test / direct 启动)的进程级回退。
 export XRAY_LOCATION_ASSET="$ASSET_DIR"
 export GEO_LOG="$LOG_DIR/geo.log"
@@ -109,15 +110,38 @@ export XRAY_REPO_API="https://api.github.com/repos/XTLS/Xray-core/releases"
 export GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
 
-# Xray config.json 官方顶层字段顺序(官方 docs/config/index.md; _normalize_config_format 与
-# _mutate_config 共用)。env 为 2026-07 新增(核心 ≥ v26.7.11), 旧核心静默忽略, 顺序无影响。
-readonly XRAY_TOP_FIELDS_JSON='["env","log","api","dns","routing","policy","inbounds","outbounds","stats","fakedns","metrics","observatory","burstObservatory","geodata","version"]'
+
+# ---------------------------------------------------------------------------
+# 默认 dns 段(唯一真相): _init_config_if_empty(20-xray-core) 与 DNS 菜单的
+# [恢复默认](30-geo) 共用, **绝不允许任一侧另写一份**。
+# 三个上游都用 https+local:// (直连 DoH, 不经代理), 故不需要 routing 配合即可生效。
+# ---------------------------------------------------------------------------
+readonly XRAY_DEFAULT_DNS_JSON='{
+    "enableParallelQuery": true,
+    "queryStrategy": "UseIP",
+    "servers": [
+      {
+        "address": "https+local://cloudflare-dns.com/dns-query",
+        "tag": "dns_cloudflare"
+      },
+      {
+        "address": "https+local://dns.quad9.net/dns-query",
+        "tag": "dns_quad9"
+      },
+      {
+        "address": "https+local://freedns.controld.com/p0",
+        "tag": "dns_controld"
+      }
+    ],
+    "tag": "dns_inbound",
+    "useSystemHosts": false
+  }'
 
 # ---------------------------------------------------------------------------
 # 默认 routing 规则集(唯一真相): _init_config_if_empty(20-xray-core) 与
 # _route_restore_default_rules(30-geo) 共用, **绝不允许任一侧另写一份**。
 # 4 条中只有第 2、3 条会让 Xray 加载 geosite.dat/geoip.dat(各 ~20MB+), 这正是
-# [9] → 路由规则精简 要摘掉的两条(见 XRAY_PRIVATE_BLOCK_RULE_JSON)。
+# Geo 自动更新 → [路由规则] 精简 要摘掉的两条(见 XRAY_PRIVATE_BLOCK_RULE_JSON)。
 # regexp 内 \\d / \\. 是 JSON 转义后的单个反斜杠(单引号防 bash 再吃一层)。
 # ---------------------------------------------------------------------------
 readonly XRAY_DEFAULT_ROUTING_RULES_JSON='[
@@ -593,18 +617,143 @@ _meta_update() {
 }
 
 # ---------------------------------------------------------------------------
+# 多文件配置(confs 目录): 一个顶层字段一个文件, 文件名固定。
+# 合并/拆分只用 jq 读写字段内容, 不再做"按官方顺序重排顶层字段"(每文件只有一个字段)。
+# ---------------------------------------------------------------------------
+_conf_file_for_field() {   # <顶层字段> → <文件名>
+    case "$1" in
+        env) printf '01_env.json' ;;
+        log) printf '02_log.json' ;;
+        api) printf '03_api.json' ;;
+        dns) printf '04_dns.json' ;;
+        routing) printf '05_routing.json' ;;
+        policy) printf '06_policy.json' ;;
+        inbounds) printf '07_inbounds.json' ;;
+        outbounds) printf '08_outbounds.json' ;;
+        stats) printf '09_stats.json' ;;
+        fakedns) printf '10_fakedns.json' ;;
+        metrics) printf '11_metrics.json' ;;
+        observatory) printf '12_observatory.json' ;;
+        burstObservatory) printf '13_burstObservatory.json' ;;
+        geodata) printf '14_geodata.json' ;;
+        version) printf '15_version.json' ;;
+        *) printf '99_%s.json' "$1" ;;
+    esac
+}
+
+# confs 里是否至少有一个非空配置文件。空目录会让 xray 转去读 STDIN 并以晦涩错误失败,
+# 故所有"配置是否存在"的守卫都走这里。
+_config_present() {
+    local f
+    for f in "$CONFIG_DIR"/*.json; do
+        [ -f "$f" ] && [ -s "$f" ] && return 0
+    done
+    return 1
+}
+
+# 合并 confs/*.json 成一份完整配置(输出到 stdout)。数字前缀即合并顺序, 与 xray -confdir 一致。
+_config_merged() {
+    local files=()
+    local f
+    for f in "$CONFIG_DIR"/*.json; do
+        [ -f "$f" ] && [ -s "$f" ] && files+=("$f")
+    done
+    if [ "${#files[@]}" -eq 0 ]; then
+        printf '{}'
+        return 0
+    fi
+    jq -s 'reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))' "${files[@]}"
+}
+
+# 在合并视图上跑 jq: 参数与 jq 完全一致(jq 选项在前, filter 在最后), 输入改为合并后的配置。
+# 用法: _config_jq [-r] [--arg k v ...] '<filter>'
+_config_jq() {
+    [ "$#" -ge 1 ] || return 1
+    local filter="${!#}" opts=() merged
+    [ "$#" -gt 1 ] && opts=("${@:1:$#-1}")
+    # 先取合并结果再喂给 jq。写成 `_config_merged | jq ...` 时管道退出码只看 jq(项目没有
+    # pipefail), 而合并失败(clob 里的文件读不了)时 jq 读到 EOF 会**返回 0 且无输出** ⇒
+    # 调用方的 `|| return 1`、`|| return 0` 全部失效, "读取失败"会被当成"配置里没有" ——
+    # 例如 _hy2_cert_dir_referenced 会把仍被引用的证书目录判成无引用再 rm -rf。
+    merged=$(_config_merged) || return 1
+    if [ "${#opts[@]}" -gt 0 ]; then
+        printf '%s' "$merged" | jq "${opts[@]}" "$filter"
+    else
+        printf '%s' "$merged" | jq "$filter"
+    fi
+}
+
+# 把一份完整配置拆回 confs(每字段一个文件, 文件内容是 `{"<字段>": <值>}` 的合法配置片段),
+# 并删除内容里已不存在的字段所对应的文件(例如 del(.geodata) 必须真的让 14_geodata.json 消失)。
+# 第二个参数可指定目标目录(DNS 菜单用它把候选配置写进临时目录做 xray -test 预检)。
+_config_write_merged() {   # <完整配置 JSON> [目标目录]
+    local content="$1" dir="${2:-$CONFIG_DIR}"
+    [ -n "$content" ] || return 1
+    printf '%s' "$content" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
+    mkdir -p "$dir" || return 1
+    local k v f written=$'\n'
+    while IFS= read -r -d '' k && IFS= read -r -d '' v; do
+        f=$(_conf_file_for_field "$k") || return 1
+        v=$(printf '%s' "$v" | jq --arg k "$k" '{($k): .}') || return 1
+        _atomic_write_json "$dir/$f" "$v" || return 1
+        written="${written}${f}"$'\n'
+    done < <(printf '%s' "$content" | jq -j 'to_entries[] | "\(.key)\u0000\(.value | tojson)\u0000"')
+    local old
+    for old in "$dir"/*.json; do
+        [ -f "$old" ] || continue
+        grep -qxF "$(basename "$old")" <<< "$written" || rm -f "$old"
+    done
+    return 0
+}
+
+# 一次性迁移: 旧的单文件 config.json → confs/ 目录, 旧文件改名 config.json.bak。
+# 幂等判据是"旧文件已改名"(存在 .bak), 而不是"confs 非空": 拆分是逐文件写, 若中途被杀,
+# confs 已非空但旧文件还在 ⇒ 必须重跑才能补齐剩余字段。旧文件解析失败时**不改名**, 保持现场。
+_config_migrate_legacy() {
+    [ -f "${LEGACY_CONFIG_FILE}.bak" ] && return 0
+    _config_present && return 0
+    [ -f "$LEGACY_CONFIG_FILE" ] && [ -s "$LEGACY_CONFIG_FILE" ] || return 0
+    if ! command -v jq >/dev/null 2>&1; then
+        _warn "jq 不可用, 暂无法把 $LEGACY_CONFIG_FILE 迁移到 $CONFIG_DIR"
+        return 1
+    fi
+    local content
+    content=$(jq . "$LEGACY_CONFIG_FILE" 2>/dev/null) || {
+        _error "旧配置文件解析失败, 未迁移(保持原样): $LEGACY_CONFIG_FILE"
+        return 1
+    }
+    [ -n "$content" ] || { _error "旧配置文件为空, 未迁移: $LEGACY_CONFIG_FILE"; return 1; }
+    if ! _config_write_merged "$content"; then
+        rm -f "$CONFIG_DIR"/*.json 2>/dev/null
+        _error "配置迁移失败(写入 $CONFIG_DIR 出错), 已回退; 旧配置保持原样"
+        return 1
+    fi
+    if ! mv -f "$LEGACY_CONFIG_FILE" "${LEGACY_CONFIG_FILE}.bak"; then
+        _error "配置已拆分到 $CONFIG_DIR, 但无法重命名旧文件: $LEGACY_CONFIG_FILE"
+        return 1
+    fi
+    _info "配置已迁移到 $CONFIG_DIR(旧文件保留为 ${LEGACY_CONFIG_FILE}.bak)"
+    if [ -x "$XRAY_BIN" ]; then
+        declare -F _create_xray_service >/dev/null 2>&1 && _create_xray_service
+        if declare -F _restart_xray_verified >/dev/null 2>&1 && ! _restart_xray_verified; then
+            _warn "迁移后 Xray 重启未通过验证, 请到 [服务控制] 查看状态"
+        fi
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # 确保部署目录结构存在
 # ---------------------------------------------------------------------------
 _ensure_dirs() {
     local ok=1
-    for d in "$BIN_DIR" "$ASSET_DIR" "$NODES_DIR" "$CERT_DIR" "$LOG_DIR" "$STATE_DIR" "$BACKUP_DIR"; do
+    for d in "$BIN_DIR" "$ASSET_DIR" "$NODES_DIR" "$CERT_DIR" "$LOG_DIR" "$STATE_DIR" "$BACKUP_DIR" "$CONFIG_DIR"; do
         mkdir -p "$d" || ok=0
         chmod 700 "$d" 2>/dev/null || ok=0
     done
     # 存量敏感文件收紧为仅 root 可读(私钥/密码/token; umask 只对新建文件生效, 这里回填旧文件)
-    [ -f "$CONFIG_FILE" ] && { chmod 600 "$CONFIG_FILE" 2>/dev/null || ok=0; }
     local f
-    for f in "$NODES_DIR"/*.json "$STATE_DIR"/cf_token "$DEPLOY_DIR"/clash.yaml; do
+    for f in "$CONFIG_DIR"/*.json "$NODES_DIR"/*.json "$STATE_DIR"/cf_token "$DEPLOY_DIR"/clash.yaml; do
         [ -f "$f" ] && { chmod 600 "$f" 2>/dev/null || ok=0; }
     done
     # 安全加固是启动前提: 目录/敏感文件权限设置失败必须让初始化失败, 不能静默当作成功
@@ -735,55 +884,69 @@ _crontab_has_marker() {
 }
 
 # ---------------------------------------------------------------------------
-# 配置备份/回滚(写 config.json 前调用)
+# 配置备份/回滚(写 confs 前调用)。备份单位是**整个 confs 目录**。
 # ---------------------------------------------------------------------------
+# R38(P1): 备份必须非空 —— 磁盘满时 cp 可能返回 0 却只落地 0 字节, 之后回滚就会以
+# "空配置"覆盖。判据必须是 [ -s ]: ls 只能证明"文件存在", 0 字节文件会漏过去。
+_backup_config_has_bytes() {
+    local f
+    for f in "$1"/*.json; do [ -f "$f" ] && [ -s "$f" ] && return 0; done
+    return 1
+}
+
 _backup_config() {
-    [ -f "$CONFIG_FILE" ] || return 0
+    _config_present || return 0
     mkdir -p "$BACKUP_DIR" || return 1
     local tmp
     # 注意: busybox/musl 的 mktemp 要求模板以 XXXXXX 结尾, 后缀必须放在 X 之前(否则 EINVAL)
-    tmp=$(mktemp "${BACKUP_DIR}/config.json.bak.XXXXXX") || return 1
-    cp -f "$CONFIG_FILE" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    # R38(P1): 备份必须非空 —— 磁盘满时 cp 可能返回 0 却只落地 0 字节, 之后回滚就会
-    # 以"空配置"覆盖。空备份视为备份失败, 由调用方中止事务。
-    [ -s "$tmp" ] || { rm -f "$tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
+    tmp=$(mktemp -d "${BACKUP_DIR}/confs.bak.XXXXXX") || return 1
+    cp -f "$CONFIG_DIR"/*.json "$tmp"/ 2>/dev/null || { rm -rf "$tmp"; return 1; }
+    # R38(P1): 备份必须非空(磁盘满时 cp 可能返回 0 却只落地 0 字节), 见 _backup_config_has_bytes
+    _backup_config_has_bytes "$tmp" || { rm -rf "$tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
     # 备份含密码/UUID/私钥: chmod 600 失败视为备份失败(R13), 不能留下 0644 备份
-    chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    chmod 700 "$tmp" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+    chmod 600 "$tmp"/*.json 2>/dev/null || { rm -rf "$tmp"; return 1; }
     # R23: lastbak 原子更新 —— 旧 lastbak 保持到新备份完整成功(直接 cp 覆盖在 I/O 失败时
     # 会截断 lastbak, 损坏整个 rollback 基础)。
     local last_tmp
-    last_tmp=$(mktemp "${BACKUP_DIR}/config.json.lastbak.XXXXXX") || { rm -f "$tmp"; return 1; }
-    cp -f "$CONFIG_FILE" "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
+    last_tmp=$(mktemp -d "${BACKUP_DIR}/confs.lastbak.XXXXXX") || { rm -rf "$tmp"; return 1; }
+    cp -f "$CONFIG_DIR"/*.json "$last_tmp"/ 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
     # R38(P1): 同上 —— lastbak 是回滚基础, 0 字节比"没有备份"更危险
-    [ -s "$last_tmp" ] || { rm -f "$tmp" "$last_tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
-    chmod 600 "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
-    mv -f "$last_tmp" "$BACKUP_DIR/config.json.lastbak" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
+    _backup_config_has_bytes "$last_tmp" || { rm -rf "$tmp" "$last_tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
+    chmod 700 "$last_tmp" 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
+    chmod 600 "$last_tmp"/*.json 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
+    rm -rf "$BACKUP_DIR/confs.lastbak"
+    mv -f "$last_tmp" "$BACKUP_DIR/confs.lastbak" 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
     # 轮转历史快照: 仅保留最新 10 份随机备份(回滚只用 lastbak, 其余作人工追溯)。
     # while read 逐行消费 ls -1t, 不用 `for old in $(ls ...)` 词分割(文件名含空白时 rm -f
-    # 静默失败 → 目录无界增长); 只对普通文件计数。不用 find -printf(busybox 未必编译)。
+    # 静默失败 → 目录无界增长); 只对目录计数。不用 find -printf(busybox 未必编译)。
     local i=0 old
     while IFS= read -r old; do
         [ -n "$old" ] || continue
-        [ -f "$BACKUP_DIR/$old" ] || continue
+        [ -d "$BACKUP_DIR/$old" ] || continue
         i=$((i+1))
-        [ "$i" -gt 10 ] && rm -f "$BACKUP_DIR/$old"
-    done <<< "$(ls -1t "$BACKUP_DIR" 2>/dev/null | grep '^config\.json\.bak\.')"
+        [ "$i" -gt 10 ] && rm -rf "$BACKUP_DIR/$old"
+    done <<< "$(ls -1t "$BACKUP_DIR" 2>/dev/null | grep '^confs\.bak\.')"
     return 0
 }
 
 _restore_config() {
-    [ -f "$BACKUP_DIR/config.json.lastbak" ] || return 1
-    # R23: 原子回滚 —— 直接 cp 覆盖在 I/O 失败时可能把 config 截断; 复用 _atomic_write_json
-    # (tmp → 校验 → mv), 失败时旧 config 保持原样。
-    # R38(P1): 前置判非空, 否则"回滚"会把 config 变成空文件却报成功。
-    [ -s "$BACKUP_DIR/config.json.lastbak" ] || {
-        _error "备份文件为空, 无法回滚($BACKUP_DIR/config.json.lastbak)"
+    [ -d "$BACKUP_DIR/confs.lastbak" ] || return 1
+    # R23: 原子回滚 —— 逐文件写(每个文件走 _atomic_write_json 的 tmp → 校验 → mv),
+    # 失败时旧 confs 保持原样。
+    # R38(P1): 前置判非空, 否则"回滚"会把配置变成空目录却报成功。
+    ls -1 "$BACKUP_DIR/confs.lastbak"/*.json >/dev/null 2>&1 || {
+        _error "备份为空, 无法回滚($BACKUP_DIR/confs.lastbak)"
         return 1
     }
     local content
-    content=$(cat "$BACKUP_DIR/config.json.lastbak" 2>/dev/null) || { _error "读取备份失败($BACKUP_DIR/config.json.lastbak)"; return 1; }
-    if ! _atomic_write_json "$CONFIG_FILE" "$content"; then
-        _error "配置回滚失败($CONFIG_FILE)"
+    content=$(cat "$BACKUP_DIR/confs.lastbak"/*.json 2>/dev/null | jq -s 'reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))') || {
+        _error "读取备份失败($BACKUP_DIR/confs.lastbak)"
+        return 1
+    }
+    [ -n "$content" ] || { _error "读取备份失败($BACKUP_DIR/confs.lastbak)"; return 1; }
+    if ! _config_write_merged "$content"; then
+        _error "配置回滚失败($CONFIG_DIR)"
         return 1
     fi
     _warn "已回滚到上次配置"
@@ -820,53 +983,6 @@ _gen_short_id() {
 _gen_rand_path() {
     # 生成随机 ws/xhttp path,如 /xxxxxxxx
     echo "/"$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
-}
-
-# ---------------------------------------------------------------------------
-# 格式化 config.json: 按官方顺序重排字段 + 统一缩进, 幂等
-# R35(P2): 复用 _atomic_write_json 单一严格写入器, 不再维护第二套 tmp/mv 逻辑;
-# R38(P1): 空内容由 _atomic_write_json 拦截, 这里再显式判一次避免无谓错误输出。
-#
-# 三十三轮 P1: 本函数是"读整份 config → jq 重排 → 原子写回"的 RMW, 必须在 config lock
-# 内执行, 否则并发节点事务提交后会被旧快照整份覆盖(lost update)。外层先做廉价守卫。
-# ---------------------------------------------------------------------------
-_normalize_config_format() {
-    [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
-    _with_config_lock _normalize_config_format_locked
-}
-_normalize_config_format_locked() {
-    # 廉价守卫留在屏障外(不必要为空/无 jq 的 no-op 去取 core lock)
-    [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
-    _with_config_write_barrier _normalize_config_format_write
-}
-
-_normalize_config_format_write() {
-    # 直写整份 config 的 RMW(不经 _mutate_config), 必须自带未收敛事务闸门(复审 P1):
-    # reset / core(仅非终态) / port 任一未收敛时, 连"重排字段"也会改变现场。
-    # 屏障保证"检查"与"写入"同一 core lock 临界区(TOCTOU)。
-    # guard 是软依赖: 混装旧 lib 缺 helper 时放行(与项目口径一致)。
-    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
-       && ! _txn_allow_config_write; then
-        return 1
-    fi
-    local content
-    # 按官方顺序排已知字段, 未知字段追加到末尾, 去除 null 值; jq 失败保持原文件不动
-    content=$(jq '
-        . as $c |
-        ('"${XRAY_TOP_FIELDS_JSON}"') as $known |
-        (reduce $known[] as $k ({}; .[$k] = $c[$k]) | with_entries(select(.value != null))) as $ordered |
-        ($c | to_entries | map(select(.key as $k | $known | index($k) | not)) | from_entries) as $extra |
-        $ordered + $extra
-    ' "$CONFIG_FILE" 2>/dev/null) || return 0
-    # 变换结果为空(输入是空白/非对象): 保持原文件不动, 交由 xray 自己报配置错误
-    [ -n "$content" ] || return 0
-    # 2026-09-12 三审(L5): 本函数每次主菜单启动都跑; 内容无变化时跳过写入,
-    # 避免无条件 mv 刷新 mtime(纯 I/O 浪费)。
-    local cur
-    cur=$(cat "$CONFIG_FILE" 2>/dev/null) || cur=""
-    [ "$content" = "$cur" ] && return 0
-    _atomic_write_json "$CONFIG_FILE" "$content"
 }
 
 # ---------------------------------------------------------------------------
@@ -1109,7 +1225,7 @@ _proc_any_named() {
 }
 
 # ---------------------------------------------------------------------------
-# 就地修改 config.json 前的共同前置校验(路由规则精简/恢复、日志级别切换共用):
+# 就地修改配置前的共同前置校验(路由规则精简/恢复、日志级别切换、DNS 设置共用):
 # 缺任一条件即拒绝并给出准确原因(而不是让下游 jq 产出空配置)。
 # 用法: _config_edit_preflight [操作名]   —— 操作名仅用于错误文案
 # ---------------------------------------------------------------------------
@@ -1119,8 +1235,8 @@ _config_edit_preflight() {
         _error "Xray 未安装, 无法${what}"
         return 1
     fi
-    if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
-        _error "配置文件不存在或为空, 无法${what}: $CONFIG_FILE"
+    if ! _config_present; then
+        _error "配置不存在或为空, 无法${what}: $CONFIG_DIR"
         return 1
     fi
     if ! command -v jq >/dev/null 2>&1; then
