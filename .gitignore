@@ -1,6 +1,3 @@
-# 打包产物
-xray-deploy-bundle.tar.gz
-
 # 系统
 .DS_Store
 Thumbs.db
@@ -11,8 +8,6 @@ Thumbs.db
 .idea/
 
 # 开发工具
-# 注: .trellis/ 与 .scratch/ 已于十六轮移除 —— 两者不再使用。曾因它们不在版本控制里却
-# 被 tracked 文件(.gitattributes)与测试断言引用, 导致"任何克隆仓库的人跑套件必红"。
 .claude/
 .opencode/
 .agents/
@@ -24,10 +19,7 @@ CLAUDE.md
 
 # 文档
 docs/
-
-# 回归测试套件: 2026-09-27 起**入库**(tests/run-tests.sh)。原"仅本地保留"的决策撤销 ——
-# 它让 PR 里的通过数无法被任何人复现, 评审只能看到一个不可验证的数字。套件只依赖本仓库
-# 工作树($ROOT/lib、$ROOT/install.sh), 不引用未跟踪路径或同级克隆, 故克隆后可直接运行。
+references/
 
 # 临时文件
 __pycache__/

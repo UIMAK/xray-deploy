@@ -157,45 +157,6 @@ _maybe_drop_caches() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# 下载完整性校验(2026-09-12 审查 F2, 对齐官方 Xray-install 的 .dgst 方案)。
-# Xray release 的 <url>.dgst 为多行文本, 形如 "SHA2-256= <hex>"; 
-# _dgst_sha256_of 取 sha+256 行最后一个字段并只留 hex, 供单测。
-# 校验失败/解析异常/sha256sum 缺失一律 fail-closed(官方所有 release tag 都有 .dgst)。
-# ---------------------------------------------------------------------------
-
-# 从 .dgst 文本文件解析 SHA256(hex, 64 位); 解析不出输出空串
-_dgst_sha256_of() {
-    awk 'tolower($0) ~ /sha/ && /256/ {print tolower($NF); exit}' "$1" 2>/dev/null \
-        | tr -cd '0-9a-f'
-}
-
-# 校验已下载的 zip 与其官方 .dgst; 通过返回 0, 任何异常返回 1(调用方中止替换)
-_xray_verify_sha256() {
-    local zip="$1" url="$2" dgst want got
-    dgst="${zip}.dgst"
-    if ! _http_download "${url}.dgst" "$dgst" 30; then
-        _error "下载校验文件失败(${url}.dgst), 取消替换(不使用未校验的二进制)"
-        return 1
-    fi
-    want=$(_dgst_sha256_of "$dgst")
-    rm -f "$dgst"
-    if [ "${#want}" -ne 64 ]; then
-        _error "校验文件中未解析到 SHA256(格式异常?), 取消替换"
-        return 1
-    fi
-    if ! command -v sha256sum >/dev/null 2>&1; then
-        _error "sha256sum 不可用, 无法校验下载完整性, 取消替换"
-        return 1
-    fi
-    got=$(sha256sum "$zip" 2>/dev/null | awk '{print tolower($1)}')
-    if [ "$got" != "$want" ]; then
-        _error "SHA256 校验失败(下载损坏或被篡改?), 取消替换"
-        return 1
-    fi
-    return 0
-}
-
 # 阶段一(十二轮 P2-③): **只做取件, 不碰任何共享状态** —— 下载/校验/解压全落在自有 staging
 # 目录, 因此**不需要核心锁**(锁只包住阶段二 _xray_commit_staged), 下载 40s 不会把别人拖成
 # 15s 锁超时。成功时把 staging 路径打到 stdout。
@@ -228,11 +189,6 @@ _xray_stage_release() {
     # curl 优先 + 可移植 wget 兜底(原 wget --show-progress 在 busybox 上直接失败)
     if ! _http_download "$dl_url" "$tmp_zip" 120; then
         _error "下载失败: $dl_url"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    # 完整性校验(F2): 先验 SHA256 再解压, 坏包不进入替换事务
-    if ! _xray_verify_sha256 "$tmp_zip" "$dl_url"; then
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -325,7 +281,7 @@ _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutatio
 # 快照删除统一由 _xray_core_cleanup_sources 执行(删 journal 前检查全部残留)。
 # ---------------------------------------------------------------------------
 _xref_snapshot_geo_dats() {  # <journal> -- unique transaction paths are recorded in the journal
-    local j="$1" gd src bak pre hash
+    local j="$1" gd src bak pre
     for gd in geoip geosite; do
         src="$ASSET_DIR/${gd}.dat"
         pre=$(jq -r --arg g "$gd" '.[$g + "_preexisted"]' "$j" 2>/dev/null) || return 1
@@ -339,40 +295,30 @@ _xref_snapshot_geo_dats() {  # <journal> -- unique transaction paths are recorde
                 _error "$gd.dat 快照不完整(磁盘空间/IO?): $bak"
                 return 1
             fi
-            _xray_core_journal_set_hash "$j" "${gd}_sha256" "$bak" || return 1
         else
             ! _xray_core_path_present "$src" || { _error "$gd.dat 在快照阶段被外部创建: $src"; return 1; }
             ! _xray_core_path_present "$bak" || { _error "$gd.dat 唯一快照路径已存在: $bak"; return 1; }
-            hash=$(jq -r --arg g "$gd" '.[$g + "_sha256"] // empty' "$j" 2>/dev/null) || return 1
-            [ -z "$hash" ] || { _error "$gd.dat 原先不存在但 journal 却记录了快照 hash"; return 1; }
         fi
     done
     return 0
 }
 
 _xref_restore_geo_dats() {  # <journal> -- retain snapshot sources until rolled_back phase is durable
-    local j="$1" gd src bak pre expected got failed=0
+    local j="$1" gd src bak pre failed=0
     for gd in geoip geosite; do
         src="$ASSET_DIR/${gd}.dat"
         pre=$(jq -r --arg g "$gd" '.[$g + "_preexisted"]' "$j" 2>/dev/null) || { failed=1; continue; }
         bak=$(jq -r --arg g "$gd" '.[$g + "_backup"]' "$j" 2>/dev/null) || { failed=1; continue; }
-        expected=$(jq -r --arg g "$gd" '.[$g + "_sha256"]' "$j" 2>/dev/null) || { failed=1; continue; }
         if [ "$pre" = true ]; then
             if [ ! -f "$bak" ] || [ -L "$bak" ]; then
                 _error "$gd.dat 恢复源丢失或不是普通文件: $bak"
                 failed=1
-            else
-                got=$(_xray_core_sha256_file "$bak") || got=""
-                if [ -z "$got" ] || [ "$got" != "$expected" ]; then
-                    _error "$gd.dat 恢复源 hash 不符/不可读, 拒绝写回并保留现场: $bak"
-                    failed=1
-                elif ! _xray_restore_file_atomic "$bak" "$src" 644; then
-                    _error "$gd.dat 原子恢复失败: $src (源保留: $bak)"
-                    failed=1
-                elif ! cmp -s "$bak" "$src" 2>/dev/null; then
-                    _error "$gd.dat 恢复后校验不一致: $src"
-                    failed=1
-                fi
+            elif ! _xray_restore_file_atomic "$bak" "$src" 644; then
+                _error "$gd.dat 原子恢复失败: $src (源保留: $bak)"
+                failed=1
+            elif ! cmp -s "$bak" "$src" 2>/dev/null; then
+                _error "$gd.dat 恢复后校验不一致: $src"
+                failed=1
             fi
         elif _xray_core_path_present "$bak"; then
             _error "事务前不存在的 $gd.dat 却发现恢复快照, 拒绝猜测: $bak"
@@ -397,7 +343,7 @@ _timed_restart_do() {
         echo "[$ts] 跳过: Xray 未安装" >> "$log_file"
         exit 0
     fi
-    if [ ! -f "$CONFIG_FILE" ]; then
+    if ! _config_present; then
         echo "[$ts] 跳过: 配置文件不存在" >> "$log_file"
         exit 0
     fi
@@ -477,7 +423,7 @@ _xray_restore_prev_bin() {
     # 服务拉起放在两侧还原之后: service 没还原成功时**仍然要拉**, 失败方向是"尽力恢复可用" ——
     # 但那属于"回滚不完整", 由返回码 2 如实上报, 不再伪装成成功。
     _manage_xray restart >/dev/null 2>&1 || _manage_xray start >/dev/null 2>&1 || \
-        _warn "还原旧核心后服务未能拉起, 请手动检查: xd 菜单 [核心管理]"
+        _warn "还原旧核心后服务未能拉起, 请手动检查: xd 菜单 [Xray 核心管理]"
     local recv; recv=$(_xray_current_version 2>/dev/null)
     [ -n "$recv" ] || recv="$cur"
     [ -n "$recv" ] && { _state_set version "$recv" || _warn "状态持久化失败(version)"; }
@@ -492,7 +438,7 @@ _xray_restore_prev_bin() {
         # 与用户都看见, 而不是混在"已还原到旧核心"里。
         _error "回滚不完整: 旧二进制已就位, 但 service 文件未能还原到改动前的内容"
         _tip "请核对: $(_xray_service_unit_path 2>/dev/null || echo '(无 service)') 与备份 $(_xray_service_prev_path)"
-        _tip "临时可用: xd 菜单 [核心管理] 重装一次该通道, 会按当前核心版本重写 service"
+        _tip "临时可用: xd 菜单 [Xray 核心管理] 重装一次该通道, 会按当前核心版本重写 service"
         return 2
     fi
     _warn "已还原到旧核心 v${recv:-?}"
@@ -1355,34 +1301,11 @@ _xray_core_production_fsync() {  # <journal>; best effort before terminal phase/
 }
 
 
-_xray_core_sha256_file() {
-    local file="$1" hash
-    command -v sha256sum >/dev/null 2>&1 || return 1
-    hash=$(sha256sum "$file" 2>/dev/null | awk '{print tolower($1)}')
-    [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    printf '%s' "$hash"
-}
-
-_xray_core_journal_set_hash() {  # <journal> <hash-field> <snapshot-file>
-    local j="$1" key="$2" file="$3" hash
-    case "$key" in geoip_sha256|geosite_sha256|service_sha256) ;; *) return 1 ;; esac
-    hash=$(_xray_core_sha256_file "$file") || {
-        _error "无法计算事务快照 SHA256: $file"
-        return 1
-    }
-    _meta_update "$j" '.[$k]=$h' --arg k "$key" --arg h "$hash" || return 1
-    [ "$(jq -r --arg k "$key" '.[$k] // empty' "$j" 2>/dev/null)" = "$hash" ] || {
-        _error "事务快照 SHA256 写入回读不一致: $file"
-        return 1
-    }
-    return 0
-}
-
 # 写新账本。调用前必须已过 core lock + pending gate。账本写入拒绝覆盖任何旧 journal。
 # 参数: <old_version> <old_channel> <new_tag> <channel> <staging_dir>
 _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> <staging_dir> [core|geo]
     local old_ver="$1" old_ch="$2" new_tag="$3" new_ch="$4" stage="$5" operation="${6:-core}"
-    local j payload txn_id binary_preexisting runtime_was_running=false old_state_ver old_hash unit sprev
+    local j payload txn_id binary_preexisting runtime_was_running=false old_state_ver unit sprev
     local geoip_pre geosite_pre service_pre=false
     case "$operation" in core|geo) ;; *) _error "未知核心事务 operation: $operation"; return 1 ;; esac
     j=$(_xray_core_journal_path)
@@ -1403,7 +1326,7 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
     sprev=$(_xray_service_prev_path)
     unit=$(_xray_service_unit_path 2>/dev/null || printf '')
     if [ -n "$unit" ] && _xray_core_path_present "$unit"; then service_pre=true; fi
-    geoip_pre=false; geosite_pre=false; old_hash=""
+    geoip_pre=false; geosite_pre=false
     [ -f "$XRAY_BIN" ] && binary_preexisting=true || binary_preexisting=false
     if ! declare -F _xray_is_running >/dev/null 2>&1; then
         _error "缺少 Xray 进程状态探测, 无法安全记录事务 pre-state"; return 1
@@ -1428,44 +1351,36 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
     else
         old_ch=""
     fi
-    if [ "$binary_preexisting" = true ]; then
-        old_hash=$(_xray_core_sha256_file "$XRAY_BIN") || {
-            _error "无法计算旧核心 SHA256, 事务中止"; return 1; }
-    fi
     [ -f "$ASSET_DIR/geoip.dat" ] && geoip_pre=true
     [ -f "$ASSET_DIR/geosite.dat" ] && geosite_pre=true
     payload=$(jq -n \
         --arg id "$txn_id" --arg ov "$old_ver" --arg osv "$old_state_ver" --arg oc "$old_ch" \
         --arg nt "$new_tag" --arg nc "$new_ch" --arg bin "$XRAY_BIN" --arg bak "${XRAY_BIN}.bak" \
-        --arg bh "$old_hash" --arg unit "$unit" --arg sprev "$sprev" --arg stage "$stage" \
+        --arg unit "$unit" --arg sprev "$sprev" --arg stage "$stage" \
         --arg gip "$ASSET_DIR/.geoip.dat.coretxn.${txn_id}.bak" \
         --arg gsp "$ASSET_DIR/.geosite.dat.coretxn.${txn_id}.bak" \
-        --arg shash "" --arg ghash "" --arg gshash "" \
         --argjson bp "$binary_preexisting" --argjson runtime "$runtime_was_running" \
         --argjson gipre "$geoip_pre" --argjson gspre "$geosite_pre" --argjson spre "$service_pre" \
-        --arg op "$operation" --arg gi_new "" --arg gs_new "" \
+        --arg op "$operation" \
         '{phase:"prepared", operation:$op, txn_id:$id, old_version:$ov, old_state_version:$osv, old_channel:$oc,
-          new_tag:$nt, channel:$nc, binary:$bin, binary_preexisted:$bp, binary_sha256:$bh,
+          new_tag:$nt, channel:$nc, binary:$bin, binary_preexisted:$bp,
           runtime_was_running:$runtime, binary_backup:$bak, unit:$unit, service_prev:$sprev, staging_dir:$stage,
-          geoip_preexisted:$gipre, geoip_backup:$gip, geoip_sha256:$ghash, geoip_new_sha256:$gi_new,
-          geosite_preexisted:$gspre, geosite_backup:$gsp, geosite_sha256:$gshash, geosite_new_sha256:$gs_new,
-          service_preexisted:$spre, service_sha256:$shash}') || return 1
+          geoip_preexisted:$gipre, geoip_backup:$gip,
+          geosite_preexisted:$gspre, geosite_backup:$gsp,
+          service_preexisted:$spre}') || return 1
     _atomic_write_json "$j" "$payload"
 }
 
 # 最终验证全体恢复源后才能进入 snapshotted。单个 snapshot helper 的 cmp 保证写入当时完整;
-# 这里再验证 journal 中已 durable 记录的 hash 与全部 sidecar, 让该 phase 成为可依赖的屏障。
+# 这里再验证 journal 引用的全部 sidecar 都在, 让该 phase 成为可依赖的屏障。
 #
 _xray_core_snapshots_ok() {  # <journal>
-    local j="$1" bin bak pre got hash gd src unit sprev service_pre service_hash flag want operation
+    local j="$1" bin bak pre gd src unit sprev service_pre flag want operation
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
-    hash=$(jq -r '.binary_sha256' "$j" 2>/dev/null) || return 1
     if [ "$pre" = true ]; then
         [ -f "$bak" ] && [ ! -L "$bak" ] || { _error "binary 恢复源缺失/无效: $bak"; return 1; }
-        got=$(_xray_core_sha256_file "$bak") || got=""
-        [ -n "$got" ] && [ "$got" = "$hash" ] || { _error "binary 恢复源 hash 不符: $bak"; return 1; }
     else
         ! _xray_core_path_present "$bak" || { _error "首次安装不应存在 binary 恢复源: $bak"; return 1; }
     fi
@@ -1474,21 +1389,16 @@ _xray_core_snapshots_ok() {  # <journal>
         src="$ASSET_DIR/${gd}.dat"
         pre=$(jq -r --arg g "$gd" '.[$g + "_preexisted"]' "$j" 2>/dev/null) || return 1
         bak=$(jq -r --arg g "$gd" '.[$g + "_backup"]' "$j" 2>/dev/null) || return 1
-        hash=$(jq -r --arg g "$gd" '.[$g + "_sha256"]' "$j" 2>/dev/null) || return 1
         if [ "$pre" = true ]; then
             [ -f "$bak" ] && [ ! -L "$bak" ] || { _error "$gd.dat 恢复源缺失/无效: $bak"; return 1; }
-            got=$(_xray_core_sha256_file "$bak") || got=""
-            [ -n "$got" ] && [ "$got" = "$hash" ] || { _error "$gd.dat 恢复源 hash 不符: $bak"; return 1; }
         else
             ! _xray_core_path_present "$bak" || { _error "原先不存在的 $gd.dat 却有恢复源: $bak"; return 1; }
-            [ -z "$hash" ] || return 1
         fi
     done
 
     unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-    service_hash=$(jq -r '.service_sha256' "$j" 2>/dev/null) || return 1
     if [ -n "$unit" ]; then
         flag="${sprev}.enabled"
         [ -f "$flag" ] && [ ! -L "$flag" ] || { _error "service enable snapshot 缺失/无效: $flag"; return 1; }
@@ -1498,20 +1408,14 @@ _xray_core_snapshots_ok() {  # <journal>
             [ -f "$sprev" ] && [ ! -L "$sprev" ] && \
                 ! _xray_core_path_present "${sprev}.absent" || {
                 _error "pre-existing service snapshot 缺失/含糊: $sprev"; return 1; }
-            got=$(_xray_core_sha256_file "$sprev") || got=""
-            [ -n "$got" ] && [ "$got" = "$service_hash" ] || {
-                _error "service 恢复源 hash 不符: $sprev"; return 1; }
         else
             _xray_core_path_present "$sprev" && { _error "新 service 不应存在内容快照: $sprev"; return 1; }
             [ -f "${sprev}.absent" ] && [ ! -L "${sprev}.absent" ] || {
                 _error "service absent 标记缺失/无效: ${sprev}.absent"; return 1; }
-            [ -z "$service_hash" ] || return 1
         fi
-    else
-        [ "$service_pre" = false ] && [ -z "$service_hash" ] || return 1
     fi
 
-    local stage operation hash expected f
+    local stage f
     stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
     operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || operation=core
     # staging 在这里**无条件**要求存在: 本函数只在进入 snapshotted 那一次被调用
@@ -1525,14 +1429,9 @@ _xray_core_snapshots_ok() {  # <journal>
             ;;
         geo)
             for f in geoip geosite; do
-                expected=$(jq -r --arg g "$f" '.[$g + "_new_sha256"] // empty' "$j" 2>/dev/null) || return 1
-                [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || { _error "$f.dat 新数据 hash 缺失/非法"; return 1; }
                 [ -f "$stage/$f.dat" ] && [ ! -L "$stage/$f.dat" ] || { _error "$f.dat Geo staging 缺失"; return 1; }
-                hash=$(_xray_core_sha256_file "$stage/$f.dat") || hash=""
-                [ -n "$hash" ] && [ "$hash" = "$expected" ] || { _error "$f.dat Geo staging hash 不符"; return 1; }
             done
             ;;
-        *) return 1 ;;
     esac
     return 0
 }
@@ -1680,8 +1579,8 @@ _txn_allow_config_write() {
 }
 
 _xray_core_journal_ok() {
-    local j="$1" id bin binbak pre hash binary_hash runtime unit sprev stage stage_name phase operation
-    local gipre gspre service_pre giphash gsphash service_hash gi_new_hash gs_new_hash
+    local j="$1" id bin binbak pre runtime unit sprev stage stage_name phase operation
+    local gipre gspre service_pre gip gsp
     jq -e '
       (.phase | type == "string" and test("^(prepared|snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)$")) and
       ((.operation // "core") | (type == "string" and test("^(core|geo)$"))) and
@@ -1691,37 +1590,29 @@ _xray_core_journal_ok() {
       (.new_tag | type == "string" and length > 0) and
       (.binary | type == "string" and length > 0) and
       (.binary_backup | type == "string" and length > 0) and
-      (.binary_preexisted | type == "boolean") and (.binary_sha256 | type == "string") and
+      (.binary_preexisted | type == "boolean") and
       (.runtime_was_running | type == "boolean") and
       (.unit | type == "string") and (.service_prev | type == "string" and length > 0) and
       (.staging_dir | type == "string" and length > 0) and
       (.geoip_preexisted | type == "boolean") and (.geoip_backup | type == "string" and length > 0) and
-      (.geoip_sha256 | type == "string") and (.geoip_new_sha256 // "" | type == "string") and
       (.geosite_preexisted | type == "boolean") and (.geosite_backup | type == "string" and length > 0) and
-      (.geosite_sha256 | type == "string") and (.geosite_new_sha256 // "" | type == "string") and
-      (.service_preexisted | type == "boolean") and (.service_sha256 | type == "string")
+      (.service_preexisted | type == "boolean")
     ' "$j" >/dev/null 2>&1 || return 1
     phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
     id=$(jq -r '.txn_id' "$j" 2>/dev/null) || return 1
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
-    binary_hash=$(jq -r '.binary_sha256' "$j" 2>/dev/null) || return 1
     runtime=$(jq -r '.runtime_was_running' "$j" 2>/dev/null) || return 1
     unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
     operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || operation=core
-    gi_new_hash=$(jq -r '.geoip_new_sha256 // empty' "$j" 2>/dev/null) || return 1
-    gs_new_hash=$(jq -r '.geosite_new_sha256 // empty' "$j" 2>/dev/null) || return 1
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
     gipre=$(jq -r '.geoip_preexisted' "$j" 2>/dev/null) || return 1
     gspre=$(jq -r '.geosite_preexisted' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-    giphash=$(jq -r '.geoip_sha256' "$j" 2>/dev/null) || return 1
-    gsphash=$(jq -r '.geosite_sha256' "$j" 2>/dev/null) || return 1
-    service_hash=$(jq -r '.service_sha256' "$j" 2>/dev/null) || return 1
 
     [ "$bin" = "$XRAY_BIN" ] && [ "$binbak" = "$XRAY_BIN.bak" ] || return 1
     [ "$sprev" = "$BACKUP_DIR/xray-service.$id.prev" ] || return 1
@@ -1731,11 +1622,9 @@ _xray_core_journal_ok() {
         ""|/etc/systemd/system/xray.service|/etc/init.d/xray) ;;
         *) return 1 ;;
     esac
-    if [ -z "$unit" ]; then
-        [ "$service_pre" = false ] && [ -z "$service_hash" ] || return 1
-    elif [ "$service_pre" = false ]; then
-        [ -z "$service_hash" ] || return 1
-    fi
+    # unit 非空但 service_pre=false 是首次安装的**正常**状态(unit 路径按 init 后端推导,
+    # 与文件是否存在无关); 只有 unit 为空(direct 后端)时才不允许 pre=true。
+    [ "$service_pre" = false ] || [ -n "$unit" ] || return 1
     case "$operation" in
         core)
             case "$stage" in
@@ -1745,7 +1634,6 @@ _xray_core_journal_ok() {
                     ;;
                 *) return 1 ;;
             esac
-            [ -z "$gi_new_hash" ] && [ -z "$gs_new_hash" ] || return 1
             ;;
         geo)
             case "$stage" in
@@ -1755,47 +1643,25 @@ _xray_core_journal_ok() {
                     ;;
                 *) return 1 ;;
             esac
-            for hash in "$gi_new_hash" "$gs_new_hash"; do
-                [ -z "$hash" ] || [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-            done
             ;;
         *) return 1 ;;
     esac
-    if [ "$pre" = true ]; then
-        [[ "$binary_hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    else
-        [ -z "$binary_hash" ] && [ "$runtime" = false ] || return 1
+    if [ "$pre" = false ]; then
+        [ "$runtime" = false ] || return 1
     fi
-    for hash in "$giphash" "$gsphash" "$service_hash"; do
-        [ -z "$hash" ] || [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-    done
-    [ "$gipre" = true ] || [ -z "$giphash" ] || return 1
-    [ "$gspre" = true ] || [ -z "$gsphash" ] || return 1
-    case "$phase" in
-        snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)
-            [ "$gipre" = false ] || [ -n "$giphash" ] || return 1
-            [ "$gspre" = false ] || [ -n "$gsphash" ] || return 1
-            [ "$service_pre" = false ] || [ -n "$service_hash" ] || return 1
-            if [ "$operation" = geo ]; then
-                [[ "$gi_new_hash" =~ ^[[:xdigit:]]{64}$ ]] && [[ "$gs_new_hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
-            fi
-            ;;
-    esac
     return 0
 }
 # snapshot binary/geodata source for this journal. Called only before phase=snapshotted.
 _xray_core_snapshot_binary() {  # <journal>
-    local j="$1" bin bak pre hash got
+    local j="$1" bin bak pre
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
-    hash=$(jq -r '.binary_sha256' "$j" 2>/dev/null) || return 1
     if [ "$pre" = true ]; then
         [ -f "$bin" ] || { _error "旧核心在快照前消失: $bin"; return 1; }
         ! _xray_core_path_present "$bak" || { _error "旧核心快照目标已存在, 拒绝覆盖: $bak"; return 1; }
         cp -p "$bin" "$bak" 2>/dev/null || { rm -f "$bak" 2>/dev/null; return 1; }
-        got=$(_xray_core_sha256_file "$bak") || got=""
-        if ! cmp -s "$bin" "$bak" 2>/dev/null || [ "$got" != "$hash" ]; then
+        if ! cmp -s "$bin" "$bak" 2>/dev/null; then
             rm -f "$bak" 2>/dev/null
             _error "旧核心快照与原 binary 不一致: $bak"
             return 1
@@ -1896,20 +1762,18 @@ _xray_core_txn_recover_locked() {
 # Rollback 从 snapshot source 重放, **不消费 source**(cp→cmp→rename), 直到 rolled_back phase
 # durable 才 cleanup。这样每个崩溃点都可重入: phase 还没写成功就从原 snapshot 再做一遍。
 _xray_core_recover_rollback_locked() {
-    local j="$1" bin bak pre was_running old_ver old_hash got_hash old_state_ver old_ch unit sprev
-    local service_pre service_hash service_got run_ok=1 disk_ok=1 state_ok=1
+    local j="$1" bin bak pre was_running old_ver old_state_ver old_ch unit sprev
+    local service_pre run_ok=1 disk_ok=1 state_ok=1
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
     was_running=$(jq -r '.runtime_was_running' "$j" 2>/dev/null) || return 1
-    old_hash=$(jq -r '.binary_sha256' "$j" 2>/dev/null) || return 1
     old_ver=$(jq -r '.old_version' "$j" 2>/dev/null) || old_ver=""
     old_state_ver=$(jq -r '.old_state_version' "$j" 2>/dev/null) || old_state_ver=""
     old_ch=$(jq -r '.old_channel' "$j" 2>/dev/null) || old_ch=""
     unit=$(jq -r '.unit' "$j" 2>/dev/null) || unit=""
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-    service_hash=$(jq -r '.service_sha256' "$j" 2>/dev/null) || return 1
 
     _warn "检测到未完成的核心切换事务(阶段: $(jq -r '.phase' "$j" 2>/dev/null)), 正在回滚..."
     # 先停并验证: binary 还被当前 Xray mmap/exe 使用时不能覆盖, 且恢复完成后必须按旧 binary 重启。
@@ -1939,10 +1803,6 @@ _xray_core_recover_rollback_locked() {
             if [ ! -f "$bak" ] || [ -L "$bak" ]; then
                 disk_ok=0
                 _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
-            else
-                got_hash=$(_xray_core_sha256_file "$bak") || got_hash=""
-                [ -n "$got_hash" ] && [ "$got_hash" = "$old_hash" ] || {
-                    disk_ok=0; _error "事务旧 binary 恢复源 hash 不符: $bak"; }
             fi
             _warn "本次为 Geo 事务且未跨过替换点, binary 按未变更处理(不重放旧快照)"
         fi
@@ -1950,20 +1810,14 @@ _xray_core_recover_rollback_locked() {
         if [ ! -f "$bak" ] || [ -L "$bak" ]; then
             disk_ok=0
             _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
+        elif ! _xray_restore_file_atomic "$bak" "$bin" 755; then
+            disk_ok=0
+            _error "旧 binary 原子还原失败: $bin (恢复源保留: $bak)"
+        elif ! cmp -s "$bak" "$bin" 2>/dev/null; then
+            disk_ok=0
+            _error "旧 binary 还原后内容不一致: $bin"
         else
-            got_hash=$(_xray_core_sha256_file "$bak") || got_hash=""
-            if [ "$got_hash" != "$old_hash" ]; then
-                disk_ok=0
-                _error "事务旧 binary 恢复源 hash 不符, 拒绝写回: $bak"
-            elif ! _xray_restore_file_atomic "$bak" "$bin" 755; then
-                disk_ok=0
-                _error "旧 binary 原子还原失败: $bin (恢复源保留: $bak)"
-            elif ! cmp -s "$bak" "$bin" 2>/dev/null; then
-                disk_ok=0
-                _error "旧 binary 还原后内容不一致: $bin"
-            else
-                _warn "已还原切换前的 binary(snapshot 保留到 rolled_back phase)"
-            fi
+            _warn "已还原切换前的 binary(snapshot 保留到 rolled_back phase)"
         fi
     else
         if ! rm -f "$bin" 2>/dev/null || _xray_core_path_present "$bin"; then
@@ -1975,16 +1829,13 @@ _xray_core_recover_rollback_locked() {
     # 2. geo sources 是 transaction-unique 路径, 且 restore 保留 source 以支持 crash replay。
     _xref_restore_geo_dats "$j" || disk_ok=0
 
-    # 3. service: hash 与显式 pre-existence 都由 journal 绑定。快照损坏或两种状态标记
+    # 3. service: 显式 pre-existence 由 journal 绑定。快照损坏或两种状态标记
     # 同时存在时拒绝写回/删除, 保留 journal 和恢复源等待人工处理。
     #    **Geo 事务未跨过替换点时只校验、不写回**(见上方 P2-③ 说明): 该事务从未创建/改写 unit,
     #    用快照覆盖 live unit 只会把"绕过 core lock 的外部改动"静默回退。
     if [ -n "$unit" ] && [ "$txn_touched_service" -eq 0 ]; then
         if [ "$service_pre" = true ]; then
             if [ -f "$sprev" ] && [ ! -L "$sprev" ] && ! _xray_core_path_present "${sprev}.absent"; then
-                service_got=$(_xray_core_sha256_file "$sprev") || service_got=""
-                [ -n "$service_got" ] && [ "$service_got" = "$service_hash" ] || {
-                    disk_ok=0; _error "service 恢复源 hash 不符: $sprev"; }
                 _warn "本次为 Geo 事务且未跨过替换点, service 按未变更处理(不重放旧快照)"
             else
                 disk_ok=0
@@ -1994,11 +1845,7 @@ _xray_core_recover_rollback_locked() {
     elif [ -n "$unit" ]; then
         if [ "$service_pre" = true ]; then
             if [ -f "$sprev" ] && [ ! -L "$sprev" ] && ! _xray_core_path_present "${sprev}.absent"; then
-                service_got=$(_xray_core_sha256_file "$sprev") || service_got=""
-                if [ "$service_got" != "$service_hash" ]; then
-                    disk_ok=0
-                    _error "service 恢复源 hash 不符, 拒绝写回并保留现场: $sprev"
-                elif ! _xray_service_restore_file "$sprev" "$unit"; then
+                if ! _xray_service_restore_file "$sprev" "$unit"; then
                     disk_ok=0
                     _error "service 还原失败: $unit(snapshot 保留: $sprev)"
                 elif ! cmp -s "$sprev" "$unit" 2>/dev/null; then
@@ -2146,7 +1993,7 @@ _xray_core_abort_locked() {  # <用户可读原因>
 # 未变更的 binary/service), 并把"所有 binary/service 变更都必须持 core lock"写成硬前提。
 _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
     local download_dir="$1" ts="$2" downloads_ok="$3"
-    local j stage old_ver old_channel runtime f src staged dest size hash expected gi_hash="" gs_hash=""
+    local j stage old_ver old_channel runtime f src staged dest size
     if ! _xray_core_txn_recover_locked; then
         _error "核心事务尚未收敛, 拒绝提交 Geo 数据"
         return 1
@@ -2186,7 +2033,7 @@ _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
         return 1
     fi
 
-    # 新 dat 先写入同盘 transaction stage; 对源、落地副本与 journal hash 三方逐字节/哈希校验。
+    # 新 dat 先写入同盘 transaction stage, 并逐字节校验落地副本与下载源一致。
     for f in geoip geosite; do
         src="$download_dir/$f.dat"
         staged="$stage/$f.dat"
@@ -2194,15 +2041,7 @@ _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
             _xray_core_abort_locked "$f.dat Geo staging 复制/逐字节校验失败"
             return 1
         fi
-        hash=$(_xray_core_sha256_file "$staged") || hash=""
-        [ -n "$hash" ] || { _xray_core_abort_locked "$f.dat Geo staging SHA256 计算失败"; return 1; }
-        if [ "$f" = geoip ]; then gi_hash="$hash"; else gs_hash="$hash"; fi
     done
-    if ! _meta_update "$j" '.geoip_new_sha256=$gi | .geosite_new_sha256=$gs' \
-        --arg gi "$gi_hash" --arg gs "$gs_hash"; then
-        _xray_core_abort_locked "无法记录 Geo 新数据 hash"
-        return 1
-    fi
 
     # 恢复 binary/service 与旧 geo 一起纳入事务; 即使本操作只改 dat, recovery 仍能验证完整 pre-state。
     if ! _xray_service_snapshot || ! _xray_core_snapshot_binary "$j" || ! _xref_snapshot_geo_dats "$j"; then
@@ -2225,12 +2064,8 @@ _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
             _xray_core_abort_locked "$f.dat Geo 原子替换失败"
             return 1
         fi
-        hash=$(_xray_core_sha256_file "$dest") || hash=""
-        if [ "$f" = geoip ]; then expected="$gi_hash"; else expected="$gs_hash"; fi
-        if [ -z "$hash" ] || [ "$hash" != "$expected" ]; then
-            _xray_core_abort_locked "$f.dat Geo 替换后 SHA256 不符"
-            return 1
-        fi
+        [ -f "$dest" ] && [ ! -L "$dest" ] || {
+            _xray_core_abort_locked "$f.dat Geo 替换后文件缺失或不是普通文件"; return 1; }
     done
     if ! _xray_core_journal_phase geo_replaced; then
         _xray_core_abort_locked "Geo dat 已替换但无法推进 geo_replaced phase"
@@ -2392,6 +2227,12 @@ _install_or_switch_xray_locked() {
         return 1
     fi
 
+    if declare -F _config_migrate_legacy >/dev/null 2>&1; then
+        if ! _config_migrate_legacy; then
+            _xray_core_abort_locked "旧单文件配置迁移失败, 中止安装/切换"
+            return 1
+        fi
+    fi
     if ! _init_config_if_empty; then
         _xray_core_abort_locked "配置初始化失败, 中止安装/切换"
         return 1
@@ -2450,7 +2291,7 @@ _install_or_switch_xray_locked() {
 
 # ---------------------------------------------------------------------------
 # 配置文件初始化(空 inbounds + freedom/blackhole + log)
-# 仅在 config.json 不存在或为空时写
+# confs/ 里没有任何非空 JSON 时写
 #
 # 并发(F5): 与项目里所有其他 config 写路径一样在 _with_config_lock 内执行 —— 这是
 # 一次 read-decide-write(先判空再写), 与并发的 geo 更新/节点事务交叠时会互相覆盖。
@@ -2475,16 +2316,17 @@ _init_config_if_empty() {
 }
 
 _init_config_if_empty_locked() {
-    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ]; then
+    if _config_present; then
         return 0
     fi
     _ensure_dirs || return 1
-    # 美化多行格式(便于手动编辑) + routing 规则(bt/广告/私网/CN 走 block)
+    # 美化多行格式(便于手动编辑) + dns 段 + routing 规则(bt/广告/私网/CN 走 block)
     # 按 Xray 官方文档顺序排列(env → log → dns → routing → inbounds → outbounds)
     # env 段设置 XRAY_LOCATION_ASSET(docs/config/env.md): 核心 ≥ v26.7.11 在构建模块前
     # 应用该段, geo 文件按此路径加载; 旧核心忽略该字段, 由 service 文件注入同名变量兜底。
-    # routing.rules 先留空占位, 下面由 XRAY_DEFAULT_ROUTING_RULES_JSON 注入 ——
-    # 默认规则集是唯一真相(00-common), [9] 路由规则的"恢复默认"复用同一常量, 不允许两处硬编码。
+    # dns 段与 routing.rules 都先留空占位, 下面由 XRAY_DEFAULT_DNS_JSON /
+    # XRAY_DEFAULT_ROUTING_RULES_JSON 注入 —— 两个默认常量是唯一真相(00-common),
+    # DNS 菜单的"恢复默认"与路由规则的"恢复默认"复用同一份, 不允许两处硬编码。
     local base='{
   "env": {
     "XRAY_LOCATION_ASSET": "'"$ASSET_DIR"'"
@@ -2493,26 +2335,6 @@ _init_config_if_empty_locked() {
     "loglevel": "warning",
     "access": "'"$LOG_DIR"'/access.log",
     "error": "'"$LOG_DIR"'/error.log"
-  },
-  "dns": {
-    "enableParallelQuery": true,
-    "queryStrategy": "UseIP",
-    "servers": [
-      {
-        "address": "https+local://cloudflare-dns.com/dns-query",
-        "tag": "dns_cloudflare"
-      },
-      {
-        "address": "https+local://dns.quad9.net/dns-query",
-        "tag": "dns_quad9"
-      },
-      {
-        "address": "https+local://freedns.controld.com/p0",
-        "tag": "dns_controld"
-      }
-    ],
-    "tag": "dns_inbound",
-    "useSystemHosts": false
   },
   "routing": {
     "domainStrategy": "IPIfNonMatch",
@@ -2530,27 +2352,29 @@ _init_config_if_empty_locked() {
     }
   ]
 }'
-    # 注入默认规则。jq 不可用/失败时不能落地"没有 routing 规则"的半份配置 —— 那会让
-    # 首次安装的机器悄悄失去 BT/广告/私网拦截, 故显式失败由调用方处理。
+    # 注入默认 DNS 段与默认规则。jq 不可用/失败时不能落地"没有 routing 规则"的半份配置 ——
+    # 那会让首次安装的机器悄悄失去 BT/广告/私网拦截, 故显式失败由调用方处理。
+    # 两个默认常量都取自 00-common(唯一真相), DNS 菜单的 [恢复默认] 复用同一份。
     local content
-    content=$(jq --argjson r "$XRAY_DEFAULT_ROUTING_RULES_JSON" '.routing.rules = $r' <<< "$base") || {
-        _error "生成默认配置失败(jq 不可用?), 未写入 $CONFIG_FILE"
+    content=$(jq --argjson d "$XRAY_DEFAULT_DNS_JSON" --argjson r "$XRAY_DEFAULT_ROUTING_RULES_JSON" \
+        '.dns = $d | .routing.rules = $r' <<< "$base") || {
+        _error "生成默认配置失败(jq 不可用?), 未写入 $CONFIG_DIR"
         return 1
     }
-    [ -n "$content" ] || { _error "生成默认配置为空, 未写入 $CONFIG_FILE"; return 1; }
-    _atomic_write_json "$CONFIG_FILE" "$content" || return 1
+    [ -n "$content" ] || { _error "生成默认配置为空, 未写入 $CONFIG_DIR"; return 1; }
+    _config_write_merged "$content" || return 1
     # jq 输出即 2 空格缩进且 _atomic_write_json 已做 jq 校验, 不再做第二遍 jq 写回
     # (旧的 "jq . > tmp && mv" 路径无错误处理, 失败会静默继续且可能残留 .tmp, R13)
-    _info "已初始化空配置: $CONFIG_FILE"
+    _info "已初始化空配置: $CONFIG_DIR"
 }
 
 # ---------------------------------------------------------------------------
-# 启动自动操作(R45): 确保 config.json 带 env.XRAY_LOCATION_ASSET
+# 启动自动操作(R45): 确保配置带 env.XRAY_LOCATION_ASSET
 # 背景: 新部署的默认配置已含 env 段(见 _init_config_if_empty), 但存量部署的 config 没有。
 # 新核心(≥ v26.7.11)靠该段定位 geo 文件, 若缺失且 service 文件也不再注入, geo 会静默失效;
 # 旧核心忽略该字段(service 注入兜底仍在), 提前补上无副作用, 未来切到新核心即可无缝生效。
 # 幂等: 仅当 env.XRAY_LOCATION_ASSET 缺失时注入; 用户手改的值不被覆盖。不重启服务
-# (与 _normalize_config_format 同级), 只保证磁盘上的 config 自描述, 下次重启生效。
+# (与启动链其它自动维护同级), 只保证磁盘上的 config 自描述, 下次重启生效。
 # 失败静默(启动路径不阻塞), 由下次启动重试。
 #
 # **读-改-写必须在 _with_config_lock 内**(2026-09-22 九轮 OCR #17)。旧写法直接读 config
@@ -2561,7 +2385,7 @@ _init_config_if_empty_locked() {
 # ---------------------------------------------------------------------------
 _auto_ensure_config_env_locked() {
     # 廉价守卫留在屏障外(空配置/无 jq 的 no-op 不取 core lock)
-    [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] || return 0
+    _config_present || return 0
     command -v jq >/dev/null 2>&1 || return 0
     # **本函数是权威 config 写入**(注入 env 段), 与其它写入口同一口径: 读-改-写整体进
     # core lock 屏障, 检查与写入同临界区(复审 P2-1)。只靠启动链门禁覆盖不了
@@ -2577,14 +2401,14 @@ _auto_ensure_config_env_write() {
     local need
     # .env 非对象时 `.env.XRAY_LOCATION_ASSET` 会让 jq 报类型错误而整行失败 -> 前置判断
     # 必须先按类型分支(与注入处同一口径), 否则非对象 .env 会在这里提前 return 而无法自愈。
-    need=$(jq -r 'if (.env | type) == "object" and ((.env.XRAY_LOCATION_ASSET // "") != "") then 0 else 1 end' "$CONFIG_FILE" 2>/dev/null) || return 0
+    need=$(_config_jq -r 'if (.env | type) == "object" and ((.env.XRAY_LOCATION_ASSET // "") != "") then 0 else 1 end' 2>/dev/null) || return 0
     [ "$need" = "1" ] || return 0
     local content
     # 审查修订: .env 可能被手改成非对象(字符串/数组), 裸 `(.env // {}) + {...}` 会触发
     # jq 类型错误而静默跳过, 该次启动不自愈。这里显式按类型处理: 非对象一律视为 {} 重建。
-    content=$(jq --arg a "$ASSET_DIR" '.env = ((if (.env | type) == "object" then .env else {} end) + {XRAY_LOCATION_ASSET: $a})' "$CONFIG_FILE" 2>/dev/null) || return 0
+    content=$(_config_jq --arg a "$ASSET_DIR" '.env = ((if (.env | type) == "object" then .env else {} end) + {XRAY_LOCATION_ASSET: $a})' 2>/dev/null) || return 0
     [ -n "$content" ] || return 0
-    _atomic_write_json "$CONFIG_FILE" "$content" 2>/dev/null || return 0
+    _config_write_merged "$content" 2>/dev/null || return 0
     _info "已注入 config env: XRAY_LOCATION_ASSET=$ASSET_DIR"
 }
 
@@ -2597,14 +2421,14 @@ _auto_ensure_config_env() {
 
 # ---------------------------------------------------------------------------
 # 读取当前日志级别(log.loglevel)
-# 真相源只有 config.json —— 不另存 state 键(项目有 service/config/state 分裂的历史教训)。
+# 真相源只有配置本身 —— 不另存 state 键(项目有 service/config/state 分裂的历史教训)。
 # 读不到时输出 "warning": 与核心行为一致(infra/conf/log.go 的 default 分支对未识别/缺失
 # 值一律按 warning 处理), 且下游 case 分支不会因空串落到"非法值"。
 # ---------------------------------------------------------------------------
 _xray_loglevel_get() {
     local lv=""
-    if [ -f "$CONFIG_FILE" ] && [ -s "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
-        lv=$(jq -r '.log.loglevel // empty' "$CONFIG_FILE" 2>/dev/null) || lv=""
+    if _config_present && command -v jq >/dev/null 2>&1; then
+        lv=$(_config_jq -r '.log.loglevel // empty' 2>/dev/null) || lv=""
     fi
     # 配置里存着非法值(手工编辑)时也回显 warning —— 核心就是这么解释它的
     _xray_loglevel_valid "$lv" || lv="warning"
@@ -2633,7 +2457,18 @@ _xray_test_config() {
     # 低内存机器: xray -test 加载完整二进制+geo,预先释放页缓存
     _maybe_drop_caches
     # 直接运行,保留完整输出供用户查看
-    XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE"
+    XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true "$XRAY_BIN" -test -confdir "$CONFIG_DIR"
+}
+
+# 校验**尚未落地**的一份候选配置(confdir 形态)。DNS 菜单用它做"先检查后写"的预检:
+# 只有候选能通过 xray -test 才允许写盘, 写盘失败/启动失败也不会把用户留在不可用配置上。
+# 候选目录由调用方创建与清理(本项目不做额外清理机制)。
+_xray_test_config_dir() {   # <confdir 路径>
+    local dir="${1:-}"
+    [ -n "$dir" ] && [ -d "$dir" ] || return 1
+    [ -x "$XRAY_BIN" ] || return 1
+    _maybe_drop_caches
+    XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true "$XRAY_BIN" -test -confdir "$dir"
 }
 
 # ---------------------------------------------------------------------------
@@ -2883,7 +2718,6 @@ _xray_service_snapshot() {
         _error "service 快照与原文件不一致(磁盘空间/IO?), 视为快照失败"
         return 1
     fi
-    _xray_core_journal_set_hash "$j" service_sha256 "$prev" || return 1
     return 0
 }
 
@@ -2942,17 +2776,18 @@ _xray_service_snapshot_drop() {
 
 # ---------------------------------------------------------------------------
 # 生成 service 文件
-# R45: XRAY_LOCATION_ASSET 优先走 config.json 的 env 段(docs/config/env.md, 核心 ≥
+# R45: XRAY_LOCATION_ASSET 优先走配置的 env 段(docs/config/env.md, 核心 ≥
 # v26.7.11 在构建模块前应用该段并替换同名进程变量)。仅当已安装核心 < v26.7.11(不识别
 # env 段)时才在 service 文件注入同名环境变量兜底 —— 版本读不到时保守保留注入(旧行为)。
 # 注意: _install_or_switch_xray 先替换二进制再调本函数, 这里读到的是"新"核心版本。
 # ---------------------------------------------------------------------------
 _create_xray_systemd_service() {
-    local nofile_line="" env_line=""
+    local nofile_line="" env_line="Environment=XRAY_JSON_STRICT=true"
     local _nf; _nf=$(_safe_nofile)
     [ -n "$_nf" ] && nofile_line="LimitNOFILE=$_nf"
     if ! _xray_version_ge "26.7.11"; then
-        env_line="Environment=XRAY_LOCATION_ASSET=${ASSET_DIR}"
+        env_line="Environment=XRAY_LOCATION_ASSET=${ASSET_DIR}
+Environment=XRAY_JSON_STRICT=true"
     fi
     # unit 写入必须**检查结果**(2026-09-22 九轮 OCR #18 的 systemd 分支)。旧写法把
     # `cat > 文件` 的返回码丢在地上, 磁盘满/只读/权限异常时会留下**半截或陈旧的 unit**,
@@ -2979,7 +2814,7 @@ ${env_line}
 # NoNewPrivileges 只是一次 prctl 调用, 不依赖 capability, 在受限容器(LXC/Podman)内同样生效,
 # 不会触发 OpenRC capabilities 那类 exec 前 EPERM(H2 同类风险为零)。
 NoNewPrivileges=true
-ExecStart=${XRAY_BIN} run -c ${CONFIG_FILE}
+ExecStart=${XRAY_BIN} run -confdir ${CONFIG_DIR}
 Restart=on-failure
 RestartSec=3
 ${nofile_line}
@@ -3008,13 +2843,14 @@ EOF
 }
 
 _create_xray_openrc_service() {
-    local rc_ulimit_line="" sd_env_line=""
+    local rc_ulimit_line="" sd_env_line="export XRAY_JSON_STRICT=true"
     local _nf; _nf=$(_safe_nofile)
     # 抬到"目标 65535 或当前 hard 上限"(见 _safe_nofile); 只有完全探测不到时才留空
     [ -n "$_nf" ] && rc_ulimit_line="rc_ulimit=\"-n $_nf\""
     # R45: 核心 ≥ v26.7.11 用 config env 段, 不再经 supervise-daemon 注入; 旧核心保留注入兜底
     if ! _xray_version_ge "26.7.11"; then
-        sd_env_line="supervise_daemon_args=\"--env XRAY_LOCATION_ASSET=${ASSET_DIR}\""
+        sd_env_line="supervise_daemon_args=\"--env XRAY_LOCATION_ASSET=${ASSET_DIR}\"
+export XRAY_JSON_STRICT=true"
     fi
     # init 脚本写入必须**检查结果**(2026-09-22 十轮 P1-①)。与 systemd 分支同一形态:
     # 旧写法把 `cat > ... <<EOF` 的返回码丢在地上, 磁盘满/只读/权限异常时原文件已被**截断**,
@@ -3039,8 +2875,8 @@ ${rc_ulimit_line}
 ${sd_env_line}
 
 command="${XRAY_BIN}"
-command_args="run -c ${CONFIG_FILE}"
-required_files="${CONFIG_FILE}"
+command_args="run -confdir ${CONFIG_DIR}"
+required_dirs="${CONFIG_DIR}"
 
 depend() {
     need net
@@ -3064,7 +2900,7 @@ _create_xray_service() {
         openrc)  _create_xray_openrc_service ;;
         direct)
             # 无 init 系统:不做 service,提示手动运行
-            _warn "未检测到 systemd/openrc,跳过 service 创建(可手动: XRAY_LOCATION_ASSET=${ASSET_DIR} ${XRAY_BIN} run -c ${CONFIG_FILE})"
+            _warn "未检测到 systemd/openrc,跳过 service 创建(可手动: XRAY_LOCATION_ASSET=${ASSET_DIR} XRAY_JSON_STRICT=true ${XRAY_BIN} run -confdir ${CONFIG_DIR})"
             ;;
         *)
             _error "未知的 init backend: ${INIT_SYSTEM:-未设置}, 无法创建 Xray service"
@@ -3242,7 +3078,7 @@ _manage_xray() {
                         echo "running"
                     else
                         rm -f /run/xray.pid
-                        XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c "$CONFIG_FILE" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- &
+                        XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true nohup "$XRAY_BIN" run -confdir "$CONFIG_DIR" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- &
                         _xd_pidfile_write /run/xray.pid "$!"
                         sleep 1
                         dpid1=$(_xd_pidfile_pid /run/xray.pid)
@@ -3400,7 +3236,7 @@ _uninstall_xray_locked() {
     # `_hysteria_cleanup_before_uninstall` 是同一类保护, 那条早已是这个形态)。
     if ! _xray_stop_and_verify; then
         _error "xray 进程未能停止, 已中止卸载(文件未删除), 请手动处理后重试"
-        _tip "可先查看: xd 主菜单 [核心管理] → 服务状态"
+        _tip "可先到 xd 主菜单 [查看状态] 确认服务与版本"
         return 1
     fi
     # 清理端口跳跃 iptables 规则必须在任何外部卸载动作之前: 失败时保留部署树和
@@ -3493,8 +3329,8 @@ _xray_core_menu() {
         2) _install_or_switch_xray preview ;;
         3)
             # 规范化的唯一入口是 _xray_canon_tag: 只接受 vX.Y.Z / X.Y.Z, 其余一律拒绝。
-            # 版本存在与否不在菜单预检 —— 与 hy 官方核心管理菜单同口径, 由下载阶段(含 .dgst
-            # SHA256 校验)判定; 不存在的 tag 会在取件阶段失败, 不触碰任何生产文件。
+            # 版本存在与否不在菜单预检 —— 与 hy 官方核心管理菜单同口径, 由下载阶段判定;
+            # 不存在的 tag 会在取件阶段失败, 不触碰任何生产文件。
             local vraw vtag
             read -rp "  输入版本号 (如 26.3.27 或 v26.3.27): " vraw || return 0
             [ -n "$vraw" ] || { _info "已取消"; return 0; }
