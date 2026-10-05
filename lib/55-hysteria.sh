@@ -1948,25 +1948,22 @@ _hysteria_check_hop_conflicts() {
     if _config_present && command -v jq >/dev/null 2>&1; then
         while IFS=: read -r p_start p_end; do
             [ -n "$p_start" ] || continue
-            [ -n "$exclude" ] && [ "$p_start" = "$exclude" ] && [ "$p_start" = "$p_end" ] && continue
             if [ "$p_start" -le "$hi" ] && [ "$p_end" -ge "$lo" ]; then
                 _error "Xray 入站端口范围 ${p_start}-${p_end} 在跳跃范围内, 会造成端口冲突"
                 return 1
             fi
         done < <(_hysteria_xray_udp_port_ranges)
     fi
-    # c) Xray Hy2 节点 iptables 跳跃范围(区间相交判定; hop_ranges 形如 "20000-50000,3010")
-    local f ranges tok_arr tok s e
+    # c) 复用 metadata 兼容读取: s:e 空格分隔, 单端口按 p:p 比较。
+    local f ranges tok s e
+    local tok_arr=()
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
-        ranges=$(jq -r '.hop_ranges // empty' "$f" 2>/dev/null)
+        ranges=$(_read_hop_ranges "$f")
         [ -n "$ranges" ] || continue
-        # IFS 只作用于这一次 read(项目规约: local IFS 会残留整个函数)
-        IFS=',' read -ra tok_arr <<< "$ranges"
+        read -ra tok_arr <<< "$ranges"
         for tok in "${tok_arr[@]}"; do
-            tok=$(printf '%s' "$tok" | tr -d ' ')
-            [[ "$tok" == *"-"* ]] || continue
-            s="${tok%%-*}"; e="${tok##*-}"
+            s="${tok%%:*}"; e="${tok##*:}"
             [[ "$s" =~ ^[0-9]+$ ]] && [[ "$e" =~ ^[0-9]+$ ]] || continue
             if [ "$s" -le "$hi" ] && [ "$e" -ge "$lo" ]; then
                 _error "与 Xray Hy2 节点($(basename "$f" .json))的跳跃范围 ${tok} 相交"
@@ -2062,11 +2059,7 @@ _hysteria_port_menu() {
                 read -rp "  新监听端口 (回车取消): " part
                 [ -z "$part" ] && { _press_any_key; continue; }
                 _validate_port "$part" || { _warn "无效端口(1-65535)"; _press_any_key; continue; }
-                # 新端口 == 当前自身监听端口: 未变更, 无需占用检查(自身持有不算冲突)
-                if [ "$part" != "$cur_first" ]; then
-                    _check_port_occupied "$part" udp && { _warn "端口 $part 已被占用"; _press_any_key; continue; }
-                    _check_port_in_config "$part" && { _warn "端口 $part 已被 Xray 节点使用"; _press_any_key; continue; }
-                fi
+                _hysteria_check_hop_conflicts "$part" "$part" "$cur_first" || { _press_any_key; continue; }
                 if ! _hysteria_config_txn --arg l ":${part}" '.listen = $l'; then
                     _error "端口修改失败"
                 else
@@ -2108,9 +2101,7 @@ _hysteria_port_menu() {
                 read -rp "  新单端口 (回车取消): " part
                 [ -z "$part" ] && { _press_any_key; continue; }
                 _validate_port "$part" || { _warn "无效端口"; _press_any_key; continue; }
-                if [ "$part" != "$cur_first" ]; then
-                    _check_port_occupied "$part" udp && { _warn "端口 $part 已被占用"; _press_any_key; continue; }
-                fi
+                _hysteria_check_hop_conflicts "$part" "$part" "$cur_first" || { _press_any_key; continue; }
                 if ! _hysteria_config_txn --arg l ":${part}" '.listen = $l'; then
                     _error "修改失败"
                 else
@@ -3249,8 +3240,7 @@ _hysteria_bootstrap() {
             _info "已随机分配监听端口: ${port}"
         fi
         _validate_port "$port" || { _warn "无效端口(1-65535)"; continue; }
-        _check_port_occupied "$port" udp && { _warn "端口 $port 已被占用, 换一个"; def_port=$(_gen_random_port); continue; }
-        _check_port_in_config "$port" && { _warn "端口 $port 已被 Xray 节点使用, 换一个"; def_port=$(_gen_random_port); continue; }
+        _hysteria_check_hop_conflicts "$port" "$port" || { def_port=$(_gen_random_port); continue; }
         break
     done
     # 跳跃范围: 用户输入错误(格式/顺序/多段)属**可恢复**错误 —— 原地重问本字段, 不再
