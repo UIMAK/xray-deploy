@@ -1890,21 +1890,35 @@ _cf_switch_token() {
 }
 
 _cf_managed_line_only() {
-    local line="$1" expected="$2" word first i=0 n
-    case "$line" in *\"*|*\'*) return 1 ;; esac
+    local line="$1" expected="$2" first kind="" actual i=0 n
+    local _cf_words=()
+    line="${line#"${line%%[![:space:]]*}"}"
     case "$line" in
-        ExecStart=*|command=*|command_args=*|cmd=*) line=${line#*=} ;;
+        ExecStart=*|command=*|command_args=*|cmd=*) kind=${line%%=*}; line=${line#*=} ;;
     esac
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+        \"*\") line=${line:1:${#line}-2} ;;
+        \'*\') line=${line:1:${#line}-2} ;;
+    esac
+    case "$line" in *\"*|*\'*) return 1 ;; esac
     read -ra _cf_words <<< "$line"
     n=${#_cf_words[@]}
     [ "$n" -gt 0 ] || return 1
     first="${_cf_words[0]}"
-    if [ "$first" = "$expected" ]; then
-        i=1
-    elif [ "$first" = tunnel ]; then
-        i=0
-    else
-        return 1
+    if [ "$kind" = command ]; then
+        [ "$n" -eq 1 ] || return 1
+        actual=$(readlink -f "$first" 2>/dev/null || printf '%s' "$first")
+        [ "$actual" = "$expected" ]
+        return
+    fi
+    if [ "$kind" != command_args ]; then
+        if [ "$first" = "$expected" ]; then
+            i=1
+        elif [ "$first" != tunnel ]; then
+            return 1
+        fi
     fi
     if [ "$i" -lt "$n" ]; then
         case "${_cf_words[$i]}" in
@@ -1912,7 +1926,8 @@ _cf_managed_line_only() {
             --no-autoupdate) i=$((i+1)) ;;
         esac
     fi
-    [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = tunnel ] && i=$((i+1))
+    [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = tunnel ] || return 1
+    i=$((i+1))
     if [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = --protocol ]; then
         [ "$((i+1))" -lt "$n" ] && [ "${_cf_words[$((i+1))]}" = http2 ] || return 1
         i=$((i+2))
@@ -1931,7 +1946,7 @@ _cf_managed_line_only() {
 }
 
 _cf_managed_flags_only() {
-    local line svc_bin expected_bin actual_bin
+    local line svc_bin expected_bin actual_bin have_command=no have_args=no have_launch=no
     svc_bin=$(_cf_service_bin "$(_cf_unit_path)" 2>/dev/null) || return 1
     [ -n "$svc_bin" ] || return 1
     expected_bin=$(readlink -f "$CF_BIN" 2>/dev/null || printf '%s' "$CF_BIN")
@@ -1939,8 +1954,17 @@ _cf_managed_flags_only() {
     [ "$actual_bin" = "$expected_bin" ] || return 1
     while IFS= read -r line; do
         _cf_managed_line_only "$line" "$expected_bin" || return 1
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in
+            command=*) have_command=yes ;;
+            command_args=*) have_args=yes ;;
+            *) have_launch=yes ;;
+        esac
     done <<< "${CF_CUR_CMDLINE:-}"
-    return 0
+    if [ "$have_command" = yes ] || [ "$have_args" = yes ]; then
+        [ "$have_command" = yes ] && [ "$have_args" = yes ] || return 1
+    fi
+    [ "$have_launch" = yes ] || [ "$have_args" = yes ]
 }
 
 # (从头重建保证参数顺序: 全局标志 tunnel 连接标志 run --token)

@@ -651,8 +651,28 @@ _config_present() {
     return 1
 }
 
-# 合并 confs/*.json 成一份完整配置(输出到 stdout)。数字前缀即合并顺序, 与 xray -confdir 一致。
+# 管理器只支持每个顶层字段一份片段; 重复字段使用核心的另一套合并语义, 不可覆盖回写。
+_config_layout_valid() {
+    local dir="${1:-$CONFIG_DIR}" repair="${2:-}" keys='[]' f fields
+    for f in "$dir"/*.json; do
+        [ -f "$f" ] && [ -s "$f" ] || continue
+        if ! fields=$(jq -e 'if type == "object" then keys else error("配置片段必须是 object") end' "$f" 2>/dev/null); then
+            # 完整快照回写允许替换损坏文件; 正常读取仍须拒绝。
+            [ "$repair" = repair ] && continue
+            _error "配置片段无法解析: $f"
+            return 1
+        fi
+        keys=$(jq -cn --argjson a "$keys" --argjson b "$fields" '$a + $b') || return 1
+    done
+    if ! printf '%s' "$keys" | jq -e 'group_by(.) | all(.[]; length == 1)' >/dev/null; then
+        _error "配置片段含重复顶层字段, 拒绝修改: $dir"
+        return 1
+    fi
+}
+
+# 合并管理器的一字段一文件布局(输出到 stdout)。
 _config_merged() {
+    _config_layout_valid || return 1
     local files=()
     local f
     for f in "$CONFIG_DIR"/*.json; do
@@ -690,6 +710,7 @@ _config_write_merged() {   # <完整配置 JSON> [目标目录]
     local content="$1" dir="${2:-$CONFIG_DIR}"
     [ -n "$content" ] || return 1
     printf '%s' "$content" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
+    _config_layout_valid "$dir" repair || return 1
     mkdir -p "$dir" || return 1
     local k v f written=$'\n'
     while IFS= read -r -d '' k && IFS= read -r -d '' v; do
@@ -701,44 +722,76 @@ _config_write_merged() {   # <完整配置 JSON> [目标目录]
     local old
     for old in "$dir"/*.json; do
         [ -f "$old" ] || continue
-        grep -qxF "$(basename "$old")" <<< "$written" || rm -f "$old"
+        if ! grep -qxF "$(basename "$old")" <<< "$written"; then
+            rm -f "$old" || return 1
+        fi
     done
     return 0
 }
 
-# 一次性迁移: 旧的单文件 config.json → confs/ 目录, 旧文件改名 config.json.bak。
-# 幂等判据是"旧文件已改名"(存在 .bak), 而不是"confs 非空": 拆分是逐文件写, 若中途被杀,
-# confs 已非空但旧文件还在 ⇒ 必须重跑才能补齐剩余字段。旧文件解析失败时**不改名**, 保持现场。
+# 旧配置作为本次迁移恢复源; service/启动失败恢复原路径、service 和运行态。
 _config_migrate_legacy() {
     [ -f "${LEGACY_CONFIG_FILE}.bak" ] && return 0
     _config_present && return 0
     [ -f "$LEGACY_CONFIG_FILE" ] && [ -s "$LEGACY_CONFIG_FILE" ] || return 0
-    if ! command -v jq >/dev/null 2>&1; then
-        _warn "jq 不可用, 暂无法把 $LEGACY_CONFIG_FILE 迁移到 $CONFIG_DIR"
-        return 1
-    fi
-    local content
+    local content snapshot="" unit="" running=0 failed=0
     content=$(jq . "$LEGACY_CONFIG_FILE" 2>/dev/null) || {
         _error "旧配置文件解析失败, 未迁移(保持原样): $LEGACY_CONFIG_FILE"
         return 1
     }
-    [ -n "$content" ] || { _error "旧配置文件为空, 未迁移: $LEGACY_CONFIG_FILE"; return 1; }
+    [ -n "$content" ] || return 1
+    if [ -x "$XRAY_BIN" ]; then
+        snapshot=$(mktemp -d) || return 1
+        unit=$(_xray_service_unit_path) || unit=""
+        if [ -n "$unit" ]; then
+            if [ -f "$unit" ]; then
+                cp -p "$unit" "$snapshot/service" || { rm -rf "$snapshot"; return 1; }
+            fi
+            _xray_service_snapshot_enable "$unit" "$snapshot/enabled" || { rm -rf "$snapshot"; return 1; }
+        fi
+        [ "$(_manage_xray status 2>/dev/null)" = running ] && running=1
+    fi
     if ! _config_write_merged "$content"; then
-        rm -f "$CONFIG_DIR"/*.json 2>/dev/null
-        _error "配置迁移失败(写入 $CONFIG_DIR 出错), 已回退; 旧配置保持原样"
+        rm -f "$CONFIG_DIR"/*.json
+        [ -z "$snapshot" ] || rm -rf "$snapshot"
+        _error "配置迁移写入失败, 旧配置保持原样"
         return 1
     fi
     if ! mv -f "$LEGACY_CONFIG_FILE" "${LEGACY_CONFIG_FILE}.bak"; then
-        _error "配置已拆分到 $CONFIG_DIR, 但无法重命名旧文件: $LEGACY_CONFIG_FILE"
+        rm -f "$CONFIG_DIR"/*.json
+        [ -z "$snapshot" ] || rm -rf "$snapshot"
         return 1
     fi
-    _info "配置已迁移到 $CONFIG_DIR(旧文件保留为 ${LEGACY_CONFIG_FILE}.bak)"
-    if [ -x "$XRAY_BIN" ]; then
-        declare -F _create_xray_service >/dev/null 2>&1 && _create_xray_service
-        if declare -F _restart_xray_verified >/dev/null 2>&1 && ! _restart_xray_verified; then
-            _warn "迁移后 Xray 重启未通过验证, 请到 [服务控制] 查看状态"
+    if [ -n "$snapshot" ]; then
+        _create_xray_service || failed=1
+        if [ "$failed" -eq 0 ] && [ "$running" -eq 1 ]; then
+            _restart_xray_verified || failed=1
         fi
+        if [ "$failed" -eq 1 ]; then
+            _manage_xray stop
+            mv -f "${LEGACY_CONFIG_FILE}.bak" "$LEGACY_CONFIG_FILE" || return 1
+            if [ -n "$unit" ]; then
+                if [ -f "$snapshot/service" ]; then
+                    _xray_service_restore_file "$snapshot/service" "$unit" || return 1
+                else
+                    rm -f "$unit" || return 1
+                    if [ "${INIT_SYSTEM:-}" = systemd ]; then
+                        systemctl daemon-reload || return 1
+                    fi
+                fi
+                _xray_service_restore_enable "$snapshot/enabled" || _warn "旧 service 开机状态恢复失败, 继续恢复运行状态"
+            fi
+            rm -f "$CONFIG_DIR"/*.json || return 1
+            if [ "$running" -eq 1 ]; then
+                _restart_xray_verified || _error "旧配置已恢复, 但 Xray 启动仍失败"
+            fi
+            rm -rf "$snapshot"
+            _error "配置迁移失败, 已恢复旧配置与 service"
+            return 1
+        fi
+        rm -rf "$snapshot"
     fi
+    _info "配置已迁移到 $CONFIG_DIR(旧文件保留为 ${LEGACY_CONFIG_FILE}.bak)"
     return 0
 }
 
