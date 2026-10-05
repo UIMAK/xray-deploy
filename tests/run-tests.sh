@@ -261,6 +261,15 @@ check 'Xray hysteria PortList overlap rejected' _xh_hop_conflict \
     '{"protocol":"hysteria","port":"30000,31000-32000"}' 31500 31500
 check 'Xray hysteria single port inside hop range rejected' _xh_hop_conflict \
     '{"protocol":"hysteria","port":30000}' 20000 40000
+check 'Xray WireGuard inbound flagged as UDP conflict' _xh_hop_conflict \
+    '{"protocol":"wireguard","port":31500}' 20000 40000
+if _xh_hop_conflict '{"protocol":"wireguard","port":443}' 20000 40000; then
+    fail 'Xray WireGuard outside hop range allowed'
+else
+    pass 'Xray WireGuard outside hop range allowed'
+fi
+check 'own socket exclusion does not exempt Xray WireGuard config port' _xh_hop_conflict \
+    '{"protocol":"wireguard","port":31500}' 20000 40000 31500
 check 'Xray hysteria port range overlapping hop range rejected' _xh_hop_conflict \
     '{"protocol":"hysteria","port":"30000-31000"}' 30500 32000
 if _xh_hop_conflict '{"protocol":"hysteria","port":443}' 20000 40000; then fail 'Xray hysteria outside hop range allowed'; else pass 'Xray hysteria outside hop range allowed'; fi
