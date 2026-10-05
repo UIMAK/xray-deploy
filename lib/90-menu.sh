@@ -1,15 +1,7 @@
 #!/bin/bash
-# =============================================================================
-# lib/90-menu.sh — 主菜单 + 状态栏
-# 串接所有模块, 渲染菜单, 调度用户选择
-# ============================================================================
+# lib/90-menu.sh — 主菜单、事务恢复与协议子菜单。
 
-# 字符串的终端显示宽度(列数)。
-# 判据: ASCII(<0x80) 1 列; 首字节 0xC0-0xDF(2 字节字符) 1 列; 首字节 ≥0xE0(3/4 字节字符,
-# 汉字在此) 2 列; 续字节 0x80-0xBF 0 列。
-# **不能**用 (字节数 - 字符数) / 2 估算: 2 字节字符个数为奇数时会多算 1 列("a··" 会算成 4
-# 而不是 3), 双栏因此错位。按字节类判定与终端实际渲染一致。
-# LC_ALL=C 让 od 的输出与 IFS 分词不受 locale 影响(只取字节值)。
+# UTF-8 首字节决定列宽：ASCII/双字节 1、三/四字节 2、续字节 0；LC_ALL=C 固定判定。
 _menu_display_width() {
     local s="$1" w=0 b
     for b in $(printf '%s' "$s" | LC_ALL=C od -An -tu1 -v 2>/dev/null); do
@@ -22,9 +14,7 @@ _menu_display_width() {
     printf '%s' "$w"
 }
 
-# 双栏菜单的一行。左列按**显示宽度**补空格(而不是 printf 的字符宽度), 右列(可省)接在后面。
-# 宽度只按纯文本算: 颜色转义序列的字节不能计入, 否则每格会多出十几列。
-# 用法: _menu_row <左编号> <左名称> [<右编号> <右名称>]
+# _menu_row 按纯文本显示宽度补齐，不计颜色；避免 printf 字节宽度造成错列。
 MENU_COL_WIDTH=22
 _menu_row() {
     local lnum="$1" lname="$2" rnum="${3:-}" rname="${4:-}"
@@ -33,8 +23,7 @@ _menu_row() {
     [ "$pad" -lt 1 ] && pad=1
     ltxt="  ${GREEN}[${lnum}]${NC} ${lname}"
     [ -n "$rnum" ] && rtxt="${GREEN}[${rnum}]${NC} ${rname}"
-    # %b 而不是 %s: 颜色变量里存的是字面 `\033[0;32m`, 需要 printf 解释转义
-    # (原来的 echo -e 就负责这件事; 用 %s 会原样打出反斜杠序列)。
+    # %b 解释颜色变量的字面转义，%s 会显示原文。
     printf '%b%*s%b\n' "$ltxt" "$pad" "" "$rtxt"
 }
 
@@ -51,9 +40,7 @@ _print_logo() {
     echo -e "  ${CYAN}${left}${title}${NC}"
 }
 
-# ---------------------------------------------------------------------------
 # 状态栏
-# ---------------------------------------------------------------------------
 _print_status_bar() {
     # 系统
     local os_info="未知"
@@ -66,8 +53,7 @@ _print_status_bar() {
         local ver=""
         ver=$(_xray_cached_version 2>/dev/null)
         [ -n "$ver" ] && xver=" v${ver}"
-        # 通道名来自 state 文件(可被本地写坏/篡改), 且会被 echo -e 打屏 —— 先净化,
-        # 只保留版本号类安全字符, 避免转义序列注入管理员终端。
+        # 通道显示先净化再 echo -e，口径同 _print_status_bar，避免终端转义注入。
         xchannel=$(_sanitize_token "$(_state_get channel 2>/dev/null)") || xchannel="?"
         local st; st=$(_manage_xray status 2>/dev/null)
         if [ "$st" = "running" ]; then
@@ -115,9 +101,7 @@ _print_status_bar() {
     echo
 }
 
-# ---------------------------------------------------------------------------
 # 节点类型检测(用于条件显示管理菜单)
-# ---------------------------------------------------------------------------
 _has_hy2_nodes() {
     [ -d "$NODES_DIR" ] || return 1
     for f in "$NODES_DIR"/*.json; do
@@ -137,57 +121,24 @@ _has_reality_nodes() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# 交互终端保障(2026-09-26): 菜单的 `read -rp` 只在 stdin 是终端时才打印提示符,
-# 且非终端时通常是"立即 EOF"或"阻塞在永远没有数据的管道上"。安装器 `exec "$INSTALL_BIN"`
-# 会把承载安装脚本输入的 fd 0(典型是 `curl … | bash` 的管道)一并带入, 于是菜单刚渲染出来
-# 就没有 `请选择:`, 随后静默退出或空转 —— 用户实测必须 Ctrl+C 再手动 `xd`。
-# 注意"提示符消失"的主因在安装器侧(它把 fd 2 污染成 /dev/null, 见 install.sh 锁 fd 打开处);
-# 本函数负责 fd 0 是非终端的另一半 —— 两处都修, 症状才真正消失。
-# `xray-deploy.sh` 从磁盘读取(经 /usr/local/bin/xd 符号链接), 因此重定向 fd 0 不会影响
-# 脚本自身的读取; cron 子命令在进入菜单前就已 exit, 不受影响。
-#
-# **重定向写法是硬约束(0.18.3)**: `exec` 的**无命令**形态会把列表里每个重定向都持久化到
-# 当前 shell —— 旧写法 `exec </dev/tty 2>/dev/null` 顺带把 fd 2 接到 /dev/null, 而
-# `read -rp` 的提示符写的正是 stderr: 改接"成功"也看不到提示(输入其实已被 tty 接收)。
-# 故用组重定向只吞掉打开 /dev/tty 的失败信息, fd 2 出组即还原; 失败路径也不再泄漏 bash
-# 原生报错(旧写法的 2>/dev/null 对第一条重定向的失败根本来不及生效)。
-#
-# **契约(复审 P2 明确化)**: 交互菜单需要**控制终端**, 不支持把选项经管道喂给菜单
-# (`printf '1\n0\n' | xd` 会改读 /dev/tty, 管道输入被忽略)。这是有意取舍: bash 无法在不
-# 消费字节的前提下可靠区分"已 EOF 的安装遗留管道"与"待读的自动化输入", 而这两种场景只能
-# 二选一; 菜单是 `clear` + 循环重绘的 TUI, 自动化输入本就不是受支持的用法。
-# 返回 0 = stdin 已是终端或成功改接到控制终端; 1 = 两者都做不到(纯后台无终端)。
-# ---------------------------------------------------------------------------
+# _menu_require_tty 需要控制终端；stdin 非 tty 重挂 /dev/tty，不支持管道菜单输入。
+# 组重定向保留 stderr；rc 0=终端可用，1=不可用。
 _menu_require_tty() {
     [ -t 0 ] && return 0
     { exec </dev/tty; } 2>/dev/null && return 0
     return 1
 }
 
-# ---------------------------------------------------------------------------
 # 主菜单
-# ---------------------------------------------------------------------------
 _main_menu() {
-    # 必须最先做: 下面所有恢复/迁移步骤都可能弹交互提示, 而 fd 0 一旦不是终端,
-    # 菜单的 read 就会失去提示符并立即 EOF/空转(见 _menu_require_tty 说明)。
+    # 先取得终端再恢复/迁移，避免交互 EOF；见 _menu_require_tty。
     if ! _menu_require_tty; then
         _error "无法进入交互菜单: 当前输入不是终端且无法打开 /dev/tty"
         _tip "请在交互式终端中运行 xd(或为 stdin 连接一个 tty)"
         exit 1
     fi
-    # 启动期维护链(严格按此顺序):
-    #   reset 崩溃恢复 → 核心事务崩溃恢复 → 端口事务崩溃恢复 → 旧单文件配置迁移
-    #   → 自动补 tag → 自动采纳孤儿入站 → 注入 config env(R45) → 迁移 Geo 自动更新(R45)
-    # 各恢复/迁移步骤都用 declare -F 守卫: 可选维护 helper 缺失时跳过; 事务恢复失败或任一
-    # 维护步骤失败, 则 fail-stop 停止后续步骤。**全局写闸门不在这里**: 未收敛的
-    # core/reset 事务由各 config/metadata 写路径的账本闸门(_core_txn_allow_config_write /
-    # _mutate_config 的 reset 检查)持续拒绝, 直到重启收敛后自动解除 —— 菜单变量只负责
-    # 启动链的顺序, 不承担"挡住用户操作"的责任。
-    # reset 恢复放在最前: 半截 reset 的 live 状态可能是"config 空/缺 + nodes 空 + 快照藏着
-    # 旧 metadata", 先收敛再让 adopt/迁移 基于稳定状态工作。
-    # 核心恢复紧随其后且**先于一切 config 写入**(复审 P1): 它可能重启服务, 且失败时运行态
-    # 未知, 半收敛的现场不允许再被 auto_tag/adopt 们叠加修改。
+    # 启动链：reset → core → legacy → port → tag → adopt → env → geo。
+    # reset/core 先分别恢复；任一失败阻塞 legacy 至 geo，legacy/port/tag/adopt 失败停止后续。
     RESET_RECOVERY_FAILED=0
     local reset_rc=0
     if declare -F _reset_config_recover >/dev/null 2>&1; then
@@ -197,11 +148,7 @@ _main_menu() {
         RESET_RECOVERY_FAILED=1
         _error "reset 事务未收敛(账本/快照已保留): 已跳过启动期维护, 并阻止配置修改类操作; 请处理后重启脚本"
     fi
-    # 核心切换的崩溃恢复(十一轮 P1-②): 进程在"二进制已换 / unit 已重写"之后被杀(断电/OOM/
-    # kill -9)时没有任何函数会被调用, 只能靠启动期按 state/coretxn.json 收敛。
-    # **必须先于任何 config/metadata 写入**(复审 P1): 恢复失败时运行态未知, 下面全部会写
-    # config 的自动维护都必须让路; 原先它排在 auto_tag/auto_adopt 之后, 门禁形同虚设。
-    # 它只动二进制/unit, 不写 config, 故不受未收敛 reset 的门禁影响。
+    # core 恢复先于任何维护写入；运行态未知则停止链。
     CORE_RECOVERY_FAILED=0
     local core_rc=0
     if declare -F _xray_core_txn_recover >/dev/null 2>&1; then
@@ -211,18 +158,13 @@ _main_menu() {
         CORE_RECOVERY_FAILED=1
         _error "Xray 核心事务未收敛(账本/恢复源已保留): 已跳过全部启动期 config 维护, 请处理后重启脚本"
     fi
-    # 启动期自动维护链: 恢复未收敛或任一维护步骤失败即停止后续步骤(fail-stop), 不让未收敛/
-    # 半维护的现场继续叠加写入。各步骤幂等, 修复后下次启动自动重试。
-    # 返回码必须被消费(复审 P2): auto_tag/auto_adopt 的失败与"本就不需要维护"是两回事。
+    # legacy/port/tag/adopt 失败置阻塞，防止叠加写入。
     STARTUP_MAINT_BLOCKED=0
     if [ "$RESET_RECOVERY_FAILED" -ne 0 ] || [ "$CORE_RECOVERY_FAILED" -ne 0 ]; then
         STARTUP_MAINT_BLOCKED=1
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        # **旧单文件迁移必须先于 porttxn 恢复**: 未迁移的旧部署里 confs 是空的(合并视图
-        # 没有 .inbounds), 此时若遗留 *.porttxn, _port_txn_recover 会报"无法读取有效配置"
-        # 并 fail-stop ⇒ 迁移永远排在被跳过的位置, 每次启动都报"维护失败"。迁移只读旧
-        # config.json、写 confs、改名 .bak, 不依赖任何事务收敛, 放在这里是安全的。
+        # legacy 先于 port 恢复，确保旧部署 confs 的合并视图可读。
         if declare -F _config_migrate_legacy >/dev/null 2>&1; then
             if ! _config_migrate_legacy; then
                 STARTUP_MAINT_BLOCKED=1
@@ -231,10 +173,7 @@ _main_menu() {
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        # **端口事务恢复必须最先**(先于任何 config 写入): 遗留的 *.porttxn 是未收敛现场,
-        # 统一写闸门会拒绝所有普通 config 写入, 若不先收敛, 下面的 auto_tag/adopt 会被
-        # 闸门挡下并误报为"维护失败"。**必须消费返回码**(复审 P1): 未收敛(隔离/保留待人工)
-        # 时同样 fail-stop, 否则"任一维护步骤失败即停止"的新契约在端口事务这条路上不成立。
+        # port 恢复先于普通写入；未收敛账本会使写闸门拒绝。
         if declare -F _port_txn_recover >/dev/null 2>&1; then
             if ! _port_txn_recover; then
                 STARTUP_MAINT_BLOCKED=1
@@ -290,8 +229,7 @@ _main_menu() {
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
         read -rp "  请选择: " choice || exit 0
-        # 编号连续且固定(1-21 + 0): 新增功能追加到最后一组的末尾, 不重排既有编号
-        # (用户已记住的编号必须稳定)。分组只影响显示, 与调度无关。
+        # 编号固定 1–21 与 0；新增末组追加，分组不改变调度。
         case "$choice" in
             1) _add_node; continue ;;
             2) _view_nodes; continue ;;
@@ -321,9 +259,7 @@ _main_menu() {
     done
 }
 
-# ---------------------------------------------------------------------------
 # 查看状态
-# ---------------------------------------------------------------------------
 _view_status() {
     clear
     echo
@@ -334,10 +270,7 @@ _view_status() {
         local ver="" ch
         ver=$(_xray_cached_version 2>/dev/null)
         [ -z "$ver" ] && ver="未知"
-        # 通道名来自 state 文件(可被本地写坏/篡改), 且会进 `echo -e` —— **必须与
-        # `_print_status_bar` 同一口径净化**(2026-09-22 九轮 OCR #40)。同一个键在两个读点
-        # 一处净化一处不净化, 是项目反复踩过的"同一条件各调用点各自解释"形状; 未净化的那个
-        # 会把 ANSI/控制序列原样打给管理员终端。
+        # 通道显示先净化再 echo -e，口径同 _print_status_bar，避免终端转义注入。
         ch=$(_sanitize_token "$(_state_get channel 2>/dev/null)") || ch="?"
         echo -e "  版本: $([ "$ver" = "未知" ] && echo "$ver" || echo "v${ver}")  通道: ${ch}"
     fi
@@ -355,18 +288,14 @@ _view_status() {
     _press_any_key
 }
 
-# ---------------------------------------------------------------------------
 # 查看日志
-# ---------------------------------------------------------------------------
 _view_log() {
     clear
     echo
-    # loglevel=none 时核心同时关闭 access 与 error 两个日志(infra/conf/log.go),
-    # 文件不会有新内容 —— 不提示的话用户会以为是脚本坏了。历史内容仍照常展示。
-    # declare -F 探测: 混装版本(20-xray-core 是旧版)时静默跳过提示, 不影响看日志本身。
+    # loglevel=none 只展示历史；缺 _xray_loglevel_get 时不阻断查看。
     if declare -F _xray_loglevel_get >/dev/null 2>&1 && [ "$(_xray_loglevel_get 2>/dev/null)" = "none" ]; then
         _warn "当前日志级别为 none: access.log 与 error.log 均已停止写入, 以下仅为历史内容"
-        # 按名字而不是编号指路: 编号在菜单重排后会变(50-nodes.sh 的 "[6] 安装 Xray" 就这么过期过)。
+        # 按菜单名称指路，避免编号依赖。
         _tip "如需恢复记录, 请到主菜单 [日志轮换] → [日志级别] 选择 error/warning 等级别"
         echo
     fi
@@ -384,9 +313,7 @@ _view_log() {
     _press_any_key
 }
 
-# ---------------------------------------------------------------------------
 # 检查配置
-# ---------------------------------------------------------------------------
 _check_config() {
     clear
     echo
@@ -401,16 +328,7 @@ _check_config() {
     _press_any_key
 }
 
-# ---------------------------------------------------------------------------
-# 定时重启 菜单
-# ---------------------------------------------------------------------------
-# cron 单字段结构校验(比"字符集 + 含数字或 *"严格得多)。
-# 旧写法 ^[0-9*,/-]*[0-9*][0-9*,/-]*$ 只保证"含数字或 *", 于是 */ 、1- 、-1 、1--2 、1,2, 这些
-# 结构畸形字段照样放行 —— 用户看到"已设置", 直到 cron 运行才报解析错误, 正是该处注释声称
-# 要消除的失败形态。现在按 cron 的真实语法逐项校验: 逗号列表的每一项必须是
-# * | N | N-M | */S | N-M/S, 且逗号不得出现在首尾或连续出现。
-# 只做结构校验, 不硬编码"分 0-59 / 时 0-23"的取值范围 —— 取值范围交给 cron,
-# 在这里写死会让合法的自定义表达式被误拒。
+# cron 字段仅接受 *、N、N-M、*/S、N-M/S 及逗号列表；正步长在此校验，范围交 cron。
 _cron_field_valid() {
     local f="$1" x
     [ -n "$f" ] || return 1
@@ -419,8 +337,7 @@ _cron_field_valid() {
     IFS=',' read -ra _parts <<< "$f"
     for x in "${_parts[@]}"; do
         [[ "$x" =~ ^(\*|[0-9]+)(-[0-9]+)?(/[0-9]+)?$ ]] || return 1
-        # 步长为 0 是**结构非法**(cron 直接报解析错误), 不属于"取值范围交给 cron"的范畴:
-        # */0 / 0-30/0 都能通过上面的正则, 却让用户看到"已设置"后运行时才失败。
+        # 步长必须正数；零步长属结构错误，不交给 cron 延迟拒绝。
         case "$x" in
             */0) return 1 ;;
             */0[0-9]*) return 1 ;;
@@ -460,8 +377,7 @@ _timed_restart_menu() {
         4)
             read -rp "  输入 cron 表达式 (如 30 3 * * *): " cron_expr
             [ -z "$cron_expr" ] && { _warn "表达式为空, 取消"; _press_any_key; return; }
-            # 2026-09-12 三审(S4): 基本格式校验 —— 5 个字段, 每字段仅数字/*/,/- 字符集。
-            # 过松会让坏行被 cron 反复报解析错误; 不校验取值范围是刻意的, 不会误伤 */3 等合法写法。
+            # cron 只验五字段结构和字符集，范围由 cron 解析。
             local -a _ce
             read -ra _ce <<< "$cron_expr"
             if [ "${#_ce[@]}" -ne 5 ]; then
@@ -490,18 +406,16 @@ _timed_restart_menu() {
     esac
     [ -z "$cron_expr" ] && { _press_any_key; return; }
     cron_line="${cron_expr} ${cmd_path} timed-restart ${marker}"
-    # 混装旧 lib(00-common 是旧版)时 _crontab_replace 不存在: 这是写路径, 必须响亮拒绝并
-    # 给出可执行提示, 绝不能退回旧的裸管道写法(读失败会清空用户全部 crontab)。
+    # 缺 _crontab_replace 拒绝写入，裸管道会将读失败变成清空。
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
         _error "lib 版本过旧(00-common 缺 _crontab_replace), 无法写入 crontab"
         _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
         _press_any_key; return
     fi
-    # 先确保 cron 服务运行(M20: 无 cron 的全新 Alpine 上先装 cron 再写 crontab)
+    # 先确认 cron 能运行，再写任务。
     local cron_ok=0
     _ensure_cron_running && cron_ok=1
-    # 删除旧行 + 写入新行。读 crontab 失败时 _crontab_replace 返回 1 且不改动现有内容 ——
-    # 旧的 `(crontab -l; echo) | crontab -` 在读失败时会把用户的全部定时任务覆盖掉。
+    # _crontab_replace 读失败 rc 1 且不动原任务。
     if ! _crontab_replace "$marker" "$cron_line"; then
         _error "写入 crontab 失败"
         _press_any_key; return
@@ -511,11 +425,9 @@ _timed_restart_menu() {
         _state_set timed_restart "$cron_expr"
         _success "定时重启已设置: ${cron_expr}"
     else
-        # 回滚刚写入的 crontab 行, 保证 state=off ⇔ 项目 cron entry 不存在;
-        # 回滚失败要暴露, 不能静默。
+        # 启用失败回滚新行；回滚不完整如实报告，不记 off。
         if ! _crontab_replace "$marker"; then
-            # 回滚失败 => cron 行可能仍在。此时**不能**写 state=off, 否则就是"UI 说已关、
-            # cron 还在跑"的分裂状态(与 _timed_restart_disable 同一口径)。
+            # 行可能仍在，保留 state；见 _timed_restart_disable。
             _warn "crontab 回滚失败, 请手动检查项目定时任务 (${marker})"
             _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
             _warn "cron 守护进程未能启动, 定时重启可能未完全取消"
@@ -528,9 +440,7 @@ _timed_restart_menu() {
     _press_any_key
 }
 
-# ---------------------------------------------------------------------------
 # 禁用定时重启
-# ---------------------------------------------------------------------------
 _timed_restart_disable() {
     local marker="# xray-deploy-timed-restart"
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
@@ -538,31 +448,24 @@ _timed_restart_disable() {
         _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
         return 1
     fi
-    # 2026-09-21 复审(P1): 这里原本是裸管道 `crontab -l 2>/dev/null | grep -qF "$marker"`,
-    # 把"读成功但确实没这行"(该记账)与"crontab -l 读失败"(行可能仍在, 绝不能记账)压成
-    # 同一个退出码 1。实测: 令 crontab -l 返回 2 并输出 "cannot open spool: Input/output
-    # error", 本函数报"定时重启未启用"并写下 state=off —— cron 行仍在无人值守地重启服务。
-    # _crontab_has_marker 就是为这个三态判据而存在的(00-common)。
+    # _crontab_has_marker 区分存在/缺失/读失败，不能将读失败记为 off。
     local has_rc=0
     if declare -F _crontab_has_marker >/dev/null 2>&1; then
         _crontab_has_marker "$marker" || has_rc=$?
     else
-        # 混装旧 lib(00-common 是旧版): 没有三态判据可用。**绝不能退回裸管道** —— 那正是
-        # 上面刚修掉的分裂形态。宁可不改 state 并如实告警, 也不猜。
+        # 缺三态判据拒绝，不猜 off 或退回裸管道。
         _error "lib 版本过旧(00-common 缺 _crontab_has_marker), 无法确认定时任务状态"
         _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
         return 1
     fi
     case "$has_rc" in
         2)
-            # 读不到 crontab => 行可能仍在。此时**不能**写 state=off, 否则就是
-            # "UI 说已关、cron 还在跑"的分裂状态, 而且下次用户看到"未启用"就不会再处理。
+            # 读失败保留 state，不能推断任务已消失。
             _warn "无法读取 crontab, 定时重启任务是否仍在无法确认"
             _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
             return 1 ;;
         0)
-            # 删除失败必须暴露: 否则 state 记成 off 而 cron 行仍在(无人值守地重启服务)。
-            # **这里必须提前 return, 不能继续往下写 state=off**。
+            # 删除失败立即返回，不把仍在的任务记 off。
             if ! _crontab_replace "$marker"; then
                 _warn "定时重启任务未能移除, 请手动检查 crontab (${marker})"
                 _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
@@ -576,9 +479,7 @@ _timed_restart_disable() {
     _state_set timed_restart "off"
 }
 
-# ---------------------------------------------------------------------------
 # 查看定时重启日志
-# ---------------------------------------------------------------------------
 _timed_restart_view_log() {
     clear
     echo -e "  ${CYAN}【定时重启日志】${NC}"
@@ -590,11 +491,7 @@ _timed_restart_view_log() {
     fi
 }
 
-# 兜底卸载专用的进程发现(bash 无函数局部作用域, 嵌套定义会泄漏到全局并每次重定义 ——
-# 项目惯例是这类 helper 一律放顶层, 与 40-cloudflared.sh 的 _cf_pids/_cf_pids_owned 一致)。
-# **不能只靠 pidof**: 容器内 busybox pidof/pgrep 会假阴性(H3), 漏报时 kill 块被整段跳过、
-# 事后校验也判"无残留", 于是进程还活着却报卸载成功。pidof 优先, 再补 /proc/<pid>/comm
-# 精确扫描(容器内可靠)。
+# 顶层进程 helper：pidof 后补 /proc comm 扫描，避免容器假阴性。
 _cf_fb_pids() {
     local pids p c
     pids=$(pidof cloudflared 2>/dev/null | tr ' ' '\n' | grep -e '^[0-9][0-9]*$')
@@ -605,10 +502,7 @@ _cf_fb_pids() {
     done
 }
 
-# 兜底卸载 cloudflared（当 VPS 上的 lib/40-cloudflared.sh 是旧版、缺少 _uninstall_cloudflared 时用）
-# 只用于混装旧 lib 的机器, 故不复用 40 的 _cf_kill_all(可能根本不存在)。
-# 注意 pgrep 在容器内会假阴性(H3), 因此**成功与否以事后的文件/进程事实为准**,
-# 不以命令退出码为准 —— 原实现无条件打印"已卸载", 即便二进制仍在也报成功。
+# 混装缺卸载 helper 的 cloudflared 兜底；以文件/进程事实判成功。
 _uninstall_cloudflared_fallback() {
     if [ -x /usr/local/bin/cloudflared ]; then
         _info "卸载 cloudflared (fallback)..."
@@ -634,13 +528,12 @@ _uninstall_cloudflared_fallback() {
         esac
         rm -f /usr/local/bin/cloudflared
         rm -f "$STATE_DIR"/cf_*
-        # 事后校验: 二进制必须真的消失, 且没有残留进程(容器内 pidof 可能漏报,
-        # 故两者都看; 任一不满足就如实报失败而不是宣称已卸载)
+        # 校验 binary 消失且无进程；pidof 漏报由 _top_process_running 兜底。
         if [ -e /usr/local/bin/cloudflared ]; then
             _error "cloudflared 二进制删除失败, 请手动检查 /usr/local/bin/cloudflared"
             return 1
         fi
-        # 事后校验同样用 /proc 兜底扫描(只信 pidof 会在容器内漏报, 见上)
+        # 同样验证文件/进程事实，见 _top_process_running。
         if [ -n "$(_cf_fb_pids)" ]; then
             _warn "cloudflared 文件已删除, 但仍有残留进程, 请手动确认"
             return 1
@@ -651,9 +544,7 @@ _uninstall_cloudflared_fallback() {
     fi
 }
 
-# ---------------------------------------------------------------------------
 # 卸载菜单
-# ---------------------------------------------------------------------------
 _uninstall_menu() {
     local choice
     clear
@@ -664,8 +555,7 @@ _uninstall_menu() {
     echo -e "  ${GREEN}[3]${NC} 卸载 Xray + cloudflared"
     echo -e "  ${GREEN}[0]${NC} 取消"
     read -rp "  选择: " choice
-    # RT-4(2026-09-12 实测): [2]/[3] 是不可逆的整站卸载, 此前无任何确认 —— 单键误触
-    # 即全毁, 与本脚本其他破坏性操作(删节点/重置配置)的 y/N 确认惯例不一致。补上。
+    # 整站卸载不可逆，执行前 y/N 确认。
     case "$choice" in
         1) _reset_config ;;
         2)
@@ -676,16 +566,13 @@ _uninstall_menu() {
             read -rp "  确认卸载 Xray + cloudflared(删除全部数据与隧道, 不可恢复)? [y/N]: " ans
             case "$ans" in
                 y|Y)
-                    # _uninstall_xray 会在官方 Hysteria2 进程停不掉时中途 return 1(文件未删),
-                    # 此前返回值被忽略、用户仍看到"卸载完成"。如实报告: 失败时明确告知数据
-                    # 可能残留, 但仍继续卸 cloudflared(独立子系统, 用户确实要求两个都卸)。
+                    # Xray 卸载 rc 1 报残留；cloudflared 独立，仍执行用户请求。
                     local xray_rc=0
                     _uninstall_xray || xray_rc=$?
                     if [ "$xray_rc" -ne 0 ]; then
                         _error "Xray 卸载未完成(见上方原因), 部署目录可能仍然存在, 请处理后重试"
                     fi
-                    # 返回值必须消费: 两个实现都会在"文件已删但进程仍在"时返回 1,
-                    # 忽略它会让用户看到"卸载完成"而实际上进程还活着。
+                    # 文件已删但进程仍在可返回 1，必须如实报告。
                     local cf_rc=0
                     if declare -F _uninstall_cloudflared >/dev/null 2>&1; then
                         _uninstall_cloudflared || cf_rc=$?
@@ -705,16 +592,10 @@ _uninstall_menu() {
     _press_any_key
 }
 
-# ---------------------------------------------------------------------------
-# 重置配置为默认(含 routing 规则, 清空节点); 保留 Xray 二进制
-# ---------------------------------------------------------------------------
-# 破坏性部分必须整体位于 config lock 内: backup、hop 清理、config 替换、metadata 清理和
-# restart 之间不能让普通节点事务插入, 否则并发创建的节点会被 reset 在 rm config/nodes 时抹掉。
-# 提问留在锁外, 避免用户思考时长期占住配置锁; wrapper 只负责前置检查/确认和取锁。
+# reset 保留核心；backup/hop/config/metadata/restart 整体持 config lock，交互锁外。
 _reset_config() {
     echo
-    # F10: 重建默认配置依赖 jq —— 先删后建, jq 缺失会留下"无 config + xray 起不来"的残局,
-    # 必须在删除前确认重建能力
+    # 删除前确认 jq 重建能力，避免清空后无法生成配置。
     if ! command -v jq >/dev/null 2>&1; then
         _error "jq 不可用, 无法重建默认配置, 已取消重置"
         _tip "请先安装 jq(主菜单启动时也会自动尝试安装), 再执行重置"
@@ -730,9 +611,7 @@ _reset_config() {
             *) _info "已取消"; return 0 ;;
         esac
     fi
-    # 全站破坏性操作遵循 install → config → core 的锁序, 与 uninstall 相同。
-    # 仅取 config lock 会让 uninstall 在 install+core 锁内删除部署树, 把 config fd 拆成
-    # deleted inode 后继续写 metadata/restart; 外层 install lock 先把两条破坏性路径串起来。
+    # 全站破坏性锁序 install → config → core，防卸载拆掉正在写的部署树。
     if declare -F _with_deploy_install_lock >/dev/null 2>&1; then
         _with_deploy_install_lock _with_config_lock _reset_config_locked
     else
@@ -741,25 +620,16 @@ _reset_config() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# reset 的崩溃恢复(二十轮 P1-3)。
-#
-# reset 是"备份 → 移走 metadata/clash → 删 config → 重建"的多步事务, 进程被 SIGKILL/OOM/
-# 掉电杀死时没有任何函数会被调用。故与 coretxn 同口径: **先把 journal(含 config 副本)
-# 落盘, 再动任何真实状态**; 启动期发现未提交的 journal 就回滚到重置前, 已提交的只清理:
-#   prepared  -> 已开始移动 metadata/clash, 崩溃必须回滚(config 也回到副本)
-#   committed -> 重置后状态已生效, 崩溃只需清理快照与 journal
-# 快照目录用**固定名**: reset 全程持有 install+config 锁, 同一时刻只可能有一个 reset 事务。
-# prepared 前 flush 快照数据/目录; 每次 rename flush 目标与两侧目录; journal phase 写入使用严格 fsync 检查。
-# ---------------------------------------------------------------------------
+# reset：prepared → committed → runtime_verified，仅第三阶段清理。
+# prepared 按事务快照回滚；committed 推进运行态不回滚。
+# 快照/目录先落盘再 prepared，rename/phase 严格定向落盘。
 _reset_journal_path() { printf '%s' "$DEPLOY_DIR/.reset-journal.json"; }
 _reset_snapshot_path() { printf '%s' "$DEPLOY_DIR/.reset-snapshot"; }
 
 _reset_fsync_strict() {
     local p="$1"
     [ -n "$p" ] || return 0
-    # Do not fall back to bare `sync`: it can report success while the targeted writeback
-    # failed. `sync -f` is accepted only as the path-targeted capability fallback.
+    # 定向 sync 失败不退裸 sync；仅 sync -f 可作为定向能力退路。
     if sync "$p" >/dev/null 2>&1; then return 0; fi
     if sync -f "$p" >/dev/null 2>&1; then return 0; fi
     _error "无法确认 reset 持久化屏障: $p"
@@ -803,8 +673,7 @@ _reset_journal_quarantine() {   # <journal> <原因>
     return 1
 }
 
-# 回滚"未提交的 reset"的文件系统侧。config 优先用快照里的副本恢复(不依赖会被后续事务
-# 覆盖的 lastbak); 重置前没有 config 时回滚即恢复"无配置"。
+# prepared 文件恢复只用事务私有快照；重置前无配置则恢复无配置，见 _reset_config_snapshot_restore。
 _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_config>
     local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0 f content=""
     if [ "$had_config" -eq 1 ]; then
@@ -821,8 +690,7 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_
                 _reset_fsync_required "$CONFIG_DIR" || ok=1
             fi
         else
-            # **不得退回 lastbak**(二十五轮 P2): 它不是 transaction-ID 绑定的恢复源, 可能已被
-            # 后续事务覆盖。自己的副本丢失/为空 ⇒ UNKNOWN, 停止恢复并保留现场供人工处理。
+            # 私有副本缺失/空即 UNKNOWN，保留现场，不退共享 lastbak。
             _error "事务快照中的配置副本缺失或为空, 无法确认恢复源; 已保留现场供人工检查: $stage/confs"
             ok=1
         fi
@@ -903,11 +771,7 @@ _reset_config_abort_locked() {   # <stage> <nodes_moved> <clash_moved> <had_conf
     return 0
 }
 
-# 运行态已收敛后的收尾: 先 durable 记 runtime_verified, 再清快照与账本。
-# **runtime_verified 落盘失败时必须中止清理并返回 1**(二十七轮 P1): 它是"清理之前必须先 durable"
-# 的检查点 —— 写不进去就继续 rm 快照/账本, 等于把最后的恢复证据毁掉, 协议自相矛盾。此时磁盘上
-# 仍是 committed 账本, 下次启动会重跑一次(幂等)restart+收敛并重试写入。快照清理失败则保留
-# runtime_verified 账本(下次只需继续清理)。
+# 运行态收敛后 durable 写 runtime_verified 才清理；写失败保留 committed，清理失败保留 runtime_verified。
 _reset_config_commit_finish_locked() {   # <journal> <snapshot> <had_json> <specs_json>
     if ! _reset_journal_write "$1" "$2" "runtime_verified" "$3" "$4"; then
         _warn "运行态已收敛, 但 runtime_verified 账本写入失败; 已保留 committed 账本与快照, 下次启动重试收敛"
@@ -932,10 +796,7 @@ _reset_config_commit_finish_locked() {   # <journal> <snapshot> <had_json> <spec
     return 0
 }
 
-# 带锁的恢复入口(启动期/菜单调用); `_reset_config_locked` 内部直接调 locked 体。
-# **本入口也必须持 install 锁**(与正常 reset/uninstall 同锁序): 它同样会移动/删除
-# deployment tree 内的文件, 只拿 config 锁会让 `install.sh --update` 与恢复交错。
-# 无账本且无快照时是纯读检查, 不加锁直接返回(避免每次启动都与并发安装互等)。
+# 恢复同样按 install → config 取锁；无 journal/快照时纯读返回，避免无谓争用。
 _reset_config_recover() {
     local journal; journal=$(_reset_journal_path)
     [ -e "$journal" ] || [ -e "$(_reset_snapshot_path)" ] || _reset_journal_quarantine_exists "$journal" || return 0
@@ -955,8 +816,7 @@ _reset_config_recover_locked() {
         return 1
     fi
     if [ ! -e "$journal" ]; then
-        # journal 是提交顺序里的**最后**一个文件: 没有它, 快照只能是"写 journal 之前"的
-        # 残骸或已提交后的清理残留, 两者都无权威可恢复, 直接清掉。
+        # journal 缺失时快照无恢复权威，只清无账本残留。
         [ -e "$snapshot" ] && rm -rf "$snapshot" 2>/dev/null
         return 0
     fi
@@ -975,18 +835,13 @@ _reset_config_recover_locked() {
         _reset_journal_quarantine "$journal" "schema 非法"
         return 1
     fi
-    # **严格 schema**(二十四轮 P1): 缺字段/类型不对一律 quarantine, 绝不"猜成默认值"。
-    # 旧写法 `if .had_config == true then 1 else 0 end` 会把缺失/null/字符串/数字全部映射成
-    # 0(= 重置前没有 config), 于是恢复可能 `rm -f "$CONFIG_DIR"` —— 用损坏的账本做出破坏性
-    # 决策。对齐 design: had_config 必须是 boolean, hop_specs 必须是 array(可为空)。
+    # had_config 必须 boolean，hop_specs 必须 array；非法隔离保留证据，不猜默认值。
     if ! jq -e '(.had_config | type) == "boolean"' "$journal" >/dev/null 2>&1; then
         _reset_journal_quarantine "$journal" "had_config 缺失或非布尔"
         return 1
     fi
     had_config=$(jq -r 'if .had_config then 1 else 0 end' "$journal" 2>/dev/null)
-    # hop_specs 是**回放执行**的参数, 必须严格限定形状(防账本被改写后的命令注入), 且必须
-    # 与候选输出同源: `<4|6> -A PREROUTING ... xray-deploy-hy2-hop`。字段缺失/非数组一律
-    # quarantine —— 否则会把"不知道要恢复什么"当成"没有需要恢复的"。
+    # hop_specs 为回放参数，仅接受同源双栈 PREROUTING 项，非法隔离保留证据。
     if ! jq -e '((.hop_specs | type) == "array") and all(.hop_specs[]; (type == "string") and test("^[46] -A PREROUTING .*xray-deploy-hy2-hop"))' \
         "$journal" >/dev/null 2>&1; then
         _reset_journal_quarantine "$journal" "hop_specs 缺失/非数组/形状非法"
@@ -996,13 +851,10 @@ _reset_config_recover_locked() {
         local had_json2 specs_json2
         had_json2=$(jq -c '.had_config' "$journal" 2>/dev/null) || had_json2="false"
         specs_json2=$(jq -c '.hop_specs // []' "$journal" 2>/dev/null) || specs_json2="[]"
-        # **运行态收敛必须早于清理/删账本**(二十五轮 P1): 原顺序(删快照→删账本→重启)在
-        # "已提交但未重启"处崩溃时会留下 磁盘新配置 / runtime 旧配置 且无账本可查。
+        # committed 先收敛运行态；runtime_verified 才可清理，见 _reset_config_commit_finish_locked。
         if [ "$phase" = "committed" ]; then
             if [ -x "$XRAY_BIN" ]; then
-                # 存在运行态就必须具备收敛它的能力(二十八轮 P1): 混装版本(旧 20-xray-core 没有
-                # `_restart_xray_verified`)时 **不能**把"无法验证"当成"已验证"而直接写
-                # runtime_verified —— 那样状态机的不变量就被伪证绕过了。fail-closed。
+                # 有核心却缺 verified restart 能力即失败，不伪证 runtime_verified。
                 if ! declare -F _restart_xray_verified >/dev/null 2>&1; then
                     _error "缺少 _restart_xray_verified, 无法验证 committed reset 的运行态; 账本与快照保留"
                     return 1
@@ -1030,8 +882,7 @@ _reset_config_recover_locked() {
         _warn "上次 reset 崩溃后的回滚不完整(端口跳跃规则), 快照与 journal 保留供重试: $snapshot"
         return 1
     fi
-    # (2) 再还原文件。快照目录已不在 ⇒ 文件侧此前已还原(或本次事务根本没移动过), 跳过;
-    #     不能因为"快照里的 nodes 不在"就去回退 lastbak, 那会把已还原的 config 再改一次。
+    # 再还原文件；快照已消失不重复恢复，绝不猜 lastbak。
     if [ -d "$snapshot" ]; then
         [ -d "$snapshot/nodes" ] && nodes_moved=1
         [ -f "$snapshot/clash.yaml" ] && clash_moved=1
@@ -1059,8 +910,7 @@ _reset_config_locked() {
     fi
     if _config_present; then
         had_config=1
-        # 2026-09-12 三审(M1): 重置是清空全部节点数据的破坏性操作, 备份失败(磁盘满/IO 错误)
-        # 必须中止 —— 原写法忽略返回值, 备份失败仍 rm config, 用户在无备份情况下丢失全部节点。
+        # 重置会清空节点；备份失败必须在删除前中止。
         if ! _backup_config; then
             _error "配置备份失败(磁盘空间/IO?), 已取消重置以保护现有数据"
             return 1
@@ -1096,11 +946,7 @@ _reset_config_locked() {
         rm -rf "$snapshot" 2>/dev/null
         return 1
     fi
-    # hop 清理会删除 iptables 规则, 属于"真实状态改动": 候选 spec 必须先写进账本,
-    # 崩溃时由启动恢复回补(见 `_reset_config_replay_hop_specs_locked`)。
-    # **恢复源获取失败一律 fail-closed**(二十一轮 P1-1): 存在真实 hop 节点却枚举不出 spec 时
-    # 继续清理, 崩溃后会留下"metadata 有 hop / runtime 无 hop"且无账本可回补 —— 恰恰是本轮
-    # 要消灭的分裂。空数组只允许出现在"确实没有会被删除的节点"时(helper 返回 0 且输出为空)。
+    # hop 候选先入 journal 再清理；枚举失败拒绝，空数组只表示确认无候选。
     local specs_json="[]" hop_specs="" cand_rc=0
     if declare -F _hy2_hop_cleanup_candidates >/dev/null 2>&1; then
         hop_specs=$(_hy2_hop_cleanup_candidates 2>/dev/null) || cand_rc=$?
@@ -1117,8 +963,7 @@ _reset_config_locked() {
             fi
         fi
     elif declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        # **混装版本必须 fail-closed**(二十四轮 P1): 有清理能力却拿不到候选枚举助手, 说明
-        # 50-nodes 与 90-menu 版本不一致; 继续清理会在无账本保护下删除 hop runtime。
+        # 有清理却无候选枚举能力则拒绝，防止无账本删除 hop。
         _error "lib 版本不匹配(缺 hop 恢复源枚举助手), 拒绝在无账本保护下执行端口跳跃清理"
         _tip "请先执行 install.sh --update 同步全部模块, 再重试重置"
         rm -rf "$snapshot" 2>/dev/null
@@ -1129,8 +974,7 @@ _reset_config_locked() {
         rm -rf "$snapshot" 2>/dev/null
         return 1
     fi
-    # 清理端口跳跃 iptables 规则(必须在删除节点元数据之前, 且在 rm config 前, M22)。
-    # 失败时 `_hy2_cleanup_all_hops` 已自行回补已删规则; abort 再按账本回补一次(幂等)并还原文件。
+    # 先清 hop 再删 config/metadata；失败按 journal 幂等回补，见 _reset_config_abort_locked。
     if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
         if ! _hy2_cleanup_all_hops; then
             _error "端口跳跃规则清理失败, 正在回滚本次重置"
@@ -1139,8 +983,7 @@ _reset_config_locked() {
         fi
     fi
     if [ -d "$NODES_DIR" ]; then
-        # mv 失败时 NODES_DIR 仍是原件, **绝不能**走恢复路径(那里会 rm -rf 它再去搬
-        # 快照里不存在的内容 ⇒ 直接毁掉全部节点元数据)。只有 mv 确认成功才置 nodes_moved。
+        # mv 成功才置 nodes_moved，失败不可恢复不存在的副本。
         if ! mv "$NODES_DIR" "$snapshot/nodes" 2>/dev/null; then
             _error "无法准备节点 metadata 恢复快照, 已取消重置以保护现有数据"
             _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
@@ -1176,9 +1019,7 @@ _reset_config_locked() {
             return 1
         fi
     fi
-    # 删掉 confs 让 _init_config_if_empty 重建。
-    # **重建失败必须回滚**(2026-09-22 九轮 OCR #41): 不滚会留下"既没有配置、也没有节点
-    # 元数据"; 回滚源是快照里的 confs 副本与 metadata/clash, 失败时保留 journal 供启动重试。
+    # 清 confs 后重建；失败从事务快照回滚，不完整保留 journal。
     if ! rm -rf "$CONFIG_DIR" 2>/dev/null; then
         _error "无法删除旧配置目录, 已取消重置以保护现有数据"
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
@@ -1212,15 +1053,12 @@ _reset_config_locked() {
         _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
         return 1
     fi
-    # COMMIT: phase 先 durable 落盘, 之后**绝不再回滚**; 任一步失败都留 committed journal
-    # 给启动恢复做 cleanup。
+    # committed durable 后不回滚；恢复先收敛运行态，再进入清理。
     if ! _reset_journal_write "$journal" "$snapshot" "committed" "$had_json" "$specs_json"; then
         _error "无法确认 reset committed 阶段已持久化; 保留 journal 与快照, 停止后续清理"
         return 1
     fi
-    # **运行态收敛必须早于删除账本**(二十五轮 P1): 顺序是
-    # committed → restart+verified → runtime_verified(durable) → 清快照 → 删账本。
-    # 否则在"已提交但未重启"处崩溃会留下 disk 新配置 / runtime 旧配置且无账本可查。
+    # restart+verified → durable runtime_verified → 清理；失败保留阶段与恢复源。
     if [ -x "$XRAY_BIN" ]; then
         if ! _restart_xray_verified; then
             _warn "重置已提交, 但 Xray 重启未通过验证; 事务日志保留, 下次启动会重试收敛"
@@ -1236,31 +1074,11 @@ _reset_config_locked() {
     _success "配置已重置(含 routing 规则), 节点已清空"
 }
 
-# ---------------------------------------------------------------------------
-# 检测脚本更新
-# 本地版本从 $DEPLOY_DIR/VERSION 文件读取, 远程从 GitHub raw 拉取
-# 以后只需改 VERSION 文件, 不用动代码
-# 可通过环境变量 XRAY_DEPLOY_RAW 覆盖上游 raw URL（如自建镜像/私有 fork）
-#
-# **信任模型(必须明示)**: 自更新会把下载到的 install.sh 以 root 执行。当前校验只有
-# "非空 + bash -n 语法检查" —— 二者都挡不住**恶意但语法合法**的内容。因此:
-#   * `XRAY_DEPLOY_RAW` 指向的源被视为**受信源**(自建镜像/私有 fork 由用户自己负责);
-#     该变量来自调用者环境, 若脚本被以被污染的环境拉起, 攻击者可控制下载内容。
-#   * 要真正做到来源可信, 需要上游发布**签名或校验和**并与脚本一同验证 —— 本项目尚未
-#     建立该发布流程, 故不做"假装校验"的假动作(如只比长度/前缀)。
-# 这条注释就是该取舍的显式声明; 引入校验和发布流程前, 不要移除它。
-# ---------------------------------------------------------------------------
+# 更新检查读取本地/远端 VERSION；XRAY_DEPLOY_RAW 为用户指定受信源。
+# 非空/bash -n 只验证内容/语法，不证明来源；不引入下载哈希/签名机制。
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
 
-# ---------------------------------------------------------------------------
-# 终端安全显示: 把来自外部(state 文件 / 远端 HTTP 响应)的短字符串限制在安全字符集内。
-# 这些值会被 echo -e 直接打屏, 而 echo -e 会解释 ANSI 转义 —— 一个被劫持的响应或被写坏
-# 的 state 文件就能向管理员的终端注入转义序列(改标题、伪造输出、清屏)。
-# 允许集刻意保守: 版本号/通道名只需 [0-9A-Za-z._-]。
-# ---------------------------------------------------------------------------
-# 校验 + 净化: 含任何非安全字符时**返回 1**(调用方拒绝该值), 否则原样输出。
-# 为什么不能"静默剥掉非法字符": 被劫持/损坏的响应 `v1.2.3<!--x` 会被剥成 `v1.2.3`,
-# 看起来完全合法并被当作权威版本号去比对, 从而给出"已是最新"的错误结论。
+# 外部版本/通道仅接受 [0-9A-Za-z._-]，避免 echo -e 解释转义；非法 rc 1，不剥字符伪造合法值。
 _sanitize_token() {
     case "$1" in
         ''|*[!0-9A-Za-z._-]*) return 1 ;;
@@ -1285,8 +1103,7 @@ _check_script_update() {
         _press_any_key; return
     fi
     remote=$(echo "$remote" | tr -d '[:space:]')
-    # 远端响应是外部输入: 必须**整体合法**才接受(既防 ANSI 转义注入终端, 也防
-    # "截断后看起来合法"导致的错误"已是最新"结论)。
+    # 外部版本必须整体合法，不能剥字符后误判最新版；见 _sanitize_token。
     if ! remote=$(_sanitize_token "$remote"); then
         _warn "远程版本内容异常(含非预期字符), 已忽略"
         _press_any_key; return
@@ -1308,10 +1125,7 @@ _check_script_update() {
                     _error "更新脚本下载失败(网络受限?), 当前版本未变动"
                     _press_any_key; return
                 fi
-                # R38(M13): 只判非空挡不住"截断但非空"的下载(chunked 传输、劫持插入的 HTML
-                # 片段、CDN 部分内容)。install.sh 头部就有 root 检查/依赖安装/mkdir 等副作用,
-                # 半截脚本执行到 download_all 定义前断掉会留下不可预期的中间状态。
-                # bash -n 只做语法解析、不执行任何命令, 能拦掉绝大多数截断。
+                # 执行前 bash -n 只解析不执行，拒绝语法损坏/截断的安装脚本。
                 if ! bash -n "$updater" 2>/dev/null; then
                     rm -f "$updater"
                     _error "更新脚本不完整或语法异常(下载被截断?), 当前版本未变动"
@@ -1332,16 +1146,14 @@ _check_script_update() {
     _press_any_key
 }
 
-# ---------------------------------------------------------------------------
 # Hysteria2 管理子菜单
-# ---------------------------------------------------------------------------
 _hy2_manage_menu() {
     local choice
     while true; do
         clear
         echo
         echo -e "  ${CYAN}【Xray Hy2 管理 (Xray-core 实现)】${NC}"
-        # 暂无节点守卫 (M18: CLAUDE.md 规约 — 无节点时显示警告)
+        # 无节点先提示并返回，不进入编辑。
         if ! _has_hy2_nodes; then
             echo -e "  ${YELLOW}暂无 Xray Hy2 节点${NC}"
         fi
@@ -1351,8 +1163,7 @@ _hy2_manage_menu() {
         echo -e "  ${GREEN}[3]${NC} 端口跳跃 (iptables)"
         echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
         echo -e "  ${GREEN}[5]${NC} 混淆 salamander / gecko (FinalMask.udp)"
-        # masquerade 是**另一个机制**(HTTP 页面), 不能与 [5] 的链路混淆混为一谈标为"伪装":
-        # 菜单标签必须各自点出所属配置路径, 否则用户会以为 [5] 就是伪装页面的开关。
+        # 标签区分 HTTP masquerade 与链路 FinalMask，二者独立。
         echo -e "  ${GREEN}[6]${NC} HTTP/3 伪装 masquerade (非 Hysteria 请求的 HTTP 页面)"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
@@ -1370,32 +1181,9 @@ _hy2_manage_menu() {
     done
 }
 
-# ---------------------------------------------------------------------------
-# [6] HTTP/3 页面伪装 masquerade(hysteriaSettings.masquerade)
-#
-# **本项与 [5] 混淆(FinalMask.udp)是两个独立机制** —— 菜单文案必须点明, 否则用户会把
-# "伪装"理解成混淆的别名(两者都叫"伪装"但改的是完全不同的东西):
-#   [5] finalmask.udp → 改变链路上的 QUIC 字节(抗特征识别)
-#   [6] masquerade    → 非 Hysteria 客户端连上端口时回什么 HTTP 页面(抗主动探测)
-# 用户可以只开其一, 也可以都开。
-#
-# 节点选择与 [5] 同口径: 多节点时必须先选节点(要求 7 —— 绝不能改错节点), 且提交前校验
-# 该入站**真实存在于配置中**: 元数据在而 config 被手工改过时, jq 会匹配 0 条路径并
-# 返回 0, _mutate_config 重启成功却什么都没改, 菜单却报"已设置"。
-# ---------------------------------------------------------------------------
-# 节点编号解析的唯一入口(成功时 stdout 输出 tag; 失败返回 1)。
-#
-# **为什么不能只写 `[[ $c =~ ^[0-9]+$ ]]` 然后 `$((c-1))`**:
-#   bash 算术是 64 位有符号, 超大十进制会**回绕成负数**, 而数组负索引是合法的 ——
-#   实测 choice=18446744073709551615 => idx=-2 => tags[-2] 命中**倒数第二个节点**。
-#   即"输入一个看起来完全无效的超大编号"会**改错节点**, 与"绝不能改错节点"直接冲突。
-#   该模式在 90-menu 里原有 4 处(本次新增的第 5 处在 masquerade 菜单), 故收口为唯一入口。
-#
-# 四道闸门, 顺序不可交换:
-#   ① 纯数字(任何其它字符直接拒) ② **去前导零后再限长** —— 长度闸门必须先于算术,
-#   否则超长数在 `$(( ))` 里已经回绕了 ③ 范围 1..n ④ 最后才做减一。
-# 前导零单独处理有两种必要: bash 把 `08`/`09` 当**八进制**会报错(故用 `10#` 显式十进制),
-# 且 `0000001` 这类"长但数值很小"的输入不该被长度闸门误杀。
+# masquerade 为 HTTP 页面，与 FinalMask 链路字节独立；修改先确认真实入站。
+# _hy2_select_node 成功输出 tag/失败 rc 1：数字 → 去前导零/限长 → 范围 → 减一。
+# 长度门先于算术且用 10#，防回绕/负索引及八进制误选。
 _hy2_select_node() {   # <choice> <tag1> [<tag2> ...]
     local c="${1:-}" idx
     shift || return 1
@@ -1405,13 +1193,11 @@ _hy2_select_node() {   # <choice> <tag1> [<tag2> ...]
     return 0
 }
 
-# ---------------------------------------------------------------------------
 _hy2_masq_menu() {
     local choice
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
-    # 版本门控(要求 1 的兼容性硬约束): 核心 < v26.3.23 不认该字段, Go JSON 静默忽略 ⇒
-    # 写进去也不生效, 只有被主动探测时才暴露。故在这里就拒绝, 并说清为什么。
+    # masquerade 要求 v26.3.23，旧核心静默忽略该字段，必须先拒绝。
     if ! _hy2_masq_supported; then
         _error "当前核心不支持 masquerade 页面伪装(需 Xray >= v${_HY2_MASQ_MIN_VER})"
         _tip "旧核心会静默忽略该字段(伪装不生效且无任何报错); 请先升级/切换 Xray 核心"
@@ -1436,7 +1222,7 @@ _hy2_masq_menu() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice || return 1
     [ "$choice" = "0" ] && return
-    # 编号解析收口到唯一入口: 原写法 $((choice-1)) + 负索引会让超大编号选错节点
+    # 编号经 _hy2_select_node 限长/范围校验后再索引。
     local tag
     tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
 
@@ -1472,9 +1258,7 @@ _hy2_masq_menu() {
     done
 }
 
-# 文件伪装: type=file + dir(核心 http.FileServer(http.Dir(dir)))。
-# 每个字段都是"只重问当前字段"的循环(要求 3): 输入非法时已确认的节点选择与其它字段
-# 全部保留; EOF(read 失败)一律 return 1 中止, 绝不空转、也不兜默认值。
+# file 必答字段逐项重问，EOF rc 1；保留其它已确认输入。
 _hy2_masq_set_file() {
     local tag="$1" dir why payload
     echo
@@ -1502,9 +1286,7 @@ _hy2_masq_set_file() {
     return 0
 }
 
-# 反向代理: type=proxy + url / rewriteHost / insecure。
-# 这三项都要问, 是因为它们的取值决定了"回源时 Host 头是什么"与"是否校验证书",
-# 而这两个语义用户无法从别处推断 —— 与 official Hysteria 侧形状不同, 不能互抄。
+# proxy 为扁平 url/rewriteHost/insecure 模型，不照抄官方 Hysteria 嵌套形状。
 _hy2_masq_set_proxy() {
     local tag="$1" url why ans rh="true" ins="false" xf="false" payload
     echo
@@ -1518,8 +1300,7 @@ _hy2_masq_set_proxy() {
         [ -z "$why" ] && break
         _error "URL 非法: ${why}"
     done
-    # 布尔问题必须与其它枚举同口径: 非法输入**重问**, 不能落进 *) 被静默当默认值
-    # (要求 4: 不把非法值当默认值)。空输入才是"取默认"。
+    # 布尔非法值重问，只有空输入取默认。
     while true; do
         read -rp "  转发时用目标站点的 Host 头? [Y/n]: " ans || return 1
         case "$ans" in
@@ -1563,12 +1344,7 @@ _hy2_masq_set_proxy() {
     return 0
 }
 
-# 固定字符串: type=string + content / headers / statusCode。
-# content 逐行收集(单独一行 "." 结束): 真实伪装页多是多行 HTML, 单行 read 表达不了。
-# EOF 语义在这里**有意区分**两种情况(与"必答字段 EOF 即中止"不同):
-#   - 已有内容时收到 EOF: 输入完成(与 cat 一致), 提交 —— 丢弃用户刚敲进去的 HTML 更糟;
-#   - 没有任何内容时收到 EOF: 中止本项(不写配置)。
-# 两种都不会空转。headers 逐行收集(见 _hy2_masq_headers_merge: 不能按逗号切)。
+# string 逐行以单独 . 结束；有内容 EOF 完成，无内容 EOF 取消；headers 可选逐行收集。
 _hy2_masq_set_string() {
     local tag="$1" content="" line why sc hdr_json='{}' merged payload nl got_dot
     nl=$'\n'
@@ -1596,11 +1372,7 @@ _hy2_masq_set_string() {
         _error "状态码非法: ${why}"
     done
     echo -e "  ${YELLOW}响应头(可选): 每行一条 名称: 值; 直接回车结束${NC}"
-    # EOF 语义(与"必答字段 EOF 即中止"不同, 此处**有意**允许 EOF 收尾):
-    #   响应头是**可选多行收集器** —— 空行与 EOF 在这里都只表示"不再输入"(空集合法,
-    #   headers 本就是可选的), 且此处不存在"丢弃用户已输入内容"的风险。
-    #   故 EOF 不再上抛取消: 否则 `printf "200\n" | 菜单` 这类自动化(末行无换行)会被取消。
-    #   必答字段(状态码/URL/目录…)仍一律 EOF => return 1, 见 _hysteria_ask_* 与各输入循环。
+    # 可选 headers 空行/EOF 均结束收集；必答字段 EOF 仍取消。
     while true; do
         read -rp "    响应头 (如 Content-Type: text/html; charset=utf-8): " line || break
         [ -z "$line" ] && break
@@ -1619,9 +1391,7 @@ _hy2_masq_set_string() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
 # Hysteria2: 切换 brutal / bbr
-# ---------------------------------------------------------------------------
 _hy2_congestion_txn() {
     _with_config_lock _hy2_congestion_txn_locked "$@"
 }
@@ -1647,6 +1417,10 @@ _hy2_congestion_txn_locked() {
     case "$operation" in
         congestion)
             case "$new_cc" in bbr|brutal|force-brutal) ;; *) _error "无效拥塞模式: $new_cc"; return 1 ;; esac
+            if [ "$new_cc" = "force-brutal" ] && ! _hy2_force_brutal_up_valid "$up"; then
+                _error "force-brutal 服务端上传带宽必须非零"
+                return 1
+            fi
             if [ "$new_cc" = "$cur_cc" ] && [ "$new_cc" = "$config_cc" ]; then
                 _info "已是 ${new_cc} 模式, 无需切换"
                 return 3
@@ -1683,6 +1457,10 @@ _hy2_congestion_txn_locked() {
             effective_down="$down"
             [ -n "$effective_up" ] || effective_up=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalUp // empty' 2>/dev/null)
             [ -n "$effective_down" ] || effective_down=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalDown // empty' 2>/dev/null)
+            if [ "$config_cc" = "force-brutal" ] && ! _hy2_force_brutal_up_valid "$effective_up"; then
+                _error "force-brutal 服务端上传带宽必须非零"
+                return 1
+            fi
             if ! _mutate_config --arg t "$tag" --arg up "$effective_up" --arg down "$effective_down" \
                 'if ([.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] | length) != 1 then error("Hy2 inbound changed") else (.inbounds[] | select(.tag == $t and .protocol == "hysteria") | .streamSettings.finalmask.quicParams) |= (. + (if $up != "" then {brutalUp: $up} else {} end) + (if $down != "" then {brutalDown: $down} else {} end)) end'; then
                 _error "带宽调整失败, config 事务未成功; 请核对上方回滚状态"
@@ -1738,7 +1516,7 @@ _hy2_toggle_brutal() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
-    # 编号解析收口到唯一入口: 原写法 $((choice-1)) + 负索引会让超大编号选错节点
+    # 编号经 _hy2_select_node 限长/范围校验后再索引。
     local tag
     tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
 
@@ -1763,7 +1541,11 @@ _hy2_toggle_brutal() {
     local brutal_up="" brutal_down="" txn_rc
     if [ "$new_cc" != "bbr" ]; then
         echo -e "  ${YELLOW}${new_cc} 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
-        read -rp "  上传带宽 (回车不限): " brutal_up
+        if [ "$new_cc" = "force-brutal" ]; then
+            read -rp "  服务端上传带宽 (非零必填): " brutal_up
+        else
+            read -rp "  服务端上传带宽 (回车不限): " brutal_up
+        fi
         read -rp "  下载带宽 (回车不限): " brutal_down
         brutal_up=$(_normalize_bandwidth "$brutal_up")
         brutal_down=$(_normalize_bandwidth "$brutal_down")
@@ -1793,9 +1575,7 @@ _hy2_toggle_brutal() {
     _press_any_key
 }
 
-# ---------------------------------------------------------------------------
 # Hysteria2: 调整 brutal 带宽(仅 brutal 模式)
-# ---------------------------------------------------------------------------
 _hy2_adjust_bandwidth() {
     local choice
     clear
@@ -1817,7 +1597,7 @@ _hy2_adjust_bandwidth() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
-    # 编号解析收口到唯一入口: 原写法 $((choice-1)) + 负索引会让超大编号选错节点
+    # 编号经 _hy2_select_node 限长/范围校验后再索引。
     local tag
     tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
 
@@ -1852,16 +1632,8 @@ _hy2_adjust_bandwidth() {
     _press_any_key
 }
 
-# ---------------------------------------------------------------------------
-# Hysteria2: 混淆 salamander / gecko (FinalMask.udp)
-# 官方依据: Xray-docs-next config/transports/finalmask.md「UDPMask」
-#   finalmask.udp = [ {type:"salamander", settings:{password, packetSize}} ]
-#   packetSize 为 Int32Range, 非空即启用 Gecko(QUIC 长包头额外分片填充), 上限 2048。
-# 注意: 官方文档没有 hysteriaSettings.obfs 字段; 链接侧 obfs/obfs-password 参数名
-# 来自 Hysteria 官方 URI-Scheme(Xray 文档未定义 hy2 分享链接)。
-# 输入在锁外收集; `_hy2_obfs_txn_locked` 锁内复验入站/外来层并从实际 config 捕获回滚层。
-# config、metadata 与派生同步串行提交; metadata 失败时只回滚本脚本管理的混淆层。
-# ---------------------------------------------------------------------------
+# FinalMask：salamander + 非空 packetSize 为 Gecko；URI obfs 是独立客户端模型。
+# 输入锁外，_hy2_obfs_txn_locked 锁内刷新真实层；失败仅回滚管理层。
 _hy2_obfs_txn() {
     _with_config_lock _hy2_obfs_txn_locked "$@"
 }
@@ -1970,7 +1742,7 @@ _hy2_obfs_menu() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择节点: " choice
     [ "$choice" = "0" ] && return
-    # 编号解析收口到唯一入口: 原写法 $((choice-1)) + 负索引会让超大编号选错节点
+    # 编号经 _hy2_select_node 限长/范围校验后再索引。
     local tag
     tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
 
@@ -2001,18 +1773,13 @@ _hy2_obfs_menu() {
             opw=${opw_in:-$opw}
             _validate_json_text "$opw" || { _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; _press_any_key; return; }
             if [ "$obfs_choice" = "2" ]; then
-                # gecko 需要核心支持 packetSize; 旧核心静默忽略该字段 ⇒ 服务端退化成无分片。
-                # **不支持时直接拒绝, 不自动降级** —— 用户明确选了 gecko, 替他改成另一种混淆
-                # 形态是改变请求(且客户端按 gecko 配、服务端跑 salamander)。版本门控的存在
-                # 本身已表明"旧核心无法安全承载 gecko", 故 fail-closed。
+                # Gecko 要求 packetSize 能力；不支持拒绝，不替用户降级。
                 if ! _hy2_gecko_supported; then
                     _error "当前核心不支持 gecko 分片(packetSize 需核心 >= ${_HY2_GECKO_MIN_VER}); 已取消, 未修改任何配置"
                     _tip "请先升级/切换 Xray 核心, 或改选 [1] 普通 salamander"
                     _press_any_key; return
                 fi
-                # 空输入必须落成显式尺寸: Xray 侧 packetSize 留空 = **不启用 Gecko**
-                # (退化成普通 salamander)。所填 512-1200 来自 Hysteria 官方
-                # Full-Client-Config 的 gecko 默认值, 不是 Xray 文档里的默认值。
+                # 空输入写 512-1200（Hysteria 客户端默认）；空尺寸会退化 salamander。
                 read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " osize
                 osize="${osize:-512-1200}"
                 local size_why; size_why=$(_hy2_obfs_size_invalid "$osize")
@@ -2043,11 +1810,8 @@ _hy2_obfs_menu() {
     _press_any_key
 }
 
-# 把 config 里该节点的**我们那一层** finalmask.udp 回滚为指定形态(见 _hy2_obfs_menu 的回滚路径)。
-# $2 = _hy2_obfs_mask_block 的输出; 空 ⇒ 回滚成"无混淆"(只剔除我们那层, 保留其它层),
-# 为 __INVALID__ ⇒ 改动前的元数据本身无法解析(畸形), 此时**拒绝动 config**:
-# 拿"无混淆"当回滚值会把一个可能在工作的混淆配置静默清掉, 宁可不回滚并如实报告。
-# 用法: _hy2_obfs_rollback <tag> <mask_or_empty_or_INVALID>
+# _hy2_obfs_rollback <tag> <mask_or_empty_or_INVALID> 仅恢复管理层，保留外来层。
+# 空值关闭，__INVALID__ 拒绝回滚，不把未知旧态当无混淆。
 _hy2_obfs_rollback() {
     local tag="$1" mask="$2"
     if [ "$mask" = "__INVALID__" ]; then
@@ -2062,28 +1826,11 @@ _hy2_obfs_rollback() {
             "$XD_UDP_JQ_UPSERT"
     fi
 }
-# ---------------------------------------------------------------------------
-# Reality 域名切换的**后置步骤失败回滚**(2026-09-22 九轮 OCR #43)。
-#
-# `_mutate_config` 提交之后还有三步: metadata 写入 → 分享链接重建 → clash 派生缓存同步。
-# 旧写法在这三步失败时只 `_error`/`_warn` + `continue`, 于是残局是
-# **config 已是新 SNI, 而 metadata/链接仍是旧的** —— config 是"事实"、metadata 是"声明",
-# 两者分裂后, 节点列表/分享链接/改端口/域名切换全都按 metadata 走, 用户看到的是一个
-# 与服务器实际行为不符的节点。同项目的 `_port_txn`/`_hy2_port_txn` 对同类窗口都是回滚语义。
-#
-# 还原源:
-#   · config —— `_mutate_config` 在改动前自己调过 `_backup_config`, 故
-#     `$BACKUP_DIR/confs.lastbak` 正是切换前那一份, 直接用 `_restore_config`。
-#   · metadata —— `_reality_domain_txn_locked` 在持锁后把原文读入内存, 供本事务回滚。
-# 还原后必须重新确认服务稳定(`_restart_xray_verified`), 因为它才是我方"新配置可用"的判据。
-#
-# 参数: <meta 路径> <metadata 原文>
-# 调用者: **必须**在 `_reality_domain_txn_locked` 的锁域内(见下面"锁域"一节)。
-# ---------------------------------------------------------------------------
+# _reality_switch_rollback <meta> <metadata 原文>：权威状态失败一起回滚并验证重启。
+# 须在域名事务 config lock 内，共享 lastbak 才属于本次事务；派生失败另行报告。
 _reality_switch_rollback() {
     local meta="$1" meta_prev="${2:-}" config_ok=0 runtime_ok=0 meta_ok=0
-    # 锁域是这里的前提: `_restore_config` 读的是**共享**的 `confs.lastbak`, 而它由
-    # `_backup_config` 在每次 config 写入前覆盖。锁域内保证该快照自始至终属于本次事务。
+    # _restore_config 的 lastbak 只在同一 config 锁域内属于本次事务。
     if _restore_config; then
         config_ok=1
         if _restart_xray_verified >/dev/null 2>&1; then
@@ -2112,35 +1859,10 @@ _reality_switch_rollback() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# Reality 域名切换的**整个提交事务**(2026-09-22 十轮 P1-③)。
-#
-# 九轮把"后置失败回滚"做出来了, 但回滚源是**共享的** `confs.lastbak`, 而该文件只在
-# `_mutate_config` 内部被锁保护 —— 事务的其余部分(metadata 写入、链接重建、失败回滚)都在
-# 锁**外**。于是并发场景: A 的 `_mutate_config` 提交并释放锁 → B 修改 config(覆盖 lastbak)
-# → A 的后置步骤失败 → A 用 **B 的快照**回滚, 把 B 已提交的改动静默抹掉(丢失更新)。
-# 同文件的 `_reality_port_txn` / `_hy2_port_txn` 早已是"整个事务在锁内"的形态 —— 这条路径
-# 漏了同一层保护。
-#
-# 锁域范围: config 提交 → metadata → 链接重建 → 失败回滚, 全部在 `_with_config_lock` 内。
-# 提问与后量子网络探测留在锁外; topology、tunnel tag 与 rollback metadata 在锁内刷新。
-# `_mutate_config` 经 XRAY_DEPLOY_LOCK_HELD 可重入, 不会自锁死(与 _reality_port_txn 同款)。
-#
-# 参数: <tag> <meta> <new_sni> <pq_seed> <pq_verify> <allow_missing_tunnel>
-# 返回: 0 = 提交成功;
-#       1 = 失败但已完整回滚(原因已打印, 调用方无需再回滚);
-#       2 = 失败且回滚不完整(原因与人工核对点已打印);
-#       3 = 权威状态已提交, 仅分享链接未更新(见下, **刻意不回滚**)。
-#
-# 为什么"链接重建失败"不与另外四处后置写失败同待遇: 那一刻 config 与 metadata **都**已经是
-# 新 SNI(两者一致), 不一致的只有 metadata 里的 `.share_link` 这个**派生字段**; 而重建失败的
-# 根因是元数据本来就缺必填字段(不是本次改动造成的), 回滚并不会把它变好, 只会让这类节点永远
-# 切不了域名。九轮把"消费返回值并如实告警"作为这条路径的终态, 本轮回滚只针对**权威状态之间**
-# 的分裂, 故保持该口径(行为与改动前逐字一致)。
-# 新分享链接不回传: 锁体在**子 shell** 里跑, 变量带不出去, 而 stdout 又会被 direct 后端
-# 启动路径的 "running" 污染。成功路径直接回读 metadata 的 `.share_link` —— 它就是本事务
-# 刚刚原子写入的那个值, 比另开一条回传通道更少活动部件。
-# ---------------------------------------------------------------------------
+# _reality_domain_txn_locked <tag> <meta> <new_sni> <pq_seed> <pq_verify> <allow_missing_tunnel>
+# config → metadata → 链接及回滚整体持 config lock；交互/PQ 锁外，状态锁内刷新。
+# rc 0=成功，1=失败已回滚，2=回滚不完整，3=权威态已提交仅链接未更新。
+# 链接缺字段不回滚一致权威态；成功回读 metadata，避免子 shell 输出污染。
 _reality_domain_txn() {
     _with_config_lock _reality_domain_txn_locked "$@"
 }
@@ -2194,8 +1916,7 @@ _reality_domain_txn_locked() {
             fi
         fi
     fi
-    # 仅 config/metadata 提交与本地重启验证持锁; 用户确认与后量子网络探测都在锁外完成。
-    # `_mutate_config` 的备份与 metadata 原文快照均在此临界区内, 回滚不会覆盖并发会话。
+    # config/metadata/verified restart 同锁，交互与 PQ 探测锁外，避免覆盖并发状态。
     if [ -n "$pq_seed" ]; then
         _mutate_config --arg t "$tag" --arg sni "$new_sni" --arg seed "$pq_seed" \
              --arg tg "$tunnel_tag" --arg dom "$new_sni" --arg new_tg "$new_tunnel_tag" \
@@ -2241,7 +1962,7 @@ _reality_domain_txn_locked() {
                         else . end)
                 else . end' || return 1
     fi
-    # 更新元数据(R42: 同时回填 reality_mode, 使旧节点元数据自描述)
+    # 同步元数据及 reality_mode，明确节点拓扑。
     if [ -n "$new_tunnel_tag" ]; then
         _meta_update "$meta" '.sni=$sni | .mldsa65_verify=$pqv | .tunnel_tag=$new_tg | .reality_mode=$rm' \
             --arg sni "$new_sni" --arg pqv "$pq_verify" --arg new_tg "$new_tunnel_tag" --arg rm "$rmode" || {
@@ -2255,7 +1976,7 @@ _reality_domain_txn_locked() {
             --arg sni "$new_sni" --arg pqv "$pq_verify" --arg rm "$rmode" || {
                 _reality_switch_rollback "$meta" "$meta_prev" && return 1 || return 2; }
     fi
-    # R38(M10): 消费 rebuild 返回码 —— SNI 已改, 但链接重建失败时不能写入空/坏链接
+    # SNI 已提交；链接重建失败返回3，保留旧链接。
     local newlink=""
     if ! newlink=$(_rebuild_reality_link "$meta") || [ -z "$newlink" ]; then
         _warn "域名已切换为 ${new_sni}, 但分享链接重建失败(元数据缺少必要字段), 链接未更新"
@@ -2281,7 +2002,7 @@ _reality_domain_menu() {
         local tag name sni
         tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); sni=$(jq -r '.sni' "$f")
         tags+=("$tag")
-        # R42: 显示拓扑 —— 直连节点切域名要同时改 target, tunnel 节点要改 tunnel/路由
+        # 显示实际拓扑；域名切换按 direct/tunnel 分别更新目标。
         local mlabel="隧道"
         [ "$(_reality_node_mode "$tag")" = "direct" ] && mlabel="直连"
         printf "  ${GREEN}[%d]${NC} %-24s [%s] 当前域名: %s\n" "$i" "$name" "$mlabel" "$sni"
@@ -2300,7 +2021,7 @@ _reality_domain_menu() {
     local new_sni
     read -rp "  新伪装域名 (回车取消): " new_sni
     [ -z "$new_sni" ] && { _info "已取消"; _press_any_key; continue; }
-    # R38(P1): 新 SNI 会被拼进新 tunnel tag, 含空格/引号会破坏按 tag 的关联匹配
+    # SNI 同时组成 tunnel tag，先校验域名避免关联失效。
     if ! _validate_domain "$new_sni"; then
         _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $new_sni"
         _press_any_key; continue
@@ -2308,10 +2029,7 @@ _reality_domain_menu() {
 
     local new_target="${new_sni}:443"
 
-    # 后量子检测(新域名可能支持或不支持)。**必须按三态返回码分流**(十二轮复审 P2):
-    # 0=支持 / 1=明确不支持(可安全移除旧 PQ) / 2=探测失败或环境异常(结论未知)。
-    # 把 2 归到 1 会在一次临时网络故障后删掉节点上已生效的 mldsa65Seed/mldsa65_verify ——
-    # 等于用一次失败的探测完成不可逆降级。结论未知就不动: 直接取消本次域名切换。
+    # PQ rc 0=支持/1=确认不支持/2=未知；未知取消切换，不移除旧 PQ。
     local pq_seed="" pq_verify="" pq_rc=0
     _detect_reality_pq "$new_target" || pq_rc=$?
     case "$pq_rc" in
@@ -2349,8 +2067,7 @@ _reality_domain_menu() {
     _reality_domain_txn "$tag" "$meta" "$new_sni" "$pq_seed" "$pq_verify" "$allow_missing_tunnel"
     local txn_rc=$?
     if [ "$txn_rc" -ne 0 ]; then
-        # 1 = 失败但已完整回滚 / 2 = 回滚不完整 / 3 = 权威状态已提交但链接未更新。
-        # 三种都由事务体自己打印了原因与后续动作, 这里只补一句"改动未完成"的总括。
+        # rc 1/2/3 的具体恢复状态由事务体报告，契约见 _reality_domain_txn_locked。
         [ "$txn_rc" -eq 2 ] && _tip "本次改动未完成, 请按上方提示人工核对后重试"
         _press_any_key; continue
     fi
@@ -2359,9 +2076,7 @@ _reality_domain_menu() {
     result_mode=$(_reality_node_mode "$tag")
     newlink=$(jq -r '.share_link // empty' "$meta" 2>/dev/null)
     [ -n "$newlink" ] || _warn "未能读回新分享链接, 请用 [查看节点] 查看: $meta"
-    # F1: servername(域名)变化需同步 clash 派生缓存, 否则订阅仍指向旧伪装域名。
-    # **返回值必须消费**(2026-09-22 九轮 OCR #45): clash 是可再生的派生缓存, 失败**不回滚**
-    # 权威状态(与 hy2 侧同口径), 但"报成功却仍指向旧域名"必须让用户看见。
+    # clash 是派生缓存；同步失败告警，不回滚已一致权威态。
     if ! _sync_node_clash "$meta"; then
         _warn "clash 派生缓存同步失败, 订阅里的条目仍是旧伪装域名"
         _tip "可重新执行一次本操作, 或删除后重建该节点以重建 clash 条目"

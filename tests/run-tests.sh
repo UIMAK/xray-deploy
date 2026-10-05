@@ -135,7 +135,7 @@ else
     pass 'unreadable conf dir makes _config_jq fail visibly'
 fi
 _config_write_merged '{"log":{"loglevel":"warning"}}' >/dev/null 2>&1
-# 改 DNS 段(需求4): 仍然只动 04_dns.json, 其余字段文件原样保留。
+# DNS 编辑只动 04_dns.json, 其余字段文件原样保留。
 # 场景1: 核心预检直接拒绝候选配置 ⇒ 必须保留原配置。_config_edit_preflight 要求 XRAY_BIN
 # 可执行, 且 _xray_test_config_dir 要在候选目录上跑真核心; 套件用"可执行空壳 + 恒拒绝"
 # 桩来驱动这条拒绝路径(全部限制在子 shell 内, 不泄漏给后续断言)。
@@ -188,8 +188,27 @@ check_eq 'dns restore default uses the shared constant' \
     "$(jq -cS . <<<"$XRAY_DEFAULT_DNS_JSON")" "$(_config_jq -cS '.dns')"
 rm -f "$XRAY_BIN"
 
+check 'default DNS races equivalent adjacent upstreams' _config_jq -e '
+    .dns.enableParallelQuery == true
+    and (.dns.servers | length == 3)
+    and (.dns.servers | map(del(.address)) | unique | length == 1)
+    and (.dns.servers | all(.address | startswith("https+local://")))'
+check 'routing domain alias references geo data' jq -e "$GEO_RULE_REF_JQ" <<< '{"domains":["geosite:cn"]}'
+check 'routing alias supports inverted external geo references' jq -e "$GEO_RULE_REF_JQ" <<< '{"domains":["!ext:custom.dat:cn"]}'
+if jq -e "$GEO_RULE_REF_JQ" <<< '{"domains":["domain:example.com"]}' >/dev/null; then
+    fail 'literal routing alias does not consume geo data'
+else pass 'literal routing alias does not consume geo data'; fi
+_config_write_merged '{"dns":{"servers":[{"unexpectedIPs":["geoip:private","!ext:custom.dat:cn"]}],"hosts":{"geosite:cn":"127.0.0.1","ext:hosts.dat:ads":"127.0.0.1","domain:example.com":"127.0.0.1"}},"routing":{"rules":[]}}'
+check_eq 'DNS counts unexpectedIPs and geo hosts keys' '4' "$(_route_dns_geo_count)"
+_config_write_merged '{"dns":{"servers":[{"domains":["geosite:cn"],"expectedIPs":["geoip:cn"],"expectIPs":["ext:custom.dat:cn"]}]}}'
+check_eq 'DNS retains existing geo field coverage' '3' "$(_route_dns_geo_count)"
+_config_write_merged '{"dns":{"hosts":{"!geosite:cn":"127.0.0.1","ext:hosts.dat:ads":"127.0.0.1","domain:example.com":"127.0.0.1"}}}'
+check_eq 'DNS hosts keys count even without upstream objects' '2' "$(_route_dns_geo_count)"
+_config_write_merged '{"dns":{"hosts":null,"servers":["1.1.1.1"]}}'
+check_eq 'DNS missing optional fields consumes no geo data' '0' "$(_route_dns_geo_count)"
+
 printf '== launch contract (confdir + strict JSON) ==\n'
-# 需求3 的启动契约: confdir 与 XRAY_JSON_STRICT 只能通过启动参数/shell 环境传, **绝不能**写进
+# 启动契约: confdir 与 XRAY_JSON_STRICT 只能通过启动参数/shell 环境传, 不能写进
 # config 的 env 段 —— Xray 必须先选定 JSON 解析器才能读配置。这里注入 env 后检查配置里除了
 # XRAY_LOCATION_ASSET 没有别的键、且没有任何值指向 confs 目录; 有人"顺手"把严格开关塞进
 # env 段时这条会立刻变红。
@@ -241,7 +260,7 @@ check_eq 'Geo off marker persists' off_pending "$(_state_get "$GEO_TRANSITION_KE
 printf '{"name":"shared-name"}\n' > "$NODES_DIR/xray.json"
 if _hysteria_name_taken shared-name; then pass 'shared Clash name collision rejected'; else fail 'shared Clash name collision rejected'; fi
 rm -f "$NODES_DIR/xray.json"
-# 十二轮 P1: Xray Hy2 的协议键是 `hysteria`, 旧判据查的却是 Xray 里**不存在**的 "hysteria2"
+# Xray Hy2 的协议键是 `hysteria`, 与节点元数据中的 "hysteria2" 区分。
 # ⇒ Hy2 节点落在跳跃范围内时被静默放行(该 UDP 端口随后被官方 REDIRECT 抢走)。
 # `.port` 又是 PortList(单端口 / 范围 / 逗号多段) ⇒ 必须按区间相交判定, 不能等值比较。
 # NODES_DIR 指向空目录, 使这些断言只检验 config 入站分支(分支 c 另有专测)。
@@ -339,7 +358,7 @@ check 'netstat fallback excludes own UDP socket' _test_udp_snapshot netstat 4000
 check 'netstat own exclusion preserves other conflicts' _test_udp_snapshot netstat 40000 40002 40000 1 $'udp 0 0 0.0.0.0:40000 0.0.0.0:*\nudp6 0 0 :::40001 :::*'
 check 'ss preferred when both tools exist' _test_udp_snapshot ss 40000 40002 '' 1 'UNCONN 0 0 0.0.0.0:40001 0.0.0.0:*'
 
-# 十三轮复审: shadowsocks 缺 `network` 在核心里是 nil ⇒ [TCP]
+# Shadowsocks 缺 `network` 在核心里默认为 TCP。
 # (infra/conf/common.go 的 (*NetworkList).Build(): nil 返回 net.Network_TCP), 官方文档
 # inbounds/shadowsocks.md 也写"默认 tcp" ⇒ 默认 SS 入站**不监听 UDP**, 不得被误判成冲突。
 if _xh_hop_conflict '{"protocol":"shadowsocks","port":31500,"settings":{"method":"aes-256-gcm"}}' 20000 40000; then
@@ -381,7 +400,7 @@ else
     pass 'PQ malformed output rejected and globals cleared'
 fi
 
-# 十二轮 P2: 返回码三态 —— 只有"探测成功且目标客观上不支持"才是 1(调用方可安全移除旧 PQ);
+# PQ 返回码三态: 只有探测成功且目标不支持才是 1(调用方可移除旧 PQ);
 # 探测/取键失败或环境异常必须是 2(结论未知)。原实现把两者压成 1, 于是**一次临时网络超时**
 # 就会让域名切换删掉节点上已生效的 mldsa65Seed/mldsa65_verify。
 _pq_rc() {   # 输出 _detect_reality_pq 的返回码(0/1/2)
@@ -559,7 +578,7 @@ fi
 flock -u "$TEST_LOCK_FD"; eval "exec ${TEST_LOCK_FD}>&-"
 
 printf '== clash derivation runs under the config lock ==\n'
-# 十二轮 P2: clash.yaml 是 Xray 节点与官方 Hysteria 节点**共用**的派生文件, 追加/替换/去重
+# clash.yaml 是 Xray 节点与官方 Hysteria 节点共用的派生文件, 追加/替换/去重
 # 都是读-改-写 ⇒ 不进 config lock 就会丢条目。探针把"写"缩短成记录锁状态, 观察写发生时
 # 是否持有 flock 后端见证标记 —— 见证目录只在持锁期间存在(`_xray_primary_flock_marker_take`)。
 CLASH_PROBE_META="$TMP/clash-probe.json"
@@ -720,7 +739,7 @@ if (
     [ "$(jq -r '.settings.password' <<< "$ss_config")" = "$R_PASSWORD" ] || exit 1
     R_AUTH='hello&world' R_CERT_FILE=/cert R_KEY_FILE=/key R_CONGESTION=bbr
     hy=$(_render_template "$ROOT/templates/hysteria2.server.jsonc") || exit 1
-    [ "$(jq -r '.settings.users[0].auth' <<< "$hy")" = "$R_AUTH" ]
+    [ "$(jq -r '(.settings.clients // .settings.users)[0].auth' <<< "$hy")" = "$R_AUTH" ]
 ); then pass 'template path password and auth preserve ampersands'; else fail 'template path password and auth preserve ampersands'; fi
 
 if (
@@ -813,5 +832,16 @@ _test_direct_config_source() (
 )
 check 'direct restored legacy service starts from existing single file' _test_direct_config_source legacy
 check 'direct migrated service prefers nonempty confdir' _test_direct_config_source confdir
+
+# 专属行为套件在独立进程内运行, 不泄漏服务/配置桩到本套件。
+for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh; do
+    if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then
+        tail -n 1 "$TMP/$suite.log"
+        pass "alignment suite $suite"
+    else
+        tail -n 12 "$TMP/$suite.log"
+        fail "alignment suite $suite"
+    fi
+done
 printf 'passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
