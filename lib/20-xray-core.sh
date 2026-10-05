@@ -2192,6 +2192,8 @@ _install_or_switch_xray_locked() {
         _tip "请先按提示处理: $(_xray_core_journal_path) / $(_xray_core_blocked_path)"
         return 1
     fi
+    # 在旧 service 快照前完成布局迁移, 回滚快照始终引用存在的配置路径。
+    _config_migrate_legacy || return 1
     cur=$(_xray_current_version 2>/dev/null) || cur=""
     prev_channel=$(_state_get channel 2>/dev/null) || prev_channel=""
 
@@ -2227,12 +2229,6 @@ _install_or_switch_xray_locked() {
         return 1
     fi
 
-    if declare -F _config_migrate_legacy >/dev/null 2>&1; then
-        if ! _config_migrate_legacy; then
-            _xray_core_abort_locked "旧单文件配置迁移失败, 中止安装/切换"
-            return 1
-        fi
-    fi
     if ! _init_config_if_empty; then
         _xray_core_abort_locked "配置初始化失败, 中止安装/切换"
         return 1
@@ -3078,7 +3074,11 @@ _manage_xray() {
                         echo "running"
                     else
                         rm -f /run/xray.pid
-                        XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true nohup "$XRAY_BIN" run -confdir "$CONFIG_DIR" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- &
+                        local -a config_args=(-confdir "$CONFIG_DIR")
+                        if ! _config_present && [ -s "$LEGACY_CONFIG_FILE" ]; then
+                            config_args=(-config "$LEGACY_CONFIG_FILE")
+                        fi
+                        XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true nohup "$XRAY_BIN" run "${config_args[@]}" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- &
                         _xd_pidfile_write /run/xray.pid "$!"
                         sleep 1
                         dpid1=$(_xd_pidfile_pid /run/xray.pid)

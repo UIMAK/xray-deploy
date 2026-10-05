@@ -283,7 +283,7 @@ check 'shadowsocks network=tcp,udp flagged' _xh_hop_conflict \
 if _xh_hop_conflict '{"protocol":"shadowsocks","port":31500,"settings":{"network":"tcp"}}' 20000 40000; then fail 'TCP-only shadowsocks not flagged'; else pass 'TCP-only shadowsocks not flagged'; fi
 check 'mkcp transport inbound flagged' _xh_hop_conflict \
     '{"protocol":"vless","port":31500,"streamSettings":{"network":"mkcp"}}' 20000 40000
-if _xh_hop_conflict '{"protocol":"hysteria","port":443}' 443 50000 443; then fail 'own listen port exempt from hop conflict'; else pass 'own listen port exempt from hop conflict'; fi
+check 'own socket exclusion does not exclude Xray inbound' _xh_hop_conflict '{"protocol":"hysteria","port":443}' 443 50000 443
 
 SEED=$(head -c 32 /dev/zero | base64 | tr '+/' '-_' | tr -d '=')
 VERIFY=$(head -c 1952 /dev/zero | base64 | tr -d '=\n' | tr '+/' '-_')
@@ -576,5 +576,171 @@ if (
     [ -e "$TMP/hysteria-stop-verified" ]
 ); then pass 'transient Hysteria validation uses terminal stop verifier'; else fail 'transient Hysteria validation uses terminal stop verifier'; fi
 
+printf '== approved repair regressions ==\n'
+if (
+    CONFIG_DIR="$TMP/duplicate-confs"
+    mkdir -p "$CONFIG_DIR"
+    printf '{"inbounds":[{"tag":"one"}]}' > "$CONFIG_DIR/one.json"
+    printf '{"inbounds":[{"tag":"two"}]}' > "$CONFIG_DIR/two.json"
+    _config_merged >/dev/null 2>&1 && exit 1
+    _config_write_merged '{"inbounds":[]}' >/dev/null 2>&1 && exit 1
+    [ "$(jq -r '.inbounds[0].tag' "$CONFIG_DIR/one.json")" = one ] &&
+        [ "$(jq -r '.inbounds[0].tag' "$CONFIG_DIR/two.json")" = two ]
+); then pass 'duplicate top-level fragments refuse read/write without data loss'; else fail 'duplicate top-level fragments refuse read/write without data loss'; fi
+if (
+    CONFIG_DIR="$TMP/delete-failure-confs"
+    _config_write_merged '{"dns":{"servers":["1.1.1.1"]}}' || exit 1
+    rm() { [ "${*: -1}" = "$CONFIG_DIR/04_dns.json" ] && return 1; command rm "$@"; }
+    _config_write_merged '{}' >/dev/null 2>&1 && exit 1
+    [ -f "$CONFIG_DIR/04_dns.json" ]
+); then pass 'field deletion failure propagates'; else fail 'field deletion failure propagates'; fi
+
+_test_migration_restore() (
+    local failure="$1" state="$2"
+    CONFIG_DIR="$TMP/migration-$failure-$state/confs"
+    LEGACY_CONFIG_FILE="$TMP/migration-$failure-$state/config.json"
+    XRAY_BIN=/bin/true
+    local unit="$TMP/migration-$failure-$state/service" attempts=0 current="$state"
+    mkdir -p "$CONFIG_DIR"
+    printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
+    printf 'legacy-service' > "$unit"
+    _xray_service_unit_path() { printf '%s' "$unit"; }
+    _xray_service_snapshot_enable() { printf disabled > "$2"; }
+    _xray_service_restore_enable() { [ "$failure" != enable ] && [ "$(cat "$1")" = disabled ]; }
+    _xray_service_restore_file() { cp "$1" "$2"; }
+    _manage_xray() { case "$1" in status) printf '%s' "$current" ;; stop) current=stopped ;; esac; }
+    _create_xray_service() { printf confdir-service > "$unit"; [ "$failure" != service ] && [ "$failure" != enable ]; }
+    _restart_xray_verified() { attempts=$((attempts+1)); current=running; [ "$failure" = enable ] || [ "$attempts" -gt 1 ]; }
+    _config_migrate_legacy >/dev/null 2>&1 && exit 1
+    [ -f "$LEGACY_CONFIG_FILE" ] && [ ! -e "$LEGACY_CONFIG_FILE.bak" ] &&
+        [ "$(cat "$unit")" = legacy-service ] && ! _config_present &&
+        [ "$current" = "$state" ]
+)
+check 'restart failure restores legacy layout and running state' _test_migration_restore restart running
+check 'service creation failure restores legacy layout and stopped state' _test_migration_restore service stopped
+check 'enable restoration failure still restarts restored running service' _test_migration_restore enable running
+if (
+    CONFIG_DIR="$TMP/stopped-migration/confs"
+    LEGACY_CONFIG_FILE="$TMP/stopped-migration/config.json"
+    XRAY_BIN=/bin/true
+    mkdir -p "$CONFIG_DIR"; printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
+    _xray_service_unit_path() { return 1; }
+    _manage_xray() { printf stopped; }
+    _create_xray_service() { return 0; }
+    _restart_xray_verified() { return 1; }
+    _config_migrate_legacy >/dev/null 2>&1 && [ -f "$LEGACY_CONFIG_FILE.bak" ]
+); then pass 'successful migration leaves stopped service stopped'; else fail 'successful migration leaves stopped service stopped'; fi
+if (
+    _xray_core_txn_recover_locked() { return 0; }
+    _xray_core_txn_pending() { return 1; }
+    _config_migrate_legacy() { printf migrated > "$TMP/ordered-migration"; }
+    _xray_core_journal_write() { [ -f "$TMP/ordered-migration" ] && printf seen > "$TMP/ordered-journal"; return 1; }
+    _install_or_switch_xray_locked stable "$TMP" v26.9.9 >/dev/null 2>&1
+    [ -f "$TMP/ordered-journal" ]
+); then pass 'migration precedes core journal and service snapshot'; else fail 'migration precedes core journal and service snapshot'; fi
+
+if (
+    R_LISTEN=127.0.0.1 R_PORT=12345 R_TAG=test
+    R_UUID=11111111-1111-1111-1111-111111111111 R_HOST=example.com R_PATH='/api?a=1&b=2'
+    ws=$(_render_template "$ROOT/templates/vless-ws-cdn.server.jsonc") || exit 1
+    [ "$(jq -r '.streamSettings.wsSettings.path' <<< "$ws")" = "$R_PATH" ] || exit 1
+    R_METHOD=aes-256-gcm R_PASSWORD='hello&world' R_NETWORK=tcp
+    ss_config=$(_render_template "$ROOT/templates/shadowsocks.server.jsonc") || exit 1
+    [ "$(jq -r '.settings.password' <<< "$ss_config")" = "$R_PASSWORD" ] || exit 1
+    R_AUTH='hello&world' R_CERT_FILE=/cert R_KEY_FILE=/key R_CONGESTION=bbr
+    hy=$(_render_template "$ROOT/templates/hysteria2.server.jsonc") || exit 1
+    [ "$(jq -r '.settings.users[0].auth' <<< "$hy")" = "$R_AUTH" ]
+); then pass 'template path password and auth preserve ampersands'; else fail 'template path password and auth preserve ampersands'; fi
+
+if (
+    CF_BIN="$TMP/cloudflared"
+    _cf_service_bin() { printf '%s' "$CF_BIN"; }
+    _cf_unit_path() { printf '%s' "$TMP/cf-service"; }
+    CF_CUR_CMDLINE="command=$CF_BIN"$'\n''command_args="--no-autoupdate tunnel --protocol http2 --edge-ip-version 4 run --token TOKEN"'
+    _cf_managed_flags_only || exit 1
+    CF_CUR_CMDLINE="${CF_CUR_CMDLINE%\"} --metrics localhost:1234\""
+    ! _cf_managed_flags_only
+); then pass 'OpenRC managed commands accepted but custom flags rejected'; else fail 'OpenRC managed commands accepted but custom flags rejected'; fi
+
+_test_xray_hop_conflict() (
+    CONFIG_DIR="$TMP/xray-hop-check/confs"
+    NODES_DIR="$TMP/xray-hop-check/nodes"
+    mkdir -p "$NODES_DIR"
+    _config_write_merged '{"inbounds":[]}' || exit 1
+    printf '%s' "$1" > "$NODES_DIR/xh.json"
+    ! _hysteria_check_hop_conflicts 40001 40001 >/dev/null 2>&1
+)
+check 'official single listen rejects Xray singleton hop' _test_xray_hop_conflict '{"hop_ranges":"40001"}'
+check 'official single listen rejects Xray range hop' _test_xray_hop_conflict '{"hop_ranges":"40000-40002"}'
+check 'official checks legacy udp_hop_ports' _test_xray_hop_conflict '{"udp_hop_ports":"40000-40002"}'
+check 'official checks legacy hop_start and hop_end' _test_xray_hop_conflict '{"hop_start":40000,"hop_end":40002}'
+if _xh_hop_conflict '{"protocol":"vless","port":443,"streamSettings":{"network":"tcp"}}' 443 443; then fail 'official UDP single port permits same-number TCP inbound'; else pass 'official UDP single port permits same-number TCP inbound'; fi
+
+_test_official_port_menu() (
+    local mode="$1" port="$2" udp="$3"
+    CONFIG_DIR="$TMP/official-menu-$mode-$port-$udp/confs"
+    NODES_DIR="$TMP/official-menu-$mode-$port-$udp/nodes"
+    HYSTERIA_CONFIG="$TMP/official-menu-$mode-$port-$udp/hy.json"
+    mkdir -p "$NODES_DIR"
+    if [ "$udp" = tcp ]; then
+        _config_write_merged '{"inbounds":[{"protocol":"vless","port":443,"streamSettings":{"network":"tcp"}}]}' || exit 1
+    else
+        _config_write_merged '{"inbounds":[]}' || exit 1
+        printf '{"hop_ranges":"40000-40002"}' > "$NODES_DIR/xh.json"
+    fi
+    printf '{"listen":":8443"}' > "$HYSTERIA_CONFIG"
+    local committed=""
+    _hysteria_gate() { return 0; }
+    clear() { :; }
+    _hysteria_config_txn() { committed=yes; }
+    _hysteria_rebuild_all_links() { :; }
+    _press_any_key() { :; }
+    _hysteria_port_menu >/dev/null 2>&1 <<< "$mode"$'\n'"$port"$'\n0'
+    if [ "$udp" = tcp ]; then [ "$committed" = yes ]; else [ -z "$committed" ]; fi
+)
+check 'official change-listen menu rejects DNAT hop overlap' _test_official_port_menu 1 40001 udp
+check 'official disable-hop menu rejects DNAT hop overlap' _test_official_port_menu 3 40001 udp
+check 'official change-listen menu permits TCP-only same number' _test_official_port_menu 1 443 tcp
+
+if (
+    CONFIG_DIR="$TMP/first-install/confs"
+    LEGACY_CONFIG_FILE="$TMP/first-install/config.json"
+    XRAY_BIN="$TMP/first-install/absent-binary"
+    mkdir -p "$CONFIG_DIR"; printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
+    _create_xray_service() { exit 1; }
+    _config_migrate_legacy >/dev/null 2>&1 && [ -f "$LEGACY_CONFIG_FILE.bak" ] && _config_present
+); then pass 'offline legacy migration does not require installed binary'; else fail 'offline legacy migration does not require installed binary'; fi
+if (
+    CONFIG_DIR="$TMP/broken-duplicate/confs"
+    mkdir -p "$CONFIG_DIR"
+    printf '{"dns":{}}' > "$CONFIG_DIR/a.json"
+    printf '{"dns":{}}' > "$CONFIG_DIR/b.json"
+    printf broken > "$CONFIG_DIR/broken.json"
+    ! _config_write_merged '{}' >/dev/null 2>&1
+); then pass 'malformed fragment cannot bypass duplicate field guard'; else fail 'malformed fragment cannot bypass duplicate field guard'; fi
+_test_direct_config_source() (
+    local layout="$1"
+    CONFIG_DIR="$TMP/direct-$layout/confs"
+    LEGACY_CONFIG_FILE="$TMP/direct-$layout/config.json"
+    mkdir -p "$CONFIG_DIR"
+    printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
+    [ "$layout" != confdir ] || printf '{"inbounds":[]}' > "$CONFIG_DIR/07_inbounds.json"
+    INIT_SYSTEM=direct XRAY_DEPLOY_CORE_LOCK_HELD=1
+    _xd_pidfile_pid() { printf '%s' "$$"; }
+    _xd_pidfile_identity_ok() { return 1; }
+    _xd_pidfile_write() { :; }
+    sleep() { :; }
+    rm() { [ "$1" = -f ] && [ "$2" = /run/xray.pid ]; }
+    cat() { if [ "$1" = "/proc/$$/comm" ]; then printf xray; else command cat "$@"; fi; }
+    nohup() { printf '%s\n' "$@" > "$TMP/direct-$layout/args"; }
+    _manage_xray start >/dev/null 2>&1
+    wait
+    local expected=-config source="$LEGACY_CONFIG_FILE"
+    if [ "$layout" = confdir ]; then expected=-confdir; source="$CONFIG_DIR"; fi
+    [ "$(sed -n '3p' "$TMP/direct-$layout/args")" = "$expected" ] &&
+        [ "$(sed -n '4p' "$TMP/direct-$layout/args")" = "$source" ]
+)
+check 'direct restored legacy service starts from existing single file' _test_direct_config_source legacy
+check 'direct migrated service prefers nonempty confdir' _test_direct_config_source confdir
 printf 'passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
