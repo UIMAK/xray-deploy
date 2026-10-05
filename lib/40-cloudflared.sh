@@ -1,41 +1,15 @@
 #!/bin/bash
-# =============================================================================
-# lib/40-cloudflared.sh — cloudflared 管理
-# 需求 R5:
-#   - 安装(架构自适应下载) / 卸载(彻底清) / 切换令牌
-#   - 安装走官方 `cloudflared service install <token>`, 不写 config.yml(路由在 CF Web 配)
-#   - 改参数/令牌 = 直接改 /etc/systemd/system/cloudflared.service 或 /etc/init.d/cloudflared 启动行
-#   - 3 项设置: 自动更新 (--autoupdate-freq 24h0m0s / --no-autoupdate)
-#               HTTP/2   (--protocol http2 / 不写)
-#               协议栈   (--edge-ip-version 4|6|auto / 不写)
-#   - cloudflared 是唯一例外, 落官方默认点, 不收口 /opt/xray-deploy
-# ============================================================================
 
-# cloudflared 开关状态文件(持久化供手动查看, 运行时从 service 文件解析)
 CF_STATE_AUTOUPDATE="$STATE_DIR/cf_autoupdate"     # on|off
 CF_STATE_HTTP2="$STATE_DIR/cf_http2"               # on|off
 CF_STATE_EDGE_IP="$STATE_DIR/cf_edge_ip"           # off|4|6|auto
-CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 安装时的 token
+CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 仅清理旧版本遗留
 
-# cloudflared 收到 SIGTERM 后的优雅退出窗口: 停止接受新请求, 等在途请求结束
-# (官方 `--grace-period` 默认 30s, 也可由 TUNNEL_GRACE_PERIOD 覆盖)。_cf_kill_all
-# 必须在这个窗口内等它**自然退出**, 提前 SIGKILL 会硬断正在处理的隧道请求。
-# **窗口长度以 service 自己的配置为准**(见 _cf_grace_wait_seconds), 这里只有默认值与余量 ——
-# 写死一个数字就等价于"用户配了 60s 优雅退出、脚本仍在 35s 强杀", 与"3s 强杀"是同一个
-# 错误, 只是窗口大了一点。余量只作为"等到什么时候才允许升级到 SIGKILL"的上界, 停完即
-# 返回, 不是固定等待。
-# 注意这个窗口**不是**最终上界: 更外层还有 systemd 自己的停止超时(官方 unit 未设
-# TimeoutStopSec, 由 manager 的 DefaultTimeoutStopSec 决定), 它更短时 cloudflared 会被
-# systemd 提前终止。脚本无法单方面改变它, 只能如实告知 —— 见
-# _cf_systemd_stop_timeout_seconds / _cf_check_stop_timeout_covers。
 CF_GRACE_DEFAULT=30    # 官方 --grace-period 默认值
 CF_GRACE_MARGIN=5      # 余量: 不在宽限期到点的同一瞬间强杀
 CF_GRACE_MAX=300       # 上限: 防病态配置(cloudflared 自身只接受 <=3 分钟, 4h 只可能是手写错误)
 CF_STOP_REVERIFY=5     # 强杀后复验 systemd 停止终态的上界(进程已死, 只剩 unit 事务)
 
-# ---------------------------------------------------------------------------
-# 架构 -> cloudflared 下载资产名
-# ---------------------------------------------------------------------------
 _cf_arch_tag() {
     case "$(_detect_arch)" in
         amd64) echo "amd64" ;;
@@ -44,9 +18,6 @@ _cf_arch_tag() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# 安装 cloudflared 二进制
-# ---------------------------------------------------------------------------
 _install_cloudflared_bin() {
     if [ -d "$CF_BIN" ]; then
         _error "cloudflared 目标路径是目录, 拒绝安装: $CF_BIN"
@@ -60,11 +31,6 @@ _install_cloudflared_bin() {
     [ -z "$tag" ] && { _error "不支持的架构: $(uname -m)"; return 1; }
     local url="$CF_DL_BASE/cloudflared-linux-${tag}"
     _info "下载 cloudflared <- $url"
-    # 先下到同目录临时文件再原子替换, 避免半截文件留在最终路径(L7); curl 优先(H1)
-    # R38(P1): chmod/mv 必须检查——mv 失败(分区满/只读/同名目录)时 $CF_BIN 根本不存在,
-    # 原实现却因末句 _success 返回 0 而报"安装成功", 且把 cloudflared.tmp.XXXXXX 留在
-    # 最终目录旁(正是本 PR 要消除的"半截文件留在最终路径")。与 20-xray-core.sh 的
-    # cp/mv/chmod 三步全查保持同一标准。
     local cf_tmp; cf_tmp=$(mktemp "${CF_BIN}.tmp.XXXXXX") || {
         _error "无法创建临时文件: ${CF_BIN}.tmp.XXXXXX(目录不可写/磁盘空间?)"
         return 1
@@ -85,11 +51,6 @@ _install_cloudflared_bin() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# 从用户粘贴文本提取令牌(纯 bash, 不用 sed/grep -E, 避 busybox 兼容问题)
-# cloudflared token 是 JSON 的标准 Base64 串(字母表 A-Za-z0-9+/ 与 '=' padding; 见 _cf_token_valid)
-# 策略: 优先取 "service install" 或 "--token" 后的第一个字段; 兜底 ey 开头串
-# ---------------------------------------------------------------------------
 _extract_token() {
     local input="$1" token=""
     local arr=()
@@ -98,10 +59,7 @@ _extract_token() {
     for ((i=0; i<${#arr[@]}; i++)); do
         local w="${arr[$i]}"
         if [ "$grab" -eq 1 ]; then
-            # 跳过"纯引号"词: read -ra 只按空白切分、不做引号处理, 于是 CF 网页端的
-            # --token " eyXXX" 会被拆成单独一个双引号词与带尾引号的 token 两个词。旧实现会把前者当成
-            # token(剥引号后为空), 令牌提取失败并静默落到"整段原始输入当 token"的路径。
-            case "$w" in ''|'"'|"'") continue ;; esac
+            case "$w" in ''|'"'|"'"|--no-update-service) continue ;; esac
             token="$w"; break
         fi
         case "$w" in
@@ -119,47 +77,26 @@ _extract_token() {
             esac
         done
     fi
-    # 只剥一层首尾引号(与 _cf_extract_line_token 同口径)。用户从 CF 网页端粘贴的安装命令
-    # 常给 token 加引号; read 不做引号移除, 残留的引号会被写进 service 启动行:
-    # systemd 把它当分隔符尚可, 但 OpenRC 的 command_args="..." 会因内层引号提前闭合而
-    # 截断整条命令行。结尾的 '=' 是 base64 合法 padding, 只剥引号不动它。
     token="${token%\"}"; token="${token%\'}"
     token="${token#\"}"; token="${token#\'}"
     [ -n "$token" ] && echo "$token"
 }
 
-# Tunnel tokens must pass cloudflared's own decoder before being embedded in service files
-# (OpenRC sources its init file as shell, so quotes/substitutions/whitespace must never be token data).
-# cloudflared 的 `ParseToken`(cmd/cloudflared/tunnel/subcommands.go)做的是
-# `base64.StdEncoding.DecodeString` **再** `json.Unmarshal(content, &connection.TunnelToken{})`。
-# 故校验要对齐两者: **标准**字母表 A-Za-z0-9+/、padding 正确(长度 %4==0)、**且解码后必须是 JSON
-# 对象**。只验字符集/长度会放过 `eyI=`(解码得 `{"`); 只验"任意合法 JSON"又会接受 `[]`/`123`
-# 这类 Go 反序列化到 struct 时必然失败的值。(注: `ey` 前缀本身已蕴含首字节 `{`, 故此处的对象
-# 判定实际是"花钱很少的精确性保证", 而非可达的行为分歧。)
+# Token 须是标准 Base64 JSON object；与官方 ParseToken 一致，避免把 shell 内容写进 init.d。
 _cf_token_valid() {
     local token="${1:-}" decoded
     [[ "$token" == ey* ]] || return 1
     [[ "$token" =~ ^ey[A-Za-z0-9+/]+={0,2}$ ]] || return 1
     (( ${#token} % 4 == 0 )) || return 1
-    # jq is required to prove that the decoded payload is a TunnelToken object.
-    # Character-set validation alone is not enough: a syntactically valid
-    # base64 value can still decode to malformed JSON or a non-object.
     command -v jq >/dev/null 2>&1 || return 1
     decoded=$(printf '%s' "$token" | jq -Rr '@base64d' 2>/dev/null) || return 1
     [ -n "$decoded" ] || return 1
     printf '%s' "$decoded" | jq -e 'type == "object"' >/dev/null 2>&1
 }
 
-# ---------------------------------------------------------------------------
-# 读取当前 service 文件启动行, 解析出 token 与 3 开关状态
-# 输出全局: CF_CUR_TOKEN / CF_CUR_AUTOUPDATE / CF_CUR_HTTP2 / CF_CUR_EDGE_IP
-#           CF_CUR_AUTOUPDATE_FLAG(启动行是否**显式**写了 autoupdate 标志)
-# ---------------------------------------------------------------------------
+# 只解析生效启动行；注释和停止指令不是运行事实。
 _read_cf_state() {
-    CF_CUR_TOKEN=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_RAWLINE=""; CF_CUR_CMDLINE=""
-    # F6: "启动行没有 autoupdate 标志" ≠ "自动更新关闭" —— cloudflared 缺省 autoupdate=on
-    # (24h)。flag=no 时菜单按"默认开"显示, 且重建行不再无条件写 --no-autoupdate,
-    # 避免对手动安装的 cloudflared 造成用户未要求的静默行为变更。
+    CF_CUR_TOKEN=""; CF_CUR_TOKEN_FILE=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_RAWLINE=""; CF_CUR_CMDLINE=""
     CF_CUR_AUTOUPDATE_FLAG="no"
     local svcfile
     case "$INIT_SYSTEM" in
@@ -168,13 +105,6 @@ _read_cf_state() {
         *)       svcfile="$CF_UNIT_SYSTEMD" ;;
     esac
     [ -f "$svcfile" ] || return 1
-    # R39(P1): 只从"真正的启动命令行"收集(见 _cf_is_cmd_line: 排除注释与空行, 认
-    # ExecStart=/command_args=/cmd=/command= 前缀或内联了 $CF_BIN 的 SysV start) 块)。
-    # 原实现把**整个文件**作为兜底搜索范围, 于是形如
-    #     # previous example token: eyAAAA...
-    # 的注释会被当成当前 token: 显示给用户是错的, 更糟的是 _cf_toggle 会把它经
-    # _cf_build_cmdline 写进 ExecStart —— 用一个注释里的过期 token 覆盖真 token, 隧道直接挂。
-    # SysV 内联命令的场景由 _cf_is_cmd_line 的 $CF_BIN 分支覆盖, 不再需要全文件兜底。
     local lines="" ln
     while IFS= read -r ln || [ -n "$ln" ]; do
         if _cf_is_cmd_line "$ln"; then
@@ -187,72 +117,101 @@ $ln"
         fi
     done < "$svcfile"
     CF_CUR_CMDLINE="$lines"
-    # 诊断输出仍需要完整原文(仅用于 _cf_diagnose 展示, 不参与解析)
     CF_CUR_RAWLINE=$(cat "$svcfile" 2>/dev/null)
-    # token: 优先在启动行里找 --token 后字段; 兜底同一批行里的裸 ey 开头串
-    # 把多行合成单行(换行换空格), 再 read -ra 按空白分词(read -ra 只读单行)
     local oneline
     oneline=$(printf '%s' "$lines" | tr '\n' ' ')
-    local arr=() i grab=0
-    read -ra arr <<< "$oneline"
-    for ((i=0; i<${#arr[@]}; i++)); do
-        local w="${arr[$i]}"
-        if [ "$grab" -eq 1 ]; then
-            CF_CUR_TOKEN="$w"; break
-        fi
-        case "$w" in
-            --token)    grab=1 ;;
-            --token=*)  CF_CUR_TOKEN="${w#--token=}"; break ;;
-        esac
-    done
-    if [ -z "$CF_CUR_TOKEN" ]; then
-        for w in "${arr[@]}"; do
-            case "$w" in ey????????????????????*) CF_CUR_TOKEN="$w"; break ;; esac
-        done
+    CF_CUR_TOKEN_FILE=$(_cf_extract_token_file "$oneline") || CF_CUR_TOKEN_FILE=""
+    if [ -n "$CF_CUR_TOKEN_FILE" ]; then
+        CF_CUR_TOKEN=$(cat "$CF_CUR_TOKEN_FILE" 2>/dev/null) || CF_CUR_TOKEN=""
+    else
+        CF_CUR_TOKEN=$(_cf_extract_line_token "$oneline")
     fi
-    # 去掉 token 首尾可能粘连的引号(command_args="..." 闭合引号)
-    # 注意只剥引号: cloudflared token 是 base64, 末尾 '=' 是合法 padding
-    case "$CF_CUR_TOKEN" in
-        *\") CF_CUR_TOKEN="${CF_CUR_TOKEN%\"}" ;;
-    esac
-    case "$CF_CUR_TOKEN" in
-        \"*) CF_CUR_TOKEN="${CF_CUR_TOKEN#\"}" ;;
-    esac
-    # 开关(固定字符串匹配)
     echo "$oneline" | grep -q -- '--no-autoupdate'      && CF_CUR_AUTOUPDATE="off" && CF_CUR_AUTOUPDATE_FLAG="yes"
     echo "$oneline" | grep -q -- '--autoupdate-freq'   && CF_CUR_AUTOUPDATE="on"  && CF_CUR_AUTOUPDATE_FLAG="yes"
     echo "$oneline" | grep -q -- '--protocol http2'    && CF_CUR_HTTP2="on"
-    # 协议栈: --edge-ip-version <4|6|auto>; 未写则 off
     if   echo "$oneline" | grep -q -- '--edge-ip-version 4';    then CF_CUR_EDGE_IP="4";
     elif echo "$oneline" | grep -q -- '--edge-ip-version 6';    then CF_CUR_EDGE_IP="6";
     elif echo "$oneline" | grep -q -- '--edge-ip-version auto'; then CF_CUR_EDGE_IP="auto";
     fi
 }
 
-# ---------------------------------------------------------------------------
-# autoupdate 的**有效**状态(供菜单显示与 _cf_toggle 共用同一判据)。
-# cloudflared 缺省 autoupdate=on(24h), 所以"启动行没写任何 autoupdate 标志"意味着
-# 实际是开着的 —— CF_CUR_AUTOUPDATE 此时是 off(那是"行里写了 --no-autoupdate"的意思),
-# 二者语义不同。显示与切换基线必须都走这里, 否则会出现"菜单显示开、按一下算出 on、
-# 写出 24h 后行为不变"的空操作。
-# ---------------------------------------------------------------------------
+# 官方 linux_service.go 使用独立更新 timer；状态与开关必须同时覆盖它和进程标志。
+_cf_update_timer_present() {
+    [ "$INIT_SYSTEM" = systemd ] || return 1
+    local load
+    load=$(systemctl show -p LoadState --value cloudflared-update.timer 2>/dev/null) || return 1
+    [ "$load" = loaded ]
+}
+
+_cf_update_timer_on() {
+    _cf_update_timer_present || return 1
+    systemctl is-enabled --quiet cloudflared-update.timer 2>/dev/null \
+        || systemctl is-active --quiet cloudflared-update.timer 2>/dev/null
+}
+
+_cf_update_timer_set() {
+    local val="$1"
+    _cf_update_timer_present || return 0
+    if [ "$val" = on ]; then
+        systemctl enable --now cloudflared-update.timer 2>/dev/null
+    else
+        systemctl disable --now cloudflared-update.timer 2>/dev/null || return 1
+        systemctl stop cloudflared-update.service 2>/dev/null || return 1
+    fi
+}
+
+_cf_update_timer_snapshot() {
+    CF_TIMER_WAS_ENABLED=""; CF_TIMER_WAS_ACTIVE=""
+    _cf_update_timer_present || return 0
+    CF_TIMER_WAS_ENABLED=off; CF_TIMER_WAS_ACTIVE=off
+    systemctl is-enabled --quiet cloudflared-update.timer 2>/dev/null && CF_TIMER_WAS_ENABLED=on
+    systemctl is-active --quiet cloudflared-update.timer 2>/dev/null && CF_TIMER_WAS_ACTIVE=on
+    return 0
+}
+
+_cf_update_timer_restore() {
+    [ -n "${CF_TIMER_WAS_ENABLED:-}" ] || return 0
+    if [ "$CF_TIMER_WAS_ENABLED" = on ]; then systemctl enable cloudflared-update.timer 2>/dev/null || return 1;
+    else systemctl disable cloudflared-update.timer 2>/dev/null || return 1; fi
+    if [ "$CF_TIMER_WAS_ACTIVE" = on ]; then systemctl start cloudflared-update.timer 2>/dev/null || return 1;
+    else systemctl stop cloudflared-update.timer 2>/dev/null || return 1; fi
+}
+
+# 仅支持官方的简单绝对路径；不解释 shell 展开或 Environment 令牌。
+_cf_extract_token_file() {
+    local line="$1" w next=no path="" words=()
+    read -ra words <<< "$line"
+    for w in "${words[@]}"; do
+        w=$(_cf_strip_quotes "$w")
+        if [ "$next" = yes ]; then path="$w"; break; fi
+        case "$w" in
+            --token-file) next=yes ;;
+            --token-file=*) path="${w#--token-file=}"; break ;;
+        esac
+    done
+    [[ "$path" =~ ^/[A-Za-z0-9_./-]+$ ]] || return 1
+    printf '%s' "$path"
+}
+
+_cf_token_backup_clear() {
+    if [ -n "${CF_TOKEN_BACKUP_PATH:-}" ]; then
+        rm -f "$CF_TOKEN_BACKUP_PATH.bak"
+        CF_TOKEN_BACKUP_PATH=""
+    fi
+}
+
 _cf_autoupdate_effective() {
-    if [ "${CF_CUR_AUTOUPDATE_FLAG:-no}" = "no" ]; then
+    if _cf_update_timer_on; then
+        echo "on"
+    elif [ "${CF_CUR_AUTOUPDATE_FLAG:-no}" = "no" ]; then
         echo "on"
     else
         echo "${CF_CUR_AUTOUPDATE:-off}"
     fi
 }
 
-# ---------------------------------------------------------------------------
-# 令牌掩码显示(菜单/诊断三处共用)。首 12 + 末 4 的固定切片对短令牌会**重叠**,
-# 例如 8 字符令牌渲染成整串加一个省略号 —— 等于把凭据打屏(诊断输出常被直接粘贴到
-# issue/群里)。故长度不足掩码窗口时改用固定占位, 不泄漏任何字符。
-# ---------------------------------------------------------------------------
 _cf_mask_token() {
     local t="$1"
-    # 阈值必须 > 16: 长度恰为 16 时 ${t:0:12} 与 ${t: -4} 正好覆盖全部字符(0-11 + 12-15),
-    # "掩码"等于把整串原样打出来。留出隐藏区才算掩码, 故要求 >= 20(首12+末4, 中间至少 4 位)。
     if [ "${#t}" -lt 20 ]; then
         printf '%s' '****(过短, 已隐藏)'
     else
@@ -260,16 +219,12 @@ _cf_mask_token() {
     fi
 }
 
-# Redact service lines without assuming quotes are absent. For an unparseable credential-bearing
-# line, omit the complete line instead of risking a plaintext token in copy/pasted diagnostics.
 _cf_redact_service_line() {
     local line="$1" token masked lower remaining
     if _cf_is_cmd_line "$line"; then
         token=$(_cf_extract_line_token "$line")
         if [ -n "$token" ]; then
             masked=$(_cf_mask_token "$token")
-            # After removing the parsed credential and its option marker, any remaining token
-            # marker or token-shaped value makes complete redaction uncertain: hide the line.
             remaining="${line//"$token"/}"
             remaining="${remaining/--token/}"
             lower="${remaining,,}"
@@ -287,11 +242,7 @@ _cf_redact_service_line() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# 重组 cloudflared 启动命令行(按 3 开关 + token)
-# 用法:_cf_build_cmdline <token>
-# 读取全局 CF_AUTOUPDATE/CF_HTTP2/CF_EDGE_IP
-# ---------------------------------------------------------------------------
+# 连接选项在 run 前、凭据在最后；避免官方 CLI 忽略 token 后的参数。
 _cf_build_cmdline() {
     local token="$1"
     _cf_token_valid "$token" || { _error "拒绝把非法 Token 写入 service 命令行"; return 1; }
@@ -299,8 +250,6 @@ _cf_build_cmdline() {
     if [ "$CF_AUTOUPDATE" = "on" ]; then
         cmd="$cmd --autoupdate-freq 24h0m0s"
     elif [ "${CF_AUTOUPDATE_FLAG:-yes}" = "yes" ]; then
-        # F6: 仅当原启动行确实显式管理该开关(或本脚本首次安装, FLAG 默认 yes)才写
-        # --no-autoupdate; 手动安装的无标志行重建后保持 cloudflared 缺省行为不变
         cmd="$cmd --no-autoupdate"
     fi
     cmd="$cmd tunnel"
@@ -310,21 +259,17 @@ _cf_build_cmdline() {
         6)    cmd="$cmd --edge-ip-version 6" ;;
         auto) cmd="$cmd --edge-ip-version auto" ;;
     esac
-    cmd="$cmd run --token $token"
+    if [ -n "${CF_CUR_TOKEN_FILE:-}" ]; then
+        cmd="$cmd run --token-file $CF_CUR_TOKEN_FILE"
+    else
+        cmd="$cmd run --token $token"
+    fi
     echo "$cmd"
 }
 
-# ---------------------------------------------------------------------------
-# 把启动行写回 service 文件(纯 bash 逐行处理, 避 busybox sed -E)
-# 用法:_cf_write_service_line <cmdline>          (整行重组)
-#       _cf_replace_token_in_service <oldtoken> <newtoken>  (只换 token, 保留原参数)
-# ---------------------------------------------------------------------------
-# 通用: 逐行读 service 文件, 替换匹配行, 写回(保留原文件权限)
-# 兼容缩进: 匹配前先去除行首空白; 未匹配到任何行时返回 1
 _svc_replace_line() {
     local svcfile="$1" pattern="$2" newline="$3" tmp found=0
     [ -f "$svcfile" ] || return 1
-    # 备份必须真正成功才允许改 service(磁盘满/IO 失败时无 .bak 可恢复)
     _svc_backup "$svcfile" || return 1
     local tmp write_ok=1
     tmp=$(mktemp) || { _error "无法创建临时 service 文件: $svcfile"; return 1; }
@@ -336,11 +281,9 @@ _svc_replace_line() {
         esac
     done < "$svcfile"
     if [ "$found" -eq 0 ]; then
-        # 未找到目标行: 本次未产生任何修改, 同时清理 .bak 避免留下陈旧回滚点
         rm -f "$tmp" "$svcfile.bak"
         return 1
     fi
-    # tmp 构造必须完整成功(磁盘满/IO/配额时 printf 可能写一半), 否则半截文件会被 _svc_commit 提交
     if [ "$write_ok" -ne 1 ]; then
         _error "临时 service 文件写入失败(磁盘空间/IO?), 保留原文件"
         rm -f "$tmp"
@@ -349,8 +292,7 @@ _svc_replace_line() {
     _svc_commit "$svcfile" "$tmp"
 }
 
-# Backups contain plaintext credentials. The global entry point uses umask 077, but the library
-# can also be sourced directly and an existing .bak keeps its old mode when cp truncates it.
+# 备份必须成功且限为 600；失败时不能失去含凭据的恢复源。
 _svc_backup() {
     local svcfile="$1" backup="${1}.bak"
     if [ -e "$backup" ] && ! chmod 600 "$backup" 2>/dev/null; then
@@ -369,8 +311,7 @@ _svc_backup() {
     return 0
 }
 
-# 把 tmp 提交为 service 文件内容: cat(而非 mv)保原文件 inode 与权限(openrc init.d 的
-# +x 位不能丢; mktemp 是 0600)。写入失败自动从 .bak 恢复并返回 1, 保证"失败可恢复"。
+# cat 写回以保留 init.d 执行位；失败保留 .bak 供恢复。
 _svc_commit() {
     local svcfile="$1" tmp="$2"
     [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
@@ -385,11 +326,6 @@ _svc_commit() {
         return 1
     fi
     rm -f "$tmp"
-    # F4: service 行内含明文隧道 token, 写回时收紧权限 —— systemd unit 600(init.d 700
-    # 含可执行位)。cloudflared service install 生成的是 644/755(任何本地用户可读 token);
-    # xray unit 无密钥可选 644(R38 M14), 这里有密钥必须收口。systemd 会记
-    # "marked world-inaccessible" 提示, 属可接受代价。chmod 失败 warn-only:
-    # 内容已落地, 因权限回滚会丢掉用户要的结果(与 logrotate chmod 同一取舍)。
     case "$svcfile" in
         /etc/init.d/*)
             if ! chmod 700 "$svcfile" 2>/dev/null; then
@@ -406,8 +342,7 @@ _svc_commit() {
     return 0
 }
 
-# 从 .bak 恢复 service 文件(cat 保原文件权限/执行位, 与 _svc_commit 一致)。
-# 回滚本身必须检查: 失败显式报错并返回 1, 不静默"假装已回滚"。
+# 恢复成功才消费 .bak；失败必须留下人工修复入口。
 _svc_restore() {
     local svcfile="$1"
     [ -f "${svcfile}.bak" ] || { _warn "无 ${svcfile}.bak 可回滚"; return 1; }
@@ -427,15 +362,15 @@ _svc_restore() {
                 _warn "service 文件权限收紧失败(token 可能被其他用户读取): $svcfile"
             ;;
     esac
-    # 恢复成功: .bak 已消费, 立即删除(否则直调 _svc_restore 的路径——_svc_commit chmod 失败、
-    # _cf_write_service_line/_cf_replace_token_in_service 的 daemon-reload 失败——都会留下陈旧回滚点)
     rm -f "${svcfile}.bak"
     return 0
 }
 
 _cf_write_service_line() {
     local cmd="$1" svcfile
-    local token; token=$(_cf_extract_line_token "$cmd")
+    local token token_file; token_file=$(_cf_extract_token_file "$cmd") || token_file=""
+    if [ -n "$token_file" ]; then token=$(cat "$token_file" 2>/dev/null) || token="";
+    else token=$(_cf_extract_line_token "$cmd"); fi
     _cf_token_valid "$token" || { _error "拒绝写入不安全的 cloudflared Token"; return 1; }
     case "$INIT_SYSTEM" in
         systemd) svcfile="$CF_UNIT_SYSTEMD" ;;
@@ -468,43 +403,23 @@ _cf_write_service_line() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# R39(P1): 判定一行是否为"真正的启动命令行"。只有这些行里的 token 才允许替换。
-# 为什么: R38 只加了 `replaced` 标志, 但判据是"整行包含 oldtok"。而 _read_cf_state 的
-# token 兜底会在**整个文件**里搜 ey... 串, 所以 oldtok 可能来自一行注释:
-#     # previous example token: eyAAAA...
-#     ExecStart=... --token eyBBBB...
-# 于是替换命中注释行 -> replaced=1 -> 报"令牌已更新", 而 ExecStart 仍是旧 token,
-# 重启当然成功, state 却写入新 token => service 与 state 分裂。假成功只是从
-# "0 次替换"变成了"1 次替换但改的是注释", 标志本身并不足够。
-# 判据: 注释行一律不动; 只认 unit/init 的命令字段前缀, 或内联了 cloudflared 二进制
-# 路径的行(SysV 的 start) 块)。
-# ---------------------------------------------------------------------------
 _cf_is_cmd_line() {
     local t="${1#"${1%%[![:space:]]*}"}"
     case "$t" in
         '#'*|'') return 1 ;;   # 注释与空行绝不修改
     esac
-    # R40: systemd 的其他 Exec* 指令一定不是启动命令行, 必须在下面的 $CF_BIN 兜底之前排除。
-    # 否则 `ExecStop=/usr/local/bin/cloudflared tunnel cleanup --token <旧>` 这类形态会被
-    # 兜底规则当成启动行改写(replaced 计数还会 +1, 掩盖"真启动行没改到"的失败)。
-    # 这是严格收窄: 只排除可证明不是 start 的指令, 不会让真正的 ExecStart 漏判。
     case "$t" in
         ExecStartPre=*|ExecStartPost=*|ExecStop=*|ExecStopPost=*|ExecReload=*|ExecCondition=*) return 1 ;;
     esac
     case "$t" in
         ExecStart=*|command_args=*|cmd=*|command=*) return 0 ;;
     esac
-    # SysV/OpenRC 的 start) 块可能内联完整命令行, 用二进制路径识别
     case "$t" in
         *"$CF_BIN"*) return 0 ;;
     esac
     return 1
 }
 
-# R39(P1): 从一行启动命令里提取现存 token。优先 `--token <v>` / `--token=<v>`,
-# 兜底裸 ey... 词; 去掉粘连的闭合引号(command_args="... --token XXX")。
-# 输出为空表示该行没有 token(如 openrc 的 command="/usr/local/bin/cloudflared")。
 _cf_extract_line_token() {
     local ln="$1" arr=() i w grab=0 tok=""
     read -ra arr <<< "$ln"
@@ -521,22 +436,11 @@ _cf_extract_line_token() {
             case "$w" in ey????????????????????*) tok="$w"; break ;; esac
         done
     fi
-    # 只剥一层首尾引号: cloudflared token 是 base64, 末尾的 '=' 是合法 padding, 不能动
     tok="${tok%\"}"; tok="${tok%\'}"
     tok="${tok#\"}"; tok="${tok#\'}"
     printf '%s' "$tok"
 }
 
-# 只替换 service 启动行里的 token, 保留用户原有的其他参数(不破坏手动装的好配置)
-# 用纯 bash 字符串替换(不依赖 sed -E 正则)
-# R38(P1): 必须跟踪"是否真的替换了至少一处"——原实现只看写 tmp 是否成功, 零替换也返回 0,
-#   调用方随后用**旧 token** 重启成功, 于是写入新 token 到 state 并报「令牌已更新」。
-# R39(P1): 判据由"整行包含 oldtok"收紧为"在真正的启动命令行上替换掉解析出来的 token"
-#   (见 _cf_is_cmd_line / _cf_extract_line_token)。同时替换方式改为只替换 token 子串
-#   `${ln//$found/$newtok}` —— 原来的 `read -ra` + 逐词重组会吃掉 openrc
-#   `command_args="... --token XXX="` 的闭合引号并把连续空格压成一个, 写出的 init 脚本
-#   引号不闭合, source 时报错、服务彻底起不来。
-# 参数 oldtok 现在只是提示(命令行上解析到的 token 才是权威), 保留以兼容调用方签名。
 _cf_replace_token_in_service() {
     local oldtok="$1" newtok="$2" svcfile
     _cf_token_valid "$newtok" || { _error "拒绝写入不安全的 cloudflared Token"; return 1; }
@@ -546,7 +450,24 @@ _cf_replace_token_in_service() {
         *) return 1 ;;
     esac
     [ -f "$svcfile" ] || return 1
-    # 备份必须真正成功才允许改 service(失败可恢复)
+    CF_TOKEN_BACKUP_PATH=""
+    local token_file="" ln
+    while IFS= read -r ln || [ -n "$ln" ]; do
+        _cf_is_cmd_line "$ln" || continue
+        token_file=$(_cf_extract_token_file "$ln") && break
+    done < "$svcfile"
+    if [ -n "$token_file" ]; then
+        _svc_backup "$svcfile" || return 1
+        _svc_backup "$token_file" || return 1
+        CF_TOKEN_BACKUP_PATH="$token_file"
+        if ! printf '%s' "$newtok" > "$token_file" || ! chmod 600 "$token_file" \
+            || [ "$(cat "$token_file" 2>/dev/null)" != "$newtok" ]; then
+            _svc_restore "$token_file" || _error "token 文件恢复失败: $token_file"
+            CF_TOKEN_BACKUP_PATH=""
+            return 1
+        fi
+        return 0
+    fi
     _svc_backup "$svcfile" || return 1
     local tmp write_ok=1 replaced=0 ln found
     tmp=$(mktemp) || { _error "无法创建临时 service 文件: $svcfile"; return 1; }
@@ -561,18 +482,15 @@ _cf_replace_token_in_service() {
         fi
         printf '%s\n' "$ln" >> "$tmp" || write_ok=0
     done < "$svcfile"
-    # tmp 构造必须完整成功(磁盘满/IO/配额时 printf 可能写一半), 否则半截文件会被提交
     if [ "$write_ok" -ne 1 ]; then
         _error "临时 service 文件写入失败(磁盘空间/IO?), 保留原文件"
         rm -f "$tmp"
         return 1
     fi
-    # R38/R39(P1): 未在任何启动命令行上替换到 token => 必须失败, 否则调用方拿旧 token
-    # 重启并宣称"令牌已更新"
     if [ "$replaced" -lt 1 ]; then
         rm -f "$tmp" "${svcfile}.bak"
         _error "未在 $svcfile 的启动命令行中找到可替换的令牌, 令牌未更新"
-        _tip "该 service 可能以其他形式提供 token(--token-file / Environment=TUNNEL_TOKEN=),"
+        _tip "该 service 可能以其他形式提供 token(Environment=TUNNEL_TOKEN=),"
         _tip "本脚本不会改写这类形态; 请手动编辑 $svcfile 后重启 cloudflared"
         return 1
     fi
@@ -592,21 +510,8 @@ _cf_replace_token_in_service() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# R38(P2): 统一的 cloudflared 进程发现。与 _cf_is_running 用同一套判据, 避免
-# "判活用 /proc 扫描、杀进程用 pgrep" 两套逻辑不一致: 容器内 busybox pgrep 假阴性时
-# _cf_kill_all 会报"已清理"而实际仍有残留, 随后 start 出第二个实例。
-# 另: procps 的 ps 无 -e 时只列当前 tty 的进程, cron 下几乎列不出东西, 必须带 -e。
-# 输出: 每行一个 PID(可能为空)
-# ---------------------------------------------------------------------------
 _cf_pids() {
     local p c seen=" "
-    # 2026-09-21 复审(P1): pidof 与 /proc 扫描必须**都跑并取并集**。旧写法"pidof 有输出就
-    # 直接 return"假定 pidof 的结果是超集 —— 但 busybox 的 pidof 在容器里会**漏报**(H3),
-    # 漏掉的恰恰可能是我们自己的残留进程, 于是 _cf_kill_all 第 4 步认为"已清理干净"并返回 0,
-    # 把真正活着的孤儿进程留给用户(隧道连接数持续增长)。
-    # 两条路径会重复列出同一 PID, 故用 seen 去重(重复项会让"仍有残留"的告警与 others
-    # 列表失真)。
     for p in $(pidof cloudflared 2>/dev/null); do
         case "$p" in ''|*[!0-9]*) continue ;; esac
         case "$seen" in *" $p "*) continue ;; esac
@@ -623,20 +528,6 @@ _cf_pids() {
     done
 }
 
-# ---------------------------------------------------------------------------
-# "可以安全杀掉"的 cloudflared PID: 只认 exe 指向**本 service 实际启动的那个二进制**的进程。
-#
-# 为什么杀进程不能沿用 _cf_is_running 的全机 comm 判据:
-#   判活用全机扫描的代价只是"把别人的隧道算成我们的"(假阳性只影响显示), 而**杀进程**的
-#   假阳性是破坏性的 —— 用户机器上可能有另一个与本脚本无关的 cloudflared(别的工具、
-#   容器宿主进程), 一次开关切换就把人家 SIGKILL 掉。
-# 为什么期望路径取 _cf_service_bin 而不是写死 $CF_BIN:
-#   cloudflared 二进制不由本脚本独占(用户可能先用发行版包/自己装过, 本脚本只接管
-#   service 文件)。写死 $CF_BIN 会让运行 /usr/bin/cloudflared 的**我们自己的**进程
-#   变成"非我所有", 于是杀不掉、启动出第二个实例 —— 正是本函数要防的事。
-# exe 读不到时 _proc_exe_is 放行(与既有的 fail-open 约定一致): 那是最后一道清理路径,
-# 假阴性会留下我们自己的孤儿进程。
-# 本平台对应的 service 文件路径(与 _read_cf_state 同口径)
 _cf_unit_path() {
     case "$INIT_SYSTEM" in
         openrc) printf '%s' "$CF_UNIT_OPENRC" ;;
@@ -644,21 +535,6 @@ _cf_unit_path() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# 包装器的"取参选项"表 + 前置位置参数个数(2026-09-21 七轮复审 P2)。
-#
-# 为什么需要: 纯词法外观判断(`-*`/NAME=value/纯数字跳过, 其余含非数字的词视为二进制)会把
-# 包装器的**选项取值**当成二进制 —— `env -u FOO …` → `FOO`, `timeout --signal TERM 5` → `TERM`。
-# 期望路径成了不存在的词 ⇒ `command -v` 失败 ⇒ 回退 `$CF_BIN` ⇒ 自己的实例永不杀(静默双实例);
-# 若被吞掉的值本身是存在的绝对路径(`env -C /tmp` → `/tmp`), `command -v` 成功, 连回退都不
-# 触发, 返回**确定的错路径**。
-#
-# 表内容逐条来自 `--help` 实测, 两个陷阱项必须记住:
-#   · `env --ignore-signal/--default-signal/--block-signal` 是**可选参数**(只有 `=SIG` 形态吃参,
-#     空格形态实测会把 SIG 当要执行的命令)⇒ **不得**列进表里;
-#   · `taskset -c/--cpu-list` 是 **flag**, mask 是**前置位置参数**。
-# 只匹配**完整 token**, 粘连形态(`-n5`/`--signal=TERM`)天然不命中、不消费下一个词。
-# ---------------------------------------------------------------------------
 _cf_opt_takes_value() { # <包装器名> <token> ; 0 = 该 token 的取值是下一个词
     local w="$1" t="$2" tbl=""
     case "$w" in
@@ -678,14 +554,6 @@ _cf_opt_takes_value() { # <包装器名> <token> ; 0 = 该 token 的取值是下
     return 1
 }
 
-# 链式包装器下必须按"**已见过的所有**包装器"判定取参选项, 不能只看当前这一个。
-#
-# 根因(2026-09-22 七轮复审实测): `_wrap` 若只记最新者, 则 `nohup env -C /tmp <bin>` 里
-# `-C` 是 env 的取参选项, 但当前包装器是 `nohup`(表里没有 `-C`) => `/tmp` 被当成二进制返回。
-# 反之若只记首个, 则 `nohup env -C /tmp <bin>` 里 `_wrap=nohup` 同样漏掉 `-C`。
-# 两种"只记一个"都错, 故取并集: 任一已见包装器把该 token 当取参选项, 就消费它的取值。
-# 实测(行为级驱动, 68 条用例): 并集版"第三值"(既非真二进制也非 $CF_BIN)为 0,
-# 而只记首个/只记最新者各有残留。
 _cf_opt_seen_takes_value() { # <已见包装器串> <token>
     local w
     for w in $1; do
@@ -701,26 +569,7 @@ _cf_wrap_pos_count() { # <包装器名> -> 该包装器在真命令前有几个"
     esac
 }
 
-# ---------------------------------------------------------------------------
-# 从一段命令行文本里取出第一个"看起来是二进制"的词; 找不到返回 1。
-#
-# 四类东西必须跳过, 否则期望路径会指向包装器(或它的选项取值)而不是我们真正的二进制, 于是
-# _cf_pids_owned 把我们**自己**的运行实例判成"别人家"而永不杀 —— 静默双实例(本函数族存在的
-# 唯一理由):
-#   1. 包装器本身: env/nice/ionice/setpriv/timeout/chrt/taskset/busybox/nohup/setsid/stdbuf/exec
-#      (发行版生成的单元常写 ExecStart=/usr/bin/env cloudflared ...)
-#   2. 包装器的**取参选项的取值**(`env -u FOO` 的 FOO)与**前置位置参数**
-#      (`timeout 30` 的 30 / `taskset 0x1` 的 0x1)—— 见上方 _cf_opt_takes_value
-#   3. 以 - 开头的选项本身, 或纯数字(nice 的优先级 / timeout 的秒数)
-#   4. 环境赋值 NAME=value —— 2026-09-21 复审实测: `/usr/bin/env FOO=bar cloudflared tunnel run`
-#      下旧实现返回 FOO=bar(它含非数字, 被判成二进制), 期望路径随即变成 FOO=bar。
-# `sh -c '命令串'` 再往命令串里解析一次(限深度): 旧实现返回 /bin/sh, 同样导致双实例。
-# 每个词都剥一层成对引号, 这样 command="..." 与 sh -c "..." 两种写法都不必特殊处理。
-#
-# 结构保持 2026-09-21 之前的形态(包装器白名单 + sh -c 数组切片递归 + NAME=value/纯数字跳过),
-# 只在上面**叠加**选项感知, 不做整体重写 —— 实测把本函数重写成"包装器分支吞掉一切"的状态机
-# 会让 `env sh -c "exec ..."` / `busybox sh -c "..."` / `nice -n 5 sh -c "..."` 返回 `sh`,
-# 而 `command -v sh` 成功 => `$CF_BIN` 回退不触发 => 恰好制造本函数要防的静默双实例。
+# 包装器取值按已见选项表跳过，命令串用数组切片；不把包装器当归属二进制。
 _cf_first_bin_word() {
     local text="$1" depth="${2:-0}" tok inner
     local -a _w
@@ -731,19 +580,9 @@ _cf_first_bin_word() {
         tok="${tok#\"}"; tok="${tok%\"}"
         tok="${tok#\'}"; tok="${tok%\'}"
         [ -n "$tok" ] || continue
-        # 上一轮判定"这个选项的取值是下一个词" => 消费掉它, 不做任何判断
         if [ "$_wantarg" -eq 1 ]; then _wantarg=0; continue; fi
         case "${tok##*/}" in
             env|nice|ionice|setpriv|timeout|chrt|taskset|busybox|nohup|setsid|stdbuf|exec)
-                # 链式包装器(`nohup env ...` / `timeout 30 env ...` / `busybox taskset ...`)下:
-                #   · `_seen` 累积**每一个**已见包装器 —— 取参选项的判定取并集(见
-                #     _cf_opt_seen_takes_value 上方的说明);
-                #   · `_wrap` 记**最新**者, `_pos` 随它重算 —— 位置参数属于最近那个包装器
-                #     (`timeout 30 env <bin>` 的 30 是 timeout 的, env 没有)。
-                # 两者都不可退化为"只记一个": 只记首个会让 `nohup env -C /tmp <bin>` 漏判
-                # `-C`(nohup 表里没有) => 返回 /tmp 这个**确定错路径**; 只记最新者会让
-                # `nohup env -C /tmp <bin>` 同样漏判(最新者是 env, 但 `-C` 要靠 env 的表 ——
-                # 实测该形态两者皆错, 故必须并集)。取 basename 是因为单元里常写绝对路径。
                 _wrap="${tok##*/}"
                 _seen="$_seen $_wrap"
                 _pos=$(_cf_wrap_pos_count "$_wrap")
@@ -751,31 +590,13 @@ _cf_first_bin_word() {
             sh|bash|dash|ash|ksh|zsh)
                 _next="${_w[$((_i+1))]:-}"
                 if [ "$depth" -lt 2 ] && [ "$_next" = "-c" ] && [ -n "${_w[$((_i+2))]:-}" ]; then
-                    # 必须取**整段**命令串(数组切片), 不能只取第 _i+2 个词。
-                    # 根因: `read -ra` 的 IFS 切分**不感知引号** —— shell 的引号规则只在真正
-                    # 解析命令时生效。实测 `sh -c "exec /opt/custom/cloudflared tunnel run"`
-                    # 被切成 6 个词: sh | -c | "exec | /opt/custom/cloudflared | tunnel | run,
-                    # 只取第 3 个词会拿到未闭合引号的 `"exec`, 递归词法解析失败 =>
-                    # _cf_service_bin 回退 $CF_BIN => 我们自己的实例被判成"别人家"而永不杀
-                    # = 静默双实例(本函数族存在的唯一理由)。
-                    # 切片保留内层引号(实测), 递归里的逐词剥引号逻辑因此照常工作; 从 _i+2 起算
-                    # (而非固定 2)使 `env sh -c "..."` 这类前置包装器也能正确定位。
-                    # 边界(有意不修): 嵌套转义(`sh -c 'sh -c "..."'`)、变量展开、eval 等仍走
-                    # "解析失败 => 回退 $CF_BIN" 的安全分支 —— 这些形态无法用词法解析正确处理,
-                    # 而回退路径本身安全(不会把 /bin/sh 或 env 当二进制)。
                     inner="${_w[*]:$((_i+2))}"
                     _cf_first_bin_word "$inner" $((depth+1))
                     return $?
                 fi
                 printf '%s' "$tok"; return 0 ;;
         esac
-        # 选项: 若任一**已见**包装器把它当取参选项, 则它的取值是下一个词。
-        # 只在见过包装器之后才判定, 使本改动的影响面严格限于包装器命令行。
         if [ -n "$_seen" ] && [ "${tok#-}" != "$tok" ] && _cf_opt_seen_takes_value "$_seen" "$tok"; then
-            # `env -S/--split-string` 的取值**本身就是一条命令串**(与 `sh -c` 同构, 空格分隔的
-            # 一个词), 必须递归解析 —— 否则整串被当作"选项取值"吞掉, 函数返回 1,
-            # `_cf_service_bin` 回退 `$CF_BIN`(二进制在非默认路径时归属判定即失效)。
-            # 实测: 加此分支前 `env -S "<bin> tunnel run"` 返回 $CF_BIN, 加后返回 <bin>。
             case "${tok##*/}" in
                 -S|--split-string)
                     if [ "$depth" -lt 2 ] && [ -n "${_w[$((_i+1))]:-}" ]; then
@@ -790,7 +611,6 @@ _cf_first_bin_word() {
         case "$tok" in
             -*) continue ;;
         esac
-        # 包装器在真命令前的前置位置参数(如 `timeout 30` 的 30)
         if [ "$_pos" -gt 0 ]; then _pos=$((_pos-1)); continue; fi
         case "$tok" in
             [A-Za-z_]*=*) continue ;;   # NAME=value => 环境赋值
@@ -809,19 +629,8 @@ _cf_service_bin() {
         case "$t" in
             ExecStart=*|cmd=*|command=*)
                 t="${t#*=}"
-                # 引号剥离交给 _cf_first_bin_word 逐词处理。**不能**在这里用
-                # ${t%%\"*} 截断: 那会在第一个引号处砍掉整段命令串,
-                # `sh -c "/usr/local/bin/cloudflared ..."` 于是只剩 `/bin/sh -c `,
-                # 期望路径变成 /bin/sh => 静默双实例。
                 bin=$(_cf_first_bin_word "$t") || bin=""
                 if [ -n "$bin" ]; then
-                    # 相对名(如 env cloudflared 里的 cloudflared)必须解析成绝对路径: 调用方
-                    # 拿它比对 readlink /proc/<pid>/exe(恒为绝对路径), 裸名永远不匹配, 于是
-                    # 我们自己的实例被判成"别人家"而永不杀 => 静默双实例。
-                    # **解析不出来就回退 $CF_BIN, 绝不把裸名原样返回** —— 裸名同样永远
-                    # 匹配不上 exe, 返回值等于"一个谁也匹配不到的期望路径", 比 CF_BIN 兜底
-                    # 更糟(CF_BIN 至少是项目自己的安装点)。契约: 本函数只输出绝对路径或
-                    # $CF_BIN。
                     case "$bin" in
                         /*) printf '%s' "$bin" ;;
                         *)  printf '%s' "$(command -v -- "$bin" 2>/dev/null || printf '%s' "$CF_BIN")" ;;
@@ -838,48 +647,22 @@ _cf_pids_owned() {
     local want p
     want=$(_cf_service_bin "$(_cf_unit_path)")
     [ -n "$want" ] || want="$CF_BIN"
-    # 判据与 _cf_pids 同源(它就是 _cf_pids 加一层 exe 归属过滤), 避免两处各自演化出
-    # "哪套扫描更全"的差异。
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         _cf_exe_owned "$p" "$want" && printf '%s\n' "$p"
     done <<< "$(_cf_pids)"
 }
 
-# 杀进程专用归属判定: 优先用严格版(读不到 exe => 拒绝)。
-# _proc_exe_is 的 fail-open 是给**判活**的(见 00-common 的说明), 直接拿来杀进程会让
-# "读不到 exe"时所有同名进程都被判成我们的 —— 限定 exe 的杀进程扫描就退化成它本该取代的
-# 全机 comm 扫描, 可能 SIGKILL 掉用户自己装的 cloudflared。
-#
-# 三态返回码(2026-09-21 复审, 与 55-hysteria.sh 的 `_hysteria_proc_tree_has_bin` 同口径):
-#   0 = 确认属于我们(exe 指向期望二进制)      => 可 kill
-#   1 = **确认不属于**我们(exe 可读且不同)     => 不 kill, 归"他人"
-#   2 = **无法确认**(严格版缺失, 即混装旧 lib) => 不 kill, 归"归属不明" + 告警
-#
-# 为什么必须是三态而非布尔: 第 4 步的三分类(确认我们的 / 确认他人的 / 归属不明)要求区分
-# `1` 与 `2`。若把"无法确认"折进 `1`, 混装旧 lib 时会把**可能属于我们**的进程报成
-# "非本脚本管理的 cloudflared 进程(未触碰)" —— 一句我们并不知道真假的断言, 正是该三分类
-# 要消灭的错误信息。(项目已有同类先例: `_crontab_has_marker` 的 0/1/2。)
+# 归属返回 0=本服务、1=他人、2=未知；杀路径不得继承判活的 fail-open。
 _cf_exe_owned() {
     if declare -F _proc_exe_is_strict >/dev/null 2>&1; then
         _proc_exe_is_strict "$1" "$2"
         return $?
     fi
-    # 旧 lib 混装: 严格版不存在。**绝不退回宽松版** —— 那会让归属判定在杀进程路径上失效。
     _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认进程归属, 跳过"
     return 2
 }
 
-# ---------------------------------------------------------------------------
-# 剥掉值两端的引号(systemd 的 `ExecStart=`/`Environment=` 都支持引号, 传给进程前会去掉)。
-# read -ra 只按空白切词、**不做任何引号处理**, 所以必须自己剥:
-#   --grace-period "60s"   -> 词是 `"60s"`    (成对)
-#   --grace-period="60s"   -> 词是 `"60s"`
-#   Environment="V=90s"    -> 词是 `90s"`     (只有尾引号, 首引号在 `Environment="` 里)
-#   command_args="--grace-period 60s" -> 词是 `"--grace-period` / `60s"` (openrc)
-# 两端**各自独立**剥(不做成对匹配), 上面前三种形态才能统一处理。值里出现引号只可能是
-# 配置本身有误, 剥掉即可。
-# ---------------------------------------------------------------------------
 _cf_strip_quotes() {
     local w="$1"
     while :; do
@@ -891,18 +674,11 @@ _cf_strip_quotes() {
     printf '%s' "$w"
 }
 
-# 去掉行首空白(systemd 允许缩进, 缩进的 `#` 仍是注释)。
 _cf_ltrim() {
     local s="$1"
     printf '%s' "${s#"${s%%[![:space:]]*}"}"
 }
 
-# 从 EnvironmentFile= 指定的文件里取 TUNNEL_GRACE_PERIOD 的值。
-# systemd.exec(5): 空行/无 `=` 的行/`#` 与 `;` 开头的行忽略, 行首行尾空白丢弃, 同一变量
-# 出现多次时**后面的覆盖前面的**。
-# 该手册描述的完整语法(单/双引号跨行、反斜杠续行)不在这里实现: 这个文件里放的是一个时长
-# 字面量(`TUNNEL_GRACE_PERIOD=60s`), 多行引号形态对它没有现实意义。解析不出时返回非 0,
-# 由上层回退官方默认值并告警(第四轮复审已把该项降级为 P2)。
 _cf_env_file_value() {
     local f="$1" ln v out=""
     [ -f "$f" ] || return 1
@@ -919,35 +695,10 @@ _cf_env_file_value() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# systemd 的**有效配置**里的宽限期: 直接问 systemd, 不自己拼 unit 文本。
-#
-# 为什么文本解析不够(第四轮复审 P1): 生效值与主 unit 文件的文本不是一回事 ——
-#   · drop-in(`/etc/systemd/system/cloudflared.service.d/*.conf`, 官方文档现在直接推荐
-#     `systemctl edit`)可以覆盖 `Environment=` 与 `ExecStart=`;
-#   · `Environment=` 写多次时**后写的覆盖先写的**;
-#   · `EnvironmentFile=` 里的值**覆盖** `Environment=`(systemd.exec(5): "Settings from
-#     these files override settings made with Environment="), 多个文件按书写顺序、
-#     后面的覆盖前面的;
-#   · `ExecStart=` 的引号由 systemd 剥掉后的 argv 才是真正传给进程的。
-# 只扫主 unit 文本会在这些情形下读到**过小**的值 ⇒ 又变成"实际 60s / 脚本判 30s /
-# 35s SIGKILL", 与本 PR 要修的原始 bug 同形。
-#
-# `systemctl show` 给的就是合并结果: -p ExecStart 的 argv[] 已无引号; -p Environment 是
-# **去重后**的最终环境(实测 drop-in 的 60s 覆盖主 unit 的 30s)。注意 -p Environment
-# **不含** EnvironmentFile 的值, 那部分仍必须自己读文件(实测: 进程拿到 222s 而
-# show -p Environment 仍是 30s)。
-#   rc 0 = 输出有效字面量; rc 1 = systemd 明确回答"没配"; rc 2 = 读不到有效配置
-#   (systemctl 不可用 / bus 不通 / 旧版无 --value / unit 未加载)
-# ---------------------------------------------------------------------------
 _cf_systemd_grace_raw() {
     local load argv envs efs w v="" efp vf arr=() i
     load=$(systemctl show -p LoadState --value cloudflared 2>/dev/null) || return 2
-    # 只有 loaded 才算"systemd 承认了这份有效配置"。not-found(没有该 unit)、
-    # bad-setting(配置非法, 起不来)、masked 等一律回退文本解析: 宁可多读到值, 不可漏读。
     [ "$load" = loaded ] || return 2
-    # 1. 启动行。显式 flag 优先于环境变量(urfave/cli altsrc 语义: 环境变量只提供默认值)。
-    #    argv[] 由 systemd 解析, 引号已剥, 无需再 _cf_strip_quotes。
     argv=$(systemctl show -p ExecStart --value cloudflared 2>/dev/null) || return 2
     case "$argv" in
         *'argv[]='*) argv="${argv#*argv[]=}" ;;
@@ -965,17 +716,14 @@ _cf_systemd_grace_raw() {
         done
     fi
     [ -n "$v" ] && { printf '%s' "$v"; return 0; }
-    # 2. EnvironmentFile= 的值覆盖 Environment=, 且后列的文件覆盖先列的 -> 取最后一个有效值。
     efs=$(systemctl show -p EnvironmentFiles --value cloudflared 2>/dev/null) || efs=""
     while IFS= read -r efp || [ -n "$efp" ]; do
         [ -n "$efp" ] || continue
         efp="${efp% (ignore_errors=*)}"
-        # 通配路径不展开: 展开错了会把不生效的值当成生效配置(与旧实现一致)。
         case "$efp" in ''|*'*'*|*'?'*|*'['*) continue ;; esac
         if vf=$(_cf_env_file_value "$efp"); then v="$vf"; fi
     done <<< "$efs"
     [ -n "$v" ] && { printf '%s' "$v"; return 0; }
-    # 3. Environment=(已去重、已是最终生效值)
     envs=$(systemctl show -p Environment --value cloudflared 2>/dev/null) || envs=""
     for w in $envs; do
         case "$w" in TUNNEL_GRACE_PERIOD=*) v="${w#TUNNEL_GRACE_PERIOD=}" ;; esac
@@ -984,25 +732,10 @@ _cf_systemd_grace_raw() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# 用户实际配置的优雅退出宽限期(原始字面量, 如 `60s` / `2m`)。
-# cloudflared 支持 `--grace-period <PERIOD>` 与 `TUNNEL_GRACE_PERIOD` 覆盖官方默认 30s,
-# 两者都写在 service 文件里 —— 脚本必须读它, **不能写死一个数字**: 用户配了 60s 而脚本
-# 35s 强杀, 与"3s 强杀"是同一个错误(提前 SIGKILL 一个仍在 drain 在途请求的 cloudflared),
-# 只是窗口大了一点。命令行 flag 优先于环境变量(urfave/cli 的 altsrc 语义: 环境变量只提供
-# 默认值, 显式 flag 覆盖它)。输出非空 = 用户配过; 空/rc 1 = 没配, 由调用方用官方默认值。
-# ---------------------------------------------------------------------------
+# systemd 有效配置优先，读不到才退回文本；宽限期不能按主 unit 猜测。
 _cf_grace_config() {
     local svcfile="$1" ln arr=() i w v efpath efv eff rc
-    # systemd: **问 systemd 的有效配置**, 不自己拼 unit 文本(第四轮复审 P1)。
-    # `_cf_systemd_grace_raw` 已覆盖 drop-in、多重 Environment= 的后写覆盖、
-    # EnvironmentFile 覆盖 Environment 的次序, 以及 ExecStart 由 systemd 剥引号后的 argv。
-    # rc 1 = systemd 明确回答"没配"(它是权威, 直接采信, 不再回退文本);
-    # rc 2 = 读不到有效配置(容器无 bus / 旧版 systemctl / unit 未加载) -> 回退下面的文本
-    #        解析。文本解析是有效配置的**子集**, 只在拿不到权威答案时使用。
     if [ "${INIT_SYSTEM:-}" = systemd ]; then
-        # 必须先把返回码接住: `if cmd; then …; fi` 之后 `$?` 是 **if 语句本身**的状态
-        # (条件为假且无 else 时恒为 0), 不是 cmd 的。
         eff=$(_cf_systemd_grace_raw); rc=$?
         case "$rc" in
             0) printf '%s' "$eff"; return 0 ;;
@@ -1010,13 +743,9 @@ _cf_grace_config() {
         esac
     fi
     [ -f "$svcfile" ] || return 1
-    # 1. 启动行里的 --grace-period <PERIOD> / --grace-period=<PERIOD>(优先)。
-    #    先按 _cf_is_cmd_line 过滤, 注释行 / ExecStop= 行里的 --grace-period 不算生效配置。
     while IFS= read -r ln || [ -n "$ln" ]; do
         _cf_is_cmd_line "$ln" || continue
         ln=$(_cf_ltrim "$ln")
-        # openrc 的 `command_args="--grace-period 60s run"`、systemd 的 `ExecStart=…`: 字段前缀
-        # 会粘在第一个词上, 先摘掉, 后面的引号处理才能统一。
         case "$ln" in
             ExecStart=*|command_args=*|cmd=*|command=*) ln="${ln#*=}" ;;
         esac
@@ -1033,8 +762,6 @@ _cf_grace_config() {
             esac
         done
     done < "$svcfile"
-    # 2. 环境变量: systemd `Environment=TUNNEL_GRACE_PERIOD=60s`(可带引号), openrc 的
-    #    `export TUNNEL_GRACE_PERIOD=60s`。这些行不是启动行(_cf_is_cmd_line 认不出), 故单独扫。
     while IFS= read -r ln || [ -n "$ln" ]; do
         ln=$(_cf_ltrim "$ln")
         case "$ln" in '#'*|'') continue ;; esac
@@ -1044,10 +771,6 @@ _cf_grace_config() {
         v=$(_cf_strip_quotes "$v")
         [ -n "$v" ] && { printf '%s' "$v"; return 0; }
     done < "$svcfile"
-    # 3. `EnvironmentFile=<path>`(前缀 `-` 表示文件缺失不算错): 变量是 PID 1 从该文件读入
-    #    再传给进程的, 只扫 unit 文本会漏掉 —— 把 TUNNEL_GRACE_PERIOD 写在
-    #    /etc/default/cloudflared 里是完全正常的形态。通配路径不展开(YAGNI: 极少见,
-    #    展开错了反而会把不生效的值当成生效配置)。
     while IFS= read -r ln || [ -n "$ln" ]; do
         ln=$(_cf_ltrim "$ln")
         case "$ln" in '#'*|'') continue ;; esac
@@ -1062,23 +785,15 @@ _cf_grace_config() {
     return 1
 }
 
-# Go 时长字面量("30s" / "1m30s" / "500ms" / "1.5m") -> 向上取整的秒数。纯 bash 整数运算:
-# 目标机可能是 busybox(无 bc), 且这里不能依赖 GNU date 的 -d 解析。
-# 累加单位是**纳秒**: 官方 flag 是 Go time.Duration, ns/us/µs 都是合法单位, 用毫秒累加会把
-# 500us 这类不足 1ms 的值算成 0s, 而这里的契约是"向上取整"—— 非零时长至少 1 秒。
+# Go duration 按纳秒累加并向上取整；亚秒宽限期不能被当成零。
 _cf_duration_seconds() {
     local rest="$1" total_ns=0 int frac unit ns=0 scale div nonzero=0
     [ -n "$rest" ] || return 1
-    # Go 的 ParseDuration 特例: 裸 "0" 是合法时长(无单位), cloudflared 用它表示"不为在途
-    # 请求等待"(waitToShutdown 里 `if gracePeriod > 0` 才起 ticker)。不认它就会解析失败并
-    # 回退到默认 30s, 白白多等并打出一条误导性的告警。
     case "$rest" in 0) printf '0'; return 0 ;; esac
     while [ -n "$rest" ]; do
         [[ "$rest" =~ ^([0-9]+)(\.([0-9]+))?(ns|us|µs|ms|s|m|h)(.*)$ ]] || return 1
         int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"
         unit="${BASH_REMATCH[4]}"; rest="${BASH_REMATCH[5]}"
-        # 位数上限: 纳秒累加必须留在 bash 的 64 位整数里(999999h 已是 3.6e18ns)。
-        # Go 自己的 ParseDuration 对溢出同样报错, 这里也判非法 -> 回退默认值。
         [ "${#int}" -le 6 ] || return 1
         case "$unit" in
             ns)    ns=1 ;;
@@ -1102,17 +817,11 @@ _cf_duration_seconds() {
             total_ns=$(( total_ns + 10#$frac * ns / div ))
         fi
     done
-    # 溢出(字面量里有多段天量单位)会绕成负数: 必须判非法, 否则会算出一个远小于配置的秒数,
-    # 又回到"提前 SIGKILL"。
     [ "$total_ns" -lt 0 ] && return 1
-    # 非零但不足 1 秒(含被整数除法吃掉的不足 1ns 部分) -> 至少 1 秒, 与"向上取整"一致。
     [ "$total_ns" -eq 0 ] && [ "$nonzero" -eq 1 ] && total_ns=1
     printf '%s' "$(( (total_ns + 999999999) / 1000000000 ))"
 }
 
-# 允许升级到 SIGKILL 之前应当等待的秒数 = **用户实际配置的宽限期** + 余量。
-# 余量不是"多睡一会": 宽限期到点与收到 SIGKILL 撞在同一瞬间会让 cloudflared 来不及把
-# 最后一轮 in-flight 请求收尾。没配任何宽限期时才用官方默认 30s。
 _cf_grace_wait_seconds() {
     local raw secs
     raw=$(_cf_grace_config "$(_cf_unit_path)") || raw=""
@@ -1124,23 +833,10 @@ _cf_grace_wait_seconds() {
     else
         secs="$CF_GRACE_DEFAULT"
     fi
-    # 病态配置不得把停止流程挂住数小时; cloudflared 自身只接受 <=3 分钟
-    # (connection.MaxGracePeriod), 这里再留一道保险。上限只影响强杀时点。
     [ "$secs" -gt "$CF_GRACE_MAX" ] && secs="$CF_GRACE_MAX"
-    # 余量对**任何**配置都成立, 包括 --grace-period 0: 0 的语义是"不为在途请求等待", 不是
-    # "收到 SIGTERM 就立刻 SIGKILL" —— 进程仍需要时间处理信号并注销 connector, 余量是
-    # SIGTERM→SIGKILL 的**最小间隔下界**; 它是上界而不是固定等待, 进程一退出即返回。
     printf '%s' "$(( secs + CF_GRACE_MARGIN ))"
 }
 
-# ---------------------------------------------------------------------------
-# systemd 的 time span 文本 -> 向上取整的秒数。
-# **不能复用 _cf_duration_seconds**: 那读的是 Go 时长字面量(`1m30s`), 而 systemd 打印的是
-# **它自己的**格式, 实测 `systemctl show -p TimeoutStopUSec --value` 输出形如 `1min 30s` /
-# `1h 30min` / `2min 3.456789s` / `1.500000s` / `500ms` / `1us` / `1w` / `1month` / `1y` /
-# `infinity` —— 按量级由大到小、空格分隔, 小数只出现在最后一段。`1min 30s` 会被 Go 解析器
-# 直接拒掉(它不认 `min`), 因此必须另写一个, 单位常量取自 systemd-analyze 自身。
-#   rc 0 = 输出秒数(nonzero 不足 1 秒按 1 计, 与向上取整契约一致); rc 1 = 不是合法 span
 _cf_systemd_span_seconds() {
     local span="$1" tok int frac unit scale div mult total_us=0 nonzero=0
     [ -n "$span" ] || return 1
@@ -1164,7 +860,6 @@ _cf_systemd_span_seconds() {
         if [ -n "$frac" ]; then
             case "$frac" in *[!0]*) nonzero=1 ;; esac
             scale="${#frac}"
-            # format_timespan 的小数最多 6 位; 更长的只可能是伪造输入, 截断即可。
             [ "$scale" -gt 6 ] && { frac="${frac:0:6}"; scale=6; }
             case "$scale" in
                 1) div=10 ;; 2) div=100 ;; 3) div=1000 ;;
@@ -1173,66 +868,22 @@ _cf_systemd_span_seconds() {
             total_us=$(( total_us + 10#$frac * mult / div ))
         fi
     done
-    # 溢出会绕成负数: 必须判非法, 否则会算出一个远小于真实值的秒数。
     [ "$total_us" -lt 0 ] && return 1
     [ "$total_us" -eq 0 ] && [ "$nonzero" -eq 1 ] && total_us=1
     printf '%s' "$(( (total_us + 999999) / 1000000 ))"
 }
 
-# systemd 实际会施加的停止超时(`TimeoutStopUSec`, **含 manager 默认值**)。
-# 这是比 cloudflared 宽限期**更外层**的一道边界: 官方 unit(cmd/cloudflared/linux_service.go
-# 的 systemd 模板)只写 `TimeoutStartSec=15`, **没有 `TimeoutStopSec`**, 于是这一层完全由
-# manager 的 `DefaultTimeoutStopSec` 决定(实测本机 90s = `1min 30s`)。到点后 systemd 会
-# **自行终止** cloudflared, 不管它的 `--grace-period` 还剩多久 —— 所以 xray-deploy 宣称的
-# "等完实际配置的宽限期"在某些配置下是空话(grace 120s + 默认 90s: 90s 就被切断)。
-#
-# 不查 `LoadState`: 与 `_cf_systemd_grace_raw` 不同, 这个上界只有在**真有进程活着**时才会
-# 被用到(unit 不存在/未运行时 `_cf_wait_exit` 立即返回 0, 根本走不到上限), 所以"是不是
-# loaded"不影响结论, 少一次 `systemctl show` 更适合热路径。
-#   rc 0 = 输出秒数(有限上界)
-#   rc 1 = systemd 明确表示没有有限上界(`infinity`) -> 不施加任何上限
-#   rc 2 = 读不到(无 systemd / 旧版 / bus 不通) -> 不施加任何上限(维持原有行为)
 _cf_systemd_stop_timeout_seconds() {
     local span
-    # 不查 TimeoutStopFailureMode: 该属性接受 terminate|abort|kill(abort 自 systemd v246
-    # 起存在), 三者都会在停止超时到点时**终止进程**。实测 systemd 259: 三个合法值都无解析
-    # 错误; terminate 与 abort 都在 TimeoutStopUSec 到点后结束了忽略 SIGTERM 的进程;
-    # 非法值(如 continue)被直接拒绝, journal 里报 "Failed to parse
-    # TimeoutStopFailureMode=continue, ignoring: Invalid argument", 有效值保持 terminate。
-    # 所以"到点后 systemd 会真的终止进程"恒成立, 只要 TimeoutStopUSec 是有限值, 它就是
-    # 真正的上界 —— 无需再查该属性。
-    # `infinity` 与任何非数字形态都被 timespan 解析器拒掉 -> rc 1 -> 不施加任何上限。
     span=$(systemctl show -p TimeoutStopUSec --value cloudflared 2>/dev/null) || return 2
     [ -n "$span" ] || return 2
     _cf_systemd_span_seconds "$span" || return 1
 }
 
-# systemd 施加的停止超时是否会**早于**我们自己的升级时点。
-# 官方 unit 没有 `TimeoutStopSec`, 所以这一层由 manager 的 `DefaultTimeoutStopSec` 决定;
-# 若它比"宽限期 + 余量"更短, 那么 cloudflared 会在自己的 `--grace-period` 走完之前就被
-# systemd 终止 —— 此时脚本宣称的"按实际配置的宽限期等完"只是空话, 必须**显式说出来**,
-# 而不是安静地等一个永远不会由我们触发的时点。这是设计契约的一部分:
-# 脚本只能在 systemd 允许的窗口内尊重宽限期, 窗口本身必须由 unit 的 TimeoutStopSec 保证。
-# 只告警、不改 unit: 自动改写 systemd 停止超时属于改变系统行为, 不该由一次菜单停止动作
-# 顺手完成(与 `_cf_managed_line_only` 拒绝改写未托管启动行同一取舍)。
-#
-# **只在确实有东西要停时才检查**(复审第七轮 P2-2): cloudflared 已处于停止终态且没有本脚本
-# 归属的进程时, 这次调用根本不会等待任何进程, TimeoutStopSec 再短也截断不了什么 —— 此时
-# 告警纯属噪声(实测: unit 为 inactive + TimeoutStopSec=5s + 默认宽限期, 仍会打出"停止超时
-# 短于宽限期"且没有任何待停进程)。
-#   rc 0 = 上界足够 / 无需检查(读不到、无有限上界、或没有待停对象); rc 1 = 上界更短, 已告警
 _cf_check_stop_timeout_covers() {
     local want="$1" have st_rc=0
     [ "${INIT_SYSTEM:-}" = systemd ] || return 0
-    # 先问 unit 是否已到停止终态(一次 show, 比扫进程便宜), 只有它说"已停止"时才需要再确认
-    # 有没有归属进程残留 —— 顺序不可颠倒: 反过来会在热路径上多做一次进程扫描。
-    # 判据与 _cf_wait_exit 的"还有没有要等的对象"一致。
     _cf_unit_stopped || st_rc=$?
-    # rc 0 = inactive/failed 且 MainPID=0。再确认没有本脚本归属的孤儿进程(那种情况第 3 步仍要
-    # 等它退出), 两者都成立才算"这次没有待停对象"。
-    # rc 1(仍在运行/过渡态)必须继续检查 —— 确实要等。
-    # rc 2(状态读不到)也继续检查: 无法排除"其实要停", 与 _cf_unit_stopped 的 fail-closed
-    # 口径一致("读不到"不等于"已停止"), 宁可多一条告警也不假装无需等待。
     if [ "$st_rc" -eq 0 ] && [ -z "$(_cf_pids_owned)" ]; then
         return 0
     fi
@@ -1244,15 +895,7 @@ _cf_check_stop_timeout_covers() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# systemd unit 是否已进入"停止终态"。
-# **不得用 `systemctl is-active` 判"停完了没有"**: stop 进行中 unit 处于 deactivating,
-# 而 is-active 只认 active —— 它会**立刻**返回非 0, 于是等待形同不存在, 调用方紧接着就
-# 对一个仍在优雅退出的 cloudflared 发 SIGKILL, 硬断在途隧道请求(官方 --grace-period
-# 默认 30s)。与 _xray_stopped_state / _hysteria_stopped_state 同口径。
-#   rc 0 = 已停止终态(inactive/failed 且 MainPID=0)
-#   rc 1 = 仍在运行或处于过渡态(active/activating/deactivating/reloading)
-#   rc 2 = 读不到状态(容器内无 systemd / 旧版无 --value): 不据此断言任何事
+# 仅 inactive/failed 且 MainPID=0 算停止；deactivating 和读取失败不是终态。
 _cf_unit_stopped() {
     local active mainpid
     active=$(systemctl show -p ActiveState --value cloudflared 2>/dev/null) || return 2
@@ -1266,24 +909,11 @@ _cf_unit_stopped() {
     return 0
 }
 
-# 等 cloudflared 真正退出: 正常情况**立即**返回, 最坏消耗 <max> 秒。
-# 这是"正常退出检测"那一半 —— 强制清理(SIGTERM/SIGKILL)在它超时之后才允许发生。
-#   rc 0 = 已确认退出(进程已无且 unit 处于停止终态)
-#   rc 1 = 超时: 仍有存活进程或 unit 处于过渡态
-#   rc 2 = **无法观察**(进程已无, 但读不到 unit 状态): 既不算成功, 也不拖延
-#
-# 第三态是第四轮复审修的 P1: 旧实现把 `_cf_unit_stopped` 的 rc 2 归进 `*) return 0`,
-# 即"读不到 systemd 状态"被当成"已停止" —— 与 `_cf_unit_stopped` 自己声明的契约
-# (rc 2 = 不据此断言任何事)以及 `_xray_stopped_state` / `_hysteria_stop_and_verify` 的
-# fail-closed 口径直接矛盾, 调用方会据此宣称清理成功。
-# 立刻返回 2(而不是等满 max 秒)不会缩短任何进程的优雅窗口: 这段代码只在
-# `_cf_pids_owned` **已经为空**时才会去读状态; 只要还有存活进程就继续等到期限。
+# 进程与 unit 都退出才成功；0=停止、1=超时、2=无法观察。
 _cf_wait_exit() {
     local max="$1" i=0 rc
     while [ "$i" -lt "$max" ]; do
         if [ -z "$(_cf_pids_owned)" ]; then
-            # 进程没了还不够: systemd 可能仍在 deactivating(收尾 cgroup), 此时立刻返回
-            # 会让后续流程与被杀进程的收尾重叠。
             if [ "$INIT_SYSTEM" != systemd ]; then return 0; fi
             _cf_unit_stopped; rc=$?
             case "$rc" in
@@ -1297,38 +927,16 @@ _cf_wait_exit() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# 强力杀干净所有 cloudflared 进程(防止 PID 残留导致的进程泄漏)
-# openrc 的 rc-service stop 经常杀不干净, 必须内核级 kill 兜底
-# ---------------------------------------------------------------------------
+# stop → TERM → 实际宽限期 → KILL → 再 stop 复验；未知归属或终态必须失败。
 _cf_kill_all() {
     local pids="" pid i rc
-    # 严格归属判定不可用(混装旧 lib)的标志: 此时我们**无法确认**任何进程的归属,
-    # 进程状态未被确认清理, 最终必须 return 1 —— 不能对调用方谎报"已清理干净"。
     local _cf_strict_missing=0
-    # 停止终态**无法观察**的标志(_cf_wait_exit 的 rc 2)。进程可能真的没了, 但 unit 状态
-    # 读不到 => 我们没有证据说它已停止。与 _cf_strict_missing 同理, 最终必须 return 1:
-    # "读不到"不等于"已停止"(第四轮复审 P1)。
     local _cf_unit_unreadable=0
-    # 允许升级到 SIGKILL 的时点 = 用户实际配置的宽限期 + 余量(见 _cf_grace_wait_seconds)。
-    # 只在需要等待时才解析一次; 干净停止的路径上它不产生任何等待。
     local _cf_grace=""
 
-    # 1. 按实际 init 系统走正确的 stop，并等待进程真正退出
     case "$INIT_SYSTEM" in
         systemd)
-            # 异步请求停止: 同步 `systemctl stop` 会阻塞在 unit 的 TimeoutStopSec
-            # (DefaultTimeoutStopSec 常见默认 90s)。
-            # 请求发出后**必须按 ActiveState 等**, 不能拿 `is-active` 当"停完了"的判据 ——
-            # stop 进行中 unit 处于 deactivating, 而 is-active 只认 active, 会**立刻**
-            # 返回非 0 让等待形同不存在; 紧接着第 3 步的 SIGKILL 就会打断 cloudflared 的
-            # 优雅退出, 硬断在途隧道请求。
             _cf_grace=$(_cf_grace_wait_seconds)
-            # 更外层还有一道 systemd 自己的停止超时(官方 unit 未设 TimeoutStopSec, 由
-            # manager 的 DefaultTimeoutStopSec 决定)。它更短时, cloudflared 会在宽限期走完
-            # 之前就被 systemd 终止 —— 此时"等完实际配置的宽限期"是空话, 必须明说而不能
-            # 假装等到(见 _cf_check_stop_timeout_covers)。只告警, 不影响返回码: 这是我们
-            # 无法单方面改变的系统配置, 不该因它把一次正常停止判成失败。
             _cf_check_stop_timeout_covers "$_cf_grace" || true
             systemctl --no-block stop cloudflared 2>/dev/null || true
             _cf_wait_exit "$_cf_grace"; rc=$?
@@ -1344,18 +952,6 @@ _cf_kill_all() {
             ;;
     esac
 
-    # 2. 杀 PID 文件里的残留(PID reuse 防护: 只对**确属我们**的 pidfile PID 发信号)
-    #
-    # 2026-09-21 复审(P1): 这里的判据原本只有 `comm == cloudflared`, 而 comm 是**进程自报的
-    # 名字**, 任何同名程序都能满足 —— 用户自己装的 cloudflared(发行版包)、另一个 x-ui 之类
-    # 留下的实例, 只要 PID 被 pidfile 复用就会被我们 SIGTERM 掉。第 3 步(扫描)已经改用
-    # exe 限定的 _cf_pids_owned, 唯独这条 pidfile 路径绕过了它, 于是"exe 限定"的防护在
-    # 这条路径上形同不存在。实测复现: comm=cloudflared 但 exe=/usr/bin/bash 的进程被本分支
-    # 杀掉。
-    #
-    # 归属判定统一走 _cf_exe_owned(优先严格版: 读不到 exe 一律拒绝), 拿不到确切归属就
-    # 只告警、不发信号 —— 杀错一个别人的进程是不可逆的, 而 pidfile 残留最坏只是多告警一次。
-    # pidfile 本身仍然照删: 它记录的是"上一次由我们写的 PID", 对调用方没有保留价值。
     local _cf_pf_want
     _cf_pf_want=$(_cf_service_bin "$(_cf_unit_path)")
     [ -n "$_cf_pf_want" ] || _cf_pf_want="$CF_BIN"
@@ -1364,12 +960,7 @@ _cf_kill_all() {
         case "$_pf_pid" in
             ''|*[!0-9]*) ;;   # 空/非数字: 不是有效 PID, 只删文件
             *)
-                # comm 预筛只是"看起来像"的快速过滤(避免对每个无关 PID 都去读 exe);
-                # **决定权在 exe 归属判定**, 不能止步于 comm。
                 if [ "$(cat "/proc/$_pf_pid/comm" 2>/dev/null)" = "cloudflared" ]; then
-                    # 三态: 0=我们的(可 kill) / 1=确属他人 / 2=归属无法确认(严格版缺失)。
-                    # 两种非 0 的处置不同 —— 2 必须与 1 分开报, 否则混装旧 lib 时会把
-                    # "可能属于我们"的进程断言成"非本脚本管理的 cloudflared"。
                     local _cf_own_rc=0
                     _cf_exe_owned "$_pf_pid" "$_cf_pf_want" || _cf_own_rc=$?
                     case "$_cf_own_rc" in
@@ -1385,48 +976,23 @@ _cf_kill_all() {
         rm -f "$pf" 2>/dev/null
     done
 
-    # 3. 扫残留进程：先 SIGTERM（给 cloudflared 时间向 CF 边缘发送断开信号 + 完成优雅退出），
-    #    等到宽限期仍存活才 SIGKILL。
-    # R38(P2): 统一走 _cf_pids 家族, 不再用 pgrep/ps 两套逻辑。
-    # 2026-09-20: 这里用 _cf_pids_owned(exe 限定到 $CF_BIN)而不是全机 comm 扫描 ——
-    # 判活可以接受"把别人的隧道算成我们的", 杀进程不能(会 SIGKILL 掉用户自己装的
-    # cloudflared)。无关的同名进程留给第 4 步只告警, 由用户判断。
-    # 2026-09-28 复审(P1): 这里原本固定等 3s 就 SIGKILL, 而 cloudflared 收到 SIGTERM 后要
-    # 走官方 --grace-period(默认 30s)等**在途隧道请求**结束才退出 —— 3s 强杀会硬断正在
-    # 处理的请求。改成等自然退出, 上限才是允许升级到 SIGKILL 的时点(停完即返回)。
-    # 2026-09-29 复审(P1): 上限本身也必须来自 service 的**实际配置**(_cf_grace_wait_seconds
-    # 读 --grace-period / TUNNEL_GRACE_PERIOD), 不能再写死一个数字: 用户配 60s 而我们 35s
-    # 强杀, 与 3s 强杀是同一个错误, 只是窗口大一点。
     pids=$(_cf_pids_owned)
     if [ -n "$pids" ]; then
-        # step 1 已经解析过一次; openrc 或 step 1 未走的路径在此补算(幂等且不产生等待)。
         [ -n "$_cf_grace" ] || _cf_grace=$(_cf_grace_wait_seconds)
         for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
         _cf_wait_exit "$_cf_grace"; rc=$?
         if [ "$rc" -eq 2 ]; then
-            # 进程已全部退出, 只是读不到 unit 状态: **没有**需要强杀的对象, 所以不进入
-            # SIGKILL 分支(那会打出一条误导性的"残留进程未退出"告警), 只记下事实, 由第 4 步
-            # 折算成"未确认清理"的返回码。
             _cf_unit_unreadable=1
             _warn "无法读取 systemd 中 cloudflared 的状态, 无法确认其已进入停止终态"
         elif [ "$rc" -eq 1 ]; then
-            # 到这里才允许强杀: 优雅窗口已给足, 进程仍未退出。
             _warn "cloudflared 残留进程在 ${_cf_grace}s 内未退出, 发送 SIGKILL"
             pids=$(_cf_pids_owned)
             for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
-            # SIGKILL 不可捕获, 退出是立即的; 只在实际仍扫到 PID 时才消耗这一秒。
             i=0
             while [ "$i" -lt 5 ]; do
                 [ -z "$(_cf_pids_owned)" ] && break
                 sleep 1; i=$((i+1))
             done
-            # 2026-09-29 复审(P2): 进程消失 **不等于** unit 已停止。官方 unit 是
-            # `Restart=on-failure`, 而 SIGKILL 的退出信号正是 failure —— systemd 可能已经
-            # 排好了重启 job, 也可能仍有 stop job 在收尾 cgroup(此时 MainPID 已为 0 但
-            # ActiveState 仍是 deactivating)。若就这样返回 0, _cf_restart 会在 2s 后
-            # `systemctl start`, 与尚未结束的 stop/restart job 竞争, 出现"刚杀完又被拉起"
-            # 或 start 被 job 合并丢弃。按 _hysteria_stop_and_verify 的既有做法
-            # (lib/55-hysteria.sh:3971): **再 stop 一次**, 然后才复核终态, 顺序不可交换。
             if [ "$INIT_SYSTEM" = systemd ]; then
                 systemctl --no-block stop cloudflared 2>/dev/null || true
                 _cf_wait_exit "$CF_STOP_REVERIFY"; rc=$?
@@ -1437,47 +1003,23 @@ _cf_kill_all() {
         fi
     fi
 
-    # 4. 最终确认
     pids=$(_cf_pids_owned)
     if [ -n "$pids" ]; then
-        # R38(P2): 仍然返回 1 把"有残留"这个事实报给调用方, 但调用方语义变了 ——
-        # _cf_restart 不再据此跳过 start(见那里的注释)。原先"残留即中止"会让 _cf_restart
-        # 在已 stop+TERM+KILL **之后**直接返回而不 start, 一次普通的开关切换就把隧道彻底
-        # 打停; 调用方随后 _cf_rollback_service 内部又走 _cf_restart, 同一残留进程导致再次
-        # 不 start, 于是永久下线。残留可能是不可中断 IO 的进程。
         _warn "cloudflared 仍有残留进程: $pids"
         _tip "若隧道行为异常, 请手动确认这些进程是否应当存在"
         return 1
     fi
-    # 严格归属判定不可用时 _cf_pids_owned 恒为空(它只认 rc=0), 上面这条"无残留"因此是
-    # **假的**: 我们根本没能判定任何进程。这里显式复核一次, 并把标志置位以便最终 return 1。
     declare -F _proc_exe_is_strict >/dev/null 2>&1 || _cf_strict_missing=1
-    # 有同名的**别人家**进程时只提示不报错: 它不是残留, 更不该被我们杀。
     local p others="" unclear="" _cf_want
-    # 期望路径只解析一次: 旧写法在循环里每次都重读 unit 文件(_cf_service_bin 会打开并
-    # 逐行扫描 service 文件), 进程多时是无谓的重复 IO。
     _cf_want=$(_cf_service_bin "$(_cf_unit_path)")
     [ -n "$_cf_want" ] || _cf_want="$CF_BIN"
-    # 三分类, 不能用宽松的 _proc_exe_is 二分: 它在 exe 读不到时**放行**(fail-open 是判活
-    # 语义), 于是"exe 读不到"的进程既不在严格版的残留列表里(严格版拒绝), 又被宽松版算成
-    # "我们的", 两边都不提 —— 函数最后报"所有进程已清理"并返回 0, 而真正属于我们的孤儿
-    # 进程还活着。这里显式把"归属不明"单列出来告警, 不再静默吞掉。
     while IFS= read -r p; do
         [ -n "$p" ] || continue
-        # **判据顺序至关重要**: 必须先直接看 readlink 能否读到 exe, 不能先问宽松版
-        # _proc_exe_is —— 它在 exe 读不到时**放行**(fail-open 判活语义), 于是"exe 读不到"
-        # 的进程会在第一步就被当成"我们的"而 continue, 下面的 unclear 分支永远走不到
-        # (实测: 该分支曾是死代码), 函数最终报"所有进程已清理"并返回 0, 而真正属于我们、
-        # 只是 exe 不可读的孤儿进程还活着 —— 正是这段代码要防的事。
         if ! readlink "/proc/$p/exe" >/dev/null 2>&1; then
-            # PID 可能在 _cf_pids 扫描后退出; 不把已经消失的进程当作未清理残留。
             [ -d "/proc/$p" ] || continue
             unclear="$unclear $p"          # live PID 且 exe 读不到 => 归属无法确认
             continue
         fi
-        # exe 可读: 走归属判定(三态)。**必须用 case 区分 1 与 2** —— 旧实现用 `if ...; then
-        # continue; fi; others=...`, 把"无法确认"(2, 混装旧 lib)与"确属他人"(1)压成同一
-        # 结论, 于是把**可能属于我们**的进程断言成"非本脚本管理的 cloudflared(未触碰)"。
         local _cf_own_rc=0
         _cf_exe_owned "$p" "$_cf_want" || _cf_own_rc=$?
         case "$_cf_own_rc" in
@@ -1491,37 +1033,20 @@ _cf_kill_all() {
         _tip "检测到非本脚本管理的 cloudflared 进程:${others}(未触碰)"
     fi
     if [ -n "$unclear" ]; then
-        # 这些进程可能是我们自己的(只是 /proc/<pid>/exe 读不到, 如加固的 /proc 挂载),
-        # 不能宣称"已清理干净"。
         _warn "以下 cloudflared 进程归属无法确认(exe 不可读或 lib 版本过旧):${unclear}"
         _tip "它们可能仍属于本服务; 若隧道行为异常, 请手动确认"
         return 1
     fi
     if [ "$_cf_strict_missing" -eq 1 ]; then
-        # 归属判定降级: 进程状态**未被确认清理**, 不能对调用方谎报干净(_cf_restart 的
-        # `|| _warn` 与 _uninstall_cloudflared 的 kill_rc 契约都依赖这个返回码的真实性)。
         _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认 cloudflared 进程归属"
         _tip "请重跑 install.sh --update 同步模块后重试"
         return 1
     fi
     if [ "$_cf_unit_unreadable" -eq 1 ]; then
-        # 进程都没了, 但读不到 unit 状态 => 没有"已进入停止终态"的证据。这**不是**"仍有
-        # 残留进程", 也不是"已清理干净": 对调用方必须报未确认(_cf_restart 会因此拒绝启动
-        # 第二个实例, _uninstall_cloudflared 会因此保留服务定义与凭据)。
         _warn "cloudflared 进程已无, 但无法读取 systemd 状态, 停止终态未获确认"
         _tip "通常是容器内无 systemd 或 systemctl 不可用; 请手动确认服务状态"
         return 1
     fi
-    # 最终复验: "进程都没了"不等于"unit 已停止"。systemd 可以先回收主进程(MainPID=0)
-    # 再继续跑 ExecStop/ExecStopPost 与 cgroup 收尾, 期间 unit 一直是 deactivating ——
-    # 此时我们手上一个 cloudflared 进程都扫不到, 第 3 步("有 pids 才处理")整段跳过, 于是
-    # 上面所有判断都放行, 函数报"已清理"并返回 0, 而同一次停止事务其实还没结束。
-    # 真实危害与第 4 轮 P2 同源: _cf_restart 会在 2s 后 systemctl start, 与仍在进行的
-    # stop job 竞争(启动被合并丢弃, 或刚停就被 `Restart=on-failure` 拉起)。
-    # 第 4 轮 P1 修的是"读不到状态"(rc 2), 这里补上"读得到、但没停完"(rc 1) —— 两者都是
-    # 没有'已进入停止终态'的正向证据, 都不能算成功(与 _cf_unit_stopped 契约同口径)。
-    # 必须**重新读一次**而不能复用第 1 步的结论: 第 1 步超时可能只是因为进程还在跑, 而第 3
-    # 步的 SIGTERM 之后它已经干净退出, 那种情形终态确实达成了, 报失败会平白拦住正常重启。
     if [ "$INIT_SYSTEM" = systemd ]; then
         local _cf_term_rc=0
         _cf_unit_stopped || _cf_term_rc=$?
@@ -1540,11 +1065,8 @@ _cf_kill_all() {
     return 0
 }
 
-# 重启 cloudflared service(先杀干净所有, 等 CF 边缘回收旧 session, 再重新 start)
-# 保留重启前 2s 的 edge 回收间隔; 启动后不固定 sleep, 调用方立即做真实 liveness 确认。
+# 清理成功后保留 2s edge 间隔再启动；防止残留 connector 累积。
 _cf_restart() {
-    # An incomplete cleanup/ownership decision can create a second connector,
-    # so restart is fail-closed until all managed processes are accounted for.
     if ! _cf_kill_all; then
         _error "cloudflared 停止流程未完成, 为避免启动第二个实例已取消重启"
         return 1
@@ -1557,7 +1079,6 @@ _cf_restart() {
         *) return 1 ;;
     esac
     [ "$rc" -eq 0 ] || return "$rc"
-    # 服务已能启动时立即继续; 慢机器最多等 5 秒, 而不是固定睡满 3 秒。
     for ((i=0; i<6; i++)); do
         _cf_is_managed_running && return 0
         [ "$i" -lt 5 ] && sleep 1
@@ -1565,11 +1086,13 @@ _cf_restart() {
     return 1
 }
 
-# 从 .bak 回滚 service 文件并尽力恢复服务: restore -> (systemd) reload -> restart。
-# 供 token/开关/协议栈切换失败时统一使用。严格语义: restore -> (systemd) reload -> restart ->
-# liveness, 全部成功才算回滚成功(rc 0); 任一步失败 rc 1——"service 文件恢复"≠"系统回到原状态"。
+# 凭据、service、timer 恢复后重启并验证；文件还原不等于服务恢复。
 _cf_rollback_service() {
     local svcfile="$1"
+    if [ -n "${CF_TOKEN_BACKUP_PATH:-}" ]; then
+        _svc_restore "$CF_TOKEN_BACKUP_PATH" || return 1
+        CF_TOKEN_BACKUP_PATH=""
+    fi
     [ -f "${svcfile}.bak" ] || { _warn "无 ${svcfile}.bak 可回滚"; return 1; }
     if ! _svc_restore "$svcfile"; then
         _warn "回滚失败, 请手动检查 $svcfile"
@@ -1579,6 +1102,7 @@ _cf_rollback_service() {
         _error "回滚后 systemd daemon-reload 也失败: $svcfile"
         return 1
     fi
+    _cf_update_timer_restore || { _error "回滚更新 timer 失败"; return 1; }
     if ! _cf_restart 2>/dev/null; then
         _error "回滚后 cloudflared 重启失败: $svcfile"
         return 1
@@ -1590,8 +1114,7 @@ _cf_rollback_service() {
     return 0
 }
 
-# Transactional success requires evidence tied to the managed unit; unlike _cf_is_running,
-# this never falls back to a machine-wide cloudflared scan.
+# 事务成功只认服务进程树；全机同名扫描仅用于状态显示。
 _cf_is_managed_running() {
     local anchor pf
     case "$INIT_SYSTEM" in
@@ -1616,8 +1139,6 @@ _cf_is_running() {
     local anchor=""
     case "$INIT_SYSTEM" in
         systemd)
-            # R38(M3): 用 MainPID 把判活绑定到本 unit 的主进程, 而不是"机器上有没有叫
-            # cloudflared 的进程"。同时避免 is-active 在崩溃循环的 activating 窗口报成功。
             anchor=$(systemctl show -p MainPID --value cloudflared 2>/dev/null)
             if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ]; then
                 _proc_named_under "$anchor" cloudflared && return 0
@@ -1627,25 +1148,11 @@ _cf_is_running() {
             return $?
             ;;
         *)
-            # openrc/sysv/direct: 只认真实 cloudflared 进程, 不信 rc-service 的 started 文本
-            # (supervise-daemon 崩溃循环时仍报 started)。优先按 pidfile 回溯进程树确认归属,
-            # 拿不到 pidfile 时回退全机 comm 扫描(best-effort, 无法排除他人实例)。
-            # R40 说明: 这里**故意**不像 xray 侧那样把兜底扫描限定到 exe==$CF_BIN。cloudflared
-            # 二进制不由本脚本独占(用户可能先用发行版包/自己装过, 本脚本只接管 service 文件),
-            # 一旦限定路径, 运行中的是 /usr/bin/cloudflared 时判活会恒假 —— 而 _cf_toggle /
-            # 令牌切换都以"重启后 _cf_is_running 为真"作为事务成功条件, 假阴性会把本已生效的
-            # 改动整体回滚。此处的假阳性(把别人的隧道算成我们的)只影响状态显示, 危害更小。
             local pf
             for pf in /run/cloudflared.pid /var/run/cloudflared.pid; do
                 anchor=$(cat "$pf" 2>/dev/null) || continue
                 if [[ "$anchor" =~ ^[0-9]+$ ]] && [ "$anchor" != "0" ] && [ -d "/proc/$anchor" ]; then
                     _proc_named_under "$anchor" cloudflared && return 0
-                    # 不直接判死: 与 xray 侧 R40 同一条推理 —— pidfile 里的 PID 可能是陈旧
-                    # 残留后被其他进程复用(见 _cf_kill_all 的 PID reuse 防护), 也可能因
-                    # supervise-daemon→cloudflared 的 ppid 拓扑与预期不符而判不出归属。
-                    # 此处假阴性会让 _cf_toggle/令牌切换把"重启后 _cf_is_running 为真"的
-                    # 事务成功条件判假, 回滚本已生效的改动。anchor 判不出归属时继续按
-                    # 全机 comm 扫描兜底(不限定 exe, 理由见上方 R40 说明)。
                 fi
             done
             _proc_any_named cloudflared
@@ -1653,9 +1160,6 @@ _cf_is_running() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# 安装 cloudflared(含 service install)
-# ---------------------------------------------------------------------------
 _install_cloudflared() {
     _install_cloudflared_bin || return 1
     echo
@@ -1669,55 +1173,45 @@ _install_cloudflared() {
     fi
     _cf_token_valid "$token" || { _error "Token 格式非法(仅接受 ey 开头的标准 Base64 Tunnel Token: 解码后须为合法 JSON)"; return 1; }
 
-    # 默认设置(脚本安装默认: 自动更新 off, HTTP2 on, 协议栈 off)。
-    # FLAG=yes: 本脚本管理的启动行显式携带全部管理标志(_cf_build_cmdline 依赖)
     CF_AUTOUPDATE="off"; CF_HTTP2="on"; CF_EDGE_IP="off"; CF_AUTOUPDATE_FLAG="yes"
 
     _info "调用 cloudflared service install..."
-    if ! "$CF_BIN" service install "$token" 2>&1; then
+    if ! "$CF_BIN" service install --no-update-service "$token" 2>&1; then
         _error "cloudflared service install 失败"
         return 1
     fi
-    # 官方命令生成的 unit 是 644/755, token 任何本地用户可读 —— 落地即收紧(F4);
-    # 随后 _cf_write_service_line 的 _svc_commit 会再收一次, 这里覆盖"写入失败中止"的分支。
     case "$INIT_SYSTEM" in
         systemd) chmod 600 "$CF_UNIT_SYSTEMD" 2>/dev/null ;;
         openrc)  chmod 700 "$CF_UNIT_OPENRC" 2>/dev/null ;;
     esac
-    # 官方命令生成的 service 行可能不含我们要的参数, 重组覆盖。写入失败必须中止(不写 state,
-    # 否则 state 记录的参数与 service 实际内容不一致)。
+    _read_cf_state || return 1
+    _cf_update_timer_snapshot
+    _cf_update_timer_set off || { _cf_update_timer_restore || _warn "更新 timer 状态还原失败"; _error "关闭更新 timer 失败, 安装中止"; return 1; }
     local cmdline
-    cmdline=$(_cf_build_cmdline "$token") || { _error "无法构造安全的 cloudflared 启动行"; return 1; }
+    cmdline=$(_cf_build_cmdline "$token") || { _cf_update_timer_restore || _warn "更新 timer 状态还原失败"; _error "无法构造安全的 cloudflared 启动行"; return 1; }
     if ! _cf_write_service_line "$cmdline"; then
-        # 安装中止: 清掉 _svc_replace_line 可能留下的预修改快照, 否则它永远不会被消费
-        # (_cf_rollback_service 只服务"已安装后的切换", 安装已中止)。
         local ab_svc
         ab_svc=$(_cf_unit_path)
         rm -f "${ab_svc}.bak" 2>/dev/null
+        _cf_update_timer_restore || _warn "更新 timer 状态还原失败"
         _error "service 配置写入失败, 安装中止"
         return 1
     fi
-    # 重启失败同样中止(service 已写好但未启动, 不宣称安装完成)
     if ! _cf_restart; then
+        _cf_update_timer_restore || _warn "更新 timer 状态还原失败"
         _error "cloudflared 启动失败, 安装中止"
         return 1
     fi
-    # liveness 判定必须**先于**提交 state / 清理预修改快照(复审 P2): service install 在
-    # token 不可用时也会返回成功, 只有服务真的在跑, 安装事务才算可提交。失败时保留
-    # service 文件(用户唯一的修复入口), 但不写 state、不留预修改快照。
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
     if ! _cf_is_managed_running; then
         rm -f "${svcfile}.bak" 2>/dev/null
+        _cf_update_timer_restore || _warn "更新 timer 状态还原失败"
         _error "cloudflared service 已写入但启动后未运行, 安装未完成(请检查 token / 查看服务日志)"
         _tip "service 文件已保留以便修复: $svcfile"
         return 1
     fi
-    # 安装事务可提交: 清理 _cf_write_service_line 留下的预修改快照
     rm -f "${svcfile}.bak"
-    # 持久化状态。cf_token 不再落盘 ——
-    # 该 state 键全项目无读者(权威来源是 service 启动行, _read_cf_state 随时能解析),
-    # 多存一份明文只是纯泄漏面; 卸载清理保留, 以覆盖历史版本遗留的文件。
     mkdir -p "$STATE_DIR"
     _state_set cf_autoupdate "$CF_AUTOUPDATE" || _warn "状态持久化失败(cf_autoupdate)"
     _state_set cf_http2 "$CF_HTTP2" || _warn "状态持久化失败(cf_http2)"
@@ -1727,12 +1221,7 @@ _install_cloudflared() {
     _tip "隧道路由请在 Cloudflare Web 端配置, 本脚本不写 config.yml"
 }
 
-# ---------------------------------------------------------------------------
-# 卸载 cloudflared(彻底清)
-# ---------------------------------------------------------------------------
 _uninstall_cloudflared() {
-    # Keep credentials and the service definition until process cleanup is verified.
-    # service uninstall may erase a custom executable path needed to retry ownership checks.
     local kill_rc=0
     _cf_kill_all || kill_rc=$?
     if [ "$kill_rc" -ne 0 ]; then
@@ -1741,7 +1230,6 @@ _uninstall_cloudflared() {
         return 1
     fi
     local cleanup_rc=0 service_rc=0 enabled runlevels d link
-    # Clear the standalone token only after the service process has been stopped; verify removal.
     if [ -e /etc/cloudflared/token ] || [ -L /etc/cloudflared/token ]; then
         rm -f /etc/cloudflared/token || cleanup_rc=1
     fi
@@ -1810,15 +1298,11 @@ _uninstall_cloudflared() {
     _success "cloudflared 已卸载(二进制/服务/状态已清除)"
 }
 
-# ---------------------------------------------------------------------------
-# 切换/补录令牌
-# 策略: 优先"只替换 token"保留原 service 行其他参数(不破坏手动装的好配置);
-#       service 文件不存在时才用 cloudflared service install 注册。
-# 绝不在已装状态下重复 service install(会冲突报错)。
-# ---------------------------------------------------------------------------
+# 已有 service 只改凭据，缺失才注册；失败恢复旧凭据和服务。
 _cf_switch_token() {
     [ -x "$CF_BIN" ] || { _warn "cloudflared 未安装, 请先安装"; return 1; }
     _read_cf_state
+    _cf_update_timer_snapshot
     if [ -n "$CF_CUR_TOKEN" ]; then
         echo -e "  当前令牌: $(_cf_mask_token "$CF_CUR_TOKEN")"
     else
@@ -1833,14 +1317,13 @@ _cf_switch_token() {
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
 
     if [ ! -f "$svcfile" ]; then
-        # service 文件不存在: 用官方命令注册一次。install 失败必须中止, 不能继续往下走成"假成功"
         _info "service 文件不存在, 调用 cloudflared service install 注册..."
-        if ! "$CF_BIN" service install "$token" 2>/dev/null; then
+        if ! "$CF_BIN" service install --no-update-service "$token" 2>/dev/null; then
             _error "cloudflared service install 失败"
             return 1
         fi
-        # 注册后若文件出现, 再用只换 token 方式确保 token 正确(替换失败同样中止)
         if [ -f "$svcfile" ]; then
+            _cf_update_timer_set off || { _error "关闭更新 timer 失败"; return 1; }
             _cf_replace_token_in_service "" "$token" || {
                 _error "service install 成功但 token 替换失败"
                 return 1
@@ -1850,7 +1333,6 @@ _cf_switch_token() {
             return 1
         fi
     else
-        # service 文件已存在: 只换 token, 保留原参数(关键: 不破坏手动装的好配置)
         _info "保留原有启动参数, 仅替换令牌..."
         _cf_replace_token_in_service "$CF_CUR_TOKEN" "$token" || {
             _error "替换令牌失败"
@@ -1858,8 +1340,6 @@ _cf_switch_token() {
         }
     fi
 
-    # 重启: 先杀干净所有, 等 CF 边缘回收旧 session。restart 与 liveness 共同构成成功:
-    # restart 命令失败即中止(与 _install_cloudflared 同一语义), 避免"重启失败却宣称令牌已更新"。
     if ! _cf_restart; then
         _warn "重启 cloudflared 失败, 回滚 service 文件..."
         if _cf_rollback_service "$svcfile"; then
@@ -1870,13 +1350,9 @@ _cf_switch_token() {
         return 1
     fi
     local restarted_ok="no"
-    # R38(M3): 统一走 _cf_is_running —— 它现在把判活绑定到 unit MainPID / pidfile 进程树,
-    # 比裸 is-active 更严(is-active 在崩溃循环的 activating 窗口也会返回 0)
     _cf_is_managed_running && restarted_ok="yes"
     if [ "$restarted_ok" = "no" ]; then
         _warn "重启后服务未运行, 回滚 service 文件..."
-        # R38(P1): 回滚结果必须如实反映——原写法在 _cf_rollback_service 返回 1 时仍无条件
-        # 打印"已回滚", 与紧邻的"回滚失败"自相矛盾, 而此时 .bak 已被 _svc_restore 消费删除。
         if _cf_rollback_service "$svcfile"; then
             _error "令牌替换后服务异常, 已回滚到原令牌。请检查新令牌是否正确"
         else
@@ -1885,7 +1361,7 @@ _cf_switch_token() {
         return 1
     fi
     rm -f "${svcfile}.bak"   # 事务成功, 清理预修改快照
-    # F3: 不再把新令牌写进 state/cf_token(见 _install_cloudflared 同处注释)
+    _cf_token_backup_clear
     _success "令牌已更新, cloudflared 已重启(隧道短暂中断)"
 }
 
@@ -1938,13 +1414,14 @@ _cf_managed_line_only() {
     fi
     [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = run ] || return 1
     i=$((i+1))
-    [ "$i" -lt "$n" ] && [ "${_cf_words[$i]}" = --token ] || return 1
+    [ "$i" -lt "$n" ] && case "${_cf_words[$i]}" in --token|--token-file) ;; *) return 1 ;; esac
     i=$((i+1))
     [ "$i" -lt "$n" ] || return 1
     i=$((i+1))
     [ "$i" -eq "$n" ] || return 1
 }
 
+# 仅重建已托管参数形态；手改服务的额外参数不能被静默丢掉。
 _cf_managed_flags_only() {
     local line svc_bin expected_bin actual_bin have_command=no have_args=no have_launch=no
     svc_bin=$(_cf_service_bin "$(_cf_unit_path)" 2>/dev/null) || return 1
@@ -1967,13 +1444,11 @@ _cf_managed_flags_only() {
     [ "$have_launch" = yes ] || [ "$have_args" = yes ]
 }
 
-# (从头重建保证参数顺序: 全局标志 tunnel 连接标志 run --token)
-# 协议栈为四选一, 走 _cf_set_edge_ip(见下)
-# ---------------------------------------------------------------------------
 _cf_toggle() {
     local key="$1"
     [ -x "$CF_BIN" ] || { _warn "cloudflared 未安装, 请先安装"; return 1; }
     _read_cf_state
+    _cf_update_timer_snapshot
     if [ -z "$CF_CUR_TOKEN" ]; then
         _warn "未能读取令牌(可能是手动安装), 请先 [1] 补录令牌后再切换开关"
         return 1
@@ -1985,10 +1460,6 @@ _cf_toggle() {
     }
     local cur
     case "$key" in
-        # autoupdate 的"当前值"必须用与菜单显示同一个判据。启动行没写标志时 cloudflared
-        # 缺省是开(24h), 菜单据此显示"开"; 若这里改用 CF_CUR_AUTOUPDATE(此时是 off),
-        # 按一下会算出 new=on 并写出 `--autoupdate-freq 24h0m0s` —— 行为与显示一致(仍是开),
-        # 用户看到的是"按了没反应"。
         autoupdate) cur=$(_cf_autoupdate_effective) ;;
         http2)      cur="${CF_CUR_HTTP2:-on}" ;;
     esac
@@ -1999,7 +1470,7 @@ _cf_toggle() {
     case "$key" in
         autoupdate)
             CF_AUTOUPDATE="$new"
-            # 用户显式切换 autoupdate 本身 => 目标状态必须落成标志(含从"无标志"切到关)
+            _cf_update_timer_present && CF_AUTOUPDATE="off"
             CF_AUTOUPDATE_FLAG="yes"
             ;;
         http2)      CF_HTTP2="$new" ;;
@@ -2009,9 +1480,11 @@ _cf_toggle() {
     local cmdline
     cmdline=$(_cf_build_cmdline "$CF_CUR_TOKEN") || return 1
     _cf_write_service_line "$cmdline" || return 1
+    if [ "$key" = autoupdate ] && ! _cf_update_timer_set "$new"; then
+        _cf_rollback_service "$svcfile" || _error "更新 timer 切换失败且回滚未完成"
+        return 1
+    fi
 
-    # restart 与 liveness 共同构成成功(与 _cf_switch_token 同一语义), 失败即回滚
-    # R38(P1): 回滚消息按真实结果分支, 不再在回滚失败时也宣称"已回滚到原状态"
     if ! _cf_restart; then
         _warn "重启 cloudflared 失败, 回滚..."
         if _cf_rollback_service "$svcfile"; then
@@ -2035,13 +1508,10 @@ _cf_toggle() {
     _success "${key} 已切换为 ${new}(cloudflared 已重启, 隧道短暂中断)"
 }
 
-# ---------------------------------------------------------------------------
-# 设置协议栈 (--edge-ip-version 4|6|auto|关)
-# 四选一: IPv4 / IPv6 / Auto / 关(不写参数, 交 cloudflared 默认)
-# ---------------------------------------------------------------------------
 _cf_set_edge_ip() {
     [ -x "$CF_BIN" ] || { _warn "cloudflared 未安装, 请先安装"; return 1; }
     _read_cf_state
+    _cf_update_timer_snapshot
     if [ -z "$CF_CUR_TOKEN" ]; then
         _warn "未能读取令牌(可能是手动安装), 请先 [1] 补录令牌后再切换协议栈"
         return 1
@@ -2059,7 +1529,7 @@ _cf_set_edge_ip() {
     echo -e "  ${GREEN}[1]${NC} IPv4 (--edge-ip-version 4)"
     echo -e "  ${GREEN}[2]${NC} IPv6 (--edge-ip-version 6)"
     echo -e "  ${GREEN}[3]${NC} Auto (--edge-ip-version auto)"
-    echo -e "  ${GREEN}[4]${NC} 关   (不写参数, 使用 cloudflared 默认)"
+    echo -e "  ${GREEN}[4]${NC} 未指定 (不写参数, 默认 auto)"
     echo -e "  ${GREEN}[0]${NC} 取消"
     local choice
     read -rp "  请选择: " choice
@@ -2078,15 +1548,13 @@ _cf_set_edge_ip() {
     fi
 
     CF_AUTOUPDATE="${CF_CUR_AUTOUPDATE}"; CF_HTTP2="${CF_CUR_HTTP2}"; CF_EDGE_IP="$val"
-    CF_AUTOUPDATE_FLAG="${CF_CUR_AUTOUPDATE_FLAG:-yes}"   # F6: 保留原行对 autoupdate 的管理方式
+    CF_AUTOUPDATE_FLAG="${CF_CUR_AUTOUPDATE_FLAG:-yes}"
     local cmdline
     cmdline=$(_cf_build_cmdline "$CF_CUR_TOKEN") || return 1
     _cf_write_service_line "$cmdline" || return 1
 
     local svcfile
     case "$INIT_SYSTEM" in systemd) svcfile="$CF_UNIT_SYSTEMD" ;; *) svcfile="$CF_UNIT_OPENRC" ;; esac
-    # restart 与 liveness 共同构成成功(与 _cf_switch_token 同一语义), 失败即回滚
-    # R38(P1): 回滚消息按真实结果分支
     if ! _cf_restart; then
         _warn "重启 cloudflared 失败, 回滚..."
         if _cf_rollback_service "$svcfile"; then
@@ -2110,9 +1578,6 @@ _cf_set_edge_ip() {
     _success "协议栈已切换为 $(_cf_edge_ip_label "$val")(cloudflared 已重启, 隧道短暂中断)"
 }
 
-# ---------------------------------------------------------------------------
-# cloudflared 子菜单
-# ---------------------------------------------------------------------------
 _cloudflared_menu() {
     local choice
     while true; do
@@ -2129,28 +1594,22 @@ _cloudflared_menu() {
             else
                 tok_disp="${YELLOW}未读取(需补录)${NC}"
             fi
-            # F6: 启动行未显式写 autoupdate 标志时, cloudflared 缺省是开启(24h),
-            # 状态显示必须反映真实行为而不是"没有标志=关"。判据与 _cf_toggle 共用
-            # _cf_autoupdate_effective —— 两处各自解释同一个"缺失"会把切换基线算错。
             local auto_disp auto_suffix=""
             auto_disp=$(_cf_autoupdate_effective)
             if [ "${CF_CUR_AUTOUPDATE_FLAG:-yes}" = "no" ]; then
                 auto_suffix="(启动行无标志, 默认开)"
             fi
             echo -e "  状态: ${GREEN}已安装${NC}  令牌: ${tok_disp}"
-            echo -e "  自动更新: $(_cf_onoff "$auto_disp")${auto_suffix}  HTTP/2: $(_cf_onoff "${CF_CUR_HTTP2:-on}")  协议栈: $(_cf_edge_ip_disp "${CF_CUR_EDGE_IP:-off}")"
+            echo -e "  自动更新: $(_cf_onoff "$auto_disp")${auto_suffix}  HTTP/2: $(_cf_http2_disp "${CF_CUR_HTTP2:-on}")  协议栈: $(_cf_edge_ip_disp "${CF_CUR_EDGE_IP:-off}")"
             echo
             if [ -n "$CF_CUR_TOKEN" ]; then
                 echo -e "  ${GREEN}[1]${NC} 切换令牌"
             else
                 echo -e "  ${GREEN}[1]${NC} 补录令牌(手动安装的 cloudflared)"
-                # 管理范围声明: 本脚本只认启动行里的 `--token <值>`, 改写/切换都只针对它。
-                # token-file / Environment=TUNNEL_TOKEN 等官方形态无法安全重写(会破坏用户原配置),
-                # 故必须显式说明, 不能让用户以为"支持 cloudflared 令牌"就等于支持全部形态。
-                echo -e "  ${YELLOW}仅管理启动行中的 --token <值>; --token-file / Environment=TUNNEL_TOKEN 需手动维护${NC}"
+                echo -e "  ${YELLOW}管理 --token 与 --token-file; Environment=TUNNEL_TOKEN 需手动维护${NC}"
             fi
             echo -e "  ${GREEN}[2]${NC} 切换 自动更新 (当前 $(_cf_onoff "$auto_disp"))"
-            echo -e "  ${GREEN}[3]${NC} 切换 HTTP/2      (当前 $(_cf_onoff "${CF_CUR_HTTP2:-on}"))"
+            echo -e "  ${GREEN}[3]${NC} 切换 HTTP/2      (当前 $(_cf_http2_disp "${CF_CUR_HTTP2:-on}"))"
             echo -e "  ${GREEN}[4]${NC} 切换 协议栈      (当前 $(_cf_edge_ip_disp "${CF_CUR_EDGE_IP:-off}"))"
             echo -e "  ${GREEN}[5]${NC} 重启 cloudflared"
             echo -e "  ${GREEN}[6]${NC} 诊断(查看 service 文件内容)"
@@ -2184,7 +1643,6 @@ _cloudflared_menu() {
     done
 }
 
-# 诊断: 显示 service 文件内容 + 解析结果, 便于排查"读不出 token"
 _cf_diagnose() {
     echo
     echo -e "  ${CYAN}【cloudflared 诊断】${NC}"
@@ -2197,17 +1655,14 @@ _cf_diagnose() {
     echo -e "  service 文件: ${svcfile}"
     if [ -f "$svcfile" ]; then
         echo -e "  权限: $(ls -la "$svcfile" | awk '{print $1}')"
-        # R39(P2): token 打屏必须掩码 —— 诊断输出常被用户直接粘贴到 issue/群里,
-        # 明文 token 等同于隧道凭据泄漏。与菜单里的展示口径一致(首 12 + 末 4)。
         if [ -n "$CF_CUR_TOKEN" ]; then
             echo -e "  解析到的 token: $(_cf_mask_token "$CF_CUR_TOKEN") (长度 ${#CF_CUR_TOKEN})"
         else
             echo -e "  解析到的 token: (空)"
         fi
-        echo -e "  解析到的开关: auto=${CF_CUR_AUTOUPDATE} http2=${CF_CUR_HTTP2} 协议栈=${CF_CUR_EDGE_IP}"
+        echo -e "  解析到的开关: auto=$(_cf_autoupdate_effective) http2=${CF_CUR_HTTP2} 协议栈=${CF_CUR_EDGE_IP}"
         echo
         echo -e "  ${CYAN}--- 文件内容(token 已掩码) ---${NC}"
-        # 共享 quote-aware redactor: 无法安全解析的 token 行整个隐藏, 绝不原样放行。
         local dl
         while IFS= read -r dl || [ -n "$dl" ]; do
             _cf_redact_service_line "$dl"
@@ -2224,22 +1679,24 @@ _cf_onoff() {
     [ "$1" = "on" ] && echo "${GREEN}● 开${NC}" || echo "${RED}○ 关${NC}"
 }
 
-# 协议栈显示: 带颜色 (菜单/状态栏)
 _cf_edge_ip_disp() {
     case "$1" in
         4)    echo "${GREEN}● IPv4${NC}" ;;
         6)    echo "${GREEN}● IPv6${NC}" ;;
         auto) echo "${GREEN}● Auto${NC}" ;;
-        *)    echo "${RED}○ 关${NC}" ;;
+        *)    echo "${YELLOW}未指定(默认 auto)${NC}" ;;
     esac
 }
 
-# 协议栈纯文本标签(日志/提示用, 不带颜色)
 _cf_edge_ip_label() {
     case "$1" in
         4) echo "IPv4" ;;
         6) echo "IPv6" ;;
         auto) echo "Auto" ;;
-        *) echo "关" ;;
+        *) echo "未指定(默认 auto)" ;;
     esac
+}
+
+_cf_http2_disp() {
+    [ "$1" = on ] && echo "${GREEN}HTTP2${NC}" || echo "${YELLOW}auto(默认, QUIC 优先)${NC}"
 }
