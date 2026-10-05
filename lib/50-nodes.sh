@@ -1934,38 +1934,38 @@ _render_template() {
 
     # 占位符替换(用变量存 pattern, 避免 ${//\{\{...\}\}//} 转义歧义)
     local p
-    p="{{LISTEN}}";       content="${content//$p/$R_LISTEN}"
-    p="{{PORT}}";         content="${content//$p/$R_PORT}"
-    p="{{TAG}}";          content="${content//$p/$R_TAG}"
-    p="{{UUID}}";         content="${content//$p/$R_UUID}"
-    p="{{TARGET}}";       content="${content//$p/$R_TARGET}"
-    p="{{SERVER_NAME}}";  content="${content//$p/$R_SERVER_NAME}"
-    p="{{PRIVATE_KEY}}";  content="${content//$p/$R_PRIVATE_KEY}"
-    p="{{SHORT_ID}}";     content="${content//$p/$R_SHORT_ID}"
-    p="{{PATH}}";         content="${content//$p/$R_PATH}"
-    p="{{HOST}}";         content="${content//$p/$R_HOST}"
-    p="{{METHOD}}";       content="${content//$p/$R_METHOD}"
-    p="{{PASSWORD}}";     content="${content//$p/$R_PASSWORD}"
-    p="{{TUNNEL_PORT}}";  content="${content//$p/$R_TUNNEL_PORT}"
-    p="{{TUNNEL_TAG}}";   content="${content//$p/$R_TUNNEL_TAG}"
-    p="{{FLOW}}";          content="${content//$p/$R_FLOW}"
-    p="{{DECRYPTION}}";    content="${content//$p/$R_DECRYPTION}"
-    p="{{NETWORK}}";      content="${content//$p/$R_NETWORK}"
-    p="{{AUTH}}";         content="${content//$p/$R_AUTH}"
-    p="{{CERT_FILE}}";    content="${content//$p/$R_CERT_FILE}"
-    p="{{KEY_FILE}}";     content="${content//$p/$R_KEY_FILE}"
-    p="{{CONGESTION}}";   content="${content//$p/$R_CONGESTION}"
+    p="{{LISTEN}}";       content="${content//$p/"$R_LISTEN"}"
+    p="{{PORT}}";         content="${content//$p/"$R_PORT"}"
+    p="{{TAG}}";          content="${content//$p/"$R_TAG"}"
+    p="{{UUID}}";         content="${content//$p/"$R_UUID"}"
+    p="{{TARGET}}";       content="${content//$p/"$R_TARGET"}"
+    p="{{SERVER_NAME}}";  content="${content//$p/"$R_SERVER_NAME"}"
+    p="{{PRIVATE_KEY}}";  content="${content//$p/"$R_PRIVATE_KEY"}"
+    p="{{SHORT_ID}}";     content="${content//$p/"$R_SHORT_ID"}"
+    p="{{PATH}}";         content="${content//$p/"$R_PATH"}"
+    p="{{HOST}}";         content="${content//$p/"$R_HOST"}"
+    p="{{METHOD}}";       content="${content//$p/"$R_METHOD"}"
+    p="{{PASSWORD}}";     content="${content//$p/"$R_PASSWORD"}"
+    p="{{TUNNEL_PORT}}";  content="${content//$p/"$R_TUNNEL_PORT"}"
+    p="{{TUNNEL_TAG}}";   content="${content//$p/"$R_TUNNEL_TAG"}"
+    p="{{FLOW}}";          content="${content//$p/"$R_FLOW"}"
+    p="{{DECRYPTION}}";    content="${content//$p/"$R_DECRYPTION"}"
+    p="{{NETWORK}}";      content="${content//$p/"$R_NETWORK"}"
+    p="{{AUTH}}";         content="${content//$p/"$R_AUTH"}"
+    p="{{CERT_FILE}}";    content="${content//$p/"$R_CERT_FILE"}"
+    p="{{KEY_FILE}}";     content="${content//$p/"$R_KEY_FILE"}"
+    p="{{CONGESTION}}";   content="${content//$p/"$R_CONGESTION"}"
     # Hysteria2 brutal 参数块(可选: brutal 模式注入, 否则置空)
     p="{{BRUTAL_PARAMS_BLOCK}}"
     if [ -n "$R_BRUTAL_PARAMS_BLOCK" ]; then
-        content="${content//$p/$R_BRUTAL_PARAMS_BLOCK}"
+        content="${content//$p/"$R_BRUTAL_PARAMS_BLOCK"}"
     else
         content="${content//$p/}"
     fi
     # Hysteria2 混淆块(可选: 官方文档 finalmask.udp 数组; 未启用混淆时置空 → "udp": [])
     p="{{OBFS_MASK_BLOCK}}"
     if [ -n "$R_OBFS_MASK_BLOCK" ]; then
-        content="${content//$p/$R_OBFS_MASK_BLOCK}"
+        content="${content//$p/"$R_OBFS_MASK_BLOCK"}"
     else
         content="${content//$p/}"
     fi
