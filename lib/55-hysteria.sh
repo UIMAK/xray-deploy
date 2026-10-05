@@ -1885,6 +1885,7 @@ _hysteria_listen_port_part() {
 #   · protocol `hysteria` —— Xray Hy2 的协议键就是它(本项目模板实测; `infra/conf/xray.go`
 #     的入站协议表里只有 `hysteria`, **没有 `hysteria2`**) ⇒ 漏掉它会让 Xray Hy2 节点落在
 #     跳跃范围内时静默通过(端口被抢);
+#   · `wireguard` —— 入站端口监听 UDP(核心 `proxy/wireguard/server.go` 的 `Start()`);
 #   · `streamSettings.network` 为 mkcp/quic —— 传输层本身走 UDP;
 #   · `dokodemo-door`/`tunnel` 优先读 `settings.allowedNetwork`, 兼容旧 `settings.network`;
 #     含 udp 才冲突, 缺省 TCP(官方 config/inbounds/tunnel.md)。
@@ -1903,6 +1904,7 @@ _hysteria_xray_udp_port_ranges() {
         .inbounds[]? | select(.port != null)
         | select(
             (.protocol // "") == "hysteria"
+            or ((.protocol // "") == "wireguard")
             or ((.streamSettings.network // "") == "mkcp")
             or ((.streamSettings.network // "") == "quic")
             or ((.protocol // "") == "socks" and ((.settings.udp // false) == true))
