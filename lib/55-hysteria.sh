@@ -1886,9 +1886,8 @@ _hysteria_listen_port_part() {
 #     的入站协议表里只有 `hysteria`, **没有 `hysteria2`**) ⇒ 漏掉它会让 Xray Hy2 节点落在
 #     跳跃范围内时静默通过(端口被抢);
 #   · `streamSettings.network` 为 mkcp/quic —— 传输层本身走 UDP;
-#   · `dokodemo-door`/`tunnel` 的 `settings.network` 含 udp —— 缺字段按核心的 nil ⇒ TCP
-#     规则; 本项目 tunnel 模板还写死了 `"network": "tcp"`, TCP-only 不冲突 ⇒ 对它无条件
-#     判冲突是假阳性(会挡住合法跳跃范围);
+#   · `dokodemo-door`/`tunnel` 优先读 `settings.allowedNetwork`, 兼容旧 `settings.network`;
+#     含 udp 才冲突, 缺省 TCP(官方 config/inbounds/tunnel.md)。
 #   · `socks` 且 `settings.udp == true`;
 #   · `shadowsocks` 的 `settings.network` 含 udp —— **缺字段时默认是纯 TCP**: 核心
 #     `infra/conf/common.go` 的 `(*NetworkList).Build()` 对 nil 返回 `[net.Network_TCP]`,
@@ -1908,7 +1907,7 @@ _hysteria_xray_udp_port_ranges() {
             or ((.streamSettings.network // "") == "quic")
             or ((.protocol // "") == "socks" and ((.settings.udp // false) == true))
             or (((.protocol // "") == "dokodemo-door" or (.protocol // "") == "tunnel")
-                and (((.settings.network // "tcp") | tostring) | test("udp")))
+                and (((.settings.allowedNetwork // .settings.network // "tcp") | tostring) | test("udp")))
             or ((.protocol // "") == "shadowsocks"
                 and (((.settings.network // "tcp") | tostring) | test("udp")))
           )
@@ -1929,16 +1928,18 @@ _hysteria_xray_udp_port_ranges() {
 _hysteria_check_hop_conflicts() {
     local lo="$1" hi="$2" exclude="${3:-}" p
     [[ "$lo" =~ ^[0-9]+$ ]] && [[ "$hi" =~ ^[0-9]+$ ]] || return 1
-    local hit=""
-    # a) 一次 ss 快照(范围可上万, 逐端口探测太慢); exclude = hysteria 自身端口。
-    # 列位: ss 数据行 $4=本机 addr:port, $5=对端(*:*, 无端口) —— 用 $5 是空扫(已修)。
+    local hit="" udp_snapshot=""
+    # a) 一次 UDP 快照, ss 缺失时用 netstat; 两者本机 addr:port 均在 $4。
     if command -v ss >/dev/null 2>&1; then
-        while read -r p; do
-            [ -n "$p" ] || continue
-            [ -n "$exclude" ] && [ "$p" = "$exclude" ] && continue
-            [ "$p" -ge "$lo" ] && [ "$p" -le "$hi" ] && hit="$hit $p"
-        done <<< "$(ss -lun 2>/dev/null | awk 'NR > 1 {print $4}' | grep -oE '[0-9]+$' | sort -un)"
+        udp_snapshot=$(ss -lun 2>/dev/null)
+    elif command -v netstat >/dev/null 2>&1; then
+        udp_snapshot=$(netstat -lnu 2>/dev/null)
     fi
+    while read -r p; do
+        [ -n "$p" ] || continue
+        [ -n "$exclude" ] && [ "$p" = "$exclude" ] && continue
+        [ "$p" -ge "$lo" ] && [ "$p" -le "$hi" ] && hit="$hit $p"
+    done <<< "$(printf '%s\n' "$udp_snapshot" | awk 'NR > 1 {print $4}' | grep -oE '[0-9]+$' | sort -un)"
     [ -n "$hit" ] && { _error "以下端口已被本机监听, 与跳跃范围冲突:$hit"; return 1; }
     # b) Xray config 中 **UDP 能力** 的入站端口(P2-3: TCP-only 的 vless/reality/xhttp 等
     # 不与 hysteria 的 UDP 范围冲突 —— TCP 443 与 UDP 443 可共存)。

@@ -268,6 +268,68 @@ if _xh_hop_conflict '{"protocol":"vless","port":31500,"streamSettings":{"network
 if _xh_hop_conflict '{"protocol":"tunnel","port":31500,"settings":{"network":"tcp"}}' 20000 40000; then fail 'TCP-only tunnel not flagged as UDP conflict'; else pass 'TCP-only tunnel not flagged as UDP conflict'; fi
 check 'UDP-capable dokodemo-door flagged' _xh_hop_conflict \
     '{"protocol":"dokodemo-door","port":31500,"settings":{"network":"tcp,udp"}}' 20000 40000
+for proto in tunnel dokodemo-door; do
+    for network in udp tcp,udp; do
+        check "$proto allowedNetwork=$network flagged" _xh_hop_conflict \
+            "{\"protocol\":\"$proto\",\"port\":31500,\"settings\":{\"allowedNetwork\":\"$network\"}}" 20000 40000
+    done
+    for settings in '{"allowedNetwork":"tcp"}' '{}' '{"allowedNetwork":"tcp","network":"udp"}'; do
+        if _xh_hop_conflict "{\"protocol\":\"$proto\",\"port\":31500,\"settings\":$settings}" 20000 40000; then
+            fail "$proto TCP-only settings=$settings allowed"
+        else
+            pass "$proto TCP-only settings=$settings allowed"
+        fi
+    done
+    check "$proto allowedNetwork=udp takes precedence over legacy tcp" _xh_hop_conflict \
+        "{\"protocol\":\"$proto\",\"port\":31500,\"settings\":{\"allowedNetwork\":\"udp\",\"network\":\"tcp\"}}" 20000 40000
+done
+
+_test_udp_snapshot() (
+    local backend="$1" lo="$2" hi="$3" exclude="$4" expected="$5" rows="$6" rc=0
+    local calls="$TMP/udp-snapshot-calls"
+    : > "$calls"
+    CONFIG_DIR="$TMP/no-snapshot-config"
+    NODES_DIR="$XH_NODES_EMPTY"
+    command() {
+        if [ "${1:-}" = -v ]; then
+            case "${2:-}" in
+                ss) [ "$backend" = ss ]; return $? ;;
+                netstat) return 0 ;;
+            esac
+        fi
+        builtin command "$@"
+    }
+    ss() {
+        printf 'ss %s\n' "$*" >> "$calls"
+        printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n%s\n' "$rows"
+    }
+    netstat() {
+        printf 'netstat %s\n' "$*" >> "$calls"
+        printf 'Active Internet connections (only servers)\nProto Recv-Q Send-Q Local Address Foreign Address State\n'
+        if [ "$*" = -lnu ]; then
+            printf '%s\n' "$rows" | awk '$1 ~ /^udp/'
+        else
+            printf '%s\n' "$rows"
+        fi
+    }
+    _hysteria_check_hop_conflicts "$lo" "$hi" "$exclude" >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq "$expected" ] || return 1
+    if [ "$backend" = ss ]; then
+        [ "$(cat "$calls")" = 'ss -lun' ]
+    else
+        [ "$(cat "$calls")" = 'netstat -lnu' ]
+    fi
+)
+check 'netstat fallback rejects IPv4 UDP listener' _test_udp_snapshot netstat 40000 40002 '' 1 'udp 0 0 0.0.0.0:40001 0.0.0.0:*'
+check 'netstat fallback rejects IPv6 UDP listener' _test_udp_snapshot netstat 40000 40002 '' 1 'udp6 0 0 :::40001 :::*'
+check 'netstat fallback includes lower boundary' _test_udp_snapshot netstat 40000 40002 '' 1 'udp 0 0 127.0.0.1:40000 0.0.0.0:*'
+check 'netstat fallback includes upper boundary' _test_udp_snapshot netstat 40000 40002 '' 1 'udp 0 0 127.0.0.1:40002 0.0.0.0:*'
+check 'netstat fallback permits UDP outside range' _test_udp_snapshot netstat 40000 40002 '' 0 'udp 0 0 0.0.0.0:40003 0.0.0.0:*'
+check 'netstat UDP query permits same-number TCP listener' _test_udp_snapshot netstat 40000 40002 '' 0 'tcp 0 0 0.0.0.0:40001 0.0.0.0:* LISTEN'
+check 'netstat fallback excludes own UDP socket' _test_udp_snapshot netstat 40000 40002 40000 0 'udp 0 0 0.0.0.0:40000 0.0.0.0:*'
+check 'netstat own exclusion preserves other conflicts' _test_udp_snapshot netstat 40000 40002 40000 1 $'udp 0 0 0.0.0.0:40000 0.0.0.0:*\nudp6 0 0 :::40001 :::*'
+check 'ss preferred when both tools exist' _test_udp_snapshot ss 40000 40002 '' 1 'UNCONN 0 0 0.0.0.0:40001 0.0.0.0:*'
+
 # 十三轮复审: shadowsocks 缺 `network` 在核心里是 nil ⇒ [TCP]
 # (infra/conf/common.go 的 (*NetworkList).Build(): nil 返回 net.Network_TCP), 官方文档
 # inbounds/shadowsocks.md 也写"默认 tcp" ⇒ 默认 SS 入站**不监听 UDP**, 不得被误判成冲突。
