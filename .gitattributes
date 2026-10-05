@@ -1,5 +1,4 @@
-# Force LF line endings for all text files
-# Prevents CRLF corruption when committing from Windows
+# Auto-detect text; force LF for the listed file types and paths.
 * text=auto
 *.sh text eol=lf
 *.jsonc text eol=lf

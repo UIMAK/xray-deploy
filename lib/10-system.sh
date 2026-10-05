@@ -1,12 +1,7 @@
 #!/bin/bash
-# =============================================================================
-# lib/10-system.sh — 系统适配层
-# init 系统探测(systemd/openrc) / 包管理(apt/apk) / bash 依赖(Alpine)
-# ============================================================================
+# lib/10-system.sh — init/OS/架构探测与 apt/apk 依赖安装。
 
-# ---------------------------------------------------------------------------
-# 探测 init 系统:systemd / openrc / direct(兜底)
-# ---------------------------------------------------------------------------
+# 探测 systemd / OpenRC / direct。
 _detect_init_system() {
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         echo "systemd"
@@ -20,32 +15,20 @@ _detect_init_system() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# 探测系统类型(debian/ubuntu/alpine/其他)
-# ---------------------------------------------------------------------------
+# OS 家族探测；未知返回原 ID。
 _detect_os_family() {
     if [ -f /etc/os-release ]; then
         # shellcheck disable=SC1091
-        # R38(M2): 用子 shell 隔离 —— `. /etc/os-release` 会把 ID/NAME/VERSION/PRETTY_NAME
-        # 等 20+ 个大写变量注入调用者作用域。当前 4 个调用点都是命令替换(污染限于子 shell),
-        # 但函数本身没有任何防护, 一次裸调用就会静默覆盖同名变量。
+        # 子 shell 隔离 os-release 变量，防止覆盖调用者全局。
         (
             unset ID ID_LIKE
             . /etc/os-release 2>/dev/null
-            # R38(M2): 必须用 ${ID:-} —— 入口有 set -u, 而部分裁剪镜像/自制 rootfs 的
-            # os-release 只写 NAME/PRETTY_NAME 而没有 ID=; 裸 "$ID" 会让子 shell 以
-            # "ID: unbound variable" 直接退出, 下面 ${ID:-unknown} 的兜底永远到不了,
-            # 调用方拿到空串并报"不支持的系统"。
+            # ID 可能缺失；默认展开避免 set -u 在裁剪镜像中提前退出。
             case "${ID:-}" in
                 debian|ubuntu) echo "debian" ;;
                 alpine)        echo "alpine" ;;
                 *)
-                    # 衍生版(Mint/Kali/Raspbian/Devuan/Pop!_OS 等)通过 ID_LIKE 归类
-                    # R38(M2): 同时覆盖 alpine 系衍生版(postmarketOS 等), 否则它们会落到
-                    # echo "$ID" 而被 _pkg_install 判为"不支持的系统"。
-                    # ID_LIKE 的官方格式是空格分隔, 但实际发行版也出现过逗号/制表符分隔
-                    # (如 ID_LIKE=debian,ubuntu)。先归一化分隔符, 否则这类衍生版会掉进
-                    # 兜底分支被误判为"不支持的系统"。
+                    # 衍生版按 ID_LIKE 归类；统一空白/逗号分隔以免漏判。
                     local _like
                     _like=$(printf '%s' "${ID_LIKE:-}" | tr ',\t' '  ')
                     case " ${_like} " in
@@ -61,9 +44,7 @@ _detect_os_family() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# 探测架构(amd64 / arm64 / 386)
-# ---------------------------------------------------------------------------
+# 架构映射：amd64 / arm64 / 386。
 _detect_arch() {
     local m
     m=$(uname -m)
@@ -75,16 +56,12 @@ _detect_arch() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# 包安装(统一 apt/apk 分支)
-# 用法:_pkg_install <pkg1> [pkg2 ...]
-# ---------------------------------------------------------------------------
+# _pkg_install <pkg1> [pkg2 ...]：统一 apt/apk 安装。
 _pkg_install() {
     local fam p
     local -a pkgs=("$@")
     local pkg_label="${pkgs[*]}"
-    # 保留原始参数边界传给包管理器; 不得把数组展平为字符串后未引用展开, 否则 glob 会按
-    # 当前工作目录扩展, 而含空白的包约束会被拆成多个包名。拒绝 option-like package name。
+    # 保留 argv 边界并拒绝选项型包名，避免空白/glob 改变包约束。
     for p in "$@"; do
         case "$p" in
             -*) _error "非法包名(不得以 - 开头): $p"; return 1 ;;
@@ -102,13 +79,9 @@ _pkg_install() {
             ;;
         debian)
             command -v apt-get >/dev/null 2>&1 || { _error "apt-get 不可用, 无法安装: $pkg_label"; return 1; }
-            # DEBIAN_FRONTEND=noninteractive 防交互卡住(时区/服务重启提示)
-            # --no-install-recommends 省空间(小机器友好)
-            # DPkg::Lock::Timeout: 另一个 apt/unattended-upgrades 持锁时等待而非立即失败
-            #   (旧行为只报一句无信息的"apt 安装失败"); -- 终止选项解析(双保险)。
+            # 非交互、无 recommends 并等待 apt 锁，避免卡提示和无谓占盘。
             export DEBIAN_FRONTEND=noninteractive
-            # update 失败/超时不再被无视: 无网络或源坏时 install 必然失败, 这里先给出原因;
-            # 加 timeout 避免挂死的镜像源永久阻塞启动。
+            # update 失败告警但继续 install；timeout 限制坏镜像阻塞。
             if command -v timeout >/dev/null 2>&1; then
                 timeout 120 apt-get update -qq >/dev/null 2>&1 || _warn "apt-get update 失败或超时(继续尝试安装)"
             else
@@ -127,10 +100,7 @@ _pkg_install() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# 检查并安装基础依赖(jq curl wget unzip)
-# 每次启动轻量探测(command -v), 仅缺依赖时安装; 安装后复核, 返回真实成败
-# ---------------------------------------------------------------------------
+# 基础依赖逐次探测、只装缺项并装后复核；返回真实成败。
 _ensure_base_deps() {
     local c missing=()
     command -v curl   >/dev/null 2>&1 || missing+=(curl)

@@ -6,7 +6,7 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# 常量:安装目录收口 /opt/xray-deploy(用户需求 R2)
+# 常量:安装目录收口 /opt/xray-deploy
 # ---------------------------------------------------------------------------
 export DEPLOY_DIR="/opt/xray-deploy"
 export BIN_DIR="$DEPLOY_DIR/bin"
@@ -31,11 +31,8 @@ export CF_UNIT_SYSTEMD="/etc/systemd/system/cloudflared.service"
 export CF_UNIT_OPENRC="/etc/init.d/cloudflared"
 
 # ---------------------------------------------------------------------------
-# 进程间锁根目录(2026-09-26): 固定 `/var/lock/xray-deploy`(FHS 标准位置, 通常 tmpfs, 重启
-# 自愈陈旧锁, 且不污染 /opt)。必须在 `$DEPLOY_DIR` 之外 —— 卸载的 rm -rf 不会把锁拆成
-# 新旧 inode。**不接受环境变量覆盖**(会致两进程各持不同锁而互不排斥); 测试直接改写本函数。
-# 建不出时退 /run/lock; 仍失败**不回落到 /opt**, 返回 /var/lock 让调用方 fail-closed。
-# 与 install.sh 的 `_install_lock_root` 同口径。
+# 锁根固定在部署树外, 卸载不能拆开锁 inode; 不接受环境变量覆盖。
+# /var/lock 创建失败退 /run/lock, 均失败返回前者让调用方 fail-closed; 见 install.sh _install_lock_root。
 # ---------------------------------------------------------------------------
 _deploy_lock_root() {
     if mkdir -p /var/lock/xray-deploy 2>/dev/null; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
@@ -114,23 +111,20 @@ export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/dow
 # ---------------------------------------------------------------------------
 # 默认 dns 段(唯一真相): _init_config_if_empty(20-xray-core) 与 DNS 菜单的
 # [恢复默认](30-geo) 共用, **绝不允许任一侧另写一份**。
-# 三个上游都用 https+local:// (直连 DoH, 不经代理), 故不需要 routing 配合即可生效。
+# 三个 https+local:// 直连 DoH 上游策略相同且不单设 tag, 同组竞速首个成功响应(dns.md)。
 # ---------------------------------------------------------------------------
 readonly XRAY_DEFAULT_DNS_JSON='{
     "enableParallelQuery": true,
     "queryStrategy": "UseIP",
     "servers": [
       {
-        "address": "https+local://cloudflare-dns.com/dns-query",
-        "tag": "dns_cloudflare"
+        "address": "https+local://cloudflare-dns.com/dns-query"
       },
       {
-        "address": "https+local://dns.quad9.net/dns-query",
-        "tag": "dns_quad9"
+        "address": "https+local://dns.quad9.net/dns-query"
       },
       {
-        "address": "https+local://freedns.controld.com/p0",
-        "tag": "dns_controld"
+        "address": "https+local://freedns.controld.com/p0"
       }
     ],
     "tag": "dns_inbound",
@@ -272,7 +266,7 @@ _get_public_ip() {
         echo "$ip" && return 0
     done
     for url in "https://api.ipify.org" "https://ifconfig.me" "https://ipv4.icanhazip.com"; do
-        # 与 _http_download 同一口径: --timeout 是 GNU 长选项, busybox wget 可能 unrecognized option (H1), 用 -T
+        # 与 _http_download 同一口径: --timeout 是 GNU 长选项, busybox wget 可能 unrecognized option , 用 -T
         ip=$(wget -q -T 6 -O- "$url" 2>/dev/null) && [ -n "$ip" ] && \
         [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] && \
         (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 )) && \
@@ -310,9 +304,8 @@ _http_download() {
 
 # ---------------------------------------------------------------------------
 # URL 编解码(节点链接生成用)
-# 实现 NOTE(Alpine musl): 旧"按字符 + printf '%%02X'"依赖 locale 的字符/字节语义, musl 的
-# C locale 是 UTF-8, CJK 被编成 %DFE8 一类垃圾。现用 od 拆字节后逐字节判定, 与平台/locale
-# 无关: 允许集(字母/数字/.~_-)保留字面量, 其余字节 %XX 大写十六进制。
+# 按 od 输出的字节编码, 不依赖 libc/locale 的字符语义。
+# 字母/数字/.~_- 保留字面量, 其余字节编码为 %XX 大写十六进制。
 # ---------------------------------------------------------------------------
 _url_encode() {
     local s="$1" hex out="" b oct c o
@@ -380,7 +373,7 @@ _is_ipv6_literal() {
 }
 
 # ---------------------------------------------------------------------------
-# 监听地址合法性校验(R7)
+# 监听地址合法性校验
 # 接受 ::、0.0.0.0、127.0.0.1、::1、具体 IPv4/IPv6;非法返回非 0
 # ---------------------------------------------------------------------------
 _validate_listen() {
@@ -405,7 +398,7 @@ _validate_listen() {
     return 1
 }
 
-# 判断监听是否为回环(用于联动链接服务器地址 R7)
+# 判断监听是否为回环，用于联动链接服务器地址。
 _is_listen_loopback() {
     case "$1" in
         "127.0.0.1"|"::1"|"localhost") return 0 ;;
@@ -442,7 +435,7 @@ _xd_index_from_choice() {
 }
 
 # ---------------------------------------------------------------------------
-# 域名合法性校验(R38): 伪装域名会被拼进 inbound tag, tag 含空格/引号会破坏按 tag 的关联
+# 域名合法性校验: 伪装域名会被拼进 inbound tag, tag 含空格/引号会破坏按 tag 的关联
 # 匹配与 Clash 条目, 故从输入侧禁止。只接受 LDH 形式, 单段 1-63, 总长 ≤253。
 # ---------------------------------------------------------------------------
 _validate_domain() {
@@ -453,9 +446,7 @@ _validate_domain() {
 }
 
 # ---------------------------------------------------------------------------
-# 用户自定义值(path/密码/认证串/证书路径)进入 JSON 模板前的字符安全校验(2026-09-12 三审 M5)。
-# 值含 " \ 或换行/制表符会让渲染产物 JSON 不合法(用户只看到一句含混的"JSON 不合法");
-# 含 {{ 字样还会被后续替换轮次二次改写。在输入侧直接拒绝, 给出可理解的报错。
+# JSON 模板值拒绝引号、反斜杠、换行/制表符与 {{, 防止非法 JSON 或二次替换。
 # 用法: _validate_json_text <值>  非法返回 1
 # ---------------------------------------------------------------------------
 _validate_json_text() {
@@ -472,10 +463,8 @@ _validate_json_text() {
 }
 
 # ---------------------------------------------------------------------------
-# 生成 Reality 的 tunnel inbound tag(R39): 形态 Tunnel-<sni>-<tunnel_port>-<reality_port>
-# 合法 SNI 最长 253, 拼出的 tag 可达 270+ —— 内部标识不该无界携带 display 信息(污染菜单/
-# 日志, 且将来拿 tag 拼路径会撞 NAME_MAX)。这里截断 SNI 段使 tag ≤ 200 字符; 关联推导
-# 不受影响(主键是 realitySettings.target 端口, legacy 兜底按 "-<reality_port>" 后缀匹配)。
+# Reality tunnel tag: Tunnel-<sni>-<tunnel_port>-<reality_port>; 截断 SNI 使总长 ≤200。
+# 关联按 realitySettings.target 端口与 legacy 后缀推导, 不依赖完整显示域名。
 # 用法: tag=$(_gen_tunnel_tag <sni> <tunnel_port> <reality_port>)
 # ---------------------------------------------------------------------------
 _gen_tunnel_tag() {
@@ -492,10 +481,7 @@ _gen_tunnel_tag() {
 }
 
 # ---------------------------------------------------------------------------
-# YAML 双引号标量最小转义(R38)
-# clash.yaml 的 proxy 条目是单行 flow 映射, 用户可控字段直接插进 "..."。只有三类字符会
-# 破坏语义: " 提前闭合(整份 YAML 不可解析) / \ 被当转义符静默改写 / CR/LF 截断条目。
-# 其余( {} , # : ' 空格 Tab 中文 )在双引号内均安全。
+# YAML 双引号标量转义: 处理引号、反斜杠与 CR/LF, 防止闭合/改写/截断条目。
 # 用法: v=$(_yaml_dq "$raw"); 输出可直接放进双引号内, 不含外层引号。
 # ---------------------------------------------------------------------------
 _yaml_dq() {
@@ -543,11 +529,9 @@ _check_port_occupied() {
 }
 
 # ---------------------------------------------------------------------------
-# 持久化屏障: `mv` 只保证 rename **原子**(读不到半份文件), **不等于掉电持久**。
-# 事务账本的 phase barrier 声称 durable 就必须刷两次 —— 先刷临时文件(数据落盘), rename
-# 之后再刷**父目录**(新目录项落盘); 只刷文件时断电后目录项可能仍是旧的。
-# 手段按平台级联: `sync <path>`(coreutils ≥8.24 / busybox ≥1.31) → `sync -f <path>`(GNU) →
-# 全系统 `sync`(更重但永远正确)。尽力而为: 任一步成功返回 0, 全失败才告警。
+# rename 只保证原子可见性; 持久化须先刷临时文件, rename 后再刷父目录。
+# 按平台尝试 sync <path>(coreutils ≥8.24 / BusyBox ≥1.31)、sync -f(GNU)、全系统 sync。
+# best-effort: 任一步成功返回 0, 全失败才告警。
 # ---------------------------------------------------------------------------
 _fsync_path() {   # <path>
     local p="$1"
@@ -573,9 +557,7 @@ _atomic_write_json() {
         _error "写入临时 JSON 文件失败: $target"
         return 1
     fi
-    # R38(P1): 空内容必须拦在这里。上游普遍写 _atomic_write_json "$f" "$(jq ...)",
-    # jq 失败时为空串; 而 `jq empty` 对 0 字节返回 0, 于是空文件会被当合法 JSON 提交 ——
-    # 表现为"metadata 变 0 字节却报创建成功"、"config 被截断仍报回滚成功"。
+    # 拒绝空内容: jq 对零字节输入可能成功却无输出, 不得据此截断配置/元数据。
     if [ ! -s "$tmp" ]; then
         rm -f "$tmp"
         _error "生成的 JSON 内容为空,已放弃写入: $target"
@@ -603,7 +585,7 @@ _atomic_write_json() {
     return 0
 }
 
-# 原子更新 JSON 文件(R15): 先 jq 变换到内存, 成功后用 _atomic_write_json 提交。
+# 原子更新 JSON 文件: 先 jq 变换到内存, 成功后用 _atomic_write_json 提交。
 # 目标文件失败时保持原样, 无 .tmp 残留。替代所有裸 "jq ... > tmp && mv"。
 # 用法: _meta_update <目标文件> <jq-filter> [jq 参数...]  (jq 参数置于 filter 前)
 # 返回: 0 成功; 1 jq 变换或原子写失败
@@ -611,14 +593,14 @@ _meta_update() {
     local target="$1" filter="$2"; shift 2
     local content
     content=$(jq "$@" "$filter" "$target") || { _error "元数据变换失败: $target"; return 1; }
-    # R38(P1): jq 对 0 字节输入返回 0 且输出空; 空内容不得提交(会把 metadata 清成 0 字节)
+    # jq 对 0 字节输入返回 0 且输出空; 空内容不得提交(会把 metadata 清成 0 字节)
     [ -n "$content" ] || { _error "元数据变换结果为空(源文件损坏?): $target"; return 1; }
     _atomic_write_json "$target" "$content"
 }
 
 # ---------------------------------------------------------------------------
 # 多文件配置(confs 目录): 一个顶层字段一个文件, 文件名固定。
-# 合并/拆分只用 jq 读写字段内容, 不再做"按官方顺序重排顶层字段"(每文件只有一个字段)。
+# 管理器仅管理 *.json 的一字段一文件布局; Xray confdir 本身也支持 *.jsonc。
 # ---------------------------------------------------------------------------
 _conf_file_for_field() {   # <顶层字段> → <文件名>
     case "$1" in
@@ -691,10 +673,7 @@ _config_jq() {
     [ "$#" -ge 1 ] || return 1
     local filter="${!#}" opts=() merged
     [ "$#" -gt 1 ] && opts=("${@:1:$#-1}")
-    # 先取合并结果再喂给 jq。写成 `_config_merged | jq ...` 时管道退出码只看 jq(项目没有
-    # pipefail), 而合并失败(clob 里的文件读不了)时 jq 读到 EOF 会**返回 0 且无输出** ⇒
-    # 调用方的 `|| return 1`、`|| return 0` 全部失效, "读取失败"会被当成"配置里没有" ——
-    # 例如 _hy2_cert_dir_referenced 会把仍被引用的证书目录判成无引用再 rm -rf。
+    # 先检查合并返回码再调用 jq; 无 pipefail 的管道会掩盖读取失败并误判为空配置。
     merged=$(_config_merged) || return 1
     if [ "${#opts[@]}" -gt 0 ]; then
         printf '%s' "$merged" | jq "${opts[@]}" "$filter"
@@ -828,10 +807,8 @@ _state_get() {
 
 _state_set() {
     local key="$1" val="$2" tmp
-    # 严格半事务(R14): mkdir/printf/mv 任一步失败都返回 1 并清理 tmp, 避免
-    # "业务成功但 state 写失败被忽略"导致 service/config 与 state 分裂。
-    # 临时名必须唯一(mktemp): 两个并发 _state_set 写同一键时会交错写同一文件, 发布出半截状态。
-    # state 键含 cf_token 等凭据, 写完立即 chmod 600(umask 不可依赖)。
+    # mkdir/printf/mv 任一步失败返回 1 并清理 tmp; 唯一临时名防止并发写入交错。
+    # state 可含凭据, 写入后必须 chmod 600。
     mkdir -p "$STATE_DIR" || return 1
     tmp=$(mktemp "$STATE_DIR/${key}.tmp.XXXXXX") || return 1
     if ! printf '%s' "$val" > "$tmp"; then
@@ -868,11 +845,7 @@ _crontab_read() {
     if [ "$rc" -ne 0 ]; then
         local errtext; errtext=$(cat "$err" 2>/dev/null)
         rm -f "$err"
-        # "没有 crontab" 是正常空态(此时写回空内容正确); 其余错误(权限/I/O)必须 fail-closed,
-        # 当成空态会让调用方用空内容清空用户全部定时任务。
-        # 只认规范文案 "no crontab"(Vixie/cronie/busybox 共用)。**不能**把 can't open /
-        # cannot open / No such file or directory 也算进来 —— 它们同样出现在权限失败或
-        # crontab 包装器损坏场景, 而那正是必须 fail-closed 的情形。
+        # 只认规范 no crontab 为空态; 权限/I/O/包装器损坏均 fail-closed, 不得清空用户任务。
         case "$errtext" in
             *"no crontab"*)
                 return 0 ;;
@@ -885,9 +858,7 @@ _crontab_read() {
     return 0
 }
 
-# 三十四轮 P2: crontab 是独立于 config.json 的共享状态, 但同样是 RMW —— 并发会话会最后
-# 写入者覆盖前者。这里复用项目唯一的进程间事务锁(config lock), 不新建第二套锁机制。
-# 锁可重入: 已在 config lock 内的调用者不会自锁死。只读的 _crontab_read 不取锁。
+# crontab RMW 复用可重入 config lock 防止并发覆盖; 只读 _crontab_read 不取锁。
 _crontab_replace() {
     _with_config_lock _crontab_replace_locked "$@"
 }
@@ -895,18 +866,14 @@ _crontab_replace_locked() {
     local marker="$1" newline="${2:-}" cur filtered grc
     [ -n "$marker" ] || return 1
     cur=$(_crontab_read) || return 1
-    # -F: marker 含 "." "-" 等正则元字符, 按字面匹配。**必须检查 grep 退出码**:
-    # 命令替换的退出码不影响赋值, grep 真出错(rc>=2)时 filtered 为空串, 写回即清空 crontab。
-    # grep -v 在"所有行都被过滤掉"时**合法地**返回 1, 故只有 rc>=2 才算错误。
+    # -F 按字面匹配 marker; grep -v 返回 1 是合法空结果, rc>=2 必须拒绝写回。
     filtered=$(printf '%s\n' "$cur" | grep -vF "$marker"); grc=$?
     if [ "$grc" -ge 2 ]; then
         _error "过滤 crontab 失败(grep 返回 ${grc}), 已中止(避免覆盖并清空现有定时任务)"
         return 1
     fi
     if [ -n "$newline" ]; then
-        # **不能**在字符串里换行写 "${filtered:+${filtered}\n}": 源码会造出一行以 `}`
-        # 开头的内容行, 让测试套件的函数体提取器(_fn_body_extract 以行首 `}` 结束)截断函数;
-        # 用变量承载换行, 行为不变且函数可被完整提取。
+        # 用变量承载换行, 避免源码行首 } 截断测试套件的 _fn_body_extract。
         local nl=$'\n'
         filtered="${filtered:+${filtered}${nl}}${newline}"
     fi
@@ -914,14 +881,8 @@ _crontab_replace_locked() {
     return 0
 }
 
-# 判断某条项目定时任务是否还在 —— **必须走 _crontab_read, 不能用裸管道**。
-#
-# `crontab -l 2>/dev/null | grep -qF "$marker"` 的退出码把两种相反事实压成同一个 1:
-#   (a) 读成功, 确实没有这行          => 应继续把 state 记为 off
-#   (b) crontab -l 失败(权限/瞬时 I/O) => 行**可能仍在**, 绝不能记 off
-# (b) 会把系统留在"UI 说已关、cron 仍在无人值守重启服务"的分裂状态。
-#
-# 返回码刻意三态(而非布尔): 两种"非 0"的处置完全相反, 压成布尔必然误判一方。
+# 查询任务必须走 _crontab_read; 读失败不能等同于不存在, 否则 UI/cron 状态分裂。
+# 返回三态见 crontab 契约: 0=存在, 1=确实没有, 2=读取失败(未知)。
 _crontab_has_marker() {
     local marker="$1" cur rc
     [ -n "$marker" ] || return 2
@@ -939,8 +900,7 @@ _crontab_has_marker() {
 # ---------------------------------------------------------------------------
 # 配置备份/回滚(写 confs 前调用)。备份单位是**整个 confs 目录**。
 # ---------------------------------------------------------------------------
-# R38(P1): 备份必须非空 —— 磁盘满时 cp 可能返回 0 却只落地 0 字节, 之后回滚就会以
-# "空配置"覆盖。判据必须是 [ -s ]: ls 只能证明"文件存在", 0 字节文件会漏过去。
+# 备份须至少一份非空 *.json; 文件存在不等于内容可用于恢复。
 _backup_config_has_bytes() {
     local f
     for f in "$1"/*.json; do [ -f "$f" ] && [ -s "$f" ] && return 0; done
@@ -954,25 +914,22 @@ _backup_config() {
     # 注意: busybox/musl 的 mktemp 要求模板以 XXXXXX 结尾, 后缀必须放在 X 之前(否则 EINVAL)
     tmp=$(mktemp -d "${BACKUP_DIR}/confs.bak.XXXXXX") || return 1
     cp -f "$CONFIG_DIR"/*.json "$tmp"/ 2>/dev/null || { rm -rf "$tmp"; return 1; }
-    # R38(P1): 备份必须非空(磁盘满时 cp 可能返回 0 却只落地 0 字节), 见 _backup_config_has_bytes
+    # 非空判据见 _backup_config_has_bytes。
     _backup_config_has_bytes "$tmp" || { rm -rf "$tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
-    # 备份含密码/UUID/私钥: chmod 600 失败视为备份失败(R13), 不能留下 0644 备份
+    # 备份含密码/UUID/私钥: chmod 600 失败视为备份失败, 不能留下 0644 备份
     chmod 700 "$tmp" 2>/dev/null || { rm -rf "$tmp"; return 1; }
     chmod 600 "$tmp"/*.json 2>/dev/null || { rm -rf "$tmp"; return 1; }
-    # R23: lastbak 原子更新 —— 旧 lastbak 保持到新备份完整成功(直接 cp 覆盖在 I/O 失败时
-    # 会截断 lastbak, 损坏整个 rollback 基础)。
+    # 新副本完整且权限就绪后才替换 lastbak; rm + mv 不是整目录原子提交。
     local last_tmp
     last_tmp=$(mktemp -d "${BACKUP_DIR}/confs.lastbak.XXXXXX") || { rm -rf "$tmp"; return 1; }
     cp -f "$CONFIG_DIR"/*.json "$last_tmp"/ 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
-    # R38(P1): 同上 —— lastbak 是回滚基础, 0 字节比"没有备份"更危险
+    # lastbak 同样必须通过非空检查。
     _backup_config_has_bytes "$last_tmp" || { rm -rf "$tmp" "$last_tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
     chmod 700 "$last_tmp" 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
     chmod 600 "$last_tmp"/*.json 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
     rm -rf "$BACKUP_DIR/confs.lastbak"
     mv -f "$last_tmp" "$BACKUP_DIR/confs.lastbak" 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
-    # 轮转历史快照: 仅保留最新 10 份随机备份(回滚只用 lastbak, 其余作人工追溯)。
-    # while read 逐行消费 ls -1t, 不用 `for old in $(ls ...)` 词分割(文件名含空白时 rm -f
-    # 静默失败 → 目录无界增长); 只对目录计数。不用 find -printf(busybox 未必编译)。
+    # 随机快照保留最新 10 份; 按行读取目录名兼容空白, 不依赖 find -printf。
     local i=0 old
     while IFS= read -r old; do
         [ -n "$old" ] || continue
@@ -985,9 +942,8 @@ _backup_config() {
 
 _restore_config() {
     [ -d "$BACKUP_DIR/confs.lastbak" ] || return 1
-    # R23: 原子回滚 —— 逐文件写(每个文件走 _atomic_write_json 的 tmp → 校验 → mv),
-    # 失败时旧 confs 保持原样。
-    # R38(P1): 前置判非空, 否则"回滚"会把配置变成空目录却报成功。
+    # 逐文件回写(_config_write_merged), 非整目录原子回滚; 失败可能已恢复部分文件。
+    # 先拒绝无 JSON 的备份目录; 读取/写回失败返回 1。
     ls -1 "$BACKUP_DIR/confs.lastbak"/*.json >/dev/null 2>&1 || {
         _error "备份为空, 无法回滚($BACKUP_DIR/confs.lastbak)"
         return 1
@@ -1019,8 +975,7 @@ _gen_uuid() {
         # 兜底:从 /proc/sys/kernel/random/uuid(Linux)
         u=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
     fi
-    # 形状校验: 三个来源都可能失败(非 Linux 无 /proc、uuidgen 缺、xray 版本不支持), 或把
-    # 告警行混进 stdout。空 UUID 写进配置会让节点看似建好却永远连不上, 故 fail-closed。
+    # 各来源输出均须验证 UUID 形状, 缺失或告警文本不得写进配置。
     if [[ "$u" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
         printf '%s\n' "$u"
         return 0
@@ -1039,10 +994,7 @@ _gen_rand_path() {
 }
 
 # ---------------------------------------------------------------------------
-# 进程归属判定辅助(R38, M3)
-# 只按 comm 全机扫描会把**别的**安装(x-ui/3x-ui 残留、用户自己跑的 xray)也算成"我们的
-# 服务在跑", _restart_xray_verified 恒成功, 击穿核心保证。这些 helper 把判活绑定到具体
-# service 进程树。
+# 进程归属 helper: 判活绑定 service 进程树, 避免别的同名安装掩盖启动失败。
 # ---------------------------------------------------------------------------
 
 # 读取指定 pid 的父 pid。comm 字段可能含空格与括号, 故从最后一个 ') ' 之后取字段。
@@ -1077,31 +1029,17 @@ _xd_pid_unchanged() {
     [ "$now" = "$st" ]
 }
 
-# TERM -> 等待 -> KILL; 等待与强杀都绑定**同一进程化身**(starttime), 但**不是**硬保证。
-#
-# 裸 `kill -0` 等待会把"等待窗口内退出并被复用的 PID"当成"仍活着", 随后的 SIGKILL 就落到
-# 无关进程上。抓一次 starttime 并在每次判定与强杀前比对, 把风险从"整个等待期"收窄到
-# "最后一次读 stat 与 kill(2) 之间"。
-#
-# **残余窗口在本项目依赖范围内无法消除(不可写成"绝不误杀")**: 无竞争信号需要 pidfd;
-# Debian/Ubuntu 的 kill 由 procps 提供(无 --timeout), Alpine 是 busybox, bash 内建 kill 无该
-# 原语, python3 不是运行期依赖。契约是 **best-effort**。
-#
-# 读不到身份时**不做**延迟强杀(fail-closed, 与 `_proc_exe_is_strict` 对破坏性操作的口径一致):
-# 退回 `kill -0 + kill -9` 恰好会重建本函数要消除的缺陷。此时只发 TERM 并如实告警。
-#
+# TERM → 等待 → KILL 均复核 starttime, 限制 PID 复用导致的误杀。
+# best-effort: 最后一次 stat 与 kill 之间仍有窗口, 不依赖 pidfd/python3, 不承诺绝不误杀。
+# 身份读不到只发 TERM 并告警, 不退回 kill -0 + kill -9 的延迟强杀。
 # 用法: _xd_kill_pid_graceful <pid> [grace_seconds] [expected_starttime]
-#
-# **expected_starttime 是身份链闭合的关键**(复审 P1): 调用方复核身份后必须把**那次复核所用
-# 的 starttime** 传进来, 否则本函数重读一次, 两次读取之间 PID 仍可能被复用 ⇒ "复核的是 A、
-# 杀的是 B"。为空时退化为"自己抓一次"(openrc 纯 PID pidfile 等, 属已声明的 best-effort)。
+# 调用方须传复核时的 expected_starttime 闭合身份链; 省略时自行读取, 仍属 best-effort。
 _xd_kill_pid_graceful() {
     local pid="${1:-}" grace="${2:-5}" expected_st="${3:-}" st k=0
     # 规范 PID: `kill 0` 发给整个进程组(非 PID 0), 会误伤整组; 前导零/超长一律拒绝。
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
     [ "${#pid}" -le 7 ] || return 1
-    # **必须在 TERM 之前取身份**(复审 P1): 先 TERM 再读时原进程可能已退出并被复用,
-    # 读到的是**新进程**的 starttime, 强杀就正好打在新进程上。
+    # 必须在 TERM 前取身份, 否则可能记录退出后复用 PID 的新进程。
     st=$(_proc_starttime "$pid") || st=""
     if [ -n "$expected_st" ]; then
         # 身份链闭合: 当前化身必须与调用方复核过的记录一致, 否则一个信号都不发。
@@ -1129,12 +1067,8 @@ _xd_kill_pid_graceful() {
 }
 
 # ---------------------------------------------------------------------------
-# direct 后端的进程身份 pidfile: 记录 "PID starttime", 使停止时能证明"还是启动时那个进程"。
-#
-# 只记 PID 时, 调用点 comm/exe 检查与真正的 kill 之间仍有窗口 —— PID 被复用后, 即使复用者
-# 同名/同路径也分不出来(如两个 xray 实例)。启动时记录的 starttime 来自 fork 那一刻。
-# 兼容: 只含 PID 的旧 pidfile 与 openrc 自写 pidfile 没有第二字段 ⇒ 退化为"PID 存活即视为
-# 同一进程"(与旧行为一致), 与 `_proc_exe_is` 的 fail-open 口径同源。
+# direct pidfile 记录 PID starttime; 同名同路径也须区分进程化身。
+# 兼容旧纯 PID / OpenRC pidfile: 无 starttime 时仅检查存活, 属已声明的 best-effort。
 # ---------------------------------------------------------------------------
 _xd_pidfile_pid() {   # <file> -> stdout: 规范 PID, 否则空
     local f="${1:-}" pid=""
@@ -1181,12 +1115,8 @@ _xd_pidfile_identity_ok() {   # <file>
     return 0
 }
 
-# 严格版 exe 归属判定 —— **杀进程专用**。与 _proc_exe_is 的唯一差别: exe 读不到时**拒绝**。
-#
-# _proc_exe_is 的"读不到就放行"是为**判活**设计的(假阴性会让调用方重复启动实例, 比多算更糟)。
-# 用在杀进程上则是反向危害: 读不到 exe 时所有同名进程都被判成"我们的", 限定 exe 的杀进程
-# 扫描退化成它本该取代的全机 comm 扫描, 可能 SIGKILL 掉用户自己装的 cloudflared。
-# 凡"凭 exe 归属决定是否 kill"的地方都必须用本函数(55-hysteria 的两处杀 supervisor 闸门)。
+# kill 专用 exe 判定: 身份读不到即拒绝; 判活 _proc_exe_is 为防重复启动而 fail-open。
+# 凡凭 exe 归属决定是否 kill 都必须用本函数(含 55-hysteria supervisor 清理)。
 # ---------------------------------------------------------------------------
 _proc_exe_is_strict() {
     local pid="${1:-}" want="${2:-}" got rw
@@ -1231,11 +1161,8 @@ _proc_named_under() {
     return 1
 }
 
-# R40: 校验 pid 的 exe 是否就是期望的二进制 —— 全机 comm 扫描无法区分本脚本的实例与别人
-# 的同名进程(x-ui 残留、用户手跑), 而本脚本的 unit/init 永远指向自己的 $XRAY_BIN。
-# fail-open 的两种"读不到"要分清:
-#   - exe 读不到(权限/内核/刚退出) => 放行。判活的最后兜底, 假阴性会导致双实例, 更糟。
-#   - exe 读到但与期望不同 => 拒绝(即便期望路径解析不出来); "不同"已是确定结论。
+# exe 归属判活: 路径匹配才接受, 防止混入其它安装的同名进程。
+# exe 读不到但 PID 仍存在则 fail-open, 防止误判停止后重复启动; 读到不匹配则拒绝。
 _proc_exe_is() {
     local pid="${1:-}" want="${2:-}" got rw
     [ -n "$want" ] || return 0                  # 未指定期望路径 => 不做这层过滤
@@ -1266,8 +1193,7 @@ _proc_any_named() {
             [ -n "$pid" ] || continue
             _proc_exe_is "$pid" "$want" && return 0
         done <<< "$pids"
-        # pidof 报了同名进程但没有一个是期望的二进制: 不能就此判"没有" ——
-        # busybox pidof 在部分容器里会漏报(见 _xray_is_running 坑2), 继续 /proc 扫描兜底
+        # pidof 可能漏报, 未命中期望二进制时继续 /proc 扫描(见 _xray_is_running)。
     fi
     for p in /proc/[0-9]*; do
         read -r c 2>/dev/null < "$p/comm" || continue
@@ -1307,12 +1233,8 @@ _press_any_key() {
     read -r
 }
 
-# 无 flock 时的 config 锁退路(二十轮 P1-2): 与 install/core 的 mkdir 退路同一契约 ——
-# 锁根下 `config.lock.d` 原子 mkdir + pid, **永不自动接管**既有目录(活持有者/死 pid/无 pid
-# 一律拒绝并给人工清理命令)。SIGKILL 残局需人工 rm -rf, 是相对 flock 的已知代价; 但直接
-# 放行会让 reset 事务与普通 config writer 完全失去互斥。
-# **跨版本协调**: 覆盖 L1/L2 × flock文件/mkdir目录 四种组合, 复用 `_xray_legacy_lock_name`
-# 的无-flock 分支; 缺该助手时 fail-closed。
+# 无 flock 时 config.lock.d 原子 mkdir + pid; 既有目录一律拒绝, SIGKILL 残留需人工清理。
+# 跨版本 L1/L2 × flock/mkdir 协调见 _xray_legacy_lock_name; 缺 helper 时 fail-closed。
 _with_config_lock_mkdir() {
     local deploy_path="${DEPLOY_DIR%/}" lock_dir lock_file rc owner lrc
     local legacy_lock_file legacy_lock_dir legacy1_lock_file legacy1_lock_dir
@@ -1418,16 +1340,10 @@ _with_config_lock_mkdir() {
 }
 
 # ---------------------------------------------------------------------------
-# 跨进程配置修改锁(2026-09-12 审查 F5): 包住 config 的 read-modify-write, 防并发 xd 会话
-# 丢失更新。主锁在锁根 `/var/lock/xray-deploy/config.lock`(见 `_deploy_lock_root`): 卸载的
-# rm -rf $DEPLOY_DIR 不会把它拆成两个 inode, config writer 与全站破坏性操作才能真互斥。
-# **跨版本协调**: L1(父目录)/L2(目录内) × flock/mkdir 四种组合, 统一走 `_xray_legacy_lock_name`;
-# 只对**已存在**的旧路径协调(不凭空重建)。旧版(<=0.17.11)无锁写者无从协调。
-# 锁序: install → config → core(破坏性操作先取 install lock; 本函数**不自取** install lock ——
-# 那会让每次普通写入都创建旧版目录锁标记, SIGKILL 残局把菜单锁死)。
-# flock 不可用时走 `_with_config_lock_mkdir`(fail-closed, 不 best-effort 直通)。
-# 持锁者导出 `XRAY_DEPLOY_LOCK_HELD=1` 支持重入。$@ 在子 shell 中执行: 返回码经退出码透传,
-# fd 随子 shell 结束自动关闭释放锁。
+# 配置 RMW 锁: 锁根在部署树外, 卸载不能拆开 inode 导致并发覆盖。
+# 跨版本协调已存在的 L1/L2 × flock/mkdir, 见 _xray_legacy_lock_name; 无锁旧写者无法协调。
+# 锁序 install → config → core; 本函数不自取 install lock, 无 flock 时 mkdir 退路 fail-closed。
+# XRAY_DEPLOY_LOCK_HELD=1 支持重入; 子 shell 透传返回码并在退出时释放 fd。
 # ---------------------------------------------------------------------------
 _with_config_lock() {
     if [ "${XRAY_DEPLOY_LOCK_HELD:-0}" = "1" ]; then
@@ -1447,14 +1363,9 @@ _with_config_lock() {
     legacy_lock_file="$DEPLOY_DIR/.config.lock"
     legacy_lock_dir="$DEPLOY_DIR/.config.lock.d"
     (
-        # **只创建锁根目录**, 绝不创建 `$DEPLOY_DIR`: 与卸载竞态时会把它重新制造出来;
-        # 目录存在性改为**取到主锁之后**再判定, 不存在就 fail-closed。
+        # 只建锁根不重建部署树; 主锁后确认部署仍存在。
         mkdir -p "$(dirname "$config_lock_file")" 2>/dev/null
-        # 主锁文件在锁根, 不被卸载的 rm -rf 拆分。**已存在**的旧版 L1/L2 路径会被一并打开
-        # 占用以排斥旧版写者; 不存在则跳过。
-        # 注意: 仅带重定向的 exec 会把 stderr 重定向**持久化**到整个子 shell —— 原写法
-        # `exec 9>... 2>/dev/null` 吞掉事务体内全部 _error(2026-09-13 Alpine 实测);
-        # 去掉 2>/dev/null, open 失败时 bash 自身报错 + 下面的 _error 都可见。
+        # 主锁在锁根, 旧锁仅协调已存在路径; exec 不得永久重定向 stderr 吞掉事务错误。
         if ! exec 9>"$config_lock_file"; then
             _error "无法创建配置锁文件 $config_lock_file(目录不可写?), 放弃本次修改"
             exit 1
@@ -1519,11 +1430,9 @@ _with_config_lock() {
 }
 
 # ---------------------------------------------------------------------------
-# 普通 config/metadata 写入的**核心屏障**(复审 P1, 2026-09-26)。
-# 调用前提: 已持 config lock; 本包装再取 core lock 并在其内执行写入体, 使"未收敛事务检查
-# + 写入 + verified restart"处于**同一**临界区 —— 只做一次瞬时探测再写是 TOCTOU。
-# 锁序 config → core 成立(核心事务侧从不取 config lock), 屏障内的嵌套调用经持锁标记
-# 退化为直接调用, 不死锁。缺 `_with_core_lock`(混装旧 lib)时直接执行。
+# 普通 config/metadata 核心屏障: 已持 config lock 后再取 core lock。
+# 检查 + 写入 + verified restart 必须同一临界区, 防止 TOCTOU。
+# 锁序 config → core, 核心事务不反向取锁; HELD 标记支持嵌套, 混装缺 helper 时直接执行。
 # ---------------------------------------------------------------------------
 _with_config_write_barrier() {
     if declare -F _with_core_lock >/dev/null 2>&1; then
@@ -1534,7 +1443,7 @@ _with_config_write_barrier() {
 }
 
 # ---------------------------------------------------------------------------
-# 节点改名的安全替换(F8): 全局子串替换会误伤名称里含端口号的数字(5432 会改到 54321)。
+# 节点改名的安全替换: 全局子串替换会误伤名称里含端口号的数字(5432 会改到 54321)。
 # 默认命名形如 <Proto>-<port>, 只替换 "-<oldport>" 后缀; 无匹配则原样保留。
 # 用法: new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
 # ---------------------------------------------------------------------------
@@ -1549,7 +1458,7 @@ _rename_node_with_port() {
 }
 
 # ---------------------------------------------------------------------------
-# 分享链接地址/端口改写(F7, 收口 _modify_port 与 _update_listen 各自的字符串手术)。
+# 分享链接地址/端口改写。
 # @ 锚定分割, 不误伤 path/sni/name 段; IPv6 目标自动加括号, 源 host_part 还原成 "[addr]"。
 #   _rewrite_link_addr <link> <newaddr>          —— 只换 host 段, 保留端口(改监听)
 #   _rewrite_link_port <link> <oldport> <newport>—— 换 host:port 段(改端口, host 不变)
@@ -1566,8 +1475,7 @@ _rewrite_link_addr() {
         host_part="${after_at%%[:/?#]*}"
     fi
     local new_host="$newaddr"
-    # 前缀判断, 不是"包含"判断: 旧写法 `!= *"["*` 会把任何含 "[" 的地址都当成已加括号
-    # (如 "a[bc"), 于是不做包裹。正常地址不含 "[" , 这里收紧只为让判定与意图一致。
+    # 仅按前缀判断 IPv6 括号, 不能把地址中任意 [ 当成已包裹。
     if [[ "$newaddr" == *":"* && "$newaddr" != "["* ]]; then
         new_host="[${newaddr}]"
     fi
@@ -1584,9 +1492,7 @@ _rewrite_link_port() {
     else
         host_part="${after_at%%[:/?#]*}"
     fi
-    # 2026-09-12 三审(L2): oldport 与链接实际端口不符(metadata 被手改/损坏)时,
-    # 下面的 ${after_at#...} 删除不生效, 结果会变成 "host:9999host:443?..." 拼接垃圾。
-    # 与 F7 同一口径: 无法确定改写目标时输出空串, 调用方保留原链接。
+    # oldport 与实际端口不符时输出空串; 调用方须保留原链接, 防止拼接损坏。
     local prefix="$host_part:$oldport" suffix
     [[ "$after_at" == "$prefix"* ]] || { printf ''; return 0; }
     suffix="${after_at#"$prefix"}"
