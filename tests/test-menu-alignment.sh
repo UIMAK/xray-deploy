@@ -17,7 +17,7 @@ trap cleanup EXIT
 # Keep every mock in a subshell, including when this test is sourced elsewhere.
 (
     . "$ROOT/lib/00-common.sh"
-    . "$ROOT/lib/50-nodes.sh"
+    . "${MENU_ALIGNMENT_NODES_MODULE:-$ROOT/lib/50-nodes.sh}"
     # Override only for a disposable mutated copy, never edit production modules.
     . "${MENU_ALIGNMENT_MENU_MODULE:-$ROOT/lib/90-menu.sh}"
 
@@ -88,6 +88,8 @@ trap cleanup EXIT
         snapshot
     }
     snapshot() {
+        cp "$CONFIG_DIR/07_inbounds.json" "$TMP/before-inbounds.json"
+        cp "$META" "$TMP/before-meta.json"
         BEFORE_CONFIG=$(_config_merged)
         BEFORE_META=$(cat "$META")
         BEFORE_CLASH=$(cat "$CLASH_YAML")
@@ -104,6 +106,9 @@ trap cleanup EXIT
         check "$label: rejects before any writer or derived sync" test ! -s "$TMP/writes"
         check "$label: config byte-for-byte unchanged" eq "$BEFORE_CONFIG" "$(_config_merged)"
         check "$label: metadata byte-for-byte unchanged" eq "$BEFORE_META" "$(cat "$META")"
+        check "$label: raw config bytes unchanged" cmp -s "$TMP/before-inbounds.json" "$CONFIG_DIR/07_inbounds.json"
+        check "$label: raw metadata bytes unchanged" cmp -s "$TMP/before-meta.json" "$META"
+        check "$label: reports invalid transaction" test -s "$TMP/messages"
         check "$label: derived file unchanged" eq "$BEFORE_CLASH" "$(cat "$CLASH_YAML")"
     }
     committed() {
@@ -154,6 +159,93 @@ trap cleanup EXIT
     committed 'negotiated brutal permits unlimited zero' \
         '{"congestion":"brutal","brutalUp":"0","brutalDown":"0"}' \
         '.congestion="brutal" | .brutal_up="0" | .brutal_down="0"'
+
+    for operation in congestion bandwidth; do
+        for rate in 1bps 7bps 0.000001mbps 1kbps 65535bps 524287bps not-a-rate 1watts; do
+            for target in brutal-up brutal-down force-down; do
+                cc=brutal up='75 mbps' down='90 mbps'
+                case "$target" in
+                    brutal-up) up="$rate" ;;
+                    brutal-down) down="$rate" ;;
+                    force-down) cc=force-brutal down="$rate" ;;
+                esac
+                if [ "$operation" = congestion ]; then
+                    fixture bbr '45 mbps'
+                    invoke congestion "$cc" "$up" "$down"
+                else
+                    fixture "$cc" '75 mbps'
+                    invoke bandwidth '' "$up" "$down"
+                fi
+                rejected "$operation $target=[$rate]"
+            done
+        done
+        for rate in 524288bps 512kbps 0.5mbps 0 '0 mbps' 00.000kbps ''; do
+            for target in brutal-up brutal-down force-down; do
+                cc=brutal up='75 mbps' down='90 mbps'
+                case "$target" in
+                    brutal-up) up="$rate" ;;
+                    brutal-down) down="$rate" ;;
+                    force-down) cc=force-brutal down="$rate" ;;
+                esac
+                if [ "$operation" = congestion ]; then
+                    fixture bbr '45 mbps'
+                    invoke congestion "$cc" "$up" "$down"
+                    params=$(jq -nc --arg cc "$cc" --arg up "$up" --arg down "$down" '
+                        {congestion: $cc}
+                        + (if $up == "" then {} else {brutalUp: $up} end)
+                        + (if $down == "" then {} else {brutalDown: $down} end)')
+                else
+                    if [ -z "$rate" ]; then
+                        fixture "$cc" "$up" "$down"
+                    else
+                        fixture "$cc" '75 mbps'
+                    fi
+                    invoke bandwidth '' "$up" "$down"
+                    params=$(jq -nc --arg cc "$cc" --arg up "$up" --arg down "$down" '
+                        {congestion: $cc, debug: true, bbrProfile: "aggressive"}
+                        + (if $up == "" then {} else {brutalUp: $up} end)
+                        + (if $down == "" then {} else {brutalDown: $down} end)')
+                fi
+                meta_filter=$(jq -nr --arg cc "$cc" --arg up "$up" --arg down "$down" '
+                    ".congestion=" + ($cc | tojson) + " | .brutal_up=" + ($up | tojson)
+                    + " | .brutal_down=" + ($down | tojson)')
+                committed "$operation $target=[$rate]" "$params" "$meta_filter"
+            done
+        done
+    done
+
+    for rate in 524288bps 512kbps 0.5mbps; do
+        fixture force-brutal '75 mbps'
+        invoke bandwidth '' "$rate" ''
+        committed "force-brutal bandwidth minimum up=[$rate]" \
+            "{\"congestion\":\"force-brutal\",\"debug\":true,\"bbrProfile\":\"aggressive\",\"brutalUp\":\"$rate\",\"brutalDown\":\"90 mbps\"}" \
+            ".brutal_up=\"$rate\" | .brutal_down=\"90 mbps\""
+    done
+    for cc in brutal force-brutal; do
+        for old_down in 1kbps 65535bps 524287bps not-a-rate; do
+            fixture "$cc" '75 mbps' "$old_down"
+            jq '.brutal_down="90 mbps"' "$META" > "$TMP/meta-next"
+            cat "$TMP/meta-next" > "$META"
+            snapshot
+            invoke bandwidth '' '100 mbps' ''
+            rejected "$cc blank down retains invalid actual config down=[$old_down] despite valid metadata"
+        done
+    done
+    for old_up in 1kbps 65535bps 524287bps not-a-rate; do
+        fixture brutal "$old_up"
+        jq '.brutal_up="75 mbps"' "$META" > "$TMP/meta-next"
+        cat "$TMP/meta-next" > "$META"
+        snapshot
+        invoke bandwidth '' '' '120 mbps'
+        rejected "brutal blank up retains invalid actual config up=[$old_up] despite valid metadata"
+    done
+    for cc in brutal force-brutal; do
+        fixture "$cc" '75 mbps' 1kbps
+        invoke bandwidth '' '' 512kbps
+        committed "$cc explicit down repairs invalid old config down" \
+            "{\"congestion\":\"$cc\",\"debug\":true,\"bbrProfile\":\"aggressive\",\"brutalUp\":\"75 mbps\",\"brutalDown\":\"512kbps\"}" \
+            '.brutal_up="75 mbps" | .brutal_down="512kbps"'
+    done
 
     fixture force-brutal '75 mbps'
     jq '.brutal_up="0" | .brutal_down="stale"' "$META" > "$TMP/meta-next"
