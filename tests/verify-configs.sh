@@ -268,6 +268,43 @@ for mode in plain salamander gecko brutal; do
     hy="$inbound"
 done
 
+# Core Bandwidth.Bps uses binary units; Build requires >=65536 bytes/s, not docs' 65535 bps.
+for rate in 1kbps 0.01mbps 10kbps 65534bps 65535bps 100kbps 524287bps 511.999kbps 0.499999mbps \
+            524288bps 512kbps 0.5mbps '.5 MBPS' 524288 '512 kb'; do
+    case "$rate" in
+        524288bps|512kbps|0.5mbps|'.5 MBPS'|524288|'512 kb') expected=0 ;;
+        *) expected=1 ;;
+    esac
+    validator_rc=0
+    _hy2_force_brutal_up_valid "$rate" || validator_rc=$?
+    R_CONGESTION=force-brutal
+    R_OBFS_MASK_BLOCK=''
+    R_BRUTAL_PARAMS_BLOCK=", \"brutalUp\": \"$rate\""
+    if ! inbound=$(_render_template "$hy_tpl") \
+       || ! assert_field "$inbound" '.streamSettings.finalmask.quicParams.brutalUp' "$rate"; then
+        record FAIL "force-brutal [$rate] (render differs)"
+        continue
+    fi
+    dir="$scratch/force-brutal-confs"
+    config=$(jq -n --argjson inbound "$inbound" \
+        '{inbounds:[$inbound],outbounds:[{protocol:"freedom"}]}')
+    if ! _config_write_merged "$config" "$dir"; then
+        record FAIL "force-brutal [$rate] (confdir write failed)"
+        continue
+    fi
+    rc=0
+    XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true \
+        "$XRAY_BIN" run -test -confdir "$dir" </dev/null > "$scratch/force-brutal.log" 2>&1 || rc=$?
+    if [ "$validator_rc" -eq "$expected" ] && \
+       { { [ "$expected" -eq 0 ] && [ "$rc" -eq 0 ] && grep -qF 'Configuration OK' "$scratch/force-brutal.log"; } \
+       || { [ "$expected" -eq 1 ] && [ "$rc" -ne 0 ] && grep -qF 'BrutalUp must be at least 65536 bytes per second' "$scratch/force-brutal.log"; }; }; then
+        record PASS "force-brutal [$rate] (helper/core agree, expected rc=$expected)"
+    else
+        record FAIL "force-brutal [$rate] (helper rc=$validator_rc, core rc=$rc, expected=$expected)"
+        tail -n 8 "$scratch/force-brutal.log" >&2
+    fi
+done
+
 if [ -n "$ws" ] && [ -n "$ss" ] && [ -n "$hy" ]; then
     legacy=$(jq -n --argjson ws "$ws" --argjson ss "$ss" --argjson hy "$hy" \
         --arg asset "$ASSET_DIR" \

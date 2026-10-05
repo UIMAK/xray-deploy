@@ -118,10 +118,18 @@ trap cleanup EXIT
     }
 
     printf '== Hy2 menu transaction official alignment ==\n'
-    for invalid_up in '' '0' '0 mbps' '00.000 kbps' 'not-a-rate'; do
+    for invalid_up in '' '0' '0 mbps' '00.000 kbps' 'not-a-rate' 1kbps 0.01mbps 10kbps 65534bps 65535bps 100kbps 524287bps 511.999kbps 0.499999mbps 1watts; do
         fixture bbr '45 mbps'
         invoke congestion force-brutal "$invalid_up" '80 mbps'
         rejected "force-brutal switch up=[$invalid_up]"
+    done
+
+    for valid_up in 524288bps 512kbps 0.5mbps; do
+        fixture bbr '45 mbps'
+        invoke congestion force-brutal "$valid_up" ''
+        committed "force-brutal minimum [$valid_up]" \
+            "{\"congestion\":\"force-brutal\",\"brutalUp\":\"$valid_up\"}" \
+            ".congestion=\"force-brutal\" | .brutal_up=\"$valid_up\" | .brutal_down=\"\""
     done
 
     fixture bbr '45 mbps'
@@ -168,12 +176,12 @@ trap cleanup EXIT
         '{"congestion":"force-brutal","debug":true,"bbrProfile":"aggressive","brutalUp":"100 mbps","brutalDown":"90 mbps"}' \
         '.brutal_up="100 mbps" | .brutal_down="90 mbps"'
 
-    for invalid_up in '0' '0 mbps' '0.000 gbps'; do
+    for invalid_up in '0' '0 mbps' '0.000 gbps' 1kbps 524287bps 0.499999mbps; do
         fixture force-brutal '75 mbps'
         invoke bandwidth '' "$invalid_up" '120 mbps'
         rejected "force-brutal bandwidth explicit up=[$invalid_up]"
     done
-    for old_up in '' '0' '0 mbps'; do
+    for old_up in '' '0' '0 mbps' 1kbps 524287bps; do
         fixture force-brutal "$old_up"
         invoke bandwidth '' '' '120 mbps'
         rejected "force-brutal blank up with invalid effective config up=[$old_up]"

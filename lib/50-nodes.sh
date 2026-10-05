@@ -17,12 +17,22 @@ PROTOCOLS=(
 # ---------------------------------------------------------------------------
 # 带宽格式化: 纯数字自动补 mbps 单位
 # ---------------------------------------------------------------------------
-# force-brutal 的上行必须非零；它不经过对端协商(finalmask.md: force-brutal)。
+# 发布核心按 1024 倍单位转为字节/秒，上行至少 65536；文档 bps 门槛与实现不同。
+# Xray v26.9.30: infra/conf/transport_method.go Bandwidth.Bps / transport_internet.go Build。
 _hy2_force_brutal_up_valid() {
-    local v="${1//[[:space:]]/}" rate
-    [[ "$v" =~ ^([0-9]+([.][0-9]+)?)[[:alpha:]]*$ ]] || return 1
-    rate="${BASH_REMATCH[1]}"
-    [[ "$rate" == *[1-9]* ]]
+    local v="${1,,}" rate unit mul
+    [[ "$v" =~ ^[[:space:]]*([0-9]+([.][0-9]*)?|[.][0-9]+)[[:space:]]*([a-z]*)[[:space:]]*$ ]] || return 1
+    rate="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[3]}"
+    case "$unit" in
+        ''|b|bps) mul=1 ;;
+        k|kb|kbps) mul=1024 ;;
+        m|mb|mbps) mul=1048576 ;;
+        g|gb|gbps) mul=1073741824 ;;
+        t|tb|tbps) mul=1099511627776 ;;
+        *) return 1 ;;
+    esac
+    jq -en --arg rate "$rate" --argjson mul "$mul" \
+        '((($rate | tonumber) * $mul | floor) / 8 | floor) >= 65536' >/dev/null 2>&1
 }
 
 _normalize_bandwidth() {
@@ -1843,7 +1853,7 @@ _commit_hy2_node_txn_locked() {
     shift 9
     local congestion="$1" brutal_up="$2" brutal_down="$3" obfs_type="$4" obfs_pw="$5" obfs_size="$6" cert_file="$7" key_file="$8"
     if [ "$congestion" = "force-brutal" ] && ! _hy2_force_brutal_up_valid "$brutal_up"; then
-        _error "force-brutal 必须填写非零服务器上传带宽"
+        _error "force-brutal 服务器上传至少 524288 bps (512 kbps / 0.5 mbps)"
         return 1
     fi
 
@@ -4267,12 +4277,12 @@ _add_hysteria2() {
     case "${cc_choice:-1}" in
         2|3)
             [ "${cc_choice}" = "3" ] && congestion="force-brutal" || congestion="brutal"
-            echo -e "  ${YELLOW}${congestion} 带宽格式: 100 mbps / 10m / 1g; force-brutal 上传必填且非零${NC}"
+            echo -e "  ${YELLOW}${congestion} 带宽格式: 100 mbps / 10m / 1g; force-brutal 上传至少 512 kbps (0.5 mbps)${NC}"
             while :; do
                 read -rp "  上传带宽 (服务器→客户端, brutal 回车不限): " brutal_up || return 1
                 brutal_up=$(_normalize_bandwidth "$brutal_up")
                 [ "$congestion" != "force-brutal" ] || _hy2_force_brutal_up_valid "$brutal_up" && break
-                _error "force-brutal 必须填写非零服务器上传带宽"
+                _error "force-brutal 服务器上传至少 524288 bps (512 kbps / 0.5 mbps)"
             done
             read -rp "  下载带宽 (客户端→服务器, 回车不限): " brutal_down
             brutal_down=$(_normalize_bandwidth "$brutal_down")
