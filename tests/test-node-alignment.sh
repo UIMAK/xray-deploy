@@ -4,8 +4,9 @@ set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d) || exit 1
 trap 'case "$TMP" in "${TMPDIR:-/tmp}"/tmp.*) rm -rf "$TMP" ;; esac' EXIT
+(
 DEPLOY_DIR="$TMP"
-. "$ROOT/lib/50-nodes.sh"
+. "${NODE_ALIGNMENT_NODES_MODULE:-$ROOT/lib/50-nodes.sh}"
 . "$ROOT/lib/51-reality-pq.sh"
 NODES_DIR="$TMP/nodes" CERT_DIR="$TMP/certs" STATE_DIR="$TMP/state"
 mkdir -p "$NODES_DIR" "$CERT_DIR" "$STATE_DIR"
@@ -62,6 +63,74 @@ line=$(_hy2_clash_line "$TMP/committed.json")
 check 'ordinary brutal URI empty omits upload' lacks "$link" '&up='
 check 'ordinary brutal Clash empty omits upload' lacks "$line" ', up:'
 
+# Exercise both directions through creation, with an existing byte snapshot to protect.
+creation_fixture() {
+    printf '{"existing":"config"}\n' > "$TMP/inbound.json"
+    printf '{"existing":"metadata"}\n' > "$TMP/committed.json"
+    cp "$TMP/inbound.json" "$TMP/before-inbound.json"
+    cp "$TMP/committed.json" "$TMP/before-committed.json"
+    : > "$TMP/preflight"
+    : > "$TMP/errors"
+}
+creation_invoke() {
+    rc=0
+    _commit_hy2_node_txn_locked hy2-test node server 443 0.0.0.0 secret sni false '' "$1" "$2" "$3" '' '' '' /fixture/cert.pem /fixture/key.pem || rc=$?
+}
+creation_rejected() {
+    local label="$1"
+    check "$label rejects" eq "$rc" 1
+    check "$label rejects before config preflight" test ! -s "$TMP/preflight"
+    check "$label preserves config bytes" cmp -s "$TMP/before-inbound.json" "$TMP/inbound.json"
+    check "$label preserves metadata bytes" cmp -s "$TMP/before-committed.json" "$TMP/committed.json"
+    check "$label reports invalid rate" test -s "$TMP/errors"
+}
+creation_committed() {
+    local label="$1" cc="$2" up="$3" down="$4"
+    check "$label succeeds" eq "$rc" 0
+    check "$label config direction and empty omission" jq -e --arg cc "$cc" --arg up "$up" --arg down "$down" '
+        .streamSettings.finalmask.quicParams == ({congestion: $cc}
+            + (if $up == "" then {} else {brutalUp: $up} end)
+            + (if $down == "" then {} else {brutalDown: $down} end))' "$TMP/inbound.json"
+    check "$label metadata direction" jq -e --arg cc "$cc" --arg up "$up" --arg down "$down" '
+        .congestion == $cc and .brutal_up == $up and .brutal_down == $down' "$TMP/committed.json"
+}
+for rate in 1bps 7bps 0.000001mbps 1kbps 65535bps 524287bps not-a-rate 1watts; do
+    for target in brutal-up brutal-down force-down; do
+        cc=brutal up='80 mbps' down='20 mbps'
+        case "$target" in
+            brutal-up) up="$rate" ;;
+            brutal-down) down="$rate" ;;
+            force-down) cc=force-brutal down="$rate" ;;
+        esac
+        creation_fixture
+        creation_invoke "$cc" "$up" "$down"
+        creation_rejected "creation $target=[$rate]"
+    done
+done
+for rate in 524288bps 512kbps 0.5mbps 0 '0 mbps' 00.000kbps ''; do
+    check "shared rate accepts [$rate]" _hy2_brutal_rate_valid "$rate"
+    for target in brutal-up brutal-down force-down; do
+        cc=brutal up='80 mbps' down='20 mbps'
+        case "$target" in
+            brutal-up) up="$rate" ;;
+            brutal-down) down="$rate" ;;
+            force-down) cc=force-brutal down="$rate" ;;
+        esac
+        creation_fixture
+        creation_invoke "$cc" "$up" "$down"
+        creation_committed "creation $target=[$rate]" "$cc" "$up" "$down"
+    done
+done
+for rate in 1bps 7bps 0.000001mbps 1kbps 65535bps 524287bps not-a-rate 1watts; do
+    rc=0; _hy2_brutal_rate_valid "$rate" || rc=$?
+    check "shared rate rejects [$rate]" eq "$rc" 1
+done
+for rate in 524288bps 512kbps 0.5mbps; do
+    creation_fixture
+    creation_invoke force-brutal "$rate" ''
+    creation_committed "creation force-up=[$rate]" force-brutal "$rate" ''
+done
+
 # Both CDN transports preserve existing Firefox and default absent fp to Chrome.
 for proto in vless-xhttp-cdn vless-ws-cdn; do
     jq -n --arg p "$proto" '{protocol:$p,name:"cdn",link_addr:"edge",port:443,uuid:"id",host:"site.example",path:"/path",fp:"firefox"}' > "$TMP/cdn.json"
@@ -108,3 +177,4 @@ rc=0; _detect_reality_pq example:443 || rc=$?
 check 'PQ probe failure unknown not unsupported' eq "$rc" 2
 printf 'node-alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
+)

@@ -1417,6 +1417,11 @@ _hy2_congestion_txn_locked() {
     case "$operation" in
         congestion)
             case "$new_cc" in bbr|brutal|force-brutal) ;; *) _error "无效拥塞模式: $new_cc"; return 1 ;; esac
+            if [ "$new_cc" != "bbr" ] &&
+               { ! _hy2_brutal_rate_valid "$up" || ! _hy2_brutal_rate_valid "$down"; }; then
+                _error "brutal 上下行须为有效速率: 0/回车不限, 非零至少 512 kbps (0.5 mbps)"
+                return 1
+            fi
             if [ "$new_cc" = "force-brutal" ] && ! _hy2_force_brutal_up_valid "$up"; then
                 _error "force-brutal 服务端上传至少 524288 bps (512 kbps / 0.5 mbps)"
                 return 1
@@ -1457,6 +1462,10 @@ _hy2_congestion_txn_locked() {
             effective_down="$down"
             [ -n "$effective_up" ] || effective_up=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalUp // empty' 2>/dev/null)
             [ -n "$effective_down" ] || effective_down=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalDown // empty' 2>/dev/null)
+            if ! _hy2_brutal_rate_valid "$effective_up" || ! _hy2_brutal_rate_valid "$effective_down"; then
+                _error "brutal 上下行须为有效速率: 0 不限, 非零至少 512 kbps (0.5 mbps)"
+                return 1
+            fi
             if [ "$config_cc" = "force-brutal" ] && ! _hy2_force_brutal_up_valid "$effective_up"; then
                 _error "force-brutal 服务端上传至少 524288 bps (512 kbps / 0.5 mbps)"
                 return 1
@@ -1540,7 +1549,7 @@ _hy2_toggle_brutal() {
     esac
     local brutal_up="" brutal_down="" txn_rc
     if [ "$new_cc" != "bbr" ]; then
-        echo -e "  ${YELLOW}${new_cc} 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
+        echo -e "  ${YELLOW}${new_cc} 格式: 100 mbps / 10m / 1g; 0/回车不限, 非零上下行至少 512 kbps (0.5 mbps)${NC}"
         if [ "$new_cc" = "force-brutal" ]; then
             read -rp "  服务端上传带宽 (至少 512 kbps / 0.5 mbps): " brutal_up
         else
@@ -1610,7 +1619,7 @@ _hy2_adjust_bandwidth() {
     local cur_up cur_down
     cur_up=$(jq -r '.brutal_up // empty' "$meta"); cur_down=$(jq -r '.brutal_down // empty' "$meta")
     echo -e "  当前: 上传=${CYAN}${cur_up:-不限}${NC}  下载=${CYAN}${cur_down:-不限}${NC}"
-    echo -e "  ${YELLOW}格式: 100 mbps / 10m / 1g  (回车保持不变)${NC}"
+    echo -e "  ${YELLOW}格式: 100 mbps / 10m / 1g; 0 不限, 非零上下行至少 512 kbps (0.5 mbps), 回车保持不变${NC}"
     [ "$cur_cc" != "force-brutal" ] || _tip "服务端上传至少 512 kbps (0.5 mbps)"
     local new_up new_down
     read -rp "  新上传带宽: " new_up

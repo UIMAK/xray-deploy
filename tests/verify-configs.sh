@@ -305,6 +305,67 @@ for rate in 1kbps 0.01mbps 10kbps 65534bps 65535bps 100kbps 524287bps 511.999kbp
     fi
 done
 
+for scenario in forceDown ordinaryUp ordinaryDown; do
+    case "$scenario" in
+        forceDown) R_CONGESTION=force-brutal; field=brutalDown; error_field=BrutalDown ;;
+        ordinaryUp) R_CONGESTION=brutal; field=brutalUp; error_field=BrutalUp ;;
+        ordinaryDown) R_CONGESTION=brutal; field=brutalDown; error_field=BrutalDown ;;
+    esac
+    for rate_case in 1kbps 65535bps 524287bps 524288bps 512kbps 0.5mbps 0 '' absent; do
+        rate="$rate_case"
+        expected=0
+        case "$rate_case" in
+            1kbps|65535bps|524287bps) expected=1 ;;
+            absent) rate='' ;;
+        esac
+        validator_rc=0
+        _hy2_brutal_rate_valid "$rate" || validator_rc=$?
+        R_OBFS_MASK_BLOCK=''
+        R_BRUTAL_PARAMS_BLOCK=''
+        if [ "$scenario" = forceDown ]; then
+            R_BRUTAL_PARAMS_BLOCK=', "brutalUp": "80mbps"'
+        fi
+        if [ "$rate_case" != absent ]; then
+            R_BRUTAL_PARAMS_BLOCK+=", \"$field\": \"$rate\""
+        fi
+        name="$scenario [${rate_case:-empty}]"
+        if ! inbound=$(_render_template "$hy_tpl") \
+           || ! assert_field "$inbound" '.streamSettings.finalmask.quicParams.congestion' "$R_CONGESTION" \
+           || { [ "$scenario" = forceDown ] && ! assert_field "$inbound" '.streamSettings.finalmask.quicParams.brutalUp' 80mbps; }; then
+            record FAIL "$name (render differs)"
+            continue
+        fi
+        if [ "$rate_case" = absent ]; then
+            if ! printf '%s' "$inbound" | jq -e --arg field "$field" \
+                '.streamSettings.finalmask.quicParams | has($field) | not' >/dev/null; then
+                record FAIL "$name (field must actually be omitted)"
+                continue
+            fi
+        elif ! assert_field "$inbound" ".streamSettings.finalmask.quicParams.$field" "$rate"; then
+            record FAIL "$name (rendered rate differs)"
+            continue
+        fi
+        dir="$scratch/brutal-rate-confs"
+        config=$(jq -n --argjson inbound "$inbound" \
+            '{inbounds:[$inbound],outbounds:[{protocol:"freedom"}]}')
+        if ! _config_write_merged "$config" "$dir"; then
+            record FAIL "$name (confdir write failed)"
+            continue
+        fi
+        rc=0
+        XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true \
+            "$XRAY_BIN" run -test -confdir "$dir" </dev/null > "$scratch/brutal-rate.log" 2>&1 || rc=$?
+        if [ "$validator_rc" -eq "$expected" ] && \
+           { { [ "$expected" -eq 0 ] && [ "$rc" -eq 0 ] && grep -qF 'Configuration OK' "$scratch/brutal-rate.log"; } \
+           || { [ "$expected" -eq 1 ] && [ "$rc" -ne 0 ] && grep -qF "$error_field must be at least 65536 bytes per second" "$scratch/brutal-rate.log"; }; }; then
+            record PASS "$name (helper/core agree, expected rc=$expected)"
+        else
+            record FAIL "$name (helper rc=$validator_rc, core rc=$rc, expected=$expected; expected error=$error_field minimum)"
+            tail -n 8 "$scratch/brutal-rate.log" >&2
+        fi
+    done
+done
+
 if [ -n "$ws" ] && [ -n "$ss" ] && [ -n "$hy" ]; then
     legacy=$(jq -n --argjson ws "$ws" --argjson ss "$ss" --argjson hy "$hy" \
         --arg asset "$ASSET_DIR" \
