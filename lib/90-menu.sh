@@ -1418,7 +1418,7 @@ _hy2_congestion_txn_locked() {
         congestion)
             case "$new_cc" in bbr|brutal|force-brutal) ;; *) _error "无效拥塞模式: $new_cc"; return 1 ;; esac
             if [ "$new_cc" = "force-brutal" ] && ! _hy2_force_brutal_up_valid "$up"; then
-                _error "force-brutal 服务端上传带宽必须非零"
+                _error "force-brutal 服务端上传至少 524288 bps (512 kbps / 0.5 mbps)"
                 return 1
             fi
             if [ "$new_cc" = "$cur_cc" ] && [ "$new_cc" = "$config_cc" ]; then
@@ -1458,7 +1458,7 @@ _hy2_congestion_txn_locked() {
             [ -n "$effective_up" ] || effective_up=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalUp // empty' 2>/dev/null)
             [ -n "$effective_down" ] || effective_down=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams.brutalDown // empty' 2>/dev/null)
             if [ "$config_cc" = "force-brutal" ] && ! _hy2_force_brutal_up_valid "$effective_up"; then
-                _error "force-brutal 服务端上传带宽必须非零"
+                _error "force-brutal 服务端上传至少 524288 bps (512 kbps / 0.5 mbps)"
                 return 1
             fi
             if ! _mutate_config --arg t "$tag" --arg up "$effective_up" --arg down "$effective_down" \
@@ -1542,7 +1542,7 @@ _hy2_toggle_brutal() {
     if [ "$new_cc" != "bbr" ]; then
         echo -e "  ${YELLOW}${new_cc} 模式须填写带宽, 格式: 100 mbps / 10m / 1g${NC}"
         if [ "$new_cc" = "force-brutal" ]; then
-            read -rp "  服务端上传带宽 (非零必填): " brutal_up
+            read -rp "  服务端上传带宽 (至少 512 kbps / 0.5 mbps): " brutal_up
         else
             read -rp "  服务端上传带宽 (回车不限): " brutal_up
         fi
@@ -1611,6 +1611,7 @@ _hy2_adjust_bandwidth() {
     cur_up=$(jq -r '.brutal_up // empty' "$meta"); cur_down=$(jq -r '.brutal_down // empty' "$meta")
     echo -e "  当前: 上传=${CYAN}${cur_up:-不限}${NC}  下载=${CYAN}${cur_down:-不限}${NC}"
     echo -e "  ${YELLOW}格式: 100 mbps / 10m / 1g  (回车保持不变)${NC}"
+    [ "$cur_cc" != "force-brutal" ] || _tip "服务端上传至少 512 kbps (0.5 mbps)"
     local new_up new_down
     read -rp "  新上传带宽: " new_up
     read -rp "  新下载带宽: " new_down

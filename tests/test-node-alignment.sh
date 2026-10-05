@@ -31,14 +31,14 @@ _render_template "$ROOT/templates/hysteria2.server.jsonc" > "$TMP/rendered.json"
 check 'new settings.clients auth' jq -e '.settings.clients[0].auth == "secret" and (.settings | has("users") | not)' "$TMP/rendered.json"
 check 'default masquerade omitted' jq -e '.streamSettings.hysteriaSettings | has("masquerade") | not' "$TMP/rendered.json"
 check 'network and version unchanged' jq -e '.streamSettings.network == "hysteria" and .settings.version == 2 and .streamSettings.hysteriaSettings.version == 2' "$TMP/rendered.json"
-for up in '' 0 '0 mbps' 00.0mbps bad; do
+for up in '' 0 '0 mbps' 00.0mbps bad 1kbps 0.01mbps 10kbps 65534bps 65535bps 100kbps 524287bps 511.999kbps 0.499999mbps 1watts '1 000kbps' '1 k bps'; do
     rc=0
     _commit_hy2_node_txn_locked hy2-test node server 443 0.0.0.0 secret sni false '' force-brutal "$up" '' '' '' '' /fixture/cert.pem /fixture/key.pem || rc=$?
     check "force-brutal rejects [$up] before mutation" eq "$rc" 1
     check "force-brutal [$up] no config preflight" test ! -e "$TMP/preflight"
     check "force-brutal [$up] no committed state" test ! -e "$TMP/committed.json"
 done
-for up in '100 mbps' 10m 1g '0.5 gbps'; do
+for up in '100 mbps' 10m 1g '0.5 gbps' 524288 524288b 524288bps 512k 512kb 512kbps 0.5m 0.5mb .5mbps ' 0.5 MBPS ' 1tbps; do
     check "positive force bandwidth [$up]" _hy2_force_brutal_up_valid "$up"
 done
 rc=0
