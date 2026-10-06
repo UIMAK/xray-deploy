@@ -1169,7 +1169,7 @@ _xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
     operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || return 1
-    for f in "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "$gip" "$gsp"; do
+    for f in "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked" "$gip" "$gsp"; do
         _xray_core_path_present "$f" && _xray_core_fsync_file_dir "$f"
     done
     case "$operation" in
@@ -1212,7 +1212,7 @@ _xray_core_production_fsync() {  # <journal>; best effort before terminal phase/
 _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> <staging_dir> [core|geo]
     local old_ver="$1" old_ch="$2" new_tag="$3" new_ch="$4" stage="$5" operation="${6:-core}"
     local j payload txn_id binary_preexisting runtime_was_running=false old_state_ver unit sprev
-    local geoip_pre geosite_pre service_pre=false
+    local geoip_pre geosite_pre service_pre=false service_masked=false
     case "$operation" in core|geo) ;; *) _error "未知核心事务 operation: $operation"; return 1 ;; esac
     j=$(_xray_core_journal_path)
     _xray_core_path_present "$j" && { _error "核心事务账本已存在, 拒绝覆盖: $j"; return 1; }
@@ -1231,7 +1231,15 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
     fi
     sprev=$(_xray_service_prev_path)
     unit=$(_xray_service_unit_path 2>/dev/null || printf '')
-    if [ -n "$unit" ] && _xray_core_path_present "$unit"; then service_pre=true; fi
+    if [ -n "$unit" ] && _xray_core_path_present "$unit"; then
+        # A masked unit is not a valid service snapshot source. The installer
+        # records it as an absent unit and removes the stale mask before writing.
+        if [ "${INIT_SYSTEM:-}" = systemd ] && _xray_service_is_masked "$unit"; then
+            service_masked=true
+        else
+            service_pre=true
+        fi
+    fi
     geoip_pre=false; geosite_pre=false
     [ -f "$XRAY_BIN" ] && binary_preexisting=true || binary_preexisting=false
     if ! declare -F _xray_is_running >/dev/null 2>&1; then
@@ -1267,13 +1275,13 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
         --arg gsp "$ASSET_DIR/.geosite.dat.coretxn.${txn_id}.bak" \
         --argjson bp "$binary_preexisting" --argjson runtime "$runtime_was_running" \
         --argjson gipre "$geoip_pre" --argjson gspre "$geosite_pre" --argjson spre "$service_pre" \
-        --arg op "$operation" \
+        --argjson smask "$service_masked" --arg op "$operation" \
         '{phase:"prepared", operation:$op, txn_id:$id, old_version:$ov, old_state_version:$osv, old_channel:$oc,
           new_tag:$nt, channel:$nc, binary:$bin, binary_preexisted:$bp,
           runtime_was_running:$runtime, binary_backup:$bak, unit:$unit, service_prev:$sprev, staging_dir:$stage,
           geoip_preexisted:$gipre, geoip_backup:$gip,
           geosite_preexisted:$gspre, geosite_backup:$gsp,
-          service_preexisted:$spre}') || return 1
+          service_preexisted:$spre, service_masked:$smask}') || return 1
     _atomic_write_json "$j" "$payload"
 }
 
@@ -1281,7 +1289,7 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
 # 这里再验证 journal 引用的全部 sidecar 都在, 让该 phase 成为可依赖的屏障。
 #
 _xray_core_snapshots_ok() {  # <journal>
-    local j="$1" bin bak pre gd src unit sprev service_pre flag want operation
+    local j="$1" bin bak pre gd src unit sprev service_pre service_masked flag want operation
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
@@ -1305,6 +1313,7 @@ _xray_core_snapshots_ok() {  # <journal>
     unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
+    service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
     if [ -n "$unit" ]; then
         flag="${sprev}.enabled"
         [ -f "$flag" ] && [ ! -L "$flag" ] || { _error "service enable snapshot 缺失/无效: $flag"; return 1; }
@@ -1314,10 +1323,19 @@ _xray_core_snapshots_ok() {  # <journal>
             [ -f "$sprev" ] && [ ! -L "$sprev" ] && \
                 ! _xray_core_path_present "${sprev}.absent" || {
                 _error "pre-existing service snapshot 缺失/含糊: $sprev"; return 1; }
+            _xray_core_path_present "${sprev}.masked" && {
+                _error "pre-existing service 不应存在 mask 恢复源: ${sprev}.masked"; return 1; }
         else
             _xray_core_path_present "$sprev" && { _error "新 service 不应存在内容快照: $sprev"; return 1; }
             [ -f "${sprev}.absent" ] && [ ! -L "${sprev}.absent" ] || {
                 _error "service absent 标记缺失/无效: ${sprev}.absent"; return 1; }
+            if [ "$service_masked" = true ]; then
+                [ -L "${sprev}.masked" ] && [ "$(readlink "${sprev}.masked" 2>/dev/null)" = /dev/null ] || {
+                    _error "service mask 恢复源缺失/无效: ${sprev}.masked"; return 1; }
+            elif _xray_core_path_present "${sprev}.masked"; then
+                _error "非 masked service 不应存在 mask 恢复源: ${sprev}.masked"
+                return 1
+            fi
         fi
     fi
 
@@ -1471,7 +1489,7 @@ _xray_core_journal_ok() {
       (.staging_dir | type == "string" and length > 0) and
       (.geoip_preexisted | type == "boolean") and (.geoip_backup | type == "string" and length > 0) and
       (.geosite_preexisted | type == "boolean") and (.geosite_backup | type == "string" and length > 0) and
-      (.service_preexisted | type == "boolean")
+      (.service_preexisted | type == "boolean") and ((.service_masked // false) | type == "boolean")
     ' "$j" >/dev/null 2>&1 || return 1
     phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
     id=$(jq -r '.txn_id' "$j" 2>/dev/null) || return 1
@@ -1488,6 +1506,7 @@ _xray_core_journal_ok() {
     gipre=$(jq -r '.geoip_preexisted' "$j" 2>/dev/null) || return 1
     gspre=$(jq -r '.geosite_preexisted' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
+    service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
 
     [ "$bin" = "$XRAY_BIN" ] && [ "$binbak" = "$XRAY_BIN.bak" ] || return 1
     [ "$sprev" = "$BACKUP_DIR/xray-service.$id.prev" ] || return 1
@@ -1568,15 +1587,27 @@ _xray_core_journal_quarantine() {
 
 # 清理事务资源(除 journal): 任何资源仍存在都返回失败, journal 保留用于下次 retry。
 _xray_core_cleanup_sources() {  # <journal>
-    local j="$1" binbak stage sprev gip gsp left=0 f
+    local j="$1" binbak stage sprev gip gsp phase service_masked left=0 f
+    phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
     binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
-    rm -f "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "$gip" "$gsp" 2>/dev/null
+    service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
+    if [ "$phase" = committed ] && [ "$service_masked" = true ] && _xray_core_path_present "${sprev}.masked"; then
+        _xray_service_restore_mask "$(_xray_service_unit_path 2>/dev/null)" "${sprev}.masked" || {
+            _error "提交后清理前无法恢复原有 systemd mask, 保留账本与恢复源"
+            return 1
+        }
+        systemctl daemon-reload >/dev/null 2>&1 || {
+            _error "提交后恢复 systemd mask 的 daemon-reload 失败"
+            return 1
+        }
+    fi
+    rm -f "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked" "$gip" "$gsp" 2>/dev/null
     [ -n "$stage" ] && rm -rf "$stage" 2>/dev/null
-    for f in "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "$gip" "$gsp"; do
+    for f in "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked" "$gip" "$gsp"; do
         _xray_core_path_present "$f" && left=1
         [ -n "$f" ] && _fsync_path "$(dirname "$f")" || :
     done
@@ -1638,7 +1669,7 @@ _xray_core_txn_recover_locked() {
 # durable 才 cleanup。这样每个崩溃点都可重入: phase 还没写成功就从原 snapshot 再做一遍。
 _xray_core_recover_rollback_locked() {
     local j="$1" bin bak pre was_running old_ver old_state_ver old_ch unit sprev
-    local service_pre run_ok=1 disk_ok=1 state_ok=1
+    local service_pre service_masked run_ok=1 disk_ok=1 state_ok=1
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
@@ -1649,6 +1680,7 @@ _xray_core_recover_rollback_locked() {
     unit=$(jq -r '.unit' "$j" 2>/dev/null) || unit=""
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
+    service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
 
     _warn "检测到未完成的核心切换事务(阶段: $(jq -r '.phase' "$j" 2>/dev/null)), 正在回滚..."
     # 先停并验证: binary 还被当前 Xray mmap/exe 使用时不能覆盖, 且恢复完成后必须按旧 binary 重启。
@@ -1703,7 +1735,17 @@ _xray_core_recover_rollback_locked() {
     #    **Geo 事务未跨过替换点时只校验、不写回**(见上方 Geo mutation 范围): 该事务从未创建/改写 unit,
     #    用快照覆盖 live unit 只会把"绕过 core lock 的外部改动"静默回退。
     if [ -n "$unit" ] && [ "$txn_touched_service" -eq 0 ]; then
-        if [ "$service_pre" = true ]; then
+        if [ "$service_masked" = true ]; then
+            if ! _xray_service_restore_mask "$unit" "${sprev}.masked"; then
+                disk_ok=0
+                _error "原有 systemd mask 无法恢复: $unit"
+            else
+                systemctl daemon-reload >/dev/null 2>&1 || {
+                    disk_ok=0
+                    _error "恢复 systemd mask 后 daemon-reload 失败"
+                }
+            fi
+        elif [ "$service_pre" = true ]; then
             if [ -f "$sprev" ] && [ ! -L "$sprev" ] && ! _xray_core_path_present "${sprev}.absent"; then
                 _warn "本次为 Geo 事务且未跨过替换点, service 按未变更处理(不重放旧快照)"
             else
@@ -1733,6 +1775,17 @@ _xray_core_recover_rollback_locked() {
             else
                 disk_ok=0
                 _error "service 开机自启快照缺失或无效, 保留 journal: ${sprev}.enabled"
+            fi
+        elif [ "$service_masked" = true ] && [ -L "${sprev}.masked" ] && \
+             [ "$(readlink -f "${sprev}.masked" 2>/dev/null)" = /dev/null ]; then
+            if ! _xray_service_restore_mask "$unit" "${sprev}.masked"; then
+                disk_ok=0
+                _error "原有 systemd mask 无法恢复: $unit"
+            else
+                systemctl daemon-reload >/dev/null 2>&1 || {
+                    disk_ok=0
+                    _error "恢复 systemd mask 后 daemon-reload 失败"
+                }
             fi
         elif [ -f "${sprev}.absent" ] && [ ! -L "${sprev}.absent" ] && \
              ! _xray_core_path_present "$sprev" && \
@@ -2339,6 +2392,67 @@ _xray_service_unit_path() {
     esac
 }
 
+# systemd mask is a stale, externally managed unit marker, not restorable service
+# content. It is handled as an absent unit during reinstall.
+_xray_service_is_masked() {
+    local unit="$1" target=""
+    [ -L "$unit" ] || return 1
+    target=$(readlink -f "$unit" 2>/dev/null) || return 1
+    [ "$target" = /dev/null ]
+}
+
+# Move the exact /dev/null symlink into the transaction-owned snapshot. A rename
+# avoids unlinking a concurrently replaced regular unit; verify the moved object
+# and fail closed if an external writer won the race.
+_xray_service_take_mask_snapshot() {  # <unit> <snapshot symlink>
+    local unit="$1" snapshot="$2" unit_dev snapshot_dev
+    _xray_service_is_masked "$unit" || return 1
+    ! _xray_core_path_present "$snapshot" || return 1
+    unit_dev=$(stat -c '%d' "$(dirname "$unit")" 2>/dev/null) || return 1
+    snapshot_dev=$(stat -c '%d' "$(dirname "$snapshot")" 2>/dev/null) || return 1
+    [ "$unit_dev" = "$snapshot_dev" ] || return 1
+    if ! mv -f "$unit" "$snapshot" 2>/dev/null; then
+        return 1
+    fi
+    if [ -L "$snapshot" ] && [ "$(readlink -f "$snapshot" 2>/dev/null)" = /dev/null ]; then
+        return 0
+    fi
+    if ! _xray_core_path_present "$unit"; then
+        mv -f "$snapshot" "$unit" 2>/dev/null || :
+    fi
+    return 1
+}
+
+_xray_service_restore_mask() {  # <unit> <snapshot symlink>
+    local unit="$1" snapshot="$2" displaced target=""
+    displaced="${snapshot}.displaced"
+    [ -L "$snapshot" ] && [ "$(readlink -f "$snapshot" 2>/dev/null)" = /dev/null ] || return 1
+    if _xray_core_path_present "$unit"; then
+        _xray_service_is_masked "$unit" && return 0
+        ! _xray_core_path_present "$displaced" || return 1
+        # Preserve the current file until the replacement mask is installed.
+        # A no-clobber symlink creation makes an external concurrent writer fail
+        # closed instead of being overwritten by mv/rm.
+        mv -f "$unit" "$displaced" 2>/dev/null || return 1
+    fi
+    target=$(readlink "$snapshot" 2>/dev/null) || target=/dev/null
+    if ! ln -s "$target" "$unit" 2>/dev/null; then
+        if ! _xray_core_path_present "$unit"; then
+            mv -f "$displaced" "$unit" 2>/dev/null || :
+        fi
+        return 1
+    fi
+    if ! _xray_service_is_masked "$unit"; then
+        rm -f "$unit" 2>/dev/null
+        if ! _xray_core_path_present "$unit"; then
+            mv -f "$displaced" "$unit" 2>/dev/null || :
+        fi
+        return 1
+    fi
+    [ ! -e "$displaced" ] || rm -f "$displaced" 2>/dev/null || return 1
+    return 0
+}
+
 _xray_service_prev_path() {
     # 每笔事务唯一快照路径, journal 写入 txn_id 后才调用。没有 txn_id 的旧/测试调用保留 legacy 名。
     printf '%s' "$BACKUP_DIR/xray-service.${XRAY_CORE_TXN_ID:-legacy}.prev"
@@ -2360,6 +2474,16 @@ _xray_service_enable_state() {
                 not-found)
                     unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
                     if [ -n "$unit" ] && ! _xray_core_path_present "$unit"; then
+                        printf 'disabled'
+                    else
+                        return 1
+                    fi
+                    ;;
+                masked)
+                    unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
+                    if [ -n "$unit" ] && _xray_service_is_masked "$unit"; then
+                        # A stale /dev/null mask has no enable link to preserve;
+                        # treat it as disabled until the installer replaces it.
                         printf 'disabled'
                     else
                         return 1
@@ -2505,11 +2629,21 @@ _xray_service_snapshot() {
     prev=$(_xray_service_prev_path)
     mkdir -p "$BACKUP_DIR" || return 1
     if _xray_core_path_present "$prev" || _xray_core_path_present "${prev}.absent" || \
-       _xray_core_path_present "${prev}.enabled"; then
+       _xray_core_path_present "${prev}.enabled" || _xray_core_path_present "${prev}.masked"; then
         _error "service snapshot 路径已存在, 拒绝覆盖旧恢复源: $prev"
         return 1
     fi
     # service 写入会同时变更 enable 状态; 两个维度都必须在 snapshotted 前可恢复。
+    if [ "${INIT_SYSTEM:-}" = systemd ] && _xray_service_is_masked "$unit"; then
+        if ! _xray_service_take_mask_snapshot "$unit" "${prev}.masked"; then
+            _error "无法安全快照 stale systemd mask, 拒绝继续: $unit"
+            return 1
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || {
+            _error "移除 stale systemd mask 后 daemon-reload 失败"
+            return 1
+        }
+    fi
     _xray_service_snapshot_enable "$unit" "${prev}.enabled" || return 1
     if ! _xray_core_path_present "$unit"; then
         [ "$pre" = false ] || { _error "service 在账本写入后消失, 无法建立旧 unit 快照"; return 1; }
@@ -2536,6 +2670,15 @@ _xray_service_restore_prev() {
     local unit prev
     unit=$(_xray_service_unit_path) || return 0
     prev=$(_xray_service_prev_path)
+    if _xray_core_path_present "${prev}.masked"; then
+        if _xray_service_restore_mask "$unit" "${prev}.masked"; then
+            systemctl daemon-reload >/dev/null 2>&1 || return 1
+            _xray_service_restore_enable "${prev}.enabled" || :
+            return 0
+        fi
+        _error "原有 systemd mask 无法恢复: $unit"
+        return 1
+    fi
     if [ -f "${prev}.absent" ]; then
         # 事务之前没有 unit ⇒ 把本次新建的那个删掉, 回到"本来就没有"
         # 删除新 unit 失败必须返回失败, 不得把残留 service 报成完整恢复。
@@ -2574,7 +2717,7 @@ _xray_service_restore_prev() {
 # 事务成功提交: 丢弃 unit 快照(与 rm -f "$XRAY_BIN.bak" 同一步)
 _xray_service_snapshot_drop() {
     local prev; prev=$(_xray_service_prev_path)
-    rm -f "$prev" "${prev}.absent" "${prev}.enabled" 2>/dev/null
+    rm -f "$prev" "${prev}.absent" "${prev}.enabled" "${prev}.masked" 2>/dev/null
     return 0
 }
 
