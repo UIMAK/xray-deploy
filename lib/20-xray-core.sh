@@ -1473,7 +1473,7 @@ _txn_allow_config_write() {
 
 _xray_core_journal_ok() {
     local j="$1" id bin binbak pre runtime unit sprev stage stage_name phase operation
-    local gipre gspre service_pre gip gsp
+    local gipre gspre service_pre service_masked gip gsp
     jq -e '
       (.phase | type == "string" and test("^(prepared|snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)$")) and
       ((.operation // "core") | (type == "string" and test("^(core|geo)$"))) and
@@ -1508,6 +1508,7 @@ _xray_core_journal_ok() {
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
     service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
 
+    [ "$service_masked" = false ] || [ "$service_pre" = false ] || return 1
     [ "$bin" = "$XRAY_BIN" ] && [ "$binbak" = "$XRAY_BIN.bak" ] || return 1
     [ "$sprev" = "$BACKUP_DIR/xray-service.$id.prev" ] || return 1
     [ "$gip" = "$ASSET_DIR/.geoip.dat.coretxn.$id.bak" ] || return 1
@@ -1595,13 +1596,17 @@ _xray_core_cleanup_sources() {  # <journal>
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
     service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
-    if [ "$phase" = committed ] && [ "$service_masked" = true ] && _xray_core_path_present "${sprev}.masked"; then
-        _xray_service_restore_mask "$(_xray_service_unit_path 2>/dev/null)" "${sprev}.masked" || {
-            _error "提交后清理前无法恢复原有 systemd mask, 保留账本与恢复源"
+    # prepared/snapshotted never crossed the production mutation barrier. Restore
+    # the original mask before deleting its source; committed keeps the new service.
+    if [ "$service_masked" = true ] && { [ "$phase" = prepared ] || [ "$phase" = snapshotted ]; }; then
+        local unit; unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
+        [ -n "$unit" ] || return 1
+        _xray_service_restore_mask "$unit" "${sprev}.masked" || {
+            _error "事务尚未修改生产态, 但原有 systemd mask 无法恢复: $unit"
             return 1
         }
         systemctl daemon-reload >/dev/null 2>&1 || {
-            _error "提交后恢复 systemd mask 的 daemon-reload 失败"
+            _error "恢复原有 systemd mask 后 daemon-reload 失败"
             return 1
         }
     fi

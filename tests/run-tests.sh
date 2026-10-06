@@ -779,6 +779,23 @@ if (
 ); then pass 'stale systemd mask is snapshotted before removal'; else fail 'stale systemd mask is snapshotted before removal'; fi
 if (
     INIT_SYSTEM=systemd
+    MASK_ROOT="$TMP/stale-mask-cleanup"
+    MASK_UNIT="$MASK_ROOT/xray.service"
+    MASK_JOURNAL="$MASK_ROOT/coretxn.json"
+    BACKUP_DIR="$MASK_ROOT/backups"
+    mkdir -p "$BACKUP_DIR"
+    ln -s /dev/null "$BACKUP_DIR/xray-service.legacy.prev.masked"
+    printf '{"phase":"prepared","service_masked":true,"binary_backup":"%s/b","staging_dir":"%s/s","service_prev":"%s/xray-service.legacy.prev","geoip_backup":"%s/g","geosite_backup":"%s/h"}' "$MASK_ROOT" "$MASK_ROOT" "$BACKUP_DIR" "$MASK_ROOT" "$MASK_ROOT" > "$MASK_JOURNAL"
+    _xray_core_path_present() { [ -e "$1" ] || [ -L "$1" ]; }
+    _xray_core_journal_path() { printf '%s' "$MASK_JOURNAL"; }
+    _xray_service_unit_path() { printf '%s' "$MASK_UNIT"; }
+    _xray_service_restore_mask() { ln -s /dev/null "$1"; }
+    systemctl() { [ "$1" = daemon-reload ]; }
+    _xray_core_cleanup_sources "$MASK_JOURNAL" &&
+        [ -L "$MASK_UNIT" ] && [ "$(readlink -f "$MASK_UNIT")" = /dev/null ]
+); then pass 'prepared cleanup restores stale systemd mask'; else fail 'prepared cleanup restores stale systemd mask'; fi
+if (
+    INIT_SYSTEM=systemd
     MASK_ROOT="$TMP/stale-mask-restore"
     MASK_UNIT="$MASK_ROOT/xray.service"
     MASK_SNAPSHOT="$MASK_ROOT/xray-service.masked"

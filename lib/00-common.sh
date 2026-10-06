@@ -723,7 +723,19 @@ _config_migrate_legacy() {
         snapshot=$(mktemp -d) || return 1
         unit=$(_xray_service_unit_path) || unit=""
         if [ -n "$unit" ]; then
-            if [ -f "$unit" ]; then
+            if [ "${INIT_SYSTEM:-}" = systemd ] && _xray_service_is_masked "$unit"; then
+                _xray_service_take_mask_snapshot "$unit" "$snapshot/masked" || {
+                    rm -rf "$snapshot"
+                    _error "无法安全快照 stale systemd mask, 取消配置迁移"
+                    return 1
+                }
+                systemctl daemon-reload || {
+                    _xray_service_restore_mask "$unit" "$snapshot/masked" >/dev/null 2>&1 || :
+                    rm -rf "$snapshot"
+                    _error "移除 stale systemd mask 后 daemon-reload 失败"
+                    return 1
+                }
+            elif [ -f "$unit" ]; then
                 cp -p "$unit" "$snapshot/service" || { rm -rf "$snapshot"; return 1; }
             fi
             _xray_service_snapshot_enable "$unit" "$snapshot/enabled" || { rm -rf "$snapshot"; return 1; }
@@ -750,7 +762,12 @@ _config_migrate_legacy() {
             _manage_xray stop
             mv -f "${LEGACY_CONFIG_FILE}.bak" "$LEGACY_CONFIG_FILE" || return 1
             if [ -n "$unit" ]; then
-                if [ -f "$snapshot/service" ]; then
+                if [ -f "$snapshot/masked" ]; then
+                    _xray_service_restore_mask "$unit" "$snapshot/masked" || return 1
+                    if [ "${INIT_SYSTEM:-}" = systemd ]; then
+                        systemctl daemon-reload || return 1
+                    fi
+                elif [ -f "$snapshot/service" ]; then
                     _xray_service_restore_file "$snapshot/service" "$unit" || return 1
                 else
                     rm -f "$unit" || return 1
