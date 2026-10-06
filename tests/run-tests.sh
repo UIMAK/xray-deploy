@@ -169,9 +169,28 @@ else
     fail 'dns change touches only the dns field file'
 fi
 check_eq 'dns summary reports the upstream' '1.1.1.1|' "$(_dns_summary)"
+_dns_split_servers 'https+local://cloudflare-dns.com/dns-query,https+local://dns.google/dns-query'
+check_eq 'dns input splits comma-separated upstreams' '2' "${#DNS_SERVER_VALUES[@]}"
+check_eq 'dns input keeps first upstream' 'https+local://cloudflare-dns.com/dns-query' "${DNS_SERVER_VALUES[0]}"
+check_eq 'dns input keeps second upstream' 'https+local://dns.google/dns-query' "${DNS_SERVER_VALUES[1]}"
+_dns_split_servers 'tcp+local://8.8.8.8:53,quic+local://dns.adguard.com'
+check_eq 'dns input accepts TCP local mode' 'tcp+local://8.8.8.8:53' "${DNS_SERVER_VALUES[0]}"
+check_eq 'dns input accepts QUIC local mode' 'quic+local://dns.adguard.com' "${DNS_SERVER_VALUES[1]}"
+_dns_apply_ok --argjson s '["https+local://cloudflare-dns.com/dns-query","https+local://dns.google/dns-query"]' '.dns.servers = $s' >/dev/null 2>&1
+check_eq 'dns stores multiple upstreams as separate servers' '2' "$(_config_jq '.dns.servers | length')"
+check_eq 'dns defaults parallel query to true when absent' 'true' "$(_config_jq -r '.dns.enableParallelQuery // true')"
+_dns_apply_ok --argjson v false '.dns.enableParallelQuery = $v' >/dev/null 2>&1
+check_eq 'dns parallel query can be disabled' 'false' "$(_config_jq -r '.dns.enableParallelQuery')"
+_dns_apply_ok --argjson v true '.dns.enableParallelQuery = $v' >/dev/null 2>&1
+check_eq 'dns parallel query can be enabled' 'true' "$(_config_jq -r '.dns.enableParallelQuery')"
+check_eq 'built-in Cloudflare DoH uses local mode' 'https+local://cloudflare-dns.com/dns-query' "$(sed -n 's/.*3) addr=\"\([^\"]*\)\".*/\1/p' "$ROOT/lib/30-geo.sh")"
+check_eq 'built-in Google DoH uses local mode' 'https+local://dns.google/dns-query' "$(sed -n 's/.*4) addr=\"\([^\"]*\)\".*/\1/p' "$ROOT/lib/30-geo.sh")"
+check 'manual DNS prompts for TCP local mode' grep -Fq 'tcp+local://${item#tcp://}' "$ROOT/lib/30-geo.sh"
+check 'manual DNS prompts for DoH local mode' grep -Fq 'https+local://${item#https://}' "$ROOT/lib/30-geo.sh"
+check 'manual DNS prompts for QUIC local mode' grep -Fq 'quic+local://${item#quic://}' "$ROOT/lib/30-geo.sh"
 # queryStrategy 只有 UseIP/UseIPv4/UseIPv6 三档; 写进去后摘要必须反映出来。
 _dns_apply_ok '.dns.queryStrategy = "UseIPv4"' >/dev/null 2>&1
-check_eq 'dns summary reports the query strategy' '1.1.1.1|UseIPv4' "$(_dns_summary)"
+check_eq 'dns summary reports the query strategy' 'https+local://cloudflare-dns.com/dns-query, https+local://dns.google/dns-query|UseIPv4' "$(_dns_summary)"
 # 删除 DNS 段必须让 04_dns.json 消失(空文件会让核心加载空 dns 段)。
 _dns_apply_ok 'del(.dns)' >/dev/null 2>&1
 if [ -e "$CONFIG_DIR/04_dns.json" ]; then fail 'dns delete removes the field file'; else pass 'dns delete removes the field file'; fi

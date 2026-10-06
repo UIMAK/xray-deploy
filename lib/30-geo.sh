@@ -688,6 +688,20 @@ _geo_menu() {
 # 菜单新选 https:// 是 routedDoH, UDP/IP 上游也经 Xray 路由; 不能据默认出站承诺直连。
 # 用户设置保存普通字符串, 不添加 tag, 保持 confs/04_dns.json 可读。
 
+# 将用户输入拆成独立上游; 空白项丢弃, 其它内容原样保留。
+_dns_split_servers() {
+    local input="$1" item
+    DNS_SERVER_VALUES=()
+    local -a parts=()
+    IFS=',' read -r -a parts <<< "$input"
+    for item in "${parts[@]}"; do
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        [ -n "$item" ] && DNS_SERVER_VALUES+=("$item")
+    done
+    [ "${#DNS_SERVER_VALUES[@]}" -gt 0 ]
+}
+
 # 摘要输出“上游列表|解析策略”; 不可读时返回 1 和空摘要, 不虚构默认值。
 _dns_summary() {
     if ! _config_present || ! command -v jq >/dev/null 2>&1; then
@@ -768,25 +782,81 @@ _dns_set_servers() {
     echo
     echo -e "  ${GREEN}[1]${NC} 1.1.1.1 (Cloudflare)"
     echo -e "  ${GREEN}[2]${NC} 8.8.8.8 (Google)"
-    echo -e "  ${GREEN}[3]${NC} https://cloudflare-dns.com/dns-query (Cloudflare DoH)"
-    echo -e "  ${GREEN}[4]${NC} https://dns.google/dns-query (Google DoH)"
+    echo -e "  ${GREEN}[3]${NC} https+local://cloudflare-dns.com/dns-query (Cloudflare DoH 本地模式)"
+    echo -e "  ${GREEN}[4]${NC} https+local://dns.google/dns-query (Google DoH 本地模式)"
     echo -e "  ${GREEN}[5]${NC} 手动输入"
+    echo -e "      支持 tcp+local://host:port、quic+local://host 等 Xray DNS 地址"
     echo -e "  ${GREEN}[0]${NC} 取消"
-    local c addr=""
+    local c addr="" local_mode="" manual=0
     read -rp "  请选择: " c || return 0
     case "${c:-0}" in
         1) addr="1.1.1.1" ;;
         2) addr="8.8.8.8" ;;
-        3) addr="https://cloudflare-dns.com/dns-query" ;;
-        4) addr="https://dns.google/dns-query" ;;
-        5) read -rp "  请输入 DNS 地址(如 1.1.1.1 或 https://dns.google/dns-query): " addr || return 0 ;;
+        3) addr="https+local://cloudflare-dns.com/dns-query" ;;
+        4) addr="https+local://dns.google/dns-query" ;;
+        5) manual=1; read -rp "  请输入 DNS 地址(可用逗号分隔多个服务器): " addr || return 0 ;;
         0) return 0 ;;
         *) _warn "无效选择"; return 1 ;;
     esac
-    addr="${addr//[[:space:]]/}"
-    [ -n "$addr" ] || { _warn "地址为空, 已取消"; return 1; }
-    _dns_apply --arg a "$addr" '.dns = ((.dns | if type == "object" then . else {} end) + {servers: [$a]})' || return 1
-    _success "DNS 上游已更新为: $addr"
+    _dns_split_servers "$addr" || { _warn "地址为空, 已取消"; return 1; }
+    local -a json_servers=() item
+    for item in "${DNS_SERVER_VALUES[@]}"; do
+        if [ "$manual" -eq 1 ]; then
+            case "$item" in
+                https://*)
+                    read -rp "  检测到 DoH 地址 $item, 是否使用本地模式(https+local://)? [y/N]: " local_mode || return 0
+                    case "$local_mode" in
+                        y|Y) item="https+local://${item#https://}" ;;
+                    esac
+                    ;;
+                tcp://*)
+                    read -rp "  检测到 DNS over TCP 地址 $item, 是否使用本地模式(tcp+local://)? [y/N]: " local_mode || return 0
+                    case "$local_mode" in
+                        y|Y) item="tcp+local://${item#tcp://}" ;;
+                    esac
+                    ;;
+                quic://*)
+                    read -rp "  检测到 DNS over QUIC 地址 $item, 是否使用本地模式(quic+local://)? [y/N]: " local_mode || return 0
+                    case "$local_mode" in
+                        y|Y) item="quic+local://${item#quic://}" ;;
+                    esac
+                    ;;
+            esac
+            local_mode=""
+        fi
+        json_servers+=("$item")
+    done
+    local servers_json
+    servers_json=$(printf '%s\n' "${json_servers[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))') || {
+        _error "生成 DNS 上游失败, 已取消"; return 1
+    }
+    _dns_apply --argjson s "$servers_json" '.dns = ((.dns | if type == "object" then . else {} end) + {servers: $s})' || return 1
+    _success "DNS 上游已更新为: $(IFS=', '; printf '%s' "${json_servers[*]}")"
+}
+
+_dns_set_parallel() {
+    _config_edit_preflight "修改 DNS 配置" || return 1
+    echo
+    echo -e "  ${CYAN}设置并行查询 enableParallelQuery${NC}"
+    local current c value
+    current=$(_config_jq -r '.dns.enableParallelQuery // true' 2>/dev/null) || current=true
+    echo -e "  当前状态: $current"
+    echo -e "  ${GREEN}[1]${NC} 开启"
+    echo -e "  ${GREEN}[2]${NC} 关闭"
+    echo -e "  ${GREEN}[0]${NC} 取消"
+    read -rp "  请选择: " c || return 0
+    case "${c:-0}" in
+        1) value=true ;;
+        2) value=false ;;
+        0) return 0 ;;
+        *) _warn "无效选择"; return 1 ;;
+    esac
+    _dns_apply --argjson v "$value" '.dns = ((.dns | if type == "object" then . else {} end) + {enableParallelQuery: $v})' || return 1
+    if [ "$value" = true ]; then
+        _success "并行查询已开启"
+    else
+        _success "并行查询已关闭"
+    fi
 }
 
 _dns_set_strategy() {
@@ -863,7 +933,8 @@ _dns_menu() {
         echo -e "  ${GREEN}[2]${NC} 设置解析策略"
         echo -e "  ${GREEN}[3]${NC} 恢复默认 DNS"
         echo -e "  ${GREEN}[4]${NC} 删除 DNS 配置"
-        echo -e "  ${GREEN}[5]${NC} 查看完整 DNS 配置"
+        echo -e "  ${GREEN}[5]${NC} 设置并行查询"
+        echo -e "  ${GREEN}[6]${NC} 查看完整 DNS 配置"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
@@ -872,7 +943,8 @@ _dns_menu() {
             2) _dns_set_strategy ;;
             3) _dns_restore_default ;;
             4) _dns_delete ;;
-            5) _dns_view ;;
+            5) _dns_set_parallel ;;
+            6) _dns_view ;;
             0) return ;;
             *) _warn "无效选择" ;;
         esac
