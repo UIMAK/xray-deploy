@@ -2481,8 +2481,11 @@ _xray_service_enable_state() {
             st=${st%"${st##*[![:space:]]}"}
             case "$st" in
                 enabled|disabled) printf '%s' "$st" ;;
-                not-found)
+                ""|not-found)
                     unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
+                    # Some systemd versions print the missing-unit diagnostic on
+                    # stderr only, leaving stdout empty; an absent managed path
+                    # still has no enablement to preserve.
                     if [ -n "$unit" ] && ! _xray_core_path_present "$unit"; then
                         printf 'disabled'
                     else

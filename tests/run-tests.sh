@@ -780,6 +780,14 @@ if (
 ); then pass 'stale systemd mask is snapshotted before removal'; else fail 'stale systemd mask is snapshotted before removal'; fi
 if (
     INIT_SYSTEM=systemd
+    NO_UNIT="$TMP/no-unit"
+    _xray_service_unit_path() { printf '%s' "$NO_UNIT"; }
+    _xray_core_path_present() { [ -e "$1" ] || [ -L "$1" ]; }
+    systemctl() { printf 'Unit xray.service could not be found.\n' >&2; return 1; }
+    [ "$(_xray_service_enable_state)" = disabled ]
+); then pass 'missing systemd unit snapshots as disabled'; else fail 'missing systemd unit snapshots as disabled'; fi
+if (
+    INIT_SYSTEM=systemd
     MASK_ROOT="$TMP/stale-mask-cleanup"
     MASK_UNIT="$MASK_ROOT/xray.service"
     MASK_JOURNAL="$MASK_ROOT/coretxn.json"
