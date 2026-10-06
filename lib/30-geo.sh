@@ -785,7 +785,6 @@ _dns_set_servers() {
     echo -e "  ${GREEN}[3]${NC} https+local://cloudflare-dns.com/dns-query (Cloudflare DoH 本地模式)"
     echo -e "  ${GREEN}[4]${NC} https+local://dns.google/dns-query (Google DoH 本地模式)"
     echo -e "  ${GREEN}[5]${NC} 手动输入"
-    echo -e "      支持 tcp+local://host:port、quic+local://host 等 Xray DNS 地址"
     echo -e "  ${GREEN}[0]${NC} 取消"
     local c addr="" local_mode="" manual=0
     read -rp "  请选择: " c || return 0
