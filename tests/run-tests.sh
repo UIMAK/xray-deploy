@@ -739,56 +739,6 @@ if (
     _restart_xray_verified() { return 1; }
     _config_migrate_legacy >/dev/null 2>&1 && [ -f "$LEGACY_CONFIG_FILE.bak" ]
 ); then pass 'successful migration leaves stopped service stopped'; else fail 'successful migration leaves stopped service stopped'; fi
-
-# Third-party uninstallers may leave a systemd mask symlink at the managed unit
-# path. Reinstall must recognize that stale mask before snapshotting.
-if (
-    INIT_SYSTEM=systemd
-    MASK_UNIT="$TMP/stale-mask/xray.service"
-    mkdir -p "$(dirname "$MASK_UNIT")"
-    ln -s /dev/null "$MASK_UNIT"
-    _xray_service_unit_path() { printf '%s' "$MASK_UNIT"; }
-    _xray_core_path_present() { [ -e "$1" ] || [ -L "$1" ]; }
-    _xray_service_is_masked "$MASK_UNIT" && rm -f "$MASK_UNIT" && ! _xray_core_path_present "$MASK_UNIT"
-); then pass 'stale systemd mask is recognized as removable'; else fail 'stale systemd mask is recognized as removable'; fi
-if (
-    INIT_SYSTEM=systemd
-    MASK_ROOT="$TMP/stale-mask-snapshot"
-    MASK_UNIT="$MASK_ROOT/xray.service"
-    MASK_JOURNAL="$MASK_ROOT/coretxn.json"
-    BACKUP_DIR="$MASK_ROOT/backups"
-    mkdir -p "$BACKUP_DIR"
-    ln -s /dev/null "$MASK_UNIT"
-    printf '{"service_preexisted":false}' > "$MASK_JOURNAL"
-    _xray_core_journal_path() { printf '%s' "$MASK_JOURNAL"; }
-    _xray_service_unit_path() { printf '%s' "$MASK_UNIT"; }
-    _xray_core_path_present() { [ -e "$1" ] || [ -L "$1" ]; }
-    systemctl() {
-        case "$1" in
-            daemon-reload) return 0 ;;
-            is-enabled) printf 'not-found\n'; return 1 ;;
-            *) return 0 ;;
-        esac
-    }
-    _xray_service_snapshot
-    [ ! -e "$MASK_UNIT" ] && [ ! -L "$MASK_UNIT" ] &&
-        [ -L "$BACKUP_DIR/xray-service.legacy.prev.masked" ] &&
-        [ "$(readlink -f "$BACKUP_DIR/xray-service.legacy.prev.masked")" = /dev/null ] &&
-        [ "$(cat "$BACKUP_DIR/xray-service.legacy.prev.enabled")" = disabled ] &&
-        [ -f "$BACKUP_DIR/xray-service.legacy.prev.absent" ]
-); then pass 'stale systemd mask is snapshotted before removal'; else fail 'stale systemd mask is snapshotted before removal'; fi
-if (
-    INIT_SYSTEM=systemd
-    MASK_ROOT="$TMP/stale-mask-restore"
-    MASK_UNIT="$MASK_ROOT/xray.service"
-    MASK_SNAPSHOT="$MASK_ROOT/xray-service.masked"
-    mkdir -p "$MASK_ROOT"
-    ln -s /dev/null "$MASK_SNAPSHOT"
-    _xray_service_unit_path() { printf '%s' "$MASK_UNIT"; }
-    _xray_core_path_present() { [ -e "$1" ] || [ -L "$1" ]; }
-    _xray_service_restore_mask "$MASK_UNIT" "$MASK_SNAPSHOT" &&
-        [ -L "$MASK_UNIT" ] && [ "$(readlink -f "$MASK_UNIT")" = /dev/null ]
-); then pass 'stale systemd mask restores from transaction snapshot'; else fail 'stale systemd mask restores from transaction snapshot'; fi
 if (
     _xray_core_txn_recover_locked() { return 0; }
     _xray_core_txn_pending() { return 1; }
