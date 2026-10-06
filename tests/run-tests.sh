@@ -757,6 +757,7 @@ if (
     MASK_UNIT="$MASK_ROOT/xray.service"
     MASK_JOURNAL="$MASK_ROOT/coretxn.json"
     BACKUP_DIR="$MASK_ROOT/backups"
+    XRAY_CORE_TXN_ID=legacy; export XRAY_CORE_TXN_ID
     mkdir -p "$BACKUP_DIR"
     ln -s /dev/null "$MASK_UNIT"
     printf '{"service_preexisted":false}' > "$MASK_JOURNAL"

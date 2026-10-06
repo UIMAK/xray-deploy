@@ -2517,9 +2517,9 @@ _xray_service_enable_state() {
 
 # enable 状态会在 service 创建时改变, 因此属于 snapshotted 的必要恢复源。
 # 只接受能明确恢复的 enabled/disabled; 查询失败或其它状态必须在 replacing 前中止。
-_xray_service_snapshot_enable() {  # <unit路径> <标志文件路径>
-    local unit="$1" flag="$2" want=""
-    want=$(_xray_service_enable_state) || {
+_xray_service_snapshot_enable() {  # <unit路径> <标志文件路径> [已知状态]
+    local unit="$1" flag="$2" want="${3:-}"
+    [ -n "$want" ] || want=$(_xray_service_enable_state) || {
         _error "无法安全快照 ${INIT_SYSTEM:-未知} 的 xray 开机自启状态, 取消核心事务"
         return 1
     }
@@ -2632,7 +2632,7 @@ _xray_service_restore_file() {  # <snapshot> <target>
 
 # 重写 unit 之前留快照。返回 1 = 任一恢复源没做成功, 调用方必须中止事务。
 _xray_service_snapshot() {
-    local unit prev j pre
+    local unit prev j pre service_masked=false
     unit=$(_xray_service_unit_path) || return 0    # direct 后端: 无 unit 可写, 无需快照
     j=$(_xray_core_journal_path)
     pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
@@ -2645,6 +2645,7 @@ _xray_service_snapshot() {
     fi
     # service 写入会同时变更 enable 状态; 两个维度都必须在 snapshotted 前可恢复。
     if [ "${INIT_SYSTEM:-}" = systemd ] && _xray_service_is_masked "$unit"; then
+        service_masked=true
         if ! _xray_service_take_mask_snapshot "$unit" "${prev}.masked"; then
             _error "无法安全快照 stale systemd mask, 拒绝继续: $unit"
             return 1
@@ -2654,7 +2655,11 @@ _xray_service_snapshot() {
             return 1
         }
     fi
-    _xray_service_snapshot_enable "$unit" "${prev}.enabled" || return 1
+    if [ "$service_masked" = true ]; then
+        _xray_service_snapshot_enable "$unit" "${prev}.enabled" disabled || return 1
+    else
+        _xray_service_snapshot_enable "$unit" "${prev}.enabled" || return 1
+    fi
     if ! _xray_core_path_present "$unit"; then
         [ "$pre" = false ] || { _error "service 在账本写入后消失, 无法建立旧 unit 快照"; return 1; }
         # systemd not-found / OpenRC 无条目已快照为 disabled, 回滚时可撤销本次 enable。
