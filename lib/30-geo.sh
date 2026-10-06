@@ -839,7 +839,7 @@ _dns_set_parallel() {
     echo
     echo -e "  ${CYAN}设置并行查询 enableParallelQuery${NC}"
     local current c value
-    current=$(_config_jq -r '.dns.enableParallelQuery // true' 2>/dev/null) || current=true
+    current=$(_config_jq -r '.dns.enableParallelQuery // false' 2>/dev/null) || current=false
     echo -e "  当前状态: $current"
     echo -e "  ${GREEN}[1]${NC} 开启"
     echo -e "  ${GREEN}[2]${NC} 关闭"

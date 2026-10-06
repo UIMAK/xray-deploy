@@ -178,7 +178,7 @@ check_eq 'dns input accepts TCP local mode' 'tcp+local://8.8.8.8:53' "${DNS_SERV
 check_eq 'dns input accepts QUIC local mode' 'quic+local://dns.adguard.com' "${DNS_SERVER_VALUES[1]}"
 _dns_apply_ok --argjson s '["https+local://cloudflare-dns.com/dns-query","https+local://dns.google/dns-query"]' '.dns.servers = $s' >/dev/null 2>&1
 check_eq 'dns stores multiple upstreams as separate servers' '2' "$(_config_jq '.dns.servers | length')"
-check_eq 'dns defaults parallel query to true when absent' 'true' "$(_config_jq -r '.dns.enableParallelQuery // true')"
+check_eq 'dns reports Xray parallel query default as disabled when absent' 'false' "$(_config_jq -r '.dns.enableParallelQuery // false')"
 _dns_apply_ok --argjson v false '.dns.enableParallelQuery = $v' >/dev/null 2>&1
 check_eq 'dns parallel query can be disabled' 'false' "$(_config_jq -r '.dns.enableParallelQuery')"
 _dns_apply_ok --argjson v true '.dns.enableParallelQuery = $v' >/dev/null 2>&1
