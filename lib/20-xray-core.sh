@@ -1601,10 +1601,15 @@ _xray_core_cleanup_sources() {  # <journal>
     if [ "$service_masked" = true ] && { [ "$phase" = prepared ] || [ "$phase" = snapshotted ]; }; then
         local unit; unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
         [ -n "$unit" ] || return 1
-        _xray_service_restore_mask "$unit" "${sprev}.masked" || {
-            _error "事务尚未修改生产态, 但原有 systemd mask 无法恢复: $unit"
+        if _xray_core_path_present "${sprev}.masked"; then
+            _xray_service_restore_mask "$unit" "${sprev}.masked" || {
+                _error "事务尚未修改生产态, 但原有 systemd mask 无法恢复: $unit"
+                return 1
+            }
+        elif ! _xray_service_is_masked "$unit"; then
+            _error "prepared/snapshotted 账本缺少 mask 快照且 live unit 状态不符: $unit"
             return 1
-        }
+        fi
         systemctl daemon-reload >/dev/null 2>&1 || {
             _error "恢复原有 systemd mask 后 daemon-reload 失败"
             return 1
