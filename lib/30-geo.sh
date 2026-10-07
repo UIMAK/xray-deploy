@@ -6,7 +6,6 @@
 # DNS 写入先预检候选配置, 再走 _mutate_config 的验证与回滚; 见 _dns_apply。
 
 GEO_CRON_MARKER="# xray-deploy-geo-update"
-GEO_STATE_FILE="$STATE_DIR/geo_cron"
 GEO_TRANSITION_KEY="geo_update_transition"
 # day-of-month 的 */3 是每月 1/4/7/.../31 号, 跨月不保证每隔三天。
 GEO_CRON_EXPR="0 3 */3 * *"
