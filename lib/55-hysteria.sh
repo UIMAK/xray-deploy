@@ -1639,7 +1639,7 @@ _hysteria_rebuild_all_links() {
 }
 
 _hysteria_port_menu() {
-    local choice part lo hi new_listen cur_first
+    local choice part lo hi cur_first
     _hysteria_gate || { _press_any_key; return; }
     cur_first=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)" 2>/dev/null)
     cur_first=${cur_first%%-*}   # 跳跃范围下监听的只是首端口
