@@ -139,8 +139,15 @@ _hy2_obfs_size_is_default() {
 _hy2_link_unexpressible() {
     # 损坏的 obfs_type(_hy2_obfs_kind rc≠0)按"不是不可表达"处理 —— 调用方会走
     # "保留旧链接 + 如实报告"分支(保守侧), 而不是清空一条可能仍可用的旧链接。
-    [ "$(_hy2_obfs_kind "$1")" = "gecko" ] || return 1
-    _hy2_obfs_size_is_default "$1" && return 1
+    local meta="$1" auth host port congestion name
+    auth=$(jq -r '.auth // empty' "$meta" 2>/dev/null)
+    host=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
+    port=$(jq -r '.port // empty' "$meta" 2>/dev/null)
+    congestion=$(jq -r '.congestion // empty' "$meta" 2>/dev/null)
+    name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
+    [ -n "$auth" ] && [ -n "$host" ] && [ -n "$port" ] && [ -n "$congestion" ] && [ -n "$name" ] || return 1
+    [ "$(_hy2_obfs_kind "$meta")" = "gecko" ] || return 1
+    _hy2_obfs_size_is_default "$meta" && return 1
     return 0
 }
 
@@ -2045,7 +2052,7 @@ _reality_node_mode() {
 # 回环target判为tunnel；非回环direct不创建隧道。
 _is_reality_loopback_host() {
     case "$1" in
-        "127.0.0.1"|"::1"|"localhost") return 0 ;;
+        "127.0.0.1"|"::1"|"0:0:0:0:0:0:0:1"|"localhost"|"localhost."|"ip6-localhost"|"ip6-localhost.") return 0 ;;
     esac
     # 127.0.0.0/8: 127.<a>.<b>.<c>, 每段 0-255。10#$ 强制十进制, 避免 08/09 被当八进制
     if [[ "$1" =~ ^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
@@ -4187,12 +4194,14 @@ _hy2_clash_line() {
 _hy2_sync_derived() {
     local meta="$1" old_name="${2:-}" link="" nname="" nline="" lrc=0 crc=0
     # (1) share_link: 派生值, 但写在 metadata 里、是用户直接看到的主输出 —— 失败要单独报。
-    if link=$(_rebuild_hy2_link "$meta") && [ -n "$link" ]; then
+    link=$(_rebuild_hy2_link "$meta") || lrc=$?
+    if [ "$lrc" -eq 0 ] && [ -n "$link" ]; then
         _meta_update "$meta" '.share_link=$l' --arg l "$link" || {
             lrc=1
             _error "分享链接写入失败(节点元数据不可写?): $meta"
         }
     elif _hy2_link_unexpressible "$meta"; then
+        lrc=0
         _meta_update "$meta" '.share_link=""' || {
             lrc=1
             _error "分享链接清空失败(节点元数据不可写?): $meta"
@@ -4201,6 +4210,7 @@ _hy2_sync_derived() {
         _tip "官方 URI 的 obfs 只表达类型(salamander/gecko), 没有尺寸参数; 只有默认 512-1200 可表达"
         _tip "请用 Clash 条目(含 obfs-min/max-packet-size)导入客户端"
     else
+        lrc=1
         _warn "分享链接重建失败(元数据缺少必要字段), 已保留原链接"
     fi
     # (2) clash.yaml: 可再生派生缓存 —— 失败单独报, 且不回滚权威状态。
@@ -4937,11 +4947,55 @@ _reality_port_txn_locked() {
 
     # 主 tag 前缀(xd-reality-vision / xd-reality-xhttp) + 新端口
     local new_tag="${tag%-*}-${newport}"
-    # 新 tunnel tag: 仅替换末段 reality 端口(Tunnel-<sni>-<tport>-<port>);
-    # 保持 SNI 段原样(含旧版无长度封顶产生的超长 SNI 段, 不做二次截断)
-    local new_tunnel_tag=""
+    # 单节点沿用端口后缀；共享 tunnel 保持 tag，避免其它节点 metadata 引用失效。
+    local new_tunnel_tag="" targets target host shared_tunnel=0
     if [ -n "$tunnel_tag" ]; then
-        new_tunnel_tag="${tunnel_tag%-*}-${newport}"
+        tunnel_port=$(_config_jq -er --arg tg "$tunnel_tag" \
+            '.inbounds[] | select(.tag == $tg and .protocol == "tunnel") | .port') || return 1
+        # 先以 metadata 交叉确认共享引用；旧节点即使 config target 缺失/格式异常，
+        # 也不能把仍被引用的 tunnel 当成独占资源。
+        local peer peer_tunnel peer_port
+        for peer in "$NODES_DIR"/*.json; do
+            [ -f "$peer" ] || continue
+            [ "$peer" = "$meta" ] && continue
+            jq -e . "$peer" >/dev/null 2>&1 || {
+                _error "其他节点 metadata 无法解析, 无法确认 tunnel 是否共享: $peer"
+                return 1
+            }
+            peer_tunnel=$(jq -r '.tunnel_tag // empty' "$peer" 2>/dev/null)
+            peer_port=$(jq -r '.tunnel_port // empty' "$peer" 2>/dev/null)
+            if [ -n "$peer_tunnel" ] && [ "$peer_tunnel" = "$tunnel_tag" ]; then
+                shared_tunnel=1; break
+            fi
+            if [ -n "$peer_port" ] && [ -n "$peer_tunnel" ] && [ "$peer_tunnel" = "$tunnel_tag" ] \
+                && [ "$(jq -nr --arg p "$peer_port" --argjson t "$tunnel_port" 'try (($p | tonumber) == $t) catch false')" = true ]; then
+                shared_tunnel=1; break
+            fi
+        done
+        if [ "$shared_tunnel" -eq 0 ]; then
+            targets=$(_config_jq -r --arg t "$tag" \
+                '.inbounds[] | select(.tag != $t and .protocol == "vless")
+                 | .streamSettings.realitySettings.target // empty') || return 1
+            while IFS= read -r target; do
+                [ -n "$target" ] || continue
+                local parsed_host parsed_port
+                parsed_host=$(jq -nr --arg v "$target" 'try ($v | capture("^(?<host>\\[[^]]+\\]|[^:]+):(?<port>[0-9]+)$") | .host) catch empty')
+                parsed_port=$(jq -nr --arg v "$target" 'try ($v | capture("^(?<host>\\[[^]]+\\]|[^:]+):(?<port>[0-9]+)$") | .port) catch empty')
+                if [ -z "$parsed_host" ] || [ -z "$parsed_port" ]; then
+                    _error "config 中存在无法解析的 Reality target, 无法确认 tunnel 是否共享"
+                    return 1
+                fi
+                if [ "$(jq -nr --arg p "$parsed_port" --argjson t "$tunnel_port" 'try (($p | tonumber) == $t) catch false')" = true ]; then
+                    host="${parsed_host#[}"; host="${host%]}"
+                    if _is_reality_loopback_host "$host"; then shared_tunnel=1; break; fi
+                fi
+            done <<< "$targets"
+        fi
+        if [ "$shared_tunnel" -eq 1 ]; then
+            new_tunnel_tag="$tunnel_tag"
+        else
+            new_tunnel_tag="${tunnel_tag%-*}-${newport}"
+        fi
     fi
 
     # 新 tag 冲突检查 —— 目标元数据文件已存在说明该端口/标签被其他节点占用,
@@ -5009,7 +5063,7 @@ _reality_port_txn_locked() {
     local jq_filter
     jq_filter='(.inbounds[] | select(.tag == $t) | .tag) = $new_t
 | (.inbounds[] | select(.tag == $new_t) | .port) = $p'
-    if [ -n "$tunnel_tag" ]; then
+    if [ -n "$tunnel_tag" ] && [ "$tunnel_tag" != "$new_tunnel_tag" ]; then
         jq_filter="$jq_filter
 | (.inbounds[] | select(.tag == \$tg) | .tag) = \$new_tg
 | .routing.rules |= map(
@@ -5030,7 +5084,9 @@ _reality_port_txn_locked() {
     fi
     rm -f "$journal"
 
-    if [ "$rmode" = "tunnel" ]; then
+    if [ "$shared_tunnel" -eq 1 ]; then
+        _success "端口已改为 ${newport}(节点标签已更新, 共享 tunnel 标签保持不变)"
+    elif [ "$rmode" = "tunnel" ]; then
         _success "端口已改为 ${newport}(标签与 tunnel 标签已同步更新)"
     else
         _success "端口已改为 ${newport}(直连模式, 标签已同步更新)"

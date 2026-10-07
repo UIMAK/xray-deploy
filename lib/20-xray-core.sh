@@ -1100,14 +1100,20 @@ _xray_core_fsync_file_dir() {  # best-effort durability for an artifact and its 
 }
 
 _xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
-    local j="$1" binbak stage sprev gip gsp operation f
+    local j="$1" binbak stage sprev gip gsp operation scope f
+    local -a sources
     binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
     operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || return 1
-    for f in "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked" "$gip" "$gsp"; do
+    scope=$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null) || return 1
+    sources=("$gip" "$gsp")
+    if [ "$scope" = full ]; then
+        sources+=("$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked")
+    fi
+    for f in "${sources[@]}"; do
         _xray_core_path_present "$f" && _xray_core_fsync_file_dir "$f"
     done
     case "$operation" in
@@ -1156,7 +1162,7 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
     _xray_core_path_present "$j" && { _error "核心事务账本已存在, 拒绝覆盖: $j"; return 1; }
     _xray_core_path_present "$(_xray_core_blocked_path)" && { _error "核心事务处于 BLOCKED, 拒绝新建账本"; return 1; }
     _xray_core_path_present "${j}.corrupt" && { _error "存在损坏的核心事务账本, 拒绝新建事务: ${j}.corrupt"; return 1; }
-    _xray_core_path_present "$XRAY_BIN.bak" && { _error "发现未归属的旧二进制备份, 拒绝覆盖: $XRAY_BIN.bak"; return 1; }
+    [ "$operation" != geo ] && _xray_core_path_present "$XRAY_BIN.bak" && { _error "发现未归属的旧二进制备份, 拒绝覆盖: $XRAY_BIN.bak"; return 1; }
     [ ! -L "$XRAY_BIN" ] || { _error "Xray binary 路径是符号链接, 无法安全快照: $XRAY_BIN"; return 1; }
     [ ! -L "$ASSET_DIR/geoip.dat" ] && [ ! -L "$ASSET_DIR/geosite.dat" ] || {
         _error "geo dat 是符号链接, 无法安全建立事务快照"; return 1; }
@@ -1220,6 +1226,9 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
           geoip_preexisted:$gipre, geoip_backup:$gip,
           geosite_preexisted:$gspre, geosite_backup:$gsp,
           service_preexisted:$spre, service_masked:$smask}') || return 1
+    if [ "$operation" = geo ]; then
+        payload=$(jq '.snapshot_scope="dat"' <<< "$payload") || return 1
+    fi
     _atomic_write_json "$j" "$payload"
 }
 
@@ -1227,14 +1236,17 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
 # 这里再验证 journal 引用的全部 sidecar 都在, 让该 phase 成为可依赖的屏障。
 #
 _xray_core_snapshots_ok() {  # <journal>
-    local j="$1" bin bak pre gd src unit sprev service_pre service_masked flag want operation
-    bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
-    bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
-    pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
-    if [ "$pre" = true ]; then
-        [ -f "$bak" ] && [ ! -L "$bak" ] || { _error "binary 恢复源缺失/无效: $bak"; return 1; }
-    else
-        ! _xray_core_path_present "$bak" || { _error "首次安装不应存在 binary 恢复源: $bak"; return 1; }
+    local j="$1" bin bak pre gd src unit sprev service_pre service_masked flag want operation scope
+    scope=$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null) || return 1
+    if [ "$scope" = full ]; then
+        bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
+        bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
+        pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
+        if [ "$pre" = true ]; then
+            [ -f "$bak" ] && [ ! -L "$bak" ] || { _error "binary 恢复源缺失/无效: $bak"; return 1; }
+        else
+            ! _xray_core_path_present "$bak" || { _error "首次安装不应存在 binary 恢复源: $bak"; return 1; }
+        fi
     fi
 
     for gd in geoip geosite; do
@@ -1248,31 +1260,33 @@ _xray_core_snapshots_ok() {  # <journal>
         fi
     done
 
-    unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
-    sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
-    service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-    service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
-    if [ -n "$unit" ]; then
-        flag="${sprev}.enabled"
-        [ -f "$flag" ] && [ ! -L "$flag" ] || { _error "service enable snapshot 缺失/无效: $flag"; return 1; }
-        want=$(cat "$flag" 2>/dev/null) || return 1
-        case "$want" in enabled|disabled) ;; *) _error "service enable snapshot 内容非法: $flag"; return 1 ;; esac
-        if [ "$service_pre" = true ]; then
-            [ -f "$sprev" ] && [ ! -L "$sprev" ] && \
-                ! _xray_core_path_present "${sprev}.absent" || {
-                _error "pre-existing service snapshot 缺失/含糊: $sprev"; return 1; }
-            _xray_core_path_present "${sprev}.masked" && {
-                _error "pre-existing service 不应存在 mask 恢复源: ${sprev}.masked"; return 1; }
-        else
-            _xray_core_path_present "$sprev" && { _error "新 service 不应存在内容快照: $sprev"; return 1; }
-            [ -f "${sprev}.absent" ] && [ ! -L "${sprev}.absent" ] || {
-                _error "service absent 标记缺失/无效: ${sprev}.absent"; return 1; }
-            if [ "$service_masked" = true ]; then
-                [ -L "${sprev}.masked" ] && [ "$(readlink "${sprev}.masked" 2>/dev/null)" = /dev/null ] || {
-                    _error "service mask 恢复源缺失/无效: ${sprev}.masked"; return 1; }
-            elif _xray_core_path_present "${sprev}.masked"; then
-                _error "非 masked service 不应存在 mask 恢复源: ${sprev}.masked"
-                return 1
+    if [ "$scope" = full ]; then
+        unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
+        sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
+        service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
+        service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
+        if [ -n "$unit" ]; then
+            flag="${sprev}.enabled"
+            [ -f "$flag" ] && [ ! -L "$flag" ] || { _error "service enable snapshot 缺失/无效: $flag"; return 1; }
+            want=$(cat "$flag" 2>/dev/null) || return 1
+            case "$want" in enabled|disabled) ;; *) _error "service enable snapshot 内容非法: $flag"; return 1 ;; esac
+            if [ "$service_pre" = true ]; then
+                [ -f "$sprev" ] && [ ! -L "$sprev" ] && \
+                    ! _xray_core_path_present "${sprev}.absent" || {
+                    _error "pre-existing service snapshot 缺失/含糊: $sprev"; return 1; }
+                _xray_core_path_present "${sprev}.masked" && {
+                    _error "pre-existing service 不应存在 mask 恢复源: ${sprev}.masked"; return 1; }
+            else
+                _xray_core_path_present "$sprev" && { _error "新 service 不应存在内容快照: $sprev"; return 1; }
+                [ -f "${sprev}.absent" ] && [ ! -L "${sprev}.absent" ] || {
+                    _error "service absent 标记缺失/无效: ${sprev}.absent"; return 1; }
+                if [ "$service_masked" = true ]; then
+                    [ -L "${sprev}.masked" ] && [ "$(readlink "${sprev}.masked" 2>/dev/null)" = /dev/null ] || {
+                        _error "service mask 恢复源缺失/无效: ${sprev}.masked"; return 1; }
+                elif _xray_core_path_present "${sprev}.masked"; then
+                    _error "非 masked service 不应存在 mask 恢复源: ${sprev}.masked"
+                    return 1
+                fi
             fi
         fi
     fi
@@ -1415,6 +1429,8 @@ _xray_core_journal_ok() {
     jq -e '
       (.phase | type == "string" and test("^(prepared|snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)$")) and
       ((.operation // "core") | (type == "string" and test("^(core|geo)$"))) and
+      ((has("snapshot_scope") | not) or .snapshot_scope == "full" or
+        (.operation == "geo" and .snapshot_scope == "dat")) and
       (.txn_id | type == "string" and length > 0 and test("^[A-Za-z0-9._-]+$")) and
       (.old_version | type == "string") and (.old_state_version | type == "string") and
       (.old_channel | type == "string") and (.channel | type == "string") and
@@ -1526,7 +1542,8 @@ _xray_core_journal_quarantine() {
 
 # 清理事务资源(除 journal): 任何资源仍存在都返回失败, journal 保留用于下次 retry。
 _xray_core_cleanup_sources() {  # <journal>
-    local j="$1" binbak stage sprev gip gsp phase service_masked left=0 f
+    local j="$1" binbak stage sprev gip gsp phase service_masked operation scope left=0 f
+    local -a sources
     phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
     binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
@@ -1534,9 +1551,15 @@ _xray_core_cleanup_sources() {  # <journal>
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
     service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
-    # prepared/snapshotted never crossed the production mutation barrier. Restore
-    # the original mask before deleting its source; committed keeps the new service.
-    if [ "$service_masked" = true ] && { [ "$phase" = prepared ] || [ "$phase" = snapshotted ]; }; then
+    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || return 1
+    scope=$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null) || return 1
+    sources=("$gip" "$gsp")
+    if [ "$scope" = full ]; then
+        sources+=("$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked")
+    fi
+    # Legacy Geo snapshots moved the mask despite owning only dat changes.
+    if [ "$scope" = full ] && [ "$service_masked" = true ] &&
+       { [ "$phase" = prepared ] || [ "$phase" = snapshotted ]; }; then
         local unit; unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
         [ -n "$unit" ] || return 1
         if _xray_core_path_present "${sprev}.masked"; then
@@ -1553,9 +1576,9 @@ _xray_core_cleanup_sources() {  # <journal>
             return 1
         }
     fi
-    rm -f "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked" "$gip" "$gsp" 2>/dev/null
+    rm -f "${sources[@]}" 2>/dev/null
     [ -n "$stage" ] && rm -rf "$stage" 2>/dev/null
-    for f in "$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked" "$gip" "$gsp"; do
+    for f in "${sources[@]}"; do
         _xray_core_path_present "$f" && left=1
         [ -n "$f" ] && _fsync_path "$(dirname "$f")" || :
     done
@@ -1590,9 +1613,20 @@ _xray_core_txn_recover_locked() {
     if ! _xray_core_journal_ok "$j"; then _xray_core_journal_quarantine "$j" "schema 不合法"; return 1; fi
     phase=$(jq -r '.phase' "$j" 2>/dev/null)
 
-    # committed / rolled_back 都是终态: 永不再回滚, 只重试 cleanup。
+    # committed / rolled_back 都是终态: Geo 旧账本仍需先恢复曾被移动的 mask，再清理。
     case "$phase" in
         committed|rolled_back)
+            if [ "$phase" = committed ] && [ "$(jq -r '.operation // "core"' "$j" 2>/dev/null)" = geo ] &&
+               [ "$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null)" = full ] &&
+               [ "$(jq -r '.service_masked // false' "$j" 2>/dev/null)" = true ]; then
+                local legacy_unit legacy_prev
+                legacy_unit=$(jq -r '.unit // empty' "$j" 2>/dev/null) || return 1
+                legacy_prev=$(jq -r '.service_prev // empty' "$j" 2>/dev/null) || return 1
+                if [ -n "$legacy_unit" ] && [ -L "${legacy_prev}.masked" ]; then
+                    _xray_service_restore_mask "$legacy_unit" "${legacy_prev}.masked" || return 1
+                    systemctl daemon-reload >/dev/null 2>&1 || return 1
+                fi
+            fi
             _xray_core_cleanup_after_commit "$j" || return 1
             return 0
             ;;
@@ -1611,8 +1645,8 @@ _xray_core_txn_recover_locked() {
 # Rollback 从 snapshot source 重放, **不消费 source**(cp→cmp→rename), 直到 rolled_back phase
 # durable 才 cleanup。这样每个崩溃点都可重入: phase 还没写成功就从原 snapshot 再做一遍。
 _xray_core_recover_rollback_locked() {
-    local j="$1" bin bak pre was_running old_ver old_state_ver old_ch unit sprev
-    local service_pre service_masked run_ok=1 disk_ok=1 state_ok=1
+    local j="$1" bin bak pre was_running old_ver old_state_ver old_ch unit sprev phase scope
+    local service_pre service_masked run_ok=1 disk_ok=1 state_ok=1 runtime_touched=1
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
@@ -1624,26 +1658,34 @@ _xray_core_recover_rollback_locked() {
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
     service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
+    phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
 
     _warn "检测到未完成的核心切换事务(阶段: $(jq -r '.phase' "$j" 2>/dev/null)), 正在回滚..."
-    # 先停并验证: binary 还被当前 Xray mmap/exe 使用时不能覆盖, 且恢复完成后必须按旧 binary 重启。
-    if ! _xray_stop_and_verify; then
+
+    # 新 Geo 只拥有 dat; 旧 Geo 的 full 快照仍核对恢复源, 不重放 binary。
+    # core 跨 replacing 后重放 binary/service; 缺失/损坏恢复源仍失败并保留 journal。
+    local txn_touched_binary=1 txn_touched_service=1
+    scope=$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null) || return 1
+    if [ "$(jq -r '.operation // "core"' "$j" 2>/dev/null)" = geo ]; then
+        txn_touched_binary=0; txn_touched_service=0
+        case "$phase" in
+            geo_replaced|restart_verified|committed) ;;
+            *) runtime_touched=0 ;;
+        esac
+    fi
+
+    # 只有事务已经触碰运行态时才先停服务；早期 dat-only 失败只恢复文件，
+    # 避免把事务开始后由外部启动的 Xray 当成事务自己的进程处理。
+    if [ "$runtime_touched" -eq 1 ] && ! _xray_stop_and_verify; then
         _error "恢复前无法确认 Xray 已停止, 暂不改动 binary/service snapshots"
         _tip "事务账本与全部恢复源保留: $j"
         return 1
     fi
 
-    # Geo 只改 dat, binary/service 快照只用于验证 pre-state, 不重放未拥有的修改。
-    # core 跨 replacing 后重放 binary/service; 缺失/损坏恢复源仍失败并保留 journal。
-    local txn_touched_binary=1 txn_touched_service=1
-    if [ "$(jq -r '.operation // "core"' "$j" 2>/dev/null)" = geo ]; then
-        txn_touched_binary=0; txn_touched_service=0
-    fi
-
     # 1. binary pre-state 由**显式布尔值**描述, 绝不从 old_version 是否为空推断。
     if [ "$txn_touched_binary" -eq 0 ]; then
-        # 只验证恢复源可用(缺失/损坏仍要报错并保留 journal), 不写回 live binary。
-        if [ "$pre" = true ]; then
+        # 旧 Geo full 账本仍检查恢复源; 新 dat 账本不拥有 binary 快照。
+        if [ "$scope" = full ] && [ "$pre" = true ]; then
             if [ ! -f "$bak" ] || [ -L "$bak" ]; then
                 disk_ok=0
                 _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
@@ -1677,7 +1719,7 @@ _xray_core_recover_rollback_locked() {
     # 同时存在时拒绝写回/删除, 保留 journal 和恢复源等待人工处理。
     #    **Geo 事务未跨过替换点时只校验、不写回**(见上方 Geo mutation 范围): 该事务从未创建/改写 unit,
     #    用快照覆盖 live unit 只会把"绕过 core lock 的外部改动"静默回退。
-    if [ -n "$unit" ] && [ "$txn_touched_service" -eq 0 ]; then
+    if [ "$scope" = full ] && [ -n "$unit" ] && [ "$txn_touched_service" -eq 0 ]; then
         if [ "$service_masked" = true ]; then
             if ! _xray_service_restore_mask "$unit" "${sprev}.masked"; then
                 disk_ok=0
@@ -1696,7 +1738,7 @@ _xray_core_recover_rollback_locked() {
                 _error "service pre-existing 快照缺失/含糊, 保留 journal: $sprev"
             fi
         fi
-    elif [ -n "$unit" ]; then
+    elif [ "$scope" = full ] && [ -n "$unit" ]; then
         if [ "$service_pre" = true ]; then
             if [ -f "$sprev" ] && [ ! -L "$sprev" ] && ! _xray_core_path_present "${sprev}.absent"; then
                 if ! _xray_service_restore_file "$sprev" "$unit"; then
@@ -1751,7 +1793,9 @@ _xray_core_recover_rollback_locked() {
     fi
 
     if [ "$disk_ok" -ne 1 ]; then
-        if _xray_stop_and_verify; then
+        if [ "$runtime_touched" -eq 0 ]; then
+            _error "核心磁盘状态未能完全还原; Geo 事务尚未触碰运行态, journal 与全部恢复源均保留"
+        elif _xray_stop_and_verify; then
             _error "核心磁盘状态未能完全还原; 已确认服务停止, journal 与全部恢复源均保留"
         else
             _error "核心磁盘状态未能完全还原, 且无法确认服务已停止; journal 与全部恢复源均保留"
@@ -1760,9 +1804,30 @@ _xray_core_recover_rollback_locked() {
         return 1
     fi
 
+    # Legacy Geo journals may have moved the mask before the dat-only scope marker existed.
+    if [ "$scope" = full ] && [ "$(jq -r '.operation // "core"' "$j" 2>/dev/null)" = geo ] &&
+       [ "$phase" = committed ] && [ "$service_masked" = true ] && [ -n "$unit" ]; then
+        if [ -L "${sprev}.masked" ]; then
+            if ! _xray_service_restore_mask "$unit" "${sprev}.masked"; then
+                _error "旧 Geo 事务的 systemd mask 无法恢复: $unit"
+                return 1
+            fi
+        elif ! _xray_service_is_masked "$unit"; then
+            _error "旧 Geo 事务的 systemd mask 恢复源缺失且 live unit 未 mask: $unit"
+            return 1
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || {
+            _error "旧 Geo 事务的 systemd daemon-reload 失败, journal 保留待重试"
+            return 1
+        }
+    fi
+
     # 4. Runtime 必须回到事务前的运行态, 不把用户主动停止的核心意外启动。
     # pre-state 无 binary 时 schema 已保证 was_running=false; 有旧 binary 但原来 stopped 也保持 stopped。
-    if [ "$pre" = true ] && [ "$was_running" = true ]; then
+    if [ "$runtime_touched" -eq 0 ]; then
+        run_ok=1
+        _warn "Geo 事务尚未触碰运行态, 保持当前 Xray 运行状态"
+    elif [ "$pre" = true ] && [ "$was_running" = true ]; then
         if ! _restart_xray_verified; then
             run_ok=0
             _error "恢复旧核心后服务未能稳定运行"
@@ -1849,7 +1914,7 @@ _xray_core_abort_locked() {  # <用户可读原因>
 
 # Geo 复用 coretxn 锁、transaction-unique 快照与 phase 状态机; 下载在锁外。
 # journal 先 durable, stage/snapshots 就绪后才跨 replacing; 只拥有 dat 的 mutation/rollback。
-# binary/service 快照用于校验, 不恢复未改动文件; 所有 binary/service 修改仍必须持 core lock。
+# 新 Geo 只备份 dat; 旧 full 快照账本仍按原字段恢复和清理。
 _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
     local download_dir="$1" ts="$2" downloads_ok="$3"
     local j stage old_ver old_channel runtime f src staged dest size
@@ -1902,8 +1967,8 @@ _xray_core_geo_update_locked() {  # <download_dir> <timestamp> <downloads_ok>
         fi
     done
 
-    # 恢复 binary/service 与旧 geo 一起纳入事务; 即使本操作只改 dat, recovery 仍能验证完整 pre-state。
-    if ! _xray_service_snapshot || ! _xray_core_snapshot_binary "$j" || ! _xref_snapshot_geo_dats "$j"; then
+    # Geo 不修改 binary/service, 不建立会移走 systemd mask 的 service 快照。
+    if ! _xref_snapshot_geo_dats "$j"; then
         _xray_core_abort_locked "Geo transaction rollback source 快照失败"
         return 1
     fi
@@ -2874,12 +2939,18 @@ _manage_xray() {
                         _xray_st=$(_xd_pidfile_starttime /run/xray.pid)
                         if [ -n "$dpid" ] && _xd_pidfile_identity_ok /run/xray.pid \
                            && [ "$(cat /proc/$dpid/comm 2>/dev/null)" = "xray" ]; then
-                            _xd_kill_pid_graceful "$dpid" 5 "$_xray_st"
+                            [ -n "$_xray_st" ] || _xray_st=$(_proc_starttime "$dpid") || return 1
+                            if ! _proc_exe_is_strict "$dpid" "$XRAY_BIN" ||
+                               ! _xd_kill_pid_graceful "$dpid" 5 "$_xray_st" ||
+                               _xd_pid_unchanged "$dpid" "$_xray_st"; then
+                                _error "Xray 停止失败或进程归属无法确认, 保留 pidfile"
+                                return 1
+                            fi
                         fi
                     fi
                     rm -f /run/xray.pid
                     ;;
-                restart) _manage_xray stop; sleep 2; _manage_xray start ;;
+                restart) _manage_xray stop || return 1; sleep 2; _manage_xray start ;;
                 status)  if _xray_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
@@ -2901,8 +2972,8 @@ _restart_xray_verified() {
         _with_core_lock _restart_xray_verified
         return $?
     fi
-    # 成败以 8s 真实判活采样为准; OpenRC 命令 rc 仅决定是否补 start, 不替代业务健康证据。
-    _manage_xray restart 2>/dev/null
+    # 成败以 8s 真实判活采样为准; restart rc 仅决定是否补 start, 不替代业务健康证据。
+    _manage_xray restart 2>/dev/null || :
     if [ "$(_manage_xray status 2>/dev/null)" != "running" ]; then
         _manage_xray start 2>/dev/null
     fi
@@ -2961,7 +3032,7 @@ _xray_stop_and_verify() {
         _tip "请执行 install.sh --update 同步全部模块后重试"
         return 1
     fi
-    _manage_xray stop >/dev/null 2>&1 || true
+    _manage_xray stop >/dev/null 2>&1 || return 1
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
         if [ "${INIT_SYSTEM:-}" = systemd ]; then

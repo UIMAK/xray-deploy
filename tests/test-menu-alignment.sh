@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline behavior of the real Hy2 transaction; finalmask.md: force-brutal.
+# Offline behavior of real Hy2 transactions, cron scheduling and service menus.
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
@@ -115,7 +115,7 @@ trap cleanup EXIT
         local label="$1" params="$2" meta_filter="$3" expected_config expected_meta
         expected_config=$(jq --arg t "$TAG" --argjson q "$params" '
             (.inbounds[] | select(.tag == $t) | .streamSettings.finalmask.quicParams) = $q' <<< "$BEFORE_CONFIG")
-        expected_meta=$(jq "$meta_filter" <<< "$BEFORE_META")
+        expected_meta=$(jq "$meta_filter | if .brutal_up == \"\" then del(.brutal_up) else . end | if .brutal_down == \"\" then del(.brutal_down) else . end" <<< "$BEFORE_META")
         check "$label: succeeds" eq "$RC" 0
         check "$label: config then metadata then derived exactly once" eq "$(cat "$TMP/writes")" $'config\nmetadata\nderived'
         check "$label: config contract including unrelated inbound and transport" eq "$expected_config" "$(_config_merged)"
@@ -312,8 +312,30 @@ trap cleanup EXIT
     invoke congestion reno '60 mbps' ''
     rejected 'unsupported menu congestion mode'
 
-    fixture force-brutal '75 mbps'
-    invoke congestion force-brutal '75 mbps' ''
+    for cc in brutal force-brutal; do
+        fixture "$cc" '75 mbps'
+        invoke congestion "$cc" '100 mbps' '120 mbps'
+        committed "$cc same-mode switch applies both new bandwidths" \
+            "{\"congestion\":\"$cc\",\"brutalUp\":\"100 mbps\",\"brutalDown\":\"120 mbps\"}" \
+            '.brutal_up="100 mbps" | .brutal_down="120 mbps"'
+
+        fixture "$cc" '75 mbps'
+        invoke congestion "$cc" '75 mbps' ''
+        committed "$cc same-mode switch clears down on blank input" \
+            "{\"congestion\":\"$cc\",\"brutalUp\":\"75 mbps\"}" '.brutal_down=""'
+
+        fixture "$cc" '75 mbps'
+        jq '.brutal_up="stale" | .brutal_down="stale"' "$META" > "$TMP/meta-next"
+        cat "$TMP/meta-next" > "$META"
+        snapshot
+        invoke congestion "$cc" '75 mbps' '90 mbps'
+        committed "$cc same-mode switch reconciles stale metadata" \
+            "{\"congestion\":\"$cc\",\"brutalUp\":\"75 mbps\",\"brutalDown\":\"90 mbps\"}" \
+            '.brutal_up="75 mbps" | .brutal_down="90 mbps"'
+    done
+
+    fixture bbr '' ''
+    invoke congestion bbr '' ''
     check 'already aligned congestion returns existing no-op status' eq "$RC" 3
     check 'already aligned congestion performs no writes or sync' test ! -s "$TMP/writes"
     check 'already aligned congestion preserves config' eq "$BEFORE_CONFIG" "$(_config_merged)"
@@ -326,6 +348,119 @@ trap cleanup EXIT
     check 'config failure never attempts metadata or derived commit' eq "$(cat "$TMP/writes")" config
     check 'config failure preserves metadata' eq "$BEFORE_META" "$(cat "$META")"
     check 'config failure preserves config' eq "$BEFORE_CONFIG" "$(_config_merged)"
+
+    printf '== Timed restart menu ==\n'
+    cron_fixture() {
+        printf '%s\n' 'MAILTO=operator@example.test' '15 4 * * * /usr/local/bin/backup' \
+            '0 */3 * * * /usr/local/bin/xd timed-restart # xray-deploy-timed-restart' > "$TMP/crontab"
+        printf '0 */3 * * *' > "$STATE_DIR/timed_restart"
+        cp "$TMP/crontab" "$TMP/before-crontab"
+        cp "$STATE_DIR/timed_restart" "$TMP/before-timed-state"
+        : > "$TMP/cron-writes"
+        : > "$TMP/success"
+        : > "$TMP/messages"
+    }
+    invoke_cron() {
+        RC=0
+        (
+            clear() { :; }
+            _press_any_key() { :; }
+            _tip() { :; }
+            _success() { printf '%s\n' "$*" >> "$TMP/success"; }
+            command() {
+                if [ "${1-}" = -v ] && [ "${2-}" = "$CMD_NAME" ]; then
+                    printf '/usr/local/bin/%s\n' "$CMD_NAME"
+                else
+                    builtin command "$@"
+                fi
+            }
+            # Only the daemon and command boundary are mocked; helpers read/write scratch.
+            _with_config_lock() { "$@"; }
+            crontab() {
+                case "$1" in
+                    -l) cat "$TMP/crontab" ;;
+                    -) printf 'write\n' >> "$TMP/cron-writes"
+                       [ "$CRON_WRITE_FAIL" = no ] || return 1
+                       cat > "$TMP/crontab" ;;
+                    *) return 99 ;;
+                esac
+            }
+            CRON_START_RC="$1"
+            _ensure_cron_running() { return "$CRON_START_RC"; }
+            _timed_restart_menu <<< '2'
+        ) > "$TMP/output" 2>&1 || RC=$?
+    }
+    CMD_NAME=xd
+    CRON_WRITE_FAIL=no
+    cron_fixture
+    invoke_cron 1
+    check 'cron startup failure retains menu return status' eq "$RC" 0
+    check 'cron startup failure performs no crontab writes' test ! -s "$TMP/cron-writes"
+    check 'cron startup failure preserves all original crontab bytes' cmp -s "$TMP/before-crontab" "$TMP/crontab"
+    check 'cron startup failure preserves original state bytes' cmp -s "$TMP/before-timed-state" "$STATE_DIR/timed_restart"
+    check 'cron startup failure emits no success' test ! -s "$TMP/success"
+    check 'cron startup failure reports daemon failure' grep -qF 'cron 守护进程未能启动' "$TMP/messages"
+
+    cron_fixture
+    invoke_cron 0
+    check 'cron startup success retains menu return status' eq "$RC" 0
+    check 'cron startup success writes exactly once' eq "$(cat "$TMP/cron-writes")" write
+    check 'cron startup success preserves unrelated tasks and replaces old schedule' \
+        eq "$(cat "$TMP/crontab")" $'MAILTO=operator@example.test\n15 4 * * * /usr/local/bin/backup\n0 */6 * * * /usr/local/bin/xd timed-restart # xray-deploy-timed-restart'
+    check 'cron startup success updates state' eq "$(_state_get timed_restart)" '0 */6 * * *'
+    check 'cron startup success reports new schedule' grep -qF '定时重启已设置: 0 */6 * * *' "$TMP/success"
+
+    cron_fixture
+    CRON_WRITE_FAIL=yes
+    invoke_cron 0
+    check 'cron write failure retains menu return status' eq "$RC" 0
+    check 'cron write failure preserves old tasks' cmp -s "$TMP/before-crontab" "$TMP/crontab"
+    check 'cron write failure preserves state' cmp -s "$TMP/before-timed-state" "$STATE_DIR/timed_restart"
+    check 'cron write failure emits no success' test ! -s "$TMP/success"
+    check 'cron write failure reports failure' grep -qF '写入 crontab 失败' "$TMP/messages"
+
+    printf '== Main menu stop result ==\n'
+    invoke_stop_menu() {
+        : > "$TMP/success"
+        : > "$TMP/messages"
+        : > "$TMP/service-calls"
+        : > "$TMP/press-calls"
+        RC=0
+        (
+            STOP_RC="$1"
+            clear() { :; }
+            _menu_require_tty() { return 0; }
+            _print_logo() { :; }
+            _print_status_bar() { :; }
+            _menu_row() { :; }
+            _press_any_key() { printf 'press\n' >> "$TMP/press-calls"; }
+            _success() { printf '%s\n' "$*" >> "$TMP/success"; }
+            _reset_config_recover() { return 0; }
+            _xray_core_txn_recover() { return 0; }
+            _config_migrate_legacy() { return 0; }
+            _port_txn_recover() { return 0; }
+            _auto_tag_tagless_inbounds() { return 0; }
+            _auto_adopt_orphans() { return 0; }
+            _auto_ensure_config_env() { return 0; }
+            _auto_migrate_geo_autoupdate() { return 0; }
+            _manage_xray() { printf '%s\n' "$*" >> "$TMP/service-calls"; return "$STOP_RC"; }
+            _main_menu <<< $'11\n0'
+        ) > "$TMP/output" 2>&1 || RC=$?
+    }
+    for stop_rc in 1 2 99; do
+        invoke_stop_menu "$stop_rc"
+        check "stop rc=$stop_rc: menu exits normally after 0" eq "$RC" 0
+        check "stop rc=$stop_rc: dispatches only stop once" eq "$(cat "$TMP/service-calls")" stop
+        check "stop rc=$stop_rc: emits no success" test ! -s "$TMP/success"
+        check "stop rc=$stop_rc: reports failure" grep -qF '停止 Xray 失败' "$TMP/messages"
+        check "stop rc=$stop_rc: still pauses before next selection" eq "$(cat "$TMP/press-calls")" press
+    done
+    invoke_stop_menu 0
+    check 'stop success: menu exits normally after 0' eq "$RC" 0
+    check 'stop success: dispatches only stop once' eq "$(cat "$TMP/service-calls")" stop
+    check 'stop success: reports stopped' eq "$(cat "$TMP/success")" '已停止'
+    check 'stop success: emits no failure' test ! -s "$TMP/messages"
+    check 'stop success: still pauses before next selection' eq "$(cat "$TMP/press-calls")" press
 
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]

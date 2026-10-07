@@ -5,7 +5,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d) || exit 1
 trap 'case "$TMP" in "${TMPDIR:-/tmp}"/tmp.*) rm -rf "$TMP" ;; esac' EXIT
 (
+. "$ROOT/lib/00-common.sh"
 DEPLOY_DIR="$TMP"
+CONFIG_DIR="$TMP/confs" BACKUP_DIR="$TMP/state/backup"
 . "${NODE_ALIGNMENT_NODES_MODULE:-$ROOT/lib/50-nodes.sh}"
 . "$ROOT/lib/51-reality-pq.sh"
 NODES_DIR="$TMP/nodes" CERT_DIR="$TMP/certs" STATE_DIR="$TMP/state"
@@ -20,6 +22,7 @@ _info() { :; }; _tip() { :; }; _success() { :; }; _warn() { :; }; _error() { pri
 _url_encode() { jq -rn --arg v "$1" '$v | @uri'; }
 _yaml_dq() { local v; v=$(jq -rn --arg v "$1" '$v | @json'); printf '%s' "${v:1:${#v}-2}"; }
 _read_hop_ranges_display() { :; }
+actual_config_jq=$(declare -f _config_jq)
 _config_jq() { printf call >> "$TMP/preflight"; return 1; }
 _ensure_unique_name() { return 0; }
 _tpl_path() { printf '%s/templates/%s.server.jsonc' "$ROOT" "$1"; }
@@ -142,6 +145,113 @@ for proto in vless-xhttp-cdn vless-ws-cdn; do
     check "$proto URI defaults Chrome" contains "$link" '&fp=chrome&'
     check "$proto Clash defaults Chrome" contains "$line" '"client-fingerprint": "chrome"'
 done
+
+# Real port transactions and recovery run against confdir/metadata fixtures; no host locks/services.
+eval "$actual_config_jq"
+_with_config_lock() { "$@"; }
+_restart_xray_verified() { return 0; }
+_warn() { printf '%s\n' "$*" >> "$TMP/warnings"; }
+reality_fixture() {
+    local dir="$1" shared="$2" addr_key="$3" peer_host="${4:-127.0.0.1}"
+    DEPLOY_DIR="$TMP/$dir" CONFIG_DIR="$TMP/$dir/confs" NODES_DIR="$TMP/$dir/nodes"
+    BACKUP_DIR="$TMP/$dir/backup" CLASH_YAML="$TMP/$dir/clash.yaml"
+    mkdir -p "$CONFIG_DIR" "$NODES_DIR"
+    jq -n --arg key "$addr_key" --arg peer "$peer_host:10443" --argjson shared "$shared" '
+        {inbounds:[
+            {tag:"xd-reality-vision-443",protocol:"vless",port:443,
+             streamSettings:{network:"raw",security:"reality",realitySettings:{target:"127.0.0.1:10443",serverNames:["site.example"]}}},
+            {tag:"tunnel-site-10443-443",protocol:"tunnel",listen:"127.0.0.1",port:10443,
+             settings:{($key):"site.example",rewritePort:443,allowedNetwork:"tcp"}}
+        ] + (if $shared then [{tag:"xd-reality-xhttp-9443",protocol:"vless",port:9443,
+             streamSettings:{network:"xhttp",security:"reality",realitySettings:{target:$peer,serverNames:["site.example"]}}}] else [] end),
+         routing:{rules:[{type:"field",inboundTag:["tunnel-site-10443-443"],domain:["full:site.example"],outboundTag:"direct"}]}}
+    ' > "$DEPLOY_DIR/config-before.json"
+    _config_write_merged "$(cat "$DEPLOY_DIR/config-before.json")" || return 1
+    for tag in xd-reality-vision-443 xd-reality-xhttp-9443; do
+        [ "$shared" = true ] || [ "$tag" = xd-reality-vision-443 ] || continue
+        local port="${tag##*-}" proto=vless-tcp-reality-vision
+        [ "$port" = 9443 ] && proto=vless-xhttp-reality
+        jq -n --arg tag "$tag" --argjson p "$port" --arg proto "$proto" '
+            {tag:$tag,protocol:$proto,port:$p,name:("Reality-"+($p|tostring)),reality_mode:"tunnel",
+             tunnel_tag:"tunnel-site-10443-443",tunnel_port:10443,sni:"site.example",uuid:"id",
+             link_addr:"edge.example",public_key:"key",short_id:"abcd",path:"/path",share_link:"old"}
+        ' > "$NODES_DIR/$tag.json"
+    done
+}
+for addr_key in address rewriteAddress; do
+    for peer_host in 127.0.0.1 '[::1]' localhost 127.0.0.2; do
+        label="shared $addr_key $peer_host"
+        reality_fixture "shared-$addr_key-$peer_host" true "$addr_key" "$peer_host" || exit 1
+        cp "$NODES_DIR/xd-reality-xhttp-9443.json" "$DEPLOY_DIR/peer-before.json"
+        rc=0; _reality_port_txn xd-reality-vision-443 "$NODES_DIR/xd-reality-vision-443.json" 443 8443 || rc=$?
+        check "$label A port transaction succeeds" eq "$rc" 0
+        check "$label A metadata keeps tunnel identity" jq -e '.tag == "xd-reality-vision-8443" and .port == 8443 and .tunnel_tag == "tunnel-site-10443-443" and .tunnel_port == 10443 and (.share_link | contains(":8443?"))' "$NODES_DIR/xd-reality-vision-8443.json"
+        check "$label peer metadata bytes unchanged" cmp -s "$DEPLOY_DIR/peer-before.json" "$NODES_DIR/xd-reality-xhttp-9443.json"
+        _config_merged > "$DEPLOY_DIR/config-after.json"
+        check "$label only A config tag/port changes" jq -e --slurpfile before "$DEPLOY_DIR/config-before.json" 'del(.inbounds[0].tag,.inbounds[0].port) == ($before[0] | del(.inbounds[0].tag,.inbounds[0].port)) and .inbounds[0].tag == "xd-reality-vision-8443" and .inbounds[0].port == 8443' "$DEPLOY_DIR/config-after.json"
+        check "$label no completed journal remains" test ! -e "$NODES_DIR/xd-reality-vision-443.json.porttxn"
+        rc=0; _reality_port_txn xd-reality-xhttp-9443 "$NODES_DIR/xd-reality-xhttp-9443.json" 9443 10444 || rc=$?
+        check "$label B remains manageable" eq "$rc" 0
+        check "$label B metadata keeps tunnel identity" jq -e '.port == 10444 and .tunnel_tag == "tunnel-site-10443-443"' "$NODES_DIR/xd-reality-xhttp-10444.json"
+        check "$label B change leaves A port intact" _config_jq -e '[.inbounds[] | select(.tag == "xd-reality-vision-8443" and .port == 8443)] | length == 1'
+    done
+    reality_fixture "single-$addr_key" false "$addr_key" || exit 1
+    rc=0; _reality_port_txn xd-reality-vision-443 "$NODES_DIR/xd-reality-vision-443.json" 443 8443 || rc=$?
+    check "single $addr_key transaction succeeds" eq "$rc" 0
+    check "single $addr_key tunnel still renamed" jq -e '.tunnel_tag == "tunnel-site-10443-8443"' "$NODES_DIR/xd-reality-vision-8443.json"
+    check "single $addr_key route follows renamed tunnel" _config_jq -e '.routing.rules[0].inboundTag == ["tunnel-site-10443-8443"]'
+    check "single $addr_key address/port untouched" _config_jq -e --arg key "$addr_key" '.inbounds[1] | .tag == "tunnel-site-10443-8443" and .port == 10443 and .settings[$key] == "site.example" and .settings.rewritePort == 443'
+done
+
+# Interrupt after metadata commit, and after config commit, using the actual journal writer.
+for committed in false true; do
+    reality_fixture "recover-$committed" true rewriteAddress || exit 1
+    orig=$(cat "$NODES_DIR/xd-reality-vision-443.json")
+    next=$(jq '.tag="xd-reality-vision-8443" | .port=8443 | .name="Reality-8443"' <<< "$orig")
+    _port_txn_journal_write "$NODES_DIR/xd-reality-vision-443.json" "$NODES_DIR/xd-reality-vision-8443.json" reality 443 8443 '' "$orig" "$next" || exit 1
+    _atomic_write_json "$NODES_DIR/xd-reality-vision-8443.json" "$next" || exit 1
+    rm "$NODES_DIR/xd-reality-vision-443.json"
+    if [ "$committed" = true ]; then
+        _mutate_config '(.inbounds[0].tag)="xd-reality-vision-8443" | .inbounds[0].port=8443' || exit 1
+        expected="$NODES_DIR/xd-reality-vision-8443.json" expected_port=8443
+    else
+        expected="$NODES_DIR/xd-reality-vision-443.json" expected_port=443
+    fi
+    rc=0; _port_txn_recover || rc=$?
+    check "shared recovery committed=$committed succeeds" eq "$rc" 0
+    check "shared recovery committed=$committed metadata reconciles" jq -e --argjson p "$expected_port" '.port == $p and .tunnel_tag == "tunnel-site-10443-443"' "$expected"
+    check "shared recovery committed=$committed journal cleaned" test ! -e "$NODES_DIR/xd-reality-vision-443.json.porttxn"
+    check "shared recovery committed=$committed preserves tunnel" _config_jq -e '.inbounds[1].tag == "tunnel-site-10443-443" and .routing.rules[0].inboundTag == ["tunnel-site-10443-443"] and .inbounds[2].port == 9443'
+done
+
+# Missing congestion makes the real URI builder fail while the real Clash builder still succeeds.
+DEPLOY_DIR="$TMP/derived" CLASH_YAML="$TMP/derived/clash.yaml"
+mkdir -p "$DEPLOY_DIR"
+hy2_derived_fixture() {
+    jq -n '{tag:"hy2-test",protocol:"hysteria2",name:"hy2-new",auth:"secret",link_addr:"edge.example",port:443,sni:"site.example",congestion:"bbr",share_link:"old-link"}' > "$DEPLOY_DIR/meta.json"
+    printf 'proxies:\n  - {name: "hy2-old", type: hysteria2, server: "old", port: 443}\n' > "$CLASH_YAML"
+    : > "$TMP/warnings"
+}
+hy2_derived_fixture
+_meta_update "$DEPLOY_DIR/meta.json" 'del(.congestion)' || exit 1
+rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" hy2-old || rc=$?
+check 'Hy2 URI failure with Clash success returns nonzero' eq "$rc" 1
+check 'Hy2 URI failure preserves old link' jq -e '.share_link == "old-link"' "$DEPLOY_DIR/meta.json"
+check 'Hy2 URI failure still updates Clash' grep -qF 'name: "hy2-new"' "$CLASH_YAML"
+check 'Hy2 URI failure removes old Clash name' lacks "$(cat "$CLASH_YAML")" 'name: "hy2-old"'
+check 'Hy2 URI failure reports link warning' grep -qF '分享链接重建失败' "$TMP/warnings"
+hy2_derived_fixture
+_meta_update "$DEPLOY_DIR/meta.json" '.obfs_type="salamander" | .obfs_password="obfs" | .obfs_packet_size="800-1000"' || exit 1
+rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" hy2-old || rc=$?
+check 'Hy2 custom Gecko unexpressible succeeds' eq "$rc" 0
+check 'Hy2 custom Gecko clears old link' jq -e '.share_link == ""' "$DEPLOY_DIR/meta.json"
+check 'Hy2 custom Gecko still exports full Clash dimensions' contains "$(cat "$CLASH_YAML")" 'obfs: gecko, obfs-password: "obfs", obfs-min-packet-size: 800, obfs-max-packet-size: 1000'
+hy2_derived_fixture
+rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" hy2-old || rc=$?
+check 'Hy2 normal derived sync succeeds' eq "$rc" 0
+check 'Hy2 normal derived sync rebuilds link' jq -e '.share_link | startswith("hy2://") and contains("@edge.example:443/")' "$DEPLOY_DIR/meta.json"
+check 'Hy2 normal derived sync updates Clash' grep -qF 'name: "hy2-new"' "$CLASH_YAML"
+check 'Hy2 normal derived sync removes old name' lacks "$(cat "$CLASH_YAML")" 'name: "hy2-old"'
 
 # Invoke the real PQ decision using deterministic local command output.
 XRAY_BIN="$TMP/xray"

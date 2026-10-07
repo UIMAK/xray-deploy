@@ -40,6 +40,8 @@ NODES_DIR="$DEPLOY_DIR/nodes"
 CERT_DIR="$DEPLOY_DIR/certs"
 BIN_DIR="$DEPLOY_DIR/bin"
 LOG_DIR="$DEPLOY_DIR/log"
+GEO_LOG="$LOG_DIR/geo-update.log"
+CF_LOG="$LOG_DIR/cloudflared.log"
 CLASH_YAML="$DEPLOY_DIR/clash.yaml"
 XRAY_BIN="$BIN_DIR/xray"
 CF_BIN="$TMP/cloudflared"
@@ -930,7 +932,7 @@ check 'direct restored legacy service starts from existing single file' _test_di
 check 'direct migrated service prefers nonempty confdir' _test_direct_config_source confdir
 
 # 专属行为套件在独立进程内运行, 不泄漏服务/配置桩到本套件。
-for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh; do
+for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then
         tail -n 1 "$TMP/$suite.log"
         pass "alignment suite $suite"
