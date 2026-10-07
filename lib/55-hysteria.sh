@@ -765,21 +765,24 @@ _hysteria_restore_config() {
     return 0
 }
 
-# 仅变更目标字段并原子发布；启动失败恢复配置和 was_running。
-_hysteria_config_txn_locked() {
-    _hysteria_config_preflight || return 1
-    local was_running; was_running=$(_hysteria_runtime_state) || return 1
+# 事务公共序言: 记录原运行态并建立回滚备份(环境校验由各事务自己先做); 结果见 _HY_TXN_WAS_RUNNING。
+_hysteria_txn_prologue() {
+    _HY_TXN_WAS_RUNNING=$(_hysteria_runtime_state) || return 1
     if ! _hysteria_backup_config; then
         _error "配置备份失败, 中止操作"
         return 1
     fi
+    return 0
+}
+
+# 应用 jq 过滤器并原子发布 config; 失败保留旧配置。
+_hysteria_config_apply_filter() {
+    local filter="$1"; shift
     local tmp
     tmp=$(mktemp "${HYSTERIA_CONFIG}.XXXXXX") || { _error "无法创建临时配置"; return 1; }
-    local user_filter="${!#}"
-    local args=("${@:1:$#-1}" "$user_filter")
-    if ! jq "${args[@]}" "$HYSTERIA_CONFIG" > "$tmp" 2>/dev/null; then
+    if ! jq "$@" "$filter" "$HYSTERIA_CONFIG" > "$tmp" 2>/dev/null; then
         rm -f "$tmp"
-        local jq_err; jq_err=$(jq "${args[@]}" "$HYSTERIA_CONFIG" 2>&1 >/dev/null | head -3)
+        local jq_err; jq_err=$(jq "$@" "$filter" "$HYSTERIA_CONFIG" 2>&1 >/dev/null | head -3)
         _error "jq 处理失败: ${jq_err:-未知错误}"
         return 1
     fi
@@ -791,6 +794,15 @@ _hysteria_config_txn_locked() {
         _error "配置替换失败, 保留旧配置"
         return 1
     fi
+    return 0
+}
+
+# 仅变更目标字段并原子发布；启动失败恢复配置和 was_running。
+_hysteria_config_txn_locked() {
+    _hysteria_config_preflight || return 1
+    _hysteria_txn_prologue || return 1
+    local was_running="$_HY_TXN_WAS_RUNNING"
+    _hysteria_config_apply_filter "${!#}" "${@:1:$#-1}" || return 1
     if [ "$was_running" = "running" ]; then
         if ! _hysteria_restart_verified; then
             _error "hysteria 启动失败, 回滚配置"
@@ -836,27 +848,9 @@ _hysteria_server_txn_locked() {
     _hysteria_config_preflight || return 1
     [ "$#" -ge 2 ] || { _error "server_txn 参数不足(config_filter, meta_filter)"; return 1; }
     local config_filter="$1" meta_filter="$2"; shift 2
-    local was_running; was_running=$(_hysteria_runtime_state) || return 1
-    if ! _hysteria_backup_config; then
-        _error "配置备份失败, 中止操作"
-        return 1
-    fi
-    local tmp
-    tmp=$(mktemp "${HYSTERIA_CONFIG}.XXXXXX") || { _error "无法创建临时配置"; return 1; }
-    if ! jq "${@}" "$config_filter" "$HYSTERIA_CONFIG" > "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        local jq_err; jq_err=$(jq "${@}" "$config_filter" "$HYSTERIA_CONFIG" 2>&1 >/dev/null | head -3)
-        _error "jq 处理失败: ${jq_err:-未知错误}"
-        return 1
-    fi
-    if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"; _error "生成的配置为空"; return 1
-    fi
-    if ! mv -f "$tmp" "$HYSTERIA_CONFIG"; then
-        rm -f "$tmp"
-        _error "配置替换失败, 保留旧配置"
-        return 1
-    fi
+    _hysteria_txn_prologue || return 1
+    local was_running="$_HY_TXN_WAS_RUNNING"
+    _hysteria_config_apply_filter "$config_filter" "${@}" || return 1
     local meta_bak="" meta_had=0 meta_created=0
     if [ "$meta_filter" != "-" ]; then
         if [ -f "$HYSTERIA_SERVER_META" ]; then
@@ -978,10 +972,6 @@ _hysteria_server_txn_rollback_after_change() {
     return 1
 }
 
-_hysteria_server_txn() {
-    _with_config_lock _hysteria_server_txn_txn_wrapper "$@"
-}
-
 _hysteria_node_txn() {
     _with_config_lock _hysteria_node_txn_txn_wrapper "$@"
 }
@@ -1008,11 +998,8 @@ _hysteria_node_txn_txn_wrapper() {
 _hysteria_node_txn_locked() {
     local config_filter="$1" meta_file="$2" meta_op="$3" meta_content="${4:-}"; shift 4
     _hysteria_config_preflight || return 1
-    local was_running; was_running=$(_hysteria_runtime_state) || return 1
-    if ! _hysteria_backup_config; then
-        _error "配置备份失败, 中止操作"
-        return 1
-    fi
+    _hysteria_txn_prologue || return 1
+    local was_running="$_HY_TXN_WAS_RUNNING"
     local meta_had=0 meta_bak="" node_name=""
     if [ "$meta_op" = "delete" ] && [ -f "$meta_file" ]; then
         node_name=$(jq -r '.name // empty' "$meta_file" 2>/dev/null)
@@ -1028,22 +1015,7 @@ _hysteria_node_txn_locked() {
             return 1
         fi
     fi
-    local tmp
-    tmp=$(mktemp "${HYSTERIA_CONFIG}.XXXXXX") || { _error "无法创建临时配置"; return 1; }
-    if ! jq "${@}" "$config_filter" "$HYSTERIA_CONFIG" > "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        local jq_err; jq_err=$(jq "${@}" "$config_filter" "$HYSTERIA_CONFIG" 2>&1 >/dev/null | head -3)
-        _error "jq 处理失败: ${jq_err:-未知错误}"
-        return 1
-    fi
-    if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"; _error "生成的配置为空"; return 1
-    fi
-    if ! mv -f "$tmp" "$HYSTERIA_CONFIG"; then
-        rm -f "$tmp"
-        _error "配置替换失败, 保留旧配置"
-        return 1
-    fi
+    _hysteria_config_apply_filter "$config_filter" "${@}" || return 1
     _hysteria_node_txn_meta_rollback() {
         local rc=0 mc
         if [ "$meta_had" -eq 1 ]; then
@@ -2322,34 +2294,6 @@ _hysteria_default_name_for_listen() {
     fi
 }
 
-_hysteria_ask_why() {
-    local fn="$1" val="$2" why=""
-    why=$("$fn" "$val" 2>/dev/null) || why=""
-    [ -n "$why" ] || why="取值非法"
-    printf '%s' "$why"
-}
-
-_hysteria_ask_value() {
-    local prompt="$1" reply_var="$2" allow_empty="$3" validator="$4" val="" why
-    while true; do
-        read -rp "$prompt" val || return 1
-        if [ -z "$val" ]; then
-            if [ "$allow_empty" = "1" ]; then
-                printf -v "$reply_var" '%s' ""
-                return 0
-            fi
-            _error "不能为空"
-            continue
-        fi
-        if "$validator" "$val"; then
-            printf -v "$reply_var" '%s' "$val"
-            return 0
-        fi
-        why=$(_hysteria_ask_why "$validator" "$val")
-        _error "$why"
-    done
-}
-
 # 非法输入只重问当前字段，EOF 返回失败；不得悄悄修正或重置已确认值。
 _hysteria_ask_value_reason() {
     local prompt="$1" reply_var="$2" allow_empty="$3" reason_fn="$4" val="" why
@@ -2367,23 +2311,6 @@ _hysteria_ask_value_reason() {
         [ -z "$why" ] || { _error "$why"; continue; }
         printf -v "$reply_var" '%s' "$val"
         return 0
-    done
-}
-
-_hysteria_ask_choice() {
-    local prompt="$1" reply_var="$2" default="$3" allowed="$4" val="" ok a
-    while true; do
-        read -rp "$prompt" val || return 1
-        if [ -z "$val" ]; then
-            printf -v "$reply_var" '%s' "$default"
-            return 0
-        fi
-        ok=""
-        for a in $allowed; do
-            [ "$val" = "$a" ] && { ok=1; break; }
-        done
-        [ -n "$ok" ] && { printf -v "$reply_var" '%s' "$val"; return 0; }
-        _error "无效选择: ${val}(可选: ${allowed// /, })"
     done
 }
 

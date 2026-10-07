@@ -163,8 +163,6 @@ _hy2_link_unexpressible() {
 XD_UDP_OUR_TYPE="salamander"
 XD_UDP_OUR_MARKER="xd_managed"
 XD_UDP_JQ_UPSERT='def xd_udp_ours($new): .streamSettings.finalmask.udp = ((.streamSettings.finalmask.udp // []) as $a | ($a | map(.type == $ourtype and (.settings // {})[$ourmark] == true) | index(true)) as $i | if $i == null then (if $new == null then $a else $a + [$new] end) else (if $new == null then $a[0:$i] + $a[$i+1:] else $a[0:$i] + [$new] + $a[$i+1:] end) end); (.inbounds[] | select(.tag == $t)) |= xd_udp_ours($new)'
-# 兼容别名: 语义与 UPSERT($new=null) 完全相同 —— 独立常量只为调用点可读, 不得再复制过滤逻辑。
-XD_UDP_JQ_DROP="$XD_UDP_JQ_UPSERT"
 
 # 探测无归属标记的 salamander 层；外来层不得由本脚本替换。
 _hy2_udp_has_foreign_salamander() {
@@ -244,26 +242,6 @@ _hy2_masq_trim() {
     s="${s#"${s%%[![:space:]]*}"}"
     s="${s%"${s##*[![:space:]]}"}"
     printf '%s' "$s"
-}
-
-# 读取选中节点的伪装字段。未配置/形态不符(非对象)一律输出空串, 菜单据此显示"默认 404"。
-# 用法: _hy2_masq_get <tag> <type|dir|url|rewriteHost|xForwarded|insecure|content|statusCode>
-_hy2_masq_get() {
-    local tag="$1" field="$2"
-    _config_present || return 0
-    _config_jq -r --arg t "$tag" --arg k "$field" '
-        (.inbounds[]? | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade) as $m
-        | if ($m | type) != "object" then ""
-          else (if $k == "type" then ($m.type // "")
-                elif $k == "dir" then ($m.dir // "")
-                elif $k == "url" then ($m.url // "")
-                elif $k == "content" then ($m.content // "")
-                elif $k == "statusCode" then (($m.statusCode // 0) | tostring)
-                elif $k == "rewriteHost" then (($m.rewriteHost // false) | tostring)
-                elif $k == "insecure" then (($m.insecure // false) | tostring)
-                elif $k == "xForwarded" then (($m.xForwarded // false) | tostring)
-                else "" end) | tostring
-          end' 2>/dev/null
 }
 
 # 当前伪装的一句话描述(菜单唯一展示入口; 单次 jq, 避免"同一状态两处各自解释")。
@@ -772,32 +750,49 @@ _hy2_remove_hop_rules() {
 }
 
 # IPv4 save 是权威提交；失败返回1，IPv6 按可观察能力处理。
+# v4 规则原子持久化; 目录创建失败计入返回码, 但仍尝试写入。
+_hy2_persist_v4_rules() {
+    local ipt_dir="$1" ok=0 tmp
+    mkdir -p "$ipt_dir" 2>/dev/null || ok=1
+    tmp="$ipt_dir/rules.v4.tmp.$$"
+    if iptables-save > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$tmp"; ok=1; }
+    else
+        rm -f "$tmp"; ok=1
+    fi
+    return "$ok"
+}
+
+# v6 规则 best-effort 持久化; 无 ip6tables-save 时跳过, 失败只告警。
+# ensure_dir=1 时自行创建目录(alpine 缺 init.d ip6tables 的回退路径)。
+_hy2_persist_v6_rules() {
+    local ipt_dir="$1" ensure_dir="${2:-0}" tmp
+    command -v ip6tables-save >/dev/null 2>&1 || return 0
+    if [ "$ensure_dir" = 1 ]; then
+        mkdir -p "$ipt_dir" 2>/dev/null || _warn "无法创建 $ipt_dir, IPv6 规则持久化失败(best-effort)"
+    fi
+    tmp="$ipt_dir/rules.v6.tmp.$$"
+    if ip6tables-save > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
+    else
+        rm -f "$tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
+    fi
+    return 0
+}
+
 _hy2_persist_iptables() {
     # 需要持久化而无 iptables-save 必须失败；runtime 成功不等于事务完成。
     if ! command -v iptables-save >/dev/null 2>&1; then
         _error "iptables-save 不可用, 无法安全持久化端口跳跃规则(重启后规则会丢失)"
         return 1
     fi
-    local ok=0 fam v4tmp v6tmp ipt_dir="${HY2_IPTABLES_DIR:-/etc/iptables}" \
+    local ok=0 fam ipt_dir="${HY2_IPTABLES_DIR:-/etc/iptables}" \
         initd_dir="${HY2_INITD_DIR:-/etc/init.d}"
     fam=$(_detect_os_family)
     case "$fam" in
         debian)
-            mkdir -p "$ipt_dir" 2>/dev/null || ok=1
-            v4tmp="$ipt_dir/rules.v4.tmp.$$"
-            if iptables-save > "$v4tmp" 2>/dev/null; then
-                mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
-            else
-                rm -f "$v4tmp"; ok=1
-            fi
-            if command -v ip6tables-save >/dev/null 2>&1; then
-                v6tmp="$ipt_dir/rules.v6.tmp.$$"
-                if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                    mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
-                else
-                    rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
-                fi
-            fi
+            _hy2_persist_v4_rules "$ipt_dir" || ok=1
+            _hy2_persist_v6_rules "$ipt_dir"
             ;;
         alpine)
             if [ -x "$initd_dir/iptables" ]; then
@@ -807,41 +802,16 @@ _hy2_persist_iptables() {
                 # 回退到直接原子写(与无 init.d 分支一致), 避免调用不存在的脚本 rc127 误报失败
                 if [ -x "$initd_dir/ip6tables" ]; then
                     "$initd_dir/ip6tables" save >/dev/null 2>&1 || _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
-                elif command -v ip6tables-save >/dev/null 2>&1; then
-                    mkdir -p "$ipt_dir" 2>/dev/null || _warn "无法创建 $ipt_dir, IPv6 规则持久化失败(best-effort)"
-                    v6tmp="$ipt_dir/rules.v6.tmp.$$"
-                    if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                        mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
-                    else
-                        rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
-                    fi
+                else
+                    _hy2_persist_v6_rules "$ipt_dir" 1
                 fi
             else
-                mkdir -p "$ipt_dir" 2>/dev/null || ok=1
-                v4tmp="$ipt_dir/rules.v4.tmp.$$"
-                if iptables-save > "$v4tmp" 2>/dev/null; then
-                    mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
-                else
-                    rm -f "$v4tmp"; ok=1
-                fi
-                if command -v ip6tables-save >/dev/null 2>&1; then
-                    v6tmp="$ipt_dir/rules.v6.tmp.$$"
-                    if ip6tables-save > "$v6tmp" 2>/dev/null; then
-                        mv -f "$v6tmp" "$ipt_dir/rules.v6" 2>/dev/null || { rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"; }
-                    else
-                        rm -f "$v6tmp"; _warn "IPv6 规则持久化失败(best-effort), 重启后 IPv6 跳跃规则可能丢失"
-                    fi
-                fi
+                _hy2_persist_v4_rules "$ipt_dir" || ok=1
+                _hy2_persist_v6_rules "$ipt_dir"
             fi
             ;;
         *)
-            mkdir -p "$ipt_dir" 2>/dev/null || ok=1
-            v4tmp="$ipt_dir/rules.v4.tmp.$$"
-            if iptables-save > "$v4tmp" 2>/dev/null; then
-                mv -f "$v4tmp" "$ipt_dir/rules.v4" 2>/dev/null || { rm -f "$v4tmp"; ok=1; }
-            else
-                rm -f "$v4tmp"; ok=1
-            fi
+            _hy2_persist_v4_rules "$ipt_dir" || ok=1
             ;;
     esac
     return "$ok"
@@ -2201,19 +2171,6 @@ _known_tags() {
     done
 }
 
-# 只认 _known_tags 的脚本管理入站；孤儿采纳前不能伪装成已管理。
-_tag_is_managed() {
-    local tag="$1" f ttag
-    [ -n "$tag" ] || return 1
-    [ -f "$NODES_DIR/${tag}.json" ] && return 0
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        ttag=$(jq -r '.tunnel_tag // empty' "$f" 2>/dev/null) || continue
-        [ -n "$ttag" ] && [ "$ttag" = "$tag" ] && return 0
-    done
-    return 1
-}
-
 # 无tag入站补唯一tag；保留现有tag且一次性提交，避免关联定位漂移。
 _auto_tag_tagless_inbounds() {
     _config_present || return 0
@@ -2349,16 +2306,6 @@ _node_protocol_safe() {
     _error "节点元数据损坏且本机存在端口跳跃规则, 无法确认归属, 拒绝删除: $tag"
     _tip "请核对 iptables -t nat -S PREROUTING 与 ${meta}, 手工清理后重试"
     return 1
-}
-
-# tunnel 端口共享意味着归属歧义；删除不得影响其它节点。
-_tunnel_port_ambiguous() {
-    local tag="$1" port n
-    port=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
-    [[ "$port" =~ ^[0-9]+$ ]] || return 1
-    n=$(_config_jq -r --argjson p "$port" '[.inbounds[] | select(.protocol == "tunnel") | select(.port == $p)] | length' 2>/dev/null)
-    [[ "$n" =~ ^[0-9]+$ ]] || return 1
-    [ "$n" -gt 1 ]
 }
 
 # 反向关联只认回环target+端口；无parent保留孤儿，歧义拒绝自动删除。
@@ -2514,29 +2461,6 @@ _auto_adopt_orphans_locked() {
 }
 
 # ---------------------------------------------------------------------------
-# 检测配置中的孤儿入站(手动添加,无元数据)
-# 返回 0 = 有孤儿, 1 = 无
-# ---------------------------------------------------------------------------
-_has_orphan_inbounds() {
-    _config_present || return 1
-    [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
-    local tags_json
-    tags_json=$(_config_jq -c '[.inbounds[]?.tag // empty]' 2>/dev/null) || return 1
-    [ -z "$tags_json" ] && return 1
-    [ "$tags_json" = "[]" ] && return 1
-    local known_list
-    known_list=$(_known_tags)
-    local tag
-    while IFS= read -r tag; do
-        [ -z "$tag" ] && continue
-        if ! grep -qxF "$tag" <<< "$known_list"; then
-            return 0
-        fi
-    done <<< "$(jq -r '.[]' <<< "$tags_json" 2>/dev/null)"
-    return 1
-}
-
-# ---------------------------------------------------------------------------
 # 从配置入站推断协议类型(按 tag)
 # ---------------------------------------------------------------------------
 _detect_inbound_protocol() {
@@ -2576,224 +2500,6 @@ _detect_inbound_protocol() {
     else
         echo "$proto"
     fi
-}
-
-# ---------------------------------------------------------------------------
-# 同步配置: 检测孤儿入站, 提供清理/采纳选项
-# ---------------------------------------------------------------------------
-_sync_config_check() {
-    clear
-    echo
-    echo -e "  ${CYAN}【同步配置入站】${NC}"
-    echo -e "  扫描配置中未由脚本管理的入站..."
-    echo
-
-    _config_present || { _warn "配置不存在"; _press_any_key; return; }
-    [ -d "$NODES_DIR" ] || mkdir -p "$NODES_DIR"
-
-    # 先自动给无 tag 入站分配 tag(幂等, 已分配的不变)。失败时后续孤儿扫描没有可靠输入
-    # (tag 未补齐 ⇒ 会把"未跟踪"误判成孤儿), 必须中止而不是拿半扫结果去采纳/清理。
-    if ! _auto_tag_tagless_inbounds; then
-        _error "自动分配入站 tag 失败(配置不可解析或写入失败), 已中止同步"
-        _press_any_key; return
-    fi
-
-    local tags_json
-    tags_json=$(_config_jq -c '[.inbounds[]?.tag // empty]' 2>/dev/null)
-    if [ -z "$tags_json" ] || [ "$tags_json" = "[]" ]; then
-        _info "配置中无任何入站"
-        _press_any_key; return
-    fi
-
-    local known_list
-    known_list=$(_known_tags)
-
-    local orphans=()
-    local tag
-    while IFS= read -r tag; do
-        [ -z "$tag" ] && continue
-        if ! grep -qxF "$tag" <<< "$known_list"; then
-            orphans+=("$tag")
-        fi
-    done <<< "$(jq -r '.[]' <<< "$tags_json" 2>/dev/null)"
-
-    if [ ${#orphans[@]} -eq 0 ]; then
-        _success "所有入站均由脚本管理, 无需同步"
-        _press_any_key; return
-    fi
-
-    echo -e "  ${YELLOW}发现 ${#orphans[@]} 个未跟踪入站:${NC}"
-    echo
-    printf "  %-3s %-30s %-16s %-7s %-8s\n" "#" "Tag" "协议" "端口" "监听"
-    echo "  ---------------------------------------------------------------------------"
-    local i=1
-    for tag in "${orphans[@]}"; do
-        local proto port listen
-        proto=$(_detect_inbound_protocol "$tag")
-        port=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // "-"' 2>/dev/null)
-        listen=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen // "::"' 2>/dev/null)
-        [ ${#tag} -gt 28 ] && tag="${tag:0:25}..."
-        printf "  %-3s %-30s %-16s %-7s %-8s\n" "[$i]" "$tag" "$proto" "$port" "$listen"
-        i=$((i+1))
-    done
-    echo
-    echo -e "  ${GREEN}[1]${NC} 从配置移除选中入站"
-    echo -e "  ${GREEN}[2]${NC} 移除全部未跟踪入站"
-    echo -e "  ${GREEN}[3]${NC} 采纳为脚本管理节点(创建元数据)"
-    echo -e "  ${GREEN}[0]${NC} 取消"
-    read -rp "  请选择: " action
-
-    case "$action" in
-        1)
-            read -rp "  输入要移除的编号(逗号分隔, 如 1,3,5): " sel
-            local to_remove=()
-            IFS=',' read -ra nums <<< "$sel"
-            for n in "${nums[@]}"; do
-                n=$(echo "$n" | tr -d ' ')
-                local idx
-                idx=$(_xd_index_from_choice "$n" "${#orphans[@]}") || continue
-                to_remove+=("${orphans[$idx]}")
-            done
-            [ ${#to_remove[@]} -eq 0 ] && { _warn "无有效选择"; _press_any_key; return; }
-            _remove_orphan_inbounds "${to_remove[@]}"
-            ;;
-        2)
-            echo -e "  ${RED}确认移除全部 ${#orphans[@]} 个未跟踪入站?${NC}"
-            read -rp "  继续? [y/N]: " ans
-            case "$ans" in
-                y|Y) _remove_orphan_inbounds "${orphans[@]}" ;;
-                *) _info "已取消" ;;
-            esac
-            ;;
-        3)
-            _adopt_orphan_inbounds "${orphans[@]}"
-            ;;
-        *)
-            _info "已取消"
-            ;;
-    esac
-    _press_any_key
-}
-
-# ---------------------------------------------------------------------------
-# 从配置移除孤儿入站 + 关联路由规则
-# ---------------------------------------------------------------------------
-_remove_orphan_inbounds() {
-    _with_config_lock _remove_orphan_inbounds_locked "$@"
-}
-
-_remove_orphan_inbounds_locked() {
-    local tags=("$@")
-    [ ${#tags[@]} -eq 0 ] && return 0
-    if ! _config_jq -e 'type == "object" and (.inbounds | type == "array")' >/dev/null 2>&1; then
-        _error "配置不可读或结构无效, 无法安全移除孤儿入站"
-        return 1
-    fi
-
-    # orphan删除双向扩展parent/tunnel并检查存活引用；共享结构不得被整体删除。
-    local safe=() excluded=() managed=()
-    local tag ttag trc rtags rt
-    for tag in "${tags[@]}"; do
-        if ! _config_jq -e --arg t "$tag" 'any(.inbounds[]?; (.tag // "") == $t)' \
-            >/dev/null 2>&1; then
-            excluded+=("$tag")
-            continue
-        fi
-        ttag=$(_find_reality_tunnel_tag "$tag"); trc=$?
-        if [ "$trc" = "2" ]; then
-            excluded+=("$tag")
-            continue
-        fi
-        # Tunnel ownership gate —— 必须在 safe+= 之前判定; 多 tunnel 同 port 时
-        # ownership 不成立, 排除该项(否则删 parent Reality + 一个 tunnel 留下同 port 兄弟)
-        if [ "$(_detect_inbound_protocol "$tag")" = "tunnel" ] && _tunnel_port_ambiguous "$tag"; then
-            excluded+=("$tag")
-            continue
-        fi
-        # 先把本项的完整删除集合算出来并逐个检查"是否受管", 任一受管则整项不删
-        local group=("$tag") mgr=""
-        [ "$trc" = "0" ] && [ -n "$ttag" ] && group+=("$ttag")
-        rtags=$(_find_reality_for_tunnel_tag "$tag")
-        # 必须逐行读——tag 可含空格(伪装域名曾无字符校验, tunnel_tag 由 SNI 拼成),
-        # 无引号 $rtags 会按 IFS 分词并做 glob 展开, 把真实 tag 切碎 => jq 删不到 => 半套
-        while IFS= read -r rt; do
-            [ -n "$rt" ] && group+=("$rt")
-        done <<< "$rtags"
-        for rt in "${group[@]}"; do
-            if _tag_is_managed "$rt"; then
-                mgr="$rt"
-                break
-            fi
-        done
-        if [ -n "$mgr" ]; then
-            managed+=("${tag} → ${mgr}")
-            continue
-        fi
-        safe+=("${group[@]}")
-    done
-    if [ ${#excluded[@]} -gt 0 ]; then
-        _warn "以下 orphan 因 Reality↔tunnel 关联歧义被取消删除(请人工核对 config): ${excluded[*]}"
-    fi
-    if [ ${#managed[@]} -gt 0 ]; then
-        _warn "以下 orphan 的关联入站属于脚本管理的节点, 已取消删除(避免删掉受管节点): ${managed[*]}"
-        _tip "如需删除这些节点请使用 [删除节点], 它会同时清理 config/元数据/Clash 配置"
-    fi
-    if [ ${#safe[@]} -eq 0 ]; then
-        _error "没有可安全删除的入站"
-        return 1
-    fi
-    # 去重(双向扩展可能重复命中同一 tag)
-    local uniq=() t u found
-    for t in "${safe[@]}"; do
-        found=0
-        for u in "${uniq[@]}"; do
-            [ "$u" = "$t" ] && { found=1; break; }
-        done
-        [ "$found" = 0 ] && uniq+=("$t")
-    done
-    safe=("${uniq[@]}")
-
-    local tags_json
-    if ! tags_json=$(printf '%s\n' "${safe[@]}" | jq -R . | jq -c -s .); then
-        _error "生成移除集合失败"
-        return 1
-    fi
-
-    # 规则/入站先守卫对象类型；手改标量不能让整个jq事务报错。
-    local filter='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
-                 | .routing.rules |= map(select((type != "object") or .inboundTag == null
-                       or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))'
-
-    if _mutate_config --argjson rm "$tags_json" "$filter"; then
-        _success "已移除 ${#safe[@]} 个入站"
-    else
-        _error "移除失败, 已回滚"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# 采纳孤儿入站: 从配置推断元数据, 创建 nodes/*.json
-# ---------------------------------------------------------------------------
-_adopt_orphan_inbounds() {
-    local tags=("$@")
-    local adopted=0 failed=0
-    for tag in "${tags[@]}"; do
-        if _adopt_single_inbound "$tag" "adopted"; then
-            adopted=$((adopted+1))
-            _info "已采纳: $tag"
-        else
-            failed=$((failed+1))
-        fi
-    done
-    # 部分失败必须如实报告, 不能整体假装成功; 返回码反映是否全部成功
-    [ "$failed" -eq 0 ] || _warn "有 ${failed} 个入站采纳失败"
-    if [ "$adopted" -eq 0 ]; then
-        _error "未采纳任何入站"
-        return 1
-    fi
-    _success "已采纳 ${adopted} 个入站(分享链接需手动重建)"
-    _tip "采纳的节点缺少完整参数, 建议使用 [查看节点] 确认, 或删后重建"
-    [ "$failed" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -4844,7 +4550,7 @@ _view_nodes() {
                     echo -e "  ${YELLOW}原因: gecko 使用了自定义分片尺寸(官方 hy2 URI 的 obfs 只表达类型, 无尺寸参数)${NC}"
                     echo -e "  ${YELLOW}请改用 clash/mihomo 条目导入(含 obfs-min/max-packet-size), 见 ${CLASH_YAML}${NC}"
                 else
-                    echo -e "  ${YELLOW}原因: 节点元数据缺少链接所需字段(可删除后重建, 或用 [采纳孤儿入站] 补回)${NC}"
+                    echo -e "  ${YELLOW}原因: 节点元数据缺少链接所需字段(请删除该节点后重建)${NC}"
                 fi
             else
                 echo -e "  ${GREEN}${link}${NC}"
@@ -5074,7 +4780,7 @@ _delete_node_apply_multi() {
     local all_json; all_json=$(printf '%s\n' "${del_tags[@]}" "${del_ttags[@]}" | jq -R . | jq -s .)
 
     # 同口径: type 守卫防止非对象规则/入站元素让 jq 整体报错。
-    # tag 同样需 as 绑定后再 index(index 参数以 $all_tags 为输入求值, 见 _remove_orphan_inbounds 注)
+    # tag 同样需 as 绑定后再 index(index 参数以 $all_tags 为输入求值)
     local jq_multi='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($all_tags | index($tg)) == null)))'
     if [ ${#del_ttags[@]} -gt 0 ]; then
         jq_multi="$jq_multi | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag as \$it | \$tun_tags | index(\$it)) == null)))"
@@ -5235,7 +4941,7 @@ _reality_port_txn_locked() {
                 '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
                 >/dev/null 2>&1; then
                 _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
-                _tip "请检查配置或使用 [采纳孤儿入站] 修复元数据"
+                _tip "请检查配置中是否仍有该 tunnel 入站, 缺失时删除该节点后重建"
                 return 1
             fi
         fi

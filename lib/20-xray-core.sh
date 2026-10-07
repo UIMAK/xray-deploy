@@ -363,66 +363,6 @@ _ensure_xray_symlink() {
 }
 
 # ---------------------------------------------------------------------------
-# 核心切换同步还原: binary → service → 尽力重启 → version/channel。
-# service 与核心 env 门控相关, 两侧均还原才算成功; 重启失败只告警。
-# 用法: _xray_restore_prev_bin <旧版本号> <旧通道> [binary_kept]
-# 返回 0=完整还原, 1=无 .bak 或 binary 还原失败, 2=binary 已恢复但 service 未恢复。
-# binary_kept 表示新二进制保留, 此时 state 记新版本。
-# ---------------------------------------------------------------------------
-_xray_restore_prev_bin() {
-    local cur="$1" prev_channel="${2:-}" binary_kept="${3:-}"
-    local svc_ok=1
-    # geo dat 与二进制同属"核心运行依赖", 回滚时一并换回。放在最前: 它不依赖其它
-    # 步骤的结论, 失败只影响 disk 判据(下面按 svc_ok 汇总)。
-    if declare -F _xref_restore_geo_dats >/dev/null 2>&1; then
-        _xref_restore_geo_dats || svc_ok=0
-    fi
-    if [ ! -f "$XRAY_BIN.bak" ]; then
-        # 首次安装: 没有旧二进制可回。**不删**刚落地的新二进制 —— 用户可能仍可用它,
-        # 删掉只会把"核心能跑但 service 没建好"变成"完全没核心"。
-        _warn "无旧核心备份可还原, 保留已落地的二进制 v${cur:-?}(service/config 可能未就绪)"
-        # unit 是**独立于二进制**的一侧: 即使没有旧二进制可回, 本次新建/写坏的 unit 也必须
-        # 复原到事务前的状态, 否则"没有核心 + 半截 unit"比现状更难恢复。
-        _xray_service_restore_prev || svc_ok=0
-        local keepv; keepv=$(_xray_current_version 2>/dev/null)
-        [ -n "$keepv" ] && { _state_set version "$keepv" || _warn "状态持久化失败(version)"; }
-        return 1
-    fi
-    if ! mv -f "$XRAY_BIN.bak" "$XRAY_BIN"; then
-        _error "旧二进制还原失败, 请手动处理 $XRAY_BIN(备份仍在 $XRAY_BIN.bak)"
-        # 二进制没还原成功, 但 unit 仍要尽量复原 —— 两个失败互不依赖, 不做"先回滚谁"的取舍
-        _xray_service_restore_prev || svc_ok=0
-        [ "$svc_ok" -eq 0 ] && _error "service 文件也未能还原, 请一并手动核对(见上方提示)"
-        return 1
-    fi
-    chmod +x "$XRAY_BIN" 2>/dev/null || _warn "还原后的二进制执行位设置失败: $XRAY_BIN"
-    _xray_service_restore_prev || svc_ok=0
-    # 服务拉起放在两侧还原之后: service 没还原成功时**仍然要拉**, 失败方向是"尽力恢复可用" ——
-    # 但那属于"回滚不完整", 由返回码 2 如实上报, 不再伪装成成功。
-    _manage_xray restart >/dev/null 2>&1 || _manage_xray start >/dev/null 2>&1 || \
-        _warn "还原旧核心后服务未能拉起, 请手动检查: xd 菜单 [Xray 核心管理]"
-    local recv; recv=$(_xray_current_version 2>/dev/null)
-    [ -n "$recv" ] || recv="$cur"
-    [ -n "$recv" ] && { _state_set version "$recv" || _warn "状态持久化失败(version)"; }
-    if [ -n "$prev_channel" ]; then
-        _state_set channel "$prev_channel" || _warn "状态持久化失败(channel)"
-    else
-        # 替换前没有 channel 记录 => 磁盘上也不该有(保持"两键同进退")
-        rm -f "$STATE_DIR/channel" 2>/dev/null
-    fi
-    if [ "$svc_ok" -ne 1 ]; then
-        # 二进制回到了旧版, 但 unit 不是改动前那一份 —— 这是**回滚不完整**, 必须让调用方
-        # 与用户都看见, 而不是混在"已还原到旧核心"里。
-        _error "回滚不完整: 旧二进制已就位, 但 service 文件未能还原到改动前的内容"
-        _tip "请核对: $(_xray_service_unit_path 2>/dev/null || echo '(无 service)') 与备份 $(_xray_service_prev_path)"
-        _tip "临时可用: xd 菜单 [Xray 核心管理] 重装一次该通道, 会按当前核心版本重写 service"
-        return 2
-    fi
-    _warn "已还原到旧核心 v${recv:-?}"
-    return 0
-}
-
-# ---------------------------------------------------------------------------
 # core lock 串行化 binary/service/Geo 提交与 service control/完整判活; 下载留在锁外。
 # 锁根 /var/lock/xray-deploy 在部署树外; 普通事务锁序 install → config → core。
 # 核心事务不取 config lock; 卸载/reset 持三层锁直到删除/重建完成。
@@ -1637,11 +1577,6 @@ _xray_core_cleanup_after_commit() {  # <journal>
     return 0
 }
 
-_xray_core_journal_quarantine_and_block() {
-    local j="$1" why="$2"
-    _xray_core_journal_quarantine "$j" "$why"
-}
-
 _xray_core_txn_recover() { _with_core_lock _xray_core_txn_recover_locked "$@"; }
 
 _xray_core_txn_recover_locked() {
@@ -2680,62 +2615,6 @@ _xray_service_snapshot() {
         _error "service 快照与原文件不一致(磁盘空间/IO?), 视为快照失败"
         return 1
     fi
-    return 0
-}
-
-# 回滚时把 unit 恢复到快照状态(只在快照存在时动手; 无快照 = 本次事务没碰过 unit)。
-_xray_service_restore_prev() {
-    local unit prev
-    unit=$(_xray_service_unit_path) || return 0
-    prev=$(_xray_service_prev_path)
-    if _xray_core_path_present "${prev}.masked"; then
-        if _xray_service_restore_mask "$unit" "${prev}.masked"; then
-            systemctl daemon-reload >/dev/null 2>&1 || return 1
-            _xray_service_restore_enable "${prev}.enabled" || :
-            return 0
-        fi
-        _error "原有 systemd mask 无法恢复: $unit"
-        return 1
-    fi
-    if [ -f "${prev}.absent" ]; then
-        # 事务之前没有 unit ⇒ 把本次新建的那个删掉, 回到"本来就没有"
-        # 删除新 unit 失败必须返回失败, 不得把残留 service 报成完整恢复。
-        if ! rm -f "$unit" 2>/dev/null; then
-            _error "撤销新建 service 文件失败, 请手动删除: $unit"
-            return 1
-        fi
-        rm -f "${prev}.absent" 2>/dev/null || \
-            _warn "service 快照标志删除失败(不影响 service 状态): ${prev}.absent"
-        # 原无 unit 时撤销本次 enable; 自启恢复失败只告警, 不阻塞当前 runtime 收敛。
-        _xray_service_restore_enable "${prev}.enabled" || \
-            _warn "service 开机自启状态未能还原(不影响当前运行), 请按上方提示手动执行"
-        _warn "已撤销本次新建的 service 文件(事务之前不存在): $unit"
-        return 0
-    fi
-    # 必须存在快照才能恢复; 缺失即失败并保留账本/恢复源, 不猜 pre-state。
-    if [ ! -f "$prev" ]; then
-        # direct 后端本就没有 unit, 谈不上快照 —— 那种情况由 _xray_service_unit_path 提前返回
-        _error "service 快照缺失, 无法确认 service 已回到切换前状态: $prev"
-        _tip "请人工核对 service 内容: $unit"
-        return 1
-    fi
-    if ! _xray_service_restore_file "$prev" "$unit"; then
-        _error "service 文件还原失败, 请手动核对: $unit (备份: $prev)"
-        return 1
-    fi
-    rm -f "$prev" 2>/dev/null
-    _warn "已还原 service 文件到本次改动前的内容: $unit"
-    # enable/disable 是独立的下次启动策略维度: 恢复失败只告警, 不把已恢复的 binary+unit
-    # rollback 报成失败(否则会因缺 enable 快照而永久 pending, 与协议已确认的取舍冲突)。
-    _xray_service_restore_enable "${prev}.enabled" || \
-        _warn "service 开机自启状态未还原(不影响当前运行), 请按上方提示手动执行"
-    return 0
-}
-
-# 事务成功提交: 丢弃 unit 快照(与 rm -f "$XRAY_BIN.bak" 同一步)
-_xray_service_snapshot_drop() {
-    local prev; prev=$(_xray_service_prev_path)
-    rm -f "$prev" "${prev}.absent" "${prev}.enabled" "${prev}.masked" 2>/dev/null
     return 0
 }
 
