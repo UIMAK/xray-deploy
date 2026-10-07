@@ -1111,7 +1111,7 @@ _check_script_update() {
     echo -e "  远程版本: ${CYAN}${remote}${NC}"
     if [ "$remote" = "$local_ver" ]; then
         _success "已是最新版本"
-    elif [ -n "$remote" ]; then
+    else
         _warn "发现新版本: ${remote}"
         read -rp "  是否立即更新? [y/N]: " ans
         case "$ans" in

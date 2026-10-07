@@ -123,8 +123,6 @@ _xray_version_ge() {
     IFS='.' read -ra b <<< "$min"
     for i in 0 1 2; do
         x="${a[$i]:-0}"; y="${b[$i]:-0}"
-        [[ "$x" =~ ^[0-9]+$ ]] || return 1
-        [[ "$y" =~ ^[0-9]+$ ]] || return 1
         [ "$x" -gt "$y" ] && return 0
         [ "$x" -lt "$y" ] && return 1
     done

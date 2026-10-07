@@ -3,7 +3,7 @@
 # Geo 自动更新默认 OFF; ≥ v26.4.25 用内置 geodata, 旧核心用系统 cron。
 # 数据源 Loyalsoldier/v2ray-rules-dat, 落点 $ASSET_DIR; 下载失败保留旧 dat。
 # 内置 assets.file 必须预先存在, 否则核心拒绝启动; 见 _geo_set_auto_update。
-# DNS 写入先预检候选配置, 再走 _mutate_config 的验证与回滚; 见 _dns_apply。
+# DNS 写入走 _mutate_config 的重启与回滚; 见 _dns_apply。
 
 GEO_CRON_MARKER="# xray-deploy-geo-update"
 GEO_TRANSITION_KEY="geo_update_transition"
@@ -682,7 +682,7 @@ _geo_menu() {
     _press_any_key
 }
 
-# DNS 设置仅修改 .dns; 写入走 _dns_apply 的候选预检与 _mutate_config 回滚。
+# DNS 设置仅修改 .dns; 写入走 _mutate_config 的重启与回滚。
 # 默认 DNS 取 XRAY_DEFAULT_DNS_JSON: https+local:// 是直连 DoH(directDOH), 绕过路由。
 # 菜单新选 https:// 是 routedDoH, UDP/IP 上游也经 Xray 路由; 不能据默认出站承诺直连。
 # 用户设置保存普通字符串, 不添加 tag, 保持 confs/04_dns.json 可读。
@@ -719,40 +719,11 @@ _dns_summary() {
     printf '%s' "$out" | tr '\t' '|'
 }
 
-# 参数同 _config_jq(filter 最后); 先 _xray_test_config_dir 预检, 失败不动原配置。
+# 参数同 _config_jq(filter 最后)。
 _dns_apply() {
     [ "$#" -ge 1 ] || return 1
-    local filter="${!#}" cand content
-    local opts=()
-    [ "$#" -gt 1 ] && opts=("${@:1:$#-1}")
     _config_edit_preflight "修改 DNS 配置" || return 1
-    if [ "${#opts[@]}" -gt 0 ]; then
-        content=$(_config_jq "${opts[@]}" "$filter" 2>/dev/null)
-    else
-        content=$(_config_jq "$filter" 2>/dev/null)
-    fi
-    [ -n "$content" ] || { _error "生成 DNS 配置失败, 已保留原配置"; return 1; }
-    mkdir -p "$STATE_DIR" 2>/dev/null
-    cand=$(mktemp -d "${STATE_DIR}/dns-preview.XXXXXX") || { _error "无法创建临时目录, 已保留原配置"; return 1; }
-    if ! _config_write_merged "$content" "$cand"; then
-        rm -rf "$cand"
-        _error "生成候选配置失败, 已保留原配置"
-        return 1
-    fi
-    echo
-    _info "先用临时配置运行 xray -test..."
-    if ! _xray_test_config_dir "$cand"; then
-        rm -rf "$cand"
-        _error "配置检查未通过, 已保留原配置"
-        return 1
-    fi
-    rm -rf "$cand"
-    if [ "${#opts[@]}" -gt 0 ]; then
-        _mutate_config "${opts[@]}" "$filter" || { _error "写入 DNS 配置失败, 已保留原配置"; return 1; }
-    else
-        _mutate_config "$filter" || { _error "写入 DNS 配置失败, 已保留原配置"; return 1; }
-    fi
-    return 0
+    _mutate_config "$@" || { _error "写入 DNS 配置失败"; return 1; }
 }
 
 _dns_view() {

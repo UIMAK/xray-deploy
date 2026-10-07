@@ -1242,20 +1242,6 @@ _hysteria_gate() {
     return 1
 }
 
-# 自签导出必须 pin 与当前证书一致；insecure 单独使用不验证身份。
-_hysteria_tls_verified_pin() {
-    local cert expected actual
-    cert=$(_hysteria_config_get 'tls.cert')
-    [ -n "$cert" ] && [ -r "$cert" ] || return 1
-    actual=$(_hysteria_cert_pin "$cert") || return 1
-    [[ "$actual" =~ ^[a-f0-9]{64}$ ]] || return 1
-    expected=$(_hysteria_meta_get pin)
-    [ -n "$expected" ] || return 1
-    expected=${expected,,}
-    [[ "$expected" =~ ^[a-f0-9]{64}$ ]] && [ "$expected" = "$actual" ] || return 1
-    printf '%s' "$actual"
-}
-
 # 证书对先暂存旧文件；任一步失败必须能恢复。
 _hysteria_tls_pair_begin() {
     local stage="$1" src dst snap had_cert=0 had_key=0
@@ -1358,24 +1344,15 @@ _hysteria_meta_set() {
     fi
 }
 
-_hysteria_cert_pin() {
-    local cert="$1" fp
-    command -v openssl >/dev/null 2>&1 || return 1
-    fp=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null) || return 1
-    fp=${fp#*=}
-    fp=${fp//:/}
-    printf '%s' "$fp" | tr 'A-F' 'a-f'
-}
-
 # TLS 向导只重问错误字段，EOF 退出；空 SNI 使用客户端连接主机名。
 _hysteria_prompt_tls() {
     HY_TLS_STAGE_DIR=""
-    local choice cert_file key_file acme_domains acme_email host pin
+    local choice cert_file key_file acme_domains acme_email host
     local arr first acme_bad acme_first why ans2
     local -a doms
     local d
     echo; echo -e "  ${CYAN}【TLS 设置】${NC}"
-    echo -e "  ${GREEN}[1]${NC} 自签证书 (官方 hysteria cert 生成, 客户端 insecure+pinSHA256)"
+    echo -e "  ${GREEN}[1]${NC} 自签证书 (官方 hysteria cert 生成, 客户端 insecure)"
     echo -e "  ${GREEN}[2]${NC} 使用已有证书 (证书+私钥路径)"
     echo -e "  ${GREEN}[3]${NC} ACME 自动证书 (本向导用 HTTP/TLS 质询; DNS 质询请手工编辑 hysteria.json)"
     echo -e "  ${GREEN}[0]${NC} 取消"
@@ -1417,16 +1394,9 @@ _hysteria_prompt_tls() {
                 _error "自签 TLS 证书或私钥不可用, 已放弃"
                 return 1
             fi
-            pin=$(_hysteria_cert_pin "$HY_TLS_STAGE_DIR/cert.pem") || pin=""
-            [[ "$pin" =~ ^[a-f0-9]{64}$ ]] || {
-                rm -rf "$HY_TLS_STAGE_DIR"
-                HY_TLS_STAGE_DIR=""
-                _error "无法计算有效的自签证书 SHA-256 pin"
-                return 1
-            }
             HY_TLS_JSON=$(jq -n --arg c "$HYSTERIA_CERT_DIR/cert.pem" --arg k "$HYSTERIA_CERT_DIR/key.pem" \
                 '{tls: {cert: $c, key: $k, sniGuard: "disable"}}')
-            HY_TLS_MODE="selfsigned"; HY_TLS_SNI="$host"; HY_TLS_PIN="$pin"
+            HY_TLS_MODE="selfsigned"; HY_TLS_SNI="$host"; HY_TLS_PIN=""
             return 0
             ;;
         2)
@@ -1737,7 +1707,7 @@ _hysteria_tls_menu() {
     fi
     _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
     _success "TLS 已切换: $(_hysteria_tls_desc)"
-    [ "$HY_TLS_MODE" = "selfsigned" ] && _tip "自签证书: 客户端需 insecure=1 + pinSHA256(已写入链接)"
+    [ "$HY_TLS_MODE" = "selfsigned" ] && _tip "自签证书: 客户端使用 insecure=1, 不验证证书身份"
     [ "$HY_TLS_MODE" = "acme" ] && _tip "ACME 模式: 客户端无需 insecure; 证书由官方核心自动续期"
     _press_any_key
     return 0
@@ -2114,16 +2084,11 @@ _hysteria_build_link() {
     link_addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
     local link_ip="$link_addr"
     [[ "$link_addr" == *":"* && "$link_addr" != *"["* ]] && link_ip="[${link_addr}]"
-    local tls_mode sni pin params=""
+    local tls_mode sni params=""
     tls_mode=$(_hysteria_meta_get tls_mode)
     sni=$(_hysteria_meta_get sni)
-    pin=$(_hysteria_meta_get pin)
     if [ "$tls_mode" = "selfsigned" ]; then
-        pin=$(_hysteria_tls_verified_pin) || {
-            _warn "自签证书缺少有效且已验证的 SHA-256 pin, 拒绝生成不安全分享链接"
-            return 1
-        }
-        params="insecure=1&pinSHA256=${pin}"
+        params="insecure=1"
     fi
     [ -n "$sni" ] && params="${params}${params:+&}sni=$(_url_encode "$sni")"
     local o_type o_pw
@@ -2187,12 +2152,7 @@ _hysteria_clash_line() {
     local sni; sni=$(_hysteria_meta_get sni)
     [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
     if [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ]; then
-        local tls_pin
-        tls_pin=$(_hysteria_tls_verified_pin) || {
-            _error "自签证书缺少有效且已验证的 SHA-256 pin, 拒绝导出不安全的 Mihomo 条目"
-            return 1
-        }
-        line="${line}, skip-cert-verify: true, fingerprint: \"$tls_pin\""
+        line="${line}, skip-cert-verify: true"
     fi
     if [ -n "$o_type" ]; then
         o_pw=$(_hysteria_obfs_get password)
