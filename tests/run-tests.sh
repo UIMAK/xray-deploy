@@ -140,8 +140,8 @@ _config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/d
 _dns_apply_ok() {
     local rc=0
     (
-        : > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
-        _xray_test_config_dir() { touch "$TMP/dns-test-called"; return 1; }
+        printf '#!/usr/bin/env bash\nprintf "called\\n" >> "%s"\nexit 1\n' "$TMP/dns-test-called" > "$XRAY_BIN"
+        chmod +x "$XRAY_BIN"
         _dns_apply "$@" >/dev/null 2>&1
     ) || rc=1
     rm -f "$XRAY_BIN"

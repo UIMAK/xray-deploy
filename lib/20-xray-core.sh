@@ -2280,17 +2280,6 @@ _xray_test_config() {
     XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true "$XRAY_BIN" -test -confdir "$CONFIG_DIR"
 }
 
-# 校验**尚未落地**的一份候选配置(confdir 形态)。DNS 菜单用它做"先检查后写"的预检:
-# 只有候选能通过 xray -test 才允许写盘, 写盘失败/启动失败也不会把用户留在不可用配置上。
-# 候选目录由调用方创建与清理(本项目不做额外清理机制)。
-_xray_test_config_dir() {   # <confdir 路径>
-    local dir="${1:-}"
-    [ -n "$dir" ] && [ -d "$dir" ] || return 1
-    [ -x "$XRAY_BIN" ] || return 1
-    _maybe_drop_caches
-    XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true "$XRAY_BIN" -test -confdir "$dir"
-}
-
 # ---------------------------------------------------------------------------
 # nofile 目标 65535; hard 较低则用 hard, 防止 exec 前 EPERM, 不因受限而省略限制。
 # 读管理脚本 /proc/self/limits 对 systemd 是保守下界(PID1 能力/默认值不同), OpenRC 同环境准确。
