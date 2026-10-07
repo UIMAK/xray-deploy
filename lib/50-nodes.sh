@@ -86,7 +86,7 @@ _hy2_obfs_size_canon() {
     if [ "$a" = "$b" ]; then echo "$a"; else echo "${a}-${b}"; fi
 }
 
-# 尺寸校验输出空串表示合法，否则输出原因；规范化与校验共用 _hy2_obfs_size_normalize。
+# 尺寸校验输出空串表示合法，否则输出原因；规范化与校验共用 _hy2_obfs_size_canon。
 _hy2_obfs_size_invalid() {
     local raw="$1" canon
     raw="${raw// /}"
@@ -102,20 +102,6 @@ _hy2_obfs_size_invalid() {
     elif [ "$b" -gt 2048 ]; then
         echo "最大值不得超过 2048"
     fi
-}
-
-# 规范区间的最小值(裸数字, 用于 mihomo obfs-min-packet-size); 未填/非法 → 空。
-_hy2_obfs_size_min() {
-    local canon; canon=$(_hy2_obfs_size_canon "$1") || return 0
-    [ -z "$canon" ] && return 0
-    echo "${canon%%-*}"
-}
-
-# 规范区间的最大值(裸数字, 用于 mihomo obfs-max-packet-size); 未填/非法 → 空。
-_hy2_obfs_size_max() {
-    local canon; canon=$(_hy2_obfs_size_canon "$1") || return 0
-    [ -z "$canon" ] && return 0
-    echo "${canon##*-}"
 }
 
 # 读取元数据里的 packetSize 值(规范形式, 用于分享链接/clash/回显); 未设置 → 空
@@ -4165,8 +4151,10 @@ _hy2_clash_line() {
     if [ "$obfs_kind" = "gecko" ]; then
         # min/max 必须来自同一规范化结果, 与 Xray 侧的 packetSize 同区间: 直接按 "-"
         # 切分会把 1500-800 原样导出成 min=1500/max=800, 而 mihomo 要求 max>=min。
-        obfs_min=$(_hy2_obfs_size_min "$obfs_size")
-        obfs_max=$(_hy2_obfs_size_max "$obfs_size")
+        local obfs_canon
+        obfs_canon=$(_hy2_obfs_size_canon "$obfs_size") || obfs_canon=""
+        obfs_min="${obfs_canon%%-*}"
+        obfs_max="${obfs_canon##*-}"
         # 有尺寸却解析不出两端 = 畸形元数据; 宁可拒绝也不产出"写着 salamander、服务端在分片"的条目
         [ -n "$obfs_min" ] && [ -n "$obfs_max" ] || return 1
     fi
@@ -5254,7 +5242,7 @@ _port_txn_recover() {
 _port_txn_recover_locked() {
     [ -d "$NODES_DIR" ] || return 0
     local j kind tag newtag oldport newport old_path new_path ranges
-    local cfg_tag committed cur_path p cur_canon old_canon new_canon tgt_path tgt_obj
+    local committed cur_path p cur_canon old_canon new_canon tgt_path tgt_obj
     # failed: 任一 journal 未收敛(被隔离/保留待人工) ⇒ 返回非零, 由调用方(启动维护链)
     # 空目录/全部收敛才返回0；隔离仍未收敛，阻断后续写入以保留现场。
     local failed=0

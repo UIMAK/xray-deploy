@@ -271,7 +271,7 @@ _svc_replace_line() {
     local svcfile="$1" pattern="$2" newline="$3" tmp found=0
     [ -f "$svcfile" ] || return 1
     _svc_backup "$svcfile" || return 1
-    local tmp write_ok=1
+    local write_ok=1
     tmp=$(mktemp) || { _error "无法创建临时 service 文件: $svcfile"; return 1; }
     while IFS= read -r ln || [ -n "$ln" ]; do
         local t="${ln#"${ln%%[![:space:]]*}"}"
@@ -366,6 +366,17 @@ _svc_restore() {
     return 0
 }
 
+_cf_systemd_reload_or_restore() {
+    local svcfile="$1"
+    systemctl daemon-reload 2>/dev/null && return 0
+    _error "systemd daemon-reload 失败, 回滚 service 文件"
+    _svc_restore "$svcfile" || _error "回滚失败, 请手动检查 $svcfile"
+    if ! systemctl daemon-reload 2>/dev/null; then
+        _error "恢复后的 daemon-reload 也失败: $svcfile"
+    fi
+    return 1
+}
+
 _cf_write_service_line() {
     local cmd="$1" svcfile
     local token token_file; token_file=$(_cf_extract_token_file "$cmd") || token_file=""
@@ -391,14 +402,7 @@ _cf_write_service_line() {
         fi
     else
         _svc_replace_line "$svcfile" "ExecStart=" "ExecStart=$cmd" || return 1
-        if ! systemctl daemon-reload 2>/dev/null; then
-            _error "systemd daemon-reload 失败, 回滚 service 文件"
-            _svc_restore "$svcfile" || _error "回滚失败, 请手动检查 $svcfile"
-            if ! systemctl daemon-reload 2>/dev/null; then
-                _error "恢复后的 daemon-reload 也失败: $svcfile"
-            fi
-            return 1
-        fi
+        _cf_systemd_reload_or_restore "$svcfile" || return 1
     fi
     return 0
 }
@@ -498,14 +502,7 @@ _cf_replace_token_in_service() {
         _warn "在 $replaced 行启动命令中替换了令牌, 请确认该 service 是否本就有多条启动行"
     _svc_commit "$svcfile" "$tmp" || return 1
     if [ "$INIT_SYSTEM" = "systemd" ]; then
-        if ! systemctl daemon-reload 2>/dev/null; then
-            _error "systemd daemon-reload 失败, 回滚 service 文件"
-            _svc_restore "$svcfile" || _error "回滚失败, 请手动检查 $svcfile"
-            if ! systemctl daemon-reload 2>/dev/null; then
-                _error "恢复后的 daemon-reload 也失败: $svcfile"
-            fi
-            return 1
-        fi
+        _cf_systemd_reload_or_restore "$svcfile" || return 1
     fi
     return 0
 }
@@ -734,7 +731,7 @@ _cf_systemd_grace_raw() {
 
 # systemd 有效配置优先，读不到才退回文本；宽限期不能按主 unit 猜测。
 _cf_grace_config() {
-    local svcfile="$1" ln arr=() i w v efpath efv eff rc
+    local svcfile="$1" ln arr=() i w v efpath eff rc
     if [ "${INIT_SYSTEM:-}" = systemd ]; then
         eff=$(_cf_systemd_grace_raw); rc=$?
         case "$rc" in

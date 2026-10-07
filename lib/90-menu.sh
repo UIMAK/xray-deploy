@@ -1391,15 +1391,8 @@ _hy2_masq_set_string() {
     return 0
 }
 
-# Hysteria2: 切换 brutal / bbr
-_hy2_congestion_txn() {
-    _with_config_lock _hy2_congestion_txn_locked "$@"
-}
-
-_hy2_congestion_txn_locked() {
-    local tag="$1" operation="$2" new_cc="$3" up="$4" down="$5"
-    local meta="$NODES_DIR/${tag}.json" meta_prev cur_cc config_cc effective_up effective_down
-    # metadata 原文与 _mutate_config 写入前的 config 备份都在此 config lock 内取得。
+_hy2_txn_check_node() {
+    local tag="$1" meta="$2"
     if [ ! -s "$meta" ] || ! jq -e 'type == "object" and .protocol == "hysteria2"' "$meta" >/dev/null 2>&1; then
         _error "Hy2 元数据已变化或损坏, 拒绝提交: $meta"
         return 1
@@ -1410,6 +1403,19 @@ _hy2_congestion_txn_locked() {
         _error "配置中找不到唯一的 Hy2 入站(${tag}), 请先同步/修复配置"
         return 1
     fi
+    return 0
+}
+
+# Hysteria2: 切换 brutal / bbr
+_hy2_congestion_txn() {
+    _with_config_lock _hy2_congestion_txn_locked "$@"
+}
+
+_hy2_congestion_txn_locked() {
+    local tag="$1" operation="$2" new_cc="$3" up="$4" down="$5"
+    local meta="$NODES_DIR/${tag}.json" meta_prev cur_cc config_cc effective_up effective_down
+    # metadata 原文与 _mutate_config 写入前的 config 备份都在此 config lock 内取得。
+    _hy2_txn_check_node "$tag" "$meta" || return 1
     meta_prev=$(cat "$meta" 2>/dev/null) || meta_prev=""
     [ -n "$meta_prev" ] || { _error "无法快照 Hy2 元数据: $meta"; return 1; }
     cur_cc=$(jq -r '.congestion // empty' "$meta" 2>/dev/null) || cur_cc=""
@@ -1652,16 +1658,7 @@ _hy2_obfs_txn_locked() {
     local tag="$1" meta="$2" choice="$3" otype="$4" opw="$5" osize="$6" omask="$7"
     local meta_prev rollback_mask config_ok=0 meta_ok=0
     # 实际混淆层/metadata 快照与 _mutate_config 的 config 备份都受此锁保护。
-    if [ ! -s "$meta" ] || ! jq -e 'type == "object" and .protocol == "hysteria2"' "$meta" >/dev/null 2>&1; then
-        _error "Hy2 元数据已变化或损坏, 拒绝提交: $meta"
-        return 1
-    fi
-    if ! _config_present || ! _config_jq -e --arg t "$tag" \
-        '([.inbounds[]? | select(.tag == $t)] as $nodes | ($nodes | length) == 1 and $nodes[0].protocol == "hysteria")' \
-        >/dev/null 2>&1; then
-        _error "配置中找不到唯一的 Hy2 入站(${tag}), 请先同步/修复配置"
-        return 1
-    fi
+    _hy2_txn_check_node "$tag" "$meta" || return 1
     meta_prev=$(cat "$meta" 2>/dev/null) || meta_prev=""
     [ -n "$meta_prev" ] || { _error "无法快照 Hy2 元数据: $meta"; return 1; }
     rollback_mask=$(_config_jq -c --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" \
