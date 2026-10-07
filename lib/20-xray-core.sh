@@ -123,8 +123,6 @@ _xray_version_ge() {
     IFS='.' read -ra b <<< "$min"
     for i in 0 1 2; do
         x="${a[$i]:-0}"; y="${b[$i]:-0}"
-        [[ "$x" =~ ^[0-9]+$ ]] || return 1
-        [[ "$y" =~ ^[0-9]+$ ]] || return 1
         [ "$x" -gt "$y" ] && return 0
         [ "$x" -lt "$y" ] && return 1
     done
@@ -2280,17 +2278,6 @@ _xray_test_config() {
     _maybe_drop_caches
     # 直接运行,保留完整输出供用户查看
     XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true "$XRAY_BIN" -test -confdir "$CONFIG_DIR"
-}
-
-# 校验**尚未落地**的一份候选配置(confdir 形态)。DNS 菜单用它做"先检查后写"的预检:
-# 只有候选能通过 xray -test 才允许写盘, 写盘失败/启动失败也不会把用户留在不可用配置上。
-# 候选目录由调用方创建与清理(本项目不做额外清理机制)。
-_xray_test_config_dir() {   # <confdir 路径>
-    local dir="${1:-}"
-    [ -n "$dir" ] && [ -d "$dir" ] || return 1
-    [ -x "$XRAY_BIN" ] || return 1
-    _maybe_drop_caches
-    XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true "$XRAY_BIN" -test -confdir "$dir"
 }
 
 # ---------------------------------------------------------------------------

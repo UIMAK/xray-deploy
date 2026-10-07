@@ -318,9 +318,6 @@ _loglevel_menu() {
         5) new_lv="none" ;;
         *) _warn "无效选择"; _press_any_key; return ;;
     esac
-    if ! _xray_loglevel_valid "$new_lv"; then
-        _warn "无效日志级别: ${new_lv}"; _press_any_key; return
-    fi
     if [ "$new_lv" = "$cur" ]; then
         _info "已是 ${new_lv} 级别, 无需切换"
         _press_any_key; return
@@ -502,7 +499,6 @@ _logrotate_menu() {
                 echo -e "  当前保留份数: ${CYAN}${cur_ret}${NC}"
                 read -rp "  请输入保留份数 (1-30, 回车取消): " new_ret
                 [ -z "$new_ret" ] && { _info "已取消"; _press_any_key; continue; }
-                : "${new_ret:=7}"
                 local ret_digits
                 ret_digits=$(_logrotate_retention_digits "$new_ret") || { _warn "请输入有效数字"; _press_any_key; continue; }
                 [ "${#ret_digits}" -gt 2 ] && { _warn "最多保留 30 份"; _press_any_key; continue; }

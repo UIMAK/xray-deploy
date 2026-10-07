@@ -135,32 +135,36 @@ else
     pass 'unreadable conf dir makes _config_jq fail visibly'
 fi
 _config_write_merged '{"log":{"loglevel":"warning"}}' >/dev/null 2>&1
-# DNS 编辑只动 04_dns.json, 其余字段文件原样保留。
-# 场景1: 核心预检直接拒绝候选配置 ⇒ 必须保留原配置。_config_edit_preflight 要求 XRAY_BIN
-# 可执行, 且 _xray_test_config_dir 要在候选目录上跑真核心; 套件用"可执行空壳 + 恒拒绝"
-# 桩来驱动这条拒绝路径(全部限制在子 shell 内, 不泄漏给后续断言)。
+# DNS 编辑只动 04_dns.json, 不另跑核心预检。
 _config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
-if (
-    : > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
-    _xray_test_config_dir() { return 1; }
-    _dns_apply --arg a '1.1.1.1' '.dns = ((.dns | if type == "object" then . else {} end) + {servers: [$a]})' >/dev/null 2>&1
-); then
-    fail 'dns change is refused when the config check cannot pass'
-else
-    pass 'dns change is refused when the config check cannot pass'
-fi
-check_eq 'refused dns change keeps the old config' '{}' "$(_config_jq -r '.dns // {}')"
-# 场景2: 预检通过后, 变更必须只落在 04_dns.json 上。
 _dns_apply_ok() {
     local rc=0
     (
-        : > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
-        _xray_test_config_dir() { return 0; }
+        printf '#!/usr/bin/env bash\nprintf "called\\n" >> "%s"\nexit 1\n' "$TMP/dns-test-called" > "$XRAY_BIN"
+        chmod +x "$XRAY_BIN"
         _dns_apply "$@" >/dev/null 2>&1
     ) || rc=1
     rm -f "$XRAY_BIN"
     return "$rc"
 }
+check 'dns change skips the core precheck' _dns_apply_ok --arg a '1.1.1.1' '.dns = {servers: [$a]}'
+check 'dns change never calls xray test' test ! -e "$TMP/dns-test-called"
+if _dns_apply_ok --argjson v broken '.dns = $v'; then
+    fail 'dns change rejects invalid JSON arguments'
+else
+    pass 'dns change rejects invalid JSON arguments'
+fi
+check_eq 'invalid dns change keeps the old config' '1.1.1.1' "$(_config_jq -r '.dns.servers[0]')"
+if (
+    : > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+    _restart_xray_verified() { return 1; }
+    _dns_apply '.dns.servers = ["8.8.8.8"]' >/dev/null 2>&1
+); then
+    fail 'dns change reports restart failure'
+else
+    pass 'dns change reports restart failure'
+fi
+check_eq 'failed dns restart restores the old config' '1.1.1.1' "$(_config_jq -r '.dns.servers[0]')"
 _dns_apply_ok --arg a '1.1.1.1' '.dns = ((.dns | if type == "object" then . else {} end) + {servers: [$a]})' >/dev/null 2>&1
 check_eq 'dns change creates the dns field file' '1.1.1.1' "$(_config_jq -r '.dns.servers[0]')"
 if [ -f "$CONFIG_DIR/04_dns.json" ] && [ -f "$CONFIG_DIR/05_routing.json" ] && [ ! -e "$CONFIG_DIR/14_geodata.json" ]; then
@@ -198,7 +202,6 @@ if [ -e "$CONFIG_DIR/04_dns.json" ]; then fail 'dns delete removes the field fil
 # 时该菜单只会打印"缺少默认 DNS 常量"并退出, 所以必须断言恢复出来的段与常量逐字一致。
 if (
     : > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
-    _xray_test_config_dir() { return 0; }
     # 确认提示从 stdin 读, 直接喂 "y" —— 不能覆盖 read 函数: _config_write_merged 自己也在
     # 用 `read -d ''` 循环拆字段, 覆盖掉会把字段名读成 "y" 而写坏候选文件。
     printf 'y\n' | _dns_restore_default >/dev/null 2>&1
@@ -660,15 +663,13 @@ printf 'test cert\n' > "$HYSTERIA_CERT"
 printf '{"listen":":443","tls":{"cert":"%s"},"bandwidth":{"up":"100 mbps","down":"10 mbps"}}\n' "$HYSTERIA_CERT" > "$HYSTERIA_CONFIG"
 printf '{"tls_mode":"selfsigned","sni":"example.test","pin":"%s"}\n' "$HYSTERIA_PIN" > "$HYSTERIA_SERVER_META"
 printf '{"auth":"secret","name":"node-a","link_addr":"198.51.100.7","protocol":"hysteria2"}\n' > "$HYSTERIA_NODE_META"
-_hysteria_cert_pin() { [ -r "$1" ] || return 1; printf '%s' "$HYSTERIA_PIN"; }
 uri=$(_hysteria_build_link "$HYSTERIA_NODE_META" 2>/dev/null)
-if contains "pinSHA256=$HYSTERIA_PIN" "$uri"; then pass 'self-signed URI contains verified pin'; else fail 'self-signed URI contains verified pin'; fi
+if contains 'insecure=1' "$uri" && ! contains 'pinSHA256=' "$uri"; then pass 'self-signed URI uses insecure without pin'; else fail 'self-signed URI uses insecure without pin'; fi
 line=$(_hysteria_clash_line "$HYSTERIA_NODE_META" 2>/dev/null)
-if contains "fingerprint: \"$HYSTERIA_PIN\"" "$line"; then pass 'Mihomo self-signed entry contains fingerprint'; else fail 'Mihomo self-signed entry contains fingerprint'; fi
+if contains 'skip-cert-verify: true' "$line" && ! contains 'fingerprint:' "$line"; then pass 'Mihomo self-signed entry skips verification without fingerprint'; else fail 'Mihomo self-signed entry skips verification without fingerprint'; fi
 if contains 'down: "100 mbps"' "$line" && contains 'up: "10 mbps"' "$line"; then pass 'server bandwidth maps to client directions'; else fail 'server bandwidth maps to client directions'; fi
-BAD_HYSTERIA_PIN=$(printf '%064d' 8)
-printf '{"tls_mode":"selfsigned","sni":"example.test","pin":"%s"}\n' "$BAD_HYSTERIA_PIN" > "$HYSTERIA_SERVER_META"
-if _hysteria_build_link "$HYSTERIA_NODE_META" >/dev/null 2>&1; then fail 'mismatched self-signed pin blocks URI'; else pass 'mismatched self-signed pin blocks URI'; fi
+printf '{"tls_mode":"selfsigned","sni":"example.test","pin":""}\n' > "$HYSTERIA_SERVER_META"
+if contains 'insecure=1' "$(_hysteria_build_link "$HYSTERIA_NODE_META" 2>/dev/null)"; then pass 'legacy self-signed metadata without pin remains exportable'; else fail 'legacy self-signed metadata without pin remains exportable'; fi
 
 printf '== Hysteria terminal stop and reset quarantine ==\n'
 if (
