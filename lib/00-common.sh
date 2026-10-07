@@ -691,13 +691,20 @@ _config_write_merged() {   # <完整配置 JSON> [目标目录]
     printf '%s' "$content" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
     _config_layout_valid "$dir" repair || return 1
     mkdir -p "$dir" || return 1
-    local k v f written=$'\n'
+    local k v f split rc=0 written=$'\n'
+    split=$(mktemp) || return 1
+    if ! printf '%s' "$content" | jq -j 'to_entries[] | "\(.key)\u0000\(.value | tojson)\u0000"' > "$split"; then
+        rm -f "$split"
+        return 1
+    fi
     while IFS= read -r -d '' k && IFS= read -r -d '' v; do
-        f=$(_conf_file_for_field "$k") || return 1
-        v=$(printf '%s' "$v" | jq --arg k "$k" '{($k): .}') || return 1
-        _atomic_write_json "$dir/$f" "$v" || return 1
+        f=$(_conf_file_for_field "$k") || { rc=1; break; }
+        v=$(printf '%s' "$v" | jq --arg k "$k" '{($k): .}') || { rc=1; break; }
+        _atomic_write_json "$dir/$f" "$v" || { rc=1; break; }
         written="${written}${f}"$'\n'
-    done < <(printf '%s' "$content" | jq -j 'to_entries[] | "\(.key)\u0000\(.value | tojson)\u0000"')
+    done < "$split"
+    rm -f "$split"
+    [ "$rc" -eq 0 ] || return 1
     local old
     for old in "$dir"/*.json; do
         [ -f "$old" ] || continue
@@ -840,8 +847,11 @@ _ensure_dirs() {
 # 用法:_state_get <key> / _state_set <key> <value>
 # ---------------------------------------------------------------------------
 _state_get() {
-    local key="$1"
-    [ -f "$STATE_DIR/$key" ] && cat "$STATE_DIR/$key" 2>/dev/null | tr -d '\n'
+    local key="$1" value
+    [ -f "$STATE_DIR/$key" ] || return 1
+    value=$(cat "$STATE_DIR/$key" 2>/dev/null) || return 1
+    value=${value//$'\n'/}
+    printf '%s' "$value"
 }
 
 _state_set() {
@@ -981,18 +991,24 @@ _backup_config() {
 
 _restore_config() {
     [ -d "$BACKUP_DIR/confs.lastbak" ] || return 1
-    # 逐文件回写(_config_write_merged), 非整目录原子回滚; 失败可能已恢复部分文件。
-    # 先拒绝无 JSON 的备份目录; 读取/写回失败返回 1。
-    ls -1 "$BACKUP_DIR/confs.lastbak"/*.json >/dev/null 2>&1 || {
-        _error "备份为空, 无法回滚($BACKUP_DIR/confs.lastbak)"
-        return 1
-    }
-    local content
-    content=$(cat "$BACKUP_DIR/confs.lastbak"/*.json 2>/dev/null | jq -s 'reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))') || {
+    # 逐文件回写, 先确认所有恢复片段可用, 再触碰当前配置。
+    local content f files=()
+    for f in "$BACKUP_DIR/confs.lastbak"/*.json; do
+        if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$f" >/dev/null 2>&1; then
+            _error "备份片段为空或无法解析: $f"
+            return 1
+        fi
+        files+=("$f")
+    done
+    content=$(jq -s 'reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))' "${files[@]}") || {
         _error "读取备份失败($BACKUP_DIR/confs.lastbak)"
         return 1
     }
     [ -n "$content" ] || { _error "读取备份失败($BACKUP_DIR/confs.lastbak)"; return 1; }
+    if [ "${#files[@]}" -eq 0 ]; then
+        _error "配置备份目录中没有 JSON 片段: $BACKUP_DIR/confs.lastbak"
+        return 1
+    fi
     if ! _config_write_merged "$content"; then
         _error "配置回滚失败($CONFIG_DIR)"
         return 1

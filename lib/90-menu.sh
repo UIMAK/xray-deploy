@@ -242,7 +242,8 @@ _main_menu() {
             9) _cloudflared_menu; continue ;;
             10) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
                 _press_any_key ;;
-            11) _manage_xray stop; _success "已停止"; _press_any_key ;;
+            11) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
+                _press_any_key ;;
             12) _view_status ;;
             13) _view_log ;;
             14) _logrotate_menu ;;
@@ -413,30 +414,43 @@ _timed_restart_menu() {
         _press_any_key; return
     fi
     # 先确认 cron 能运行，再写任务。
-    local cron_ok=0
-    _ensure_cron_running && cron_ok=1
+    if ! _ensure_cron_running; then
+        _warn "cron 守护进程未能启动, 原定时任务与 state 已保留"
+        _tip "请确保系统中有 cron 守护进程, 安装后重试"
+        _press_any_key; return
+    fi
+    # 先写 state，确保 state 写失败时不会留下无法管理的 cron 任务。
+    local old_state state_changed=0
+    if [ -e "$STATE_DIR/timed_restart" ]; then
+        old_state=$(_state_get timed_restart 2>/dev/null) || {
+            _error "读取定时重启状态失败, 未修改 crontab"
+            _press_any_key; return
+        }
+    else
+        old_state=""
+    fi
+    mkdir -p "$STATE_DIR" || {
+        _error "无法创建 state 目录, 未修改 crontab"
+        _press_any_key; return
+    }
+    if ! _state_set timed_restart "$cron_expr"; then
+        _error "保存定时重启状态失败, 未修改 crontab"
+        _press_any_key; return
+    fi
+    state_changed=1
     # _crontab_replace 读失败 rc 1 且不动原任务。
     if ! _crontab_replace "$marker" "$cron_line"; then
+        if [ "$state_changed" -eq 1 ]; then
+            if [ -n "$old_state" ]; then
+                _state_set timed_restart "$old_state" || _warn "定时重启状态回滚失败, 请手动检查 $STATE_DIR/timed_restart"
+            else
+                _state_set timed_restart off || _warn "定时重启状态回滚失败, 请手动检查 $STATE_DIR/timed_restart"
+            fi
+        fi
         _error "写入 crontab 失败"
         _press_any_key; return
     fi
-    mkdir -p "$STATE_DIR"
-    if [ "$cron_ok" -eq 1 ]; then
-        _state_set timed_restart "$cron_expr"
-        _success "定时重启已设置: ${cron_expr}"
-    else
-        # 启用失败回滚新行；回滚不完整如实报告，不记 off。
-        if ! _crontab_replace "$marker"; then
-            # 行可能仍在，保留 state；见 _timed_restart_disable。
-            _warn "crontab 回滚失败, 请手动检查项目定时任务 (${marker})"
-            _tip "state 保持原值不变(未标记为已关闭), 以免与实际 cron 状态不符"
-            _warn "cron 守护进程未能启动, 定时重启可能未完全取消"
-            _press_any_key; return
-        fi
-        _warn "cron 守护进程未能启动, 定时重启已取消"
-        _tip "请确保系统中有 cron 守护进程, 安装后重试"
-        _state_set timed_restart "off"
-    fi
+    _success "定时重启已设置: ${cron_expr}"
     _press_any_key
 }
 
@@ -1432,7 +1446,7 @@ _hy2_congestion_txn_locked() {
                 _error "force-brutal 服务端上传至少 524288 bps (512 kbps / 0.5 mbps)"
                 return 1
             fi
-            if [ "$new_cc" = "$cur_cc" ] && [ "$new_cc" = "$config_cc" ]; then
+            if [ "$new_cc" = "bbr" ] && [ "$new_cc" = "$cur_cc" ] && [ "$new_cc" = "$config_cc" ]; then
                 _info "已是 ${new_cc} 模式, 无需切换"
                 return 3
             fi
@@ -1452,7 +1466,7 @@ _hy2_congestion_txn_locked() {
                     _error "切换失败, config 事务未成功; 请核对上方回滚状态"
                     return 1
                 fi
-                if ! _meta_update "$meta" '.congestion=$cc | .brutal_up=$up | .brutal_down=$down' --arg cc "$new_cc" --arg up "$up" --arg down "$down"; then
+                if ! _meta_update "$meta" '.congestion=$cc | if $up == "" then del(.brutal_up) else .brutal_up=$up end | if $down == "" then del(.brutal_down) else .brutal_down=$down end' --arg cc "$new_cc" --arg up "$up" --arg down "$down"; then
                     _hy2_congestion_rollback "$meta" "$meta_prev"
                     return $?
                 fi
@@ -1477,11 +1491,11 @@ _hy2_congestion_txn_locked() {
                 return 1
             fi
             if ! _mutate_config --arg t "$tag" --arg up "$effective_up" --arg down "$effective_down" \
-                'if ([.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] | length) != 1 then error("Hy2 inbound changed") else (.inbounds[] | select(.tag == $t and .protocol == "hysteria") | .streamSettings.finalmask.quicParams) |= (. + (if $up != "" then {brutalUp: $up} else {} end) + (if $down != "" then {brutalDown: $down} else {} end)) end'; then
+                'if ([.inbounds[]? | select(.tag == $t and .protocol == "hysteria")] | length) != 1 then error("Hy2 inbound changed") else (.inbounds[] | select(.tag == $t and .protocol == "hysteria") | .streamSettings.finalmask.quicParams) |= ((. + (if $up != "" then {brutalUp: $up} else {} end) + (if $down != "" then {brutalDown: $down} else {} end)) | if $up == "" then del(.brutalUp) else . end | if $down == "" then del(.brutalDown) else . end) end'; then
                 _error "带宽调整失败, config 事务未成功; 请核对上方回滚状态"
                 return 1
             fi
-            if ! _meta_update "$meta" '.brutal_up=$up | .brutal_down=$down' --arg up "$effective_up" --arg down "$effective_down"; then
+            if ! _meta_update "$meta" 'if $up == "" then del(.brutal_up) else .brutal_up=$up end | if $down == "" then del(.brutal_down) else .brutal_down=$down end' --arg up "$effective_up" --arg down "$effective_down"; then
                 _hy2_congestion_rollback "$meta" "$meta_prev"
                 return $?
             fi
