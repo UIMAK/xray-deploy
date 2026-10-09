@@ -589,6 +589,11 @@ _route_rules_menu() {
             1)
                 _route_preflight || { _press_any_key; continue; }
                 # 完整防护有效才跳过重启, 单有 ruleTag 不够; 见 _route_private_block_valid。
+                # stats 读取失败时 geo/node/mixed 仍是初值 0: 既不能判"已是精简", 也不能拿 0 去确认删除。
+                if [ "$stats_ok" -ne 1 ]; then
+                    _warn "无法读取当前路由规则, 无法判断精简范围, 已取消"
+                    _press_any_key; continue
+                fi
                 if [ "$geo" -eq 0 ] && [ "$private_ok" -eq 1 ]; then
                     _info "已是精简状态(无 geo 引用 + 私网防护已注入), 无需重复操作"
                     _press_any_key; continue

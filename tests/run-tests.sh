@@ -577,6 +577,46 @@ else
     fail 'logrotate reports state-only disable failure'
 fi
 
+printf '== logrotate auto-off marker ==\n'
+rm -f "$STATE_DIR/$LOGROTATE_AUTO_OFF_KEY"
+LOGROTATE_CONF="$TMP/logrotate-marker.conf"
+_state_set logrotate_enabled on
+_state_set "$LOGROTATE_AUTO_OFF_KEY" on
+rm -f "$LOGROTATE_CONF"
+check_eq 'auto-off marker with no config is effectively off' off "$(_logrotate_effective_enabled)"
+: > "$LOGROTATE_CONF"
+check_eq 'auto-off marker with leftover config is effectively on' on "$(_logrotate_effective_enabled)"
+rm -f "$STATE_DIR/$LOGROTATE_AUTO_OFF_KEY"
+check_eq 'effective state falls back to the record without the marker' on "$(_logrotate_effective_enabled)"
+if (
+    _logrotate_ensure_package() { return 0; }
+    _logrotate_init_state() { return 0; }
+    _logrotate_write_config() { : > "$LOGROTATE_CONF"; }
+    _state_set "$LOGROTATE_AUTO_OFF_KEY" on
+    rm -f "$LOGROTATE_CONF"
+    _logrotate_setup >/dev/null 2>&1
+    [ ! -e "$LOGROTATE_CONF" ]
+); then
+    pass 'auto-off marker keeps setup from rewriting the config'
+else
+    fail 'auto-off marker keeps setup from rewriting the config'
+fi
+if (
+    _logrotate_ensure_package() { return 0; }
+    _logrotate_init_state() { return 0; }
+    _logrotate_write_config() { : > "$LOGROTATE_CONF"; }
+    rm -f "$STATE_DIR/$LOGROTATE_AUTO_OFF_KEY" "$LOGROTATE_CONF"
+    _logrotate_setup >/dev/null 2>&1
+    [ -e "$LOGROTATE_CONF" ]
+); then
+    pass 'setup rewrites the config when the marker is absent'
+else
+    fail 'setup rewrites the config when the marker is absent'
+fi
+rm -f "$LOGROTATE_CONF" "$STATE_DIR/$LOGROTATE_AUTO_OFF_KEY"
+_state_set logrotate_enabled off
+LOGROTATE_CONF="$TMP/logrotate.conf"
+
 
 printf '== cross-backend config lock ==\n'
 LOCK_ROOT="$TMP/mixed-locks"

@@ -285,6 +285,24 @@ check 'PQ chain threshold is strictly greater than 3500' eq "$rc" 1
 PING_RC=124
 rc=0; _detect_reality_pq example:443 || rc=$?
 check 'PQ probe failure unknown not unsupported' eq "$rc" 2
+# 自签证书生成 rc=2(生成器回滚不完整): 必须保留快照并把 2 上报, 不得静默降级成 1 或删掉旧证书副本。
+_hy2_cert_reusable() { return 1; }
+_gen_hy2_cert() { return 2; }
+# 前面的用例把 DEPLOY_DIR/NODES_DIR 指向了别的 fixture 目录, 这里一并复位,
+# 否则"未写节点文件"的断言会落在前一个 fixture 的目录上, 恒真。
+DEPLOY_DIR="$TMP" CERT_DIR="$TMP/certs" NODES_DIR="$TMP/nodes"
+mkdir -p "$NODES_DIR"
+mkdir -p "$CERT_DIR/hy2-cert-rc2"
+printf 'old-cert\n' > "$CERT_DIR/hy2-cert-rc2/cert.pem"
+printf 'old-key\n' > "$CERT_DIR/hy2-cert-rc2/key.pem"
+rm -rf "$TMP"/hy2cert.bak.*
+rc=0
+_commit_hy2_node_txn_locked hy2-cert-rc2 node server 443 0.0.0.0 secret sni true example.com '' '' '' '' '' '' /fixture/cert.pem /fixture/key.pem || rc=$?
+check 'self-signed cert rc=2 is reported as 2' eq "$rc" 2
+check 'self-signed cert rc=2 keeps a snapshot' bash -c 'compgen -G "$1/hy2cert.bak.*" >/dev/null' _ "$TMP"
+check 'self-signed cert rc=2 snapshot holds the old cert' bash -c 'grep -qx "old-cert" "$1"/hy2cert.bak.*/cert.pem' _ "$TMP"
+check 'self-signed cert rc=2 wrote no node file' test ! -e "$NODES_DIR/hy2-cert-rc2.json"
+
 printf 'node-alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
 )

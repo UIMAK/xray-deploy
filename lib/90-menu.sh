@@ -103,6 +103,7 @@ _print_status_bar() {
 
 # 节点类型检测(用于条件显示管理菜单)
 _has_hy2_nodes() {
+    local f
     [ -d "$NODES_DIR" ] || return 1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
@@ -112,6 +113,7 @@ _has_hy2_nodes() {
 }
 
 _has_reality_nodes() {
+    local f
     [ -d "$NODES_DIR" ] || return 1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
@@ -182,15 +184,19 @@ _main_menu() {
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        if ! _auto_tag_tagless_inbounds; then
-            STARTUP_MAINT_BLOCKED=1
-            _error "启动期自动分配 inbound tag 失败(配置不可解析/写入失败): 已停止后续启动维护"
+        if declare -F _auto_tag_tagless_inbounds >/dev/null 2>&1; then
+            if ! _auto_tag_tagless_inbounds; then
+                STARTUP_MAINT_BLOCKED=1
+                _error "启动期自动分配 inbound tag 失败(配置不可解析/写入失败): 已停止后续启动维护"
+            fi
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        if ! _auto_adopt_orphans; then
-            STARTUP_MAINT_BLOCKED=1
-            _error "启动期自动采纳孤儿入站失败(配置不可解析/元数据写入失败): 已停止后续启动维护"
+        if declare -F _auto_adopt_orphans >/dev/null 2>&1; then
+            if ! _auto_adopt_orphans; then
+                STARTUP_MAINT_BLOCKED=1
+                _error "启动期自动采纳孤儿入站失败(配置不可解析/元数据写入失败): 已停止后续启动维护"
+            fi
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
@@ -1220,7 +1226,7 @@ _hy2_masq_menu() {
     echo; echo -e "  ${CYAN}【HTTP/3 页面伪装 masquerade】${NC}"
     echo -e "  ${YELLOW}作用: 非 Hysteria 客户端(普通浏览器/扫描器)连上本端口时返回什么 HTTP 页面${NC}"
     echo -e "  ${YELLOW}与 [5] 混淆(FinalMask.udp)是两个独立机制 —— 混淆改链路上的 QUIC 字节, 本项改 HTTP 页面${NC}"
-    local tags=() i=1
+    local f tags=() i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
@@ -1530,7 +1536,7 @@ _hy2_toggle_brutal() {
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【切换 brutal / bbr】${NC}"
-    local tags=() i=1
+    local f tags=() i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
@@ -1610,7 +1616,7 @@ _hy2_adjust_bandwidth() {
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【调整 brutal 带宽】${NC}"
-    local tags=() i=1
+    local f tags=() i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
@@ -1746,7 +1752,7 @@ _hy2_obfs_menu() {
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【混淆 salamander / gecko (FinalMask.udp)】${NC}"
-    local tags=() i=1
+    local f tags=() i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
@@ -2015,7 +2021,7 @@ _reality_domain_menu() {
     while true; do
         clear
         echo; echo -e "  ${CYAN}【Reality 域名管理】${NC}"
-    local tags=() i=1
+    local f tags=() i=1
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
         local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)

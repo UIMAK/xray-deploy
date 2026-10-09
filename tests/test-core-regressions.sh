@@ -5,10 +5,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
 command -v jq >/dev/null 2>&1 || { printf 'SUMMARY pass=0 fail=1 (jq required)\n'; exit 1; }
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-core-regressions.XXXXXX") || exit 1
 cleanup() {
-    local resolved
-    resolved=$(cd "$TMP" 2>/dev/null && pwd -P) || return
-    case "$resolved" in
-        */xray-core-regressions.*) [ "$resolved" = "$TMP" ] && rm -rf -- "$TMP" ;;
+    # 直接按 $TMP 的模板前缀判定, 不依赖 pwd -P 相等(软链 TMPDIR 下会漏删)。
+    case "$TMP" in
+        "${TMPDIR:-/tmp}"/xray-core-regressions.*) rm -rf -- "$TMP" ;;
     esac
 }
 trap cleanup EXIT

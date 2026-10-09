@@ -2,8 +2,8 @@
 # Offline service transactions; mocks never call the host's init system.
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TMP=$(mktemp -d) || exit 1
-trap 'case "$TMP" in "${TMPDIR:-/tmp}"/tmp.*) rm -rf "$TMP" ;; esac' EXIT
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-cloudflared-alignment.XXXXXX") || exit 1
+trap 'case "$TMP" in "${TMPDIR:-/tmp}"/xray-cloudflared-alignment.*) rm -rf "$TMP" ;; esac' EXIT
 STATE_DIR="$TMP/state"
 mkdir -p "$STATE_DIR"
 . "$ROOT/lib/40-cloudflared.sh"
@@ -47,6 +47,19 @@ systemctl() {
         esac
     elif [ "$unit" = cloudflared-update.service ]; then
         [ "$action" = stop ]
+    elif [ "$unit" = cloudflared ]; then
+        # _cf_systemd_grace_raw 用到的 show 属性: 从 $TMP/cf-* fixture 读, 缺文件即失败(退回文本兜底)。
+        case "$action" in
+            show)
+                case "$*" in
+                    *LoadState*) cat "$TMP/cf-loadstate" 2>/dev/null || echo "${CF_LOADSTATE:-loaded}" ;;
+                    *ExecStart*) cat "$TMP/cf-execstart" 2>/dev/null ;;
+                    *EnvironmentFiles*) cat "$TMP/cf-envfiles" 2>/dev/null ;;
+                    *Environment*) cat "$TMP/cf-env" 2>/dev/null ;;
+                    *) return 1 ;;
+                esac ;;
+            *) return 1 ;;
+        esac
     elif [ "$action" = daemon-reload ]; then
         if [ "${RELOAD_FAIL:-no}" = yes ] && [ ! -f "$TMP/reload-failed" ]; then touch "$TMP/reload-failed"; return 1; fi
     else
@@ -302,6 +315,19 @@ check 'old OpenRC inline credentials supported' contains "$(cat "$CF_UNIT_OPENRC
 run 0 _cf_toggle http2
 check 'OpenRC command_args stays shell-valid' bash -n "$CF_UNIT_OPENRC"
 check 'OpenRC HTTP2 off removes protocol only' no_contains "$(cat "$CF_UNIT_OPENRC")" --protocol
+
+# 多个 EnvironmentFile 是后者覆盖前者(systemd 口径): systemd 权威路径与文本兜底必须同口径。
+reset_fixture
+: > "$TMP/cf-execstart"
+printf '%s (ignore_errors=yes) -%s\n' "$TMP/a.env" "$TMP/b.env" > "$TMP/cf-envfiles"
+printf 'TUNNEL_GRACE_PERIOD=10s\n' > "$TMP/a.env"
+printf 'TUNNEL_GRACE_PERIOD=45s\n' > "$TMP/b.env"
+check 'EnvironmentFiles last file wins on the systemd path' eq "$(_cf_grace_config "$CF_UNIT_SYSTEMD")" 45s
+CF_LOADSTATE=not-found
+printf 'EnvironmentFile=%s\nEnvironmentFile=-%s\n' "$TMP/a.env" "$TMP/b.env" > "$CF_UNIT_SYSTEMD"
+check 'EnvironmentFiles last file wins in the text fallback' eq "$(_cf_grace_config "$CF_UNIT_SYSTEMD")" 45s
+CF_LOADSTATE=loaded
+rm -f "$TMP/cf-envfiles" "$TMP/cf-execstart" "$TMP/a.env" "$TMP/b.env" "$CF_UNIT_SYSTEMD"
 
 printf 'cloudflared alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

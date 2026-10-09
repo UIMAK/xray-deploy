@@ -56,6 +56,16 @@ _logrotate_enabled_state() {
     esac
 }
 
+# 有效启用态: 自动关闭标记优先于状态记录; 标记=on 时若配置仍在(上次禁用被中断的残留),
+# 轮换实际还在跑, 按"在跑"处理, 状态栏与菜单共用同一口径。
+_logrotate_effective_enabled() {
+    if [ "$(_logrotate_auto_off_get)" = "on" ]; then
+        if [ -f "$LOGROTATE_CONF" ]; then printf 'on'; else printf 'off'; fi
+        return 0
+    fi
+    _logrotate_enabled_state
+}
+
 # 直写前保存旧内容，回读一致才成功；避免 include 目录临时配置与半截文件停摆。
 _logrotate_write_config() {
     local content
@@ -198,7 +208,8 @@ _logrotate_setup() {
         _warn "logrotate 状态初始化失败, 本次跳过配置写入(下次启动会重试)"
         return 0
     fi
-    if [ "$(_logrotate_enabled_state)" = "on" ]; then
+    # 自动关闭标记优先于状态记录: 否则会把已关闭(含 loglevel 联动关闭)的轮换重新打开。
+    if [ "$(_logrotate_enabled_state)" = "on" ] && [ "$(_logrotate_auto_off_get)" != "on" ]; then
         _logrotate_write_config || _warn "logrotate 配置写入失败, 日志轮换未生效(可在菜单 [日志轮换] 重试)"
     fi
     return 0
@@ -215,7 +226,7 @@ _logrotate_cleanup() {
 
 _logrotate_status() {
     local enabled freq ret comp
-    enabled=$(_logrotate_enabled_state)
+    enabled=$(_logrotate_effective_enabled)
     freq=$(_state_get logrotate_frequency 2>/dev/null || echo "daily")
     ret=$(_state_get logrotate_retention 2>/dev/null || echo "7")
     comp=$(_state_get logrotate_compress 2>/dev/null || echo "on")
@@ -323,7 +334,9 @@ _loglevel_menu() {
         _press_any_key; return
     fi
 
-    local enabled; enabled=$(_logrotate_enabled_state)
+    # 联动禁用按"轮换是否实际在跑"判断: 标记=on 且配置仍在(上次禁用被中断的残留)时按启用处理,
+    # 走下面的禁用流程把残留配置收敛掉, 与状态栏/菜单同口径。
+    local enabled; enabled=$(_logrotate_effective_enabled)
     local auto_off; auto_off=$(_logrotate_auto_off_get)
 
     if [ "$new_lv" = "none" ]; then
@@ -403,8 +416,10 @@ _logrotate_menu() {
         echo
         _logrotate_status
         echo
+        # 有效启用态统一走 _logrotate_effective_enabled: 标记=on 时不得再写回配置把轮换打开;
+        # 但配置仍在(上次禁用被中断的残留)时轮换实际在跑, 必须给出禁用入口, 不能只显示"启用"。
         local enabled
-        enabled=$(_logrotate_enabled_state)
+        enabled=$(_logrotate_effective_enabled)
         if [ "$enabled" = "on" ] && [ -f "$LOGROTATE_CONF" ]; then
             echo -e "  ${GREEN}[1]${NC} 禁用 logrotate"
         elif [ "$enabled" = "on" ]; then
@@ -445,7 +460,9 @@ _logrotate_menu() {
                         *) _error "logrotate 启用失败, 日志轮换未生效" ;;
                     esac
                 fi
-                if [ "$(_logrotate_auto_off_get)" = "on" ]; then
+                # 只有操作完全成功(trc=0)才清标记: trc=1 失败、trc=2 状态未持久化时保留标记,
+                # 否则会重新制造"标记=on / enabled=on / 配置已删"的矛盾。
+                if [ "$trc" -eq 0 ] && [ "$(_logrotate_auto_off_get)" = "on" ]; then
                     _logrotate_auto_off_clear
                 fi
                 _press_any_key
