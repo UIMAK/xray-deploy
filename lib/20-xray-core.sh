@@ -386,8 +386,21 @@ _xray_core_lock_fd_reset() {
 # 旧 mkdir 同名标记占位, 释放时删除; SIGKILL 残留仅在匹配 .witness 时可自愈。
 # L2 缺失先扫描删除树; 缺失旧 flock 文件后来新建的窗口仍无法封住, 非跨版本结构性消除。
 # ---------------------------------------------------------------------------
+# 旧版 mkdir 目录锁活持有者/残留: 净化 pid 后拒绝, 绝不删除别人的锁目录(树内外同口径)。
+_legacy_dir_lock_reject() {   # <ldir> <label>; 固定返回 1, 锁清理留在调用方
+    local owner
+    owner=$(cat "$1/pid" 2>/dev/null)
+    case "$owner" in
+        ''|*[!0-9]*) owner="" ;;
+        *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
+    esac
+    _error "旧版${2}目录锁仍存在(pid ${owner:-未知}): $1"
+    _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+    return 1
+}
+
 _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkdir目录> <显示名>
-    local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i owner="" ef lrc locked=0
+    local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i ef lrc locked=0
     local witness="" deploy_dir devino
     # **变量名按锁家族分开**: 卸载要同时持 install 锁与 core 锁, 共用全局会让后取的覆盖先取的,
     # 先取那把 fd 再没人关闭/解锁(锁泄漏到进程退出)。
@@ -455,13 +468,7 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
             fi
         fi
         if [ -e "$ldir" ]; then
-            owner=$(cat "$ldir/pid" 2>/dev/null)
-            case "$owner" in
-                ''|*[!0-9]*) owner="" ;;
-                *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
-            esac
-            _error "旧版${label}目录锁仍存在(pid ${owner:-未知}): $ldir"
-            _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+            _legacy_dir_lock_reject "$ldir" "$label"
             flock -u "$ef" 2>/dev/null
             eval "exec ${ef}>&-" 2>/dev/null
             eval "$fdvar=\"\""
@@ -514,13 +521,7 @@ _xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkd
     fi
     # 旧版 mkdir 目录已存在 ⇒ 活持有者/残留一律拒绝, 绝不删除别人的锁目录(树内外同口径)。
     if [ -e "$ldir" ]; then
-        owner=$(cat "$ldir/pid" 2>/dev/null)
-        case "$owner" in
-            ''|*[!0-9]*) owner="" ;;
-            *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
-        esac
-        _error "旧版${label}目录锁仍存在(pid ${owner:-未知}): $ldir"
-        _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
+        _legacy_dir_lock_reject "$ldir" "$label"
         return 1
     fi
     # 无 flock: 创建旧 mkdir 目录前先跑删除树扫描 —— 与 flock 分支"即将新建 inode"同口径。
@@ -651,6 +652,16 @@ _xray_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持有
     return 1
 }
 
+# L2 旧锁路径不存在时补删除树扫描; 命中即拒绝, 由调用方清理自己持有的锁后退出。
+_legacy_deleted_tree_reject() {   # <deploy_path>; 0 = 旧版进程仍持有已删除树, 已报错
+    if _xray_legacy_deleted_tree_active "$1"; then
+        _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
+        _tip "等旧版会话退出后重试"
+        return 0
+    fi
+    return 1
+}
+
 _with_core_lock() {
     local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lockf fallback_dir
     local legacy_lockf legacy_fallback_dir legacy1_lockf legacy1_fallback_dir i locked=0 rc owner lrc
@@ -710,9 +721,7 @@ _with_core_lock() {
         fi
         # 仅协调已存在 L1/L2 旧路径; L2 缺失补删除树扫描, 见 _xray_legacy_lock_name。
         if [ ! -e "$legacy_lockf" ] && [ ! -e "$legacy_fallback_dir" ]; then
-            if _xray_legacy_deleted_tree_active "$deploy_path"; then
-                _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
-                _tip "等旧版会话退出后重试"
+            if _legacy_deleted_tree_reject "$deploy_path"; then
                 _xray_core_lock_fd_reset
                 return 1
             fi
@@ -810,9 +819,7 @@ _with_core_lock() {
     fi
     # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过, 不凭空重建旧锁文件); L2 不存在时补删除树扫描。
     if [ ! -e "$legacy_lockf" ] && [ ! -e "$legacy_fallback_dir" ]; then
-        if _xray_legacy_deleted_tree_active "$deploy_path"; then
-            _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
-            _tip "等旧版会话退出后重试"
+        if _legacy_deleted_tree_reject "$deploy_path"; then
             rm -f "$fallback_dir/pid" 2>/dev/null
             rmdir "$fallback_dir" 2>/dev/null
             return 1
@@ -908,9 +915,7 @@ _with_deploy_install_lock() {
         fi
         # 主锁 → L2 缺失时删除树扫描 → 建部署树 → 旧锁, 防止重建路径掩盖未释放旧 inode。
         if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ]; then
-            if _xray_legacy_deleted_tree_active "$deploy_path"; then
-                _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
-                _tip "等旧版会话退出后重试"
+            if _legacy_deleted_tree_reject "$deploy_path"; then
                 _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
                 eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
                 return 1
@@ -998,9 +1003,7 @@ _with_deploy_install_lock() {
             esac
             # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过); L2 不存在时补删除树扫描, 再建目录。
             if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ]; then
-                if _xray_legacy_deleted_tree_active "$deploy_path"; then
-                    _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
-                    _tip "等旧版会话退出后重试"
+                if _legacy_deleted_tree_reject "$deploy_path"; then
                     rm -f "$lock_dir/pid" 2>/dev/null
                     rmdir "$lock_dir" 2>/dev/null
                     return 1

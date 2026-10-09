@@ -2543,6 +2543,36 @@ _add_node() {
     _press_any_key
 }
 
+# add 协议共用助手
+_node_name_prompt() {   # 读取节点名(默认 default_name)并查重; 依赖调用方局部 default_name/name
+    read -rp "  节点名称 (默认 ${default_name}): " name
+    name=${name:-$default_name}
+    _ensure_unique_name "$name" || return 1
+}
+
+_enc_opts_prompt() {   # 提示加密选项并把 R_DECRYPTION 写入调用方作用域
+    _prompt_encryption || return 1
+    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+}
+
+_enc_param() {   # 输出 none 或 url-encoded 加密参数(ENC_ENABLED/ENC_ENCRYPTION)
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        _url_encode "$ENC_ENCRYPTION"
+    else
+        printf 'none'
+    fi
+}
+
+_enc_meta_json() {   # <meta_json>; 未启用加密时原样返回
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        printf '%s' "$1" | jq \
+            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
+            '. + {auth:$auth,decryption:$dec,encryption:$enc}'
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 协议1: VLESS+TCP+Reality+Vision (可选 直连 / Tunnel 模式, 见 _prompt_reality_mode)
 # ---------------------------------------------------------------------------
@@ -2568,9 +2598,7 @@ _add_vless_tcp_reality_vision() {
     fi
 
     local default_name="Reality-Vision-${port}"
-    read -rp "  节点名称 (默认 ${default_name}): " name
-    name=${name:-$default_name}
-    _ensure_unique_name "$name" || return 1
+    _node_name_prompt || return 1
 
     local uuid; uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
     _generate_reality_keys || return 1
@@ -2580,9 +2608,7 @@ _add_vless_tcp_reality_vision() {
         pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
     fi
 
-    # 加密选项
-    if ! _prompt_encryption; then return 1; fi
-    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+    _enc_opts_prompt || return 1
 
     local tag="xd-reality-vision-${port}"
     local tunnel_tag=""
@@ -2616,11 +2642,7 @@ _add_vless_tcp_reality_vision() {
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_param=$(_url_encode "$ENC_ENCRYPTION")
-    else
-        enc_param="none"
-    fi
+    enc_param=$(_enc_param)
     # 分享链接标准(XTLS VMess/VLESS 提案): type 必须是 tcp(不是 raw)、REALITY 时 fp 不可省略
     # 且默认 chrome、sni 等 URL 字段 Value 一律 encodeURIComponent。
     local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=tcp&flow=xtls-rprx-vision&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
@@ -2648,11 +2670,7 @@ _add_vless_tcp_reality_vision() {
             --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
             '. + {tunnel_tag:$ttag,tunnel_port:$tport}')
     fi
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        meta_json=$(echo "$meta_json" | jq \
-            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
-            '. + {auth:$auth,decryption:$dec,encryption:$enc}')
-    fi
+    meta_json=$(_enc_meta_json "$meta_json")
     # 原子提交( config + metadata + 派生 YAML(metadata 失败会回滚入站/路由)。
     if [ "$mode" = "tunnel" ]; then
         _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" "$clash" "$name" || return 1
@@ -2701,9 +2719,7 @@ _add_vless_xhttp_reality() {
     _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     local default_name="Reality-XHTTP-${port}"
-    read -rp "  节点名称 (默认 ${default_name}): " name
-    name=${name:-$default_name}
-    _ensure_unique_name "$name" || return 1
+    _node_name_prompt || return 1
 
     local uuid; uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
     _generate_reality_keys || return 1
@@ -2713,9 +2729,7 @@ _add_vless_xhttp_reality() {
         pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
     fi
 
-    # 加密选项
-    if ! _prompt_encryption; then return 1; fi
-    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+    _enc_opts_prompt || return 1
 
     local tag="xd-reality-xhttp-${port}"
     local tunnel_tag=""
@@ -2748,11 +2762,7 @@ _add_vless_xhttp_reality() {
     local link_ip="$addr"
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_param=$(_url_encode "$ENC_ENCRYPTION")
-    else
-        enc_param="none"
-    fi
+    enc_param=$(_enc_param)
     local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
@@ -2779,11 +2789,7 @@ _add_vless_xhttp_reality() {
             --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
             '. + {tunnel_tag:$ttag,tunnel_port:$tport}')
     fi
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        meta_json=$(echo "$meta_json" | jq \
-            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
-            '. + {auth:$auth,decryption:$dec,encryption:$enc}')
-    fi
+    meta_json=$(_enc_meta_json "$meta_json")
     # 原子提交( config + metadata + 派生 YAML(metadata 失败会回滚入站/路由)。
     if [ "$mode" = "tunnel" ]; then
         _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" "$clash" "$name" || return 1
@@ -2924,9 +2930,7 @@ _add_vless_enc() {
     [ "${flow_choice:-1}" = "2" ] && flow="xtls-rprx-vision"
 
     local default_name="ENC-${port}"
-    read -rp "  节点名称 (默认 ${default_name}): " name
-    name=${name:-$default_name}
-    _ensure_unique_name "$name" || return 1
+    _node_name_prompt || return 1
 
     local uuid; uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
     _generate_vless_enc_keys "$AUTH_TYPE" || return 1
@@ -3007,15 +3011,11 @@ _add_vless_xhttp_cdn() {
     _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     local default_name="XHTTP-CDN-${port}"
-    read -rp "  节点名称 (默认 ${default_name}): " name
-    name=${name:-$default_name}
-    _ensure_unique_name "$name" || return 1
+    _node_name_prompt || return 1
 
     local uuid; uuid=$(_gen_uuid) || return 1
 
-    # 加密选项
-    if ! _prompt_encryption; then return 1; fi
-    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+    _enc_opts_prompt || return 1
 
     local tag="xd-xhttp-cdn-${port}"
     local listen="::"
@@ -3026,11 +3026,7 @@ _add_vless_xhttp_cdn() {
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
     local enc_param
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_param=$(_url_encode "$ENC_ENCRYPTION")
-    else
-        enc_param="none"
-    fi
+    enc_param=$(_enc_param)
     # 分享链接标准: fp 默认 chrome; 标准无 insecure/allowInsecure 字段(Xray 已移除该配置项),
     # 且本节点经 CF 边缘合法证书, 无需跳过校验; sni/host 必须 encodeURIComponent
     local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&alpn=h2&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")#$(_url_encode "$name")"
@@ -3049,11 +3045,7 @@ _add_vless_xhttp_cdn() {
         --arg sni "$host" --arg fp "chrome" --arg alpn "h2" \
         --arg link "$link" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,share_link:$link}')
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        meta_json=$(echo "$meta_json" | jq \
-            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
-            '. + {auth:$auth,decryption:$dec,encryption:$enc}')
-    fi
+    meta_json=$(_enc_meta_json "$meta_json")
     _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
@@ -3091,15 +3083,11 @@ _add_vless_ws_cdn() {
     _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     local default_name="WS-CDN-${port}"
-    read -rp "  节点名称 (默认 ${default_name}): " name
-    name=${name:-$default_name}
-    _ensure_unique_name "$name" || return 1
+    _node_name_prompt || return 1
 
     local uuid; uuid=$(_gen_uuid) || return 1
 
-    # 加密选项
-    if ! _prompt_encryption; then return 1; fi
-    R_DECRYPTION="${ENC_DECRYPTION:-none}"
+    _enc_opts_prompt || return 1
 
     local tag="xd-ws-cdn-${port}"
     local listen="::"
@@ -3110,11 +3098,7 @@ _add_vless_ws_cdn() {
     local link_ip="$preferred_addr"
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
     local enc_param
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_param=$(_url_encode "$ENC_ENCRYPTION")
-    else
-        enc_param="none"
-    fi
+    enc_param=$(_enc_param)
     local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
@@ -3131,11 +3115,7 @@ _add_vless_ws_cdn() {
         --arg sni "$host" --arg fp "chrome" \
         --arg link "$link" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,share_link:$link}')
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        meta_json=$(echo "$meta_json" | jq \
-            --arg auth "$ENC_AUTH" --arg dec "$ENC_DECRYPTION" --arg enc "$ENC_ENCRYPTION" \
-            '. + {auth:$auth,decryption:$dec,encryption:$enc}')
-    fi
+    meta_json=$(_enc_meta_json "$meta_json")
     _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
     _success "节点 [${name}] 创建成功"
@@ -3187,9 +3167,7 @@ _add_shadowsocks() {
     _validate_json_text "$password" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
 
     local default_name="SS-${method%%-*}-${port}"
-    read -rp "  节点名称 (默认 ${default_name}): " name
-    name=${name:-$default_name}
-    _ensure_unique_name "$name" || return 1
+    _node_name_prompt || return 1
 
     local tag="xd-ss-${port}"
     local listen="::"
@@ -4011,9 +3989,7 @@ _add_hysteria2() {
     esac
 
     local default_name="HY2-${port}"
-    read -rp "  节点名称 (默认 ${default_name}): " name
-    name=${name:-$default_name}
-    _ensure_unique_name "$name" || return 1
+    _node_name_prompt || return 1
 
     local listen="::"
 

@@ -709,11 +709,7 @@ _hysteria_config_preflight() {
         _error "Hysteria 配置不存在或为空, 无法${what}: $HYSTERIA_CONFIG"
         return 1
     fi
-    if ! command -v jq >/dev/null 2>&1; then
-        _error "jq 不可用, 无法${what}"
-        return 1
-    fi
-    return 0
+    _require_jq "$what"
 }
 
 # 备份必须非空且能解析为对象；lastbak 用于配置恢复，历史备份最多保留十份。
