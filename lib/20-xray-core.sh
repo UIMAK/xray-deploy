@@ -2957,6 +2957,11 @@ _manage_xray() {
                 status)  if _xray_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
+        *)
+            # 未知 backend 不得静默返回 0, 否则 stop/restart 会谎报成功; fail-closed。
+            _error "未知 init 系统后端, 拒绝执行 xray ${action}: ${INIT_SYSTEM:-<空>}"
+            return 1
+            ;;
     esac
 }
 
@@ -3153,7 +3158,8 @@ _xray_core_menu() {
     echo -e "  ${GREEN}[3]${NC} 安装指定版本 (X.Y.Z)"
     echo -e "  ${GREEN}[0]${NC} 返回"
     echo
-    read -rp "  请选择: " choice
+    local choice
+    read -rp "  请选择: " choice || return 0
     case "$choice" in
         1) _install_or_switch_xray stable ;;
         2) _install_or_switch_xray preview ;;

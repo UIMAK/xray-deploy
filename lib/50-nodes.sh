@@ -1577,7 +1577,9 @@ _input_port() {
     local port="" def
     def=$(_gen_random_port)
     while true; do
-        read -rp "  监听端口 (回车随机生成): " port
+        # 输入EOF直接取消；不能把 read 失败当空值套随机默认值。
+        # 调用点用 local port=$(...) 会吞掉返回码, 所以这里必须自己出声, 否则只会看到下游的误导错误。
+        read -rp "  监听端口 (回车随机生成): " port || { _warn "输入已结束, 已取消"; return 1; }
         port=${port:-$def}
         if ! _validate_port "$port"; then
             _warn "无效端口(1-65535)"; continue
@@ -1868,12 +1870,22 @@ _commit_hy2_node_txn_locked() {
                 _error "证书快照失败(无法备份既有证书), 已中止, 未生成新证书"; return 1; }
             _gen_hy2_cert "$tag" "$self_domain" || genrc=$?
             if [ "$genrc" != 0 ]; then
-                # 生成失败: 证书已是提交前状态(生成器自带回滚), 丢掉快照即可;
-                # 目录是本次新建且已空 ⇒ 顺手清掉(rc=2 的备份必须保留, 绝不动)
+                # 只有 rc=1 明确"证书已回到提交前状态"才丢快照(丢备份不可逆), 其余非零一律保留并上报 2。
+                # rc=2: 生成器回滚不完整, 快照必须保留(可能还叠加生成器自己的 .bak.*)。
+                if [ "$genrc" != 1 ]; then
+                    if [ -f "$cert_bak/cert.pem" ] || [ -f "$cert_bak/key.pem" ]; then
+                        _warn "证书生成回滚不完整, 已保留证书快照供人工恢复: $cert_bak"
+                    else
+                        _warn "证书生成回滚不完整(本次无旧证书可恢复), 请人工检查证书目录: $cert_dir"
+                    fi
+                    return 2
+                fi
+                # rc=1: 生成失败但证书已是提交前状态(生成器自带回滚), 丢掉快照即可;
+                # 目录是本次新建且已空 ⇒ 顺手清掉
                 if ! _hy2_cert_snapshot_drop "$cert_bak"; then
                     _warn "证书快照未清理干净(内含旧私钥副本), 请手工删除: $cert_bak"
                 fi
-                [ "$genrc" = 1 ] && [ "$cert_dir_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
+                [ "$cert_dir_existed" = "false" ] && rmdir "$cert_dir" 2>/dev/null
                 return 1
             fi
             cert_dirty="true"
@@ -2591,7 +2603,7 @@ _add_vless_tcp_reality_vision() {
     # 生成放在 Reality 端口输入之后, 以便把用户端口加入排除项
     local tunnel_port=""
     echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
-    local port=$(_input_port tcp)
+    local port; port=$(_input_port tcp) || return 1
     if [ "$mode" = "tunnel" ]; then
         tunnel_port=$(_gen_free_tunnel_port "$port")
         _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
@@ -2706,7 +2718,7 @@ _add_vless_xhttp_reality() {
     # 生成放在 Reality 端口输入之后, 以便把用户端口加入排除项
     local tunnel_port=""
     echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
-    local port=$(_input_port tcp)
+    local port; port=$(_input_port tcp) || return 1
     if [ "$mode" = "tunnel" ]; then
         tunnel_port=$(_gen_free_tunnel_port "$port")
         _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
@@ -2911,7 +2923,7 @@ _prompt_encryption() {
 
 _add_vless_enc() {
     echo -e "\n  ${CYAN}=== VLESS+ENC (内置加密 · 无 TLS · 类似 SS 轻量直连) ===${NC}"
-    local port=$(_input_port tcp)
+    local port; port=$(_input_port tcp) || return 1
 
     # 认证算法选择
     echo -e "  认证算法:"
@@ -2982,7 +2994,7 @@ _add_vless_xhttp_cdn() {
     echo -e "\n  ${CYAN}=== VLESS+XHTTP (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
     echo -e "  ${RED}⚠ 该协议不能直连, 客户端须经 CF CDN 回源到本机${NC}"
     local port
-    port=$(_input_port tcp)
+    port=$(_input_port tcp) || return 1
     # 走 CDN 建议用 CF 支持的 HTTP 端口(仅警告, 不强制)
     case "$port" in 80|8080|8880|2052|2082|2086|2095|443|2053|2083|2087|2096|8443) ;; *)
         _warn "非 CF 推荐端口, 建议使用 80/8080/2052/2086/2095 等, 仍可继续"
@@ -3059,7 +3071,7 @@ _add_vless_xhttp_cdn() {
 _add_vless_ws_cdn() {
     echo -e "\n  ${CYAN}=== VLESS+WS (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
     echo -e "  ${RED}⚠ 该协议不能直连, 客户端须经 CF CDN 回源到本机${NC}"
-    local port=$(_input_port tcp)
+    local port; port=$(_input_port tcp) || return 1
 
     local host
     read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
@@ -3141,7 +3153,7 @@ _add_shadowsocks() {
         3) proto_arg="udp"; network_val="udp" ;;
         *) _warn "无效,默认 TCP+UDP"; proto_arg=""; network_val="tcp,udp" ;;
     esac
-    local port=$(_input_port "$proto_arg")
+    local port; port=$(_input_port "$proto_arg") || return 1
     echo -e "  加密方式:"
     echo -e "  ${GREEN}[1]${NC} aes-256-gcm"
     echo -e "  ${GREEN}[2]${NC} 2022-blake3-aes-256-gcm"
@@ -3891,7 +3903,7 @@ _hy2_purge_self_certs() {
 
 _add_hysteria2() {
     echo -e "\n  ${CYAN}=== Hysteria2 (QUIC · 可直连 · 需 TLS 证书) ===${NC}"
-    local port=$(_input_port udp)
+    local port; port=$(_input_port udp) || return 1
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
@@ -5445,7 +5457,7 @@ _modify_port() {
     local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
-    local newport=$(_input_port)
+    local newport; newport=$(_input_port) || return 1
 
     # 更新元数据 + 链接(端口出现在链接里)
     local meta="$NODES_DIR/${tag}.json"

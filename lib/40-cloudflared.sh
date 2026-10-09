@@ -691,7 +691,7 @@ _cf_env_file_value() {
 }
 
 _cf_systemd_grace_raw() {
-    local load argv envs efs w v="" efp vf arr=() i
+    local load argv envs efs w v="" efp vf arr=() efs_arr=() i
     load=$(systemctl show -p LoadState --value cloudflared 2>/dev/null) || return 2
     [ "$load" = loaded ] || return 2
     argv=$(systemctl show -p ExecStart --value cloudflared 2>/dev/null) || return 2
@@ -712,12 +712,17 @@ _cf_systemd_grace_raw() {
     fi
     [ -n "$v" ] && { printf '%s' "$v"; return 0; }
     efs=$(systemctl show -p EnvironmentFiles --value cloudflared 2>/dev/null) || efs=""
-    while IFS= read -r efp || [ -n "$efp" ]; do
-        [ -n "$efp" ] || continue
-        efp="${efp% (ignore_errors=*)}"
+    # 该属性是空格分隔的数组, 逐行读会把多个 EnvironmentFile 当成一个路径;
+    # 前导 '-' 是"可选文件"前缀, 不剥离会让 [ -f ] 失败(与 _cf_grace_config 同口径)。
+    # 换行先归一化成空格再 read -ra 切分: 直接 for 循环会先做路径名展开, 通配符会命中当前目录的文件。
+    efs="${efs//$'\n'/ }"
+    efs_arr=(); read -ra efs_arr <<< "$efs"
+    for efp in "${efs_arr[@]}"; do
+        case "$efp" in ''|'(ignore_errors='*) continue ;; esac
+        case "$efp" in -*) efp="${efp#-}" ;; esac
         case "$efp" in ''|*'*'*|*'?'*|*'['*) continue ;; esac
         if vf=$(_cf_env_file_value "$efp"); then v="$vf"; fi
-    done <<< "$efs"
+    done
     [ -n "$v" ] && { printf '%s' "$v"; return 0; }
     envs=$(systemctl show -p Environment --value cloudflared 2>/dev/null) || envs=""
     for w in $envs; do
@@ -729,7 +734,7 @@ _cf_systemd_grace_raw() {
 
 # systemd 有效配置优先，读不到才退回文本；宽限期不能按主 unit 猜测。
 _cf_grace_config() {
-    local svcfile="$1" ln arr=() i w v efpath eff rc
+    local svcfile="$1" ln arr=() i w v efpath eff rc efval=""
     if [ "${INIT_SYSTEM:-}" = systemd ]; then
         eff=$(_cf_systemd_grace_raw); rc=$?
         case "$rc" in
@@ -775,8 +780,10 @@ _cf_grace_config() {
         efpath="${efpath%"${efpath##*[![:space:]]}"}"
         case "$efpath" in -*) efpath="${efpath#-}" ;; esac
         case "$efpath" in ''|*'*'*|*'?'*|*'['*) continue ;; esac
-        if vf=$(_cf_env_file_value "$efpath"); then printf '%s' "$vf"; return 0; fi
+        # 多个 EnvironmentFile 是后者覆盖前者(systemd 口径), 必须扫完再取值, 不能遇第一个就返回。
+        if vf=$(_cf_env_file_value "$efpath"); then efval="$vf"; fi
     done < "$svcfile"
+    [ -n "$efval" ] && { printf '%s' "$efval"; return 0; }
     return 1
 }
 

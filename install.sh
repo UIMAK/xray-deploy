@@ -646,7 +646,8 @@ _install_primary_marker_take() {  # caller already holds INSTALL_LOCK_FD
                 INSTALL_PRIMARY_MARKER_HELD=1
                 return 0
             fi
-            [ "$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null)" = "$owner" ] && rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null
+            # mkdir 刚成功, 目录必属本次调用; 见证写入失败也必须清理, 否则残留无 .witness 的锁目录。
+            rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null
             echo "[错误] 无法建立安装锁跨后端见证标记, 安装中止"
             return 1
         fi
