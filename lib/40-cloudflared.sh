@@ -311,6 +311,20 @@ _svc_backup() {
     return 0
 }
 
+# init.d 需执行位, 其余收紧 600(token 泄漏风险); 1 = init.d 执行位设置失败。
+_svc_chmod() {   # <svcfile>
+    case "$1" in
+        /etc/init.d/*)
+            chmod 700 "$1" 2>/dev/null || return 1
+            ;;
+        *)
+            chmod 600 "$1" 2>/dev/null || \
+                _warn "service 文件权限收紧失败(token 可能被其他用户读取): $1"
+            ;;
+    esac
+    return 0
+}
+
 # cat 写回以保留 init.d 执行位；失败保留 .bak 供恢复。
 _svc_commit() {
     local svcfile="$1" tmp="$2"
@@ -326,19 +340,11 @@ _svc_commit() {
         return 1
     fi
     rm -f "$tmp"
-    case "$svcfile" in
-        /etc/init.d/*)
-            if ! chmod 700 "$svcfile" 2>/dev/null; then
-                _error "service 执行权限设置失败: $svcfile, 回滚 service 文件"
-                _svc_restore "$svcfile" || _error "回滚失败, 请手动检查 $svcfile"
-                return 1
-            fi
-            ;;
-        *)
-            chmod 600 "$svcfile" 2>/dev/null || \
-                _warn "service 文件权限收紧失败(token 可能被其他用户读取): $svcfile"
-            ;;
-    esac
+    if ! _svc_chmod "$svcfile"; then
+        _error "service 执行权限设置失败: $svcfile, 回滚 service 文件"
+        _svc_restore "$svcfile" || _error "回滚失败, 请手动检查 $svcfile"
+        return 1
+    fi
     return 0
 }
 
@@ -350,18 +356,10 @@ _svc_restore() {
         _error "service 回滚失败: $svcfile, 请手动检查"
         return 1
     fi
-    case "$svcfile" in
-        /etc/init.d/*)
-            if ! chmod 700 "$svcfile" 2>/dev/null; then
-                _error "service 回滚后执行权限设置失败: $svcfile"
-                return 1
-            fi
-            ;;
-        *)
-            chmod 600 "$svcfile" 2>/dev/null || \
-                _warn "service 文件权限收紧失败(token 可能被其他用户读取): $svcfile"
-            ;;
-    esac
+    if ! _svc_chmod "$svcfile"; then
+        _error "service 回滚后执行权限设置失败: $svcfile"
+        return 1
+    fi
     rm -f "${svcfile}.bak"
     return 0
 }

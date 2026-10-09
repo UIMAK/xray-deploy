@@ -1273,11 +1273,14 @@ _config_edit_preflight() {
         _error "配置不存在或为空, 无法${what}: $CONFIG_DIR"
         return 1
     fi
-    if ! command -v jq >/dev/null 2>&1; then
-        _error "jq 不可用, 无法${what}"
-        return 1
-    fi
-    return 0
+    _require_jq "$what"
+}
+
+# jq 缺失即拒绝; 各 preflight 的可用性判定不同, 只共用这一段。
+_require_jq() {   # <what>
+    command -v jq >/dev/null 2>&1 && return 0
+    _error "jq 不可用, 无法$1"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1286,6 +1289,57 @@ _config_edit_preflight() {
 _press_any_key() {
     echo -e "${YELLOW}按回车键继续...${NC}" >&2
     read -r
+}
+
+# ---------------------------------------------------------------------------
+# 跨版本旧锁协调: L2 路径缺失时补删除树扫描, 再协调已存在的 L1/L2 旧路径。
+# fd/目录变量名由调用方给出, 取值写入调用方作用域(本函数不得把这些名字声明为 local)。
+# 返回 1 = 必须放弃本次操作; 本函数只回滚自己已取到的 L2 锁, 调用方的锁现场自行清理。
+# 缺 _xray_legacy_lock_name / _xray_legacy_deleted_tree_active 时 fail-closed; 缺 _xray_legacy_lock_release 时不动。
+# ---------------------------------------------------------------------------
+_legacy_lock_coordinate() {   # <deploy_path> <lfile> <ldir> <l1file> <l1dir> <fdv> <dirv> <l1fdv> <l1dirv>
+    local lc_deploy="$1" lc_lfile="$2" lc_ldir="$3" lc_l1file="$4" lc_l1dir="$5"
+    local lc_fdv="$6" lc_dirv="$7" lc_l1fdv="$8" lc_l1dirv="$9"
+    # L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
+    if [ ! -e "$lc_lfile" ] && [ ! -e "$lc_ldir" ]; then
+        # 混装版本缺该助手时 fail-closed, 与下面 _xray_legacy_lock_name 的守卫一致。
+        if ! declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
+            _error "缺少 _xray_legacy_deleted_tree_active, 无法检查已删除部署树中的旧版锁, 放弃本次配置修改"
+            return 1
+        fi
+        if _xray_legacy_deleted_tree_active "$lc_deploy"; then
+            _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次配置修改"
+            return 1
+        fi
+    fi
+    # 跨版本协调(仅对已存在的旧路径)。
+    if [ -e "$lc_lfile" ] || [ -e "$lc_ldir" ]; then
+        if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
+           || ! _xray_legacy_lock_name "$lc_fdv" "$lc_dirv" \
+                "$lc_lfile" "$lc_ldir" "旧版配置锁"; then
+            _error "无法协调旧版配置锁, 放弃本次修改"
+            return 1
+        fi
+    fi
+    if [ -e "$lc_l1file" ] || [ -e "$lc_l1dir" ]; then
+        if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
+           || ! _xray_legacy_lock_name "$lc_l1fdv" "$lc_l1dirv" \
+                "$lc_l1file" "$lc_l1dir" "旧版L1配置锁"; then
+            _error "无法协调旧版L1配置锁, 放弃本次修改"
+            if declare -F _xray_legacy_lock_release >/dev/null 2>&1; then
+                _xray_legacy_lock_release "$lc_fdv" "$lc_dirv"
+            fi
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# 按取锁反序释放 L1/L2 旧锁; 缺 _xray_legacy_lock_release 时不动。
+_legacy_lock_release_all() {   # <fdv> <dirv> <l1fdv> <l1dirv>
+    declare -F _xray_legacy_lock_release >/dev/null 2>&1 || return 0
+    _xray_legacy_lock_release "$3" "$4"
+    _xray_legacy_lock_release "$1" "$2"
 }
 
 # 无 flock 时 config.lock.d 原子 mkdir + pid; 既有目录一律拒绝, SIGKILL 残留需人工清理。
@@ -1343,37 +1397,13 @@ _with_config_lock_mkdir() {
         rmdir "$lock_dir" 2>/dev/null
         return 1
     fi
-    # L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
-    if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ] \
-       && declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
-        if _xray_legacy_deleted_tree_active "$deploy_path"; then
-            _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次配置修改"
-            rm -f "$lock_dir/pid" 2>/dev/null
-            rmdir "$lock_dir" 2>/dev/null
-            return 1
-        fi
-    fi
-    # 跨版本协调(仅对已存在的旧路径)。
-    if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
-        if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
-           || ! _xray_legacy_lock_name legacy_fd legacy_dir \
-                "$legacy_lock_file" "$legacy_lock_dir" "旧版配置锁"; then
-            _error "无法协调旧版配置锁, 放弃本次修改"
-            rm -f "$lock_dir/pid" 2>/dev/null
-            rmdir "$lock_dir" 2>/dev/null
-            return 1
-        fi
-    fi
-    if [ -e "$legacy1_lock_file" ] || [ -e "$legacy1_lock_dir" ]; then
-        if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
-           || ! _xray_legacy_lock_name legacy1_fd legacy1_dir \
-                "$legacy1_lock_file" "$legacy1_lock_dir" "旧版L1配置锁"; then
-            _error "无法协调旧版L1配置锁, 放弃本次修改"
-            declare -F _xray_legacy_lock_release >/dev/null 2>&1 && _xray_legacy_lock_release legacy_fd legacy_dir
-            rm -f "$lock_dir/pid" 2>/dev/null
-            rmdir "$lock_dir" 2>/dev/null
-            return 1
-        fi
+    # 跨版本旧锁协调; 失败时清理本次锁现场并放弃。
+    if ! _legacy_lock_coordinate "$deploy_path" \
+         "$legacy_lock_file" "$legacy_lock_dir" "$legacy1_lock_file" "$legacy1_lock_dir" \
+         legacy_fd legacy_dir legacy1_fd legacy1_dir; then
+        rm -f "$lock_dir/pid" 2>/dev/null
+        rmdir "$lock_dir" 2>/dev/null
+        return 1
     fi
     (
         XRAY_DEPLOY_LOCK_HELD=1
@@ -1381,10 +1411,7 @@ _with_config_lock_mkdir() {
         "$@"
     )
     rc=$?
-    if declare -F _xray_legacy_lock_release >/dev/null 2>&1; then
-        _xray_legacy_lock_release legacy1_fd legacy1_dir
-        _xray_legacy_lock_release legacy_fd legacy_dir
-    fi
+    _legacy_lock_release_all legacy_fd legacy_dir legacy1_fd legacy1_dir
     owner=$(cat "$lock_dir/pid" 2>/dev/null)
     if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
         _error "配置锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
@@ -1445,41 +1472,18 @@ _with_config_lock() {
             _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
         fi
-        # L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
-        if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ] \
-           && declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
-            if _xray_legacy_deleted_tree_active "$DEPLOY_DIR"; then
-                _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次配置修改"
-                exit 1
-            fi
-        fi
-        # 跨版本协调(仅对**已存在**的旧路径)。复用 core 的通用助手: flock 旧文件、检查同名
-        # mkdir 目录, lfile 缺失时拒绝而不是新建。混装版本缺该助手时 fail-closed。
+        # 跨版本旧锁协调(仅对**已存在**的旧路径); 旧文件缺失时拒绝而不是新建, 见
+        # _xray_legacy_lock_name 契约。混装版本缺该助手时 fail-closed。
         local legacy_fd="" legacy_dir="" legacy1_fd="" legacy1_dir=""
-        if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
-            if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
-               || ! _xray_legacy_lock_name legacy_fd legacy_dir \
-                    "$legacy_lock_file" "$legacy_lock_dir" "旧版配置锁"; then
-                _error "无法协调旧版配置锁, 放弃本次修改"
-                exit 1
-            fi
-        fi
-        if [ -e "$legacy1_lock_file" ] || [ -e "$legacy1_lock_dir" ]; then
-            if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
-               || ! _xray_legacy_lock_name legacy1_fd legacy1_dir \
-                    "$legacy1_lock_file" "$legacy1_lock_dir" "旧版L1配置锁"; then
-                _error "无法协调旧版L1配置锁, 放弃本次修改"
-                declare -F _xray_legacy_lock_release >/dev/null 2>&1 && _xray_legacy_lock_release legacy_fd legacy_dir
-                exit 1
-            fi
+        if ! _legacy_lock_coordinate "$DEPLOY_DIR" \
+             "$legacy_lock_file" "$legacy_lock_dir" "$legacy1_lock_file" "$legacy1_lock_dir" \
+             legacy_fd legacy_dir legacy1_fd legacy1_dir; then
+            exit 1
         fi
         export XRAY_DEPLOY_LOCK_HELD=1
         "$@"
         local rc=$?
-        if declare -F _xray_legacy_lock_release >/dev/null 2>&1; then
-            _xray_legacy_lock_release legacy1_fd legacy1_dir
-            _xray_legacy_lock_release legacy_fd legacy_dir
-        fi
+        _legacy_lock_release_all legacy_fd legacy_dir legacy1_fd legacy1_dir
         exit "$rc"
     )
 }
@@ -1519,16 +1523,22 @@ _rename_node_with_port() {
 #   _rewrite_link_port <link> <oldport> <newport>—— 换 host:port 段(改端口, host 不变)
 # **链接不含 @**时输出空串 —— 调用方必须保留原链接并提示, 不得把垃圾写回 metadata。
 # ---------------------------------------------------------------------------
-_rewrite_link_addr() {
-    local oldlink="$1" newaddr="$2"
-    [[ "$oldlink" == *@* ]] || { printf ''; return 0; }
-    local before_at="${oldlink%%@*}" after_at="${oldlink#*@}"
-    local host_part
+_link_at_split() {   # <link>; 无 @ 时返回 1 且不输出, 否则经调用方作用域给出 before_at/after_at/host_part
+    local link="$1"
+    [[ "$link" == *@* ]] || return 1
+    before_at="${link%%@*}"
+    after_at="${link#*@}"
     if [[ "$after_at" == "["* ]]; then
         host_part="${after_at%%]*}]"
     else
         host_part="${after_at%%[:/?#]*}"
     fi
+    return 0
+}
+
+_rewrite_link_addr() {
+    local oldlink="$1" newaddr="$2" before_at after_at host_part
+    _link_at_split "$oldlink" || { printf ''; return 0; }
     local new_host="$newaddr"
     # 仅按前缀判断 IPv6 括号, 不能把地址中任意 [ 当成已包裹。
     if [[ "$newaddr" == *":"* && "$newaddr" != "["* ]]; then
@@ -1538,15 +1548,8 @@ _rewrite_link_addr() {
 }
 
 _rewrite_link_port() {
-    local oldlink="$1" oldport="$2" newport="$3"
-    [[ "$oldlink" == *@* ]] || { printf ''; return 0; }
-    local before_at="${oldlink%%@*}" after_at="${oldlink#*@}"
-    local host_part
-    if [[ "$after_at" == "["* ]]; then
-        host_part="${after_at%%]*}]"
-    else
-        host_part="${after_at%%[:/?#]*}"
-    fi
+    local oldlink="$1" oldport="$2" newport="$3" before_at after_at host_part
+    _link_at_split "$oldlink" || { printf ''; return 0; }
     # oldport 与实际端口不符时输出空串; 调用方须保留原链接, 防止拼接损坏。
     local prefix="$host_part:$oldport" suffix
     [[ "$after_at" == "$prefix"* ]] || { printf ''; return 0; }
