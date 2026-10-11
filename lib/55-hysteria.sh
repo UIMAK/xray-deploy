@@ -412,20 +412,16 @@ _manage_hysteria() {
     local action="$1"
     local CORE_LOCK_FD="${CORE_LOCK_FD:-9}"
     local DEPLOY_INSTALL_LOCK_FD="${DEPLOY_INSTALL_LOCK_FD:-9}"
-    local XD_CORE_LEGACY_FLOCK_FD="${XD_CORE_LEGACY_FLOCK_FD:-9}"
-    local XD_INSTALL_LEGACY_FLOCK_FD="${XD_INSTALL_LEGACY_FLOCK_FD:-9}"
-    local XD_CORE_LEGACY1_FLOCK_FD="${XD_CORE_LEGACY1_FLOCK_FD:-9}"
-    local XD_INSTALL_LEGACY1_FLOCK_FD="${XD_INSTALL_LEGACY1_FLOCK_FD:-9}"
     case "$INIT_SYSTEM" in
         systemd)
             case "$action" in
                 start)
                     systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
-                    systemctl start "$HYSTERIA_SVC" 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
+                    systemctl start "$HYSTERIA_SVC" 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 stop)    systemctl stop "$HYSTERIA_SVC" 2>/dev/null 9>&- ;;
                 restart)
                     systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
-                    systemctl restart "$HYSTERIA_SVC" 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
+                    systemctl restart "$HYSTERIA_SVC" 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
@@ -433,7 +429,7 @@ _manage_hysteria() {
             case "$action" in
                 start)
                     _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1 9>&-
-                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
+                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 stop)
                     rc-service "$HYSTERIA_SVC" stop 2>/dev/null 9>&-
                     _hysteria_kill_stale_supervisor ;;
@@ -441,7 +437,7 @@ _manage_hysteria() {
                     rc-service "$HYSTERIA_SVC" stop 2>/dev/null 9>&-
                     _hysteria_kill_stale_supervisor
                     _hysteria_is_running || rc-service "$HYSTERIA_SVC" zap >/dev/null 2>&1 9>&-
-                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
+                    rc-service "$HYSTERIA_SVC" start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 status)
                     if _hysteria_openrc_status_unknown; then echo "unknown"
                     elif _hysteria_is_running; then echo "running"
@@ -461,7 +457,7 @@ _manage_hysteria() {
                         (
                             cd "$HYSTERIA_DATA_DIR" 2>/dev/null || cd /
                             exec nohup "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" --disable-update-check \
-                                >>"$HYSTERIA_LOG_FILE" 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&-
+                                >>"$HYSTERIA_LOG_FILE" 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&-
                         ) &
                         _xd_pidfile_write "$HYSTERIA_PID_FILE" "$!"
                         sleep 1

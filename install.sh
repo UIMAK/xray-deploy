@@ -132,7 +132,7 @@ _install_backup_identical() {   # <src> <dst>; 逐字节一致返回 0
     [ "$(wc -c < "$1" 2>/dev/null)" = "$(wc -c < "$2" 2>/dev/null)" ]
 }
 
-# 只用定向 sync；裸 sync 无法证明目标落盘，见 _reset_fsync_required。
+# 只用定向 sync；裸 sync 无法证明目标落盘(安装侧不降级为全局 sync)。
 _install_fsync() {   # <path>
     [ -e "$1" ] || return 0
     sync "$1" 2>/dev/null && return 0
@@ -554,23 +554,9 @@ _install_lock_root() {
     if mkdir -p /run/lock/xray-deploy 2>/dev/null; then printf '%s' "/run/lock/xray-deploy"; return 0; fi
     printf '%s' "/var/lock/xray-deploy"
 }
-INSTALL_LOCK_PARENT="${DEPLOY_DIR%/*}"
-INSTALL_LOCK_NAME="${DEPLOY_DIR##*/}"
-[ -n "$INSTALL_LOCK_PARENT" ] || INSTALL_LOCK_PARENT="/"
-# 参数校验前只初始化无副作用常量。
-# 主锁后协调已存在的 L1（部署父目录）/L2（部署树内）旧锁；无法确认则拒绝。
-# 不新建旧 .fd；旧进程晚启动/重建旧路径仍是协调边界，见 _install_legacy_lock_name。
-INSTALL_LEGACY1_LOCK_FILE="${INSTALL_LOCK_PARENT}/.${INSTALL_LOCK_NAME}.install.lock.fd"
-INSTALL_LEGACY1_LOCK_DIR="${INSTALL_LOCK_PARENT}/.${INSTALL_LOCK_NAME}.install.lock"
-INSTALL_LEGACY_LOCK_FILE="$DEPLOY_DIR/.install.lock.fd"
-INSTALL_LEGACY_LOCK_DIR="$DEPLOY_DIR/.install.lock"
 INSTALL_LOCK_HELD=0
 INSTALL_PRIMARY_MARKER_HELD=0
 INSTALL_LOCK_FD=""
-INSTALL_LEGACY_LOCK_FD=""
-INSTALL_LEGACY_LOCK_DIR_HELD=0
-INSTALL_LEGACY1_LOCK_FD=""
-INSTALL_LEGACY1_LOCK_DIR_HELD=0
 
 _install_lock_owner_pid() {   # [锁目录]; 输出持有者 PID; 非数字/空/**数值为 0** 一律输出空(视为"无法判定")
     local d="${1:-$INSTALL_LOCK_DIR}" p
@@ -692,182 +678,12 @@ _install_primary_marker_release() {
     return 0
 }
 
-# 旧锁 FD 必须仍对应路径 inode；路径被卸载重建或不可读时 fail-closed。
-_install_lock_inode_ok() {   # <fd> <path>
-    local fd="$1" p="$2" t
-    [ -n "$fd" ] && [ -n "$p" ] || return 0
-    [ -e "$p" ] || return 1
-    t=$(readlink "/proc/self/fd/$fd" 2>/dev/null) || return 1
-    case "$t" in
-        "$p") return 0 ;;
-        *" (deleted)") return 1 ;;
-        *) return 1 ;;
-    esac
-}
-
-# 旧锁 FD 还须与先前见证同 inode，防止存在 → 删除 → 重建绕过路径复核。
-_install_legacy_lock_identity_ok() {   # <fd> <见证fd>; 0 = 同一 inode
-    local fd="$1" wfd="$2"
-    [ -n "$fd" ] && [ -n "$wfd" ] || return 1
-    [ "/proc/self/fd/$fd" -ef "/proc/self/fd/$wfd" ]
-}
-
 # 路径的 dev:ino 标识(mkdir 标记的自愈判定)。取不到输出空; 调用方必须 fail-closed。
 _install_lock_devino() { stat -c '%d:%i' "$1" 2>/dev/null; }
 
-# L2 缺失时先扫描已删除部署文件的持有者，再重建路径；无法确认即拒绝。
-# 此扫描不能证明无 FD 的旧 mkdir 持有者已退出。
-_install_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持有已删除树中的 fd
-    local root="${1%/}" p pid target prefix matches find_rc
-    [ -n "$root" ] || return 1
-    prefix="${root}/"
-    if command -v find >/dev/null 2>&1; then
-        matches=$(find /proc/[0-9]*/fd -type l -lname "${prefix}* (deleted)" -print -quit 2>/dev/null)
-        find_rc=$?
-        if [ "$find_rc" -eq 0 ]; then
-            [ -n "$matches" ] && return 0
-            return 1
-        fi
-    fi
-    for p in /proc/[0-9]*/fd/*; do
-        pid=${p#/proc/}; pid=${pid%%/*}
-        [ "$pid" = "$$" ] && continue
-        # 扫描中关闭的 FD 跳过；上面的 find 快路径承担删除树检查。
-        target=$(readlink "$p" 2>/dev/null) || continue
-        case "$target" in
-            "$prefix"*" (deleted)") return 0 ;;
-        esac
-    done
-    return 1
-}
-
-# 旧 flock 活跃判据：0=被打开，1=确认无持有者，2=未知；mkdir 退路遇未知拒绝。
-_install_legacy_flock_active() {
-    local p pid target want="$1" matches find_rc
-    if command -v find >/dev/null 2>&1; then
-        matches=$(find /proc/[0-9]*/fd -type l -lname "$want" -print -quit 2>/dev/null)
-        find_rc=$?
-        if [ "$find_rc" -eq 0 ]; then
-            [ -n "$matches" ] && return 0
-            return 1
-        fi
-    fi
-    [ -d /proc ] || return 2
-    for p in /proc/[0-9]*/fd/*; do
-        pid=${p#/proc/}; pid=${pid%%/*}
-        [ "$pid" = "$$" ] && continue
-        # 逐 FD 读取失败返回 2，不猜无持有者；与 _xray_legacy_flock_active 同契约。
-        target=$(readlink "$p" 2>/dev/null) || return 2
-        [ "$target" = "$want" ] && return 0
-    done
-    return 1
-}
-
-# 仅协调已存在旧路径，不创建旧 .fd。
-# 同路径 flock + inode 复核 + L1/L2 mkdir 见证，防旧后端在检查后插入；失败由调用方释放主锁。
-_install_lock_legacy_flock_take() {   # <file> <dir> <fdvar> <heldvar> <label>
-    local lfile="$1" ldir="$2" fdvar="$3" heldvar="$4" label="$5"
-    local witness="" devino="" ef=""
-    # L1/L2 均占位并在释放时移除；缺旧 .fd 时仍不得新建。
-    if [ ! -e "$lfile" ]; then
-        # 缺旧 .fd 不补建；已有旧 mkdir 目录直接拒绝。
-        if [ -e "$ldir" ]; then
-            echo "[错误] ${label}目录仍存在: $ldir"
-            echo "       确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-        fi
-        return 1
-    fi
-    eval "exec {witness}<\"\$lfile\"" 2>/dev/null || witness=""
-    if [ -z "$witness" ]; then
-        echo "[错误] ${label}文件存在但无法打开见证, 本次安装中止: $lfile"
-        return 1
-    fi
-    if ! eval "exec {${fdvar}}>>\"\$lfile\"" 2>/dev/null; then
-        eval "exec ${witness}<&-" 2>/dev/null
-        echo "[错误] 无法打开${label}文件 $lfile(权限/只读文件系统?), 本次安装中止"
-        return 1
-    fi
-    eval "ef=\${${fdvar}}"
-    if ! _install_legacy_lock_identity_ok "$ef" "$witness"; then
-        echo "[错误] ${label}文件在判定后被删除/替换(部署目录正被卸载?), 本次中止"
-        eval "exec ${witness}<&-" 2>/dev/null
-        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    eval "exec ${witness}<&-" 2>/dev/null
-    if ! flock -n "$ef" 2>/dev/null; then
-        echo "[错误] 旧版安装/卸载仍在运行(持有 $lfile), 本次中止"
-        echo "       以免两棵树互相覆盖; 等它退出后重试(内核会在持有进程退出时自动释放)"
-        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    if ! _install_lock_inode_ok "$ef" "$lfile"; then
-        echo "[错误] ${label}文件在获取后被替换/删除(部署目录正被卸载?), 本次中止"
-        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    devino=$(_install_lock_devino "$lfile")
-    if [ -z "$devino" ]; then
-        echo "[错误] 无法读取${label}文件标识(dev:ino), 本次安装中止"
-        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    if [ -e "$ldir" ]; then
-        if [ -f "$ldir/.witness" ] && [ "$(cat "$ldir/.witness" 2>/dev/null)" = "$devino" ]; then
-            rm -rf "$ldir" 2>/dev/null
-        fi
-    fi
-    if [ -e "$ldir" ]; then
-        echo "[错误] ${label}目录仍存在: $ldir"
-        echo "       确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    if ! mkdir "$ldir" 2>/dev/null; then
-        echo "[错误] ${label}目录被占用或无法创建: $ldir"
-        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    eval "$heldvar=1"
-    if ! printf '%s\n' "$devino" > "$ldir/.witness" 2>/dev/null; then
-        rm -rf "$ldir" 2>/dev/null; eval "$heldvar=0"
-        echo "[错误] 无法写入${label}见证记录, 本次安装中止"
-        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    if ! printf '%s\n' "$$" > "$ldir/pid" 2>/dev/null; then
-        rm -rf "$ldir" 2>/dev/null; eval "$heldvar=0"
-        echo "[错误] 无法写入${label}持有者记录, 本次安装中止"
-        eval "exec ${ef}>&-" 2>/dev/null; eval "$fdvar=\"\""
-        return 1
-    fi
-    return 0
-}
-
-_install_lock_legacy_mkdir_take() {   # <file> <dir> <heldvar> <label>
-    local lfile="$1" ldir="$2" heldvar="$3" label="$4" lrc
-    # L1/L2 占位防旧 mkdir 后端插入，见 _install_lock_mkdir_release。
-    if [ -e "$lfile" ]; then
-        if ! declare -F _install_legacy_flock_active >/dev/null 2>&1; then
-            echo "[错误] 无法确认${label} flock 是否空闲(缺少检查助手), 本次安装中止"
-            return 1
-        fi
-        _install_legacy_flock_active "$lfile"; lrc=$?
-        case "$lrc" in
-            0|2)
-                echo "[错误] 检测到${label} flock 仍被占用或无法确认, 本次安装中止"
-                return 1
-                ;;
-        esac
-    fi
-    # 每路径只取锁一次，防止重复获取把自己的 PID 当竞争者并漏登记。
-    _install_lock_mkdir_take "$ldir" "$label" || return 1
-    eval "$heldvar=1"
-    return 0
-}
-
+# 安装锁串行化整版本事务：flock 优先，mkdir 退路永不自动接管。
 _install_lock_acquire() {
-    local lockdir="" lrc
+    local lockdir=""
     lockdir=$(dirname "$INSTALL_LOCK_FILE")
     [ -n "$lockdir" ] || lockdir="/"
     mkdir -p "$lockdir" 2>/dev/null || {
@@ -887,34 +703,10 @@ _install_lock_acquire() {
                 _install_lock_release
                 return 1
             fi
-            # L2 缺失先查删除树持有者再 mkdir；已有路径用见证/身份复核。
-            if [ ! -e "$INSTALL_LEGACY_LOCK_FILE" ] && [ ! -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
-                if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
-                    echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
-                    echo "       请等旧版 install/卸载退出后重试"
-                    _install_lock_release
-                    return 1
-                fi
-            fi
             if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
                 echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
                 _install_lock_release
                 return 1
-            fi
-            # 仅协调已存在的旧路径，见 _install_legacy_lock_name。
-            if [ -e "$INSTALL_LEGACY1_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY1_LOCK_DIR" ]; then
-                _install_lock_legacy_flock_take "$INSTALL_LEGACY1_LOCK_FILE" "$INSTALL_LEGACY1_LOCK_DIR" \
-                    INSTALL_LEGACY1_LOCK_FD INSTALL_LEGACY1_LOCK_DIR_HELD "旧版L1安装锁" || {
-                    _install_lock_release
-                    return 1
-                }
-            fi
-            if [ -e "$INSTALL_LEGACY_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
-                _install_lock_legacy_flock_take "$INSTALL_LEGACY_LOCK_FILE" "$INSTALL_LEGACY_LOCK_DIR" \
-                    INSTALL_LEGACY_LOCK_FD INSTALL_LEGACY_LOCK_DIR_HELD "旧版安装锁" || {
-                    _install_lock_release
-                    return 1
-                }
             fi
             return 0
         fi
@@ -924,50 +716,13 @@ _install_lock_acquire() {
         echo "       退出后释放, 通常数十秒; 启用 retry 时可能更久)。本次中止以免两棵树互相覆盖"
         return 1
     fi
-    # mkdir 退路永不自动接管；主锁后才创建部署树和协调旧锁。
+    # mkdir 退路永不自动接管；主锁后才创建部署树。
     _install_lock_mkdir_take "$INSTALL_LOCK_DIR" "安装锁" || return 1
     INSTALL_LOCK_HELD=1
-    if ! declare -F _install_legacy_flock_active >/dev/null 2>&1; then
-        echo "[错误] 无法确认安装 flock 主锁是否空闲(缺少 /proc 检查助手), 安装中止"
-        _install_lock_release
-        return 1
-    fi
-    _install_legacy_flock_active "$INSTALL_LOCK_FILE"; lrc=$?
-    case "$lrc" in
-        0|2)
-            echo "[错误] 安装 flock 主锁被占用或无法确认, 安装中止"
-            _install_lock_release
-            return 1
-            ;;
-    esac
-    # L2 缺失时先扫描删除树，再建部署目录，顺序与 flock 分支相同。
-    if [ ! -e "$INSTALL_LEGACY_LOCK_FILE" ] && [ ! -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
-        if _install_legacy_deleted_tree_active "$DEPLOY_DIR"; then
-            echo "[错误] 检测到旧版进程仍持有已删除部署树的文件, 本次安装中止"
-            echo "       请等旧版 install/卸载退出后重试"
-            _install_lock_release
-            return 1
-        fi
-    fi
     if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
         echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
         _install_lock_release
         return 1
-    fi
-    # 无 flock 时同样协调已有旧锁：检查旧 flock，再占位 mkdir；不补建旧 .fd。
-    if [ -e "$INSTALL_LEGACY1_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY1_LOCK_DIR" ]; then
-        _install_lock_legacy_mkdir_take "$INSTALL_LEGACY1_LOCK_FILE" "$INSTALL_LEGACY1_LOCK_DIR" \
-            INSTALL_LEGACY1_LOCK_DIR_HELD "旧版L1安装锁" || {
-            _install_lock_release
-            return 1
-        }
-    fi
-    if [ -e "$INSTALL_LEGACY_LOCK_FILE" ] || [ -e "$INSTALL_LEGACY_LOCK_DIR" ]; then
-        _install_lock_legacy_mkdir_take "$INSTALL_LEGACY_LOCK_FILE" "$INSTALL_LEGACY_LOCK_DIR" \
-            INSTALL_LEGACY_LOCK_DIR_HELD "旧版安装锁" || {
-            _install_lock_release
-            return 1
-        }
     fi
     return 0
 }
@@ -975,25 +730,6 @@ _install_lock_acquire() {
 _install_lock_release() {
     [ "${INSTALL_LOCK_HELD:-0}" = "1" ] || return 0
     local rc=0
-    # 持配对 flock 时先删旧 mkdir 见证，防释放交错误删新持有者 marker。
-    if [ "${INSTALL_LEGACY1_LOCK_DIR_HELD:-0}" = "1" ]; then
-        _install_lock_mkdir_release "$INSTALL_LEGACY1_LOCK_DIR"
-        INSTALL_LEGACY1_LOCK_DIR_HELD=0
-    fi
-    if [ "${INSTALL_LEGACY_LOCK_DIR_HELD:-0}" = "1" ]; then
-        _install_lock_mkdir_release "$INSTALL_LEGACY_LOCK_DIR"
-        INSTALL_LEGACY_LOCK_DIR_HELD=0
-    fi
-    if [ -n "${INSTALL_LEGACY1_LOCK_FD:-}" ]; then
-        flock -u "$INSTALL_LEGACY1_LOCK_FD" 2>/dev/null
-        eval "exec ${INSTALL_LEGACY1_LOCK_FD}>&-" 2>/dev/null
-        INSTALL_LEGACY1_LOCK_FD=""
-    fi
-    if [ -n "${INSTALL_LEGACY_LOCK_FD:-}" ]; then
-        flock -u "$INSTALL_LEGACY_LOCK_FD" 2>/dev/null
-        eval "exec ${INSTALL_LEGACY_LOCK_FD}>&-" 2>/dev/null
-        INSTALL_LEGACY_LOCK_FD=""
-    fi
     if [ "${INSTALL_PRIMARY_MARKER_HELD:-0}" = "1" ]; then
         _install_primary_marker_release || rc=1
     fi
