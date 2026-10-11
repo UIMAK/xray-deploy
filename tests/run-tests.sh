@@ -728,6 +728,22 @@ if (
     [ -e "$TMP/hysteria-stop-verified" ]
 ); then pass 'transient Hysteria validation uses terminal stop verifier'; else fail 'transient Hysteria validation uses terminal stop verifier'; fi
 
+printf '== hy2 env reader fallback ==\n'
+# 读取器: rc 0 命中并剥离工具补的单个换行, 1 缺失, 2 工具故障(未知)。
+# 探测值**以换行结尾**, 才能区分"剥一个换行"与命令替换的"剥全部尾随换行"。
+if (
+    export _XD_PROBE_TEST=$'v1\nv2\n'
+    _hy2_env_from_tool _XD_PROBE_TEST printenv || exit 1
+    [ "$_HY2_ENV_VAL" = $'v1\nv2\n' ]
+); then pass 'hy2 env reader strips exactly one trailing newline'; else fail 'hy2 env reader strips exactly one trailing newline'; fi
+_hy2_env_from_tool _XD_DEFINITELY_UNSET_VAR printenv; _hy2_rc=$?
+if [ "$_hy2_rc" -eq 1 ]; then pass 'hy2 env reader reports absent (rc=1) for missing variable'; else fail "hy2 env reader reports absent (rc=1) for missing variable (rc=$_hy2_rc)"; fi
+(
+    command() { [ "${1:-}" = -v ] && return 1; builtin command "$@"; }
+    _hy2_env_get PATH
+) >/dev/null 2>&1; _hy2_rc=$?
+if [ "$_hy2_rc" -eq 2 ]; then pass 'hy2 env reports unknown (rc=2) when no reader is available'; else fail "hy2 env reports unknown (rc=2) when no reader is available (rc=$_hy2_rc)"; fi
+
 printf '== approved repair regressions ==\n'
 if (
     CONFIG_DIR="$TMP/duplicate-confs"

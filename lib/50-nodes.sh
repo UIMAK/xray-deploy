@@ -3404,7 +3404,7 @@ EOF
 }
 
 # env值通过全局 _HY2_ENV_VAL/_HY2_CERT_ROOT 传递；命令替换会剥尾随换行。
-# 读取当前环境依次 printenv/env -0/busybox printenv，NUL终止保全字节；0存在、1缺失、2未知。
+# 读取当前环境依次 printenv/busybox printenv，NUL终止保全字节；0存在、1缺失、2未知。
 _HY2_ENV_VAL=""
 # 环境读取不使用 /proc/self/environ 或逐行awk；前者是初始环境，后者丢失换行值。
 _hy2_env_from_tool() {
@@ -3422,7 +3422,7 @@ _hy2_env_from_tool() {
 }
 
 _hy2_env_get() {
-    local name="$1" kv="" rc=0
+    local name="$1" rc=0
     _HY2_ENV_VAL=""
     [ -n "$name" ] || return 1
     # ① printenv(首选: 读当前环境 —— 脚本自身 export 的变量同样可见)
@@ -3431,45 +3431,7 @@ _hy2_env_get() {
         _hy2_env_from_tool "$name" printenv; rc=$?
         [ "$rc" -ne 2 ] && return "$rc"
     fi
-    # env -0 用临时普通文件保留NUL边界；解析失败或无法观察返回UNKNOWN，不猜测为空。
-    if command -v env >/dev/null 2>&1; then
-        local ef="" erc=125 erd=1 efd="" hit="" found=0
-        ef=$(mktemp 2>/dev/null) || ef=""
-        [ -n "$ef" ] && { env -0 > "$ef" 2>/dev/null; erc=$?; }
-        if [ "$erc" -eq 0 ]; then
-            erd=0
-            # 用 {var}< 取一个高位空闲 fd, 不动调用方可能正在用的 3/4
-            if exec {efd}< "$ef" 2>/dev/null; then
-                # exec成功后仍确认普通文件再read；目录read可失败且无法证明环境值。
-                if [ -d /proc/self/fd ]; then
-                    [ -f "/proc/self/fd/$efd" ] || erd=2       # 机制可用 ⇒ 只信 fd
-                else
-                    [ -f "$ef" ] || erd=2                      # 无 /proc ⇒ 退回路径检查
-                fi
-                if [ "$erd" -eq 0 ]; then
-                    while :; do
-                        kv=""                              # 先清空: 使"EOF 后仍有残留"可判定
-                        IFS= read -r -d '' kv <&"$efd"; erd=$?
-                        [ "$erd" -ne 0 ] && break
-                        case "$kv" in
-                            "$name="*) hit="${kv#"$name="}"; found=1; break ;;
-                        esac
-                    done
-                fi
-                exec {efd}<&-
-            else
-                erd=2                                       # 打不开 ⇒ 无法确认完整性
-            fi
-            rm -f "$ef"
-            [ "$erd" -gt 1 ] && return 2                    # 读错误 ⇒ UNKNOWN
-            [ "$erd" -eq 1 ] && [ -n "$kv" ] && return 2    # 末条缺 NUL(截断) ⇒ UNKNOWN
-            if [ "$found" -eq 1 ]; then _HY2_ENV_VAL="$hit"; return 0; fi
-            return 1                                        # 读取正常结束且未命中 ⇒ 确实不存在
-        fi
-        [ -n "$ef" ] && rm -f "$ef"
-        # 该读取器不可用 ⇒ 落到 ③(busybox printenv); 全不可用才 UNKNOWN
-    fi
-    # ③ busybox printenv: `command -v printenv` 失败不等于 busybox 没有该 applet ——
+    # ② busybox printenv: `command -v printenv` 失败不等于 busybox 没有该 applet ——
     #    可能只是 applet 没建 symlink, 故显式走 `busybox printenv`(仍是当前环境)。
     if command -v busybox >/dev/null 2>&1 && busybox printenv >/dev/null 2>&1; then
         _hy2_env_from_tool "$name" busybox printenv; rc=$?

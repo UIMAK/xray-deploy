@@ -646,18 +646,15 @@ _reset_config() {
 _reset_journal_path() { printf '%s' "$DEPLOY_DIR/.reset-journal.json"; }
 _reset_snapshot_path() { printf '%s' "$DEPLOY_DIR/.reset-snapshot"; }
 
-_reset_fsync_strict() {
+# reset 落盘屏障: 定向 sync, 退路 sync -f; **不退裸 sync**(裸 sync 无法证明目标已落盘),
+# 与安装侧 _install_fsync 同口径。全部失败才报错。
+_reset_fsync_required() {
     local p="$1"
     [ -n "$p" ] || return 0
-    # 定向 sync 失败不退裸 sync；仅 sync -f 可作为定向能力退路。
-    if sync "$p" >/dev/null 2>&1; then return 0; fi
-    if sync -f "$p" >/dev/null 2>&1; then return 0; fi
+    sync "$p" >/dev/null 2>&1 && return 0
+    sync -f "$p" >/dev/null 2>&1 && return 0
     _error "无法确认 reset 持久化屏障: $p"
     return 1
-}
-
-_reset_fsync_required() {
-    _reset_fsync_strict "$1" || { _error "reset 持久化屏障失败: $1"; return 1; }
 }
 
 _reset_fsync_rename() {   # <source> <destination>
@@ -744,7 +741,9 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_
     return "$ok"
 }
 
-# 写 reset 账本(唯一入口): 经 `_atomic_write_json` 落盘(fsync 文件 + 父目录)。
+# 写 reset 账本(唯一入口): 先经 `_atomic_write_json` 落盘, 再用严格的 `_reset_fsync_required`
+# 复核日志文件与父目录。**不依赖 _atomic_write_json 的 _fsync_path**: 后者是尽力而为(best-effort),
+# 定向失败会退到裸 sync 且不传播失败; reset 删除配置/iptables 前 journal 必须可靠落盘。
 _reset_journal_write() {   # <journal> <snapshot> <phase> <had_json> <specs_json>
     local content
     content=$(jq -nc --arg snap "$2" --arg phase "$3" --argjson had "$4" --argjson specs "$5" \

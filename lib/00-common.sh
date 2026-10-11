@@ -1292,62 +1292,10 @@ _press_any_key() {
 }
 
 # ---------------------------------------------------------------------------
-# 跨版本旧锁协调: L2 路径缺失时补删除树扫描, 再协调已存在的 L1/L2 旧路径。
-# fd/目录变量名由调用方给出, 取值写入调用方作用域(本函数不得把这些名字声明为 local)。
-# 返回 1 = 必须放弃本次操作; 本函数只回滚自己已取到的 L2 锁, 调用方的锁现场自行清理。
-# 缺 _xray_legacy_lock_name / _xray_legacy_deleted_tree_active 时 fail-closed; 缺 _xray_legacy_lock_release 时不动。
-# ---------------------------------------------------------------------------
-_legacy_lock_coordinate() {   # <deploy_path> <lfile> <ldir> <l1file> <l1dir> <fdv> <dirv> <l1fdv> <l1dirv>
-    local lc_deploy="$1" lc_lfile="$2" lc_ldir="$3" lc_l1file="$4" lc_l1dir="$5"
-    local lc_fdv="$6" lc_dirv="$7" lc_l1fdv="$8" lc_l1dirv="$9"
-    # L2 路径不存在时补删除树扫描(旧版锁文件在部署树内, rm -rf 后 fd 仍在)。
-    if [ ! -e "$lc_lfile" ] && [ ! -e "$lc_ldir" ]; then
-        # 混装版本缺该助手时 fail-closed, 与下面 _xray_legacy_lock_name 的守卫一致。
-        if ! declare -F _xray_legacy_deleted_tree_active >/dev/null 2>&1; then
-            _error "缺少 _xray_legacy_deleted_tree_active, 无法检查已删除部署树中的旧版锁, 放弃本次配置修改"
-            return 1
-        fi
-        if _xray_legacy_deleted_tree_active "$lc_deploy"; then
-            _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次配置修改"
-            return 1
-        fi
-    fi
-    # 跨版本协调(仅对已存在的旧路径)。
-    if [ -e "$lc_lfile" ] || [ -e "$lc_ldir" ]; then
-        if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
-           || ! _xray_legacy_lock_name "$lc_fdv" "$lc_dirv" \
-                "$lc_lfile" "$lc_ldir" "旧版配置锁"; then
-            _error "无法协调旧版配置锁, 放弃本次修改"
-            return 1
-        fi
-    fi
-    if [ -e "$lc_l1file" ] || [ -e "$lc_l1dir" ]; then
-        if ! declare -F _xray_legacy_lock_name >/dev/null 2>&1 \
-           || ! _xray_legacy_lock_name "$lc_l1fdv" "$lc_l1dirv" \
-                "$lc_l1file" "$lc_l1dir" "旧版L1配置锁"; then
-            _error "无法协调旧版L1配置锁, 放弃本次修改"
-            if declare -F _xray_legacy_lock_release >/dev/null 2>&1; then
-                _xray_legacy_lock_release "$lc_fdv" "$lc_dirv"
-            fi
-            return 1
-        fi
-    fi
-    return 0
-}
-
-# 按取锁反序释放 L1/L2 旧锁; 缺 _xray_legacy_lock_release 时不动。
-_legacy_lock_release_all() {   # <fdv> <dirv> <l1fdv> <l1dirv>
-    declare -F _xray_legacy_lock_release >/dev/null 2>&1 || return 0
-    _xray_legacy_lock_release "$3" "$4"
-    _xray_legacy_lock_release "$1" "$2"
-}
-
 # 无 flock 时 config.lock.d 原子 mkdir + pid; 既有目录一律拒绝, SIGKILL 残留需人工清理。
-# 跨版本 L1/L2 × flock/mkdir 协调见 _xray_legacy_lock_name; 缺 helper 时 fail-closed。
+# ---------------------------------------------------------------------------
 _with_config_lock_mkdir() {
-    local deploy_path="${DEPLOY_DIR%/}" lock_dir lock_file rc owner lrc
-    local legacy_lock_file legacy_lock_dir legacy1_lock_file legacy1_lock_dir
-    local legacy_fd="" legacy_dir="" legacy1_fd="" legacy1_dir=""
+    local deploy_path="${DEPLOY_DIR%/}" lock_dir rc owner
     case "$deploy_path" in
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立配置锁: $DEPLOY_DIR"; return 1 ;;
@@ -1356,11 +1304,6 @@ _with_config_lock_mkdir() {
         _error "部署目录路径无效, 无法建立配置锁: $DEPLOY_DIR"
         return 1
     fi
-    legacy_lock_file="$deploy_path/.config.lock"
-    legacy_lock_dir="$deploy_path/.config.lock.d"
-    legacy1_lock_file="${deploy_path%/*}/.${deploy_path##*/}.config.lock"
-    legacy1_lock_dir="${deploy_path%/*}/.${deploy_path##*/}.config.lock.d"
-    lock_file="$(_deploy_lock_root)/config.lock"
     lock_dir="$(_deploy_lock_root)/config.lock.d"
     mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || {
         _error "无法创建配置锁目录 $(dirname "$lock_dir")(权限/只读文件系统?), 放弃本次修改"
@@ -1378,29 +1321,8 @@ _with_config_lock_mkdir() {
         _error "无法写入配置锁持有者记录 $lock_dir/pid(磁盘空间/权限?), 放弃本次修改"
         return 1
     fi
-    if ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
-        _error "无法确认配置 flock 主锁是否空闲(缺少 /proc 检查助手), 放弃本次修改"
-        rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null
-        return 1
-    fi
-    _xray_legacy_flock_active "$lock_file"; lrc=$?
-    case "$lrc" in
-        0|2)
-            _error "配置 flock 主锁被占用或无法确认, 放弃本次修改"
-            rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null
-            return 1
-            ;;
-    esac
     if [ ! -d "$deploy_path" ]; then
         _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $deploy_path"
-        rm -f "$lock_dir/pid" 2>/dev/null
-        rmdir "$lock_dir" 2>/dev/null
-        return 1
-    fi
-    # 跨版本旧锁协调; 失败时清理本次锁现场并放弃。
-    if ! _legacy_lock_coordinate "$deploy_path" \
-         "$legacy_lock_file" "$legacy_lock_dir" "$legacy1_lock_file" "$legacy1_lock_dir" \
-         legacy_fd legacy_dir legacy1_fd legacy1_dir; then
         rm -f "$lock_dir/pid" 2>/dev/null
         rmdir "$lock_dir" 2>/dev/null
         return 1
@@ -1411,7 +1333,6 @@ _with_config_lock_mkdir() {
         "$@"
     )
     rc=$?
-    _legacy_lock_release_all legacy_fd legacy_dir legacy1_fd legacy1_dir
     owner=$(cat "$lock_dir/pid" 2>/dev/null)
     if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
         _error "配置锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
@@ -1423,7 +1344,6 @@ _with_config_lock_mkdir() {
 
 # ---------------------------------------------------------------------------
 # 配置 RMW 锁: 锁根在部署树外, 卸载不能拆开 inode 导致并发覆盖。
-# 跨版本协调已存在的 L1/L2 × flock/mkdir, 见 _xray_legacy_lock_name; 无锁旧写者无法协调。
 # 锁序 install → config → core; 本函数不自取 install lock, 无 flock 时 mkdir 退路 fail-closed。
 # XRAY_DEPLOY_LOCK_HELD=1 支持重入; 子 shell 透传返回码并在退出时释放 fd。
 # ---------------------------------------------------------------------------
@@ -1436,18 +1356,13 @@ _with_config_lock() {
         _with_config_lock_mkdir "$@"
         return $?
     fi
-    local config_lock_file config_lock_dir legacy1_lock_file legacy_lock_file
-    local legacy1_lock_dir legacy_lock_dir
+    local config_lock_file config_lock_dir
     config_lock_file="$(_deploy_lock_root)/config.lock"
     config_lock_dir="$(_deploy_lock_root)/config.lock.d"
-    legacy1_lock_file="${DEPLOY_DIR%/*}/.${DEPLOY_DIR##*/}.config.lock"
-    legacy1_lock_dir="${DEPLOY_DIR%/*}/.${DEPLOY_DIR##*/}.config.lock.d"
-    legacy_lock_file="$DEPLOY_DIR/.config.lock"
-    legacy_lock_dir="$DEPLOY_DIR/.config.lock.d"
     (
         # 只建锁根不重建部署树; 主锁后确认部署仍存在。
         mkdir -p "$(dirname "$config_lock_file")" 2>/dev/null
-        # 主锁在锁根, 旧锁仅协调已存在路径; exec 不得永久重定向 stderr 吞掉事务错误。
+        # 主锁在锁根; exec 不得永久重定向 stderr 吞掉事务错误。
         if ! exec 9>"$config_lock_file"; then
             _error "无法创建配置锁文件 $config_lock_file(目录不可写?), 放弃本次修改"
             exit 1
@@ -1472,19 +1387,9 @@ _with_config_lock() {
             _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
         fi
-        # 跨版本旧锁协调(仅对**已存在**的旧路径); 旧文件缺失时拒绝而不是新建, 见
-        # _xray_legacy_lock_name 契约。混装版本缺该助手时 fail-closed。
-        local legacy_fd="" legacy_dir="" legacy1_fd="" legacy1_dir=""
-        if ! _legacy_lock_coordinate "$DEPLOY_DIR" \
-             "$legacy_lock_file" "$legacy_lock_dir" "$legacy1_lock_file" "$legacy1_lock_dir" \
-             legacy_fd legacy_dir legacy1_fd legacy1_dir; then
-            exit 1
-        fi
         export XRAY_DEPLOY_LOCK_HELD=1
         "$@"
-        local rc=$?
-        _legacy_lock_release_all legacy_fd legacy_dir legacy1_fd legacy1_dir
-        exit "$rc"
+        exit "$?"
     )
 }
 

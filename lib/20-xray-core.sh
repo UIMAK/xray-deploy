@@ -378,295 +378,9 @@ _xray_core_lock_fd_reset() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# 跨版本锁: L2(≤0.17.11)在 DEPLOY_DIR 内, L1(0.17.13/0.18.0)在部署父目录。
-# 新主锁在锁根; 取主锁后协调已存在旧路径, 不凭空新建旧 flock 文件。
-# 不按当前 flock 可用性猜旧后端: flock/mkdir 两路都检查, 占用或身份未知即 fail-closed。
-# flock 见证 inode 后再加锁并复核; 无 flock 时先扫描他人打开的旧文件。
-# 旧 mkdir 同名标记占位, 释放时删除; SIGKILL 残留仅在匹配 .witness 时可自愈。
-# L2 缺失先扫描删除树; 缺失旧 flock 文件后来新建的窗口仍无法封住, 非跨版本结构性消除。
-# ---------------------------------------------------------------------------
-# 旧版 mkdir 目录锁活持有者/残留: 净化 pid 后拒绝, 绝不删除别人的锁目录(树内外同口径)。
-_legacy_dir_lock_reject() {   # <ldir> <label>; 固定返回 1, 锁清理留在调用方
-    local owner
-    owner=$(cat "$1/pid" 2>/dev/null)
-    case "$owner" in
-        ''|*[!0-9]*) owner="" ;;
-        *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
-    esac
-    _error "旧版${2}目录锁仍存在(pid ${owner:-未知}): $1"
-    _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-    return 1
-}
-
-_xray_legacy_lock_name() {   # <fd变量名> <mkdir变量名> <flock文件> <mkdir目录> <显示名>
-    local fdvar="$1" dirvar="$2" lfile="$3" ldir="$4" label="$5" i ef lrc locked=0
-    local witness="" deploy_dir devino
-    # **变量名按锁家族分开**: 卸载要同时持 install 锁与 core 锁, 共用全局会让后取的覆盖先取的,
-    # 先取那把 fd 再没人关闭/解锁(锁泄漏到进程退出)。
-    eval "$fdvar=\"\""
-    eval "$dirvar=\"\""
-    # L1/L2 均创建临时 mkdir 标记; witness 自愈与缺失 flock 的边界见 _xray_legacy_lock_name 契约。
-    if command -v flock >/dev/null 2>&1; then
-        # (T1) 旧 flock 文件不存在 ⇒ **绝不为了"协调"新建它**(否则又把锁文件写回 /opt)。
-        # 若旧 mkdir 目录存在 ⇒ 旧会话仍在, fail-closed; 否则调用方本就不该调用。
-        if [ ! -e "$lfile" ]; then
-            if [ -e "$ldir" ]; then
-                _error "旧版${label}目录锁仍存在: $ldir"
-                _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-            fi
-            return 1
-        fi
-        # 旧 flock 文件已存在: 用**见证 fd** 记下它此刻的 inode 身份(只读, 不加锁)。
-        eval "exec {witness}<\"\$lfile\"" 2>/dev/null || witness=""
-        if [ -z "$witness" ]; then
-            _error "旧版${label}文件存在但无法打开见证, 放弃本次操作: $lfile"
-            return 1
-        fi
-        if ! eval "exec {${fdvar}}>>\"\$lfile\""; then
-            [ -n "$witness" ] && eval "exec ${witness}<&-" 2>/dev/null
-            _error "无法打开旧版${label} $lfile, 放弃本次操作"
-            return 1
-        fi
-        eval "ef=\${${fdvar}}"
-        # 打开的 fd 必须仍是 T1 见证的 inode, 拒绝路径删除/重建造成的双重持锁。
-        if [ -n "$witness" ]; then
-            if ! _xray_legacy_lock_identity_ok "$ef" "$witness"; then
-                _error "旧版${label}文件在判定后被删除/替换(部署目录正被卸载?), 拒绝继续: $lfile"
-                _tip "等对方结束后重试; 本次不做任何落地"
-                eval "exec ${witness}<&-" 2>/dev/null
-                eval "exec ${ef}>&-" 2>/dev/null
-                eval "$fdvar=\"\""
-                return 1
-            fi
-            eval "exec ${witness}<&-" 2>/dev/null
-            witness=""
-        fi
-        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-            if flock -n "$ef" 2>/dev/null; then locked=1; break; fi
-            sleep 1
-        done
-        if [ "$locked" -ne 1 ]; then
-            _error "旧版${label}仍被占用(15s), 可能仍有旧版会话在操作: $lfile"
-            _tip "等旧版会话退出后重试(内核会在持有进程退出时自动释放该锁)"
-            eval "exec ${ef}>&-" 2>/dev/null
-            eval "$fdvar=\"\""
-            return 1
-        fi
-        # 同名 mkdir 标记排斥旧后端; .witness=flock dev:ino, 只有匹配且持有同一 flock 才可接管。
-        devino=$(_xray_devino "$lfile" 2>/dev/null)
-        if [ -z "$devino" ]; then
-            _error "无法读取旧版${label}文件标识(dev:ino), 放弃本次操作: $lfile"
-            eval "exec ${ef}>&-" 2>/dev/null
-            eval "$fdvar=\"\""
-            return 1
-        fi
-        if [ -e "$ldir" ]; then
-            if [ -f "$ldir/.witness" ] && [ "$(cat "$ldir/.witness" 2>/dev/null)" = "$devino" ]; then
-                # 同族进程上次持锁时被强杀留下的标记: 此刻已无人持有该 flock ⇒ 安全清理
-                rm -rf "$ldir" 2>/dev/null
-            fi
-        fi
-        if [ -e "$ldir" ]; then
-            _legacy_dir_lock_reject "$ldir" "$label"
-            flock -u "$ef" 2>/dev/null
-            eval "exec ${ef}>&-" 2>/dev/null
-            eval "$fdvar=\"\""
-            return 1
-        fi
-        if ! mkdir "$ldir" 2>/dev/null; then
-            _error "旧版${label}目录锁被占用或无法创建: $ldir"
-            _tip "确认没有旧版会话在运行后, 请人工检查该锁目录后重试"
-            flock -u "$ef" 2>/dev/null
-            eval "exec ${ef}>&-" 2>/dev/null
-            eval "$fdvar=\"\""
-            return 1
-        fi
-        # 先写 .witness 再写 pid: 若恰在此刻被杀, 留下"有 witness 无 pid"的目录仍可被同族进程
-        # 安全接管; 反过来只能人工处理。任一步写入失败都滚回去(fail-closed)。
-        if ! printf '%s\n' "$devino" > "$ldir/.witness" 2>/dev/null; then
-            rm -rf "$ldir" 2>/dev/null
-            flock -u "$ef" 2>/dev/null
-            eval "exec ${ef}>&-" 2>/dev/null
-            eval "$fdvar=\"\""
-            _error "无法写入旧版${label}见证记录 $ldir/.witness, 放弃本次操作"
-            return 1
-        fi
-        if ! printf '%s\n' "$$" > "$ldir/pid" 2>/dev/null; then
-            rm -rf "$ldir" 2>/dev/null
-            flock -u "$ef" 2>/dev/null
-            eval "exec ${ef}>&-" 2>/dev/null
-            eval "$fdvar=\"\""
-            _error "无法写入旧版${label}持有者记录 $ldir/pid, 放弃本次操作"
-            return 1
-        fi
-        eval "$dirvar=\"\$ldir\""
-        return 0
-    fi
-    # 无 flock: 旧版可能走 mkdir 目录锁, 但仍先检查旧 flock 文件是否被某进程打开。
-    # 无 flock 时只能阻止已存在的旧 flock 持有者; 同环境旧版也无 flock 时 mkdir 标记提供完整互斥。
-    if [ -e "$lfile" ] && ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
-        _error "无法确认旧版${label} flock 文件是否空闲(缺少检查助手): $lfile"
-        return 1
-    fi
-    if [ -e "$lfile" ] && declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
-        _xray_legacy_flock_active "$lfile"; lrc=$?
-        case "$lrc" in
-            0|2)
-                _error "旧版${label}不可确认空闲(旧 flock 文件: $lfile), 放弃本次操作"
-                _tip "确认没有旧版会话在运行后, 请人工检查旧锁现场并重试"
-                return 1
-                ;;
-        esac
-    fi
-    # 旧版 mkdir 目录已存在 ⇒ 活持有者/残留一律拒绝, 绝不删除别人的锁目录(树内外同口径)。
-    if [ -e "$ldir" ]; then
-        _legacy_dir_lock_reject "$ldir" "$label"
-        return 1
-    fi
-    # 无 flock: 创建旧 mkdir 目录前先跑删除树扫描 —— 与 flock 分支"即将新建 inode"同口径。
-    # 删除树扫描根固定 DEPLOY_DIR; L1 在树外, 不得扫描整个部署父目录并误伤其它软件。
-    deploy_dir="${DEPLOY_DIR%/}"
-    if _xray_legacy_deleted_tree_active "$deploy_dir"; then
-        _error "检测到旧版进程仍持有已删除部署树的文件, 拒绝新建旧版${label}目录: $ldir"
-        _tip "等旧版会话结束后重试"
-        return 1
-    fi
-    # 无 flock: 旧版走的是 mkdir 目录锁。活持有者/残留一律拒绝, 绝不删除别人的锁目录。
-    if ! mkdir "$ldir" 2>/dev/null; then
-        _error "旧版${label}不可用: $ldir"
-        _tip "确认没有旧版会话在运行后, 请人工检查并清理该锁目录后重试"
-        return 1
-    fi
-    if ! printf '%s\n' "$$" > "$ldir/pid" 2>/dev/null; then
-        rm -f "$ldir/pid" 2>/dev/null
-        rmdir "$ldir" 2>/dev/null
-        _error "无法写入旧版${label}持有者记录 $ldir/pid, 放弃本次操作"
-        return 1
-    fi
-    eval "$dirvar=\"\$ldir\""
-    return 0
-}
-
-# <path> 被其他进程打开为 fd: 0=有, 1=没有, 2=无法确认。
-_xray_legacy_flock_active() {
-    local p pid target want="$1" matches find_rc
-    if command -v find >/dev/null 2>&1; then
-        matches=$(find /proc/[0-9]*/fd -type l -lname "$want" -print -quit 2>/dev/null)
-        find_rc=$?
-        if [ "$find_rc" -eq 0 ]; then
-            [ -n "$matches" ] && return 0
-            return 1
-        fi
-    fi
-    [ -d /proc ] || return 2
-    for p in /proc/[0-9]*/fd/*; do
-        pid=${p#/proc/}; pid=${pid%%/*}
-        [ "$pid" = "$$" ] && continue
-        target=$(readlink "$p" 2>/dev/null) || return 2
-        [ "$target" = "$want" ] && return 0
-    done
-    return 1
-}
-
-# 加锁后复核 fd 与路径 inode, 删除/替换或不可读即 fail-closed, 防止已解除链接的锁双重放行。
-_xray_legacy_lock_inode_ok() {   # <fd> <path>; 0 = 我们持有的 fd 仍指向该路径上的文件
-    local fd="$1" p="$2" t
-    [ -n "$fd" ] && [ -n "$p" ] || return 0
-    [ -e "$p" ] || return 1
-    t=$(readlink "/proc/self/fd/$fd" 2>/dev/null) || return 1
-    case "$t" in
-        "$p") return 0 ;;
-        *" (deleted)") return 1 ;;
-        *) return 1 ;;
-    esac
-}
-
-# fd 必须与创建动作前打开的 T1 witness 同 inode; 仅 fd 与当前路径相符不够。
-# /proc 不可读则无法确认并拒绝。
-_xray_legacy_lock_identity_ok() {   # <fd> <见证fd>; 0 = 同一 inode
-    local fd="$1" wfd="$2"
-    [ -n "$fd" ] && [ -n "$wfd" ] || return 1
-    [ "/proc/self/fd/$fd" -ef "/proc/self/fd/$wfd" ]
-}
-
-# 路径的 dev:ino 标识(用于 mkdir 标记的自愈判定)。取不到输出空; 调用方必须 fail-closed。
-_xray_devino() { stat -c '%d:%i' "$1" 2>/dev/null; }
-
-_xray_legacy_lock_release() {   # <fd变量名> <mkdir变量名>
-    local fdvar="$1" dirvar="$2" ef d owner rc=0
-    eval "d=\${${dirvar}:-}"
-    if [ -n "$d" ]; then
-        owner=$(cat "$d/pid" 2>/dev/null) || owner=""
-        if [ "$owner" = "$$" ]; then
-            # 先删本进程确认持有的旧 mkdir 见证, 再解 flock; 反序会让新 flock 持有者
-            # 在旧 marker 尚未释放时误判/接管, 留下跨后端交错窗口。
-            if ! rm -rf "$d" 2>/dev/null || [ -e "$d" ] || [ -L "$d" ]; then
-                _error "无法移除本进程持有的旧锁见证目录: $d"
-                rc=1
-            else
-                eval "$dirvar=\"\""
-            fi
-        elif [ -e "$d" ] || [ -L "$d" ]; then
-            _error "旧锁见证目录归属不匹配, 保留: $d"
-            rc=1
-            eval "$dirvar=\"\""
-        else
-            eval "$dirvar=\"\""
-        fi
-    fi
-    eval "ef=\${${fdvar}:-}"
-    if [ -n "$ef" ]; then
-        flock -u "$ef" 2>/dev/null
-        eval "exec ${ef}>&-" 2>/dev/null
-        eval "$fdvar=\"\""
-    fi
-    return "$rc"
-}
-
-# 旧版进程不认识部署目录外的新锁, 可能已持目录内锁并把整棵部署树删掉; 此时在路径上重建同名
-# 锁文件不能与旧 fd 互斥。故重建旧锁路径前, 扫描仍指向已删除部署文件的进程, 命中即 fail-closed。
-# 该检测只缩小旧版残留窗口, 不构成跨版本竞态的结构性消除。
-_xray_legacy_deleted_tree_active() {   # <deploy_dir>; 0 = 其他进程仍持有已删除树中的 fd
-    local root="${1%/}" p pid target prefix matches find_rc
-    [ -n "$root" ] || return 1
-    prefix="${root}/"
-    if command -v find >/dev/null 2>&1; then
-        matches=$(find /proc/[0-9]*/fd -type l -lname "${prefix}* (deleted)" -print -quit 2>/dev/null)
-        find_rc=$?
-        if [ "$find_rc" -eq 0 ]; then
-            [ -n "$matches" ] && return 0
-            return 1
-        fi
-    fi
-    for p in /proc/[0-9]*/fd/*; do
-        pid=${p#/proc/}; pid=${pid%%/*}
-        [ "$pid" = "$$" ] && continue
-        # fd 在扫描期间被并发关闭是常态, 读不到就跳过(不是"发现旧进程")。判定主力是
-        # 上面的 `find` 快路径: 它一次遍历完成, 不受这种逐 fd 竞态影响。
-        target=$(readlink "$p" 2>/dev/null) || continue
-        case "$target" in
-            "$prefix"*" (deleted)") return 0 ;;
-        esac
-    done
-    return 1
-}
-
-# L2 旧锁路径不存在时补删除树扫描; 命中即拒绝, 由调用方清理自己持有的锁后退出。
-_legacy_deleted_tree_reject() {   # <deploy_path>; 0 = 旧版进程仍持有已删除树, 已报错
-    if _xray_legacy_deleted_tree_active "$1"; then
-        _error "检测到旧版进程仍持有已删除部署树的文件, 放弃本次操作"
-        _tip "等旧版会话退出后重试"
-        return 0
-    fi
-    return 1
-}
-
 _with_core_lock() {
-    local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lockf fallback_dir
-    local legacy_lockf legacy_fallback_dir legacy1_lockf legacy1_fallback_dir i locked=0 rc owner lrc
-    local XD_CORE_LEGACY_FLOCK_FD="" XD_CORE_LEGACY_DIR=""
-    local XD_CORE_LEGACY1_FLOCK_FD="" XD_CORE_LEGACY1_DIR=""
+    local deploy_path="${DEPLOY_DIR%/}" lockf fallback_dir
+    local i locked=0 rc owner
     case "$deploy_path" in
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立核心锁: $DEPLOY_DIR"; return 1 ;;
@@ -675,16 +389,8 @@ _with_core_lock() {
         _error "部署目录路径无效, 无法建立核心锁: $DEPLOY_DIR"
         return 1
     fi
-    deploy_parent="${deploy_path%/*}"
-    deploy_name="${deploy_path##*/}"
-    [ -n "$deploy_parent" ] || deploy_parent="/"
     lockf="$(_deploy_lock_root)/core.lock"
     fallback_dir="$(_deploy_lock_root)/core.lock.d"
-    legacy_lockf="$deploy_path/.core.lock"
-    legacy_fallback_dir="$deploy_path/.core.lock.d"
-    # L1(0.17.13/0.18.0): 旧版把核心锁放在部署父目录下 `.<name>.core.lock`。
-    legacy1_lockf="${deploy_parent}/.${deploy_name}.core.lock"
-    legacy1_fallback_dir="${legacy1_lockf}.d"
     # 已是持锁状态(嵌套调用) ⇒ 直接跑, 不再重复加锁。
     # 嵌套判定必须在 `$DEPLOY_DIR` 存在性检查**之前**: 卸载主体(持锁中)会 `rm -rf "$DEPLOY_DIR"`,
     # 之后的嵌套调用(收尾/提示)在外层事务锁保护下, 不该因目录已被删除而报错。
@@ -719,51 +425,10 @@ _with_core_lock() {
             _xray_core_lock_fd_reset
             return 1
         fi
-        # 仅协调已存在 L1/L2 旧路径; L2 缺失补删除树扫描, 见 _xray_legacy_lock_name。
-        if [ ! -e "$legacy_lockf" ] && [ ! -e "$legacy_fallback_dir" ]; then
-            if _legacy_deleted_tree_reject "$deploy_path"; then
-                _xray_core_lock_fd_reset
-                return 1
-            fi
-        fi
-        if [ -e "$legacy_lockf" ] || [ -e "$legacy_fallback_dir" ]; then
-            if ! _xray_legacy_lock_name XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR \
-                "$legacy_lockf" "$legacy_fallback_dir" "核心锁"; then
-                _xray_core_lock_fd_reset
-                return 1
-            fi
-            # 同 install 锁: 旧版会话/卸载可能在打开后删掉该文件, 复核 inode 身份。
-            if ! _xray_legacy_lock_inode_ok "${XD_CORE_LEGACY_FLOCK_FD:-}" "$legacy_lockf"; then
-                _error "旧版核心锁文件在获取后被替换/删除: $legacy_lockf"
-                _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
-                _xray_core_lock_fd_reset
-                return 1
-            fi
-        fi
-        if [ -e "$legacy1_lockf" ] || [ -e "$legacy1_fallback_dir" ]; then
-            if ! _xray_legacy_lock_name XD_CORE_LEGACY1_FLOCK_FD XD_CORE_LEGACY1_DIR \
-                "$legacy1_lockf" "$legacy1_fallback_dir" "旧版L1核心锁"; then
-                _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
-                _xray_core_lock_fd_reset
-                return 1
-            fi
-            if ! _xray_legacy_lock_inode_ok "${XD_CORE_LEGACY1_FLOCK_FD:-}" "$legacy1_lockf"; then
-                _error "旧版L1核心锁文件在获取后被替换/删除: $legacy1_lockf"
-                _xray_legacy_lock_release XD_CORE_LEGACY1_FLOCK_FD XD_CORE_LEGACY1_DIR
-                _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
-                _xray_core_lock_fd_reset
-                return 1
-            fi
-        fi
         if ! _xray_primary_flock_marker_take "$CORE_LOCK_FD" "$lockf" "$fallback_dir" "核心锁"; then
-            _xray_legacy_lock_release XD_CORE_LEGACY1_FLOCK_FD XD_CORE_LEGACY1_DIR
-            _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
             _xray_core_lock_fd_reset
             return 1
         fi
-
-
-
         # 子 shell 内执行: 使 CORE_LOCK_FD 与 HELD 标记的作用域跟着这次加锁一起消失,
         # 调用方不必手工回滚环境(与 _with_config_lock 同款做法)。
         (
@@ -772,8 +437,6 @@ _with_core_lock() {
             "$@"
         )
         rc=$?
-        _xray_legacy_lock_release XD_CORE_LEGACY1_FLOCK_FD XD_CORE_LEGACY1_DIR
-        _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
         _xray_primary_flock_marker_release "$lockf" "$fallback_dir" "核心锁" || rc=1
         _xray_core_lock_fd_reset
         return "$rc"
@@ -796,19 +459,6 @@ _with_core_lock() {
         _error "无法写入核心锁持有者记录 $fallback_dir/pid, 放弃本次操作"
         return 1
     fi
-    if ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
-        _error "无法确认核心 flock 主锁是否空闲(缺少 /proc 检查助手), 放弃本次操作"
-        rm -f "$fallback_dir/pid" 2>/dev/null; rmdir "$fallback_dir" 2>/dev/null
-        return 1
-    fi
-    _xray_legacy_flock_active "$lockf"; lrc=$?
-    case "$lrc" in
-        0|2)
-            _error "核心 flock 主锁被占用或无法确认, 放弃本次操作"
-            rm -f "$fallback_dir/pid" 2>/dev/null; rmdir "$fallback_dir" 2>/dev/null
-            return 1
-            ;;
-    esac
     # 同 flock 路径: 目录存在性在**锁内**判定(锁外判断会与并发卸载竞态), 锁内不存在则 fail-closed
     # 退出且不重建目录。
     if [ ! -d "$deploy_path" ]; then
@@ -817,39 +467,12 @@ _with_core_lock() {
         rmdir "$fallback_dir" 2>/dev/null
         return 1
     fi
-    # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过, 不凭空重建旧锁文件); L2 不存在时补删除树扫描。
-    if [ ! -e "$legacy_lockf" ] && [ ! -e "$legacy_fallback_dir" ]; then
-        if _legacy_deleted_tree_reject "$deploy_path"; then
-            rm -f "$fallback_dir/pid" 2>/dev/null
-            rmdir "$fallback_dir" 2>/dev/null
-            return 1
-        fi
-    fi
-    if [ -e "$legacy_lockf" ] || [ -e "$legacy_fallback_dir" ]; then
-        if ! _xray_legacy_lock_name XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR \
-                "$legacy_lockf" "$legacy_fallback_dir" "核心锁"; then
-            rm -f "$fallback_dir/pid" 2>/dev/null
-            rmdir "$fallback_dir" 2>/dev/null
-            return 1
-        fi
-    fi
-    if [ -e "$legacy1_lockf" ] || [ -e "$legacy1_fallback_dir" ]; then
-        if ! _xray_legacy_lock_name XD_CORE_LEGACY1_FLOCK_FD XD_CORE_LEGACY1_DIR \
-                "$legacy1_lockf" "$legacy1_fallback_dir" "旧版L1核心锁"; then
-            _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
-            rm -f "$fallback_dir/pid" 2>/dev/null
-            rmdir "$fallback_dir" 2>/dev/null
-            return 1
-        fi
-    fi
     (
         XRAY_DEPLOY_CORE_LOCK_HELD=1
         export XRAY_DEPLOY_CORE_LOCK_HELD
         "$@"
     )
     rc=$?
-    _xray_legacy_lock_release XD_CORE_LEGACY1_FLOCK_FD XD_CORE_LEGACY1_DIR
-    _xray_legacy_lock_release XD_CORE_LEGACY_FLOCK_FD XD_CORE_LEGACY_DIR
     owner=$(cat "$fallback_dir/pid" 2>/dev/null)
     if [ "$owner" != "$$" ] || ! rm -f "$fallback_dir/pid" 2>/dev/null || ! rmdir "$fallback_dir" 2>/dev/null; then
         _error "核心锁释放失败或所有权记录不匹配, 锁目录保留: $fallback_dir"
@@ -860,13 +483,9 @@ _with_core_lock() {
 }
 
 # 与 install.sh 同一部署树外安装锁; 卸载锁序 install → config → core。
-# flock/mkdir 与旧路径协调语义须一致, 见 _xray_legacy_lock_name。
 _with_deploy_install_lock() {
-    local deploy_path="${DEPLOY_DIR%/}" deploy_parent deploy_name lock_dir lock_file
-    local legacy_lock_file legacy_lock_dir legacy1_lock_file legacy1_lock_dir
-    local DEPLOY_INSTALL_LOCK_FD="" i locked=0 owner tmp rc lrc
-    local XD_INSTALL_LEGACY_FLOCK_FD="" XD_INSTALL_LEGACY_DIR=""
-    local XD_INSTALL_LEGACY1_FLOCK_FD="" XD_INSTALL_LEGACY1_DIR=""
+    local deploy_path="${DEPLOY_DIR%/}" lock_dir lock_file
+    local DEPLOY_INSTALL_LOCK_FD="" i locked=0 owner tmp rc
     case "$deploy_path" in
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立安装锁: $DEPLOY_DIR"; return 1 ;;
@@ -875,15 +494,8 @@ _with_deploy_install_lock() {
         _error "部署目录路径无效, 无法建立安装锁: $DEPLOY_DIR"
         return 1
     fi
-    deploy_parent="${deploy_path%/*}"
-    deploy_name="${deploy_path##*/}"
-    [ -n "$deploy_parent" ] || deploy_parent="/"
     lock_dir="$(_deploy_lock_root)/install.lock"
     lock_file="$(_deploy_lock_root)/install.lock.fd"
-    legacy_lock_file="$deploy_path/.install.lock.fd"
-    legacy_lock_dir="$deploy_path/.install.lock"
-    legacy1_lock_file="${deploy_parent}/.${deploy_name}.install.lock.fd"
-    legacy1_lock_dir="${deploy_parent}/.${deploy_name}.install.lock"
     if [ "${XRAY_DEPLOY_INSTALL_LOCK_HELD:-0}" = "1" ]; then
         "$@"
         return $?
@@ -892,8 +504,7 @@ _with_deploy_install_lock() {
         _error "无法创建安装锁目录 $(dirname "$lock_file"), 放弃本次卸载"
         return 1
     }
-    # 主锁文件在目录外, 竞争者不会被卸载的 `rm -rf` 拆成新旧 inode; 部署目录不在这里创建 ——
-    # 旧版锁在目录内, "先拿主锁再建目录再取旧锁"见下面两条分支。
+    # 主锁文件在目录外, 竞争者不会被卸载的 `rm -rf` 拆成新旧 inode。
 
     if command -v flock >/dev/null 2>&1; then
         if ! eval "exec {DEPLOY_INSTALL_LOCK_FD}>>\"\$lock_file\""; then
@@ -913,56 +524,11 @@ _with_deploy_install_lock() {
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
-        # 主锁 → L2 缺失时删除树扫描 → 建部署树 → 旧锁, 防止重建路径掩盖未释放旧 inode。
-        if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ]; then
-            if _legacy_deleted_tree_reject "$deploy_path"; then
-                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
-                eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-                return 1
-            fi
-        fi
         if ! mkdir -p "$deploy_path" 2>/dev/null; then
             _error "无法创建部署目录 $deploy_path, 放弃本次操作"
             _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
-        fi
-        # 同一种手段再取旧版锁(**仅对已存在的旧路径**; 不存在则跳过, 不凭空重建旧锁文件),
-        # 否则旧版 install.sh 会与新版各持一把锁同时落地。L2(<=0.17.11 目录内) 与 L1(父目录)。
-        if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
-            if ! _xray_legacy_lock_name XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR \
-                "$legacy_lock_file" "$legacy_lock_dir" "安装锁"; then
-                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
-                eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-                return 1
-            fi
-            # 旧版卸载者可能在打开锁文件后 rm -rf 整棵树并删掉该锁文件 ⇒ 复核 inode 身份,
-            # 不一致就拒绝。
-            if ! _xray_legacy_lock_inode_ok "${XD_INSTALL_LEGACY_FLOCK_FD:-}" "$legacy_lock_file"; then
-                _error "旧版安装锁文件在获取后被替换/删除(部署目录正被卸载?): $legacy_lock_file"
-                _tip "等对方结束后重试; 本次不做任何落地"
-                _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
-                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
-                eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-                return 1
-            fi
-        fi
-        if [ -e "$legacy1_lock_file" ] || [ -e "$legacy1_lock_dir" ]; then
-            if ! _xray_legacy_lock_name XD_INSTALL_LEGACY1_FLOCK_FD XD_INSTALL_LEGACY1_DIR \
-                "$legacy1_lock_file" "$legacy1_lock_dir" "旧版L1安装锁"; then
-                _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
-                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
-                eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-                return 1
-            fi
-            if ! _xray_legacy_lock_inode_ok "${XD_INSTALL_LEGACY1_FLOCK_FD:-}" "$legacy1_lock_file"; then
-                _error "旧版L1安装锁文件在获取后被替换/删除(部署目录正被卸载?): $legacy1_lock_file"
-                _xray_legacy_lock_release XD_INSTALL_LEGACY1_FLOCK_FD XD_INSTALL_LEGACY1_DIR
-                _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
-                _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
-                eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-                return 1
-            fi
         fi
         (
             XRAY_DEPLOY_INSTALL_LOCK_HELD=1
@@ -970,8 +536,6 @@ _with_deploy_install_lock() {
             "$@"
         )
         rc=$?
-        _xray_legacy_lock_release XD_INSTALL_LEGACY1_FLOCK_FD XD_INSTALL_LEGACY1_DIR
-        _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
         _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || rc=1
         eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
         return "$rc"
@@ -988,49 +552,11 @@ _with_deploy_install_lock() {
                 _error "无法写入安装锁持有者记录 $lock_dir/pid, 放弃本次卸载"
                 return 1
             fi
-            if ! declare -F _xray_legacy_flock_active >/dev/null 2>&1; then
-                _error "无法确认安装 flock 主锁是否空闲(缺少 /proc 检查助手), 放弃本次卸载"
-                rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null
-                return 1
-            fi
-            _xray_legacy_flock_active "$lock_file"; lrc=$?
-            case "$lrc" in
-                0|2)
-                    _error "安装 flock 主锁被占用或无法确认, 放弃本次卸载"
-                    rm -f "$lock_dir/pid" 2>/dev/null; rmdir "$lock_dir" 2>/dev/null
-                    return 1
-                    ;;
-            esac
-            # 旧版锁协调(仅对已存在的旧路径; 不存在则跳过); L2 不存在时补删除树扫描, 再建目录。
-            if [ ! -e "$legacy_lock_file" ] && [ ! -e "$legacy_lock_dir" ]; then
-                if _legacy_deleted_tree_reject "$deploy_path"; then
-                    rm -f "$lock_dir/pid" 2>/dev/null
-                    rmdir "$lock_dir" 2>/dev/null
-                    return 1
-                fi
-            fi
             if ! mkdir -p "$deploy_path" 2>/dev/null; then
                 _error "无法创建部署目录 $deploy_path, 放弃本次操作"
                 rm -f "$lock_dir/pid" 2>/dev/null
                 rmdir "$lock_dir" 2>/dev/null
                 return 1
-            fi
-            if [ -e "$legacy_lock_file" ] || [ -e "$legacy_lock_dir" ]; then
-                if ! _xray_legacy_lock_name XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR \
-                    "$legacy_lock_file" "$legacy_lock_dir" "安装锁"; then
-                    rm -f "$lock_dir/pid" 2>/dev/null
-                    rmdir "$lock_dir" 2>/dev/null
-                    return 1
-                fi
-            fi
-            if [ -e "$legacy1_lock_file" ] || [ -e "$legacy1_lock_dir" ]; then
-                if ! _xray_legacy_lock_name XD_INSTALL_LEGACY1_FLOCK_FD XD_INSTALL_LEGACY1_DIR \
-                    "$legacy1_lock_file" "$legacy1_lock_dir" "旧版L1安装锁"; then
-                    _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
-                    rm -f "$lock_dir/pid" 2>/dev/null
-                    rmdir "$lock_dir" 2>/dev/null
-                    return 1
-                fi
             fi
             (
                 XRAY_DEPLOY_INSTALL_LOCK_HELD=1
@@ -1038,8 +564,6 @@ _with_deploy_install_lock() {
                 "$@"
             )
             rc=$?
-            _xray_legacy_lock_release XD_INSTALL_LEGACY1_FLOCK_FD XD_INSTALL_LEGACY1_DIR
-            _xray_legacy_lock_release XD_INSTALL_LEGACY_FLOCK_FD XD_INSTALL_LEGACY_DIR
             owner=$(cat "$lock_dir/pid" 2>/dev/null)
             if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
                 _error "安装锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
@@ -1050,8 +574,6 @@ _with_deploy_install_lock() {
         fi
         if [ ! -d "$lock_dir" ]; then
             _error "安装锁路径被非目录对象占用: $lock_dir"
-
-
             _tip "请手动检查该路径后重试本次卸载"
             return 1
         fi
@@ -2865,21 +2387,17 @@ _manage_xray() {
             fi
             ;;
     esac
-    # start/restart 派生服务前关闭 config fd9、core/install 主锁与全部 legacy 锁 fd, 防守护进程继承持锁。
+    # start/restart 派生服务前关闭 config fd9 与 core/install 主锁 fd, 防守护进程继承持锁。
     # 使用 local V="${V:-9}" + {V}>&-: 动态 fd 重定向只影响子命令, 父 fd 保留。
     # ${V:-9}>&- 不会把展开值作为 fd, 会多传位置参数且关错描述符; 默认 9 防未持锁/set -u 异常。
     local CORE_LOCK_FD="${CORE_LOCK_FD:-9}"
     local DEPLOY_INSTALL_LOCK_FD="${DEPLOY_INSTALL_LOCK_FD:-9}"
-    local XD_CORE_LEGACY_FLOCK_FD="${XD_CORE_LEGACY_FLOCK_FD:-9}"
-    local XD_INSTALL_LEGACY_FLOCK_FD="${XD_INSTALL_LEGACY_FLOCK_FD:-9}"
-    local XD_CORE_LEGACY1_FLOCK_FD="${XD_CORE_LEGACY1_FLOCK_FD:-9}"
-    local XD_INSTALL_LEGACY1_FLOCK_FD="${XD_INSTALL_LEGACY1_FLOCK_FD:-9}"
     case "$INIT_SYSTEM" in
         systemd)
             case "$action" in
-                start)   systemctl start xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
+                start)   systemctl start xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 stop)    systemctl stop xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
-                restart) systemctl restart xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
+                restart) systemctl restart xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 # 与 openrc/direct 一致地走 _xray_is_running(绑定到 unit MainPID 的
                 # 真实主进程), 不再用裸 is-active —— 后者在主进程已死、systemd 尚未把 unit
                 # 迁出 active 的窗口内会报 running(详见 _xray_is_running 注释)。
@@ -2893,11 +2411,11 @@ _manage_xray() {
                 # 否则 OpenRC 误判 stopped 会再起一个实例造成端口冲突)。
                 start)
                     _xray_is_running || rc-service xray zap >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&-
-                    rc-service xray start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
+                    rc-service xray start 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 stop)    rc-service xray stop 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 restart)
                     _xray_is_running || rc-service xray zap >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&-
-                    rc-service xray restart 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- ;;
+                    rc-service xray restart 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 status)
                     # 只认真实 xray 业务进程, 不认 supervise-daemon 父进程(否则崩溃循环被误报 running)
                     if _xray_is_running; then echo "running"; else echo "stopped"; fi
@@ -2921,7 +2439,7 @@ _manage_xray() {
                         if ! _config_present && [ -s "$LEGACY_CONFIG_FILE" ]; then
                             config_args=(-config "$LEGACY_CONFIG_FILE")
                         fi
-                        XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true nohup "$XRAY_BIN" run "${config_args[@]}" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- {XD_CORE_LEGACY_FLOCK_FD}>&- {XD_INSTALL_LEGACY_FLOCK_FD}>&- {XD_CORE_LEGACY1_FLOCK_FD}>&- {XD_INSTALL_LEGACY1_FLOCK_FD}>&- &
+                        XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true nohup "$XRAY_BIN" run "${config_args[@]}" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- &
                         _xd_pidfile_write /run/xray.pid "$!"
                         sleep 1
                         dpid1=$(_xd_pidfile_pid /run/xray.pid)
