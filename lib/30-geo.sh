@@ -313,12 +313,20 @@ _geo_set_auto_update_cron() {
                 _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
             else
                 # 回滚失败仍须告警, 不能把残留无人值守任务隐藏为已取消。
-                if ! _geo_remove_cron_line >/dev/null 2>&1; then
+                # 且回滚失败时不得把 geo_cron 写成 off: 残留 cron 开机仍会执行, 写 off 会让 UI 谎报"已关闭"。
+                if _geo_remove_cron_line >/dev/null 2>&1; then
+                    _state_set geo_cron "off" 2>/dev/null || \
+                        _warn "cron 守护未启动且 cron 行已回滚, 但 geo_cron 状态写入失败"
+                    _warn "cron 守护进程未能启动, 自动更新已取消"
+                    _tip "请确保系统中有 cron 守护进程, 安装后重试"
+                else
                     _warn "crontab 回滚失败, 请手动检查项目定时任务 (${GEO_CRON_MARKER})"
+                    _state_set geo_cron "on" 2>/dev/null || \
+                        _warn "cron 行可能仍残留, 但 geo_cron 状态无法持久化"
+                    # 回滚失败时 cron 行仍在, 不能沿用上面"已取消"的口径, 否则与保留的 geo_cron=on 矛盾。
+                    _warn "cron 守护进程未能启动; 残留 cron 行仍会执行, 自动更新未真正取消"
+                    _tip "请确保系统中有 cron 守护进程; 如需停止自动更新, 请手动移除上方标记的 cron 行"
                 fi
-                _warn "cron 守护进程未能启动, 自动更新已取消"
-                _tip "请确保系统中有 cron 守护进程, 安装后重试"
-                _state_set geo_cron "off"
                 # 显式失败, 不让最后一次 state 写成功把“已取消”洗成返回 0。
                 return 1
             fi
@@ -384,6 +392,10 @@ _auto_migrate_geo_autoupdate_write() {
         fi
         if _geo_transition_clear; then
             _info "已完成 Geo 自动更新关闭清理"
+        else
+            # 标记未清会让后续每次启动重跑清理; 不能静默吞掉, 否则收敛永远不完成也无告警。
+            _warn "Geo 关闭清理最后一步失败(off_pending 标记未清除), 下次启动会重试"
+            return 1
         fi
         return 0
     fi
@@ -428,13 +440,22 @@ _geo_next_run_hint() {
         echo "Xray 内置定时: ${c} (每月 1/4/7/.../31 号 03:00, 热重载)"
         return
     fi
-    local line
-    line=$(crontab -l 2>/dev/null | grep "$GEO_CRON_MARKER" | head -1)
-    if [ -z "$line" ]; then
-        echo "未开启"
-        return
+    # 走 _crontab_has_marker 的三态: 读失败(2)不能当成"未开启", 否则与 geo_cron state 分裂。
+    local hrc=2
+    if declare -F _crontab_has_marker >/dev/null 2>&1; then
+        _crontab_has_marker "$GEO_CRON_MARKER"; hrc=$?
+    elif declare -F _crontab_read >/dev/null 2>&1; then
+        # 混装旧 lib 缺三态 helper: 退回底层读取原语, 读失败保持"未知", 不谎报"未开启"。
+        local cur
+        if cur=$(_crontab_read); then
+            if printf '%s\n' "$cur" | grep -Fq -- "$GEO_CRON_MARKER"; then hrc=0; else hrc=1; fi
+        fi
     fi
-    echo "每月 1/4/7/.../31 号 03:00 (系统 cron)"
+    case "$hrc" in
+        0) echo "每月 1/4/7/.../31 号 03:00 (系统 cron)" ;;
+        1) echo "未开启" ;;
+        *) echo "未知(crontab 不可读, 无法确认系统 cron 任务)" ;;
+    esac
 }
 
 # 精简/恢复共用 _config_edit_preflight, 并检查共享常量。

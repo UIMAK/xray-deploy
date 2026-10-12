@@ -413,6 +413,11 @@ _parse_hop_ranges() {
         [ -z "$entry" ] && continue
         local start end
         if echo "$entry" | grep -q '-'; then
+            # 只接受单段 a-b; 多 '-' 会被 cut 静默丢弃多余段, 与用户意图不符, 直接拒绝。
+            if [ "$(printf '%s' "$entry" | tr -cd '-' | wc -c)" -ne 1 ]; then
+                _error "无效端口范围(只支持单段 a-b): $entry"
+                return 1
+            fi
             start=$(echo "$entry" | cut -d'-' -f1)
             end=$(echo "$entry" | cut -d'-' -f2)
         else
@@ -562,7 +567,7 @@ _hy2_no_hop_rules_at_all() {
 _hy2_add_hop_rules() {
     # hop 归属由 dport+目标端口和 metadata 记录；不按外部来源规则推断。
     local hy2_port="$1"; shift
-    local range q v6ok="" v6q=""
+    local range q v6ok="" v6q="" v6d
     if ! q=$(iptables -t nat -S PREROUTING 2>/dev/null); then
         _error "无法读取 PREROUTING 规则(iptables -S 失败), 中止添加"
         return 1
@@ -1961,10 +1966,11 @@ _commit_reality_node_txn_locked() {
     if ! _save_node_meta "$tag" "$meta_json"; then
         _error "元数据写入失败, 正在回滚入站与路由: $tag"
         # 同时移除两个入站与该 tunnel 的路由引用(非对象元素保留, 与删除路径同口径)。
+        # inboundTag 标量形式是逗号串, index 直接作用会子串误匹配(tun-a 命中 tun-ab); 先按逗号归一。
         _mutate_config --arg tg "$tunnel_tag" --arg t "$tag" \
             '.inbounds |= map(select((type != "object") or ((.tag // "") as $x | ($x != $t and $x != $tg))))
              | .routing.rules |= map(select((type != "object") or .inboundTag == null
-                   or ([.inboundTag[]? | . as $it | ($it != $tg)] | all)))' || \
+                   or (((.inboundTag | if type == "string" then split(",") else . end) | index($tg)) == null)))' || \
             _error "回滚入站/路由失败, 请手动检查配置: $tag"
         return 1
     fi
@@ -2725,6 +2731,7 @@ _add_vless_xhttp_reality() {
     fi
 
     local path=$(_gen_rand_path)
+    local custom_path=""
     read -rp "  XHTTP path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
     # path 直拼 JSON 模板, 含 " \ 换行或 {{ 占位符会让渲染失败/值被二次替换, 输入侧拒绝
@@ -3017,6 +3024,7 @@ _add_vless_xhttp_cdn() {
     [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
 
     local path=$(_gen_rand_path)
+    local custom_path=""
     read -rp "  XHTTP path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
     # 见 _add_vless_xhttp_reality 同处说明
@@ -3089,6 +3097,7 @@ _add_vless_ws_cdn() {
     [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
 
     local path=$(_gen_rand_path)
+    local custom_path=""
     read -rp "  WS path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
     # 见 _add_vless_xhttp_reality 同处说明
@@ -3719,7 +3728,7 @@ _hy2_self_cert_dir() {
     # 一律判为"归属不明确" ⇒ 返回 1, 不进入 purge)
     refs=$(_config_jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' 2>/dev/null) || return 1
     # 实际生效基准决定删除身份，额外候选只用于保留；归属冲突拒绝。
-    local ref aref rreal lex_ours ours foreign unres
+    local ref aref rreal lex_ours ours foreign unres idx is_eff
     while IFS= read -r ref; do
         [ -n "$ref" ] || continue
         ours=0; foreign=0; unres=0; idx=0
@@ -3871,6 +3880,7 @@ _add_hysteria2() {
     local tag="xd-hy2-${port}"
     local cert_file="" key_file="" self_signed="false" sni="" self_domain="" tls_mode=""
     echo -e "  TLS 证书 回车使用自签证书, 或输入证书文件路径"
+    local custom_cert custom_key
     read -rp "  cert 路径 (回车自签): " custom_cert
     if [ -n "$custom_cert" ]; then
         read -rp "  key 路径: " custom_key
@@ -3924,7 +3934,7 @@ _add_hysteria2() {
     fi
 
     # 认证密码
-    local auth
+    local auth custom_auth
     auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
     read -rp "  认证密码 (回车随机): " custom_auth
     auth=${custom_auth:-$auth}
@@ -4623,9 +4633,9 @@ _delete_node_apply_all() {
     if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ]; then
         _mutate_config "$all_filter" && all_ok=1
     else
-        local keep_tags=() kt ktt rrc
+        local rm_tags=() kt ktt rrc
         for kt in "${del_all[@]}"; do
-            keep_tags+=("$kt")
+            rm_tags+=("$kt")
             ktt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${kt}.json" 2>/dev/null)
             [ -n "$ktt" ] || continue
             _reality_tunnel_has_surviving_refs "$ktt" "${del_all[@]}"; rrc=$?
@@ -4635,10 +4645,10 @@ _delete_node_apply_all() {
                 _warn "无法确认 Reality tunnel 是否仍被引用, 保留 tunnel 与路由规则: $ktt"
                 continue
             fi
-            keep_tags+=("$ktt")
+            rm_tags+=("$ktt")
         done
         local rm_json
-        rm_json=$(printf '%s\n' "${keep_tags[@]}" | jq -R . | jq -c -s .) || rm_json=""
+        rm_json=$(printf '%s\n' "${rm_tags[@]}" | jq -R . | jq -c -s .) || rm_json=""
         if [ -z "$rm_json" ]; then
             _error "生成移除集合失败"
             _hy2_hop_restore_after_teardown
@@ -4647,7 +4657,7 @@ _delete_node_apply_all() {
         _mutate_config --argjson rm "$rm_json" \
             '.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
              | .routing.rules |= map(select((type != "object") or .inboundTag == null
-                   or ([.inboundTag[]? | . as $it | ($rm | index($it)) == null] | all)))' && all_ok=1
+                   or (.inboundTag as $ib | ([$rm[] | . as $t | (($ib | if type == "string" then split(",") else . end) | index($t)) == null] | all))))' && all_ok=1
     fi
     if [ "$all_ok" -eq 1 ]; then
         for tag in "${del_all[@]}"; do
@@ -4731,7 +4741,10 @@ _delete_node_apply_multi() {
     # tag 同样需 as 绑定后再 index(index 参数以 $all_tags 为输入求值)
     local jq_multi='.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($all_tags | index($tg)) == null)))'
     if [ ${#del_ttags[@]} -gt 0 ]; then
-        jq_multi="$jq_multi | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag as \$it | \$tun_tags | index(\$it)) == null)))"
+        # 与单删同口径(逐元素 index): 只要规则引用了任一待删 tunnel tag 即移除。
+        # 不能 [.inboundTag[]?](scalar 形式产出空流, all 恒真 ⇒ 规则被错误保留);
+        # 但标量是逗号串, index 直接作用会子串误匹配(tun-a 命中 tun-ab), 必须先 split(",") 归一。
+        jq_multi="$jq_multi | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or (.inboundTag as \$ib | ([\$tun_tags[] | . as \$t | ((\$ib | if type == \"string\" then split(\",\") else . end) | index(\$t)) == null] | all))))"
     fi
 
     if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
@@ -4783,7 +4796,7 @@ _delete_node_apply_single() {
     fi
     local jq_filter='.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))'
     if [ -n "$tunnel_tag" ] && [ "$preserve_tunnel" -eq 0 ]; then
-        jq_filter="$jq_filter | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or ((.inboundTag | index(\$tg)) == null)))
+        jq_filter="$jq_filter | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or (((.inboundTag | if type == \"string\" then split(\",\") else . end) | index(\$tg)) == null)))
             | .inbounds |= map(select((type != \"object\") or ((.tag // \"\") != \$tg)))"
     fi
     # //hop 校验与 teardown 都在锁内完成; 任一失败即取消删除, 节点保持原状。

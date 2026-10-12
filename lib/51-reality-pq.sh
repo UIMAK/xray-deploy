@@ -41,7 +41,8 @@ _pq_run_bounded() {
     if command -v timeout >/dev/null 2>&1; then
         # 仅使用支持 -k 的timeout；TERM被忽略时仍需KILL，探测用5秒避免负载误判。
         if timeout -k 1 5 true >/dev/null 2>&1; then
-            timeout -k 2 "$secs" "$@"
+            # 同样静音被测命令 stderr(与下方 fallback 口径一致): 调用方只消费 stdout 与返回码。
+            timeout -k 2 "$secs" "$@" 2>/dev/null
             return $?
         fi
     fi
@@ -95,6 +96,8 @@ _pq_field() {
                 val="${val#"${val%%[![:space:]]*}"}"
                 val="${val#[:=]}"
                 val="${val#"${val%%[![:space:]]*}"}"
+                # 同时剥尾部空白(含 CRLF 的 CR), 否则长度/字符集校验会误判为未知。
+                val="${val%"${val##*[![:space:]]}"}"
                 [ -n "$val" ] && { printf '%s' "$val"; return 0; }
                 ;;
         esac
@@ -120,7 +123,9 @@ _detect_reality_pq() {
     _info "检测 Reality 后量子兼容性: $target"
     local ping_out ping_rc=0
     # 同一次 tls ping 同时读取组名和链长；网络探测用15秒有界wrapper，失败不使用半截stdout。
-    ping_out=$(_pq_run_bounded 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" tls ping "$target" 2>/dev/null) || ping_rc=$?
+    # 不在此处吞 stderr: 被测命令的 stderr 由 _pq_run_bounded 内部静音,
+    # 而 wrapper 自身("无法创建临时文件"等)的诊断必须留给用户排障。
+    ping_out=$(_pq_run_bounded 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" tls ping "$target") || ping_rc=$?
 
     if [ "$ping_rc" -ne 0 ]; then
         PQ_REASON="xray tls ping 失败(目标不可达/超时/xray 不支持 tls ping), 无法判定 PQ 能力"

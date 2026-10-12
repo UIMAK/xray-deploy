@@ -273,11 +273,16 @@ unset _BOOTSTRAP_ENTRY_ID _bootstrap_published_id
 unset _BOOTSTRAP_LOCK_ROOT _BOOTSTRAP_LOCK_FILE _BOOTSTRAP_LOCK_DIR _BOOTSTRAP_LOCK_FD
 unset _BOOTSTRAP_LOCK_MODE _BOOTSTRAP_MARKER_HELD _bootstrap_locked _bootstrap_i _bootstrap_lrc _bootstrap_took _bootstrap_holder
 
-# 每次启动探测基础依赖，仅安装缺项。
-_init_runtime() {
+# 公共初始化: root 检测 + init 系统探测 + 目录确保; 失败即退出。
+_base_init() {
     _check_root
     INIT_SYSTEM=$(_detect_init_system)
     _ensure_dirs || { _error "初始化失败: 无法确保安全目录/权限"; exit 1; }
+}
+
+# 每次启动探测基础依赖，仅安装缺项。
+_init_runtime() {
+    _base_init
     if ! _ensure_base_deps; then
         _warn "基础依赖安装失败, 部分功能可能不可用, 请检查网络或包管理"
     fi
@@ -285,9 +290,7 @@ _init_runtime() {
 
 # cron 与菜单共用依赖初始化；常规输出静默，失败仍告警以便诊断。
 _cron_init() {
-    _check_root
-    INIT_SYSTEM=$(_detect_init_system)
-    _ensure_dirs || { _error "初始化失败: 无法确保安全目录/权限"; exit 1; }
+    _base_init
     # 依赖失败必须留下告警，不把缺命令的后续失败伪装成正常执行。
     if ! _ensure_base_deps >/dev/null 2>&1; then
         _warn "基础依赖安装失败, 部分功能可能不可用(cron 子命令可能失败)"

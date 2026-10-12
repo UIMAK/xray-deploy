@@ -58,7 +58,17 @@ for sizes in '{"minPacketSize":0,"maxPacketSize":1000}' '{"minPacketSize":256,"m
     set_sizes "$sizes"
     eq "custom Gecko accepted $sizes" custom "$(_hysteria_gecko_size_state)"
     reject "custom Gecko URI rejected $sizes" _hysteria_build_link "$HYSTERIA_NODE_META"
-    check "custom Gecko YAML accepted $sizes" _hysteria_clash_line "$HYSTERIA_NODE_META"
+    # 自定义尺寸的意义在于 YAML 能表达它: 必须断言实际 min/max 落到 clash 行, 而非只看 rc。
+    line=$(_hysteria_clash_line "$HYSTERIA_NODE_META")
+    emin=$(jq -r '.obfs.gecko.minPacketSize // 0' "$HYSTERIA_CONFIG")
+    emax=$(jq -r '.obfs.gecko.maxPacketSize // 0' "$HYSTERIA_CONFIG")
+    [ "$emin" = 0 ] && emin=512
+    [ "$emax" = 0 ] && emax=1200
+    if contains "obfs-min-packet-size: $emin" "$line" && contains "obfs-max-packet-size: $emax" "$line"; then
+        pass "custom Gecko YAML exports sizes $sizes"
+    else
+        fail "custom Gecko YAML exports sizes $sizes (want min=$emin max=$emax)"
+    fi
 done
 for sizes in '{"minPacketSize":"0"}' '{"minPacketSize":null}' '{"minPacketSize":512.5}' '{"minPacketSize":-1}' '{"maxPacketSize":2049}' '{"minPacketSize":0,"maxPacketSize":511}' '{"minPacketSize":1201,"maxPacketSize":0}'; do
     set_sizes "$sizes"
@@ -72,6 +82,15 @@ for shape in '[]' '"bad"'; do
 done
 printf 'not-json\n' > "$HYSTERIA_CONFIG"
 eq 'malformed JSON fails closed' invalid "$(_hysteria_gecko_size_state)"
+# fail-closed 分支: 无 obfs / 非 gecko / 不支持的 obfs.type 必须按 none 处理, 不得当成可用。
+jq 'del(.obfs)' <<< "$base" > "$HYSTERIA_CONFIG"
+eq 'missing obfs reports none' none "$(_hysteria_gecko_size_state)"
+jq '.obfs={type:"salamander",salamander:{password:"x"}}' <<< "$base" > "$HYSTERIA_CONFIG"
+eq 'non-gecko obfs reports none' none "$(_hysteria_gecko_size_state)"
+jq '.obfs={type:"unsupported",password:"x"}' <<< "$base" > "$HYSTERIA_CONFIG"
+check 'unsupported obfs type reports a URI gap' test -n "$(_hysteria_obfs_uri_gap)"
+jq '.obfs={type:"unsupported",password:"x"}' <<< "$base" > "$HYSTERIA_CONFIG"
+eq 'unsupported obfs type reports none state' none "$(_hysteria_gecko_size_state)"
 
 printf '== bandwidth validation and owned leaves ==\n'
 for value in '0mbps' '0 bps' '0 TBPS' '524288 bps' '1mbps' ' 1 mbps '; do
@@ -112,8 +131,8 @@ check 'failed rollback reports degraded service state' grep -q '降级: 配置�
 printf '== SNI and single-range manager ==\n'
 printf cert > "$TMP/custom.crt"
 printf key > "$TMP/custom.key"
-openssl() { printf 'subject=CN = certificate.example.com\n'; }
-check 'custom TLS empty SNI accepted' _hysteria_prompt_tls <<< $'2\n'"$TMP/custom.crt"$'\n'"$TMP/custom.key"$'\n\n' > "$TMP/tls.log" 2>&1
+# choice 2 只取用户输入的 SNI, 从不读证书 CN/SAN; 这里不放 openssl 桩, 避免制造"CN 被读取"的假象。
+check 'custom TLS empty SNI accepted' _hysteria_prompt_tls <<< $'2\n'"$TMP/custom.crt"$'\n'"$TMP/custom.key"$'\n\n'
 eq 'empty SNI never becomes certificate CN/SAN' '' "$HY_TLS_SNI"
 check 'custom TLS config retains paths' jq -e --arg c "$TMP/custom.crt" --arg k "$TMP/custom.key" '.tls.cert == $c and .tls.key == $k' <<< "$HY_TLS_JSON"
 set_sizes '{}'

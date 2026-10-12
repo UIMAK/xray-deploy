@@ -4,6 +4,8 @@ export LOGROTATE_CONF="/etc/logrotate.d/xray-deploy"
 
 # 标记仅记录因 none 自动关闭的因果；手动接管清除，自动恢复成功才消费。
 LOGROTATE_AUTO_OFF_KEY="logrotate_off_by_loglevel"
+# 用户禁用意图标记放在 include 目录下(见 _logrotate_user_off_path), 不用 state 键:
+# 它要覆盖 state 存储不可写的场景, 写进同一存储会一起失败。
 
 _logrotate_auto_off_get() {
     _state_get "$LOGROTATE_AUTO_OFF_KEY" 2>/dev/null
@@ -18,6 +20,40 @@ _logrotate_auto_off_clear() {
     return 0
 }
 
+# 用户禁用意图标记: 记录"用户显式禁用, 但 enabled 状态写入失败"。
+# 不能放 STATE_DIR —— 该标记要覆盖的正是 state 存储不可写的场景, 写进同一存储会一起失败。
+# 改放 logrotate include 目录下被 logrotate 忽略的子目录(与配置同文件系统: 配置删除成功即可写),
+# 保证 state 存储不可用时仍留下"用户已禁用"的事实, 避免 setup 复活轮换。
+_logrotate_user_off_path() {
+    printf '%s/.xray-deploy.tmp.d/disabled' "$(dirname "$LOGROTATE_CONF")"
+}
+
+_logrotate_user_off_get() {
+    [ -f "$(_logrotate_user_off_path)" ] && printf 'on'
+}
+
+_logrotate_user_off_set() {
+    local p d
+    p=$(_logrotate_user_off_path)
+    d=$(dirname "$p")
+    mkdir -p "$d" 2>/dev/null || return 1
+    : > "$p" 2>/dev/null || return 1
+    # 回读确认标记真的落盘(inode 耗尽/目录不可写时 mkdir/写可能静默失败)。
+    [ -f "$p" ]
+}
+
+_logrotate_user_off_clear() {
+    local p
+    p=$(_logrotate_user_off_path)
+    rm -f "$p" 2>/dev/null
+    # 与 _logrotate_auto_off_clear 同口径: 标记仍在即报告失败, 让调用方知道禁用意图未撤销。
+    if [ -e "$p" ]; then
+        return 1
+    fi
+    rmdir "$(dirname "$p")" 2>/dev/null || true
+    return 0
+}
+
 _logrotate_ensure_package() {
     command -v logrotate >/dev/null 2>&1 && return 0
     _info "安装 logrotate..."
@@ -29,18 +65,21 @@ _logrotate_ensure_package() {
     return 0
 }
 
-# 四键完整初始化，enabled 最后写；哨兵提前写会阻止失败后的重试。
+# 逐键初始化, enabled 作为哨兵最后写; 只补缺失键, 不覆盖仍存活的用户偏好。
+# 部分损坏(仅哨兵丢失)时, 保留如 retention=14 的既有值, 不用默认值覆盖。
 _logrotate_init_state() {
-    if [ ! -f "$STATE_DIR/logrotate_enabled" ]; then
-        if _state_set logrotate_frequency "daily" \
-           && _state_set logrotate_retention "7" \
-           && _state_set logrotate_compress "on" \
-           && _state_set logrotate_enabled "on"; then
-            return 0
-        fi
-        _warn "logrotate 默认状态写入失败, 已回退(下次启动会重试)"
-        rm -f "$STATE_DIR"/logrotate_enabled "$STATE_DIR"/logrotate_frequency \
-              "$STATE_DIR"/logrotate_retention "$STATE_DIR"/logrotate_compress 2>/dev/null
+    [ -f "$STATE_DIR/logrotate_enabled" ] && return 0
+    local rc=0
+    [ -f "$STATE_DIR/logrotate_frequency" ] || _state_set logrotate_frequency "daily" || rc=1
+    [ -f "$STATE_DIR/logrotate_retention" ] || _state_set logrotate_retention "7" || rc=1
+    [ -f "$STATE_DIR/logrotate_compress" ]  || _state_set logrotate_compress "on" || rc=1
+    if [ "$rc" -ne 0 ]; then
+        _warn "logrotate 默认状态写入失败, 下次启动会重试"
+        return 1
+    fi
+    # 哨兵最后写; 失败不删已写入的键(可能是用户偏好), 下次启动凭哨兵缺失重试。
+    if ! _state_set logrotate_enabled "on"; then
+        _warn "logrotate 默认状态写入失败(enabled 哨兵未落盘), 下次启动会重试"
         return 1
     fi
     return 0
@@ -58,63 +97,69 @@ _logrotate_enabled_state() {
 
 # 有效启用态: 自动关闭标记优先于状态记录; 标记=on 时若配置仍在(上次禁用被中断的残留),
 # 轮换实际还在跑, 按"在跑"处理, 状态栏与菜单共用同一口径。
+# 用户禁用意图标记=on 且配置已删时同样按 off: 禁用时状态写失败不能让 setup 复活轮换。
 _logrotate_effective_enabled() {
     if [ "$(_logrotate_auto_off_get)" = "on" ]; then
         if [ -f "$LOGROTATE_CONF" ]; then printf 'on'; else printf 'off'; fi
         return 0
     fi
+    if [ "$(_logrotate_user_off_get)" = "on" ] && [ ! -f "$LOGROTATE_CONF" ]; then
+        printf 'off'; return 0
+    fi
     _logrotate_enabled_state
 }
 
-# 直写前保存旧内容，回读一致才成功；避免 include 目录临时配置与半截文件停摆。
+# 原子写: 在 include 目录下的临时子目录写入(目录不被 logrotate 读取), 回读一致后 rename 覆盖。
+# 避免"截断→写入"窗口被并发 logrotate 读到半截配置而整轮失败, 也无需写失败后的还原流程。
 _logrotate_write_config() {
     local content
     content=$(_logrotate_render_config) || {
         _error "生成 logrotate 配置内容失败"
         return 1
     }
-    if ! mkdir -p /etc/logrotate.d; then
-        _error "无法创建 /etc/logrotate.d, logrotate 配置未写入"
+    local conf_dir
+    conf_dir=$(dirname "$LOGROTATE_CONF")
+    if ! mkdir -p "$conf_dir"; then
+        _error "无法创建 $conf_dir, logrotate 配置未写入"
         return 1
     fi
-    local prev="" had_prev=0
-    if [ -f "$LOGROTATE_CONF" ]; then
-        if ! prev=$(cat "$LOGROTATE_CONF" 2>/dev/null); then
-            _error "无法读取现有 logrotate 配置, 为免破坏它已取消本次修改: $LOGROTATE_CONF"
-            return 1
-        fi
-        had_prev=1
+    # 目标是目录(或指向目录的符号链接)时 mv 会把临时文件搬进目录, 造成"提交成功"假象; 显式拒绝。
+    if [ -d "$LOGROTATE_CONF" ]; then
+        _error "logrotate 配置路径是目录, 无法写入配置: $LOGROTATE_CONF"
+        return 1
     fi
-    if ! printf '%s\n' "$content" > "$LOGROTATE_CONF"; then
-        _error "写入 logrotate 配置失败(只读文件系统/磁盘空间?): $LOGROTATE_CONF"
-        _logrotate_restore_prev "$prev" "$had_prev"
+    # 每次调用用唯一临时目录(mktemp): 并发会话各写各删自己的目录, 无共享目录竞态;
+    # 子目录不被 logrotate 读取, 提交后删除不留残留。
+    local tmp_dir
+    if ! tmp_dir=$(mktemp -d "$conf_dir/.xray-deploy.tmp.XXXXXX" 2>/dev/null) || [ -z "$tmp_dir" ]; then
+        _error "无法创建 logrotate 临时写入目录: $conf_dir"
+        return 1
+    fi
+    local tmp_file="$tmp_dir/conf"
+    if ! printf '%s\n' "$content" > "$tmp_file" 2>/dev/null; then
+        _error "写入 logrotate 配置失败(只读文件系统/磁盘空间?): $tmp_file"
+        rm -rf "$tmp_dir" 2>/dev/null
         return 1
     fi
     local landed
-    landed=$(cat "$LOGROTATE_CONF" 2>/dev/null)
+    landed=$(cat "$tmp_file" 2>/dev/null)
     if [ "$landed" != "$content" ]; then
-        _error "logrotate 配置写入不完整(磁盘空间?), 正在还原上一版配置"
-        _logrotate_restore_prev "$prev" "$had_prev"
+        _error "logrotate 配置写入不完整(磁盘空间?): $tmp_file"
+        rm -rf "$tmp_dir" 2>/dev/null
         return 1
     fi
+    chmod 644 "$tmp_file" 2>/dev/null || true
+    # rename 覆盖: 目标要么是旧内容要么是新内容, 不存在半截中间态。
+    if ! mv -f "$tmp_file" "$LOGROTATE_CONF" 2>/dev/null; then
+        _error "提交 logrotate 配置失败(rename): $LOGROTATE_CONF"
+        rm -rf "$tmp_dir" 2>/dev/null
+        return 1
+    fi
+    # 只删除本次调用自建的临时目录(此刻已空), 不触碰他方目录。
+    rmdir "$tmp_dir" 2>/dev/null || true
     chmod 644 "$LOGROTATE_CONF" 2>/dev/null || \
         _warn "logrotate 配置权限设置失败(不影响轮换): $LOGROTATE_CONF"
     return 0
-}
-
-_logrotate_restore_prev() {
-    local prev="$1" had_prev="$2"
-    if [ "$had_prev" != "1" ]; then
-        rm -f "$LOGROTATE_CONF" 2>/dev/null
-        return 0
-    fi
-    if printf '%s\n' "$prev" > "$LOGROTATE_CONF" 2>/dev/null; then
-        _warn "已还原上一版 logrotate 配置(参数变更未生效, 轮换仍按旧参数执行)"
-        chmod 644 "$LOGROTATE_CONF" 2>/dev/null || true
-        return 0
-    fi
-    _error "还原上一版 logrotate 配置失败: $LOGROTATE_CONF 可能不可用, 请手动检查"
-    return 1
 }
 
 _logrotate_retention_digits() {
@@ -183,6 +228,12 @@ _logrotate_remove_config() {
 _logrotate_enable() {
     _logrotate_ensure_package || return 1
     _logrotate_write_config || return 1
+    # 启用即撤销此前的禁用意图; 残留标记会让配置缺失时被误判为已禁用, 清不掉按记账失败上报。
+    if ! _logrotate_user_off_clear; then
+        _warn "logrotate 配置已写入并生效, 但旧禁用标记未能清除(配置缺失时可能被误判为已禁用)"
+        _tip "请手动删除 $(_logrotate_user_off_path)"
+        return 2
+    fi
     if ! _state_set logrotate_enabled "on"; then
         _warn "logrotate 配置已写入并生效, 但状态持久化失败(状态显示可能不准)"
         _tip "请重试本操作, 或检查 $STATE_DIR 是否可写"
@@ -192,12 +243,25 @@ _logrotate_enable() {
 }
 
 _logrotate_disable() {
+    # $1=auto: 日志级别联动禁用, 只记 auto_off 因果, 不写 user_off("用户显式禁用"标记)。
+    # 两者必须分开: 共用 user_off 时, 若联动标记清除失败(state 存储不可写), 之后切回日志级别
+    # 的自动恢复分支会凭 auto_off 重写配置并清掉 user_off, 覆盖用户的显式禁用。
+    local intent="${1:-manual}"
+    if [ "$intent" != "auto" ]; then
+        # 先记录禁用意图再删配置: 意图写不进(如 inode 耗尽/目录不可写)就不能删,
+        # 否则 setup 会凭 enabled=on 复活轮换, 且无任何标记可追溯。
+        if ! _logrotate_user_off_set; then
+            _error "无法记录 logrotate 禁用意图, 已取消禁用(配置未删除): $(_logrotate_user_off_path)"
+            return 1
+        fi
+    fi
     _logrotate_remove_config || return 1
     if ! _state_set logrotate_enabled "off"; then
         _warn "logrotate 配置已移除(轮换已停), 但状态持久化失败(状态显示可能不准)"
         _tip "请重试本操作, 或检查 $STATE_DIR 是否可写"
         return 2
     fi
+    [ "$intent" = "auto" ] || _logrotate_user_off_clear
     return 0
 }
 
@@ -208,8 +272,8 @@ _logrotate_setup() {
         _warn "logrotate 状态初始化失败, 本次跳过配置写入(下次启动会重试)"
         return 0
     fi
-    # 自动关闭标记优先于状态记录: 否则会把已关闭(含 loglevel 联动关闭)的轮换重新打开。
-    if [ "$(_logrotate_enabled_state)" = "on" ] && [ "$(_logrotate_auto_off_get)" != "on" ]; then
+    # 有效启用态统一判定: 自动关闭标记或用户禁用意图优先, 否则会把已关闭的轮换重新打开。
+    if [ "$(_logrotate_effective_enabled)" = "on" ]; then
         _logrotate_write_config || _warn "logrotate 配置写入失败, 日志轮换未生效(可在菜单 [日志轮换] 重试)"
     fi
     return 0
@@ -222,6 +286,7 @@ _logrotate_cleanup() {
     rm -f "$STATE_DIR"/logrotate_retention
     rm -f "$STATE_DIR"/logrotate_compress
     rm -f "$STATE_DIR/$LOGROTATE_AUTO_OFF_KEY"
+    _logrotate_user_off_clear
 }
 
 _logrotate_status() {
@@ -273,8 +338,12 @@ _logrotate_status() {
             echo -e "  日志级别: ${CYAN}${lv}${NC}"
         fi
     fi
-    if [ "$(_logrotate_auto_off_get)" = "on" ]; then
+    # 仅在实际已停(有效态 off)时才提示"被自动禁用"; 标记残留但配置仍在时轮换仍在跑, 否则自相矛盾。
+    if [ "$(_logrotate_auto_off_get)" = "on" ] && [ "$enabled" = "off" ]; then
         echo -e "  ${SKYBLUE}(logrotate 因日志级别 none 被自动禁用, 切回其它级别会自动恢复)${NC}"
+    fi
+    if [ "$(_logrotate_user_off_get)" = "on" ] && [ "$enabled" = "off" ]; then
+        echo -e "  ${SKYBLUE}(此前手动禁用时状态记录写入失败, 已按禁用保留; 选 [1] 会重新启用轮换而非修正该记录)${NC}"
     fi
     echo -e "  频率: ${CYAN}${freq_label}${NC}"
     echo -e "  保留: ${CYAN}${ret}${NC} 份"
@@ -366,7 +435,7 @@ _loglevel_menu() {
                 _press_any_key; return
             fi
             local drc=0
-            _logrotate_disable || drc=$?
+            _logrotate_disable auto || drc=$?
             case "$drc" in
                 0) _success "logrotate 已同步禁用" ;;
                 2)
@@ -387,7 +456,9 @@ _loglevel_menu() {
                 _tip "如需关闭请在本菜单 [1] 手动禁用"
             fi
         fi
-    elif [ "$auto_off" = "on" ]; then
+    # 自动恢复只在禁用确由日志级别联动造成时进行: user_off=on 表示用户显式禁用(即使联动标记
+    # 因 state 不可写而残留), 此时绝不能重写配置复活轮换。
+    elif [ "$auto_off" = "on" ] && [ "$(_logrotate_user_off_get)" != "on" ]; then
         local erc=0
         _logrotate_enable || erc=$?
         case "$erc" in
@@ -452,6 +523,11 @@ _logrotate_menu() {
                         2) _warn "logrotate 轮换已停, 但状态记录写入失败(状态显示可能不准)" ;;
                         *) _error "logrotate 禁用失败, 轮换配置仍在生效" ;;
                     esac
+                    # 手动禁用即使状态写失败(trc=2)也已删配置: 显式禁用优先于自动成因标记,
+                    # 保留标记会让之后切换日志级别时被自动恢复分支重新启用, 反转用户意图。
+                    if [ "$trc" -ne 1 ] && [ "$(_logrotate_auto_off_get)" = "on" ]; then
+                        _logrotate_auto_off_clear
+                    fi
                 else
                     _logrotate_enable || trc=$?
                     case "$trc" in
@@ -459,11 +535,11 @@ _logrotate_menu() {
                         2) _warn "logrotate 轮换已生效, 但状态记录写入失败(状态显示可能不准)" ;;
                         *) _error "logrotate 启用失败, 日志轮换未生效" ;;
                     esac
-                fi
-                # 只有操作完全成功(trc=0)才清标记: trc=1 失败、trc=2 状态未持久化时保留标记,
-                # 否则会重新制造"标记=on / enabled=on / 配置已删"的矛盾。
-                if [ "$trc" -eq 0 ] && [ "$(_logrotate_auto_off_get)" = "on" ]; then
-                    _logrotate_auto_off_clear
+                    # 只有启用完全成功(trc=0)才清标记: trc=1 失败、trc=2 状态未持久化时保留标记,
+                    # 否则会重新制造"标记=on / enabled=on / 配置已删"的矛盾。
+                    if [ "$trc" -eq 0 ] && [ "$(_logrotate_auto_off_get)" = "on" ]; then
+                        _logrotate_auto_off_clear
+                    fi
                 fi
                 _press_any_key
                 ;;
