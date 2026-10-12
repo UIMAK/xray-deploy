@@ -24,3 +24,8 @@ references/
 # 临时文件
 __pycache__/
 *.pyc
+
+# 机密/本地环境
+.env
+.env.*
+!.env.example
