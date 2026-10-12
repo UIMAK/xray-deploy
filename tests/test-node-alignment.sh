@@ -28,6 +28,34 @@ _ensure_unique_name() { return 0; }
 _tpl_path() { printf '%s/templates/%s.server.jsonc' "$ROOT" "$1"; }
 _commit_node_txn_locked() { printf '%s' "$2" > "$TMP/inbound.json"; printf '%s' "$3" > "$TMP/committed.json"; }
 
+# 多选删除的路由清理必须逐元素判定: 单元素/混装数组/标量(Xray StringList 接受逗号串)三种
+# inboundTag 形态都要移除(旧实现的数组 index 恒为 null, 且 []? 对标量产出空流 ⇒ 留下僵尸规则)。
+multi_delete_routing() (
+    local dir="$TMP/multidel"
+    CONFIG_DIR="$dir/confs" NODES_DIR="$dir/nodes" STATE_DIR="$dir/state" BACKUP_DIR="$dir/backup"
+    mkdir -p "$CONFIG_DIR" "$NODES_DIR" "$STATE_DIR" "$BACKUP_DIR"
+    eval "$actual_config_jq"
+    _with_config_lock() { "$@"; }
+    _backup_config() { return 0; }
+    _restart_xray_verified() { return 0; }
+    _config_write_merged '{"inbounds":[{"tag":"tun-a"},{"tag":"tun-b"},{"tag":"node-1"}],"routing":{"rules":[{"inboundTag":["tun-a"],"outboundTag":"direct"},{"inboundTag":["tun-a","other"],"outboundTag":"block"},{"inboundTag":"tun-a","outboundTag":"scalar"},{"inboundTag":"tun-a,tun-b","outboundTag":"scalar-list"},{"inboundTag":"tun-ab","outboundTag":"prefix-keep"},{"inboundTag":["tun-ab"],"outboundTag":"prefix-keep2"},{"inboundTag":["keep"],"outboundTag":"direct"},{"inboundTag":null,"outboundTag":"block"}]}}' || exit 1
+    printf '{"tag":"node-1","name":"n","protocol":"vless-tcp-reality-vision","tunnel_tag":"tun-a"}' > "$NODES_DIR/node-1.json"
+    _hy2_hop_teardown_all() { return 0; }
+    _hy2_filter_skipped() { _HY2_DEL_KEEP=("$@"); }
+    _remove_node_from_yaml_by_tag() { return 0; }
+    _reality_tunnel_has_surviving_refs() { return 1; }
+    local id; id=$(_node_identity node-1) || exit 1
+    _delete_node_apply_multi node-1 "$id" >/dev/null 2>&1 || exit 1
+    # 引用 tun-a 的四条规则(数组单元素/数组混装/标量/逗号串)全删;
+    # tun-a 的子串前缀 tun-ab(标量与数组)与 ["keep"] 必须保留, null 保留。
+    _config_jq -e '([.routing.rules[] | select(.inboundTag == "tun-ab")] | length == 1)
+        and ([.routing.rules[] | select(.inboundTag == ["tun-ab"])] | length == 1)
+        and ([.routing.rules[] | select(.inboundTag == ["keep"])] | length == 1)
+        and ([.routing.rules[] | select(.inboundTag == ["tun-a"] or .inboundTag == "tun-a" or .inboundTag == "tun-a,tun-b" or .inboundTag == ["tun-a","other"])] | length == 0)' >/dev/null 2>&1 || exit 1
+    _config_jq -e '([.inbounds[] | .tag] | index("tun-a")) == null' >/dev/null 2>&1 || exit 1
+)
+check 'multi-delete removes tunnel routing rules by element' multi_delete_routing
+
 # Render and execute the real creation transaction; metadata retains server direction.
 R_LISTEN=0.0.0.0 R_PORT=443 R_TAG=hy2-test R_AUTH=secret
 R_CERT_FILE=/fixture/cert.pem R_KEY_FILE=/fixture/key.pem R_CONGESTION=bbr

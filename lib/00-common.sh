@@ -720,7 +720,7 @@ _config_migrate_legacy() {
     [ -f "${LEGACY_CONFIG_FILE}.bak" ] && return 0
     _config_present && return 0
     [ -f "$LEGACY_CONFIG_FILE" ] && [ -s "$LEGACY_CONFIG_FILE" ] || return 0
-    local content snapshot="" snapshot_dir="" unit="" running=0 failed=0 mask_taken=0
+    local content snapshot="" snapshot_dir="" unit="" running=0 failed=0 mask_taken=0 unit_masked=0
     content=$(jq . "$LEGACY_CONFIG_FILE" 2>/dev/null) || {
         _error "旧配置文件解析失败, 未迁移(保持原样): $LEGACY_CONFIG_FILE"
         return 1
@@ -730,12 +730,15 @@ _config_migrate_legacy() {
         snapshot=$(mktemp -d) || return 1
         unit=$(_xray_service_unit_path) || unit=""
         if [ -n "$unit" ]; then
+            # 只判定一次并缓存: 两次判定之间若 unit 被外部改回普通文件, 会导致既无 mask 快照也无 service 快照,
+            # 回滚时把 unit 直接删掉。缓存消除该 TOCTOU 窗口。
             if [ "${INIT_SYSTEM:-}" = systemd ] && _xray_service_is_masked "$unit"; then
+                unit_masked=1
                 snapshot_dir=$(mktemp -d "$(dirname "$unit")/.xray-migrate.XXXXXX") || { rm -rf "$snapshot"; return 1; }
                 rm -rf "$snapshot"
                 snapshot=$snapshot_dir
             fi
-            if [ "${INIT_SYSTEM:-}" = systemd ] && _xray_service_is_masked "$unit"; then
+            if [ "$unit_masked" -eq 1 ]; then
                 _xray_service_take_mask_snapshot "$unit" "$snapshot/masked" || {
                     rm -rf "$snapshot"
                     _error "无法安全快照 stale systemd mask, 取消配置迁移"
@@ -916,7 +919,8 @@ _crontab_replace_locked() {
     [ -n "$marker" ] || return 1
     cur=$(_crontab_read) || return 1
     # -F 按字面匹配 marker; grep -v 返回 1 是合法空结果, rc>=2 必须拒绝写回。
-    filtered=$(printf '%s\n' "$cur" | grep -vF "$marker"); grc=$?
+    # marker 可能以 '-' 开头, 必须用 -- 终止选项解析(与 _crontab_has_marker 同口径)。
+    filtered=$(printf '%s\n' "$cur" | grep -vF -- "$marker"); grc=$?
     if [ "$grc" -ge 2 ]; then
         _error "过滤 crontab 失败(grep 返回 ${grc}), 已中止(避免覆盖并清空现有定时任务)"
         return 1

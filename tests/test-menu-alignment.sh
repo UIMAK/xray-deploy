@@ -2,19 +2,37 @@
 # Offline behavior of real Hy2 transactions, cron scheduling and service menus.
 set -u
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
-command -v jq >/dev/null 2>&1 || { printf 'SUMMARY pass=0 fail=1 (jq required)\n'; exit 1; }
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-menu-alignment.XXXXXX") || exit 1
-cleanup() {
-    # 直接按 $TMP 的模板前缀判定, 不依赖 pwd -P 相等(软链 TMPDIR 下会漏删)。
-    case "$TMP" in
-        "${TMPDIR:-/tmp}"/xray-menu-alignment.*) rm -rf -- "$TMP" ;;
-    esac
-}
-trap cleanup EXIT
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || { printf 'SUMMARY pass=0 fail=1\n'; exit 1; }
+# 被 source 时不得 exit/覆盖调用方的 EXIT trap; 作为子进程运行(未 source)时才 exit 与装 trap。
+_XD_SOURCED=0
+[ "${BASH_SOURCE[0]}" != "$0" ] && _XD_SOURCED=1
+_XD_TMP_OWNED=0
+if [ "$_XD_SOURCED" -eq 0 ]; then
+    command -v jq >/dev/null 2>&1 || { printf 'SUMMARY pass=0 fail=1 (jq required)\n'; exit 1; }
+    TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-menu-alignment.XXXXXX") || { printf 'SUMMARY pass=0 fail=1 (mktemp failed)\n'; exit 1; }
+    cleanup() {
+        # 直接按 $TMP 的模板前缀判定, 不依赖 pwd -P 相等(软链 TMPDIR 下会漏删)。
+        case "$TMP" in
+            "${TMPDIR:-/tmp}"/xray-menu-alignment.*) rm -rf -- "$TMP" ;;
+        esac
+    }
+    trap cleanup EXIT
+else
+    # 被 source 时用调用方的 TMP; 缺失则自建临时目录, 由下方子 shell 负责清理,
+    # 既不装调用方 EXIT trap, 也不能因 mktemp 失败而让后续路径落到 / 根下。
+    if [ -z "${TMP:-}" ]; then
+        TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-menu-alignment.XXXXXX") || {
+            printf 'SUMMARY pass=0 fail=1 (mktemp failed)\n'
+            return 1
+        }
+        _XD_TMP_OWNED=1
+    fi
+fi
 
 # Keep every mock in a subshell, including when this test is sourced elsewhere.
 (
+    # source 模式自建的临时目录由本子 shell 清理, 不改动调用方 EXIT trap。
+    [ "${_XD_TMP_OWNED:-0}" -eq 1 ] && trap 'rm -rf -- "$TMP"' EXIT
     . "$ROOT/lib/00-common.sh"
     . "${MENU_ALIGNMENT_NODES_MODULE:-$ROOT/lib/50-nodes.sh}"
     # Override only for a disposable mutated copy, never edit production modules.
@@ -51,8 +69,14 @@ trap cleanup EXIT
         printf '%s\n' "$content" > "$meta"
     }
     _hy2_sync_derived() {
+        # 参数必须是本节点的元数据路径; 不符则不写 sentinel 并报错, 让 committed() 的
+        # "writes 序列" 与 "messages 为空" 断言暴露出来。
+        if [ "$1" != "$META" ]; then
+            _error "derived sync called with unexpected path: $1"
+            return 1
+        fi
         printf 'derived\n' >> "$TMP/writes"
-        [ "$1" = "$META" ]
+        return 0
     }
     _restart_xray_verified() { printf 'UNEXPECTED restart\n' >> "$TMP/writes"; return 99; }
     _manage_xray() { printf 'UNEXPECTED service\n' >> "$TMP/writes"; return 99; }
@@ -117,9 +141,37 @@ trap cleanup EXIT
         expected_meta=$(jq "$meta_filter | if .brutal_up == \"\" then del(.brutal_up) else . end | if .brutal_down == \"\" then del(.brutal_down) else . end" <<< "$BEFORE_META")
         check "$label: succeeds" eq "$RC" 0
         check "$label: config then metadata then derived exactly once" eq "$(cat "$TMP/writes")" $'config\nmetadata\nderived'
+        check "$label: no warnings or errors on the committed path" test ! -s "$TMP/messages"
         check "$label: config contract including unrelated inbound and transport" eq "$expected_config" "$(_config_merged)"
         check "$label: metadata contract including unrelated fields" eq "$expected_meta" "$(jq . "$META")"
     }
+    # 元数据写入失败必须触发回滚: _restore_config + _restart_xray_verified 回到旧态, 返回 1(完整回滚)。
+    # 在子 shell 内覆盖 mock(避免污染后续用例), 结果落盘, 由父层 check 断言(子 shell 内的 check 计数会丢)。
+    # _restore_config 桩必须真的恢复事务前字节, 否则"完整回滚"断言会在配置仍被改写的状态下误报通过。
+    printf '== Hy2 metadata failure rollback ==\n'
+    rb_rc=""; rb_writes=""
+    (
+        fixture bbr '45 mbps'
+        meta_prev=$(cat "$META")
+        _meta_update() { printf 'metadata\n' >> "$TMP/writes"; return 1; }
+        _restore_config() {
+            printf 'restore\n' >> "$TMP/writes"
+            cp "$TMP/before-inbounds.json" "$CONFIG_DIR/07_inbounds.json" || return 1
+            return 0
+        }
+        _restart_xray_verified() { printf 'restart\n' >> "$TMP/writes"; return 0; }
+        invoke congestion force-brutal '60 mbps' ''
+        printf '%s' "$RC" > "$TMP/rb-rc"
+        cat "$TMP/writes" > "$TMP/rb-writes"
+        printf '%s' "$meta_prev" > "$TMP/rb-meta-prev"
+        printf '%s' "$(cat "$META")" > "$TMP/rb-meta-after"
+        cp "$CONFIG_DIR/07_inbounds.json" "$TMP/rb-config-after"
+    )
+    rb_rc=$(cat "$TMP/rb-rc"); rb_writes=$(cat "$TMP/rb-writes")
+    check 'metadata write failure: reports complete rollback (rc=1)' eq "$rb_rc" 1
+    check 'metadata write failure: restores config then restarts' eq "$rb_writes" $'config\nmetadata\nrestore\nrestart'
+    check 'metadata write failure: metadata rolled back to snapshot bytes' eq "$(cat "$TMP/rb-meta-prev")" "$(cat "$TMP/rb-meta-after")"
+    check 'metadata write failure: config restored to pre-transaction bytes' cmp -s "$TMP/before-inbounds.json" "$TMP/rb-config-after"
 
     printf '== Hy2 menu transaction official alignment ==\n'
     for invalid_up in '' '0' '0 mbps' '00.000 kbps' 'not-a-rate' 1kbps 0.01mbps 10kbps 65534bps 65535bps 100kbps 524287bps 511.999kbps 0.499999mbps 1watts; do
@@ -460,6 +512,36 @@ trap cleanup EXIT
     check 'stop success: reports stopped' eq "$(cat "$TMP/success")" '已停止'
     check 'stop success: emits no failure' test ! -s "$TMP/messages"
     check 'stop success: still pauses before next selection' eq "$(cat "$TMP/press-calls")" press
+
+    printf '== reset residual snapshot ==\n'
+    # 上一次 reset 已提交(runtime_verified)但清理失败: journal 与快照都残留。
+    # 收敛路径本次返回 0 但没清掉残留快照时, 新 reset 不得被永久阻断, 应清理后继续。
+    reset_snapshot_cleanup() (
+        local dir="$TMP/reset-cleanup"
+        DEPLOY_DIR="$dir" CONFIG_DIR="$dir/confs" NODES_DIR="$dir/nodes"
+        BACKUP_DIR="$dir/backups" STATE_DIR="$dir/state" CLASH_YAML="$dir/clash.yaml"
+        XRAY_BIN="$dir/bin/xray"
+        mkdir -p "$CONFIG_DIR" "$NODES_DIR" "$BACKUP_DIR" "$STATE_DIR"
+        _config_write_merged '{"inbounds":[]}' >/dev/null 2>&1 || return 1
+        local snapshot="$dir/.reset-snapshot"
+        mkdir -p "$snapshot"
+        # 模拟"已收敛但残留未清": 收敛返回 0, 快照仍在。
+        _reset_config_recover_locked() { return 0; }
+        _backup_config() { return 0; }
+        _with_config_lock() { "$@"; }
+        _with_deploy_install_lock() { "$@"; }
+        _reset_fsync_required() { return 0; }
+        _reset_fsync_rename() { return 0; }
+        _hy2_hop_cleanup_candidates() { return 0; }
+        _hy2_cleanup_all_hops() { return 0; }
+        _init_config_if_empty() { _config_write_merged '{"inbounds":[]}' >/dev/null 2>&1; }
+        _restart_xray_verified() { return 0; }
+        _reset_config_locked >/dev/null 2>&1
+        local rc=$?
+        # 残留快照被清理并重建; 成功收尾(rc 0)且快照已随提交删除。
+        [ "$rc" -eq 0 ] && [ ! -e "$snapshot" ]
+    )
+    check 'reset proceeds past a residual snapshot and cleans up' reset_snapshot_cleanup
 
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]

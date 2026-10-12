@@ -4,7 +4,11 @@
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-deploy-test.XXXXXX")
+# mktemp 失败必须立即停: 否则 TMP 为空会让派生路径塌缩到 / 根下并在 root 下创建真实目录。
+if ! TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-deploy-test.XXXXXX"); then
+    printf 'FAIL - cannot create temp dir; aborting to avoid /-rooted paths\n' >&2
+    exit 1
+fi
 trap 'rm -rf "$TMP"' EXIT
 PASS=0
 FAIL=0
@@ -277,9 +281,10 @@ if _logrotate_render_config | grep -q 'rotate 7'; then pass 'logrotate renderer 
 _state_set logrotate_retention 999999999999999999999999
 if _logrotate_render_config | grep -q 'rotate 30'; then pass 'long retention is bounded'; else fail 'long retention is bounded'; fi
 
-GEO_TRANSITION_KEY=geo_transition
-_state_set "$GEO_TRANSITION_KEY" off_pending
-check_eq 'Geo off marker persists' off_pending "$(_state_get "$GEO_TRANSITION_KEY")"
+# state 读写往返用命名空间化的测试键, 不借用生产 GEO_TRANSITION_KEY(否则会污染后续迁移用例)。
+_state_set xd_test_state_roundtrip off_pending
+check_eq 'state marker persists' off_pending "$(_state_get xd_test_state_roundtrip)"
+rm -f "$STATE_DIR/xd_test_state_roundtrip"
 
 printf '{"name":"shared-name"}\n' > "$NODES_DIR/xray.json"
 if _hysteria_name_taken shared-name; then pass 'shared Clash name collision rejected'; else fail 'shared Clash name collision rejected'; fi
@@ -481,20 +486,11 @@ XH_PQ_MENU_OUT=$(
             *) return 2 ;;
         esac
     }
-    read() {
-        _n=$((_n + 1))
-        local v="${!#}"
-        case "$_n" in
-            1) printf -v "$v" '%s' 1 ;;
-            2) printf -v "$v" '%s' new.example ;;
-            *) return 1 ;;
-        esac
-        return 0
-    }
+    # 只喂 stdin 而不覆盖 read 内建: 覆盖 read 会污染菜单内其它 read 调用点的变量绑定。
+    _xh_menu_case() { _reality_domain_menu >/dev/null 2>&1 <<< $'1\nnew.example\n'; }
     for XH_PQ_RC in 2 1 0; do
         rm -f "$XH_TXN_MARKER"
-        _n=0
-        _reality_domain_menu >/dev/null 2>&1
+        XH_PQ_RC="$XH_PQ_RC" _xh_menu_case
         if [ -e "$XH_TXN_MARKER" ]; then
             printf 'rc=%s txn=yes args=%s\n' "$XH_PQ_RC" "$(cat "$XH_TXN_MARKER")"
         else
@@ -565,7 +561,8 @@ check_eq 'missing logrotate state is unset' unset "$(_logrotate_enabled_state)"
 _state_set logrotate_enabled off
 check_eq 'explicit logrotate disable is retained' off "$(_logrotate_enabled_state)"
 if (
-    LOGROTATE_CONF="$TMP/logrotate-disabled.conf"
+    LOGROTATE_CONF="$TMP/lr-disabled/xray-deploy"
+    mkdir -p "$TMP/lr-disabled"
     : > "$LOGROTATE_CONF"
     _state_set() { return 1; }
     _logrotate_disable >/dev/null 2>&1
@@ -579,7 +576,9 @@ fi
 
 printf '== logrotate auto-off marker ==\n'
 rm -f "$STATE_DIR/$LOGROTATE_AUTO_OFF_KEY"
-LOGROTATE_CONF="$TMP/logrotate-marker.conf"
+LOGROTATE_CONF="$TMP/lr-marker/xray-deploy"
+mkdir -p "$TMP/lr-marker"
+rm -f "$(_logrotate_user_off_path)"
 _state_set logrotate_enabled on
 _state_set "$LOGROTATE_AUTO_OFF_KEY" on
 rm -f "$LOGROTATE_CONF"
@@ -614,6 +613,112 @@ else
     fail 'setup rewrites the config when the marker is absent'
 fi
 rm -f "$LOGROTATE_CONF" "$STATE_DIR/$LOGROTATE_AUTO_OFF_KEY"
+_state_set logrotate_enabled off
+LOGROTATE_CONF="$TMP/logrotate.conf"
+
+printf '== logrotate user-off intent and atomic write ==\n'
+# 禁用时状态写失败必须留下"禁用意图", 否则 setup 会凭 enabled=on 把已删配置的轮换重新打开。
+# 关键: 意图标记不能依赖 state 存储 —— 这里让**所有** _state_set 失败(模拟 state 存储不可写),
+# 标记仍须落到 include 目录侧, 否则与失败根因同源、必然一起失败。
+rm -f "$STATE_DIR/$LOGROTATE_AUTO_OFF_KEY"
+LOGROTATE_CONF="$TMP/logrotate-useroff/xray-deploy"
+mkdir -p "$TMP/logrotate-useroff"
+: > "$LOGROTATE_CONF"
+(
+    _state_set() { return 1; }
+    _logrotate_disable >/dev/null 2>&1
+) >/dev/null 2>&1
+check_eq 'disable-with-failed-state records user-off intent' on "$(_logrotate_user_off_get)"
+check_eq 'user-off intent with no config is effectively off' off "$(_logrotate_effective_enabled)"
+# 直接驱动真实 setup: 若 setup 在"标记=on 但 enabled 记录仍为 on"时复活轮换, 会重新写出配置。
+# enabled 记录用真实 _state_set 置 on(用户禁用那一步的写失败是模拟的, 但记录本身仍为 on)。
+_state_set logrotate_enabled on
+rm -f "$LOGROTATE_CONF"
+# 桩掉包依赖: 本机无 logrotate 时不得触发真实 apt/apk, 也不得 mkdir 真实 /etc/logrotate.d。
+(
+    _logrotate_ensure_package() { return 0; }
+    _logrotate_setup >/dev/null 2>&1
+)
+if [ ! -e "$LOGROTATE_CONF" ]; then
+    pass 'user-off intent keeps setup from resurrecting rotation'
+else
+    fail 'user-off intent keeps setup from resurrecting rotation'
+fi
+# 重新启用必须清除禁用意图。
+(
+    _logrotate_ensure_package() { return 0; }
+    _logrotate_enable >/dev/null 2>&1
+)
+if [ ! -e "$(_logrotate_user_off_path)" ]; then
+    pass 'enable clears user-off intent'
+else
+    fail 'enable clears user-off intent'
+fi
+rm -rf "$TMP/logrotate-useroff"
+
+# 部分损坏(仅哨兵丢失)不得覆盖仍存活的用户偏好。
+rm -f "$STATE_DIR/logrotate_enabled"
+_state_set logrotate_retention 14
+_logrotate_init_state >/dev/null 2>&1
+check_eq 'init preserves surviving retention preference' 14 "$(_state_get logrotate_retention)"
+check_eq 'init still writes the enabled sentinel' on "$(_state_get logrotate_enabled)"
+
+# 原子写: 在 include 根下只出现完整目标文件; 临时写入区不得留在 logrotate 会读取的目录里。
+# 关键断言: 提交完成后 include 根里除了目标文件不应有别的条目(旧的非原子实现会直接截断目标文件)。
+LOGROTATE_CONF="$TMP/lr-confdir/xray-deploy"
+mkdir -p "$TMP/lr-confdir"
+if _logrotate_write_config >/dev/null 2>&1 \
+   && [ -s "$LOGROTATE_CONF" ] \
+   && [ "$(cat "$LOGROTATE_CONF")" = "$(_logrotate_render_config)" ] \
+   && [ "$(ls -A "$TMP/lr-confdir" | grep -cv '^xray-deploy$')" -eq 0 ]; then
+    pass 'atomic write leaves a complete include and no temp residue'
+else
+    fail 'atomic write leaves a complete include and no temp residue'
+fi
+# 写入路径必须经临时文件再 rename(而非就地截断目标): rename 会换掉目标 inode, 截断不会。
+# 这直接区分原子实现与旧的非原子实现, 不依赖渲染失败等间接条件。
+printf 'previous-good-include\n' > "$TMP/lr-keep.conf"
+_ino_before=$(stat -c '%i' "$TMP/lr-keep.conf")
+if LOGROTATE_CONF="$TMP/lr-keep.conf" _logrotate_write_config >/dev/null 2>&1; then
+    _ino_after=$(stat -c '%i' "$TMP/lr-keep.conf")
+    if [ "$(cat "$TMP/lr-keep.conf")" = "$(_logrotate_render_config)" ] \
+       && [ "$_ino_before" != "$_ino_after" ]; then
+        pass 'atomic write commits via rename (inode replaced)'
+    else
+        fail 'atomic write commits via rename (inode replaced)'
+    fi
+else
+    fail 'atomic write commits via rename (inode replaced)'
+fi
+rm -rf "$TMP/lr-confdir" "$TMP/lr-keep.conf"
+# 意图标记自身写入失败(如 inode 耗尽/目录不可写)时不得删除配置:
+# 否则 setup 会凭 enabled=on 复活轮换, 且无任何标记可追溯。
+LOGROTATE_CONF="$TMP/lr-useroff-fail/xray-deploy"
+mkdir -p "$TMP/lr-useroff-fail"
+: > "$LOGROTATE_CONF"
+(
+    _logrotate_user_off_set() { return 1; }
+    _logrotate_disable >/dev/null 2>&1
+) >/dev/null 2>&1
+_drc=$?
+if [ "$_drc" -ne 0 ] && [ -e "$LOGROTATE_CONF" ] && [ ! -e "$(_logrotate_user_off_path)" ]; then
+    pass 'failed disable-intent write keeps the config'
+else
+    fail 'failed disable-intent write keeps the config'
+fi
+rm -rf "$TMP/lr-useroff-fail"
+
+# 目标路径是目录时必须显式失败, 不得把临时文件搬进目录后谎报成功。
+LOGROTATE_CONF="$TMP/lr-dir-target/xray-deploy"
+mkdir -p "$LOGROTATE_CONF"
+if ! _logrotate_write_config >/dev/null 2>&1 \
+   && [ -d "$LOGROTATE_CONF" ] \
+   && [ -z "$(ls -A "$LOGROTATE_CONF")" ]; then
+    pass 'directory target is rejected instead of silently accepted'
+else
+    fail 'directory target is rejected instead of silently accepted'
+fi
+rm -rf "$TMP/lr-dir-target"
 _state_set logrotate_enabled off
 LOGROTATE_CONF="$TMP/logrotate.conf"
 
@@ -678,7 +783,6 @@ check_eq 'nested clash sync is reentrant' 'nested=held rc=0 leak=no' "$XH_NESTED
 
 
 
-GEO_TRANSITION_KEY=geo_transition
 _state_set "$GEO_TRANSITION_KEY" off_pending
 GEO_SKIP_MARKER="$TMP/geo-download-called"
 (
@@ -745,6 +849,57 @@ if [ "$_hy2_rc" -eq 1 ]; then pass 'hy2 env reader reports absent (rc=1) for mis
 if [ "$_hy2_rc" -eq 2 ]; then pass 'hy2 env reports unknown (rc=2) when no reader is available'; else fail "hy2 env reports unknown (rc=2) when no reader is available (rc=$_hy2_rc)"; fi
 
 printf '== approved repair regressions ==\n'
+# 卸载必须清掉 hysteria_asset, 否则残留键会让后续 AVX 兜底按错误变体弱推断。
+if (
+    HYSTERIA_BIN="$TMP/hy-uninstall/hysteria"
+    HYSTERIA_CONFIG="$TMP/hy-uninstall/config.json"
+    HYSTERIA_SERVER_META="$TMP/hy-uninstall/server.json"
+    HYSTERIA_NODE_META="$TMP/hy-uninstall/node.json"
+    HYSTERIA_LOG_FILE="$TMP/hy-uninstall/hy.log"
+    HYSTERIA_DATA_DIR="$TMP/hy-uninstall/data"
+    HYSTERIA_CERT_DIR="$TMP/hy-uninstall/certs"
+    _lr_conf="$TMP/hy-uninstall/logrotate.d/xd-hysteria"
+    _hysteria_logrotate_conf() { printf '%s' "$_lr_conf"; }
+    HYSTERIA_SVC="xd-hysteria"
+    mkdir -p "$HYSTERIA_DATA_DIR" "$HYSTERIA_CERT_DIR" "$(dirname "$_lr_conf")"
+    printf 'bin' > "$HYSTERIA_BIN"
+    printf 'lr' > "$_lr_conf"
+    _state_set hysteria_version 2.12.2
+    _state_set hysteria_variant avx
+    _state_set hysteria_asset hysteria-linux-amd64
+    _hysteria_installed() { return 0; }
+    _hysteria_stop_and_verify() { return 0; }
+    _hysteria_cleanup_service_units() { return 0; }
+    _hysteria_uninstall_locked >/dev/null 2>&1
+    [ ! -e "$STATE_DIR/hysteria_version" ] && [ ! -e "$STATE_DIR/hysteria_variant" ] \
+        && [ ! -e "$STATE_DIR/hysteria_asset" ] && [ ! -e "$_lr_conf" ]
+); then pass 'uninstall clears hysteria_asset state'; else fail 'uninstall clears hysteria_asset state'; fi
+# 端口跳跃解析: 只接受单段 a-b; 多 '-' 必须显式拒绝(旧实现用 cut 静默丢弃多余段)。
+if _parse_hop_ranges '20000-30000' >/dev/null 2>&1 \
+   && ! _parse_hop_ranges '80-90-100' >/dev/null 2>&1 \
+   && ! _parse_hop_ranges '1-2-3-4' >/dev/null 2>&1; then
+    pass 'hop range parser rejects multi-dash entries'
+else
+    fail 'hop range parser rejects multi-dash entries'
+fi
+# 关闭失败且 cron 回滚失败时不得把 geo_cron 写成 off(残留 cron 仍在跑, 会谎报已关闭)。
+if (
+    _ensure_cron_running() { return 1; }
+    _geo_remove_cron_line() { return 1; }
+    _crontab_replace() { return 0; }
+    _state_set geo_cron on
+    _geo_set_auto_update_cron on >/dev/null 2>&1
+    [ "$(_state_get geo_cron)" = on ]
+); then pass 'failed cron rollback keeps geo_cron on'; else fail 'failed cron rollback keeps geo_cron on'; fi
+# 关闭成功且回滚成功时才置 off。
+if (
+    _ensure_cron_running() { return 1; }
+    _geo_remove_cron_line() { return 0; }
+    _crontab_replace() { return 0; }
+    _state_set geo_cron on
+    _geo_set_auto_update_cron on >/dev/null 2>&1
+    [ "$(_state_get geo_cron)" = off ]
+); then pass 'successful cron rollback records geo_cron off'; else fail 'successful cron rollback records geo_cron off'; fi
 if (
     CONFIG_DIR="$TMP/duplicate-confs"
     mkdir -p "$CONFIG_DIR"
@@ -793,10 +948,12 @@ if (
     XRAY_BIN=/bin/true
     mkdir -p "$CONFIG_DIR"; printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
     _xray_service_unit_path() { return 1; }
-    _manage_xray() { printf stopped; }
+    # 记录 service 动作: 断言迁移没有 start/restart 一个原本停止的服务。
+    _manage_xray() { printf '%s\n' "$1" >> "$TMP/stopped-migration/actions"; printf stopped; }
     _create_xray_service() { return 0; }
-    _restart_xray_verified() { return 1; }
-    _config_migrate_legacy >/dev/null 2>&1 && [ -f "$LEGACY_CONFIG_FILE.bak" ]
+    _restart_xray_verified() { printf 'restart\n' >> "$TMP/stopped-migration/actions"; return 1; }
+    _config_migrate_legacy >/dev/null 2>&1 && [ -f "$LEGACY_CONFIG_FILE.bak" ] &&
+        ! grep -Eq 'start|restart' "$TMP/stopped-migration/actions" 2>/dev/null
 ); then pass 'successful migration leaves stopped service stopped'; else fail 'successful migration leaves stopped service stopped'; fi
 
 # Third-party uninstallers may leave a systemd mask symlink at the managed unit

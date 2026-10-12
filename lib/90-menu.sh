@@ -14,6 +14,16 @@ _menu_display_width() {
     printf '%s' "$w"
 }
 
+# 按显示宽度把名称补到指定列宽(默认20), 供 %s 使用; 中文每字 2 列, 用 %-Ns 会错列。
+_menu_name_pad() {
+    local name="$1" width="${2:-20}" pad
+    # 名称可能来自元数据且未做字符校验: 显示前剥离控制字符(ESC/CR 等), 防排版错乱与终端转义注入。
+    name=$(printf '%s' "$name" | LC_ALL=C tr -d '[:cntrl:]')
+    pad=$((width - $(_menu_display_width "$name")))
+    [ "$pad" -lt 1 ] && pad=1
+    printf '%s%*s' "$name" "$pad" ""
+}
+
 # _menu_row 按纯文本显示宽度补齐，不计颜色；避免 printf 字节宽度造成错列。
 MENU_COL_WIDTH=22
 _menu_row() {
@@ -566,7 +576,7 @@ _uninstall_cloudflared_fallback() {
 
 # 卸载菜单
 _uninstall_menu() {
-    local choice
+    local choice ans
     clear
     echo
     echo -e "  ${RED}【卸载 / 重置】${NC}"
@@ -937,7 +947,15 @@ _reset_config_locked() {
     fi
     if [ "$had_config" -eq 1 ]; then had_json=true; else had_json=false; fi
     # 恢复源与账本先落盘, 再动任何真实状态(包括 iptables): 崩溃时才有据可回滚。
-    if [ -e "$snapshot" ] || ! mkdir "$snapshot" 2>/dev/null; then
+    # 区分"残留快照"与"mkdir 失败": 上一次已提交但清理失败的残留快照不应永久阻断重置,
+    # 收敛路径(_reset_config_recover_locked)已在前面成功执行, 此时残留即为可安全清理的孤儿。
+    if [ -e "$snapshot" ]; then
+        if ! rm -rf "$snapshot" 2>/dev/null || [ -e "$snapshot" ]; then
+            _error "存在无法清理的残留 reset 快照目录, 已取消重置: $snapshot"
+            return 1
+        fi
+    fi
+    if ! mkdir "$snapshot" 2>/dev/null; then
         _error "无法创建 reset 恢复快照目录, 已取消重置以保护现有数据"
         return 1
     fi
@@ -1109,7 +1127,7 @@ _check_script_update() {
     clear
     echo
     echo -e "  ${CYAN}【检测脚本更新】${NC}"
-    local local_ver
+    local local_ver ans
     local_ver=$(cat "$DEPLOY_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')
     [ -z "$local_ver" ] && local_ver="(未知)"
     echo -e "  当前版本: ${CYAN}${local_ver}${NC}"
@@ -1234,7 +1252,7 @@ _hy2_masq_menu() {
         tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
         desc=$(_hy2_masq_desc "$tag")
         tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %-20s 当前: %s\n" "$i" "$name" "${desc:-默认 404 页面}"
+        printf "  ${GREEN}[%d]${NC} %s 当前: %s\n" "$i" "$(_menu_name_pad "$name")" "${desc:-默认 404 页面}"
         i=$((i+1))
     done
     [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
@@ -1543,7 +1561,7 @@ _hy2_toggle_brutal() {
         local tag name cc
         tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); cc=$(jq -r '.congestion' "$f")
         tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %-20s 当前: %s\n" "$i" "$name" "$cc"
+        printf "  ${GREEN}[%d]${NC} %s 当前: %s\n" "$i" "$(_menu_name_pad "$name")" "$cc"
         i=$((i+1))
     done
     [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
@@ -1605,6 +1623,9 @@ _hy2_toggle_brutal() {
             esac
             ;;
         2) _tip "本次 Hy2 更新回滚不完整, 请按上方提示人工核对" ;;
+        1) _error "本次 Hy2 更新未生效(参数非法或配置事务失败); 回滚/运行时状态不确定, 请按上方消息核对" ;;
+        3) _info "无需切换(当前已是所选模式)" ;;
+        *) _error "本次 Hy2 更新未完成(返回码 ${txn_rc}); 详见上方消息" ;;
     esac
     _press_any_key
 }
@@ -1624,7 +1645,7 @@ _hy2_adjust_bandwidth() {
         tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
         cc=$(jq -r '.congestion' "$f"); up=$(jq -r '.brutal_up // empty' "$f"); down=$(jq -r '.brutal_down // empty' "$f")
         tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %-20s cc=%-6s up=%-12s down=%s\n" "$i" "$name" "$cc" "${up:--}" "${down:--}"
+        printf "  ${GREEN}[%d]${NC} %s cc=%-6s up=%-12s down=%s\n" "$i" "$(_menu_name_pad "$name")" "$cc" "${up:--}" "${down:--}"
         i=$((i+1))
     done
     [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
@@ -1761,7 +1782,7 @@ _hy2_obfs_menu() {
         otype=$(jq -r '.obfs_type // empty' "$f")
         osize=$(_hy2_obfs_size_get "$f")
         tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %-20s 当前: %s%s\n" "$i" "$name" "${otype:-未启用}" "${osize:+ (packetSize=${osize})}"
+        printf "  ${GREEN}[%d]${NC} %s 当前: %s%s\n" "$i" "$(_menu_name_pad "$name")" "${otype:-未启用}" "${osize:+ (packetSize=${osize})}"
         i=$((i+1))
     done
     [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }

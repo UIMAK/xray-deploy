@@ -13,9 +13,11 @@ if [ -z "$core_input" ] || [ ! -x "$core_input" ]; then
     printf 'Set XRAY_TEST_BIN or pass an executable Xray core path.\n' >&2
     exit 2
 fi
-for tool in jq openssl mktemp readlink; do
+for tool in jq openssl mktemp readlink awk grep tail cat dirname; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 2; }
 done
+# readlink -f 是 GNU 扩展, 裸 readlink 存在不代表可用。
+readlink -f / >/dev/null 2>&1 || { printf 'Missing dependency: readlink -f (GNU coreutils)\n' >&2; exit 2; }
 core=$(readlink -f "$core_input")
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 scratch=$(mktemp -d)
@@ -314,9 +316,11 @@ for scenario in forceDown ordinaryUp ordinaryDown; do
     for rate_case in 1kbps 65535bps 524287bps 524288bps 512kbps 0.5mbps 0 '' absent; do
         rate="$rate_case"
         expected=0
+        omit=0
         case "$rate_case" in
             1kbps|65535bps|524287bps) expected=1 ;;
-            absent) rate='' ;;
+            # 空串语义等于"未设置"; 生产从不写空带宽字段, 故与 absent 一样省略字段, 避免与 helper 的 '' 语义错配。
+            absent|'') rate=''; omit=1 ;;
         esac
         validator_rc=0
         _hy2_brutal_rate_valid "$rate" || validator_rc=$?
@@ -325,7 +329,7 @@ for scenario in forceDown ordinaryUp ordinaryDown; do
         if [ "$scenario" = forceDown ]; then
             R_BRUTAL_PARAMS_BLOCK=', "brutalUp": "80mbps"'
         fi
-        if [ "$rate_case" != absent ]; then
+        if [ "$omit" -eq 0 ]; then
             R_BRUTAL_PARAMS_BLOCK+=", \"$field\": \"$rate\""
         fi
         name="$scenario [${rate_case:-empty}]"
@@ -335,7 +339,7 @@ for scenario in forceDown ordinaryUp ordinaryDown; do
             record FAIL "$name (render differs)"
             continue
         fi
-        if [ "$rate_case" = absent ]; then
+        if [ "$omit" -eq 1 ]; then
             if ! printf '%s' "$inbound" | jq -e --arg field "$field" \
                 '.streamSettings.finalmask.quicParams | has($field) | not' >/dev/null; then
                 record FAIL "$name (field must actually be omitted)"

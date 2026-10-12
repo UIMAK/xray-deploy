@@ -14,6 +14,9 @@ export HYSTERIA_LOG_FILE="$LOG_DIR/hysteria.log"
 export HYSTERIA_ACME_DIR="$DEPLOY_DIR/hysteria/acme"
 export HYSTERIA_SVC="xray-deploy-hysteria"
 export HYSTERIA_PID_FILE="/run/xray-deploy-hysteria.pid"
+# logrotate 配置路径经函数返回: 测试覆盖该函数即可隔离, 不开放环境变量
+# (继承的环境变量若指向任意路径, 会被特权回滚/卸载的 rm -f 误删)。
+_hysteria_logrotate_conf() { printf '%s' "/etc/logrotate.d/xd-hysteria"; }
 export HYSTERIA_DL_BASE="https://download.hysteria.network/app"
 export HYSTERIA_GH_API="https://api.github.com/repos/HyNetworks/hysteria/releases/latest"
 
@@ -500,7 +503,7 @@ _hysteria_runtime_state() {
 
 # 清理归属明确的遗留 supervisor；恢复前需消除自动重拉。
 _hysteria_kill_stale_supervisor() {
-    local a c st
+    local a c st current_st
     a=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
     if [ -z "$a" ]; then
         if [ -e "$HYSTERIA_PID_FILE" ] || [ -L "$HYSTERIA_PID_FILE" ]; then
@@ -671,9 +674,9 @@ EOF
     if ! rc-update add "$HYSTERIA_SVC" default 2>/dev/null; then
         _warn "service 定义已创建, 但开机自启设置失败(可手动: rc-update add ${HYSTERIA_SVC} default)"
     fi
-    if [ -d /etc/logrotate.d ] && [ ! -f /etc/logrotate.d/xd-hysteria ]; then
+    if [ -d "$(dirname "$(_hysteria_logrotate_conf)")" ] && [ ! -f "$(_hysteria_logrotate_conf)" ]; then
         printf '%s\n' "${HYSTERIA_LOG_FILE} {" "    weekly" "    rotate 4" "    compress" \
-            "    missingok" "    copytruncate" "}" > /etc/logrotate.d/xd-hysteria 2>/dev/null || true
+            "    missingok" "    copytruncate" "}" > "$(_hysteria_logrotate_conf)" 2>/dev/null || true
     fi
     return 0
 }
@@ -2462,7 +2465,7 @@ _hysteria_bootstrap_locked() {
             _tip "请人工清理 service 后核对 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META; 快照: ${server_bak:-无} ${node_bak:-无} ${HYSTERIA_TLS_SNAPSHOT_DIR:-}"
             return 1
         fi
-        rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+        rm -f "$(_hysteria_logrotate_conf)" 2>/dev/null
         _hysteria_bootstrap_rollback "service 创建失败"
         return 1
     fi
@@ -2480,7 +2483,7 @@ _hysteria_bootstrap_locked() {
                 _tip "请人工核对 $HYSTERIA_CONFIG / $HYSTERIA_SERVER_META / $HYSTERIA_NODE_META; 快照: ${server_bak:-无} ${node_bak:-无} ${HYSTERIA_TLS_SNAPSHOT_DIR:-}"
                 return 1
             fi
-            rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+            rm -f "$(_hysteria_logrotate_conf)" 2>/dev/null
             _hysteria_bootstrap_rollback "服务启动失败"
             return 1
         fi
@@ -3166,7 +3169,7 @@ _hysteria_cleanup_service_units() {
         *)
             ok=0 ;;
     esac
-    rm -f /etc/logrotate.d/xd-hysteria 2>/dev/null
+    rm -f "$(_hysteria_logrotate_conf)" 2>/dev/null
     return "$ok"
 }
 
@@ -3206,9 +3209,9 @@ _hysteria_uninstall_locked() {
         name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
         [ -n "$name" ] && _hysteria_remove_clash_by_name "$name"
     fi
-    rm -f "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META" "$HYSTERIA_LOG_FILE" /etc/logrotate.d/xd-hysteria
+    rm -f "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META" "$HYSTERIA_LOG_FILE" "$(_hysteria_logrotate_conf)"
     rm -rf "$HYSTERIA_DATA_DIR" "$HYSTERIA_CERT_DIR"
-    rm -f "$STATE_DIR/hysteria_version" "$STATE_DIR/hysteria_variant"
+    rm -f "$STATE_DIR/hysteria_version" "$STATE_DIR/hysteria_variant" "$STATE_DIR/hysteria_asset"
     _success "官方 Hysteria2 已卸载"
     return 0
 }
@@ -3237,19 +3240,20 @@ _hysteria_menu() {
         clear
         echo
         echo -e "  ${CYAN}【Hysteria2 管理 — 官方核心 (HyNetworks/hysteria)】${NC}"
-        local cur st ncount=0 f
+        local cur st ncount=0
         cur=$(_hysteria_cached_version 2>/dev/null)
         if [ -n "$cur" ]; then
             st=$(_manage_hysteria status 2>/dev/null)
             if [ "$st" = "running" ]; then
                 echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${GREEN}● 运行中${NC}  (Xray Hy2 在主菜单 [Xray Hy2 管理], 两者独立)"
+            elif [ "$st" = "unknown" ]; then
+                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${YELLOW}? 未知(保留服务证据)${NC}  (Xray Hy2 在主菜单 [Xray Hy2 管理], 两者独立)"
             else
                 echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${RED}○ 已停止${NC}  (Xray Hy2 在主菜单 [Xray Hy2 管理], 两者独立)"
             fi
         else
             echo -e "  核心: ${RED}未安装${NC}"
         fi
-        local ncount=0
         [ -f "$HYSTERIA_NODE_META" ] && ncount=1
         echo -e "  节点: ${CYAN}${ncount}${NC}"
         echo

@@ -15,8 +15,14 @@ trap cleanup EXIT
     . "$ROOT/lib/00-common.sh"
     . "${CORE_REGRESSIONS_MODULE:-$ROOT/lib/20-xray-core.sh}"
     # Map the allowlisted unit path to scratch while keeping real schema checks.
+    # 必须确认替换真的发生: 否则 eval 的是未修改函数, 会以真实系统路径运行却仍报 PASS。
     journal_ok_definition=$(declare -f _xray_core_journal_ok)
-    eval "${journal_ok_definition//\/etc\/systemd\/system\/xray.service/\$UNIT}"
+    [ -n "$journal_ok_definition" ] || { printf 'SUMMARY pass=0 fail=1 (declare -f failed)\n'; exit 1; }
+    case "$journal_ok_definition" in
+        *'/etc/systemd/system/xray.service'*)
+            eval "${journal_ok_definition//\/etc\/systemd\/system\/xray.service/\$UNIT}" ;;
+        *) printf 'SUMMARY pass=0 fail=1 (unit path literal changed; fix the rewrite)\n'; exit 1 ;;
+    esac
     verified_restart_definition=$(declare -f _restart_xray_verified)
     PASS=0 FAIL=0
     _info() { :; }
@@ -55,6 +61,9 @@ trap cleanup EXIT
         printf '%2048s' 'new-geosite' > "$DEPLOY_DIR/download/geosite.dat"
         ln -s /dev/null "$UNIT"
         : > "$TMP/fsync"
+        # messages/service-actions 跨用例累积: 每个 fixture 重建, 使断言只反映当前用例。
+        : > "$TMP/messages"
+        : > "$TMP/service-actions"
     }
     check() {
         local label="$1"; shift
@@ -74,7 +83,10 @@ trap cleanup EXIT
         [ "$(stat -c '%i' "$UNIT")" = "$inode" ] &&
         cmp -s "$ASSET_DIR/geoip.dat" "$DEPLOY_DIR/download/geoip.dat" &&
         cmp -s "$ASSET_DIR/geosite.dat" "$DEPLOY_DIR/download/geosite.dat" &&
-        [ "$RESTARTS" -eq 0 ] && settled
+        [ "$RESTARTS" -eq 0 ] && settled &&
+        # masked/已停服务成功路径不得触碰 systemctl start/restart, 也不得记录错误。
+        ! grep -Eq 'start|restart' "$TMP/service-actions" 2>/dev/null &&
+        [ ! -s "$TMP/messages" ]
     }
     dat_ownership() {
         fixture dat-ownership
@@ -99,7 +111,6 @@ trap cleanup EXIT
             command mv "$@"
         }
         update && return 1
-        unset -f mv
         unset -f mv
         old_dat && [ "$RUNNING" = true ] && [ "$RESTARTS" -eq 0 ] && settled && [ -L "$UNIT" ]
     }
@@ -187,7 +198,13 @@ trap cleanup EXIT
         local pidfile="$DEPLOY_DIR/xray.pid"
         printf '4242 123' > "$pidfile"
         # Map only the hardcoded pidfile/comm reads; no real process is signalled.
+        # 替换必须命中, 否则 eval 未修改函数会 rm -f 宿主真实的 /run/xray.pid。
         _manage_xray_definition=$(declare -f _manage_xray)
+        [ -n "$_manage_xray_definition" ] || return 1
+        case "$_manage_xray_definition" in
+            *'/run/xray.pid'*) ;;
+            *) return 1 ;;
+        esac
         eval "${_manage_xray_definition//\/run\/xray.pid/$pidfile}"
         _xd_pidfile_pid() { printf '4242'; }
         _xd_pidfile_starttime() { printf '123'; }
