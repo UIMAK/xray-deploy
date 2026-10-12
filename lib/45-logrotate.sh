@@ -243,11 +243,17 @@ _logrotate_enable() {
 }
 
 _logrotate_disable() {
-    # 先记录禁用意图再删配置: 意图写不进(如 inode 耗尽/目录不可写)就不能删,
-    # 否则 setup 会凭 enabled=on 复活轮换, 且无任何标记可追溯。
-    if ! _logrotate_user_off_set; then
-        _error "无法记录 logrotate 禁用意图, 已取消禁用(配置未删除): $(_logrotate_user_off_path)"
-        return 1
+    # $1=auto: 日志级别联动禁用, 只记 auto_off 因果, 不写 user_off("用户显式禁用"标记)。
+    # 两者必须分开: 共用 user_off 时, 若联动标记清除失败(state 存储不可写), 之后切回日志级别
+    # 的自动恢复分支会凭 auto_off 重写配置并清掉 user_off, 覆盖用户的显式禁用。
+    local intent="${1:-manual}"
+    if [ "$intent" != "auto" ]; then
+        # 先记录禁用意图再删配置: 意图写不进(如 inode 耗尽/目录不可写)就不能删,
+        # 否则 setup 会凭 enabled=on 复活轮换, 且无任何标记可追溯。
+        if ! _logrotate_user_off_set; then
+            _error "无法记录 logrotate 禁用意图, 已取消禁用(配置未删除): $(_logrotate_user_off_path)"
+            return 1
+        fi
     fi
     _logrotate_remove_config || return 1
     if ! _state_set logrotate_enabled "off"; then
@@ -255,7 +261,7 @@ _logrotate_disable() {
         _tip "请重试本操作, 或检查 $STATE_DIR 是否可写"
         return 2
     fi
-    _logrotate_user_off_clear
+    [ "$intent" = "auto" ] || _logrotate_user_off_clear
     return 0
 }
 
@@ -429,7 +435,7 @@ _loglevel_menu() {
                 _press_any_key; return
             fi
             local drc=0
-            _logrotate_disable || drc=$?
+            _logrotate_disable auto || drc=$?
             case "$drc" in
                 0) _success "logrotate 已同步禁用" ;;
                 2)
@@ -450,7 +456,9 @@ _loglevel_menu() {
                 _tip "如需关闭请在本菜单 [1] 手动禁用"
             fi
         fi
-    elif [ "$auto_off" = "on" ]; then
+    # 自动恢复只在禁用确由日志级别联动造成时进行: user_off=on 表示用户显式禁用(即使联动标记
+    # 因 state 不可写而残留), 此时绝不能重写配置复活轮换。
+    elif [ "$auto_off" = "on" ] && [ "$(_logrotate_user_off_get)" != "on" ]; then
         local erc=0
         _logrotate_enable || erc=$?
         case "$erc" in

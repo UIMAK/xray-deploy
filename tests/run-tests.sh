@@ -708,6 +708,41 @@ else
 fi
 rm -rf "$TMP/lr-useroff-fail"
 
+# P2 回归: state 存储不可写时手动禁用会留下 user_off, 而联动标记 auto_off 可能清不掉(同一存储不可写);
+# 之后切换日志级别绝不能凭残留 auto_off 自动恢复, 覆盖用户的显式禁用。
+LOGROTATE_CONF="$TMP/lr-auto-manual/xray-deploy"
+mkdir -p "$TMP/lr-auto-manual"
+: > "$LOGROTATE_CONF"
+_state_set "$LOGROTATE_AUTO_OFF_KEY" on
+_state_set logrotate_enabled on
+(
+    _state_set() { return 1; }
+    _logrotate_disable >/dev/null 2>&1
+) >/dev/null 2>&1
+if [ "$(_logrotate_user_off_get)" = "on" ] \
+   && [ "$(_logrotate_auto_off_get)" = "on" ] \
+   && [ ! -e "$LOGROTATE_CONF" ] \
+   && [ "$(_logrotate_effective_enabled)" = "off" ]; then
+    pass 'manual disable with unwritable state keeps user-off while auto marker stays stuck'
+else
+    fail 'manual disable with unwritable state keeps user-off while auto marker stays stuck'
+fi
+if (
+    _config_edit_preflight() { return 0; }
+    _xray_loglevel_get() { printf 'none'; }
+    _xray_loglevel_valid() { return 0; }
+    _mutate_config() { return 0; }
+    _logrotate_ensure_package() { return 0; }
+    _press_any_key() { :; }
+    printf '4\n' | _loglevel_menu >/dev/null 2>&1
+    [ ! -e "$LOGROTATE_CONF" ] && [ "$(_logrotate_user_off_get)" = "on" ]
+); then
+    pass 'loglevel switch does not resurrect a manually disabled logrotate'
+else
+    fail 'loglevel switch does not resurrect a manually disabled logrotate'
+fi
+rm -rf "$TMP/lr-auto-manual"
+
 # 目标路径是目录时必须显式失败, 不得把临时文件搬进目录后谎报成功。
 LOGROTATE_CONF="$TMP/lr-dir-target/xray-deploy"
 mkdir -p "$LOGROTATE_CONF"
