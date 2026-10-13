@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Offline scratch coverage of real core/Geo journals and direct service control.
+# 桩函数与 fixture 变量由 source 进来的生产模块间接消费。
+# shellcheck disable=SC2329,SC2034
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
 command -v jq >/dev/null 2>&1 || { printf 'SUMMARY pass=0 fail=1 (jq required)\n'; exit 1; }

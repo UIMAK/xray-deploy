@@ -155,6 +155,7 @@ _hy2_link_unexpressible() {
 # XD_UDP_OUR_TYPE/XD_UDP_OUR_MARKER 为匹配键；udp 是多层数组(finalmask.md)。
 XD_UDP_OUR_TYPE="salamander"
 XD_UDP_OUR_MARKER="xd_managed"
+# shellcheck disable=SC2034
 XD_UDP_JQ_UPSERT='def xd_udp_ours($new): .streamSettings.finalmask.udp = ((.streamSettings.finalmask.udp // []) as $a | ($a | map(.type == $ourtype and (.settings // {})[$ourmark] == true) | index(true)) as $i | if $i == null then (if $new == null then $a else $a + [$new] end) else (if $new == null then $a[0:$i] + $a[$i+1:] else $a[0:$i] + [$new] + $a[$i+1:] end) end); (.inbounds[] | select(.tag == $t)) |= xd_udp_ours($new)'
 
 # 探测无归属标记的 salamander 层；外来层不得由本脚本替换。
@@ -458,6 +459,16 @@ _hy2_match_target() {
     grep -e "--to-destination :${port} " -e "--to-destination :${port}\$"
 }
 
+# 执行一条 iptables -S 规则行: 按词拆成 argv 再交给命令, 数组不参与 glob,
+# 规则文本里的元字符不会被当路径展开。
+_hy2_run_rule_line() {   # <iptables|ip6tables> <规则行>
+    local bin="$1" line="$2"
+    local -a argv=()
+    read -r -a argv <<< "$line"
+    [ "${#argv[@]}" -gt 0 ] || return 0
+    "$bin" -t nat "${argv[@]}"
+}
+
 # 持久化路径统一读取 rules.v4/rules.v6 或 Alpine rules-save；与保存入口一致。
 _hy2_conf_save_path() {   # <conf> <key> <default>
     local conf="$1" key="$2" def="$3" line value=""
@@ -603,7 +614,9 @@ _hy2_add_hop_rules() {
             existing_start="${existing_range%%:*}"
             existing_end="$existing_start"
             [ "$existing_range" = "$existing_start" ] || existing_end="${existing_range##*:}"
-            _validate_port "$existing_start" && _validate_port "$existing_end" || continue
+            if ! _validate_port "$existing_start" || ! _validate_port "$existing_end"; then
+                continue
+            fi
             if [ "$req_start" -le "$existing_end" ] && [ "$req_end" -ge "$existing_start" ]; then
                 if [ "$existing_target" != ":${hy2_port}" ]; then
                     _error "端口范围 ${range} 与现有范围 ${existing_range} 数值重叠且指向其他节点, 拒绝添加"
@@ -645,7 +658,9 @@ _hy2_add_hop_rules() {
                 [[ "$v6_range" =~ ^[0-9]{1,5}(:[0-9]{1,5})?$ ]] || continue
                 v6_start="${v6_range%%:*}"; v6_end="$v6_start"
                 [ "$v6_range" = "$v6_start" ] || v6_end="${v6_range##*:}"
-                _validate_port "$v6_start" && _validate_port "$v6_end" || continue
+                if ! _validate_port "$v6_start" || ! _validate_port "$v6_end"; then
+                    continue
+                fi
                 if [ "$req_start" -le "$v6_end" ] && [ "$req_end" -ge "$v6_start" ] \
                    && [ "$v6_target" != ":${hy2_port}" ]; then
                     _error "IPv6 端口范围 ${range} 与现有范围 ${v6_range} 数值重叠且指向其他节点, 拒绝添加"
@@ -702,7 +717,8 @@ _hy2_remove_hop_rules() {
                 | _hy2_match_target "$hy2_port" | sed 's/^-A/-D/')
         local line
         while IFS= read -r line; do
-            [ -n "$line" ] && iptables -t nat $line 2>/dev/null || true
+            [ -n "$line" ] || continue
+            _hy2_run_rule_line iptables "$line" 2>/dev/null || true
         done <<< "$specs"
         # 删除后核验: 重新查询当前状态(不能用删除前的 q), 若该范围仍残留则显式提示并置失败标记
         local remain
@@ -728,7 +744,7 @@ _hy2_remove_hop_rules() {
                     | _hy2_match_target "$hy2_port" | sed 's/^-A/-D/')
             while IFS= read -r line; do
                 if [ -n "$line" ]; then
-                    ip6tables -t nat $line 2>/dev/null || remain_any=1
+                    _hy2_run_rule_line ip6tables "$line" 2>/dev/null || remain_any=1
                 fi
             done <<< "$specs6"
             if ! q6=$(ip6tables -t nat -S PREROUTING 2>/dev/null); then
@@ -951,7 +967,7 @@ _hy2_remove_created_hop_rules() {
             | _hy2_match_target "$port" | sed 's/^-A/-D/') || specs=""
         while IFS= read -r line; do
             [ -n "$line" ] || continue
-            $cmd -t nat $line 2>/dev/null || rc=1
+            _hy2_run_rule_line "$cmd" "$line" 2>/dev/null || rc=1
         done <<< "$specs"
         q=$($cmd -t nat -S PREROUTING 2>/dev/null) || { rc=1; continue; }
         remain=$(printf '%s\n' "$q" | grep 'xray-deploy-hy2-hop' \
@@ -1187,6 +1203,7 @@ _hy2_port_txn_locked() {
     local ranges="$*" orig journal rok current_port current_ranges
     # 本事务临界区标记(local 动态作用域, 事务返回即消失): 自己的 journal 在写 config 时
     # 不算"未收敛现场" —— 见 _txn_allow_config_write 的 port 段。
+    # shellcheck disable=SC2034
     local XD_PORT_TXN_ACTIVE=1
     journal="${meta}.porttxn"
     orig=$(cat "$meta" 2>/dev/null) || { _error "读取元数据失败: $meta"; return 1; }
@@ -1225,6 +1242,7 @@ _hy2_port_txn_locked() {
         return 1
     fi
     # DNAT retarget 失败仍复核回滚；只有完整恢复才删除 journal。
+    # shellcheck disable=SC2086
     if ! _hy2_hop_retarget "$oldport" "$newport" $ranges; then
         return 1
     fi
@@ -1630,7 +1648,7 @@ _check_port_in_config() {
 # ---------------------------------------------------------------------------
 _generate_reality_keys() {
     local keypair
-    keypair=$(XRAY_LOCATION_ASSET= "$XRAY_BIN" x25519 2>/dev/null)
+    keypair=$(XRAY_LOCATION_ASSET='' "$XRAY_BIN" x25519 2>/dev/null)
     REALITY_PRIVATE_KEY=$(echo "$keypair" | awk -F': ' '/^Private/ {print $2}')
     REALITY_PUBLIC_KEY=$(echo "$keypair" | awk -F': ' '/PublicKey/ {print $2}')
     REALITY_SHORT_ID=$(_gen_short_id)
@@ -1855,6 +1873,8 @@ _commit_hy2_node_txn_locked() {
 
     # (2) 自签证书准备。所有提问已经结束, 生成失败/取消路径见各自回滚。
     #     既有证书(可复用)与自定义证书不生成 ⇒ 无快照、不进入回滚路径。
+    # CERT_DIR 是 00-common.sh 定义的公共目录常量, 单文件分析看不到赋值。
+    # shellcheck disable=SC2153
     local cert_bak="" cert_dirty="false" cert_dir_existed="false" cert_dir="$CERT_DIR/$tag"
     if [ "$self_signed" = "true" ]; then
         cert_file="$CERT_DIR/$tag/cert.pem"; key_file="$CERT_DIR/$tag/key.pem"
@@ -2123,7 +2143,7 @@ _ensure_unique_name() {
 # 输出地址到 stdout
 # ---------------------------------------------------------------------------
 _ask_link_addr() {
-    local pubip="" hint
+    local pubip=""
     pubip=$(_get_public_ip 2>/dev/null) || true
     if [ -n "$pubip" ]; then
         local addr
@@ -2172,9 +2192,8 @@ _known_tags() {
         [ -f "$f" ] || continue
         basename "$f" .json
         local ttag
-        ttag=$(jq -r '.tunnel_tag // empty' "$f" 2>/dev/null)
         # 损坏/不可读 metadata 显式告警, 不静默丢 tunnel_tag(否则 tunnel 成永久孤儿)
-        if [ $? -ne 0 ]; then
+        if ! ttag=$(jq -r '.tunnel_tag // empty' "$f" 2>/dev/null); then
             _warn "节点元数据不可读, 无法读取 tunnel_tag: $f"
             continue
         fi
@@ -2528,8 +2547,8 @@ _add_node() {
     echo
     local i=1
     for p in "${PROTOCOLS[@]}"; do
-        local key name tls route desc
-        IFS='|' read -r key name tls route desc <<< "$p"
+        local name desc
+        IFS='|' read -r _ name _ _ desc <<< "$p"
         if [ -n "$desc" ]; then
             printf "  ${GREEN}[%d]${NC} %s   %s\n" "$i" "$name" "$desc"
         else
@@ -2546,8 +2565,8 @@ _add_node() {
     local sel="${PROTOCOLS[$idx]:-}"
     [ -z "$sel" ] && { _warn "无效选择"; _press_any_key; return; }
 
-    local key tls route desc
-    IFS='|' read -r key name tls route desc <<< "$sel"
+    local key
+    IFS='|' read -r key _ <<< "$sel"
     case "$key" in
         vless-tcp-reality-vision) _add_vless_tcp_reality_vision ;;
         vless-xhttp-reality)      _add_vless_xhttp_reality ;;
@@ -2623,7 +2642,11 @@ _add_vless_tcp_reality_vision() {
 
     local pq_seed="" pq_verify=""
     if _detect_reality_pq "${sni}:443"; then
-        pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
+        # PQ_SEED/PQ_VERIFY 由 51-reality-pq.sh 的 _detect_reality_pq 写入。
+        # shellcheck disable=SC2153
+        pq_seed="$PQ_SEED"
+        # shellcheck disable=SC2153
+        pq_verify="$PQ_VERIFY"
     fi
 
     _enc_opts_prompt || return 1
@@ -2663,7 +2686,8 @@ _add_vless_tcp_reality_vision() {
     enc_param=$(_enc_param)
     # 分享链接标准(XTLS VMess/VLESS 提案): type 必须是 tcp(不是 raw)、REALITY 时 fp 不可省略
     # 且默认 chrome、sni 等 URL 字段 Value 一律 encodeURIComponent。
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=tcp&flow=xtls-rprx-vision&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    local link
+    link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=tcp&flow=xtls-rprx-vision&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -2672,7 +2696,8 @@ _add_vless_tcp_reality_vision() {
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
     # 所有用户字段经 _yaml_dq 双引号转义；派生YAML不能改变字段结构。
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, network: tcp}"
+    local clash
+    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, network: tcp}"
 
     # reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json
@@ -2730,7 +2755,8 @@ _add_vless_xhttp_reality() {
         _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
     fi
 
-    local path=$(_gen_rand_path)
+    local path
+    path=$(_gen_rand_path)
     local custom_path=""
     read -rp "  XHTTP path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
@@ -2745,7 +2771,11 @@ _add_vless_xhttp_reality() {
 
     local pq_seed="" pq_verify=""
     if _detect_reality_pq "${sni}:443"; then
-        pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
+        # PQ_SEED/PQ_VERIFY 由 51-reality-pq.sh 的 _detect_reality_pq 写入。
+        # shellcheck disable=SC2153
+        pq_seed="$PQ_SEED"
+        # shellcheck disable=SC2153
+        pq_verify="$PQ_VERIFY"
     fi
 
     _enc_opts_prompt || return 1
@@ -2782,7 +2812,8 @@ _add_vless_xhttp_reality() {
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     local enc_param
     enc_param=$(_enc_param)
-    local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+    local link
+    link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
@@ -2792,7 +2823,8 @@ _add_vless_xhttp_reality() {
     fi
     # clash yaml (mihomo 格式): 见 _add_vless_tcp_reality_vision 同处注释 ——
     # support-x25519mlkem768 必须显式开启, client-fingerprint 用 chrome。
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
+    local clash
+    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
 
     # reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json
@@ -2832,8 +2864,7 @@ _add_vless_xhttp_reality() {
 _generate_vless_enc_keys() {
     local auth_type="${1:-x25519}"
     local output
-    output=$(XRAY_LOCATION_ASSET= "$XRAY_BIN" vlessenc 2>/dev/null)
-    if [ $? -ne 0 ] || [ -z "$output" ]; then
+    if ! output=$(XRAY_LOCATION_ASSET='' "$XRAY_BIN" vlessenc 2>/dev/null) || [ -z "$output" ]; then
         _error "VLESS+ENC 密钥生成失败 (需要较新版本的 Xray 核心)"
         return 1
     fi
@@ -2975,7 +3006,8 @@ _add_vless_enc() {
     # clash yaml (Clash Meta / mihomo 格式)
     local clash_flow=""
     [ -n "$flow" ] && clash_flow=", flow: ${flow}"
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, encryption: \"$(_yaml_dq "$VLESS_ENC_ENCRYPTION")\", network: tcp, tls: false${clash_flow}}"
+    local clash
+    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, encryption: \"$(_yaml_dq "$VLESS_ENC_ENCRYPTION")\", network: tcp, tls: false${clash_flow}}"
 
     local meta_json
     meta_json=$(jq -n \
@@ -3023,7 +3055,8 @@ _add_vless_xhttp_cdn() {
     preferred_port=${preferred_port:-443}
     [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
 
-    local path=$(_gen_rand_path)
+    local path
+    path=$(_gen_rand_path)
     local custom_path=""
     read -rp "  XHTTP path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
@@ -3049,12 +3082,14 @@ _add_vless_xhttp_cdn() {
     enc_param=$(_enc_param)
     # 分享链接标准: fp 默认 chrome; 标准无 insecure/allowInsecure 字段(Xray 已移除该配置项),
     # 且本节点经 CF 边缘合法证书, 无需跳过校验; sni/host 必须 encodeURIComponent
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&alpn=h2&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    local link
+    link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&alpn=h2&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
+    local clash
+    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
 
     local meta_json
     meta_json=$(jq -n \
@@ -3096,7 +3131,8 @@ _add_vless_ws_cdn() {
     preferred_port=${preferred_port:-443}
     [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
 
-    local path=$(_gen_rand_path)
+    local path
+    path=$(_gen_rand_path)
     local custom_path=""
     read -rp "  WS path (默认 ${path}): " custom_path
     path=${custom_path:-$path}
@@ -3120,12 +3156,14 @@ _add_vless_ws_cdn() {
     [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
     local enc_param
     enc_param=$(_enc_param)
-    local link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
+    local link
+    link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
     local enc_clash=""
     if [ "$ENC_ENABLED" -eq 1 ]; then
         enc_clash=", encryption: \"$ENC_ENCRYPTION\""
     fi
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
+    local clash
+    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
 
     local meta_json
     meta_json=$(jq -n \
@@ -3202,14 +3240,17 @@ _add_shadowsocks() {
     [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
     # SIP002 userinfo 用无填充base64url；客户端不能把 +/= 当URL结构。
     local userinfo="${method}:${password}"
-    local b64=$(printf '%s' "$userinfo" | base64 | tr -d '\n=' | tr '+/' '-_')
-    local link="ss://${b64}@${link_ip}:${port}#$(_url_encode "$name")"
+    local b64
+    b64=$(printf '%s' "$userinfo" | base64 | tr -d '\n=' | tr '+/' '-_')
+    local link
+    link="ss://${b64}@${link_ip}:${port}#$(_url_encode "$name")"
 
     # mihomo 的 ss `udp` 默认 false(通用字段); 服务端 network 含 udp 才声明,
     # 否则声明了 UDP 也会连不上(与 _input_port 的协议选择一致)
     local clash_udp=""
     [[ "$network_val" == *"udp"* ]] && clash_udp=", udp: true"
-    local clash="- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${clash_udp}}"
+    local clash
+    clash="- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${clash_udp}}"
 
     local meta_json
     meta_json=$(jq -n \
@@ -3383,7 +3424,7 @@ EOF
     if { [ ! -s "$tmp_cert" ] || [ ! -s "$tmp_key" ]; } && [ -x "$XRAY_BIN" ]; then
         # xray tls cert --file 为路径前缀；按 .crt/.key 读取并转换到正式路径。
         local xpre="${cert_dir}/.xcert.$$"
-        XRAY_LOCATION_ASSET= "$XRAY_BIN" tls cert --domain "$domain" --file "$xpre" 2>/dev/null
+        XRAY_LOCATION_ASSET='' "$XRAY_BIN" tls cert --domain "$domain" --file "$xpre" 2>/dev/null
         [ -s "${xpre}.crt" ] && mv -f "${xpre}.crt" "$tmp_cert"
         [ -s "${xpre}.key" ] && mv -f "${xpre}.key" "$tmp_key"
         rm -f "${xpre}.crt" "${xpre}.key" 2>/dev/null
@@ -3772,9 +3813,8 @@ _hy2_cert_dir_referenced() {
     # certificateFile/keyFile 都扫描；只扫证书会漏掉存活节点的共享私钥。
     refs=$(_config_jq -r '.inbounds[]? | .streamSettings.tlsSettings.certificates[]? | (.certificateFile // empty), (.keyFile // empty)' 2>/dev/null) || return 0
     [ -n "$refs" ] || return 1
-    local dreal cbase_real
+    local dreal
     dreal=$(_hy2_realpath "$dir") || dreal=""
-    cbase_real=$(_hy2_realpath "$CERT_DIR") || cbase_real="$CERT_DIR"
     if [ -z "$dreal" ]; then
         # 无法 canonicalize 待删目录 ⇒ fail-closed(与 jq 失败同口径): 目录存在就保守保留,
         # 免得"解析失败 ⇒ 退回词法比较 ⇒ 误判无引用 ⇒ 删掉仍在用的证书"
@@ -3878,7 +3918,7 @@ _add_hysteria2() {
 
     # TLS 证书: 回车自签, 或输入证书路径
     local tag="xd-hy2-${port}"
-    local cert_file="" key_file="" self_signed="false" sni="" self_domain="" tls_mode=""
+    local cert_file="" key_file="" self_signed="false" sni="" self_domain=""
     echo -e "  TLS 证书 回车使用自签证书, 或输入证书文件路径"
     local custom_cert custom_key
     read -rp "  cert 路径 (回车自签): " custom_cert
@@ -3891,7 +3931,6 @@ _add_hysteria2() {
             _error "证书文件不存在"; return 1
         fi
         cert_file="$custom_cert"; key_file="$custom_key"
-        tls_mode="custom"
         _info "使用自定义证书: $cert_file"
         # SNI 默认只取可用具体DNS SAN；无具体SAN必须询问，不能默默套默认。
         local cert_hint="" cert_cn="" sni_in=""
@@ -3930,7 +3969,7 @@ _add_hysteria2() {
             _validate_domain "$self_domain" && break
             _error "域名格式非法(仅字母/数字/连字符, 点分段): ${self_domain}"
         done
-        tls_mode="selfsigned"; self_signed="true"
+        self_signed="true"
     fi
 
     # 认证密码
@@ -4076,7 +4115,8 @@ _rebuild_hy2_link() {
     obfs_size=$(_hy2_obfs_size_get "$meta")
     local link_ip="$host"
     [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
-    local link="hy2://$(_url_encode "$auth")@${link_ip}:${port}/?sni=$(_url_encode "$sni")"
+    local link
+    link="hy2://$(_url_encode "$auth")@${link_ip}:${port}/?sni=$(_url_encode "$sni")"
     [ "$self_signed" = "true" ] && link="${link}&insecure=1&allowInsecure=1"
     link="${link}&congestion=${congestion}"
     # 服务端上行 = 客户端下行；metadata 保留服务端方向(finalmask.md: QuicParamsObject)。
@@ -4129,7 +4169,8 @@ _hy2_clash_line() {
         _error "节点元数据缺少必要字段(name/link_addr/port/auth), 无法生成 clash 条目: $meta"
         return 1
     fi
-    local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: $port, password: \"$(_yaml_dq "$auth")\", sni: \"$(_yaml_dq "$sni")\""
+    local line
+    line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: $port, password: \"$(_yaml_dq "$auth")\", sni: \"$(_yaml_dq "$sni")\""
     # brutal/force-brutal: mihomo 以 up/down 触发 brutal 速率控制; 带宽未填则省略(与分享链接一致)
     if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
         [ -n "$brutal_down" ] && line="${line}, up: \"$(_yaml_dq "$brutal_down")\""
@@ -4866,7 +4907,8 @@ _reality_port_txn() {
 }
 _reality_port_txn_locked() {
     local tag="$1" meta="$2" oldport="$3" newport="$4"
-    # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明)
+    # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明); 由 _mutate_config 等被调方读取。
+    # shellcheck disable=SC2034
     local XD_PORT_TXN_ACTIVE=1 current_tag current_port
     current_tag=$(jq -r '.tag // empty' "$meta" 2>/dev/null) || return 1
     current_port=$(jq -r '.port // empty' "$meta" 2>/dev/null) || return 1
@@ -5138,7 +5180,8 @@ _port_txn_build_newmeta() {
 
 _port_txn_locked() {
     local tag="$1" meta="$2" newport="$3" _stale_newmeta="$4" expected_oldport="${5:-}" orig oldport journal newmeta
-    # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明)
+    # 本事务临界区标记(见 _hy2_port_txn_locked 同名说明); 由 _mutate_config 等被调方读取。
+    # shellcheck disable=SC2034
     local XD_PORT_TXN_ACTIVE=1
     journal="${meta}.porttxn"
     [ -n "$_stale_newmeta" ] || { _error "新元数据为空, 端口事务未开始"; return 1; }

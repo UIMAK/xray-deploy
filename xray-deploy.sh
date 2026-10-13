@@ -16,7 +16,7 @@ SCRIPT_DIR="$(dirname "$SELF_PATH")"
 # 等安装锁前记录已打开入口 inode；发布会替换路径，不能仅比路径名。
 _bootstrap_entry_open_identity() {
     local fd target
-    for fd in /proc/$$/fd/*; do
+    for fd in /proc/"$$"/fd/*; do
         target=$(readlink "$fd" 2>/dev/null) || continue
         target="${target% (deleted)}"
         [ "$target" = "$SELF_PATH" ] || continue
@@ -69,10 +69,10 @@ _bootstrap_lock_file_open_status() {  # 0=open, 1=not open, 2=observation unknow
 }
 
 _bootstrap_flock_marker_take() {  # caller already owns the install flock
-    local devino witness owner i
+    local devino witness owner
     devino=$(stat -c '%d:%i' "$_BOOTSTRAP_LOCK_FILE" 2>/dev/null) || devino=""
     [ -n "$devino" ] || { echo "[错误] 无法读取安装锁文件标识, 模块加载中止" >&2; return 1; }
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
         if mkdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null; then
             owner="${BASHPID:-$$}"
             if printf '%s\n' "$owner" > "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null \
@@ -191,7 +191,7 @@ else
             exit 1
         fi
     fi
-    _BOOTSTRAP_LOCK_MODE=mkdir
+    _BOOTSTRAP_LOCK_MODE="mkdir"
     _BOOTSTRAP_MARKER_HELD=1
     if ! printf '%s\n' "${BASHPID:-$$}" > "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null; then
         rmdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null || :
@@ -276,6 +276,8 @@ unset _BOOTSTRAP_LOCK_MODE _BOOTSTRAP_MARKER_HELD _bootstrap_locked _bootstrap_i
 # 公共初始化: root 检测 + init 系统探测 + 目录确保; 失败即退出。
 _base_init() {
     _check_root
+    # INIT_SYSTEM 供 20-xray-core/40-cloudflared/55-hysteria 等服务后端分支消费。
+    # shellcheck disable=SC2034
     INIT_SYSTEM=$(_detect_init_system)
     _ensure_dirs || { _error "初始化失败: 无法确保安全目录/权限"; exit 1; }
 }

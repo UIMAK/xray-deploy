@@ -1,5 +1,7 @@
 #!/bin/bash
 # Offline service transactions; mocks never call the host's init system.
+# 桩函数与颜色/状态 fixture 由 source 进来的生产模块间接消费。
+# shellcheck disable=SC2329,SC2034
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/xray-cloudflared-alignment.XXXXXX") || exit 1
@@ -11,7 +13,7 @@ CF_BIN="$TMP/cloudflared"
 CF_UNIT_SYSTEMD="$TMP/cloudflared.service"
 CF_UNIT_OPENRC="$TMP/openrc"
 INIT_SYSTEM=systemd
-GREEN= RED= YELLOW= NC= CYAN= SKYBLUE=
+GREEN='' RED='' YELLOW='' NC='' CYAN='' SKYBLUE=''
 OLD=$(printf '%s' '{"a":"old-account","t":"old-tunnel","s":"secret"}' | jq -Rr '@base64')
 NEW=$(printf '%s' '{"a":"new-account","t":"new-tunnel","s":"secret"}' | jq -Rr '@base64')
 export MOCK_ROOT="$TMP" CF_UNIT_SYSTEMD CF_UNIT_OPENRC INIT_SYSTEM

@@ -698,7 +698,7 @@ _install_lock_acquire() {
             echo "[错误] 无法打开安装锁文件 $INSTALL_LOCK_FILE(磁盘空间/权限?)"; return 1; }
         if flock -n "$INSTALL_LOCK_FD" 2>/dev/null; then
             INSTALL_LOCK_HELD=1
-            printf '%s\n' "$$" >&"$INSTALL_LOCK_FD" 2>/dev/null || true   # 仅供诊断, 权威在 fd
+            { printf '%s\n' "$$" >&"$INSTALL_LOCK_FD"; } 2>/dev/null || true   # 仅供诊断, 权威在 fd
             if ! _install_primary_marker_take; then
                 _install_lock_release
                 return 1

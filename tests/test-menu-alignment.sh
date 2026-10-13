@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Offline behavior of real Hy2 transactions, cron scheduling and service menus.
+# 桩函数与 fixture 变量由 source 进来的生产模块间接消费。
+# shellcheck disable=SC2329,SC2034
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || { printf 'SUMMARY pass=0 fail=1\n'; exit 1; }

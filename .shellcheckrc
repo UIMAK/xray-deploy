@@ -1,0 +1,7 @@
+# ShellCheck 配置：本项目是多模块 source 组合的单文件分析对象，以下两类是结构性误报。
+#
+# SC2016: jq 过滤器一律写成单引号字符串。$tag/\(\) 是 jq 自己的语法，必须原样交给 jq，
+#         用双引号会被 shell 抢先展开而改变过滤语义。
+# SC1090/SC1091: lib 模块与测试源经变量路径载入（$ROOT/lib、部署目录、scratch 目录），
+#         静态分析无法跟随；模块清单由 install.sh 与 xray-deploy.sh 的 LIB_MODULES 保证一致。
+disable=SC2016,SC1090,SC1091

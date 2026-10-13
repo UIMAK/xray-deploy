@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Usage: XRAY_TEST_BIN=/path/to/xray bash tests/verify-configs.sh
 # Only parses isolated configs; never installs a core or starts a service.
+# R_* 渲染上下文与 DEPLOY_* 等由 source 进来的生产模块消费, 单文件分析看不到引用。
+# shellcheck disable=SC2034
 set -euo pipefail
 umask 077
 
@@ -107,12 +109,12 @@ check_rendered() {
 # Set the complete render context after sourcing; production defaults must stay unused.
 R_LISTEN=127.0.0.1
 R_UUID=5783a3e7-e373-51cd-8642-c83782b807c5
-R_TARGET=config-test.invalid
-R_SERVER_NAME=config-test.invalid
+R_TARGET='config-test.invalid'
+R_SERVER_NAME='config-test.invalid'
 R_PRIVATE_KEY=''
 R_SHORT_ID=0123456789abcdef
 R_PATH='/config-test?left=1&right=2&ed=2560'
-R_HOST=config-test.invalid
+R_HOST='config-test.invalid'
 R_METHOD=aes-128-gcm
 R_PASSWORD='ss-left&ss-right&%s'
 R_MLDSA65_SEED=''
@@ -123,7 +125,7 @@ R_CONGESTION=bbr
 R_BRUTAL_PARAMS_BLOCK=''
 R_OBFS_MASK_BLOCK=''
 R_TUNNEL_PORT=18450
-R_TUNNEL_TAG=config-test-tunnel
+R_TUNNEL_TAG='config-test-tunnel'
 R_FLOW=''
 R_DECRYPTION=none
 R_NETWORK=tcp,udp
@@ -153,7 +155,7 @@ for template in vless-tcp-reality-vision-direct vless-tcp-reality-vision-tunnel 
 done
 
 R_PORT=18451
-R_TAG=config-test-enc
+R_TAG='config-test-enc'
 if ! _xray_version_ge 25.8.31; then
     record SKIP 'vless-enc (requires core >=25.8.31; encryption must not silently fall back to none)'
 elif _generate_vless_enc_keys x25519 > "$scratch/vlessenc.log" 2>&1; then
@@ -171,7 +173,7 @@ fi
 R_DECRYPTION=none
 
 R_PORT=18452
-R_TAG=config-test-xhttp
+R_TAG='config-test-xhttp'
 if inbound=$(_render_template "$repo/templates/vless-xhttp-cdn.server.jsonc") \
    && assert_field "$inbound" '.streamSettings.xhttpSettings.path' "$R_PATH" \
    && assert_field "$inbound" '.streamSettings.xhttpSettings.mode' auto; then
@@ -192,7 +194,7 @@ else
 fi
 
 R_PORT=18443
-R_TAG=config-test-ws
+R_TAG='config-test-ws'
 R_UUID=5783a3e7-e373-51cd-8642-c83782b807c5
 R_DECRYPTION=none
 R_PATH='/config-test?left=1&right=2&ed=2560'
@@ -205,7 +207,7 @@ else
 fi
 
 R_PORT=18444
-R_TAG=config-test-ss
+R_TAG='config-test-ss'
 R_METHOD=aes-128-gcm
 R_PASSWORD='ss-left&ss-right&%s'
 R_NETWORK=tcp,udp
@@ -219,7 +221,7 @@ fi
 
 hy_tpl="$repo/templates/hysteria2.server.jsonc"
 R_PORT=18445
-R_TAG=config-test-hy2
+R_TAG='config-test-hy2'
 R_AUTH='hy2-left&hy2-right&%s'
 R_CERT_FILE="$CERT_DIR/cert.pem"
 R_KEY_FILE="$CERT_DIR/key.pem"
