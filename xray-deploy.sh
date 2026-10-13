@@ -273,9 +273,9 @@ unset _BOOTSTRAP_ENTRY_ID _bootstrap_published_id
 unset _BOOTSTRAP_LOCK_ROOT _BOOTSTRAP_LOCK_FILE _BOOTSTRAP_LOCK_DIR _BOOTSTRAP_LOCK_FD
 unset _BOOTSTRAP_LOCK_MODE _BOOTSTRAP_MARKER_HELD _bootstrap_locked _bootstrap_i _bootstrap_lrc _bootstrap_took _bootstrap_holder
 
-# 公共初始化: root 检测 + init 系统探测 + 目录确保; 失败即退出。
+# 公共初始化: init 系统探测 + 目录确保; 失败即退出。
+# root 已由入口 main 统一校验(本函数仅经 main → _init_runtime/_cron_init 调用)。
 _base_init() {
-    _check_root
     # INIT_SYSTEM 供 20-xray-core/40-cloudflared/55-hysteria 等服务后端分支消费。
     # shellcheck disable=SC2034
     INIT_SYSTEM=$(_detect_init_system)
@@ -305,8 +305,6 @@ _cron_init() {
 
 # 主调度
 main() {
-    # PATH 口径与文件顶部一致，见入口加固。
-    export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH"
     # 菜单与 cron 子命令都必须 root(写 /opt、重启服务)
     _check_root
     # 子命令: geo-update(cron 调用)
