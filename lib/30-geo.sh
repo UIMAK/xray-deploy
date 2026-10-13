@@ -168,10 +168,6 @@ _geo_update_commit_locked() {
 }
 
 # 启动迁移保留旧 cron, 只有 dat 提交和 runtime 收敛成功后才能清理该兜底。
-_geo_finalize_legacy_cron() {
-    _with_config_lock _with_core_lock _geo_finalize_legacy_cron_locked
-}
-
 _geo_finalize_legacy_cron_locked() {
     [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
     [ "$(_geo_transition_get)" = "off_pending" ] && return 0
@@ -347,7 +343,7 @@ _geo_set_auto_update_cron() {
 }
 
 # 启动迁移仅在 ≥ v26.4.25 且 dat 齐备时写 geodata, 不重启; 旧 cron 留作运行兜底。
-# 首次成功更新后由 _geo_finalize_legacy_cron 清理; off_pending 永远优先继续关闭。
+# 首次成功更新后由 _geo_finalize_legacy_cron_locked 清理; off_pending 永远优先继续关闭。
 # 整份 config RMW 持 config 锁和写屏障, 避免覆盖并发节点写入或未收敛事务。
 _auto_migrate_geo_autoupdate() {
     local transition; transition=$(_geo_transition_get)

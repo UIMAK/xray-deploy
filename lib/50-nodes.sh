@@ -1299,28 +1299,25 @@ _modify_port_hop() {
     return 0
 }
 
-# 从元数据读取端口跳跃范围(兼容旧格式 hop_start/hop_end)
-_read_hop_ranges() {    local meta="$1"
-    # 优先读 hop_ranges (iptables 时代格式)
-    local ranges
+# 从元数据读取端口跳跃范围(原样串, 逗号/短横线); 兼容旧格式 hop_start/hop_end。
+_read_hop_ranges_raw() {
+    local meta="$1" ranges hop_s hop_e
     ranges=$(jq -r '.hop_ranges // empty' "$meta" 2>/dev/null)
+    [ -z "$ranges" ] && ranges=$(jq -r '.udp_hop_ports // empty' "$meta" 2>/dev/null)
     if [ -n "$ranges" ]; then
-        echo "$ranges" | tr ',' ' ' | tr '-' ':'
+        printf '%s' "$ranges"
         return
     fi
-    # 兼容 udp_hop_ports (udpHop 时代格式, 同样可用于 iptables)
-    ranges=$(jq -r '.udp_hop_ports // empty' "$meta" 2>/dev/null)
-    if [ -n "$ranges" ]; then
-        echo "$ranges" | tr ',' ' ' | tr '-' ':'
-        return
-    fi
-    # 最旧格式兼容
-    local hop_s hop_e
     hop_s=$(jq -r '.hop_start // empty' "$meta" 2>/dev/null)
     hop_e=$(jq -r '.hop_end // empty' "$meta" 2>/dev/null)
     if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
-        if [ "$hop_s" = "$hop_e" ]; then echo "$hop_s"; else echo "${hop_s}:${hop_e}"; fi
+        if [ "$hop_s" = "$hop_e" ]; then printf '%s' "$hop_s"; else printf '%s-%s' "$hop_s" "$hop_e"; fi
     fi
+}
+
+# iptables 用冒号段/空格分隔形式(兼容 hop_ranges/udp_hop_ports 旧格式)。
+_read_hop_ranges() {
+    _read_hop_ranges_raw "$1" | tr ',' ' ' | tr '-' ':'
 }
 
 # HY2 hop metadata 校验区分无hop与损坏；损坏时拒绝破坏性操作。
@@ -1381,22 +1378,9 @@ _hy2_hop_meta_ok() {
     return 0
 }
 
-# 从元数据读取端口跳跃范围(人类可读格式)
+# 从元数据读取端口跳跃范围(人类可读格式: 保留逗号/短横线)
 _read_hop_ranges_display() {
-    local meta="$1"
-    local ranges
-    ranges=$(jq -r '.hop_ranges // empty' "$meta" 2>/dev/null)
-    [ -z "$ranges" ] && ranges=$(jq -r '.udp_hop_ports // empty' "$meta" 2>/dev/null)
-    if [ -n "$ranges" ]; then
-        echo "$ranges"
-        return
-    fi
-    local hop_s hop_e
-    hop_s=$(jq -r '.hop_start // empty' "$meta" 2>/dev/null)
-    hop_e=$(jq -r '.hop_end // empty' "$meta" 2>/dev/null)
-    if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
-        if [ "$hop_s" = "$hop_e" ]; then echo "$hop_s"; else echo "${hop_s}-${hop_e}"; fi
-    fi
+    _read_hop_ranges_raw "$1"
 }
 
 # 列出所有 xray-deploy 端口跳跃规则(IPv4 + IPv6)
@@ -1668,10 +1652,10 @@ _render_template() {
     # 给所有占位符变量设默认空值(避免 set -u 下 unbound; 各协议函数只设自己需要的)
     : "${R_LISTEN:=}" "${R_PORT:=}" "${R_TAG:=}" "${R_UUID:=}" "${R_TARGET:=}"
     : "${R_SERVER_NAME:=}" "${R_PRIVATE_KEY:=}" "${R_SHORT_ID:=}" "${R_PATH:=}"
-    : "${R_HOST:=}" "${R_METHOD:=}" "${R_PASSWORD:=}" "${R_MLDSA65_SEED:=}"
+    : "${R_METHOD:=}" "${R_PASSWORD:=}" "${R_MLDSA65_SEED:=}"
     : "${R_AUTH:=}" "${R_CERT_FILE:=}" "${R_KEY_FILE:=}"
     : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}" "${R_OBFS_MASK_BLOCK:=}"
-    : "${R_TUNNEL_PORT:=}" "${R_TUNNEL_TAG:=}"
+    : "${R_TUNNEL_PORT:=}"
     : "${R_FLOW:=}" "${R_DECRYPTION:=none}" "${R_NETWORK:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
@@ -1687,11 +1671,9 @@ _render_template() {
     p="{{PRIVATE_KEY}}";  content="${content//$p/"$R_PRIVATE_KEY"}"
     p="{{SHORT_ID}}";     content="${content//$p/"$R_SHORT_ID"}"
     p="{{PATH}}";         content="${content//$p/"$R_PATH"}"
-    p="{{HOST}}";         content="${content//$p/"$R_HOST"}"
     p="{{METHOD}}";       content="${content//$p/"$R_METHOD"}"
     p="{{PASSWORD}}";     content="${content//$p/"$R_PASSWORD"}"
     p="{{TUNNEL_PORT}}";  content="${content//$p/"$R_TUNNEL_PORT"}"
-    p="{{TUNNEL_TAG}}";   content="${content//$p/"$R_TUNNEL_TAG"}"
     p="{{FLOW}}";          content="${content//$p/"$R_FLOW"}"
     p="{{DECRYPTION}}";    content="${content//$p/"$R_DECRYPTION"}"
     p="{{NETWORK}}";      content="${content//$p/"$R_NETWORK"}"
@@ -2600,6 +2582,13 @@ _enc_param() {   # 输出 none 或 url-encoded 加密参数(ENC_ENABLED/ENC_ENCR
     fi
 }
 
+# clash 条目追加的 encryption 后缀; 未启用加密时为空。
+_enc_clash_suffix() {
+    if [ "$ENC_ENABLED" -eq 1 ]; then
+        printf ', encryption: "%s"' "$ENC_ENCRYPTION"
+    fi
+}
+
 _enc_meta_json() {   # <meta_json>; 未启用加密时原样返回
     if [ "$ENC_ENABLED" -eq 1 ]; then
         printf '%s' "$1" | jq \
@@ -2680,8 +2669,7 @@ _add_vless_tcp_reality_vision() {
 
     #  连接地址询问必须在 config 提交前完成, config+metadata 由事务一次性提交
     local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
-    local link_ip="$addr"
-    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
+    local link_ip; link_ip=$(_link_host "$addr")
     local enc_param
     enc_param=$(_enc_param)
     # 分享链接标准(XTLS VMess/VLESS 提案): type 必须是 tcp(不是 raw)、REALITY 时 fp 不可省略
@@ -2691,10 +2679,7 @@ _add_vless_tcp_reality_vision() {
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
-    local enc_clash=""
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_clash=", encryption: \"$ENC_ENCRYPTION\""
-    fi
+    local enc_clash; enc_clash=$(_enc_clash_suffix)
     # 所有用户字段经 _yaml_dq 双引号转义；派生YAML不能改变字段结构。
     local clash
     clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, network: tcp}"
@@ -2731,6 +2716,29 @@ _add_vless_tcp_reality_vision() {
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
 }
 
+# 交互输入帮助: 读取 Wire 路径与 CDN 目标, 写入调用方作用域(path / host,preferred_addr,preferred_port)。
+_prompt_wire_path() {   # <显示名 XHTTP|WS>
+    local label="$1"
+    path=$(_gen_rand_path)
+    local custom_path=""
+    read -rp "  ${label} path (默认 ${path}): " custom_path
+    path=${custom_path:-$path}
+    # path 直拼 JSON 模板, 含 " \ 换行或 {{ 占位符会让渲染失败/值被二次替换, 输入侧拒绝
+    _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
+}
+
+_prompt_cdn_host() {   # 读 CDN Host + 优选地址 + 优选端口
+    read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
+    [ -z "$host" ] && { _warn "CDN 协议必须填域名"; return 1; }
+    # Host 会进 inbound 模板与 clash 条目; 含空格/引号会破坏模板渲染与 YAML
+    _validate_domain "$host" || { _error "CDN 域名格式非法(仅字母/数字/连字符, 点分段): $host"; return 1; }
+    read -rp "  优选域名/IP(分享链接使用, 默认 ${host}): " preferred_addr
+    preferred_addr=${preferred_addr:-$host}
+    read -rp "  优选端口(默认 443): " preferred_port
+    preferred_port=${preferred_port:-443}
+    [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
+}
+
 # ---------------------------------------------------------------------------
 # 协议2: VLESS+XHTTP+Reality (可选 直连 / Tunnel 模式, 见 _prompt_reality_mode)
 # ---------------------------------------------------------------------------
@@ -2756,12 +2764,7 @@ _add_vless_xhttp_reality() {
     fi
 
     local path
-    path=$(_gen_rand_path)
-    local custom_path=""
-    read -rp "  XHTTP path (默认 ${path}): " custom_path
-    path=${custom_path:-$path}
-    # path 直拼 JSON 模板, 含 " \ 换行或 {{ 占位符会让渲染失败/值被二次替换, 输入侧拒绝
-    _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
+    _prompt_wire_path XHTTP || return 1
 
     local default_name="Reality-XHTTP-${port}"
     _node_name_prompt || return 1
@@ -2808,8 +2811,7 @@ _add_vless_xhttp_reality() {
 
     #  连接地址询问必须在 config 提交前完成
     local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
-    local link_ip="$addr"
-    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
+    local link_ip; link_ip=$(_link_host "$addr")
     local enc_param
     enc_param=$(_enc_param)
     local link
@@ -2817,10 +2819,7 @@ _add_vless_xhttp_reality() {
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
-    local enc_clash=""
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_clash=", encryption: \"$ENC_ENCRYPTION\""
-    fi
+    local enc_clash; enc_clash=$(_enc_clash_suffix)
     # clash yaml (mihomo 格式): 见 _add_vless_tcp_reality_vision 同处注释 ——
     # support-x25519mlkem768 必须显式开启, client-fingerprint 用 chrome。
     local clash
@@ -2994,8 +2993,7 @@ _add_vless_enc() {
     inbound=$(_render_template "$(_tpl_path vless-enc)") || return 1
     #  连接地址询问提前到提交之前; config+metadata 由事务一次性提交
     local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
-    local link_ip="$addr"
-    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
+    local link_ip; link_ip=$(_link_host "$addr")
 
     # 分享链接: encryption 参数为客户端密钥(URL 编码, 含点号和特殊字符); type=tcp 符合分享链接标准
     local enc_encoded; enc_encoded=$(_url_encode "$VLESS_ENC_ENCRYPTION")
@@ -3040,28 +3038,11 @@ _add_vless_xhttp_cdn() {
         ;;
     esac
 
-    local host
-    read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
-    [ -z "$host" ] && { _warn "CDN 协议必须填域名"; return 1; }
-    # Host 会进 inbound 模板与 clash 条目; 含空格/引号会破坏模板渲染与 YAML
-    _validate_domain "$host" || { _error "CDN 域名格式非法(仅字母/数字/连字符, 点分段): $host"; return 1; }
-
-    local preferred_addr
-    read -rp "  优选域名/IP(分享链接使用, 默认 ${host}): " preferred_addr
-    preferred_addr=${preferred_addr:-$host}
-
-    local preferred_port
-    read -rp "  优选端口(默认 443): " preferred_port
-    preferred_port=${preferred_port:-443}
-    [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
+    local host preferred_addr preferred_port
+    _prompt_cdn_host || return 1
 
     local path
-    path=$(_gen_rand_path)
-    local custom_path=""
-    read -rp "  XHTTP path (默认 ${path}): " custom_path
-    path=${custom_path:-$path}
-    # 见 _add_vless_xhttp_reality 同处说明
-    _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
+    _prompt_wire_path XHTTP || return 1
 
     local default_name="XHTTP-CDN-${port}"
     _node_name_prompt || return 1
@@ -3072,22 +3053,18 @@ _add_vless_xhttp_cdn() {
 
     local tag="xd-xhttp-cdn-${port}"
     local listen="::"
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_HOST="$host"
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path"
     local inbound
     inbound=$(_render_template "$(_tpl_path vless-xhttp-cdn)") || return 1
 
-    local link_ip="$preferred_addr"
-    [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
+    local link_ip; link_ip=$(_link_host "$preferred_addr")
     local enc_param
     enc_param=$(_enc_param)
     # 分享链接标准: fp 默认 chrome; 标准无 insecure/allowInsecure 字段(Xray 已移除该配置项),
     # 且本节点经 CF 边缘合法证书, 无需跳过校验; sni/host 必须 encodeURIComponent
     local link
     link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&alpn=h2&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")#$(_url_encode "$name")"
-    local enc_clash=""
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_clash=", encryption: \"$ENC_ENCRYPTION\""
-    fi
+    local enc_clash; enc_clash=$(_enc_clash_suffix)
     local clash
     clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
 
@@ -3116,28 +3093,11 @@ _add_vless_ws_cdn() {
     echo -e "  ${RED}⚠ 该协议不能直连, 客户端须经 CF CDN 回源到本机${NC}"
     local port; port=$(_input_port tcp) || return 1
 
-    local host
-    read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
-    [ -z "$host" ] && { _warn "CDN 协议必须填域名"; return 1; }
-    # Host 会进 inbound 模板与 clash 条目; 含空格/引号会破坏模板渲染与 YAML
-    _validate_domain "$host" || { _error "CDN 域名格式非法(仅字母/数字/连字符, 点分段): $host"; return 1; }
-
-    local preferred_addr
-    read -rp "  优选域名/IP(分享链接使用, 默认 ${host}): " preferred_addr
-    preferred_addr=${preferred_addr:-$host}
-
-    local preferred_port
-    read -rp "  优选端口(默认 443): " preferred_port
-    preferred_port=${preferred_port:-443}
-    [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
+    local host preferred_addr preferred_port
+    _prompt_cdn_host || return 1
 
     local path
-    path=$(_gen_rand_path)
-    local custom_path=""
-    read -rp "  WS path (默认 ${path}): " custom_path
-    path=${custom_path:-$path}
-    # 见 _add_vless_xhttp_reality 同处说明
-    _validate_json_text "$path" || { _error "path 含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
+    _prompt_wire_path WS || return 1
 
     local default_name="WS-CDN-${port}"
     _node_name_prompt || return 1
@@ -3148,20 +3108,16 @@ _add_vless_ws_cdn() {
 
     local tag="xd-ws-cdn-${port}"
     local listen="::"
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_HOST="$host"
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path"
     local inbound
     inbound=$(_render_template "$(_tpl_path vless-ws-cdn)") || return 1
 
-    local link_ip="$preferred_addr"
-    [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
+    local link_ip; link_ip=$(_link_host "$preferred_addr")
     local enc_param
     enc_param=$(_enc_param)
     local link
     link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
-    local enc_clash=""
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        enc_clash=", encryption: \"$ENC_ENCRYPTION\""
-    fi
+    local enc_clash; enc_clash=$(_enc_clash_suffix)
     local clash
     clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
 
@@ -3236,8 +3192,7 @@ _add_shadowsocks() {
     #  连接地址询问提前到提交之前; config+metadata 由事务一次性提交
     local addr
     addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
-    local link_ip="$addr"
-    [[ "$addr" == *":"* && "$addr" != *"["* ]] && link_ip="[$addr]"
+    local link_ip; link_ip=$(_link_host "$addr")
     # SIP002 userinfo 用无填充base64url；客户端不能把 +/= 当URL结构。
     local userinfo="${method}:${password}"
     local b64
@@ -4113,8 +4068,7 @@ _rebuild_hy2_link() {
     obfs_kind=$(_hy2_obfs_kind "$meta") || return 1
     obfs_pw=$(jq -r '.obfs_password // empty' "$meta")
     obfs_size=$(_hy2_obfs_size_get "$meta")
-    local link_ip="$host"
-    [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
+    local link_ip; link_ip=$(_link_host "$host")
     local link
     link="hy2://$(_url_encode "$auth")@${link_ip}:${port}/?sni=$(_url_encode "$sni")"
     [ "$self_signed" = "true" ] && link="${link}&insecure=1&allowInsecure=1"
@@ -4127,7 +4081,7 @@ _rebuild_hy2_link() {
         [ "$obfs_kind" = "gecko" ] && ! _hy2_obfs_size_is_default "$meta" && return 1
         link="${link}&obfs=${obfs_kind}&obfs-password=$(_url_encode "$obfs_pw")"
     fi
-    # 端口跳跃端口(如果已配置, 统一通过 _read_hop_ranges_display 读取, )
+    # 端口跳跃端口(如果已配置, 统一通过 _read_hop_ranges_display 读取)
     local hop_ports
     hop_ports=$(_read_hop_ranges_display "$meta" 2>/dev/null)
     [ -n "$hop_ports" ] && link="${link}&mport=$(_url_encode "$hop_ports")"
@@ -4385,8 +4339,7 @@ _rebuild_reality_link() {
     else
         enc_param="none"
     fi
-    local link_ip="$host"
-    [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
+    local link_ip; link_ip=$(_link_host "$host")
     local link
     case "$proto" in
         vless-tcp-reality-vision)
@@ -4414,8 +4367,7 @@ _rebuild_vless_enc_link() {
     flow=$(jq -r '.flow // empty' "$meta")
     enc=$(jq -r '.encryption // "none"' "$meta")
     name=$(jq -r '.name' "$meta")
-    local link_ip="$host"
-    [[ "$host" == *":"* && "$host" != *"["* ]] && link_ip="[$host]"
+    local link_ip; link_ip=$(_link_host "$host")
     local enc_encoded; enc_encoded=$(_url_encode "$enc")
     local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_encoded}&security=none&type=tcp"
     [ -n "$flow" ] && link="${link}&flow=${flow}"
@@ -4446,8 +4398,7 @@ _rebuild_cdn_link() {
     else
         enc_param="none"
     fi
-    local link_ip="$preferred_addr"
-    [[ "$preferred_addr" == *":"* && "$preferred_addr" != *"["* ]] && link_ip="[$preferred_addr]"
+    local link_ip; link_ip=$(_link_host "$preferred_addr")
     local link
     case "$proto" in
         vless-xhttp-cdn)
