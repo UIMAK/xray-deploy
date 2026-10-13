@@ -721,36 +721,38 @@ _hysteria_backup_config() {
     local tmp old i=0
     tmp=$(mktemp "${HYSTERIA_BACKUP_DIR}/hysteria.json.bak.XXXXXX") || return 1
     cp -f "$HYSTERIA_CONFIG" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    [ -s "$tmp" ] && jq -e 'type == "object"' "$tmp" >/dev/null 2>&1 || {
+    if [ ! -s "$tmp" ] || ! jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
         rm -f "$tmp"
         _error "配置备份缺失、为空或不可解析, 备份失败"
         return 1
-    }
+    fi
     chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     local last_tmp
     last_tmp=$(mktemp "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak.XXXXXX") || { rm -f "$tmp"; return 1; }
     cp -f "$HYSTERIA_CONFIG" "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
-    [ -s "$last_tmp" ] && jq -e 'type == "object"' "$last_tmp" >/dev/null 2>&1 || {
+    if [ ! -s "$last_tmp" ] || ! jq -e 'type == "object"' "$last_tmp" >/dev/null 2>&1; then
         rm -f "$tmp" "$last_tmp"
         _error "回滚备份缺失、为空或不可解析, 备份失败"
         return 1
-    }
+    fi
     chmod 600 "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     mv -f "$last_tmp" "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
-    for old in $(ls -1t "$HYSTERIA_BACKUP_DIR" 2>/dev/null | grep '^hysteria.json.bak.'); do
+    # 只喂 glob 给 ls, 不再用 ls | grep 过滤文件名(SC2010); 按 mtime 保留最新 10 份。
+    while IFS= read -r old; do
+        [ -n "$old" ] || continue
         i=$((i+1))
-        [ "$i" -gt 10 ] && rm -f "${HYSTERIA_BACKUP_DIR}/${old}"
-    done
+        [ "$i" -gt 10 ] && rm -f "${old:?}"
+    done <<< "$(ls -1dt -- "$HYSTERIA_BACKUP_DIR"/hysteria.json.bak.* 2>/dev/null)"
     return 0
 }
 
 _hysteria_restore_config() {
     [ -f "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" ] || return 1
-    [ -s "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" ] \
-      && jq -e 'type == "object"' "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" >/dev/null 2>&1 || {
+    if [ ! -s "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" ] \
+       || ! jq -e 'type == "object"' "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" >/dev/null 2>&1; then
         _error "回滚备份缺失、为空或不可解析, 无法回滚(${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak)"
         return 1
-    }
+    fi
     local content
     content=$(cat "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" 2>/dev/null) || { _error "读取备份失败"; return 1; }
     if ! _atomic_write_json "$HYSTERIA_CONFIG" "$content"; then
@@ -1136,7 +1138,7 @@ _hysteria_node_txn_locked() {
 _hysteria_server_txn_txn_wrapper() {
     [ "$#" -ge 2 ] || { _error "server_txn 参数不足"; return 1; }
     local meta_filter="${!#}"
-    local config_filter="${@: -2:1}"
+    local config_filter="${*: -2:1}"
     local jq_args=("${@:1:$#-2}")
     if [ "${#jq_args[@]}" -gt 0 ]; then
         _hysteria_server_txn_locked "$config_filter" "$meta_filter" "${jq_args[@]}"
@@ -1259,8 +1261,10 @@ _hysteria_tls_pair_begin() {
         esac
         if [ -e "$dst" ] || [ -L "$dst" ]; then
             [ -f "$dst" ] && [ -s "$dst" ] || { _error "现有 TLS 文件不可用, 中止替换: $dst"; return 1; }
-            cp -p "$dst" "$snap/$src.pem" 2>/dev/null \
-                && cmp -s "$dst" "$snap/$src.pem" || { _error "TLS 回滚快照失败: $dst"; return 1; }
+            if ! cp -p "$dst" "$snap/$src.pem" 2>/dev/null \
+               || ! cmp -s "$dst" "$snap/$src.pem"; then
+                _error "TLS 回滚快照失败: $dst"; return 1
+            fi
             [ "$src" = cert ] && had_cert=1 || had_key=1
         fi
     done
@@ -1847,10 +1851,8 @@ _hysteria_congestion_desc() {
 }
 
 _hysteria_congestion_menu() {
-    local choice t p cur_t cur_p
+    local choice t p
     _hysteria_gate || { _press_any_key; return; }
-    cur_t=$(_hysteria_congestion_get type)
-    cur_p=$(_hysteria_congestion_get profile)
     while true; do
         clear
         echo; echo -e "  ${CYAN}【拥塞控制 congestion】${NC}"
@@ -1875,7 +1877,6 @@ _hysteria_congestion_menu() {
                      '.congestion = {type: "bbr", bbrProfile: $pr}'; then
                     _error "拥塞控制设置失败"
                 else
-                    cur_t="bbr"; cur_p="$p"
                     _success "拥塞控制已设为 bbr/${p}"
                 fi
                 _press_any_key
@@ -1884,7 +1885,6 @@ _hysteria_congestion_menu() {
                 if ! _hysteria_config_txn '.congestion = {type: "reno"}'; then
                     _error "拥塞控制设置失败"
                 else
-                    cur_t="reno"; cur_p=""
                     _success "拥塞控制已设为 reno"
                 fi
                 _press_any_key
@@ -1893,7 +1893,6 @@ _hysteria_congestion_menu() {
                 if ! _hysteria_config_txn 'del(.congestion)'; then
                     _error "恢复默认失败"
                 else
-                    cur_t=""; cur_p=""
                     _success "已恢复官方默认(bbr/standard)"
                 fi
                 _press_any_key
@@ -2092,7 +2091,8 @@ _hysteria_build_link() {
         o_pw=$(_hysteria_obfs_get password)
         params="${params}${params:+&}obfs=$(_url_encode "$o_type")&obfs-password=$(_url_encode "$o_pw")"
     fi
-    local link="hysteria2://$(_url_encode "$auth")@${link_ip}:${port_part}/"
+    local link
+    link="hysteria2://$(_url_encode "$auth")@${link_ip}:${port_part}/"
     [ -n "$params" ] && link="${link}?${params}"
     link="${link}#$(_url_encode "$name")"
     printf '%s' "$link"
@@ -2143,7 +2143,8 @@ _hysteria_clash_line() {
     fi
     local port_part
     port_part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)") || return 1
-    local line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$auth")\""
+    local line
+    line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$auth")\""
     local sni; sni=$(_hysteria_meta_get sni)
     [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
     if [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ]; then
@@ -2325,7 +2326,7 @@ _hysteria_bandwidth_reason() {
     unit="${v#"$num"}"
     unit="${unit#"${unit%%[![:space:]]*}"}"; unit="${unit%"${unit##*[![:space:]]}"}"
     [ -n "$num" ] || { printf '%s' "带宽缺少数值(如 100 mbps); 纯单位不可用"; return; }
-    lunit=$(printf '%s' "$unit" | tr 'A-Z' 'a-z')
+    lunit=$(printf '%s' "$unit" | tr '[:upper:]' '[:lower:]')
     case "$lunit" in
         b|bps|k|kb|kbps|m|mb|mbps|g|gb|gbps|t|tb|tbps) ;;
         "") printf '%s' "带宽缺少单位(官方会报 invalid format); 请写成 100 mbps / 100m 这类形式"; return ;;
@@ -3039,8 +3040,18 @@ _hysteria_service_menu() {
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  请选择: " choice || return 0
     case "$choice" in
-        1) _manage_hysteria start && _success "已启动" || _error "启动失败(查看日志)" ;;
-        2) _manage_hysteria stop && _success "已停止" ;;
+        1)
+            if _manage_hysteria start; then
+                _success "已启动"
+            else
+                _error "启动失败(查看日志)"
+            fi
+            ;;
+        2)
+            if _manage_hysteria stop; then
+                _success "已停止"
+            fi
+            ;;
         3)
             if _hysteria_restart_verified; then
                 _success "已重启并稳定运行"

@@ -1,5 +1,7 @@
 #!/bin/bash
 # Offline node contracts; only temporary fixtures are changed, never host services.
+# 桩函数与渲染上下文 R_* 由 source 进来的生产模块间接消费。
+# shellcheck disable=SC2329,SC2034
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d) || exit 1
@@ -12,7 +14,7 @@ CONFIG_DIR="$TMP/confs" BACKUP_DIR="$TMP/state/backup"
 . "$ROOT/lib/51-reality-pq.sh"
 NODES_DIR="$TMP/nodes" CERT_DIR="$TMP/certs" STATE_DIR="$TMP/state"
 mkdir -p "$NODES_DIR" "$CERT_DIR" "$STATE_DIR"
-GREEN= RED= YELLOW= NC= CYAN= SKYBLUE=
+GREEN='' RED='' YELLOW='' NC='' CYAN='' SKYBLUE=''
 passed=0 failed=0
 check() { local label="$1"; shift; if "$@"; then passed=$((passed+1)); else failed=$((failed+1)); printf 'FAIL: %s\n' "$label"; fi; }
 eq() { [ "$1" = "$2" ]; }

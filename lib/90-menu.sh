@@ -1394,7 +1394,7 @@ _hy2_masq_set_string() {
             [ "$line" = "." ] && { got_dot=1; break; }
             content="${content}${line}${nl}"
         done
-        content="${content%${nl}}"
+        content="${content%"$nl"}"
         [ -n "$content" ] && break
         if [ "$got_dot" -eq 0 ]; then
             _error "未收到任何内容(输入已结束), 已取消本项"
@@ -2081,7 +2081,11 @@ _reality_domain_menu() {
     _detect_reality_pq "$new_target" || pq_rc=$?
     case "$pq_rc" in
         0)
-            pq_seed="$PQ_SEED"; pq_verify="$PQ_VERIFY"
+            # PQ_SEED/PQ_VERIFY 由 51-reality-pq.sh 的 _detect_reality_pq 写入。
+            # shellcheck disable=SC2153
+            pq_seed="$PQ_SEED"
+            # shellcheck disable=SC2153
+            pq_verify="$PQ_VERIFY"
             _info "新域名支持后量子签名"
             ;;
         1)

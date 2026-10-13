@@ -96,7 +96,7 @@ _cf_token_valid() {
 
 # 只解析生效启动行；注释和停止指令不是运行事实。
 _read_cf_state() {
-    CF_CUR_TOKEN=""; CF_CUR_TOKEN_FILE=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_RAWLINE=""; CF_CUR_CMDLINE=""
+    CF_CUR_TOKEN=""; CF_CUR_TOKEN_FILE=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_CMDLINE=""
     CF_CUR_AUTOUPDATE_FLAG="no"
     local svcfile
     case "$INIT_SYSTEM" in
@@ -117,7 +117,6 @@ $ln"
         fi
     done < "$svcfile"
     CF_CUR_CMDLINE="$lines"
-    CF_CUR_RAWLINE=$(cat "$svcfile" 2>/dev/null)
     local oneline
     oneline=$(printf '%s' "$lines" | tr '\n' ' ')
     CF_CUR_TOKEN_FILE=$(_cf_extract_token_file "$oneline") || CF_CUR_TOKEN_FILE=""
@@ -390,7 +389,7 @@ _cf_write_service_line() {
     if [ "$INIT_SYSTEM" = "openrc" ]; then
         if grep -q '^[[:space:]]*command_args=' "$svcfile" 2>/dev/null; then
             local prefix="$CF_BIN "
-            local args="${cmd#$prefix}"
+            local args="${cmd#"$prefix"}"
             _svc_replace_line "$svcfile" "command_args=" "command_args=\"$args\"" || return 1
         elif grep -q '^[[:space:]]*cmd=' "$svcfile" 2>/dev/null; then
             _svc_replace_line "$svcfile" "cmd=" "cmd=\"$cmd\"" || return 1
@@ -1656,7 +1655,9 @@ _cf_diagnose() {
     esac
     echo -e "  service 文件: ${svcfile}"
     if [ -f "$svcfile" ]; then
-        echo -e "  权限: $(ls -la "$svcfile" | awk '{print $1}')"
+        local svc_perms
+        svc_perms=$(stat -c '%A' "$svcfile" 2>/dev/null) || svc_perms='(读取失败)'
+        echo -e "  权限: ${svc_perms}"
         if [ -n "$CF_CUR_TOKEN" ]; then
             echo -e "  解析到的 token: $(_cf_mask_token "$CF_CUR_TOKEN") (长度 ${#CF_CUR_TOKEN})"
         else

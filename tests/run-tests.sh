@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # xray-deploy focused regression suite.
 # This suite intentionally tests observable behavior, not private source layout.
+# 桩函数由 source 进来的生产模块间接调用; fixture 变量同样供这些模块消费。
+# shellcheck disable=SC2329,SC2034
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -345,6 +347,8 @@ _test_udp_snapshot() (
     local backend="$1" lo="$2" hi="$3" exclude="$4" expected="$5" rows="$6" rc=0
     local calls="$TMP/udp-snapshot-calls"
     : > "$calls"
+    # 本用例的隔离点: CONFIG_DIR 只在子 shell 内改向, 有意不外泄到外层。
+    # shellcheck disable=SC2030
     CONFIG_DIR="$TMP/no-snapshot-config"
     NODES_DIR="$XH_NODES_EMPTY"
     command() {
@@ -538,6 +542,8 @@ _state_set geo_cron on
 # 启用内置 geodata 定时: geodata 段必须落到自己的字段文件里, 旧 cron 兜底状态保留
 # (首次成功更新后才 retire, 见 _geo_finalize_legacy_cron)。
 _config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
+# _test_udp_snapshot 里的 CONFIG_DIR 改向只在子 shell 内, 外层值不受影响。
+# shellcheck disable=SC2031
 if _auto_migrate_geo_autoupdate >/dev/null 2>&1 \
    && [ "$(_config_jq -r '.geodata.cron // empty')" = "$GEO_CRON_EXPR" ] \
    && [ -f "$CONFIG_DIR/14_geodata.json" ] \
@@ -547,13 +553,18 @@ else
     fail 'Geo migration writes the geodata field file'
 fi
 # 关闭待清理(off_pending): geodata 字段必须连同 14_geodata.json 一起删掉, 并退休旧 cron。
-(
+if (
     _crontab_replace() { return 0; }
     _state_set "$GEO_TRANSITION_KEY" off_pending
     _auto_migrate_geo_autoupdate >/dev/null 2>&1 || exit 1
+    # shellcheck disable=SC2031
     [ ! -e "$CONFIG_DIR/14_geodata.json" ] || exit 1
     [ "$(_state_get geo_cron)" = off ]
-) && pass 'Geo off_pending deletes the geodata field file' || fail 'Geo off_pending deletes the geodata field file'
+); then
+    pass 'Geo off_pending deletes the geodata field file'
+else
+    fail 'Geo off_pending deletes the geodata field file'
+fi
 
 printf '== logrotate state contracts ==\n'
 rm -f "$STATE_DIR/logrotate_enabled"
@@ -670,7 +681,7 @@ mkdir -p "$TMP/lr-confdir"
 if _logrotate_write_config >/dev/null 2>&1 \
    && [ -s "$LOGROTATE_CONF" ] \
    && [ "$(cat "$LOGROTATE_CONF")" = "$(_logrotate_render_config)" ] \
-   && [ "$(ls -A "$TMP/lr-confdir" | grep -cv '^xray-deploy$')" -eq 0 ]; then
+   && [ -z "$(find "$TMP/lr-confdir" -mindepth 1 -maxdepth 1 ! -name xray-deploy -print -quit)" ]; then
     pass 'atomic write leaves a complete include and no temp residue'
 else
     fail 'atomic write leaves a complete include and no temp residue'
@@ -828,7 +839,7 @@ GEO_SKIP_MARKER="$TMP/geo-download-called"
 ) >/dev/null 2>&1
 if [ -e "$GEO_SKIP_MARKER" ]; then pass 'Geo off_pending skips legacy update'; else fail 'Geo off_pending skips legacy update'; fi
 rm -f "$GEO_SKIP_MARKER"
-(
+if (
     _geo_transition_clear
     _xray_version_ge() { return 0; }
     _geo_remove_cron_line() { return 0; }
@@ -836,7 +847,11 @@ rm -f "$GEO_SKIP_MARKER"
     _config_write_merged '{"geodata":{"cron":"0 3 */3 * *"}}' >/dev/null 2>&1
     _geo_finalize_legacy_cron >/dev/null 2>&1
     [ "$(_state_get geo_cron)" = off ]
-) && pass 'Geo finalizer retires legacy fallback after update' || fail 'Geo finalizer retires legacy fallback after update'
+); then
+    pass 'Geo finalizer retires legacy fallback after update'
+else
+    fail 'Geo finalizer retires legacy fallback after update'
+fi
 
 HYSTERIA_CERT="$TMP/selfsigned.pem"
 HYSTERIA_PIN=$(printf '%064d' 7)

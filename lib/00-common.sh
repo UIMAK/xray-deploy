@@ -113,6 +113,7 @@ export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/dow
 # [恢复默认](30-geo) 共用, **绝不允许任一侧另写一份**。
 # 三个 https+local:// 直连 DoH 上游策略相同且不单设 tag, 同组竞速首个成功响应(dns.md)。
 # ---------------------------------------------------------------------------
+# shellcheck disable=SC2034
 readonly XRAY_DEFAULT_DNS_JSON='{
     "enableParallelQuery": true,
     "queryStrategy": "UseIP",
@@ -138,6 +139,7 @@ readonly XRAY_DEFAULT_DNS_JSON='{
 # Geo 自动更新 → [路由规则] 精简 要摘掉的两条(见 XRAY_PRIVATE_BLOCK_RULE_JSON)。
 # regexp 内 \\d / \\. 是 JSON 转义后的单个反斜杠(单引号防 bash 再吃一层)。
 # ---------------------------------------------------------------------------
+# shellcheck disable=SC2034
 readonly XRAY_DEFAULT_ROUTING_RULES_JSON='[
   {
     "protocol": [
@@ -191,7 +193,9 @@ readonly XRAY_DEFAULT_ROUTING_RULES_JSON='[
 # private 段即可保住防护且**不加载 geoip.dat**。CIDR 取自 v2fly/geoip private 列表原文。
 # ruleTag 是所有权标记: 精简/恢复都靠它精确增删(Xray 支持, 老核心忽略未知字段)。
 # ---------------------------------------------------------------------------
+# shellcheck disable=SC2034
 readonly XRAY_PRIVATE_BLOCK_RULE_TAG="xd-block-private"
+# shellcheck disable=SC2034
 readonly XRAY_PRIVATE_BLOCK_RULE_JSON='{
   "ruleTag": "xd-block-private",
   "ip": [
@@ -222,6 +226,7 @@ readonly XRAY_PRIVATE_BLOCK_RULE_JSON='{
 
 # Xray log.loglevel 合法取值。核心对未识别值静默回落 warning, 校验必须由脚本自己做。
 # "none" 同时停写 error 与 access 两个日志(infra/conf/log.go)。
+# shellcheck disable=SC2034
 readonly XRAY_LOG_LEVELS="debug info warning error none"
 
 # ---------------------------------------------------------------------------
@@ -451,7 +456,7 @@ _validate_domain() {
 # ---------------------------------------------------------------------------
 _validate_json_text() {
     case "$1" in
-        *'"'*|*'\'*|*$'\n'*|*$'\r'*|*$'\t'*|*"{{"*) return 1 ;;
+        *'"'*|*\\*|*$'\n'*|*$'\r'*|*$'\t'*|*"{{"*) return 1 ;;
     esac
     # 其余控制字符(0x01-0x1F 中未被上面覆盖的)与 DEL(0x7F)不是合法 JSON 字符串字面量,
     # 同样会被原样拼进模板。NUL 无法存在于 bash 变量, 故区间从 0x01 起。
@@ -983,13 +988,14 @@ _backup_config() {
     rm -rf "$BACKUP_DIR/confs.lastbak"
     mv -f "$last_tmp" "$BACKUP_DIR/confs.lastbak" 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
     # 随机快照保留最新 10 份; 按行读取目录名兼容空白, 不依赖 find -printf。
+    # glob 只喂给 ls, 不再用 ls | grep 过滤文件名(SC2010); -d 列出快照目录本身。
     local i=0 old
     while IFS= read -r old; do
         [ -n "$old" ] || continue
-        [ -d "$BACKUP_DIR/$old" ] || continue
+        [ -d "$old" ] || continue
         i=$((i+1))
-        [ "$i" -gt 10 ] && rm -rf "$BACKUP_DIR/$old"
-    done <<< "$(ls -1t "$BACKUP_DIR" 2>/dev/null | grep '^confs\.bak\.')"
+        [ "$i" -gt 10 ] && rm -rf "${old:?}"
+    done <<< "$(ls -1dt -- "$BACKUP_DIR"/confs.bak.* 2>/dev/null)"
     return 0
 }
 
@@ -1049,7 +1055,9 @@ _gen_short_id() {
 
 _gen_rand_path() {
     # 生成随机 ws/xhttp path,如 /xxxxxxxx
-    echo "/"$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    local hex
+    hex=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '/%s' "$hex"
 }
 
 # ---------------------------------------------------------------------------
@@ -1332,6 +1340,9 @@ _with_config_lock_mkdir() {
         return 1
     fi
     (
+        # 标记只需在 "$@"(及其子进程)内可见: 重入判定发生在锁体内, 子 shell 退出即释放锁,
+        # 外层不需要看到该标记, 故 SC2030 的"改动只在本子 shell"是预期行为。
+        # shellcheck disable=SC2030
         XRAY_DEPLOY_LOCK_HELD=1
         export XRAY_DEPLOY_LOCK_HELD
         "$@"
@@ -1352,6 +1363,8 @@ _with_config_lock_mkdir() {
 # XRAY_DEPLOY_LOCK_HELD=1 支持重入; 子 shell 透传返回码并在退出时释放 fd。
 # ---------------------------------------------------------------------------
 _with_config_lock() {
+    # 重入标记由锁体子 shell 导出后在此读回; 子 shell 外的旧值不影响释放语义。
+    # shellcheck disable=SC2031
     if [ "${XRAY_DEPLOY_LOCK_HELD:-0}" = "1" ]; then
         "$@"
         return $?
@@ -1391,6 +1404,8 @@ _with_config_lock() {
             _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
         fi
+        # 同 _with_config_lock_mkdir: 标记只给锁体内使用, 不外泄给调用方。
+        # shellcheck disable=SC2031
         export XRAY_DEPLOY_LOCK_HELD=1
         "$@"
         exit "$?"

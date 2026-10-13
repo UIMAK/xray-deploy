@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Offline official-Hysteria behavior; service and bootstrap publication are local stubs.
+# 桩函数与 fixture 变量由 source 进来的生产模块间接消费。
+# shellcheck disable=SC2329,SC2034
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/hysteria-alignment.XXXXXX")
@@ -168,5 +170,38 @@ check 'bootstrap zero bandwidth reaches JSON publication' test -f "$TMP/bootstra
 if [ -f "$TMP/bootstrap.json" ]; then
     check 'bootstrap keeps explicit zero unlimited values' jq -e '.bandwidth.up == "0mbps" and .bandwidth.down == "0mbps" and .auth == {type:"password",password:"pw"}' "$TMP/bootstrap.json"
 fi
+printf '== hysteria backup retention ==\n'
+# 保留裁剪是破坏性路径(rm 历史备份): 必须证明只裁最旧的, 且不误伤 lastbak/无关同级条目。
+# mtime 用 POSIX touch -t 拉开, 否则同秒创建的文件在 ls -1dt 里次序不定。
+hysteria_backup_retention() (
+    local i f n=0
+    # 自带目标文件, 不依赖前面用例对 HYSTERIA_CONFIG 的临时改写。
+    HYSTERIA_CONFIG="$TMP/hysteria-retention.json"
+    mkdir -p "$HYSTERIA_BACKUP_DIR" || return 1
+    rm -rf "${HYSTERIA_BACKUP_DIR:?}"/*
+    printf '%s\n' '{"listen":":443","auth":{"type":"password","password":"pw"}}' > "$HYSTERIA_CONFIG" || return 1
+    for ((i = 1; i <= 13; i++)); do
+        f="$HYSTERIA_BACKUP_DIR/hysteria.json.bak.202001$(printf '%02d' "$i")-000000"
+        printf 'sentinel-%s' "$i" > "$f" || return 1
+        touch -t "202001$(printf '%02d' "$i")0000" "$f" || return 1
+    done
+    # 无关同级条目不在 hysteria.json.bak.* 内, 裁剪不得波及。
+    printf 'keep' > "$HYSTERIA_BACKUP_DIR/unrelated.txt"
+    _hysteria_backup_config >/dev/null 2>&1 || return 1
+    # 本次新增 1 份 + 原有 13 份 = 14, 裁剪后必须恰好 10 份。
+    for f in "$HYSTERIA_BACKUP_DIR"/hysteria.json.bak.*; do
+        [ -f "$f" ] || continue
+        n=$((n + 1))
+    done
+    [ "$n" -eq 10 ] || return 1
+    # 裁掉的必须是 4 份最旧的; 最新一份内容完整。
+    for ((i = 1; i <= 4; i++)); do
+        [ ! -e "$HYSTERIA_BACKUP_DIR/hysteria.json.bak.202001$(printf '%02d' "$i")-000000" ] || return 1
+    done
+    [ -s "$HYSTERIA_BACKUP_DIR/hysteria.json.bak.20200113-000000" ] &&
+        [ -f "$HYSTERIA_BACKUP_DIR/unrelated.txt" ] &&
+        [ -s "$HYSTERIA_BACKUP_DIR/hysteria.json.lastbak" ]
+)
+check 'hysteria backup retention keeps the newest 10 and spares siblings' hysteria_backup_retention
 printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

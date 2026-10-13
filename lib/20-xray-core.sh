@@ -468,6 +468,8 @@ _with_core_lock() {
         return 1
     fi
     (
+        # 标记只给 "$@" 及其子进程用于重入判定, 子 shell 退出即释放锁, 不外泄给调用方。
+        # shellcheck disable=SC2030
         XRAY_DEPLOY_CORE_LOCK_HELD=1
         export XRAY_DEPLOY_CORE_LOCK_HELD
         "$@"
@@ -796,9 +798,9 @@ _xray_core_snapshots_ok() {  # <journal>
             want=$(cat "$flag" 2>/dev/null) || return 1
             case "$want" in enabled|disabled) ;; *) _error "service enable snapshot 内容非法: $flag"; return 1 ;; esac
             if [ "$service_pre" = true ]; then
-                [ -f "$sprev" ] && [ ! -L "$sprev" ] && \
-                    ! _xray_core_path_present "${sprev}.absent" || {
-                    _error "pre-existing service snapshot 缺失/含糊: $sprev"; return 1; }
+                if [ ! -f "$sprev" ] || [ -L "$sprev" ] || _xray_core_path_present "${sprev}.absent"; then
+                    _error "pre-existing service snapshot 缺失/含糊: $sprev"; return 1
+                fi
                 _xray_core_path_present "${sprev}.masked" && {
                     _error "pre-existing service 不应存在 mask 恢复源: ${sprev}.masked"; return 1; }
             else
@@ -849,8 +851,9 @@ _xray_core_journal_phase() {
     esac
     [ "$allowed" -eq 1 ] || { _error "非法核心事务 phase 转移: ${cur:-?} → $next"; return 1; }
     if [ "$next" = snapshotted ]; then
-        _xray_core_journal_ok "$j" && _xray_core_snapshots_ok "$j" || {
-            _error "恢复源未完整通过最终校验, 不推进 snapshotted"; return 1; }
+        if ! _xray_core_journal_ok "$j" || ! _xray_core_snapshots_ok "$j"; then
+            _error "恢复源未完整通过最终校验, 不推进 snapshotted"; return 1
+        fi
         _xray_core_snapshots_fsync "$j" || {
             _error "无法枚举 coretxn 恢复源, 不推进 snapshotted"; return 1; }
     elif [ "$next" = committed ] || [ "$next" = rolled_back ]; then
@@ -950,7 +953,7 @@ _txn_allow_config_write() {
 
 _xray_core_journal_ok() {
     local j="$1" id bin binbak pre runtime unit sprev stage stage_name phase operation
-    local gipre gspre service_pre service_masked gip gsp
+    local service_pre service_masked gip gsp
     jq -e '
       (.phase | type == "string" and test("^(prepared|snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)$")) and
       ((.operation // "core") | (type == "string" and test("^(core|geo)$"))) and
@@ -982,8 +985,6 @@ _xray_core_journal_ok() {
     operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || operation=core
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
-    gipre=$(jq -r '.geoip_preexisted' "$j" 2>/dev/null) || return 1
-    gspre=$(jq -r '.geosite_preexisted' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
     service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
 
@@ -1123,7 +1124,7 @@ _xray_core_cleanup_after_commit() {  # <journal>
     return 0
 }
 
-_xray_core_txn_recover() { _with_core_lock _xray_core_txn_recover_locked "$@"; }
+_xray_core_txn_recover() { _with_core_lock _xray_core_txn_recover_locked; }
 
 _xray_core_txn_recover_locked() {
     local j phase
@@ -1734,11 +1735,13 @@ _install_or_switch_xray_locked() {
 _init_config_if_empty() {
     # 已持 core lock 时直接初始化, 不反向取 config lock; 其它入口走 config → core。
     # _config_present 为真即不写; 空配置初始化不能与已存在配置的普通变更混为同一写路径。
+    # 重入标记由 _with_core_lock 的锁体子 shell 导出后在此读回。
+    # shellcheck disable=SC2031
     if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" = "1" ]; then
-        _init_config_if_empty_locked "$@"
+        _init_config_if_empty_locked
         return $?
     fi
-    _with_config_lock _init_config_if_empty_locked "$@"
+    _with_config_lock _init_config_if_empty_locked
 }
 
 _init_config_if_empty_locked() {
@@ -2380,6 +2383,7 @@ _manage_xray() {
     # status 是只读观察, 不取锁。缺 flock 时由 _with_core_lock 使用拒绝接管的 mkdir 退路。
     case "$action" in
         start|stop|restart)
+            # shellcheck disable=SC2031
             if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
                declare -F _with_core_lock >/dev/null 2>&1; then
                 _with_core_lock _manage_xray "$@"
@@ -2431,7 +2435,7 @@ _manage_xray() {
                     # 且 comm 仍是 xray, 才算已在运行; 旧 xray 退出后 PID 若被复用(即使复用者也是
                     # xray), 记录的身份对不上, 陈旧 pidfile 应清掉再正常启动。
                     if [ -n "$dpid0" ] && _xd_pidfile_identity_ok /run/xray.pid \
-                       && [ "$(cat /proc/$dpid0/comm 2>/dev/null)" = "xray" ]; then
+                       && [ "$(cat "/proc/$dpid0/comm" 2>/dev/null)" = "xray" ]; then
                         echo "running"
                     else
                         rm -f /run/xray.pid
@@ -2443,7 +2447,7 @@ _manage_xray() {
                         _xd_pidfile_write /run/xray.pid "$!"
                         sleep 1
                         dpid1=$(_xd_pidfile_pid /run/xray.pid)
-                        if [ -z "$dpid1" ] || [ "$(cat /proc/$dpid1/comm 2>/dev/null)" != "xray" ]; then
+                        if [ -z "$dpid1" ] || [ "$(cat "/proc/$dpid1/comm" 2>/dev/null)" != "xray" ]; then
                             _warn "Xray 启动失败,进程已退出"
                             rm -f /run/xray.pid
                             return 1
@@ -2459,7 +2463,7 @@ _manage_xray() {
                         # "复核的是 A 进程、杀的是 B 进程"。comm 检查只作附加收窄。
                         _xray_st=$(_xd_pidfile_starttime /run/xray.pid)
                         if [ -n "$dpid" ] && _xd_pidfile_identity_ok /run/xray.pid \
-                           && [ "$(cat /proc/$dpid/comm 2>/dev/null)" = "xray" ]; then
+                           && [ "$(cat "/proc/$dpid/comm" 2>/dev/null)" = "xray" ]; then
                             [ -n "$_xray_st" ] || _xray_st=$(_proc_starttime "$dpid") || return 1
                             if ! _proc_exe_is_strict "$dpid" "$XRAY_BIN" ||
                                ! _xd_kill_pid_graceful "$dpid" 5 "$_xray_st" ||
@@ -2493,6 +2497,7 @@ _manage_xray() {
 # ---------------------------------------------------------------------------
 _restart_xray_verified() {
     # restart + 8 秒健康观察作为一个不可穿插的 runtime mutation 临界区。
+    # shellcheck disable=SC2031
     if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
        declare -F _with_core_lock >/dev/null 2>&1; then
         _with_core_lock _restart_xray_verified
@@ -2548,6 +2553,7 @@ _xray_stopped_state() {
 
 _xray_stop_and_verify() {
     # stop 与完整 liveness 确认不可被核心 transaction 的 restart 插入。
+    # shellcheck disable=SC2031
     if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
        declare -F _with_core_lock >/dev/null 2>&1; then
         _with_core_lock _xray_stop_and_verify

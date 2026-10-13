@@ -189,7 +189,10 @@ _detect_reality_pq() {
         _warn "$PQ_REASON"
         return 2
     fi
+    # 结果经全局传递: 50-nodes/90-menu 在 rc=0 时读取这两个值。
+    # shellcheck disable=SC2034
     PQ_SEED=$pq_seed
+    # shellcheck disable=SC2034
     PQ_VERIFY=$pq_verify
     _success "后量子签名已启用: mldsa65Seed / mldsa65Verify 已生成"
     return 0
