@@ -689,7 +689,7 @@ _config_jq() {
 
 # 把一份完整配置拆回 confs(每字段一个文件, 文件内容是 `{"<字段>": <值>}` 的合法配置片段),
 # 并删除内容里已不存在的字段所对应的文件(例如 del(.geodata) 必须真的让 14_geodata.json 消失)。
-# 第二个参数可指定目标目录(DNS 菜单用它把候选配置写进临时目录做 xray -test 预检)。
+# 第二个参数可指定目标目录(把候选配置写进独立目录做 xray -test 预检, 见 tests/verify-configs.sh)。
 _config_write_merged() {   # <完整配置 JSON> [目标目录]
     local content="$1" dir="${2:-$CONFIG_DIR}"
     [ -n "$content" ] || return 1
@@ -1437,6 +1437,16 @@ _rename_node_with_port() {
         printf '%s-%s' "${name%"-${oldport}"}" "$newport"
     else
         printf '%s' "$name"
+    fi
+}
+
+# 分享链接里 IPv6 地址必须加方括号(含冒号且未加括号时包裹)。
+_link_host() {   # <addr>; 输出可直接拼进链接的 host 段
+    local addr="$1"
+    if [[ "$addr" == *":"* && "$addr" != *"["* ]]; then
+        printf '[%s]' "$addr"
+    else
+        printf '%s' "$addr"
     fi
 }
 

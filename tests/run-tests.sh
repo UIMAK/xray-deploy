@@ -540,7 +540,7 @@ printf '== config check and Geo state ==\n'
 GEO_TRANSITION_KEY=geo_update_transition
 _state_set geo_cron on
 # 启用内置 geodata 定时: geodata 段必须落到自己的字段文件里, 旧 cron 兜底状态保留
-# (首次成功更新后才 retire, 见 _geo_finalize_legacy_cron)。
+# (首次成功更新后才 retire, 见 _geo_finalize_legacy_cron_locked)。
 _config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
 # _test_udp_snapshot 里的 CONFIG_DIR 改向只在子 shell 内, 外层值不受影响。
 # shellcheck disable=SC2031
@@ -845,7 +845,7 @@ if (
     _geo_remove_cron_line() { return 0; }
     _state_set geo_cron on
     _config_write_merged '{"geodata":{"cron":"0 3 */3 * *"}}' >/dev/null 2>&1
-    _geo_finalize_legacy_cron >/dev/null 2>&1
+    _geo_finalize_legacy_cron_locked >/dev/null 2>&1
     [ "$(_state_get geo_cron)" = off ]
 ); then
     pass 'Geo finalizer retires legacy fallback after update'
@@ -1092,7 +1092,7 @@ if (
 
 if (
     R_LISTEN=127.0.0.1 R_PORT=12345 R_TAG=test
-    R_UUID=11111111-1111-1111-1111-111111111111 R_HOST=example.com R_PATH='/api?a=1&b=2'
+    R_UUID=11111111-1111-1111-1111-111111111111 R_PATH='/api?a=1&b=2'
     ws=$(_render_template "$ROOT/templates/vless-ws-cdn.server.jsonc") || exit 1
     [ "$(jq -r '.streamSettings.wsSettings.path' <<< "$ws")" = "$R_PATH" ] || exit 1
     R_METHOD=aes-256-gcm R_PASSWORD='hello&world' R_NETWORK=tcp

@@ -2076,8 +2076,7 @@ _hysteria_build_link() {
     auth=$(jq -r '.auth // empty' "$meta" 2>/dev/null)
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     link_addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
-    local link_ip="$link_addr"
-    [[ "$link_addr" == *":"* && "$link_addr" != *"["* ]] && link_ip="[${link_addr}]"
+    local link_ip; link_ip=$(_link_host "$link_addr")
     local tls_mode sni params=""
     tls_mode=$(_hysteria_meta_get tls_mode)
     sni=$(_hysteria_meta_get sni)
@@ -2225,17 +2224,6 @@ _hysteria_autofill_name() {
         i=$((i+1))
     done
     printf '%s' "$cand"
-}
-
-_hysteria_default_name() {
-    local part
-    part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)" 2>/dev/null) || part=""
-    part=${part%%-*}
-    if [ -n "$part" ]; then
-        printf 'HY2-%s' "$part"
-    else
-        printf 'HY2'
-    fi
 }
 
 # 提交前从向导 listen 派生默认名；此时配置可能尚不存在。
@@ -2815,7 +2803,7 @@ _hysteria_add_node() {
     _tip "服务器已有认证凭据(手工部署或此前删除过节点记录), 将按现有密码重建节点"
     _tip "认证密码保持不变(不会使已分发的链接失效)"
     local def_name
-    def_name=$(_hysteria_default_name)
+    def_name=$(_hysteria_default_name_for_listen "$(_hysteria_config_get listen)")
     read -rp "  节点名称 (回车默认 ${def_name}): " name
     name=${name:-$def_name}
     _validate_json_text "$name" || { _error "名称含非法字符"; _press_any_key; return 1; }

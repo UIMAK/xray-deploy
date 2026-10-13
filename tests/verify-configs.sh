@@ -114,7 +114,6 @@ R_SERVER_NAME='config-test.invalid'
 R_PRIVATE_KEY=''
 R_SHORT_ID=0123456789abcdef
 R_PATH='/config-test?left=1&right=2&ed=2560'
-R_HOST='config-test.invalid'
 R_METHOD=aes-128-gcm
 R_PASSWORD='ss-left&ss-right&%s'
 R_MLDSA65_SEED=''
