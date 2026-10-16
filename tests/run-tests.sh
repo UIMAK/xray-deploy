@@ -1194,6 +1194,77 @@ _test_direct_config_source() (
 check 'direct restored legacy service starts from existing single file' _test_direct_config_source legacy
 check 'direct migrated service prefers nonempty confdir' _test_direct_config_source confdir
 
+# B13c: reset 快照恢复经 JQ_MERGE_OBJECTS 合并配置片段。
+_reset_restore_stage="$TMP/reset-restore-stage"
+_reset_restore_dir="$TMP/reset-restore-confs"
+_test_reset_snapshot_restore() {
+    local saved_dir="$CONFIG_DIR" saved_deploy="$DEPLOY_DIR" saved_fsync ok=0 rc=0
+    saved_fsync=$(declare -f _reset_fsync_required)
+    _reset_fsync_required() { return 0; }
+    rm -rf "$_reset_restore_stage" "$_reset_restore_dir"
+    mkdir -p "$_reset_restore_stage/confs" "$_reset_restore_dir"
+    printf '%s\n' '{"log":{"loglevel":"debug"}}' > "$_reset_restore_stage/confs/02_log.json"
+    printf '%s\n' '{"inbounds":[{"tag":"a"}]}' > "$_reset_restore_stage/confs/07_inbounds.json"
+    DEPLOY_DIR="$TMP/reset-restore-deploy" CONFIG_DIR="$_reset_restore_dir"
+    _reset_config_snapshot_restore "$_reset_restore_stage" 0 0 1 || rc=$?
+    [ "$rc" -eq 0 ] || ok=1
+    [ "$(jq -r '.log.loglevel' "$_reset_restore_dir/02_log.json" 2>/dev/null)" = debug ] || ok=1
+    [ "$(jq -r '.inbounds[0].tag' "$_reset_restore_dir/07_inbounds.json" 2>/dev/null)" = a ] || ok=1
+    [ ! -e "$_reset_restore_stage" ] || ok=1
+    CONFIG_DIR="$saved_dir" DEPLOY_DIR="$saved_deploy"
+    eval "$saved_fsync"
+    return "$ok"
+}
+check 'reset snapshot restore merges conf fragments via shared constant' _test_reset_snapshot_restore
+
+_test_reset_snapshot_missing() {
+    local saved_dir="$CONFIG_DIR" saved_deploy="$DEPLOY_DIR" ok=0 rc=0
+    local stage="$TMP/reset-restore-missing" dir="$TMP/reset-restore-missing-confs"
+    rm -rf "$stage" "$dir"
+    mkdir -p "$stage/confs" "$dir"
+    DEPLOY_DIR="$TMP/reset-restore-missing-deploy" CONFIG_DIR="$dir"
+    _reset_config_snapshot_restore "$stage" 0 0 1 || rc=$?
+    [ "$rc" -eq 1 ] || ok=1
+    [ -d "$stage" ] || ok=1
+    CONFIG_DIR="$saved_dir" DEPLOY_DIR="$saved_deploy"
+    return "$ok"
+}
+check 'reset snapshot restore keeps scene when fragments are missing' _test_reset_snapshot_missing
+
+
+# B13 guard: 混装旧 lib(缺 JQ_MERGE_OBJECTS)时明确拒绝, 不走 unbound variable 通用失败。
+_test_reset_restore_mixed_lib() {
+    local stage="$TMP/reset-mixed-stage" dir="$TMP/reset-mixed-confs" out ok=0
+    rm -rf "$stage" "$dir"
+    mkdir -p "$stage/confs" "$dir"
+    printf '%s\n' '{"log":{"loglevel":"debug"}}' > "$stage/confs/02_log.json"
+    out=$(bash -c '
+        set -u
+        ROOT="$1"; STAGE="$2"; CONF_DIR="$3"
+        _error() { printf "[错误] %s\n" "$*"; }
+        _tip() { printf "[提示] %s\n" "$*"; }
+        _reset_fsync_required() { return 0; }
+        _config_write_merged() { : > "$CONF_DIR/__wrote__"; return 0; }
+        source "$ROOT/lib/90-menu.sh"
+        _reset_config_snapshot_restore "$STAGE" 0 0 1
+        printf "RC=%s\n" "$?"
+    ' bash "$ROOT" "$stage" "$dir" 2>&1)
+    case "$out" in
+        *"缺少合并常量"*) ;;
+        *) ok=1 ;;
+    esac
+    case "$out" in
+        *"unbound variable"*) ok=1 ;;
+    esac
+    case "$out" in
+        *"RC=1"*) ;;
+        *) ok=1 ;;
+    esac
+    [ ! -e "$dir/__wrote__" ] || ok=1
+    [ -d "$stage" ] || ok=1
+    return "$ok"
+}
+check 'reset snapshot restore rejects mixed-lib without shared constant' _test_reset_restore_mixed_lib
 # 专属行为套件在独立进程内运行, 不泄漏服务/配置桩到本套件。
 for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then

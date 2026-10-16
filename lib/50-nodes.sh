@@ -230,6 +230,15 @@ XD_MASQ_JQ_SET='(.inbounds[] | select(.tag == $t) | .streamSettings.hysteriaSett
 # 该段不存在(官方 docs: 不填为默认的 404 页面), 少一个形态就少一处"两个值表达同一件事"。
 XD_MASQ_JQ_CLEAR='del(.inbounds[] | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade)'
 
+# 禁用端口跳跃时删除的 hop 字段集合(唯一真相)。
+XD_HOP_JQ_DEL_FIELDS='del(.hop_ranges) | del(.hop_start) | del(.hop_end) | del(.udp_hop_ports)'
+
+# Hy2 自签证书默认域名(唯一真相): 未显式指定时的 CN/SAN 与分享链接 SNI 回退值。
+XD_HY2_DEFAULT_SNI='build.nvidia.com'
+
+# 删除指定 tag 的入站(唯一真相): 非对象元素保留, 与删除路径同口径。
+XD_NODE_JQ_DEL_INBOUND='.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))'
+
 # 去掉首尾空白: read 会保留用户输入的空格, 响应头行 "  Server: x" 不去掉就是非法字段名。
 _hy2_masq_trim() {
     local s="$1"
@@ -837,7 +846,8 @@ _hy2_hop_txn() {
 }
 
 _hy2_hop_txn_locked() {
-    local op="$1" meta="$2" _stale_newmeta="$3" port="$4"; shift 4
+    # $3 为调用方位次占位(newmeta 由事务内部生成); shift 4 与调用方参数个数绑定。
+    local op="$1" meta="$2" port="$4"; shift 4
     local created tag orig current_port current_ranges requested_ranges hopmeta newmeta range normalized rs re
     # 非 config writer 的 runtime+metadata 事务也必须遵守同一 pending guard。
     if declare -F _txn_allow_config_write >/dev/null 2>&1 \
@@ -878,7 +888,7 @@ _hy2_hop_txn_locked() {
             _error "config 中的节点已变化, 拒绝禁用端口跳跃"
             return 1
         fi
-        hopmeta=$(jq 'del(.hop_ranges) | del(.hop_start) | del(.hop_end) | del(.udp_hop_ports)' <<< "$orig") || return 1
+        hopmeta=$(jq "$XD_HOP_JQ_DEL_FIELDS" <<< "$orig") || return 1
     else
         _error "未知的端口跳跃事务类型: $op"
         return 1
@@ -976,6 +986,21 @@ _hy2_remove_created_hop_rules() {
         [ -z "$remain" ] || rc=1
     done
     return "$rc"
+}
+
+# 回滚到旧端口规则: 清理本事务实际新增的新端口规则, 再恢复旧端口规则
+# (幂等 add 不会重复), 最后持久化; 三步都尽力执行并聚合结果, 不完整时如实告警。
+# 契约: 恒 return 0; 失败经 _error 上报, 调用方按失败路径返回 1。
+# 其他恢复旧端口规则的路径见 _hy2_hop_reverse 与 retarget 首段失败分支, 本函数只覆盖 add/persist 失败回滚。
+_hy2_hop_rollback_to_old() {  # <newport> <oldport> <created_new> <ranges...>
+    local newport="$1" oldport="$2" created_new="$3"; shift 3
+    local rok=0
+    # shellcheck disable=SC2086
+    _hy2_remove_created_hop_rules "$newport" $created_new 2>/dev/null || rok=1
+    _hy2_add_hop_rules "$oldport" "$@" >/dev/null 2>/dev/null || rok=1
+    _hy2_persist_iptables 2>/dev/null || rok=1
+    [ "$rok" = 1 ] && _error "端口回滚不完整, 请手动检查 iptables"
+    return 0
 }
 
 # 返回 0=回滚成功; 1=回滚过程中仍有失败(runtime 或持久化), 调用方必须显式报告, 不能当作"已恢复原状"
@@ -1129,24 +1154,12 @@ _hy2_hop_retarget() {
     created_new=$(_hy2_add_hop_rules "$newport" "$@"); rc=$?
     if [ "$rc" != 0 ]; then
         _error "新端口跳跃规则添加失败, 恢复旧规则..."
-        # 先清理本事务实际新增的新端口规则(created_new), 再恢复旧端口规则(幂等 add 不会重复);
-        # 三步都尽力执行并聚合结果
-        local rok=0
-        # shellcheck disable=SC2086
-        _hy2_remove_created_hop_rules "$newport" $created_new 2>/dev/null || rok=1
-        _hy2_add_hop_rules "$oldport" "$@" >/dev/null 2>/dev/null || rok=1
-        _hy2_persist_iptables 2>/dev/null || rok=1
-        [ "$rok" = 1 ] && _error "端口回滚不完整, 请手动检查 iptables"
+        _hy2_hop_rollback_to_old "$newport" "$oldport" "$created_new" "$@"
         return 1
     fi
     if ! _hy2_persist_iptables; then
         _warn "iptables 持久化失败, 回滚到旧端口规则..."
-        local rok=0
-        # shellcheck disable=SC2086
-        _hy2_remove_created_hop_rules "$newport" $created_new 2>/dev/null || rok=1
-        _hy2_add_hop_rules "$oldport" "$@" >/dev/null 2>/dev/null || rok=1
-        _hy2_persist_iptables 2>/dev/null || rok=1
-        [ "$rok" = 1 ] && _error "端口回滚不完整, 请手动检查 iptables"
+        _hy2_hop_rollback_to_old "$newport" "$oldport" "$created_new" "$@"
         return 1
     fi
     return 0
@@ -1199,7 +1212,8 @@ _hy2_port_txn() {
 }
 
 _hy2_port_txn_locked() {
-    local tag="$1" meta="$2" oldport="$3" newport="$4" _stale_newmeta="$5"; shift 5
+    # $5 为调用方位次占位(newmeta 由事务内部生成); shift 5 与调用方参数个数绑定。
+    local tag="$1" meta="$2" oldport="$3" newport="$4"; shift 5
     local ranges="$*" orig journal rok current_port current_ranges
     # 本事务临界区标记(local 动态作用域, 事务返回即消失): 自己的 journal 在写 config 时
     # 不算"未收敛现场" —— 见 _txn_allow_config_write 的 port 段。
@@ -1801,17 +1815,12 @@ _commit_node_txn_locked() {
         _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消: ${tag}"
         return 1
     fi
-    local meta_name
-    meta_name=$(printf '%s' "$meta_json" | jq -r '.name // empty' 2>/dev/null)
-    if [ -n "$meta_name" ] && ! _ensure_unique_name "$meta_name"; then
-        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${meta_name}"
-        return 1
-    fi
+    _node_meta_name_guard "$meta_json" || return 1
     _commit_inbound "$inbound" || return 1
     if ! _save_node_meta "$tag" "$meta_json"; then
         _error "元数据写入失败, 正在回滚入站: $tag"
         _mutate_config --arg t "$tag" \
-            '.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))' || \
+            "$XD_NODE_JQ_DEL_INBOUND" || \
             _error "回滚入站失败, 请手动检查配置: $tag"
         return 1
     fi
@@ -1958,12 +1967,7 @@ _commit_reality_node_txn_locked() {
         _error "节点 tag 已被占用(可能刚被其他会话创建), 已取消: ${tag}"
         return 1
     fi
-    local meta_name
-    meta_name=$(printf '%s' "$meta_json" | jq -r '.name // empty' 2>/dev/null)
-    if [ -n "$meta_name" ] && ! _ensure_unique_name "$meta_name"; then
-        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${meta_name}"
-        return 1
-    fi
+    _node_meta_name_guard "$meta_json" || return 1
     _commit_reality_inbound "$tunnel" "$reality" "$tunnel_tag" "$domain" || return 1
     if ! _save_node_meta "$tag" "$meta_json"; then
         _error "元数据写入失败, 正在回滚入站与路由: $tag"
@@ -2015,6 +2019,22 @@ _prompt_reality_mode() {
                 ;;
         esac
     done
+}
+
+# Reality 端口选择输出 REALITY_PORT / REALITY_TUNNEL_PORT; 0已选定, 1取消。
+# 直连模式无 tunnel 入站, 不申请 tunnel 端口
+# 生成放在 Reality 端口输入之后, 以便把用户端口加入排除项
+_prompt_reality_ports() {  # <mode> <sni>
+    local mode="$1" sni="$2"
+    REALITY_PORT=""
+    REALITY_TUNNEL_PORT=""
+    echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
+    REALITY_PORT=$(_input_port tcp) || return 1
+    if [ "$mode" = "tunnel" ]; then
+        REALITY_TUNNEL_PORT=$(_gen_free_tunnel_port "$REALITY_PORT")
+        _info "Tunnel 监听端口: ${REALITY_TUNNEL_PORT} (转发到 ${sni}:443)"
+    fi
+    return 0
 }
 
 # 模式判定只走 _reality_node_mode，stdout 恒为 direct/tunnel。
@@ -2117,6 +2137,19 @@ _ensure_unique_name() {
         _warn "有 ${bad} 个节点元数据损坏/为空, 已跳过名称查重(唯一性降级为 best-effort)"
         _tip "请人工核对 ${NODES_DIR} 并修复/删除这些文件, 否则可能出现同名节点"
     }
+    return 0
+}
+
+# 锁内名称占用复核: 空名跳过(由写入方保证); 冲突必须取消整个事务。
+# Hy2 事务在证书操作前用预提取的 name 内联同一检查(见 _commit_hy2_node_txn_locked), 属有意保留的等价路径。
+_node_meta_name_guard() {  # <meta_json>
+    local meta_name
+    meta_name=$(printf '%s' "$1" | jq -r '.name // empty' 2>/dev/null)
+    [ -n "$meta_name" ] || return 0
+    if ! _ensure_unique_name "$meta_name"; then
+        _error "节点名称已被占用(可能刚被其他会话创建), 已取消: ${meta_name}"
+        return 1
+    fi
     return 0
 }
 
@@ -2613,15 +2646,8 @@ _add_vless_tcp_reality_vision() {
     # SNI 会被拼进 tunnel inbound tag, 含空格/引号会破坏按 tag 的关联匹配
     _validate_domain "$sni" || { _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $sni"; return 1; }
 
-    # 直连模式无 tunnel 入站, 不申请 tunnel 端口
-    # 生成放在 Reality 端口输入之后, 以便把用户端口加入排除项
-    local tunnel_port=""
-    echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
-    local port; port=$(_input_port tcp) || return 1
-    if [ "$mode" = "tunnel" ]; then
-        tunnel_port=$(_gen_free_tunnel_port "$port")
-        _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
-    fi
+    _prompt_reality_ports "$mode" "$sni" || return 1
+    local port="$REALITY_PORT" tunnel_port="$REALITY_TUNNEL_PORT"
 
     local default_name="Reality-Vision-${port}"
     _node_name_prompt || return 1
@@ -2753,15 +2779,8 @@ _add_vless_xhttp_reality() {
     # SNI 会被拼进 tunnel inbound tag, 含空格/引号会破坏按 tag 的关联匹配
     _validate_domain "$sni" || { _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $sni"; return 1; }
 
-    # 直连模式无 tunnel 入站, 不申请 tunnel 端口
-    # 生成放在 Reality 端口输入之后, 以便把用户端口加入排除项
-    local tunnel_port=""
-    echo -e "  ${YELLOW}Reality 监听端口 (客户端连接)${NC}"
-    local port; port=$(_input_port tcp) || return 1
-    if [ "$mode" = "tunnel" ]; then
-        tunnel_port=$(_gen_free_tunnel_port "$port")
-        _info "Tunnel 监听端口: ${tunnel_port} (转发到 ${sni}:443)"
-    fi
+    _prompt_reality_ports "$mode" "$sni" || return 1
+    local port="$REALITY_PORT" tunnel_port="$REALITY_TUNNEL_PORT"
 
     local path
     _prompt_wire_path XHTTP || return 1
@@ -3336,7 +3355,7 @@ _hy2_cert_reusable() {
 
 # 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
 _gen_hy2_cert() {
-    local tag="$1" domain="${2:-build.nvidia.com}"
+    local tag="$1" domain="${2:-$XD_HY2_DEFAULT_SNI}"
     # 证书域名会写进 X.509 CN/SAN, 从输入侧拒绝非法值(仅 LDH 域名, 与 _validate_domain 同口径)
     _validate_domain "$domain" || { _error "证书域名格式非法(仅字母/数字/连字符, 点分段): $domain"; return 1; }
     local cert_dir="$CERT_DIR/$tag"
@@ -3918,9 +3937,9 @@ _add_hysteria2() {
         # 自签域名同时写CN/SAN并用于SNI；必须允许用户选择而非硬编码。
         while :; do
             # 域名输入EOF取消；不能把失败套成默认域名。
-            read -rp "  自签证书域名/SAN (回车默认 build.nvidia.com): " self_domain || return 1
+            read -rp "  自签证书域名/SAN (回车默认 ${XD_HY2_DEFAULT_SNI}): " self_domain || return 1
             [ "$self_domain" = "0" ] && { _info "已取消"; return 1; }
-            self_domain=${self_domain:-build.nvidia.com}
+            self_domain=${self_domain:-$XD_HY2_DEFAULT_SNI}
             _validate_domain "$self_domain" && break
             _error "域名格式非法(仅字母/数字/连字符, 点分段): ${self_domain}"
         done
@@ -3972,7 +3991,7 @@ _add_hysteria2() {
     local listen="::"
 
     # 混淆仅写finalmask.udp，默认关闭；客户端类型与Xray类型分别处理(finalmask.md)。
-    local obfs_type="" obfs_pw="" obfs_size="" obfs_mask="" obfs_pw_in="" obfs_choice
+    local obfs_type="" obfs_pw="" obfs_size="" obfs_pw_in="" obfs_choice
     echo -e "  混淆 (FinalMask.udp, 默认关闭):"
     echo -e "  ${GREEN}[1]${NC} 不启用  ${GREEN}[2]${NC} salamander  ${GREEN}[3]${NC} gecko"
     read -rp "  选择 (默认 1): " obfs_choice
@@ -4052,7 +4071,7 @@ _rebuild_hy2_link() {
     auth=$(jq -r '.auth // empty' "$meta")
     host=$(jq -r '.link_addr // empty' "$meta")
     port=$(jq -r '.port // empty' "$meta")
-    sni=$(jq -r '.sni // "build.nvidia.com"' "$meta")
+    sni=$(jq -r --arg d "$XD_HY2_DEFAULT_SNI" '.sni // $d' "$meta")
     congestion=$(jq -r '.congestion // empty' "$meta")
     brutal_up=$(jq -r '.brutal_up // empty' "$meta")
     brutal_down=$(jq -r '.brutal_down // empty' "$meta")
@@ -4098,7 +4117,7 @@ _hy2_clash_line() {
     addr=$(jq -r '.link_addr // empty' "$meta")
     port=$(jq -r '.port // empty' "$meta")
     auth=$(jq -r '.auth // empty' "$meta")
-    sni=$(jq -r '.sni // "build.nvidia.com"' "$meta")
+    sni=$(jq -r --arg d "$XD_HY2_DEFAULT_SNI" '.sni // $d' "$meta")
     congestion=$(jq -r '.congestion // empty' "$meta")
     brutal_up=$(jq -r '.brutal_up // empty' "$meta")
     brutal_down=$(jq -r '.brutal_down // empty' "$meta")
@@ -4786,7 +4805,7 @@ _delete_node_apply_single() {
             2) preserve_tunnel=1; _warn "无法确认 Reality tunnel 是否仍被引用, 保留 tunnel 与路由规则: $tunnel_tag" ;;
         esac
     fi
-    local jq_filter='.inbounds |= map(select((type != "object") or ((.tag // "") != $t)))'
+    local jq_filter="$XD_NODE_JQ_DEL_INBOUND"
     if [ -n "$tunnel_tag" ] && [ "$preserve_tunnel" -eq 0 ]; then
         jq_filter="$jq_filter | .routing.rules |= map(select((type != \"object\") or .inboundTag == null or (((.inboundTag | if type == \"string\" then split(\",\") else . end) | index(\$tg)) == null)))
             | .inbounds |= map(select((type != \"object\") or ((.tag // \"\") != \$tg)))"
@@ -5826,7 +5845,7 @@ _hy2_toggle_hop() {
                 # 事务: 生成新 metadata(删 hop 字段, 链接不再含 &mport=) ->
                 # runtime remove -> 原子持久化 -> 原子提交 metadata; 任一步失败回滚, 不永久分叉
                 local hopmeta newmeta
-                hopmeta=$(jq 'del(.hop_ranges) | del(.hop_start) | del(.hop_end) | del(.udp_hop_ports)' "$meta") || { _error "生成元数据失败"; _press_any_key; return; }
+                hopmeta=$(jq "$XD_HOP_JQ_DEL_FIELDS" "$meta") || { _error "生成元数据失败"; _press_any_key; return; }
                 newmeta=$(_hy2_gen_newmeta "$meta" "$hopmeta") || { _error "重建分享链接失败"; _press_any_key; return; }
                 # shellcheck disable=SC2086
                 if ! _hy2_hop_txn remove "$meta" "$newmeta" "$port" $cur_ranges; then

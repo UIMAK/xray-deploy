@@ -626,16 +626,28 @@ _xray_core_fsync_file_dir() {  # best-effort durability for an artifact and its 
     return 0
 }
 
+# 事务恢复源字段读取(快照/清理两处的收敛入口): binbak stage sprev gip gsp operation scope。
+# 其余阶段的直接 jq 读取点保持原状; 新增读取优先收敛到本函数, 避免口径漂移。
+# 任一字段读不出来都必须让调用方看见: 账本不可用不能当成空值。
+_xray_core_journal_fields() {  # <journal>
+    local j="$1"
+    jq -r '.binary_backup' "$j" 2>/dev/null || return 1
+    jq -r '.staging_dir' "$j" 2>/dev/null || return 1
+    jq -r '.service_prev' "$j" 2>/dev/null || return 1
+    jq -r '.geoip_backup' "$j" 2>/dev/null || return 1
+    jq -r '.geosite_backup' "$j" 2>/dev/null || return 1
+    jq -r '.operation // "core"' "$j" 2>/dev/null || return 1
+    jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null || return 1
+}
+
 _xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
     local j="$1" binbak stage sprev gip gsp operation scope f
-    local -a sources
-    binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
-    stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
-    sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
-    gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
-    gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
-    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || return 1
-    scope=$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null) || return 1
+    local -a sources jf fields
+    fields=$(_xray_core_journal_fields "$j") || return 1
+    mapfile -t jf <<< "$fields"
+    [ "${#jf[@]}" -eq 7 ] || return 1
+    binbak="${jf[0]}"; stage="${jf[1]}"; sprev="${jf[2]}"
+    gip="${jf[3]}"; gsp="${jf[4]}"; operation="${jf[5]}"; scope="${jf[6]}"
     sources=("$gip" "$gsp")
     if [ "$scope" = full ]; then
         sources+=("$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked")
@@ -1068,17 +1080,15 @@ _xray_core_journal_quarantine() {
 
 # 清理事务资源(除 journal): 任何资源仍存在都返回失败, journal 保留用于下次 retry。
 _xray_core_cleanup_sources() {  # <journal>
-    local j="$1" binbak stage sprev gip gsp phase service_masked operation scope left=0 f
-    local -a sources
+    local j="$1" binbak stage sprev gip gsp phase service_masked scope left=0 f
+    local -a sources jf fields
     phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
-    binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
-    stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
-    sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
-    gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
-    gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
     service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
-    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || return 1
-    scope=$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null) || return 1
+    fields=$(_xray_core_journal_fields "$j") || return 1
+    mapfile -t jf <<< "$fields"
+    [ "${#jf[@]}" -eq 7 ] || return 1
+    binbak="${jf[0]}"; stage="${jf[1]}"; sprev="${jf[2]}"
+    gip="${jf[3]}"; gsp="${jf[4]}"; scope="${jf[6]}"
     sources=("$gip" "$gsp")
     if [ "$scope" = full ]; then
         sources+=("$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked")
@@ -2036,7 +2046,7 @@ _xray_service_enable_state() {
 # enable 状态会在 service 创建时改变, 因此属于 snapshotted 的必要恢复源。
 # 只接受能明确恢复的 enabled/disabled; 查询失败或其它状态必须在 replacing 前中止。
 _xray_service_snapshot_enable() {  # <unit路径> <标志文件路径> [已知状态]
-    local unit="$1" flag="$2" want="${3:-}"
+    local flag="$2" want="${3:-}"
     [ -n "$want" ] || want=$(_xray_service_enable_state) || {
         _error "无法安全快照 ${INIT_SYSTEM:-未知} 的 xray 开机自启状态, 取消核心事务"
         return 1

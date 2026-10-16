@@ -203,5 +203,33 @@ hysteria_backup_retention() (
         [ -s "$HYSTERIA_BACKUP_DIR/hysteria.json.lastbak" ]
 )
 check 'hysteria backup retention keeps the newest 10 and spares siblings' hysteria_backup_retention
+# A1/A2: _hysteria_meta_set 新建/更新两分支; 拥塞控制菜单预设映射与恢复默认。
+hysteria_meta_probe() {
+    local meta="$TMP/meta-probe.json"
+    rm -f "$meta"
+    HYSTERIA_SERVER_META="$meta"
+    _hysteria_meta_set k1 v1 || return 1
+    [ "$(jq -r '.k1' "$meta" 2>/dev/null)" = v1 ] || return 1
+    _hysteria_meta_set k2 v2 || return 1
+    [ "$(jq -r '.k1' "$meta" 2>/dev/null)" = v1 ] || return 1
+    [ "$(jq -r '.k2' "$meta" 2>/dev/null)" = v2 ] || return 1
+    return 0
+}
+check 'hysteria meta set creates then updates own fields' hysteria_meta_probe
+
+congestion_probe() {
+    local log="$TMP/congestion-txn"
+    : > "$log"
+    _hysteria_gate() { return 0; }
+    _hysteria_congestion_desc() { printf 'probe'; }
+    _hysteria_config_txn() { printf '%s\n' "$*" >> "$log"; return 0; }
+    printf '1\n2\n2\n3\n0\n' | _hysteria_congestion_menu || return 1
+    [[ "$(cat "$log")" == *"pr conservative"* ]] || return 1
+    [[ "$(cat "$log")" == *'type: "reno"'* ]] || return 1
+    [[ "$(cat "$log")" == *'del(.congestion)'* ]] || return 1
+    return 0
+}
+check 'hysteria congestion menu maps bbr presets and reset' congestion_probe
+
 printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

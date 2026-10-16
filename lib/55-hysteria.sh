@@ -1334,7 +1334,7 @@ _hysteria_meta_get() {
 
 # manager 元数据独立于官方 config；只写自有字段并保持原子性。
 _hysteria_meta_set() {
-    local key="$1" val="$2" cur
+    local key="$1" val="$2"
     mkdir -p "$HYSTERIA_DATA_DIR" || return 1
     if [ -f "$HYSTERIA_SERVER_META" ]; then
         _meta_update "$HYSTERIA_SERVER_META" '.[$k]=$v' --arg k "$key" --arg v "$val"
@@ -1851,7 +1851,7 @@ _hysteria_congestion_desc() {
 }
 
 _hysteria_congestion_menu() {
-    local choice t p
+    local choice p
     _hysteria_gate || { _press_any_key; return; }
     while true; do
         clear
