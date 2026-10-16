@@ -331,5 +331,35 @@ check 'EnvironmentFiles last file wins in the text fallback' eq "$(_cf_grace_con
 CF_LOADSTATE=loaded
 rm -f "$TMP/cf-envfiles" "$TMP/cf-execstart" "$TMP/a.env" "$TMP/b.env" "$CF_UNIT_SYSTEMD"
 
+# B8: _cf_svcfile 三条臂(含未知 init 默认臂)。
+cf_svcfile_systemd() {
+    local saved="$INIT_SYSTEM" out
+    INIT_SYSTEM=systemd
+    out=$(_cf_svcfile)
+    INIT_SYSTEM="$saved"
+    [ "$out" = "$CF_UNIT_SYSTEMD" ]
+}
+check 'cf svcfile picks systemd unit for systemd init' cf_svcfile_systemd
+
+cf_svcfile_openrc() {
+    local saved="$INIT_SYSTEM" out
+    INIT_SYSTEM=openrc
+    out=$(_cf_svcfile)
+    INIT_SYSTEM="$saved"
+    [ "$out" = "$CF_UNIT_OPENRC" ]
+}
+check 'cf svcfile picks openrc unit for openrc init' cf_svcfile_openrc
+
+cf_svcfile_default() {
+    local saved="$INIT_SYSTEM" empty_out weird_out
+    INIT_SYSTEM=
+    empty_out=$(_cf_svcfile)
+    INIT_SYSTEM=weird
+    weird_out=$(_cf_svcfile)
+    INIT_SYSTEM="$saved"
+    [ "$empty_out" = "$CF_UNIT_SYSTEMD" ] && [ "$weird_out" = "$CF_UNIT_SYSTEMD" ]
+}
+check 'cf svcfile falls back to systemd unit for empty/unknown init' cf_svcfile_default
+
 printf 'cloudflared alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

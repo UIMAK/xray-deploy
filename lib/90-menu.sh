@@ -704,8 +704,13 @@ _reset_journal_quarantine() {   # <journal> <原因>
 _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_config>
     local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0 f content=""
     if [ "$had_config" -eq 1 ]; then
+        if [ -z "${JQ_MERGE_OBJECTS:-}" ]; then
+            _error "缺少合并常量(lib/00-common.sh 可能是旧版本), 配置回滚已中止"
+            _tip "请在主菜单执行 [检测脚本更新] 完整更新一次后重试"
+            return 1
+        fi
         if ls -1 "$stage/confs"/*.json >/dev/null 2>&1; then
-            content=$(cat "$stage/confs"/*.json 2>/dev/null | jq -s 'reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))') || content=""
+            content=$(cat "$stage/confs"/*.json 2>/dev/null | jq -s "$JQ_MERGE_OBJECTS") || content=""
             if [ -z "$content" ] || ! _config_write_merged "$content"; then
                 _error "配置回滚失败, 请手动从快照副本恢复: $stage/confs"
                 ok=1

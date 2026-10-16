@@ -243,6 +243,37 @@ trap cleanup EXIT
     check 'direct stop refuses unknown executable ownership' direct_failure stop 0 no
     check 'direct stop confirms exit even when kill reports success' direct_failure stop 0 yes
     check 'verified direct restart rejects unchanged old running instance' direct_failure verified 1 yes
+    # Low1: journal 字段读取失败不能被进程替换吞掉。
+    journal_rc_probe() {
+        local saved rc1=0 rc2=0
+        saved=$(declare -f _xray_core_journal_fields)
+        _xray_core_journal_fields() { printf '%s\n' '' '' '' '' '' core full; return 1; }
+        local j="$TMP/rc-journal.json"
+        printf '%s\n' '{"phase":"prepared","service_masked":false}' > "$j"
+        _xray_core_snapshots_fsync "$j" || rc1=$?
+        _xray_core_cleanup_sources "$j" || rc2=$?
+        eval "$saved"
+        [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ]
+    }
+    check 'journal field read failure aborts snapshot and cleanup' journal_rc_probe
+
+    # B4: 字段顺序与默认值保持稳定。
+    journal_fields_probe() {
+        local j="$TMP/field-order.json" fields
+        printf '%s\n' '{"binary_backup":"/b","staging_dir":"/s","service_prev":"/sp","geoip_backup":"/gip","geosite_backup":"/gsp","operation":"geo","snapshot_scope":"geo"}' > "$j"
+        fields=$(_xray_core_journal_fields "$j") || return 1
+        local -a out
+        mapfile -t out <<< "$fields"
+        [ "${#out[@]}" -eq 7 ] || return 1
+        [ "${out[0]}" = /b ] && [ "${out[1]}" = /s ] && [ "${out[2]}" = /sp ] && [ "${out[3]}" = /gip ] && [ "${out[4]}" = /gsp ] && [ "${out[5]}" = geo ] && [ "${out[6]}" = geo ] || return 1
+        printf '%s\n' '{"binary_backup":"","staging_dir":"","service_prev":"","geoip_backup":"","geosite_backup":""}' > "$j"
+        fields=$(_xray_core_journal_fields "$j") || return 1
+        mapfile -t out <<< "$fields"
+        [ "${#out[@]}" -eq 7 ] || return 1
+        [ "${out[5]}" = core ] && [ "${out[6]}" = full ]
+    }
+    check 'journal fields keep order and defaults' journal_fields_probe
+
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
 )

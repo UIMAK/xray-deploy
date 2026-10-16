@@ -333,6 +333,89 @@ check 'self-signed cert rc=2 keeps a snapshot' bash -c 'compgen -G "$1/hy2cert.b
 check 'self-signed cert rc=2 snapshot holds the old cert' bash -c 'grep -qx "old-cert" "$1"/hy2cert.bak.*/cert.pem' _ "$TMP"
 check 'self-signed cert rc=2 wrote no node file' test ! -e "$NODES_DIR/hy2-cert-rc2.json"
 
+# B5/B6/B7/B14: hop 回滚聚合、锁内名称复核、Reality 端口输出、常量站点。
+hop_retarget_probe() {
+    local log="$TMP/hop-retarget.log" rc=0 body
+    _hy2_remove_hop_rules() { printf 'OLD_REMOVE %s\n' "$*" >> "$log"; [ "${SCEN_REMOVE_FAIL:-0}" = 1 ] && return 1; return 0; }
+    _hy2_add_hop_rules() { printf 'ADD %s\n' "$*" >> "$log"; if [ "$1" = 10001 ]; then [ "${SCEN_ADD_FAIL:-0}" = 1 ] && return 1; printf 'created-a created-b'; fi; return 0; }
+    _hy2_persist_iptables() { printf 'PERSIST\n' >> "$log"; [ "${SCEN_PERSIST_FAIL:-0}" = 1 ] && return 1; return 0; }
+    _hy2_remove_created_hop_rules() { printf 'CLEAN %s\n' "$*" >> "$log"; return 0; }
+    SCEN_REMOVE_FAIL=0 SCEN_ADD_FAIL=0 SCEN_PERSIST_FAIL=0
+    : > "$log"
+    _hy2_hop_retarget 10000 10001 20000:20100 || rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    body=$(cat "$log")
+    [[ "$body" == *"ADD 10001 20000:20100"* ]] || return 1
+    [[ "$body" == *"PERSIST"* ]] || return 1
+    rc=0; : > "$log"; : > "$TMP/errors"
+    SCEN_ADD_FAIL=1
+    _hy2_hop_retarget 10000 10001 20000:20100 || rc=$?
+    [ "$rc" -eq 1 ] || return 1
+    body=$(cat "$log")
+    [[ "$body" == *"CLEAN 10001"* ]] || return 1
+    [[ "$body" == *"ADD 10000 20000:20100"* ]] || return 1
+    [[ "$(cat "$TMP/errors")" == *"新端口跳跃规则添加失败"* ]] || return 1
+    SCEN_ADD_FAIL=0
+    rc=0; : > "$log"; : > "$TMP/errors"
+    SCEN_PERSIST_FAIL=1
+    _hy2_hop_retarget 10000 10001 20000:20100 || rc=$?
+    [ "$rc" -eq 1 ] || return 1
+    [[ "$(cat "$log")" == *"CLEAN 10001 created-a created-b"* ]] || return 1
+    [[ "$(cat "$TMP/errors")" == *"端口回滚不完整"* ]] || return 1
+    SCEN_PERSIST_FAIL=0
+    return 0
+}
+check 'hop retarget rollback: normal, add failure, persist failure' hop_retarget_probe
+
+name_guard_probe() {
+    local saved ok=0 rc=0
+    saved=$(declare -f _ensure_unique_name)
+    _ensure_unique_name() { [ "$1" = occupied ] && return 1; return 0; }
+    _node_meta_name_guard '{"name":"alpha"}' || ok=1
+    _node_meta_name_guard '{"name":"occupied"}' || rc=$?
+    [ "$rc" -eq 1 ] || ok=1
+    _node_meta_name_guard '{}' || ok=1
+    eval "$saved"
+    return "$ok"
+}
+check 'name guard: free name passes, occupied rejected, empty skipped' name_guard_probe
+
+reality_ports_probe() {
+    _input_port() { [ "${SCEN_PORT_FAIL:-0}" = 1 ] && return 1; printf '%s' "${SCEN_PORT:-10000}"; }
+    _gen_free_tunnel_port() { printf '%s' "${SCEN_TUNNEL:-4443}"; }
+    SCEN_PORT_FAIL=0 SCEN_PORT=10000 SCEN_TUNNEL=4443
+    _prompt_reality_ports direct example.com || return 1
+    [ "$REALITY_PORT" = 10000 ] || return 1
+    [ -z "$REALITY_TUNNEL_PORT" ] || return 1
+    _prompt_reality_ports tunnel example.com || return 1
+    [ "$REALITY_PORT" = 10000 ] || return 1
+    [ "$REALITY_TUNNEL_PORT" = 4443 ] || return 1
+    local rc=0
+    SCEN_PORT_FAIL=1
+    _prompt_reality_ports direct example.com || rc=$?
+    [ "$rc" -eq 1 ] || return 1
+    SCEN_PORT_FAIL=0
+    return 0
+}
+check 'reality ports helper: direct skips tunnel, tunnel allocates, cancel returns 1' reality_ports_probe
+
+consts_probe() {
+    [ "$XD_HY2_DEFAULT_SNI" = build.nvidia.com ] || return 1
+    local meta="$TMP/nodes/consts-probe.json" link hopdel ind
+    printf '%s' '{"auth":"pw","link_addr":"1.2.3.4","port":443,"congestion":"bbr","name":"n1"}' > "$meta"
+    link=$(_rebuild_hy2_link "$meta") || return 1
+    [[ "$link" == *"sni=build.nvidia.com"* ]] || return 1
+    printf '%s' '{"auth":"pw","link_addr":"1.2.3.4","port":443,"congestion":"bbr","name":"n1","sni":"custom.example"}' > "$meta"
+    link=$(_rebuild_hy2_link "$meta") || return 1
+    [[ "$link" == *"sni=custom.example"* ]] || return 1
+    hopdel=$(jq "$XD_HOP_JQ_DEL_FIELDS" <<< '{"port":123,"hop_ranges":["1:2"],"hop_start":1,"hop_end":2,"udp_hop_ports":[1],"other":"x"}') || return 1
+    [ "$(jq -c . <<< "$hopdel")" = '{"port":123,"other":"x"}' ] || return 1
+    ind=$(jq "$XD_NODE_JQ_DEL_INBOUND" --arg t b <<< '{"inbounds":[{"tag":"a"},{"tag":"b"},"scalar",{"no":"tag"}]}') || return 1
+    [ "$(jq -c . <<< "$ind")" = '{"inbounds":[{"tag":"a"},"scalar",{"no":"tag"}]}' ] || return 1
+    return 0
+}
+check 'literal constants: sni default, hop field removal, inbound tag removal' consts_probe
+
 printf 'node-alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
 )

@@ -94,16 +94,21 @@ _cf_token_valid() {
     printf '%s' "$decoded" | jq -e 'type == "object"' >/dev/null 2>&1
 }
 
+# service 文件路径按 init 系统选择; 未知 init 与 systemd 同路径。
+_cf_svcfile() {
+    case "$INIT_SYSTEM" in
+        systemd) printf '%s' "$CF_UNIT_SYSTEMD" ;;
+        openrc)  printf '%s' "$CF_UNIT_OPENRC" ;;
+        *)       printf '%s' "$CF_UNIT_SYSTEMD" ;;
+    esac
+}
+
 # 只解析生效启动行；注释和停止指令不是运行事实。
 _read_cf_state() {
     CF_CUR_TOKEN=""; CF_CUR_TOKEN_FILE=""; CF_CUR_AUTOUPDATE="off"; CF_CUR_HTTP2="off"; CF_CUR_EDGE_IP="off"; CF_CUR_CMDLINE=""
     CF_CUR_AUTOUPDATE_FLAG="no"
     local svcfile
-    case "$INIT_SYSTEM" in
-        systemd) svcfile="$CF_UNIT_SYSTEMD" ;;
-        openrc)  svcfile="$CF_UNIT_OPENRC" ;;
-        *)       svcfile="$CF_UNIT_SYSTEMD" ;;
-    esac
+    svcfile=$(_cf_svcfile)
     [ -f "$svcfile" ] || return 1
     local lines="" ln
     while IFS= read -r ln || [ -n "$ln" ]; do
@@ -1648,11 +1653,7 @@ _cf_diagnose() {
     echo
     echo -e "  ${CYAN}【cloudflared 诊断】${NC}"
     local svcfile
-    case "$INIT_SYSTEM" in
-        systemd) svcfile="$CF_UNIT_SYSTEMD" ;;
-        openrc)  svcfile="$CF_UNIT_OPENRC" ;;
-        *)       svcfile="$CF_UNIT_SYSTEMD" ;;
-    esac
+    svcfile=$(_cf_svcfile)
     echo -e "  service 文件: ${svcfile}"
     if [ -f "$svcfile" ]; then
         local svc_perms

@@ -131,6 +131,8 @@ readonly XRAY_DEFAULT_DNS_JSON='{
     "tag": "dns_inbound",
     "useSystemHosts": false
   }'
+# 合并 JSON 对象数组(唯一真相): 后者覆盖前者同名顶层键。
+readonly JQ_MERGE_OBJECTS='reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))'
 
 # ---------------------------------------------------------------------------
 # 默认 routing 规则集(唯一真相): _init_config_if_empty(20-xray-core) 与
@@ -669,7 +671,7 @@ _config_merged() {
         printf '{}'
         return 0
     fi
-    jq -s 'reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))' "${files[@]}"
+    jq -s "$JQ_MERGE_OBJECTS" "${files[@]}"
 }
 
 # 在合并视图上跑 jq: 参数与 jq 完全一致(jq 选项在前, filter 在最后), 输入改为合并后的配置。
@@ -1010,7 +1012,7 @@ _restore_config() {
         fi
         files+=("$f")
     done
-    content=$(jq -s 'reduce .[] as $o ({}; reduce ($o | to_entries[]) as $e (.; .[$e.key] = $e.value))' "${files[@]}") || {
+    content=$(jq -s "$JQ_MERGE_OBJECTS" "${files[@]}") || {
         _error "读取备份失败($BACKUP_DIR/confs.lastbak)"
         return 1
     }
