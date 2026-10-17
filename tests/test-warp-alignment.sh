@@ -325,7 +325,7 @@ JSON
     check 'add rule: duplicate value does not add a second rule' qe '
         [.routing.rules[]? | select((.outboundTag? // "") == "warp" and (.domain? == ["example.com"]))] | length == 1'
 
-    # 4) 插入位置: 私网防护规则(ruleTag)之后、首条普通规则之前; 连续新增的 WARP 规则相邻。
+    # 4) 追加位置: 新规则一律加到 routing.rules 末尾, 既有规则顺序与语义不变; 连续新增仍相邻。
     cfg_reset <<'JSON' || exit 1
 {
   "inbounds": [{"tag": "xd-vless-443", "protocol": "vless", "port": 443}],
@@ -338,11 +338,12 @@ JSON
 }
 JSON
     _warp_add_rule ip 'geoip:cn' >/dev/null 2>&1
-    check 'insert: warp rule lands right after the private block rule' eq 'block|xd-block-private' "$(_config_jq -r '.routing.rules[1] | [.outboundTag, .ruleTag] | join("|")')"
-    check 'insert: warp rule lands before the first ordinary rule' eq 'warp|example.org' "$(_config_jq -r '.routing.rules[2].outboundTag + "|" + (.routing.rules[3].domain[0] // "")')"
+    check 'append: existing rules keep their order' eq 'direct|block|block|warp' "$(_config_jq -r '.routing.rules | map(.outboundTag) | join("|")')"
+    check 'append: the warp rule lands at the end' eq 'warp' "$(_config_jq -r '.routing.rules[-1].outboundTag')"
+    check 'append: the private block rule keeps its position' eq 'xd-block-private' "$(_config_jq -r '.routing.rules[1].ruleTag')"
     _warp_add_rule domain 'example.net' >/dev/null 2>&1
-    check 'insert: consecutive warp rules stay adjacent' eq 'warp|warp|block' "$(_config_jq -r '[.routing.rules[2], .routing.rules[3], .routing.rules[4]] | map(.outboundTag) | join("|")')"
-    check 'insert: the second warp rule carries the new domain' eq 'example.net' "$(_config_jq -r '.routing.rules[3].domain[0]')"
+    check 'append: consecutive warp rules stay adjacent at the end' eq 'block|warp|warp' "$(_config_jq -r '[.routing.rules[2], .routing.rules[3], .routing.rules[4]] | map(.outboundTag) | join("|")')"
+    check 'append: the second warp rule carries the new domain' eq 'example.net' "$(_config_jq -r '.routing.rules[-1].domain[0]')"
 
     # 5) 列表序号与删除序号同口径: 只有 outboundTag=warp、没有 domain/ip 的裸规则不计入。
     cfg_reset <<'JSON' || exit 1
