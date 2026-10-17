@@ -29,6 +29,7 @@ contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 . "$ROOT/lib/10-system.sh"
 . "$ROOT/lib/20-xray-core.sh"
 . "$ROOT/lib/30-geo.sh"
+. "$ROOT/lib/35-warp.sh"
 . "$ROOT/lib/40-cloudflared.sh"
 . "$ROOT/lib/45-logrotate.sh"
 . "$ROOT/lib/50-nodes.sh"
@@ -1266,7 +1267,7 @@ _test_reset_restore_mixed_lib() {
 }
 check 'reset snapshot restore rejects mixed-lib without shared constant' _test_reset_restore_mixed_lib
 # 专属行为套件在独立进程内运行, 不泄漏服务/配置桩到本套件。
-for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
+for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then
         tail -n 1 "$TMP/$suite.log"
         pass "alignment suite $suite"
