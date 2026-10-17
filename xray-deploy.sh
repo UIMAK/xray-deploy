@@ -31,7 +31,7 @@ LIB_DIR="$SCRIPT_DIR/lib"
 [ -d "$LIB_DIR" ] || LIB_DIR="/opt/xray-deploy/lib"
 
 # LIB_MODULES 与安装器一致；source 前逐项检查可读，缺模块即拒绝不完整安装。
-LIB_MODULES="00-common 10-system 20-xray-core 30-geo 40-cloudflared 45-logrotate 50-nodes 51-reality-pq 55-hysteria 90-menu"
+LIB_MODULES="00-common 10-system 20-xray-core 30-geo 35-warp 40-cloudflared 45-logrotate 50-nodes 51-reality-pq 55-hysteria 90-menu"
 
 # 模块检查/source 前持安装读锁，避免混用不同发布代的文件。
 _BOOTSTRAP_LOCK_ROOT="/var/lock/xray-deploy"

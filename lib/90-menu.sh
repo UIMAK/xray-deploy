@@ -229,6 +229,7 @@ _main_menu() {
         echo -e "  ${CYAN}【协议管理】${NC}"
         _menu_row 7 "Xray Hy2 管理" 8 "Hysteria2 管理"
         _menu_row 9 "cloudflared 管理"
+        _menu_row 22 "WARP 管理"
         echo
         echo -e "  ${CYAN}【服务控制】${NC}"
         _menu_row 10 "重启 Xray"    11 "停止 Xray"
@@ -245,7 +246,7 @@ _main_menu() {
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
         read -rp "  请选择: " choice || exit 0
-        # 编号固定 1–21 与 0；新增末组追加，分组不改变调度。
+        # 编号固定 1–22 与 0；新增末组追加，分组不改变调度。
         case "$choice" in
             1) _add_node; continue ;;
             2) _view_nodes; continue ;;
@@ -270,6 +271,7 @@ _main_menu() {
             19) _check_script_update ;;
             20) _xray_core_menu ;;
             21) _uninstall_menu ;;
+            22) _warp_menu; continue ;;
             0) echo -e "${CYAN}再见${NC}"; exit 0 ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
