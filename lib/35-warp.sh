@@ -389,13 +389,11 @@ _warp_delete() {
     return 0
 }
 
-# 插入点: 首条无 inboundTag 的规则之前(tunnel/Reality 的 inboundTag 规则始终在最前),
-# 私网防护规则之后; 锚点起连续的 WARP 规则之后接续, 以保持相邻。
-# 首个匹配生效: WARP 规则被手工排到普通规则之后时必须插回锚点, 否则新规则永远命中不到。
+# 新规则追加到 routing.rules 末尾, 不改动既有规则的顺序与语义。
+# 首个匹配生效: 已被更靠前规则命中的目标不会走到 WARP, 添加后会提示这一点。
 _warp_add_rule() {   # <domain|ip> <逗号分隔值>
     local kind="${1:-}" csv="${2:-}" v vals_json new
     local -a vals=()
-    local ptag="${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}"
     case "$kind" in domain|ip) ;; *) return 1 ;; esac
     [ -n "$csv" ] || return 1
     local IFS=','
@@ -419,18 +417,12 @@ _warp_add_rule() {   # <domain|ip> <逗号分隔值>
         _info "这些值已存在于 WARP 分流规则中, 未重复写入"
         return 0
     fi
-    _mutate_config --arg k "$kind" --argjson v "$new" --arg ptag "$ptag" "$_WARP_RULE_JQ"'
+    _mutate_config --arg k "$kind" --argjson v "$new" "$_WARP_RULE_JQ"'
         . as $root
         | ($root.routing.rules // []) as $rules
         | ($rules | newvals($k; $v)) as $new
         | if ($new | length) == 0 then $root
-          else
-            ([$rules | to_entries[] | select(.value.inboundTag? == null) | .key] | first // ($rules | length)) as $base
-            | ([range(0; ($rules | length)) | select((($rules[.] | .ruleTag?) // null) == $ptag)] | first) as $pb
-            | (if $pb == null then $base else ([$base, ($pb + 1)] | max) end) as $anchor
-            | ([range($anchor; ($rules | length)) | select((($rules[.] | .outboundTag?) // "") != "warp")] | first // ($rules | length)) as $ins
-            | $root
-            | .routing.rules = ($rules[0:$ins] + [{($k): $new, outboundTag: "warp"}] + $rules[$ins:])
+          else $root | .routing.rules = ($rules + [{($k): $new, outboundTag: "warp"}])
           end' || return 1
     return 0
 }
@@ -491,7 +483,7 @@ _warp_register() {
         return 1
     fi
     _success "WARP 出站已写入(tag=warp), xray 已用新配置重启"
-    _tip "注册/重新注册不会自动添加分流规则; 需要分流请在 [3] 添加"
+    _tip "注册/重新注册不会自动添加分流规则; 需要分流请在 [4] 添加"
     return 0
 }
 
@@ -517,7 +509,12 @@ _warp_add_rule_prompt() {
         break
     done
     if _warp_add_rule "$kind" "$csv"; then
-        _success "已写入 ${kind} 分流规则, xray 已用新配置重启"
+        _success "已写入 ${kind} 分流规则(追加到路由末尾), xray 已用新配置重启"
+        _tip "首个匹配生效: 若该目标已被更靠前的规则命中, 本条不会触发"
+        # Geo 精简会删掉所有引用 geo 数据的规则, 包括刚写入的这条。
+        case "$csv" in
+            *geoip:*|*geosite:*|*ext:*) _tip "该规则引用 geo 数据; 执行 Geo 自动更新里的 [精简规则] 时会被一并删除" ;;
+        esac
         return 0
     fi
     _error "分流规则写入失败(配置已回滚或值非法)"
