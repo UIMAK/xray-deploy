@@ -145,7 +145,20 @@ JSON
   "peers": [{"publicKey": "cHVibGljLWFwaQ==", "endpoint": "162.159.192.6:2408"}]}}
 JSON
 
-    # 坏 fixture: 注册形态与出站形态各一套, 覆盖 非法 JSON / 缺字段 / reserved 长度 / reserved 越界。
+    # reserved 按官方文档是可选项(长度 3, 默认全 0): 省略时必须补 [0,0,0] 而不是判失败。
+    cat > "$FX/reg-no-reserved.json" <<'JSON'
+{"private_key": "a2V5LXJlZw==", "public_key": "cHViLXJlZw==",
+ "endpoint": {"v4": "162.159.192.7:0"}, "v4": "172.16.0.7"}
+JSON
+    cat > "$FX/api-no-reserved.json" <<'JSON'
+{"outbounds": [{"tag": "warp", "protocol": "wireguard", "settings": {
+  "secretKey": "c2VjcmV0LW5vcnN2", "address": ["172.16.0.8/32"],
+  "peers": [{"publicKey": "cHVibGljLW5vcnN2", "endpoint": "162.159.192.8:2408"}]}}]}
+JSON
+    # 坏 fixture: 注册形态与出站形态各一套, 覆盖 非法 JSON / 缺字段 / reserved 长度 / 越界 / 类型非法。
+    # reserved 省略才补默认值; 出现但不是数组属于格式异常, 必须报错而不是静默当成缺省。
+    printf '{"private_key": "k", "v4": "172.16.0.2", "public_key": "p", "endpoint": "162.159.192.1:2408", "reserved_dec": "abc"}\n' > "$FX/reg-bad-reservedtype.json"
+    printf '{"outbounds": [{"settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "reserved": "abc", "peers": [{"publicKey": "p", "endpoint": "162.159.192.1:2408", "allowedIPs": ["0.0.0.0/0"]}], "mtu": 1280}}]}\n' > "$FX/out-bad-reservedtype.json"
     printf '{"private_key": ' > "$FX/reg-bad-json.json"
     printf '{"private_key": "k"}\n' > "$FX/reg-bad-missing.json"
     printf '{"private_key": "k", "v4": "172.16.0.2", "public_key": "p", "endpoint": "162.159.192.1:2408", "reserved_dec": [1, 2]}\n' > "$FX/reg-bad-reserved2.json"
@@ -193,12 +206,16 @@ JSON
     check 'normalize api: outbound fixture yields 7 masked fields' norm_ok _warp_normalize_api "$FX/api.json" "$TMP/n-api.json"
     check 'normalize api: missing allowedIPs defaults to 0.0.0.0/0 and ::/0' eq '["0.0.0.0/0","::/0"]' "$(jq -c .allowedIPs "$TMP/n-api.json")"
     check 'normalize api: missing mtu defaults to 1280' eq '1280' "$(jq -r .mtu "$TMP/n-api.json")"
+    check 'normalize api: outbound without reserved still normalizes' norm_ok _warp_normalize_api "$FX/api-no-reserved.json" "$TMP/n-api-norsv.json"
+    check 'normalize reg: registration without reserved_dec still normalizes' norm_ok _warp_normalize_reg "$FX/reg-no-reserved.json" "$TMP/n-reg-norsv.json"
+    check 'normalize api: missing reserved defaults to three zero bytes' eq '[0,0,0]' "$(jq -c .reserved "$TMP/n-api-norsv.json")"
+    check 'normalize reg: missing reserved_dec defaults to three zero bytes' eq '[0,0,0]' "$(jq -c .reserved "$TMP/n-reg-norsv.json")"
 
-    for bad in reg-bad-json reg-bad-missing reg-bad-reserved2 reg-bad-reserved300; do
+    for bad in reg-bad-json reg-bad-missing reg-bad-reserved2 reg-bad-reserved300 reg-bad-reservedtype; do
         check "normalize reg rejects $bad with rc=1 and empty stdout" norm_bad _warp_normalize_reg "$FX/$bad.json"
         check "normalize wgcf rejects $bad with rc=1 and empty stdout" norm_bad _warp_normalize_wgcf "$FX/$bad.json"
     done
-    for bad in out-bad-json out-bad-missing out-bad-reserved2 out-bad-reserved300; do
+    for bad in out-bad-json out-bad-missing out-bad-reserved2 out-bad-reserved300 out-bad-reservedtype; do
         check "normalize api rejects $bad with rc=1 and empty stdout" norm_bad _warp_normalize_api "$FX/$bad.json"
         check "normalize wgcf rejects $bad with rc=1 and empty stdout" norm_bad _warp_normalize_wgcf "$FX/$bad.json"
     done
@@ -361,6 +378,19 @@ JSON
         and (.outbounds[2].settings.noKernelTun == true) and ((.outbounds[2].settings.peers | length) == 1)'
     check 'apply: re-apply replaces the outbound in place' _warp_apply "$(norm_b)"
     check 'apply: re-apply does not append a duplicate' eq 'direct|block|warp' "$(_config_jq -r '.outbounds | map(.tag) | join("|")')"
+    # 内核 TUN 模式: 缺省强制关闭(gVisor), 可切到自动检测; 重新注册必须沿用已选模式。
+    build_default_nk() { printf '%s' "$1" | _warp_build_outbound | jq -e '.settings.noKernelTun == true' >/dev/null 2>&1; }
+    build_false_nk() { printf '%s' "$1" | _warp_build_outbound false | jq -e '.settings.noKernelTun == false' >/dev/null 2>&1; }
+    check 'tun: build defaults to noKernelTun=true' build_default_nk "$(norm_a)"
+    check 'tun: build accepts noKernelTun=false' build_false_nk "$(norm_a)"
+    check 'tun: default mode reports on' eq on "$(_warp_tun_mode)"
+    check 'tun: switching to auto returns 0' _warp_set_tun auto
+    check 'tun: auto writes noKernelTun=false' qe '.outbounds[] | select(.tag == "warp") | .settings.noKernelTun == false'
+    check 'tun: mode reports auto after the switch' eq auto "$(_warp_tun_mode)"
+    check 'tun: re-register keeps the chosen mode' _warp_apply "$(norm_b)"
+    check 'tun: re-register did not reset auto back to true' qe '.outbounds[] | select(.tag == "warp") | .settings.noKernelTun == false'
+    check 'tun: switching back to on returns 0' _warp_set_tun on
+    check 'tun: on writes noKernelTun=true' qe '.outbounds[] | select(.tag == "warp") | .settings.noKernelTun == true'
     check 'apply: re-apply writes the new secret at the same position' eq 'c2VjcmV0LWI=' "$(_config_jq -r '.outbounds[2].settings.secretKey')"
 
     check 'set endpoint: returns 0' _warp_set_endpoint '162.159.192.9:2408'

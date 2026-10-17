@@ -6,11 +6,12 @@
 
 WARP_TAG="warp"
 WARP_DEFAULT_PORT="2408"
-WARP_DEFAULT_MTU="1280"
 WARP_REG_SCRIPT_URL="https://warp-reg.vercel.app"
 WARP_API_URL="https://warp.cloudflare.now.cc/?run=register&format=xray"
 
-# 归一/生成共用的 jq 定义: 内部表示字段名与类型固定, 缺字段或非法 reserved 一律 error 退出
+# 归一/生成共用的 jq 定义: 内部表示字段名与类型固定, 缺必填字段或非法 reserved 一律 error 退出。
+# reserved 按官方文档是可选项(默认全 0), 省略时补 [0,0,0]; mtu 缺省取 1280 是 Cloudflare WARP 的
+# 推荐值(也是 wgcf 的输出值), Xray WireGuard 出站的通用默认是 1420。
 # (error 让 jq 非零退出且不产生输出, 满足"失败时 stdout 为空")。
 _WARP_NORM_JQ='
 def fld($k): if (type == "object") then (.[$k] // null) else null end;
@@ -48,7 +49,8 @@ def reg2norm:
       address: ([ ($r | fld("v4")), ($r | fld("v6")),
                   ($r | fld("addresses") | fld("v4")), ($r | fld("addresses") | fld("v6")) ]
                 | map(select((type == "string") and (. != ""))) | unique | map(addrmask)),
-      reserved: (($r | fld("reserved_dec")) | if type == "array" then . else [] end),
+      reserved: (($r | fld("reserved_dec")) | if type == "null" then [0, 0, 0]
+                  elif type == "array" then . else error("reserved_dec 必须是数组") end),
       endpoint: (($r | fld("endpoint"))
                  | if type == "object" then (fld("v4") // fld("v6") // "")
                    elif type == "string" then .
@@ -65,7 +67,8 @@ def out2norm:
   | {
       secretKey: ($s.secretKey | if type == "string" then . else "" end),
       address: (arr($s.address) | map(select((type == "string") and (. != ""))) | map(addrmask)),
-      reserved: ($s.reserved | if type == "array" then . else [] end),
+      reserved: ($s.reserved | if type == "null" then [0, 0, 0]
+                  elif type == "array" then . else error("reserved 必须是数组") end),
       endpoint: ($p.endpoint | if type == "string" then . else "" end),
       publicKey: ($p.publicKey | if type == "string" then . else "" end),
       allowedIPs: (arr($p.allowedIPs) | if length > 0 then . else ["0.0.0.0/0", "::/0"] end),
@@ -218,14 +221,15 @@ _warp_normalize_api() {
 
 # ---------------------------------------------------------------------------
 # 生成: 从 stdin 读内部表示, 向 stdout 输出单个 Xray outbound。
-# noKernelTun=true 固定: LXC/容器里自动探测 TUN 不可靠。
+# noKernelTun 由调用方决定, 缺省 true: LXC/容器里自动探测 TUN 不可靠, 稳定优先。
 # ---------------------------------------------------------------------------
-_warp_build_outbound() {
-    local norm
+_warp_build_outbound() {   # [true|false, 缺省 true]
+    local nk="${1:-true}" norm
+    case "$nk" in true|false) ;; *) return 1 ;; esac
     norm=$(cat) || return 1
     [ -n "$norm" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
-    printf '%s' "$norm" | jq -c "$_WARP_NORM_JQ"'
+    printf '%s' "$norm" | jq -c --argjson nk "$nk" "$_WARP_NORM_JQ"'
         wgcheck
         | { protocol: "wireguard",
             tag: "warp",
@@ -235,7 +239,7 @@ _warp_build_outbound() {
               reserved: .reserved,
               peers: [{ publicKey: .publicKey, endpoint: .endpoint, allowedIPs: .allowedIPs }],
               mtu: .mtu,
-              noKernelTun: true
+              noKernelTun: $nk
             } }' 2>/dev/null
 }
 
@@ -325,10 +329,15 @@ _warp_state_summary() {
 }
 
 # 替换或追加 tag=warp 出站; 已有同 tag 出站原位替换, 其它出站原样保留。
+# 重新注册沿用现有出站的 noKernelTun 选择, 不让重新注册悄悄重置 TUN 模式。
+# 全新注册用推荐值 true; 已有出站只在明确 true 时保持, 其余(含缺字段)按 Xray 默认的 false 处理。
 _warp_apply() {
-    local norm="${1:-}" ob
+    local norm="${1:-}" ob nk=true existing
     [ -n "$norm" ] || return 1
-    ob=$(printf '%s' "$norm" | _warp_build_outbound) || return 1
+    if existing=$(_warp_outbound_json 2>/dev/null); then
+        [ "$(printf '%s' "$existing" | jq -r '.settings.noKernelTun // false' 2>/dev/null)" = "true" ] || nk=false
+    fi
+    ob=$(printf '%s' "$norm" | _warp_build_outbound "$nk") || return 1
     [ -n "$ob" ] || return 1
     _config_edit_preflight "管理 WARP" || return 1
     _mutate_config --argjson ob "$ob" '
@@ -570,6 +579,67 @@ _warp_delete_prompt() {
     return 1
 }
 
+# 内核 TUN 模式: on=强制关闭(noKernelTun=true, 始终 gVisor), auto=让 Xray 自动检测。
+# 官方文档: TUN 性能更高, 只有 LXC/Docker 里 TUN 起不来时才需要强制关闭。
+_warp_tun_mode() {
+    local ob
+    ob=$(_warp_outbound_json) || return 1
+    if printf '%s' "$ob" | jq -e '.settings.noKernelTun == true' >/dev/null 2>&1; then
+        printf 'on'
+    else
+        printf 'auto'
+    fi
+}
+
+_warp_set_tun() {   # <on|auto>
+    local mode="${1:-}" nk
+    case "$mode" in on|auto) ;; *) return 1 ;; esac
+    _config_edit_preflight "管理 WARP" || return 1
+    _warp_outbound_json >/dev/null || { _error "WARP 出站不存在, 无法修改 TUN 模式"; return 1; }
+    nk=false
+    [ "$mode" = on ] && nk=true
+    _mutate_config --argjson nk "$nk" '
+        .outbounds = ([.outbounds[]?
+            | if (.tag? // "") == "warp"
+              then .settings = ((.settings // {}) + {noKernelTun: $nk})
+              else . end])
+    ' || return 1
+    return 0
+}
+
+_warp_set_tun_prompt() {
+    local cur choice
+    cur=$(_warp_tun_mode) || { _error "WARP 出站不存在"; return 1; }
+    if [ "$cur" = on ]; then
+        echo -e "  当前: ${CYAN}强制关闭内核 TUN${NC} (noKernelTun=true, 始终使用 gVisor 用户态网络栈)"
+    else
+        echo -e "  当前: ${CYAN}自动检测${NC} (noKernelTun=false, 有 CAP_NET_ADMIN 时走内核 TUN)"
+    fi
+    echo
+    echo -e "  ${GREEN}[1]${NC} 强制关闭内核 TUN (LXC/容器推荐, 稳定优先)"
+    echo -e "  ${GREEN}[2]${NC} 自动检测 (KVM + CAP_NET_ADMIN 时吞吐更好, TUN 起不来则出站不可用)"
+    read -rp "  请选择(回车取消): " choice || return 1
+    case "$choice" in
+        1)
+            if _warp_set_tun on; then
+                _success "已切换为强制关闭内核 TUN, xray 已用新配置重启"
+                return 0
+            fi
+            _error "切换失败(配置已回滚)"
+            return 1
+            ;;
+        2)
+            if _warp_set_tun auto; then
+                _success "已切换为自动检测, xray 已用新配置重启"
+                return 0
+            fi
+            _error "切换失败(配置已回滚)"
+            return 1
+            ;;
+        *) _info "已取消"; return 0 ;;
+    esac
+}
+
 _warp_menu() {
     local choice st present endpoint addresses mtu rules
     while true; do
@@ -590,6 +660,10 @@ _warp_menu() {
                 echo -e "  地址:      ${CYAN}${addresses:-未知}${NC}"
                 echo -e "  MTU:       ${CYAN}${mtu:-未知}${NC}"
                 echo -e "  分流规则:  ${CYAN}${rules:-0}${NC} 条"
+                case "$(_warp_tun_mode 2>/dev/null)" in
+                    on) echo -e "  内核 TUN:  ${CYAN}强制关闭${NC} (始终使用 gVisor)" ;;
+                    auto) echo -e "  内核 TUN:  ${CYAN}自动检测${NC} (有权限时走内核 TUN)" ;;
+                esac
             else
                 echo -e "  出站:      ${YELLOW}未配置${NC}"
             fi
@@ -599,10 +673,11 @@ _warp_menu() {
         echo
         echo -e "  ${GREEN}[1]${NC} 注册 / 重新注册 WARP"
         echo -e "  ${GREEN}[2]${NC} 修改 endpoint"
-        echo -e "  ${GREEN}[3]${NC} 添加分流规则 (domain / ip)"
-        echo -e "  ${GREEN}[4]${NC} 查看分流规则"
-        echo -e "  ${GREEN}[5]${NC} 删除分流规则"
-        echo -e "  ${GREEN}[6]${NC} 删除 WARP 出站与全部分流规则"
+        echo -e "  ${GREEN}[3]${NC} 内核 TUN 模式 (强制关闭 / 自动检测)"
+        echo -e "  ${GREEN}[4]${NC} 添加分流规则 (domain / ip)"
+        echo -e "  ${GREEN}[5]${NC} 查看分流规则"
+        echo -e "  ${GREEN}[6]${NC} 删除分流规则"
+        echo -e "  ${GREEN}[7]${NC} 删除 WARP 出站与全部分流规则"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
@@ -610,10 +685,11 @@ _warp_menu() {
             0) return ;;
             1) _warp_register; _press_any_key ;;
             2) _warp_set_endpoint_prompt; _press_any_key ;;
-            3) _warp_add_rule_prompt; _press_any_key ;;
-            4) _warp_rules_list || _error "无法读取分流规则"; _press_any_key ;;
-            5) _warp_delete_rule_prompt; _press_any_key ;;
-            6) _warp_delete_prompt; _press_any_key ;;
+            3) _warp_set_tun_prompt; _press_any_key ;;
+            4) _warp_add_rule_prompt; _press_any_key ;;
+            5) _warp_rules_list || _error "无法读取分流规则"; _press_any_key ;;
+            6) _warp_delete_rule_prompt; _press_any_key ;;
+            7) _warp_delete_prompt; _press_any_key ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
     done
