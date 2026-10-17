@@ -25,7 +25,8 @@ _menu_name_pad() {
 }
 
 # _menu_row 按纯文本显示宽度补齐，不计颜色；避免 printf 字节宽度造成错列。
-MENU_COL_WIDTH=22
+# 取值必须大于最长左段("  [N] 名称")的显示宽度, 否则该行右列会被 pad 下限挤偏一列。
+MENU_COL_WIDTH=23
 _menu_row() {
     local lnum="$1" lname="$2" rnum="${3:-}" rname="${4:-}"
     local pad ltxt="" rtxt=""
@@ -228,25 +229,24 @@ _main_menu() {
         echo
         echo -e "  ${CYAN}【协议管理】${NC}"
         _menu_row 7 "Xray Hy2 管理" 8 "Hysteria2 管理"
-        _menu_row 9 "cloudflared 管理"
-        _menu_row 22 "WARP 管理"
+        _menu_row 9 "cloudflared 管理" 10 "WARP 管理"
         echo
         echo -e "  ${CYAN}【服务控制】${NC}"
-        _menu_row 10 "重启 Xray"    11 "停止 Xray"
-        _menu_row 12 "查看状态"     13 "查看日志"
-        _menu_row 14 "日志轮换"     15 "定时重启"
+        _menu_row 11 "重启 Xray"    12 "停止 Xray"
+        _menu_row 13 "查看状态"     14 "查看日志"
+        _menu_row 15 "日志轮换"     16 "定时重启"
         echo
         echo -e "  ${CYAN}【配置与更新】${NC}"
-        _menu_row 16 "检查配置"     17 "DNS 设置"
-        _menu_row 18 "Geo 自动更新" 19 "检测脚本更新"
+        _menu_row 17 "检查配置"     18 "DNS 设置"
+        _menu_row 19 "Geo 自动更新" 20 "检测脚本更新"
         echo
         echo -e "  ${CYAN}【核心管理】${NC}"
-        _menu_row 20 "Xray 核心管理" 21 "卸载"
+        _menu_row 21 "Xray 核心管理" 22 "卸载"
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
         read -rp "  请选择: " choice || exit 0
-        # 编号固定 1–22 与 0；新增末组追加，分组不改变调度。
+        # 编号 1–22 连续，按分组顺序递增；新增项放进所属分组并顺延其后的编号，分组不影响调度。
         case "$choice" in
             1) _add_node; continue ;;
             2) _view_nodes; continue ;;
@@ -257,21 +257,21 @@ _main_menu() {
             7) _hy2_manage_menu; continue ;;
             8) _hysteria_menu; continue ;;
             9) _cloudflared_menu; continue ;;
-            10) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
+            10) _warp_menu; continue ;;
+            11) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
                 _press_any_key ;;
-            11) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
+            12) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
                 _press_any_key ;;
-            12) _view_status ;;
-            13) _view_log ;;
-            14) _logrotate_menu ;;
-            15) _timed_restart_menu ;;
-            16) _check_config ;;
-            17) _dns_menu ;;
-            18) _geo_menu ;;
-            19) _check_script_update ;;
-            20) _xray_core_menu ;;
-            21) _uninstall_menu ;;
-            22) _warp_menu; continue ;;
+            13) _view_status ;;
+            14) _view_log ;;
+            15) _logrotate_menu ;;
+            16) _timed_restart_menu ;;
+            17) _check_config ;;
+            18) _dns_menu ;;
+            19) _geo_menu ;;
+            20) _check_script_update ;;
+            21) _xray_core_menu ;;
+            22) _uninstall_menu ;;
             0) echo -e "${CYAN}再见${NC}"; exit 0 ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac

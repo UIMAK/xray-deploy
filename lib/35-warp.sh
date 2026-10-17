@@ -227,8 +227,8 @@ _warp_build_outbound() {
     command -v jq >/dev/null 2>&1 || return 1
     printf '%s' "$norm" | jq -c "$_WARP_NORM_JQ"'
         wgcheck
-        | { tag: "warp",
-            protocol: "wireguard",
+        | { protocol: "wireguard",
+            tag: "warp",
             settings: {
               secretKey: .secretKey,
               address: .address,

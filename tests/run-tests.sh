@@ -264,10 +264,10 @@ check_eq 'mixed-width odd count' 3 "$(_menu_display_width 'a··')"
 check_eq 'wide dash width' 2 "$(_menu_display_width '—')"
 # 用 $'\033' 而不是 GNU sed 的 \x1b: busybox sed 不解释 \x1b, 转义会留在串里让下一条假失败。
 _menu_row_plain=$(_menu_row 1 "添加节点" 2 "查看节点" | sed $'s/\033\[[0-9;]*m//g')
-# 只量左段宽度的话, 右格整块丢失时 ${…%%\[2\]*} 会匹配不到而退化成量整行, 宽度仍是 22 ⇒
+# 只量左段宽度的话, 右格整块丢失时 ${…%%\[2\]*} 会匹配不到而退化成量整行, 宽度仍是列宽 ⇒
 # 断言假通过。右格存在性必须显式断言。
 if contains '[2] 查看节点' "$_menu_row_plain"; then pass 'two-column row keeps the right cell'; else fail 'two-column row keeps the right cell'; fi
-check_eq 'two-column row aligns the right cell' 22 "$(_menu_display_width "${_menu_row_plain%%\[2\]*}")"
+check_eq 'two-column row aligns the right cell' 23 "$(_menu_display_width "${_menu_row_plain%%\[2\]*}")"
 
 printf '== atomic JSON and locks ==\n'
 check 'atomic JSON write' _atomic_write_json "$DEPLOY_DIR/atomic.json" '{"ok":true}'
