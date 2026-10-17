@@ -497,7 +497,8 @@ fi
             _auto_ensure_config_env() { return 0; }
             _auto_migrate_geo_autoupdate() { return 0; }
             _manage_xray() { printf '%s\n' "$*" >> "$TMP/service-calls"; return "$STOP_RC"; }
-            _main_menu <<< $'11\n0'
+            # 12 = 主菜单的 [停止 Xray]; 编号变更时同步 lib/90-menu.sh 的 case 分支。
+            _main_menu <<< $'12\n0'
         ) > "$TMP/output" 2>&1 || RC=$?
     }
     for stop_rc in 1 2 99; do
@@ -515,6 +516,14 @@ fi
     check 'stop success: emits no failure' test ! -s "$TMP/messages"
     check 'stop success: still pauses before next selection' eq "$(cat "$TMP/press-calls")" press
 
+    printf '== Main menu numbering ==\n'
+    # 显示的编号与 case 分支必须一一对应: 漏改一侧会让该菜单项静默落到无效选择。
+    # 退出项 [0] 由 echo 打印、不在 _menu_row 里, 所以只从 case 侧剔除 0。
+    menu_body() { awk '/^_main_menu\(\) \{/{p=1} p{print} p&&/^}/{exit}' "${MENU_ALIGNMENT_MENU_MODULE:-$ROOT/lib/90-menu.sh}"; }
+    menu_display_nums() { menu_body | grep '^ *_menu_row' | sed 's/"[^"]*"//g' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' '; }
+    menu_case_nums() { menu_body | awk '/case "\$choice" in/{c=1} c&&/^ *[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1} c&&/^ *esac/{c=0}' | grep -vx 0 | sort -n | uniq | tr '\n' ' '; }
+    check 'main menu: displayed numbers are 1..22 without gaps' eq '1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 ' "$(menu_display_nums)"
+    check 'main menu: case branches match the displayed numbers' eq "$(menu_display_nums)" "$(menu_case_nums)"
     printf '== reset residual snapshot ==\n'
     # 上一次 reset 已提交(runtime_verified)但清理失败: journal 与快照都残留。
     # 收敛路径本次返回 0 但没清掉残留快照时, 新 reset 不得被永久阻断, 应清理后继续。
