@@ -378,6 +378,39 @@ JSON
         and (.routing.rules[1].ip == ["geoip:cn"])
         and (.routing.rules[2].domain == ["example.org"])'
 
+    # 6) 显示渲染: 标题带条数、每条带 "N 项"、值按终端宽度折行、空列表给提示。
+    #    渲染只是展示层: _warp_rules_list 的 TSV 契约保持不变, 上面的列表/删除用例仍按 TSV 断言。
+    _wshow_strip() { sed $'s/\x1b\\[[0-9;]*m//g'; }
+    _wshow_fits() {
+        local lim="$1" line
+        while IFS= read -r line; do
+            [ "${#line}" -le "$lim" ] || return 1
+        done <<< "$2"
+        return 0
+    }
+    _wshow_no_tab() { ! grep -q $'\t' <<< "$1"; }
+    cfg_reset <<'JSON' || exit 1
+{
+  "routing": {"rules": [
+    {"domain": ["aaaa.example.com", "bbbb.example.com", "cccc.example.com", "dddd.example.com", "eeee.example.com", "ffff.example.com", "gggg.example.com"], "outboundTag": "warp"},
+    {"ip": ["geoip:cn"], "outboundTag": "warp"}
+  ]}
+}
+JSON
+    shown="$(COLUMNS=60 _warp_rules_show 2>/dev/null | _wshow_strip)"
+    check 'show: header carries the rule count' grep -qF 'WARP 分流规则 2 条' <<< "$shown"
+    check 'show: each rule shows how many values it holds' grep -qF '7 项' <<< "$shown"
+    check 'show: no raw TSV tab in the rendered output' _wshow_no_tab "$shown"
+    check 'show: values are joined with ", " and wrapped' grep -qF 'aaaa.example.com, bbbb.example.com,' <<< "$shown"
+    check 'show: every rendered line fits the terminal width' _wshow_fits 60 "$shown"
+    check 'show: the last value of a wrapped list has no trailing comma' eq 'gggg.example.com' "$(printf '%s\n' "$shown" | grep -F 'gggg.example.com' | sed 's/^ *//')"
+    cfg_reset <<'JSON' || exit 1
+{"routing": {"rules": []}}
+JSON
+    : > "$TMP/messages"
+    _warp_rules_show >/dev/null 2>&1
+    check 'show: an empty rule list prints a hint' grep -qF '暂无 WARP 分流规则' "$TMP/messages"
+
     # -----------------------------------------------------------------------
     # D. 出站生命周期
     # -----------------------------------------------------------------------
@@ -505,7 +538,7 @@ JSON
     }
     no_secret_in_output_path() {
         local fn
-        for fn in _warp_state_summary _warp_rules_list _warp_menu _warp_delete_prompt _warp_set_endpoint_prompt; do
+        for fn in _warp_state_summary _warp_rules_list _warp_rules_show _warp_menu _warp_delete_prompt _warp_set_endpoint_prompt; do
             src_func "$fn" | grep -q 'secretKey' && return 1
         done
         return 0
