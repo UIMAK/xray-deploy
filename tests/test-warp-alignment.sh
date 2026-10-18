@@ -389,6 +389,9 @@ JSON
         return 0
     }
     _wshow_no_tab() { ! grep -q $'\t' <<< "$1"; }
+    # 颜色必须渲染成真实 ESC 字节; 字面量 "\033" 说明误把它当 %s 参数传给了 printf。
+    _wshow_lit_esc() { ! grep -qF '\033' <<< "$1"; }
+    _wshow_has_esc() { grep -q $'\x1b' <<< "$1"; }
     cfg_reset <<'JSON' || exit 1
 {
   "routing": {"rules": [
@@ -397,7 +400,10 @@ JSON
   ]}
 }
 JSON
-    shown="$(COLUMNS=60 _warp_rules_show 2>/dev/null | _wshow_strip)"
+    raw="$(COLUMNS=60 _warp_rules_show 2>/dev/null)"
+    check 'show: color is emitted as real escape bytes, not literal \033 text' _wshow_lit_esc "$raw"
+    check 'show: the rendered output is still colored' _wshow_has_esc "$raw"
+    shown="$(printf '%s' "$raw" | _wshow_strip)"
     check 'show: header carries the rule count' grep -qF 'WARP 分流规则 2 条' <<< "$shown"
     check 'show: each rule shows how many values it holds' grep -qF '7 项' <<< "$shown"
     check 'show: no raw TSV tab in the rendered output' _wshow_no_tab "$shown"

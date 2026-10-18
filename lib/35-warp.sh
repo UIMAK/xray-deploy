@@ -499,7 +499,8 @@ _warp_rules_show() {
     width=$((cols - indent))
     [ "$width" -ge 24 ] || width=24
 
-    printf '  %sWARP 分流规则 %s 条%s (序号用于删除)\n\n' "$CYAN" "$total" "$NC"
+    # %b 解释颜色变量的字面转义(\033); %s 会把它们原样打出来。
+    printf '  %bWARP 分流规则 %s 条%b (序号用于删除)\n\n' "$CYAN" "$total" "$NC"
     while IFS=$'\t' read -r num kind joined; do
         vals=()
         chunks=()
@@ -507,7 +508,7 @@ _warp_rules_show() {
             IFS=',' read -r -a vals <<< "$joined"
         fi
         count=${#vals[@]}
-        printf '  %*s) %s%-*s%s %*s 项\n' "$numw" "$num" "$CYAN" "$kindw" "$kind" "$NC" "$cntw" "$count"
+        printf '  %*s) %b%-*s%b %*s 项\n' "$numw" "$num" "$CYAN" "$kindw" "$kind" "$NC" "$cntw" "$count"
         # 无值的手工规则: 只留表头行; 空数组在旧 bash 的 set -u 下展开会报错。
         [ "$count" -eq 0 ] && continue
         # 贪心填充; 单个值超过可用宽度时独占一行并溢出, 不再拆分(拆开的值无法还原)。
