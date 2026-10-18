@@ -423,7 +423,6 @@ _timed_restart_menu() {
             ;;
         *) _warn "无效选择"; _press_any_key; return ;;
     esac
-    [ -z "$cron_expr" ] && { _press_any_key; return; }
     cron_line="${cron_expr} ${cmd_path} timed-restart ${marker}"
     # 缺 _crontab_replace 拒绝写入，裸管道会将读失败变成清空。
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
@@ -560,12 +559,12 @@ _uninstall_cloudflared_fallback() {
         esac
         rm -f /usr/local/bin/cloudflared
         rm -f "$STATE_DIR"/cf_*
-        # 校验 binary 消失且无进程；pidof 漏报由 _top_process_running 兜底。
+        # 校验 binary 消失且无进程；pidof 漏报由 _cf_fb_pids 兜底。
         if [ -e /usr/local/bin/cloudflared ]; then
             _error "cloudflared 二进制删除失败, 请手动检查 /usr/local/bin/cloudflared"
             return 1
         fi
-        # 同样验证文件/进程事实，见 _top_process_running。
+        # 同样验证文件/进程事实，见 _cf_fb_pids。
         if [ -n "$(_cf_fb_pids)" ]; then
             _warn "cloudflared 文件已删除, 但仍有残留进程, 请手动确认"
             return 1

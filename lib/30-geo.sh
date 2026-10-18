@@ -275,7 +275,7 @@ _geo_set_auto_update_cron() {
     # cron PATH 受限, 用命令绝对路径兜底; 调度语义见 GEO_CRON_EXPR。
     local cmd
     cmd="$(command -v "$CMD_NAME" 2>/dev/null || echo "/usr/local/bin/$CMD_NAME") geo-update"
-    local cron_line="0 3 */3 * * $cmd ${GEO_CRON_MARKER}"
+    local cron_line="$GEO_CRON_EXPR $cmd ${GEO_CRON_MARKER}"
 
     case "$action" in
         on)

@@ -979,7 +979,7 @@ _test_migration_restore() (
     printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
     printf 'legacy-service' > "$unit"
     _xray_service_unit_path() { printf '%s' "$unit"; }
-    _xray_service_snapshot_enable() { printf disabled > "$2"; }
+    _xray_service_snapshot_enable() { printf disabled > "$1"; }
     _xray_service_restore_enable() { [ "$failure" != enable ] && [ "$(cat "$1")" = disabled ]; }
     _xray_service_restore_file() { cp "$1" "$2"; }
     _manage_xray() { case "$1" in status) printf '%s' "$current" ;; stop) current=stopped ;; esac; }

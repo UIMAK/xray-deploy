@@ -559,8 +559,7 @@ _hysteria_restart_verified() {
     if [ "$(_manage_hysteria status 2>/dev/null)" != "running" ]; then
         _manage_hysteria start 2>/dev/null
     fi
-    local i
-    for i in 1 2 3 4 5 6 7 8; do
+    for _ in 1 2 3 4 5 6 7 8; do
         sleep 1
         [ "$(_manage_hysteria status 2>/dev/null)" = "running" ] || return 1
     done
@@ -583,8 +582,8 @@ _hysteria_recover_to_state() {
 # 连续三次 running 才通过临时启动；瞬时进程存在不代表配置稳定。
 _hysteria_validate_transient() {
     _manage_hysteria start 2>/dev/null
-    local i streak=0 stable=0
-    for i in 1 2 3 4 5 6 7 8; do
+    local streak=0 stable=0
+    for _ in 1 2 3 4 5 6 7 8; do
         sleep 1
         if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
             streak=$((streak + 1))
@@ -3101,8 +3100,8 @@ _hysteria_stopped_state() {
 # 强杀后再次 stop 再复验终态；Restart=on-failure 可能自动重拉。
 _hysteria_stop_and_verify() {
     _manage_hysteria stop 2>/dev/null
-    local i p exe
-    for i in 1 2 3 4 5 6 7 8; do
+    local p exe
+    for _ in 1 2 3 4 5 6 7 8; do
         _hysteria_stopped_state && return 0
         sleep 1
     done
@@ -3117,7 +3116,7 @@ _hysteria_stop_and_verify() {
     done
     sleep 1
     _manage_hysteria stop 2>/dev/null
-    for i in 1 2 3 4 5; do
+    for _ in 1 2 3 4 5; do
         _hysteria_stopped_state && return 0
         sleep 1
     done
@@ -3195,8 +3194,6 @@ _hysteria_uninstall_locked() {
         _press_any_key
         return 1
     fi
-    case "$INIT_SYSTEM" in
-        systemd) ;; openrc) ;; esac
     if [ -f "$HYSTERIA_CONFIG" ]; then
         local part
         part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)" 2>/dev/null)
