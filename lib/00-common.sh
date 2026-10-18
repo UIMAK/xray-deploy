@@ -762,7 +762,7 @@ _config_migrate_legacy() {
             elif [ -f "$unit" ]; then
                 cp -p "$unit" "$snapshot/service" || { rm -rf "$snapshot"; return 1; }
             fi
-            _xray_service_snapshot_enable "$unit" "$snapshot/enabled" || {
+            _xray_service_snapshot_enable "$snapshot/enabled" || {
                 if [ -f "$snapshot/masked" ]; then
                     _xray_service_restore_mask "$unit" "$snapshot/masked" >/dev/null 2>&1 || :
                     systemctl daemon-reload >/dev/null 2>&1 || :
@@ -933,7 +933,6 @@ _crontab_replace_locked() {
         return 1
     fi
     if [ -n "$newline" ]; then
-        # 用变量承载换行, 避免源码行首 } 截断测试套件的 _fn_body_extract。
         local nl=$'\n'
         filtered="${filtered:+${filtered}${nl}}${newline}"
     fi
@@ -1314,7 +1313,7 @@ _with_config_lock_mkdir() {
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立配置锁: $DEPLOY_DIR"; return 1 ;;
     esac
-    if [ -z "$deploy_path" ] || [ "$deploy_path" = "/" ]; then
+    if [ "$deploy_path" = "/" ]; then
         _error "部署目录路径无效, 无法建立配置锁: $DEPLOY_DIR"
         return 1
     fi

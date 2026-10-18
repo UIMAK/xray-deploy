@@ -385,7 +385,7 @@ _with_core_lock() {
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立核心锁: $DEPLOY_DIR"; return 1 ;;
     esac
-    if [ -z "$deploy_path" ] || [ "$deploy_path" = "/" ]; then
+    if [ "$deploy_path" = "/" ]; then
         _error "部署目录路径无效, 无法建立核心锁: $DEPLOY_DIR"
         return 1
     fi
@@ -492,7 +492,7 @@ _with_deploy_install_lock() {
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立安装锁: $DEPLOY_DIR"; return 1 ;;
     esac
-    if [ -z "$deploy_path" ] || [ "$deploy_path" = "/" ]; then
+    if [ "$deploy_path" = "/" ]; then
         _error "部署目录路径无效, 无法建立安装锁: $DEPLOY_DIR"
         return 1
     fi
@@ -1667,7 +1667,7 @@ _install_or_switch_xray_locked() {
         return 1
     fi
 
-    # commit helper 首先 durable 写 replacing, 然后才有第一次 mutation(_manage stop)。
+    # commit helper 首先 durable 写 replacing, 然后才有第一次 mutation(_xray_stop_and_verify)。
     # 返回 1=mutation 没开始; 3=replacing 已开始, 必须让 recovery 决定是否完整收敛。
     local crc=0
     _xray_commit_staged "$staged" || crc=$?
@@ -2045,8 +2045,8 @@ _xray_service_enable_state() {
 
 # enable 状态会在 service 创建时改变, 因此属于 snapshotted 的必要恢复源。
 # 只接受能明确恢复的 enabled/disabled; 查询失败或其它状态必须在 replacing 前中止。
-_xray_service_snapshot_enable() {  # <unit路径> <标志文件路径> [已知状态]
-    local flag="$2" want="${3:-}"
+_xray_service_snapshot_enable() {  # <标志文件路径> [已知状态]
+    local flag="$1" want="${2:-}"
     [ -n "$want" ] || want=$(_xray_service_enable_state) || {
         _error "无法安全快照 ${INIT_SYSTEM:-未知} 的 xray 开机自启状态, 取消核心事务"
         return 1
@@ -2184,9 +2184,9 @@ _xray_service_snapshot() {
         }
     fi
     if [ "$service_masked" = true ]; then
-        _xray_service_snapshot_enable "$unit" "${prev}.enabled" disabled || return 1
+        _xray_service_snapshot_enable "${prev}.enabled" disabled || return 1
     else
-        _xray_service_snapshot_enable "$unit" "${prev}.enabled" || return 1
+        _xray_service_snapshot_enable "${prev}.enabled" || return 1
     fi
     if ! _xray_core_path_present "$unit"; then
         [ "$pre" = false ] || { _error "service 在账本写入后消失, 无法建立旧 unit 快照"; return 1; }
@@ -2402,8 +2402,8 @@ _manage_xray() {
             ;;
     esac
     # start/restart 派生服务前关闭 config fd9 与 core/install 主锁 fd, 防守护进程继承持锁。
-    # 使用 local V="${V:-9}" + {V}>&-: 动态 fd 重定向只影响子命令, 父 fd 保留。
-    # ${V:-9}>&- 不会把展开值作为 fd, 会多传位置参数且关错描述符; 默认 9 防未持锁/set -u 异常。
+    # 使用 local CORE_LOCK_FD="${CORE_LOCK_FD:-9}" + {CORE_LOCK_FD}>&-: 动态 fd 重定向只影响子命令, 父 fd 保留。
+    # ${CORE_LOCK_FD}>&- 不会把展开值作为 fd, 会多传位置参数且关错描述符; 默认 9 防未持锁/set -u 异常。
     local CORE_LOCK_FD="${CORE_LOCK_FD:-9}"
     local DEPLOY_INSTALL_LOCK_FD="${DEPLOY_INSTALL_LOCK_FD:-9}"
     case "$INIT_SYSTEM" in

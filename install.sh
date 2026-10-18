@@ -752,7 +752,7 @@ NO_START=0
 ALLOW_LOCAL=0
 for arg in "$@"; do
     case "$arg" in
-        --update)   IS_UPDATE=1; NO_START=1 ;;
+        --update)   IS_UPDATE=1 ;;
         --no-start) NO_START=1 ;;
         --local)    ALLOW_LOCAL=1 ;;   # 仅首次安装有意义; 与 --update 组合在下面显式拒绝
         *)
@@ -903,12 +903,12 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     }
 else
     # 显式 --local 缺源须失败，不静默改用远程源。
-    if [ "$ALLOW_LOCAL" -eq 1 ] && [ ! -f "${LOCAL_DIR}/xray-deploy.sh" ]; then
+    if [ "$ALLOW_LOCAL" -eq 1 ]; then
         echo "[错误] 已指定 --local, 但本地源不可用(缺少 ${LOCAL_DIR}/xray-deploy.sh)"
         echo "       请在有源码的目录运行, 或去掉 --local 从网络安装"
         exit 1
     fi
-    if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 0 ]; then
+    if [ -f "${LOCAL_DIR}/xray-deploy.sh" ]; then
         echo "[信息] 检测到本地源但未受信任(无 .git 且未指定 --local), 改为从网络安装"
         echo "       如确实要从本地安装, 请加 --local"
     fi

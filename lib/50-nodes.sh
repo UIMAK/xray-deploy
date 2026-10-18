@@ -151,7 +151,7 @@ _hy2_link_unexpressible() {
     return 0
 }
 
-# 只替换 settings.xd_managed=true 的自有层，关闭用 XD_UDP_NEW=null；外来同类层保留。
+# 只替换 settings.xd_managed=true 的自有层，关闭用 XD_UDP_JQ_UPSERT 的 $new=null；外来同类层保留。
 # XD_UDP_OUR_TYPE/XD_UDP_OUR_MARKER 为匹配键；udp 是多层数组(finalmask.md)。
 XD_UDP_OUR_TYPE="salamander"
 XD_UDP_OUR_MARKER="xd_managed"
@@ -1618,8 +1618,8 @@ _input_port() {
 
 # tunnel 只听127.0.0.1，随机端口排除配置与监听冲突；多节点需独立端口。
 _gen_free_tunnel_port() {
-    local exclude="${1:-}" i r
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    local exclude="${1:-}" r
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
         r=$(_gen_random_port)
         [ -n "$exclude" ] && [ "$r" = "$exclude" ] && continue
         _check_port_occupied "$r" "" && continue
@@ -4082,11 +4082,10 @@ _rebuild_hy2_link() {
         return 1
     fi
     # URI类型按Hysteria URI-Scheme；Xray salamander+packetSize 在客户端是gecko。
-    local obfs_kind obfs_pw obfs_size
+    local obfs_kind obfs_pw
     # 未知 obfs_type = 损坏 metadata ⇒ 拒绝生成(不产出半成品链接)
     obfs_kind=$(_hy2_obfs_kind "$meta") || return 1
     obfs_pw=$(jq -r '.obfs_password // empty' "$meta")
-    obfs_size=$(_hy2_obfs_size_get "$meta")
     local link_ip; link_ip=$(_link_host "$host")
     local link
     link="hy2://$(_url_encode "$auth")@${link_ip}:${port}/?sni=$(_url_encode "$sni")"
@@ -4894,13 +4893,12 @@ _reality_port_txn_locked() {
         return 1
     fi
     # 判模式统一 _reality_node_mode；direct无tunnel，未知保守走tunnel检查。
-    local tunnel_tag="" tunnel_port sni trc rmode
+    local tunnel_tag="" tunnel_port trc rmode
     rmode=$(_reality_node_mode "$tag")
     if [ "$rmode" = "tunnel" ]; then
         # 缺tunnel_tag由配置唯一关联推导；歧义拒绝，不能盲选。
         tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
         tunnel_port=$(jq -r '.tunnel_port // empty' "$meta" 2>/dev/null)
-        sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
         if [ -z "$tunnel_tag" ]; then
             tunnel_tag=$(_find_reality_tunnel_tag "$tag"); trc=$?
             if [ "$trc" != "0" ]; then
@@ -4929,7 +4927,7 @@ _reality_port_txn_locked() {
             '.inbounds[] | select(.tag == $tg and .protocol == "tunnel") | .port') || return 1
         # 先以 metadata 交叉确认共享引用；旧节点即使 config target 缺失/格式异常，
         # 也不能把仍被引用的 tunnel 当成独占资源。
-        local peer peer_tunnel peer_port
+        local peer peer_tunnel
         for peer in "$NODES_DIR"/*.json; do
             [ -f "$peer" ] || continue
             [ "$peer" = "$meta" ] && continue
@@ -4938,12 +4936,7 @@ _reality_port_txn_locked() {
                 return 1
             }
             peer_tunnel=$(jq -r '.tunnel_tag // empty' "$peer" 2>/dev/null)
-            peer_port=$(jq -r '.tunnel_port // empty' "$peer" 2>/dev/null)
             if [ -n "$peer_tunnel" ] && [ "$peer_tunnel" = "$tunnel_tag" ]; then
-                shared_tunnel=1; break
-            fi
-            if [ -n "$peer_port" ] && [ -n "$peer_tunnel" ] && [ "$peer_tunnel" = "$tunnel_tag" ] \
-                && [ "$(jq -nr --arg p "$peer_port" --argjson t "$tunnel_port" 'try (($p | tonumber) == $t) catch false')" = true ]; then
                 shared_tunnel=1; break
             fi
         done
@@ -5127,7 +5120,6 @@ _port_txn_build_newmeta() {
         return 1
     fi
     case "$proto" in
-        vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$tmpm") || rebuild_rc=1 ;;
         vless-enc) newlink=$(_rebuild_vless_enc_link "$tmpm") || rebuild_rc=1 ;;
         vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$tmpm") || rebuild_rc=1 ;;
         *)
@@ -5522,7 +5514,6 @@ _modify_port() {
         rm -f "$tmpm"; _error "生成元数据失败"; _press_any_key; return 1
     fi
     case "$proto" in
-        vless-tcp-reality-vision|vless-xhttp-reality) newlink=$(_rebuild_reality_link "$tmpm") || rebuild_rc=1 ;;
         vless-enc) newlink=$(_rebuild_vless_enc_link "$tmpm") || rebuild_rc=1 ;;
         vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$tmpm") || rebuild_rc=1 ;;
         *)
