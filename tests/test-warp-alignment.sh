@@ -378,6 +378,99 @@ JSON
         and (.routing.rules[1].ip == ["geoip:cn"])
         and (.routing.rules[2].domain == ["example.org"])'
 
+    # 6) 显示渲染: 标题带条数、每条带 "N 项"、值按终端宽度折行、空列表给提示。
+    #    渲染只是展示层: _warp_rules_list 的 TSV 契约保持不变, 上面的列表/删除用例仍按 TSV 断言。
+    _wshow_strip() { sed $'s/\x1b\\[[0-9;]*m//g'; }
+    _wshow_fits() {
+        local lim="$1" line
+        while IFS= read -r line; do
+            [ "${#line}" -le "$lim" ] || return 1
+        done <<< "$2"
+        return 0
+    }
+    _wshow_no_tab() { ! grep -q $'\t' <<< "$1"; }
+    cfg_reset <<'JSON' || exit 1
+{
+  "routing": {"rules": [
+    {"domain": ["aaaa.example.com", "bbbb.example.com", "cccc.example.com", "dddd.example.com", "eeee.example.com", "ffff.example.com", "gggg.example.com"], "outboundTag": "warp"},
+    {"ip": ["geoip:cn"], "outboundTag": "warp"}
+  ]}
+}
+JSON
+    shown="$(COLUMNS=60 _warp_rules_show 2>/dev/null | _wshow_strip)"
+    check 'show: header carries the rule count' grep -qF 'WARP 分流规则 2 条' <<< "$shown"
+    check 'show: each rule shows how many values it holds' grep -qF '7 项' <<< "$shown"
+    check 'show: no raw TSV tab in the rendered output' _wshow_no_tab "$shown"
+    check 'show: values are joined with ", " and wrapped' grep -qF 'aaaa.example.com, bbbb.example.com,' <<< "$shown"
+    check 'show: every rendered line fits the terminal width' _wshow_fits 60 "$shown"
+    check 'show: the last value of a wrapped list has no trailing comma' eq 'gggg.example.com' "$(printf '%s\n' "$shown" | grep -F 'gggg.example.com' | sed 's/^ *//')"
+    cfg_reset <<'JSON' || exit 1
+{"routing": {"rules": []}}
+JSON
+    : > "$TMP/messages"
+    _warp_rules_show >/dev/null 2>&1
+    check 'show: an empty rule list prints a hint' grep -qF '暂无 WARP 分流规则' "$TMP/messages"
+
+    # 7) 渲染的边界情形: 混合 domain+ip、空值规则、CJK 宽度、可选入参、删除流程集成。
+    check 'width: a COLUMNS below the floor falls back to 80' eq 80 "$(COLUMNS=30 _warp_term_width)"
+    check 'width: an ASCII value measures one column per character' eq 3 "$(_warp_text_width 'abc')"
+    check 'width: a CJK value measures wider than its character count' \
+        [ "$(_warp_text_width '例子.中国')" -gt 5 ]
+
+    cfg_reset <<'JSON' || exit 1
+{
+  "routing": {"rules": [
+    {"domain": ["a.example.com"], "ip": ["geoip:cn"], "outboundTag": "warp"},
+    {"domain": [], "outboundTag": "warp"}
+  ]}
+}
+JSON
+    mixed="$(COLUMNS=60 _warp_rules_show 2>/dev/null | _wshow_strip)"
+    check 'show: a rule carrying both domain and ip lists both kinds' grep -qF 'domain+ip' <<< "$mixed"
+    check 'show: a rule carrying both domain and ip counts both values' grep -qF '2 项' <<< "$mixed"
+    check 'show: a rule carrying both domain and ip renders both values' grep -qF 'a.example.com, geoip:cn' <<< "$mixed"
+    check 'show: a rule with an empty domain array still prints its row' grep -qF '0 项' <<< "$mixed"
+    check 'show: a rule with an empty domain array renders without an unbound-variable error' \
+        eq '' "$(COLUMNS=60 _warp_rules_show 2>&1 >/dev/null)"
+
+    # 折行按显示宽度而非字符数: 3 个各 13~16 字节的中文值在 40 列下必须占 2 行,
+    # 按字符数算会全部塞进 1 行(中文值在终端里比字符数更宽)。
+    cfg_reset <<'JSON' || exit 1
+{"routing": {"rules": [{"domain": ["例子.中国", "例子.中国二", "例子.中国三"], "outboundTag": "warp"}]}}
+JSON
+    cjk_lines="$(COLUMNS=40 _warp_rules_show 2>/dev/null | _wshow_strip | grep -v '^[[:space:]]*$')"
+    check 'show: CJK values wrap by display width, not by character count' eq 4 "$(printf '%s\n' "$cjk_lines" | wc -l | tr -d ' ')"
+
+    wlist="$(_warp_rules_list)"
+    check 'show: an explicit rule list renders the same bytes as the default path' \
+        eq "$(COLUMNS=60 _warp_rules_show 2>/dev/null)" "$(COLUMNS=60 _warp_rules_show "$wlist" 2>/dev/null)"
+    check 'show: an empty explicit argument is not treated as unset (no read of the config)' \
+        eq '' "$(_warp_rules_show '' 2>/dev/null)"
+
+    cfg_reset <<'JSON' || exit 1
+{
+  "inbounds": [{"tag": "xd-vless-443", "protocol": "vless", "port": 443}],
+  "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
+  "routing": {"rules": [
+    {"outboundTag": "warp"},
+    {"domain": ["example.com"], "outboundTag": "warp"},
+    {"ip": ["geoip:cn"], "outboundTag": "warp"}
+  ]}
+}
+JSON
+    : > "$TMP/messages"
+    del_out="$(printf '1\n' | COLUMNS=60 _warp_delete_rule_prompt 2>&1 | _wshow_strip)"
+    check 'delete prompt: renders the rule list before asking' grep -qF 'WARP 分流规则 2 条' <<< "$del_out"
+    check 'delete prompt: choice 1 removes the first listed rule and keeps the bare warp rule' qe '
+        (.routing.rules | length) == 2
+        and (.routing.rules[0] == {"outboundTag": "warp"})
+        and (.routing.rules[1].ip == ["geoip:cn"])'
+    check 'delete prompt: no error is recorded on the success path' eq 0 "$(grep -c '^error:' "$TMP/messages")"
+    : > "$TMP/messages"
+    printf '1\n' | ( _warp_rules_show() { return 1; }; _warp_delete_rule_prompt ) >/dev/null 2>&1
+    check 'delete prompt: a display failure is reported instead of swallowed' grep -qF '无法显示分流规则' "$TMP/messages"
+    check 'delete prompt: a display failure aborts without deleting' qe '(.routing.rules | length) == 2'
+
     # -----------------------------------------------------------------------
     # D. 出站生命周期
     # -----------------------------------------------------------------------
@@ -505,7 +598,7 @@ JSON
     }
     no_secret_in_output_path() {
         local fn
-        for fn in _warp_state_summary _warp_rules_list _warp_menu _warp_delete_prompt _warp_set_endpoint_prompt; do
+        for fn in _warp_state_summary _warp_rules_list _warp_rules_show _warp_menu _warp_delete_prompt _warp_set_endpoint_prompt; do
             src_func "$fn" | grep -q 'secretKey' && return 1
         done
         return 0
