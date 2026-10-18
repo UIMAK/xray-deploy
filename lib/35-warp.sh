@@ -190,9 +190,9 @@ _warp_fetch_api() {
 # ---------------------------------------------------------------------------
 # 归一: 读 <rawfile>, 成功向 stdout 输出内部表示, 失败返回 1 且 stdout 为空。
 # ---------------------------------------------------------------------------
-# 归一骨架: <jq程序后缀> <rawfile>; 三个入口只差中间的 jq 分支表达式。
-_warp_normalize_jq() {   # <jq程序后缀> <rawfile>
-    local raw="${2:-}" prog="${1:-}" obj
+# 归一骨架: <rawfile> <jq程序后缀>; 三个入口只差中间的 jq 分支表达式。
+_warp_normalize_jq() {   # <rawfile> <jq程序后缀>
+    local raw="${1:-}" prog="${2:-}" obj
     [ -n "$raw" ] && [ -f "$raw" ] && [ -s "$raw" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
     obj=$(jq -c "$_WARP_NORM_JQ$prog" "$raw" 2>/dev/null) || return 1
@@ -200,13 +200,13 @@ _warp_normalize_jq() {   # <jq程序后缀> <rawfile>
     _warp_finalize "$obj"
 }
 
-_warp_normalize_reg() { _warp_normalize_jq ' reg2norm' "${1:-}"; }
+_warp_normalize_reg() { _warp_normalize_jq "${1:-}" ' reg2norm'; }
 
 # wgcf-cli 既可能给注册 JSON, 也可能给 generate --xray 的出站: 有出站字段就按出站解析。
-_warp_normalize_wgcf() { _warp_normalize_jq ' (if (wgs) != null then out2norm else reg2norm end)' "${1:-}"; }
+_warp_normalize_wgcf() { _warp_normalize_jq "${1:-}" ' (if (wgs) != null then out2norm else reg2norm end)'; }
 
 # API 给的是出站结构; 即使缺 allowedIPs/mtu 也必须重新映射成内部字段, 不拼接来源 JSON。
-_warp_normalize_api() { _warp_normalize_jq ' (if (wgs) != null then out2norm else error("不是 Xray WireGuard 出站结构") end)' "${1:-}"; }
+_warp_normalize_api() { _warp_normalize_jq "${1:-}" ' (if (wgs) != null then out2norm else error("不是 Xray WireGuard 出站结构") end)'; }
 
 # ---------------------------------------------------------------------------
 # 生成: 从 stdin 读内部表示, 向 stdout 输出单个 Xray outbound。
