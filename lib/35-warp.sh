@@ -447,80 +447,6 @@ _warp_rules_list() {
     printf '%s\n' "$out"
 }
 
-# 终端可见列数; 非交互(测试/管道)退回 COLUMNS, 再退回 80。
-_warp_term_width() {
-    local w=""
-    [ -t 1 ] && w=$(tput cols 2>/dev/null)
-    [[ "${w:-}" =~ ^[0-9]+$ ]] || w="${COLUMNS:-80}"
-    [[ "${w:-}" =~ ^[0-9]+$ ]] || w=80
-    [ "${w:-80}" -ge 40 ] || w=80
-    printf '%s\n' "$w"
-}
-
-# 渲染分流规则供 [5] 查看 / [6] 删除: 序号、类型、值数量成列, 值按终端宽度折行,
-# 续行缩进到类型列。序号与 _warp_rules_list 一致, 行数仍以 TSV 为准。
-_warp_rules_show() {
-    local list total numw kindw cntw indent width cols num kind joined v k last
-    local cur="" count=0
-    local -a vals=() chunks=()
-    list=$(_warp_rules_list) || return 1
-    [ -n "$list" ] || { _info "暂无 WARP 分流规则"; return 0; }
-
-    total=$(printf '%s\n' "$list" | wc -l | tr -d ' ')
-    numw=${#total}
-    kindw=6
-    cntw=1
-    while IFS=$'\t' read -r num kind joined; do
-        [ "${#kind}" -gt "$kindw" ] && kindw=${#kind}
-        count=0
-        if [ -n "$joined" ]; then
-            IFS=',' read -r -a vals <<< "$joined"
-            count=${#vals[@]}
-        fi
-        [ "${#count}" -gt "$cntw" ] && cntw=${#count}
-    done <<< "$list"
-
-    indent=$((2 + numw + 2))
-    cols=$(_warp_term_width)
-    width=$((cols - indent))
-    [ "$width" -ge 24 ] || width=24
-
-    printf '  %sWARP 分流规则 %s 条%s (序号用于删除)\n\n' "$CYAN" "$total" "$NC"
-    while IFS=$'\t' read -r num kind joined; do
-        vals=()
-        chunks=()
-        if [ -n "$joined" ]; then
-            IFS=',' read -r -a vals <<< "$joined"
-        fi
-        count=${#vals[@]}
-        printf '  %*s) %s%-*s%s %*s 项\n' "$numw" "$num" "$CYAN" "$kindw" "$kind" "$NC" "$cntw" "$count"
-        # 贪心填充; 单个值超过可用宽度时独占一行并溢出, 不再拆分(拆开的值无法还原)。
-        cur=""
-        for v in "${vals[@]}"; do
-            v=${v#"${v%%[![:space:]]*}"}
-            v=${v%"${v##*[![:space:]]}"}
-            [ -n "$v" ] || continue
-            if [ -z "$cur" ]; then
-                cur=$v
-            elif [ $((${#cur} + 2 + ${#v})) -le "$width" ]; then
-                cur="$cur, $v"
-            else
-                chunks+=("$cur")
-                cur=$v
-            fi
-        done
-        [ -n "$cur" ] && chunks+=("$cur")
-        last=$((${#chunks[@]} - 1))
-        for k in "${!chunks[@]}"; do
-            if [ "$k" -lt "$last" ]; then
-                printf '%*s%s,\n' "$indent" '' "${chunks[$k]}"
-            else
-                printf '%*s%s\n' "$indent" '' "${chunks[$k]}"
-            fi
-        done
-    done <<< "$list"
-}
-
 # 序号与 _warp_rules_list 一致(按 outboundTag=warp 规则的出现顺序从 1 开始)。
 _warp_delete_rule() {
     local n="${1:-}" total idx
@@ -616,7 +542,7 @@ _warp_delete_rule_prompt() {
     local list total n
     list=$(_warp_rules_list) || { _error "无法读取分流规则"; return 1; }
     [ -n "$list" ] || { _info "暂无 WARP 分流规则"; return 0; }
-    _warp_rules_show || return 1
+    printf '%s\n' "$list"
     total=$(printf '%s\n' "$list" | wc -l | tr -d ' ')
     while true; do
         read -rp "  请输入要删除的序号(0 取消): " n || return 1
@@ -758,7 +684,7 @@ _warp_menu() {
             2) _warp_set_endpoint_prompt; _press_any_key ;;
             3) _warp_set_tun_prompt; _press_any_key ;;
             4) _warp_add_rule_prompt; _press_any_key ;;
-            5) _warp_rules_show || _error "无法读取分流规则"; _press_any_key ;;
+            5) _warp_rules_list || _error "无法读取分流规则"; _press_any_key ;;
             6) _warp_delete_rule_prompt; _press_any_key ;;
             7) _warp_delete_prompt; _press_any_key ;;
             *) _warn "无效选择"; _press_any_key ;;
