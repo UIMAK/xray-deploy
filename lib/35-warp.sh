@@ -21,10 +21,10 @@ def arr($v): if ($v | type) == "array" then $v
 def addrmask: if test("/") then . else (if test(":") then . + "/128" else . + "/32" end) end;
 def wgs:
   if (type == "object") and ((.settings | type) == "object") and ((.settings.secretKey | type) == "string") then .settings
-  elif (type == "object") and ((.outbounds | type) == "array") and ((.outbounds[0].settings.secretKey | type) == "string") then .outbounds[0].settings
-  elif (type == "object") and ((.config | type) == "object") and ((.config.outbounds | type) == "array") and ((.config.outbounds[0].settings.secretKey | type) == "string") then .config.outbounds[0].settings
+  elif (type == "object") and ((.outbounds | type) == "array") then ([.outbounds[] | select((.settings.secretKey | type) == "string")][0].settings // null)
+  elif (type == "object") and ((.config | type) == "object") and ((.config.outbounds | type) == "array") then ([.config.outbounds[] | select((.settings.secretKey | type) == "string")][0].settings // null)
   elif (type == "object") and ((.data | type) == "object") and ((.data.settings | type) == "object") and ((.data.settings.secretKey | type) == "string") then .data.settings
-  elif (type == "object") and ((.data | type) == "object") and ((.data.outbounds | type) == "array") and ((.data.outbounds[0].settings.secretKey | type) == "string") then .data.outbounds[0].settings
+  elif (type == "object") and ((.data | type) == "object") and ((.data.outbounds | type) == "array") then ([.data.outbounds[] | select((.settings.secretKey | type) == "string")][0].settings // null)
   elif (type == "object") and ((.secretKey | type) == "string") then .
   else null end;
 def wgcheck:

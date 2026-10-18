@@ -145,6 +145,15 @@ JSON
   "peers": [{"publicKey": "cHVibGljLWFwaQ==", "endpoint": "162.159.192.6:2408"}]}}
 JSON
 
+    # 注册 API 的实际响应在 wireguard 前还有 direct/block 出站, 不能只看 outbounds[0]。
+    cat > "$FX/api-index2.json" <<'JSON'
+{"outbounds": [{"tag": "direct", "protocol": "freedom"},
+               {"tag": "block", "protocol": "blackhole", "settings": {}},
+               {"tag": "wireguard", "protocol": "wireguard", "settings": {
+  "secretKey": "c2VjcmV0LWFwaS0y", "address": ["172.16.0.9/32"], "reserved": [1, 2, 3],
+  "peers": [{"publicKey": "cHVibGljLWFwaS0y", "endpoint": "162.159.192.9:2408",
+              "allowedIPs": ["0.0.0.0/0", "::/0"]}], "mtu": 1280}}]}
+JSON
     # reserved 按官方文档是可选项(长度 3, 默认全 0): 省略时必须补 [0,0,0] 而不是判失败。
     cat > "$FX/reg-no-reserved.json" <<'JSON'
 {"private_key": "a2V5LXJlZw==", "public_key": "cHViLXJlZw==",
@@ -206,6 +215,8 @@ JSON
     check 'normalize api: outbound fixture yields 7 masked fields' norm_ok _warp_normalize_api "$FX/api.json" "$TMP/n-api.json"
     check 'normalize api: missing allowedIPs defaults to 0.0.0.0/0 and ::/0' eq '["0.0.0.0/0","::/0"]' "$(jq -c .allowedIPs "$TMP/n-api.json")"
     check 'normalize api: missing mtu defaults to 1280' eq '1280' "$(jq -r .mtu "$TMP/n-api.json")"
+    check 'normalize api: wireguard outbound after direct/block is found' norm_ok _warp_normalize_api "$FX/api-index2.json" "$TMP/n-api-index2.json"
+    check 'normalize api: indexed wireguard settings are used' eq '172.16.0.9/32' "$(jq -r '.address | join(",")' "$TMP/n-api-index2.json")"
     check 'normalize api: outbound without reserved still normalizes' norm_ok _warp_normalize_api "$FX/api-no-reserved.json" "$TMP/n-api-norsv.json"
     check 'normalize reg: registration without reserved_dec still normalizes' norm_ok _warp_normalize_reg "$FX/reg-no-reserved.json" "$TMP/n-reg-norsv.json"
     check 'normalize api: missing reserved defaults to three zero bytes' eq '[0,0,0]' "$(jq -c .reserved "$TMP/n-api-norsv.json")"
