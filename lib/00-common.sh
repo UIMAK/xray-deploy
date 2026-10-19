@@ -41,64 +41,6 @@ _deploy_lock_root() {
 }
 
 
-# Primary lock interlock: flock holders also own the fallback directory; mkdir holders
-# reserve it first and then inspect open flock descriptors. This closes the mixed-backend
-# check/acquire race without changing either backend's normal stale-lock policy.
-_xray_primary_flock_marker_take() {  # <fd> <lock-file> <fallback-dir> <label>; caller holds flock
-    local fd="$1" lock_file="$2" lock_dir="$3" label="$4" devino witness owner i
-    [ -n "$fd" ] && [ -e "$lock_file" ] || { _error "${label} flock 文件/FD 不可用"; return 1; }
-    devino=$(stat -c '%d:%i' "$lock_file" 2>/dev/null) || devino=""
-    [ -n "$devino" ] || { _error "无法读取${label} flock 文件标识, 放弃操作"; return 1; }
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        if mkdir "$lock_dir" 2>/dev/null; then
-            owner="${BASHPID:-$$}"
-            if printf '%s\n' "$owner" > "$lock_dir/pid" 2>/dev/null \
-               && printf '%s\n' "$devino" > "$lock_dir/.witness" 2>/dev/null \
-               && [ "$(cat "$lock_dir/.witness" 2>/dev/null)" = "$devino" ]; then
-                return 0
-            fi
-            [ "$(cat "$lock_dir/pid" 2>/dev/null)" = "$owner" ] && rm -rf "$lock_dir" 2>/dev/null
-            _error "无法建立${label}跨后端见证标记: $lock_dir"
-            return 1
-        fi
-        if [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] \
-           && [ -f "$lock_dir/.witness" ] && [ ! -L "$lock_dir/.witness" ]; then
-            witness=$(cat "$lock_dir/.witness" 2>/dev/null) || witness=""
-            if [ "$witness" = "$devino" ]; then
-                # Exclusive flock proves no previous flock owner remains; mkdir-only owners
-                # never write this inode witness, so only our interrupted marker is removable.
-                if rm -rf "$lock_dir" 2>/dev/null && [ ! -e "$lock_dir" ] && [ ! -L "$lock_dir" ]; then
-                    continue
-                fi
-                _error "无法清理${label}陈旧 flock 见证标记: $lock_dir"
-                return 1
-            fi
-            _error "${label}锁目录见证身份不符, 拒绝接管: $lock_dir"
-            return 1
-        fi
-        sleep 1
-    done
-    _error "等待${label} mkdir 后端互斥超时或发现残留锁: $lock_dir"
-    return 1
-}
-
-_xray_primary_flock_marker_release() {  # <lock-file> <fallback-dir> <label>
-    local lock_file="$1" lock_dir="$2" label="$3" devino owner witness
-    [ -d "$lock_dir" ] || { _error "${label}见证目录丢失: $lock_dir"; return 1; }
-    owner=$(cat "$lock_dir/pid" 2>/dev/null) || owner=""
-    witness=$(cat "$lock_dir/.witness" 2>/dev/null) || witness=""
-    devino=$(stat -c '%d:%i' "$lock_file" 2>/dev/null) || devino=""
-    if [ "$owner" != "${BASHPID:-$$}" ] || [ -z "$devino" ] || [ "$witness" != "$devino" ]; then
-        _error "${label}见证标记归属/身份校验失败, 保留: $lock_dir"
-        return 1
-    fi
-    if ! rm -rf "$lock_dir" 2>/dev/null || [ -e "$lock_dir" ] || [ -L "$lock_dir" ]; then
-        _error "无法删除${label}见证标记: $lock_dir"
-        return 1
-    fi
-    return 0
-}
-
 # 脚本自身
 export CMD_NAME="xd"                            # 快捷命令名(用户确认)
 
@@ -642,21 +584,27 @@ _config_present() {
 
 # 管理器只支持每个顶层字段一份片段; 重复字段使用核心的另一套合并语义, 不可覆盖回写。
 _config_layout_valid() {
-    local dir="${1:-$CONFIG_DIR}" repair="${2:-}" keys='[]' f fields
+    local dir="${1:-$CONFIG_DIR}" repair="${2:-}" f dups
+    local -a files=() good=()
     for f in "$dir"/*.json; do
-        [ -f "$f" ] && [ -s "$f" ] || continue
-        if ! fields=$(jq -e 'if type == "object" then keys else error("配置片段必须是 object") end' "$f" 2>/dev/null); then
-            # 完整快照回写允许替换损坏文件; 正常读取仍须拒绝。
-            [ "$repair" = repair ] && continue
-            _error "配置片段无法解析: $f"
-            return 1
-        fi
-        keys=$(jq -cn --argjson a "$keys" --argjson b "$fields" '$a + $b') || return 1
+        [ -f "$f" ] && [ -s "$f" ] && files+=("$f")
     done
-    if ! printf '%s' "$keys" | jq -e 'group_by(.) | all(.[]; length == 1)' >/dev/null; then
+    [ "${#files[@]}" -gt 0 ] || return 0
+    # 一次 jq 读完所有片段: 校验 object 并找出跨片段重复的顶层字段。
+    if dups=$(jq -s 'map(if type == "object" then keys else error("配置片段必须是 object") end) | add | group_by(.) | map(select(length > 1) | .[0])' "${files[@]}" 2>/dev/null); then
+        [ "$dups" = '[]' ] && return 0
         _error "配置片段含重复顶层字段, 拒绝修改: $dir"
         return 1
     fi
+    # 仅失败路径逐文件定位; 完整快照回写允许替换损坏片段, 正常读取仍须拒绝。
+    for f in "${files[@]}"; do
+        if jq -e 'type == "object"' "$f" >/dev/null 2>&1; then good+=("$f"); continue; fi
+        [ "$repair" = repair ] || { _error "配置片段无法解析: $f"; return 1; }
+    done
+    [ "${#good[@]}" -gt 0 ] || return 0
+    dups=$(jq -s 'map(keys) | add | group_by(.) | map(select(length > 1) | .[0])' "${good[@]}") || return 1
+    [ "$dups" = '[]' ] || { _error "配置片段含重复顶层字段, 拒绝修改: $dir"; return 1; }
+    return 0
 }
 
 # 合并管理器的一字段一文件布局(输出到 stdout)。
@@ -969,34 +917,18 @@ _backup_config_has_bytes() {
 _backup_config() {
     _config_present || return 0
     mkdir -p "$BACKUP_DIR" || return 1
-    local tmp
-    # 注意: busybox/musl 的 mktemp 要求模板以 XXXXXX 结尾, 后缀必须放在 X 之前(否则 EINVAL)
-    tmp=$(mktemp -d "${BACKUP_DIR}/confs.bak.XXXXXX") || return 1
-    cp -f "$CONFIG_DIR"/*.json "$tmp"/ 2>/dev/null || { rm -rf "$tmp"; return 1; }
-    # 非空判据见 _backup_config_has_bytes。
-    _backup_config_has_bytes "$tmp" || { rm -rf "$tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
-    # 备份含密码/UUID/私钥: chmod 600 失败视为备份失败, 不能留下 0644 备份
-    chmod 700 "$tmp" 2>/dev/null || { rm -rf "$tmp"; return 1; }
-    chmod 600 "$tmp"/*.json 2>/dev/null || { rm -rf "$tmp"; return 1; }
-    # 新副本完整且权限就绪后才替换 lastbak; rm + mv 不是整目录原子提交。
     local last_tmp
-    last_tmp=$(mktemp -d "${BACKUP_DIR}/confs.lastbak.XXXXXX") || { rm -rf "$tmp"; return 1; }
-    cp -f "$CONFIG_DIR"/*.json "$last_tmp"/ 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
-    # lastbak 同样必须通过非空检查。
-    _backup_config_has_bytes "$last_tmp" || { rm -rf "$tmp" "$last_tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
-    chmod 700 "$last_tmp" 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
-    chmod 600 "$last_tmp"/*.json 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
+    # 注意: busybox/musl 的 mktemp 要求模板以 XXXXXX 结尾, 后缀必须放在 X 之前(否则 EINVAL)
+    last_tmp=$(mktemp -d "${BACKUP_DIR}/confs.lastbak.XXXXXX") || return 1
+    cp -f "$CONFIG_DIR"/*.json "$last_tmp"/ 2>/dev/null || { rm -rf "$last_tmp"; return 1; }
+    # 非空判据见 _backup_config_has_bytes: 文件存在不等于内容可用于恢复。
+    _backup_config_has_bytes "$last_tmp" || { rm -rf "$last_tmp"; _error "配置备份内容为空(磁盘空间?), 备份失败"; return 1; }
+    # 备份含密码/UUID/私钥: chmod 600 失败视为备份失败, 不能留下 0644 备份
+    chmod 700 "$last_tmp" 2>/dev/null || { rm -rf "$last_tmp"; return 1; }
+    chmod 600 "$last_tmp"/*.json 2>/dev/null || { rm -rf "$last_tmp"; return 1; }
+    # 新副本完整且权限就绪后才替换 lastbak; rm + mv 不是整目录原子提交。
     rm -rf "$BACKUP_DIR/confs.lastbak"
-    mv -f "$last_tmp" "$BACKUP_DIR/confs.lastbak" 2>/dev/null || { rm -rf "$tmp" "$last_tmp"; return 1; }
-    # 随机快照保留最新 10 份; 按行读取目录名兼容空白, 不依赖 find -printf。
-    # glob 只喂给 ls, 不再用 ls | grep 过滤文件名(SC2010); -d 列出快照目录本身。
-    local i=0 old
-    while IFS= read -r old; do
-        [ -n "$old" ] || continue
-        [ -d "$old" ] || continue
-        i=$((i+1))
-        [ "$i" -gt 10 ] && rm -rf "${old:?}"
-    done <<< "$(ls -1dt -- "$BACKUP_DIR"/confs.bak.* 2>/dev/null)"
+    mv -f "$last_tmp" "$BACKUP_DIR/confs.lastbak" 2>/dev/null || { rm -rf "$last_tmp"; return 1; }
     return 0
 }
 
@@ -1236,33 +1168,23 @@ _proc_exe_is() {
     [ -n "$want" ] || return 0                  # 未指定期望路径 => 不做这层过滤
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     [ -d "/proc/$pid" ] || return 1              # 已退出/不存在不是"无法读取", 而是明确停止
-    # 读不到 exe 仍 fail-open, 但先复核 PID 是否还存在: 进程恰在扫描后退出时, 不能把它
-    # 当成活进程报告。存在但受 hidepid/权限限制时仍按既定 liveness 契约放行。
-    got=$(readlink "/proc/$pid/exe" 2>/dev/null) || { [ -d "/proc/$pid" ] && return 0; return 1; }
-    [ -n "$got" ] || { [ -d "/proc/$pid" ] && return 0; return 1; }
+    got=$(readlink "/proc/$pid/exe" 2>/dev/null) || got=""
+    # 存在但读不到 exe(受 hidepid/权限限制)时按既定 liveness 契约 fail-open。
+    [ -n "$got" ] || return 0
     # 就地替换二进制(升级)后, 运行中进程的 exe 链会带 " (deleted)" 后缀
     got="${got% (deleted)}"
-    [ "$got" = "$want" ] && { [ -d "/proc/$pid" ] && return 0; return 1; }
+    [ "$got" = "$want" ] && return 0
     # 路径可能经由 symlink 呈现不同前缀(如 /opt 本身是软链, exe 记录的是解析后的真实路径),
     # 把期望路径也解析一次再比。解析失败(路径不存在/断链)时以上面的字面比较为结论 => 拒绝。
     rw=$(readlink -f "$want" 2>/dev/null) || return 1
     [ -n "$rw" ] || return 1
-    [ "$got" = "$rw" ] && { [ -d "/proc/$pid" ] && return 0; return 1; }
+    [ "$got" = "$rw" ] && return 0
     return 1
 }
 
-# 全机按 comm 扫描(仅作最后回退)。可选第 2 参数 = 期望的二进制路径, 传了就只认
-# exe 指向该路径的进程(见 _proc_exe_is); 不传则维持"任何同名进程都算"的旧语义。
+# 全机按 comm 扫描; 第 2 参数 = 期望的二进制路径(见 _proc_exe_is), 不传则任何同名进程都算。
 _proc_any_named() {
-    local name="$1" want="${2:-}" p c pid pids
-    pids=$(pidof "$name" 2>/dev/null | tr ' ' '\n' | grep -e '^[0-9][0-9]*$')
-    if [ -n "$pids" ]; then
-        while IFS= read -r pid; do
-            [ -n "$pid" ] || continue
-            _proc_exe_is "$pid" "$want" && return 0
-        done <<< "$pids"
-        # pidof 可能漏报, 未命中期望二进制时继续 /proc 扫描(见 _xray_is_running)。
-    fi
+    local name="$1" want="${2:-}" p c
     for p in /proc/[0-9]*; do
         read -r c 2>/dev/null < "$p/comm" || continue
         [ "$c" = "$name" ] || continue
@@ -1309,14 +1231,6 @@ _press_any_key() {
 # ---------------------------------------------------------------------------
 _with_config_lock_mkdir() {
     local deploy_path="${DEPLOY_DIR%/}" lock_dir rc owner
-    case "$deploy_path" in
-        /*) ;;
-        *) _error "部署目录必须是绝对路径, 无法建立配置锁: $DEPLOY_DIR"; return 1 ;;
-    esac
-    if [ "$deploy_path" = "/" ]; then
-        _error "部署目录路径无效, 无法建立配置锁: $DEPLOY_DIR"
-        return 1
-    fi
     lock_dir="$(_deploy_lock_root)/config.lock.d"
     mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || {
         _error "无法创建配置锁目录 $(dirname "$lock_dir")(权限/只读文件系统?), 放弃本次修改"
@@ -1358,6 +1272,16 @@ _with_config_lock_mkdir() {
     return "$rc"
 }
 
+# 精简 PATH(cron/容器)下 command -v 会漏掉 flock: 补回标准目录, 让后续裸 flock 可用。
+_flock_ensure() {
+    command -v flock >/dev/null 2>&1 && return 0
+    local d
+    for d in /usr/bin /bin /usr/sbin /sbin; do
+        [ -x "$d/flock" ] && { PATH="${PATH:+$PATH:}$d"; export PATH; return 0; }
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # 配置 RMW 锁: 锁根在部署树外, 卸载不能拆开 inode 导致并发覆盖。
 # 锁序 install → config → core; 本函数不自取 install lock, 无 flock 时 mkdir 退路 fail-closed。
@@ -1370,13 +1294,12 @@ _with_config_lock() {
         "$@"
         return $?
     fi
-    if ! command -v flock >/dev/null 2>&1; then
+    if ! _flock_ensure; then
         _with_config_lock_mkdir "$@"
         return $?
     fi
-    local config_lock_file config_lock_dir
+    local config_lock_file
     config_lock_file="$(_deploy_lock_root)/config.lock"
-    config_lock_dir="$(_deploy_lock_root)/config.lock.d"
     (
         # 只建锁根不重建部署树; 主锁后确认部署仍存在。
         mkdir -p "$(dirname "$config_lock_file")" 2>/dev/null
@@ -1394,11 +1317,6 @@ _with_config_lock() {
             _error "等待配置锁超时(15s), 可能有其他 xd 会话正在修改配置"
             exit 1
         fi
-        if ! _xray_primary_flock_marker_take 9 "$config_lock_file" "$config_lock_dir" "配置锁"; then
-            flock -u 9 2>/dev/null || :
-            exit 1
-        fi
-        trap '_xray_primary_flock_marker_release "$config_lock_file" "$config_lock_dir" "配置锁" || exit 1; flock -u 9 2>/dev/null || :' EXIT
         # 主锁已在手, 此时才判部署树是否存在(锁内真实状态): 不存在 ⇒ 确实没有部署
         # (或刚被卸载), fail-closed 不重建。
         if [ ! -d "$DEPLOY_DIR" ]; then

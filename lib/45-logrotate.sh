@@ -65,21 +65,17 @@ _logrotate_ensure_package() {
     return 0
 }
 
-# 逐键初始化, enabled 作为哨兵最后写; 只补缺失键, 不覆盖仍存活的用户偏好。
-# 部分损坏(仅哨兵丢失)时, 保留如 retention=14 的既有值, 不用默认值覆盖。
+# 只补缺失键, 不覆盖仍存活的用户偏好(如仅哨兵丢失时保留 retention=14)。
+# enabled 作哨兵最后写: 缺键时不落盘, 下次启动凭哨兵缺失整体重试。
 _logrotate_init_state() {
     [ -f "$STATE_DIR/logrotate_enabled" ] && return 0
     local rc=0
     [ -f "$STATE_DIR/logrotate_frequency" ] || _state_set logrotate_frequency "daily" || rc=1
     [ -f "$STATE_DIR/logrotate_retention" ] || _state_set logrotate_retention "7" || rc=1
     [ -f "$STATE_DIR/logrotate_compress" ]  || _state_set logrotate_compress "on" || rc=1
+    if [ "$rc" -eq 0 ]; then _state_set logrotate_enabled "on" || rc=1; fi
     if [ "$rc" -ne 0 ]; then
         _warn "logrotate 默认状态写入失败, 下次启动会重试"
-        return 1
-    fi
-    # 哨兵最后写; 失败不删已写入的键(可能是用户偏好), 下次启动凭哨兵缺失重试。
-    if ! _state_set logrotate_enabled "on"; then
-        _warn "logrotate 默认状态写入失败(enabled 哨兵未落盘), 下次启动会重试"
         return 1
     fi
     return 0
@@ -109,8 +105,7 @@ _logrotate_effective_enabled() {
     _logrotate_enabled_state
 }
 
-# 原子写: 在 include 目录下的临时子目录写入(目录不被 logrotate 读取), 回读一致后 rename 覆盖。
-# 避免"截断→写入"窗口被并发 logrotate 读到半截配置而整轮失败, 也无需写失败后的还原流程。
+# 原子写: 在 include 目录下的唯一临时子目录写入(logrotate 只读普通文件, 不读子目录), 再 rename 覆盖。
 _logrotate_write_config() {
     local content
     content=$(_logrotate_render_config) || {
@@ -128,8 +123,7 @@ _logrotate_write_config() {
         _error "logrotate 配置路径是目录, 无法写入配置: $LOGROTATE_CONF"
         return 1
     fi
-    # 每次调用用唯一临时目录(mktemp): 并发会话各写各删自己的目录, 无共享目录竞态;
-    # 子目录不被 logrotate 读取, 提交后删除不留残留。
+    # 唯一临时子目录: 并发会话各写各删自己的目录, 子目录不被 logrotate 读取。
     local tmp_dir
     if ! tmp_dir=$(mktemp -d "$conf_dir/.xray-deploy.tmp.XXXXXX" 2>/dev/null) || [ -z "$tmp_dir" ]; then
         _error "无法创建 logrotate 临时写入目录: $conf_dir"
@@ -141,24 +135,14 @@ _logrotate_write_config() {
         rm -rf "$tmp_dir" 2>/dev/null
         return 1
     fi
-    local landed
-    landed=$(cat "$tmp_file" 2>/dev/null)
-    if [ "$landed" != "$content" ]; then
-        _error "logrotate 配置写入不完整(磁盘空间?): $tmp_file"
-        rm -rf "$tmp_dir" 2>/dev/null
-        return 1
-    fi
     chmod 644 "$tmp_file" 2>/dev/null || true
-    # rename 覆盖: 目标要么是旧内容要么是新内容, 不存在半截中间态。
     if ! mv -f "$tmp_file" "$LOGROTATE_CONF" 2>/dev/null; then
         _error "提交 logrotate 配置失败(rename): $LOGROTATE_CONF"
         rm -rf "$tmp_dir" 2>/dev/null
         return 1
     fi
-    # 只删除本次调用自建的临时目录(此刻已空), 不触碰他方目录。
+    # 只删本次调用自建的临时目录(提交后已空)。
     rmdir "$tmp_dir" 2>/dev/null || true
-    chmod 644 "$LOGROTATE_CONF" 2>/dev/null || \
-        _warn "logrotate 配置权限设置失败(不影响轮换): $LOGROTATE_CONF"
     return 0
 }
 
@@ -337,13 +321,6 @@ _logrotate_status() {
         else
             echo -e "  日志级别: ${CYAN}${lv}${NC}"
         fi
-    fi
-    # 仅在实际已停(有效态 off)时才提示"被自动禁用"; 标记残留但配置仍在时轮换仍在跑, 否则自相矛盾。
-    if [ "$(_logrotate_auto_off_get)" = "on" ] && [ "$enabled" = "off" ]; then
-        echo -e "  ${SKYBLUE}(logrotate 因日志级别 none 被自动禁用, 切回其它级别会自动恢复)${NC}"
-    fi
-    if [ "$(_logrotate_user_off_get)" = "on" ] && [ "$enabled" = "off" ]; then
-        echo -e "  ${SKYBLUE}(此前手动禁用时状态记录写入失败, 已按禁用保留; 选 [1] 会重新启用轮换而非修正该记录)${NC}"
     fi
     echo -e "  频率: ${CYAN}${freq_label}${NC}"
     echo -e "  保留: ${CYAN}${ret}${NC} 份"

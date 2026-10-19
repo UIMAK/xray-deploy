@@ -299,10 +299,6 @@ _svc_replace_line() {
 # 备份必须成功且限为 600；失败时不能失去含凭据的恢复源。
 _svc_backup() {
     local svcfile="$1" backup="${1}.bak"
-    if [ -e "$backup" ] && ! chmod 600 "$backup" 2>/dev/null; then
-        _error "无法收紧既有 service 备份权限, 未修改 service: $backup"
-        return 1
-    fi
     ( umask 077; cp -f "$svcfile" "$backup" ) 2>/dev/null || {
         _error "service 备份失败: $svcfile"
         return 1
@@ -335,11 +331,7 @@ _svc_commit() {
     [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
     if ! cat "$tmp" > "$svcfile"; then
         _error "service 文件写入失败($svcfile), 尝试从备份恢复"
-        if [ -f "${svcfile}.bak" ]; then
-            if ! cp -f "${svcfile}.bak" "$svcfile" 2>/dev/null; then
-                _error "service 文件从备份恢复也失败: $svcfile, 请手动处理"
-            fi
-        fi
+        _svc_restore "$svcfile" || _error "service 文件从备份恢复也失败: $svcfile, 请手动处理"
         rm -f "$tmp"
         return 1
     fi
@@ -534,88 +526,21 @@ _cf_unit_path() {
     esac
 }
 
-_cf_opt_takes_value() { # <包装器名> <token> ; 0 = 该 token 的取值是下一个词
-    local w="$1" t="$2" tbl=""
-    case "$w" in
-        env)     tbl='-C --chdir -f --file -u --unset -S --split-string -a --argv0' ;;
-        nice)    tbl='-n --adjustment' ;;
-        ionice)  tbl='-c --class -n --classdata -p --pid -P --pgid -u --uid' ;;
-        setpriv) tbl='--ambient-caps --inh-caps --bounding-set --ruid --euid --rgid --egid --reuid --regid --groups --securebits --pdeathsig --ptracer --selinux-label --apparmor-profile --landlock-access --landlock-rule --seccomp-filter' ;;
-        timeout) tbl='-k --kill-after -s --signal' ;;
-        chrt)    tbl='-T --sched-runtime -P --sched-period -D --sched-deadline' ;;
-        stdbuf)  tbl='-i --input -o --output -e --error' ;;
-        exec)    tbl='-a' ;;
-        *)       return 1 ;;
-    esac
-    case " $tbl " in
-        *" $t "*) return 0 ;;
-    esac
-    return 1
-}
-
-_cf_opt_seen_takes_value() { # <已见包装器串> <token>
-    local w
-    for w in $1; do
-        _cf_opt_takes_value "$w" "$2" && return 0
-    done
-    return 1
-}
-
-_cf_wrap_pos_count() { # <包装器名> -> 该包装器在真命令前有几个"前置位置参数"
-    case "$1" in
-        timeout|chrt|taskset) printf '%s' 1 ;;   # DURATION / PRIORITY / MASK
-        *)                    printf '%s' 0 ;;
-    esac
-}
-
-# 包装器取值按已见选项表跳过，命令串用数组切片；不把包装器当归属二进制。
+# 取启动行的第一个命令词；跳过常见包装器与纯数字参数, 其余认不出交给调用方拒绝。
 _cf_first_bin_word() {
-    local text="$1" depth="${2:-0}" tok inner
+    local text="$1" tok
     local -a _w
     read -ra _w <<< "$text"
-    local _i _next _wrap="" _seen="" _wantarg=0 _pos=0
-    for ((_i=0; _i<${#_w[@]}; _i++)); do
-        tok="${_w[$_i]}"
+    for tok in "${_w[@]}"; do
         tok="${tok#\"}"; tok="${tok%\"}"
         tok="${tok#\'}"; tok="${tok%\'}"
-        [ -n "$tok" ] || continue
-        if [ "$_wantarg" -eq 1 ]; then _wantarg=0; continue; fi
+        case "$tok" in ''|-*) continue ;; esac
+        case "$tok" in [A-Za-z_]*=*) continue ;; esac   # NAME=value => 环境赋值
+        case "$tok" in *[!0-9]*) ;; *) continue ;; esac # 纯数字 => 包装器/命令的时长等参数
         case "${tok##*/}" in
-            env|nice|ionice|setpriv|timeout|chrt|taskset|busybox|nohup|setsid|stdbuf|exec)
-                _wrap="${tok##*/}"
-                _seen="$_seen $_wrap"
-                _pos=$(_cf_wrap_pos_count "$_wrap")
-                continue ;;
-            sh|bash|dash|ash|ksh|zsh)
-                _next="${_w[$((_i+1))]:-}"
-                if [ "$depth" -lt 2 ] && [ "$_next" = "-c" ] && [ -n "${_w[$((_i+2))]:-}" ]; then
-                    inner="${_w[*]:$((_i+2))}"
-                    _cf_first_bin_word "$inner" $((depth+1))
-                    return $?
-                fi
-                printf '%s' "$tok"; return 0 ;;
+            env|nice|ionice|setpriv|timeout|chrt|taskset|nohup|setsid|stdbuf|exec) continue ;;
         esac
-        if [ -n "$_seen" ] && [ "${tok#-}" != "$tok" ] && _cf_opt_seen_takes_value "$_seen" "$tok"; then
-            case "${tok##*/}" in
-                -S|--split-string)
-                    if [ "$depth" -lt 2 ] && [ -n "${_w[$((_i+1))]:-}" ]; then
-                        inner="${_w[*]:$((_i+1))}"
-                        _cf_first_bin_word "$inner" $((depth+1))
-                        return $?
-                    fi ;;
-            esac
-            _wantarg=1
-            continue
-        fi
-        case "$tok" in
-            -*) continue ;;
-        esac
-        if [ "$_pos" -gt 0 ]; then _pos=$((_pos-1)); continue; fi
-        case "$tok" in
-            [A-Za-z_]*=*) continue ;;   # NAME=value => 环境赋值
-            *[!0-9]*) printf '%s' "$tok"; return 0 ;;   # 含非数字 => 这就是二进制
-            *) continue ;;                              # 纯数字 => 包装器的参数
-        esac
+        printf '%s' "$tok"; return 0
     done
     return 1
 }
@@ -843,64 +768,6 @@ _cf_grace_wait_seconds() {
     printf '%s' "$(( secs + CF_GRACE_MARGIN ))"
 }
 
-_cf_systemd_span_seconds() {
-    local span="$1" tok int frac unit scale div mult total_us=0 nonzero=0
-    [ -n "$span" ] || return 1
-    for tok in $span; do
-        [[ "$tok" =~ ^([0-9]+)(\.([0-9]+))?(us|ms|s|min|h|d|w|month|y)$ ]] || return 1
-        int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"; unit="${BASH_REMATCH[4]}"
-        [ "${#int}" -le 9 ] || return 1
-        case "$unit" in
-            us)    mult=1 ;;
-            ms)    mult=1000 ;;
-            s)     mult=1000000 ;;
-            min)   mult=60000000 ;;
-            h)     mult=3600000000 ;;
-            d)     mult=86400000000 ;;
-            w)     mult=604800000000 ;;
-            month) mult=2629800000000 ;;
-            y)     mult=31557600000000 ;;
-        esac
-        case "$int" in *[!0]*) nonzero=1 ;; esac
-        total_us=$(( total_us + 10#$int * mult ))
-        if [ -n "$frac" ]; then
-            case "$frac" in *[!0]*) nonzero=1 ;; esac
-            scale="${#frac}"
-            [ "$scale" -gt 6 ] && { frac="${frac:0:6}"; scale=6; }
-            case "$scale" in
-                1) div=10 ;; 2) div=100 ;; 3) div=1000 ;;
-                4) div=10000 ;; 5) div=100000 ;; *) div=1000000 ;;
-            esac
-            total_us=$(( total_us + 10#$frac * mult / div ))
-        fi
-    done
-    [ "$total_us" -lt 0 ] && return 1
-    [ "$total_us" -eq 0 ] && [ "$nonzero" -eq 1 ] && total_us=1
-    printf '%s' "$(( (total_us + 999999) / 1000000 ))"
-}
-
-_cf_systemd_stop_timeout_seconds() {
-    local span
-    span=$(systemctl show -p TimeoutStopUSec --value cloudflared 2>/dev/null) || return 2
-    [ -n "$span" ] || return 2
-    _cf_systemd_span_seconds "$span" || return 1
-}
-
-_cf_check_stop_timeout_covers() {
-    local want="$1" have st_rc=0
-    [ "${INIT_SYSTEM:-}" = systemd ] || return 0
-    _cf_unit_stopped || st_rc=$?
-    if [ "$st_rc" -eq 0 ] && [ -z "$(_cf_pids_owned)" ]; then
-        return 0
-    fi
-    have=$(_cf_systemd_stop_timeout_seconds) || return 0
-    [ "$have" -ge "$want" ] && return 0
-    _warn "systemd 的停止超时(${have}s)短于宽限期 + 余量(${want}s), cloudflared 可能在其宽限期走完前就被 systemd 终止"
-    _tip "如需完整等待宽限期, 请提高 unit 的 TimeoutStopSec(当前生效值 ${have}s)"
-    _tip "可用 systemctl edit cloudflared 添加 [Service] TimeoutStopSec=<秒数> 后重试"
-    return 1
-}
-
 # 仅 inactive/failed 且 MainPID=0 算停止；deactivating 和读取失败不是终态。
 _cf_unit_stopped() {
     local active mainpid
@@ -943,7 +810,6 @@ _cf_kill_all() {
     case "$INIT_SYSTEM" in
         systemd)
             _cf_grace=$(_cf_grace_wait_seconds)
-            _cf_check_stop_timeout_covers "$_cf_grace" || true
             systemctl --no-block stop cloudflared 2>/dev/null || true
             _cf_wait_exit "$_cf_grace"; rc=$?
             case "$rc" in
@@ -1235,7 +1101,7 @@ _uninstall_cloudflared() {
         _tip "服务定义已保留; 修复进程清理后再重试卸载"
         return 1
     fi
-    local cleanup_rc=0 service_rc=0 enabled runlevels d link
+    local cleanup_rc=0 service_rc=0 d link
     if [ -e /etc/cloudflared/token ] || [ -L /etc/cloudflared/token ]; then
         rm -f /etc/cloudflared/token || cleanup_rc=1
     fi
@@ -1255,20 +1121,6 @@ _uninstall_cloudflared() {
             [ ! -e "$CF_UNIT_SYSTEMD" ] && [ ! -L "$CF_UNIT_SYSTEMD" ] \
                 && [ ! -e "${CF_UNIT_SYSTEMD}.bak" ] && [ ! -L "${CF_UNIT_SYSTEMD}.bak" ] || cleanup_rc=1
             systemctl daemon-reload 2>/dev/null || cleanup_rc=1
-            local load_state
-            load_state=$(systemctl show -p LoadState --value cloudflared 2>/dev/null || true)
-            if [ "$load_state" = not-found ]; then
-                :
-            elif [ -n "$load_state" ]; then
-                enabled=$(systemctl is-enabled cloudflared 2>/dev/null || true)
-                case "$enabled" in
-                    disabled|masked|masked-runtime|static|indirect|not-found) ;;
-                    *) cleanup_rc=1 ;;
-                esac
-            else
-                _error "无法确认 cloudflared systemd unit 是否已移除"
-                cleanup_rc=1
-            fi
             if command -v find >/dev/null 2>&1; then
                 for d in /etc/systemd/system /run/systemd/system; do
                     [ -d "$d" ] || continue
@@ -1284,8 +1136,14 @@ _uninstall_cloudflared() {
             rm -f "$CF_UNIT_OPENRC" "${CF_UNIT_OPENRC}.bak" || cleanup_rc=1
             [ ! -e "$CF_UNIT_OPENRC" ] && [ ! -L "$CF_UNIT_OPENRC" \
                 ] && [ ! -e "${CF_UNIT_OPENRC}.bak" ] && [ ! -L "${CF_UNIT_OPENRC}.bak" ] || cleanup_rc=1
-            runlevels=$(rc-update show 2>/dev/null) || cleanup_rc=1
-            case "$runlevels" in *cloudflared*) cleanup_rc=1 ;; esac
+            # rc-update 返回成功不等于 runlevel 链接已消失; 残留按完整路径报出, 不宣称卸载干净。
+            for d in /etc/runlevels/*; do
+                [ -d "$d" ] || continue
+                if [ -e "$d/cloudflared" ] || [ -L "$d/cloudflared" ]; then
+                    _warn "runlevel 仍残留 cloudflared 链接: $d/cloudflared"
+                    cleanup_rc=1
+                fi
+            done
             ;;
     esac
     rm -f /run/cloudflared.pid /var/run/cloudflared.pid 2>/dev/null || cleanup_rc=1

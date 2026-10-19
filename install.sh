@@ -107,7 +107,7 @@ _verify_installed() {
     [ -s "$DEPLOY_DIR/xray-deploy.sh" ] || bad="$bad xray-deploy.sh"
     if [ -n "$bad" ]; then
         echo "[错误] 安装后复核失败, 以下文件缺失或为空:${bad}"
-        echo "       请清理 $DEPLOY_DIR 后重试"
+        echo "       请按上面列出的路径逐个检查修复; 不要整体删除 $DEPLOY_DIR (会连带删除 confs/ 与 nodes/)"
         return 1
     fi
     return 0
@@ -124,25 +124,15 @@ _install_relpaths() {
 
 # 快照内容比对与定向落盘分工不同：前者证明字节完整，后者保证 .KEEP 提交顺序。
 _install_backup_identical() {   # <src> <dst>; 逐字节一致返回 0
-    if command -v cmp >/dev/null 2>&1; then
-        cmp -s "$1" "$2" 2>/dev/null
-        return $?
-    fi
-    # cmp 缺失(裁剪版 busybox)时退回长度比较: 强于"只看存在", 但发现不了等长损坏。
-    [ "$(wc -c < "$1" 2>/dev/null)" = "$(wc -c < "$2" 2>/dev/null)" ]
+    cmp -s "$1" "$2" 2>/dev/null
 }
 
 # 只用定向 sync；裸 sync 无法证明目标落盘(安装侧不降级为全局 sync)。
+# 能力缺失只告警一次：内容已比对, 不因此拒绝安装。
 _install_fsync() {   # <path>
     [ -e "$1" ] || return 0
     sync "$1" 2>/dev/null && return 0
     sync -f "$1" 2>/dev/null && return 0
-    return 1
-}
-
-# 定向落盘能力缺失只告警一次；内容已比对，不因此拒绝安装。
-_install_fsync_or_warn() {   # <path>
-    _install_fsync "$1" && return 0
     if [ "${_install_fsync_noted:-0}" -eq 0 ]; then
         echo "[警告] 本机 sync 不支持定向刷新, 恢复快照缺少掉电持久化屏障"
         _install_fsync_noted=1
@@ -151,7 +141,7 @@ _install_fsync_or_warn() {   # <path>
 }
 
 _install_backup() {
-    local rel dest bak keep_tmp record_count=0 sums crc bytes
+    local rel dest bak keep_tmp
     # .KEEP 目录不可复用；返回 2 表示恢复源占用，返回 1 表示备份失败。
     if [ -L "$ROLLBACK_DIR" ] || { [ -e "$ROLLBACK_DIR" ] && [ ! -d "$ROLLBACK_DIR" ]; }; then
         echo "[错误] 恢复路径 $ROLLBACK_DIR 不是普通目录, 拒绝使用"
@@ -170,6 +160,7 @@ _install_backup() {
     fi
     mkdir -p "$ROLLBACK_DIR" 2>/dev/null || return 1
     keep_tmp="$ROLLBACK_DIR/.KEEP.tmp.$$"
+    # 版本号 v2 不变：尾行兼容旧 'complete <count> <crc> <bytes>' 与现 'complete' 两种。
     printf '%s\n' 'xray-install-backup-v2' > "$keep_tmp" 2>/dev/null || return 1
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
@@ -184,7 +175,7 @@ _install_backup() {
                 echo "[错误] 备份内容与源不一致(cp 未完整落盘?), 拒绝继续: $rel"
                 return 1
             fi
-            _install_fsync_or_warn "$bak"
+            _install_fsync "$bak"
             printf 'present %s\n' "$rel" >> "$keep_tmp" 2>/dev/null || return 1
         else
             # 当前缺失的目标须移除旧副本，避免恢复时与 absent 记录矛盾。
@@ -195,18 +186,13 @@ _install_backup() {
             fi
             printf 'absent %s\n' "$rel" >> "$keep_tmp" 2>/dev/null || return 1
         fi
-        record_count=$((record_count + 1))
     done <<< "$(_install_relpaths)"
-    [ "$record_count" -ge 2 ] || return 1
-    sums=$(sed '1d' "$keep_tmp" | cksum) || return 1
-    read -r crc bytes _ <<< "$sums"
-    [[ "$crc" =~ ^[0-9]+$ && "$bytes" =~ ^[0-9]+$ ]] || return 1
-    printf 'complete %s %s %s\n' "$record_count" "$crc" "$bytes" >> "$keep_tmp" 2>/dev/null || return 1
+    printf 'complete\n' >> "$keep_tmp" 2>/dev/null || return 1
     # 先刷备份、清单及目录，再提交 .KEEP 并刷目录；标记只声明完整快照。
-    _install_fsync_or_warn "$keep_tmp"
-    _install_fsync_or_warn "$ROLLBACK_DIR"
+    _install_fsync "$keep_tmp"
+    _install_fsync "$ROLLBACK_DIR"
     mv -f "$keep_tmp" "$ROLLBACK_DIR/.KEEP" 2>/dev/null || return 1
-    _install_fsync_or_warn "$ROLLBACK_DIR"
+    _install_fsync "$ROLLBACK_DIR"
     _install_snapshot_read_entries "$ROLLBACK_DIR" 0 >/dev/null || {
         echo "[错误] 新建恢复快照校验失败: $ROLLBACK_DIR"
         return 1
@@ -234,9 +220,8 @@ _install_snapshot_rel_ok() {
 }
 
 _install_snapshot_read_entries() {
-    local d="$1" require_marker="${2:-1}" name suffix keep line footer_line marker
-    local state rel extra count=0 seen='|' entries='' sums crc bytes
-    local declared_count declared_crc declared_bytes saw_entrypoint=0 saw_version=0 trailer=0
+    local d="$1" require_marker="${2:-1}" name suffix keep line marker
+    local state rel extra count=0 seen='|' entries='' saw_entrypoint=0 saw_version=0 trailer=0
     name="${d##*/}"
     case "$name" in .install-rollback.*) suffix="${name#.install-rollback.}" ;; *) return 1 ;; esac
     case "$suffix" in ''|*[!0-9]*) return 1 ;; esac
@@ -254,7 +239,7 @@ _install_snapshot_read_entries() {
         return 1
     fi
     while IFS= read -r line <&3 || [ -n "$line" ]; do
-        case "$line" in complete\ *) footer_line="$line"; trailer=1; break ;; esac
+        case "$line" in complete|complete\ *) trailer=1; break ;; esac
         [[ "$line" =~ ^(present|absent)[[:space:]]([^[:space:]]+)$ ]] || { exec 3<&-; return 1; }
         state="${BASH_REMATCH[1]}"; rel="${BASH_REMATCH[2]}"
         _install_snapshot_rel_ok "$rel" || { exec 3<&-; return 1; }
@@ -282,13 +267,6 @@ _install_snapshot_read_entries() {
     if IFS= read -r extra <&3 || [ -n "$extra" ]; then exec 3<&-; return 1; fi
     exec 3<&-
     [ "$count" -ge 2 ] && [ "$saw_entrypoint" -eq 1 ] && [ "$saw_version" -eq 1 ] || return 1
-    read -r marker declared_count declared_crc declared_bytes extra <<< "$footer_line"
-    [ "$marker" = complete ] && [ -z "${extra:-}" ] || return 1
-    [[ "$declared_count" =~ ^[0-9]+$ && "$declared_crc" =~ ^[0-9]+$ && "$declared_bytes" =~ ^[0-9]+$ ]] || return 1
-    [ "$declared_count" -eq "$count" ] || return 1
-    sums=$(printf '%s' "$entries" | cksum) || return 1
-    read -r crc bytes _ <<< "$sums"
-    [ "$crc" = "$declared_crc" ] && [ "$bytes" = "$declared_bytes" ] || return 1
     printf '%s' "$entries"
 }
 
@@ -484,8 +462,8 @@ download_all() {
         return 1
     }
     # 落地标记先持久化，_install_recover_interrupted 才能识别中断发布。
-    _install_fsync_or_warn "$(_install_txn_marker)"
-    _install_fsync_or_warn "$ROLLBACK_DIR"
+    _install_fsync "$(_install_txn_marker)"
+    _install_fsync "$ROLLBACK_DIR"
     local copy_ok=1 m
     _install_file "$stage/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || copy_ok=0
     chmod +x "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null || copy_ok=0
@@ -520,9 +498,9 @@ download_all() {
     return 0
 }
 
-# 链接创建后验证 xd 实际目标；ln 成功也可能只是写进已有目录。
+# 创建 xd 快捷链接；目标若是目录, ln 会把链接写进目录内部, 必须先拒绝。
 _install_xd_link() {
-    local bin_dir want got
+    local bin_dir
     bin_dir=$(dirname "$INSTALL_BIN")
     mkdir -p "$bin_dir" || { echo "[错误] 无法创建命令目录: $bin_dir"; return 1; }
     if [ -d "$INSTALL_BIN" ] && [ ! -L "$INSTALL_BIN" ]; then
@@ -537,13 +515,17 @@ _install_xd_link() {
         echo "[错误] 设置快捷命令执行权限失败: $INSTALL_BIN"
         return 1
     fi
-    want=$(readlink -f "$DEPLOY_DIR/xray-deploy.sh" 2>/dev/null) || want="$DEPLOY_DIR/xray-deploy.sh"
-    got=$(readlink -f "$INSTALL_BIN" 2>/dev/null) || got=""
-    if [ ! -x "$INSTALL_BIN" ] || [ "$got" != "$want" ]; then
-        echo "[错误] 快捷命令链接校验失败: $INSTALL_BIN"
-        return 1
-    fi
     return 0
+}
+
+# 精简 PATH(cron/容器)下 command -v 会漏掉 flock: 补回标准目录, 让后续裸 flock 可用。
+_flock_ensure() {
+    command -v flock >/dev/null 2>&1 && return 0
+    local d
+    for d in /usr/bin /bin /usr/sbin /sbin; do
+        [ -x "$d/flock" ] && { PATH="${PATH:+$PATH:}$d"; export PATH; return 0; }
+    done
+    return 1
 }
 
 # 安装锁串行化整版本事务：flock 优先，mkdir 退路永不自动接管。
@@ -555,7 +537,6 @@ _install_lock_root() {
     printf '%s' "/var/lock/xray-deploy"
 }
 INSTALL_LOCK_HELD=0
-INSTALL_PRIMARY_MARKER_HELD=0
 INSTALL_LOCK_FD=""
 
 _install_lock_owner_pid() {   # [锁目录]; 输出持有者 PID; 非数字/空/**数值为 0** 一律输出空(视为"无法判定")
@@ -618,69 +599,6 @@ _install_lock_mkdir_release() {   # <锁目录>; 归属校验后才删
     return 0
 }
 
-# flock/mkdir 共用目录 marker 交叉协调；仅排他 flock + 同 inode 见证可自愈。
-_install_primary_marker_take() {  # caller already holds INSTALL_LOCK_FD
-    local devino witness owner i
-    devino=$(_install_lock_devino "$INSTALL_LOCK_FILE") || devino=""
-    [ -n "$devino" ] || { echo "[错误] 无法读取安装 flock 文件标识, 安装中止"; return 1; }
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        if mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
-            owner="${BASHPID:-$$}"
-            if printf '%s\n' "$owner" > "$INSTALL_LOCK_DIR/pid" 2>/dev/null \
-               && printf '%s\n' "$devino" > "$INSTALL_LOCK_DIR/.witness" 2>/dev/null \
-               && [ "$(cat "$INSTALL_LOCK_DIR/.witness" 2>/dev/null)" = "$devino" ]; then
-                INSTALL_PRIMARY_MARKER_HELD=1
-                return 0
-            fi
-            # mkdir 刚成功, 目录必属本次调用; 见证写入失败也必须清理, 否则残留无 .witness 的锁目录。
-            rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null
-            echo "[错误] 无法建立安装锁跨后端见证标记, 安装中止"
-            return 1
-        fi
-        if [ -d "$INSTALL_LOCK_DIR" ] && [ ! -L "$INSTALL_LOCK_DIR" ] \
-           && [ -f "$INSTALL_LOCK_DIR/.witness" ] && [ ! -L "$INSTALL_LOCK_DIR/.witness" ]; then
-            witness=$(cat "$INSTALL_LOCK_DIR/.witness" 2>/dev/null) || witness=""
-            if [ "$witness" = "$devino" ]; then
-                if rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null \
-                   && [ ! -e "$INSTALL_LOCK_DIR" ] && [ ! -L "$INSTALL_LOCK_DIR" ]; then
-                    continue
-                fi
-                echo "[错误] 无法清理安装锁陈旧 flock 见证, 安装中止"
-                return 1
-            fi
-            echo "[错误] 安装锁见证身份不符, 拒绝接管: $INSTALL_LOCK_DIR"
-            return 1
-        fi
-        sleep 1
-    done
-    echo "[错误] 等待安装 mkdir 后端互斥超时或发现残留锁: $INSTALL_LOCK_DIR"
-    return 1
-}
-
-_install_primary_marker_release() {
-    [ "${INSTALL_PRIMARY_MARKER_HELD:-0}" = "1" ] || return 0
-    local devino owner witness
-    owner=$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null) || owner=""
-    witness=$(cat "$INSTALL_LOCK_DIR/.witness" 2>/dev/null) || witness=""
-    devino=$(_install_lock_devino "$INSTALL_LOCK_FILE") || devino=""
-    if [ "$owner" != "${BASHPID:-$$}" ] || [ -z "$devino" ] || [ "$witness" != "$devino" ]; then
-        echo "[错误] 安装锁见证归属/身份校验失败, 保留: $INSTALL_LOCK_DIR"
-        INSTALL_PRIMARY_MARKER_HELD=0
-        return 1
-    fi
-    if ! rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null \
-       || [ -e "$INSTALL_LOCK_DIR" ] || [ -L "$INSTALL_LOCK_DIR" ]; then
-        echo "[错误] 无法删除安装锁见证: $INSTALL_LOCK_DIR"
-        INSTALL_PRIMARY_MARKER_HELD=0
-        return 1
-    fi
-    INSTALL_PRIMARY_MARKER_HELD=0
-    return 0
-}
-
-# 路径的 dev:ino 标识(mkdir 标记的自愈判定)。取不到输出空; 调用方必须 fail-closed。
-_install_lock_devino() { stat -c '%d:%i' "$1" 2>/dev/null; }
-
 # 安装锁串行化整版本事务：flock 优先，mkdir 退路永不自动接管。
 _install_lock_acquire() {
     local lockdir=""
@@ -691,7 +609,7 @@ _install_lock_acquire() {
         return 1
     }
     # flock 优先：内核仲裁，最后一个继承 fd 关闭才释放。
-    if command -v flock >/dev/null 2>&1; then
+    if _flock_ensure; then
         # 动态 FD 避免与 config 锁 fd 9 冲突；exec 其他重定向放组外，避免永久污染 stderr。
         { exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_FILE"; } 2>/dev/null || {
             INSTALL_LOCK_FD=""
@@ -699,10 +617,6 @@ _install_lock_acquire() {
         if flock -n "$INSTALL_LOCK_FD" 2>/dev/null; then
             INSTALL_LOCK_HELD=1
             { printf '%s\n' "$$" >&"$INSTALL_LOCK_FD"; } 2>/dev/null || true   # 仅供诊断, 权威在 fd
-            if ! _install_primary_marker_take; then
-                _install_lock_release
-                return 1
-            fi
             if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
                 echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
                 _install_lock_release
@@ -729,10 +643,6 @@ _install_lock_acquire() {
 
 _install_lock_release() {
     [ "${INSTALL_LOCK_HELD:-0}" = "1" ] || return 0
-    local rc=0
-    if [ "${INSTALL_PRIMARY_MARKER_HELD:-0}" = "1" ]; then
-        _install_primary_marker_release || rc=1
-    fi
     if [ -n "${INSTALL_LOCK_FD:-}" ]; then
         # 关闭 FD 释放 flock，不删除锁文件，避免已打开 inode 与新路径分裂。
         flock -u "$INSTALL_LOCK_FD" 2>/dev/null
@@ -743,7 +653,7 @@ _install_lock_release() {
         _install_lock_mkdir_release "$INSTALL_LOCK_DIR"
     fi
     INSTALL_LOCK_HELD=0
-    return "$rc"
+    return 0
 }
 
 # 参数解析
@@ -825,21 +735,7 @@ LOCAL_TRUSTED=0
 [ -e "${LOCAL_DIR}/.git" ] && LOCAL_TRUSTED=1
 if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     echo "[信息] 检测到本地源, 从本地拷贝"
-    # 本地也走整版本事务；先预检清单，再备份，不完整源不得改目标。
-    if [ ! -d "${LOCAL_DIR}/lib" ]; then
-        echo "[错误] 本地源缺少 lib/ 目录, 安装中止"; exit 1
-    fi
-    # 预检实际模块清单，避免复制成功却缺加载模块。
-    local_missing=""
-    for m in $LIB_MODULES; do
-        [ -f "${LOCAL_DIR}/lib/${m}.sh" ] || local_missing="${local_missing} ${m}.sh"
-    done
-    if [ -n "$local_missing" ]; then
-        echo "[错误] 本地源 lib/ 缺少模块:${local_missing}"; exit 1
-    fi
-    if [ ! -d "${LOCAL_DIR}/templates" ]; then
-        echo "[错误] 本地源缺少 templates/ 目录, 安装中止"; exit 1
-    fi
+    # 本地也走整版本事务；templates 与 VERSION 在备份前预检，lib/ 缺失在落地阶段失败并回滚。
     tpl_missing=""
     for t in $TPL_NAMES; do
         [ -f "${LOCAL_DIR}/templates/${t}.server.jsonc" ] || tpl_missing="${tpl_missing} ${t}.server.jsonc"
@@ -869,8 +765,8 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
         echo "[错误] 无法写入安装事务标记, 未改动任何文件"; exit 1
     }
     # 发布标记先持久化，见 download_all。
-    _install_fsync_or_warn "$(_install_txn_marker)"
-    _install_fsync_or_warn "$ROLLBACK_DIR"
+    _install_fsync "$(_install_txn_marker)"
+    _install_fsync "$ROLLBACK_DIR"
     local_ok=1
     _install_file "${LOCAL_DIR}/xray-deploy.sh" "$DEPLOY_DIR/xray-deploy.sh" || local_ok=0
     # 执行位设置失败纳入整版本回滚，不能谎报可运行。
@@ -918,7 +814,7 @@ else
     fi
 fi
 
-# 快捷链接结果必须验证；失败报错但保留已发布文件，重跑可修复。
+# 快捷命令：建目录 → 拒绝目录目标 → ln -sfn → chmod +x；失败报错但保留已发布文件，重跑可修复。
 _install_xd_link || exit 1
 # xray 命令 symlink（检测已有安装不覆盖）
 if [ ! -e /usr/local/bin/xray ] || [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$DEPLOY_DIR/bin/xray" ]; then

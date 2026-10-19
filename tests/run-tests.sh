@@ -770,33 +770,15 @@ _state_set logrotate_enabled off
 LOGROTATE_CONF="$TMP/logrotate.conf"
 
 
-printf '== cross-backend config lock ==\n'
+# clash 探针需要一个测试用锁根: 覆盖 _deploy_lock_root, 避免触碰真实 /var/lock。
 LOCK_ROOT="$TMP/mixed-locks"
 mkdir -p "$LOCK_ROOT"
 _deploy_lock_root() { printf '%s' "$LOCK_ROOT"; }
-LOCK_FILE="$LOCK_ROOT/config.lock"
-LOCK_DIR="$LOCK_ROOT/config.lock.d"
-{ exec {TEST_LOCK_FD}>>"$LOCK_FILE"; } 2>/dev/null
-flock -n "$TEST_LOCK_FD"
-if _xray_primary_flock_marker_take "$TEST_LOCK_FD" "$LOCK_FILE" "$LOCK_DIR" 'test config'; then
-    if (
-        command() { [ "${1:-}" = -v ] && [ "${2:-}" = flock ] && return 1; builtin command "$@"; }
-        _with_config_lock :
-    ) >/dev/null 2>&1; then
-        fail 'mkdir backend excluded by active flock marker'
-    else
-        pass 'mkdir backend excluded by active flock marker'
-    fi
-    _xray_primary_flock_marker_release "$LOCK_FILE" "$LOCK_DIR" 'test config'
-else
-    fail 'flock backend creates exclusion marker'
-fi
-flock -u "$TEST_LOCK_FD"; eval "exec ${TEST_LOCK_FD}>&-"
 
 printf '== clash derivation runs under the config lock ==\n'
 # clash.yaml 是 Xray 节点与官方 Hysteria 节点共用的派生文件, 追加/替换/去重
-# 都是读-改-写 ⇒ 不进 config lock 就会丢条目。探针把"写"缩短成记录锁状态, 观察写发生时
-# 是否持有 flock 后端见证标记 —— 见证目录只在持锁期间存在(`_xray_primary_flock_marker_take`)。
+# 都是读-改-写 ⇒ 不进 config lock 就会丢条目。探针把"写"缩短成记录锁状态: 直接对被观察
+# 写时刻的 config.lock 试加 flock, 加得上就是没持锁。
 CLASH_PROBE_META="$TMP/clash-probe.json"
 CLASH_PROBE_STATE="$TMP/clash-probe-state"
 printf '{"name":"lock-probe"}\n' > "$CLASH_PROBE_META"
@@ -807,9 +789,12 @@ _clash_lock_probe() {   # $1=标签, 其余=被观察的调用; 输出 "<标签>
     printf 'proxies:\n  - {name: "lock-probe", type: vless}\n' > "$CLASH_YAML"
     : > "$CLASH_PROBE_STATE"
     _probe_lock_state() {
-        local d
-        d="$(_deploy_lock_root)/config.lock.d"
-        if [ -f "$d/.witness" ]; then printf 'held'; else printf 'free'; fi
+        local fd
+        # 无 flock 的宿主上 flock -n 恒失败 ⇒ 只能报 unknown, 否则断言退化为恒真。
+        command -v flock >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+        { exec {fd}>>"$(_deploy_lock_root)/config.lock"; } 2>/dev/null || { printf 'unknown'; return 0; }
+        if flock -n "$fd" 2>/dev/null; then printf 'free'; else printf 'held'; fi
+        eval "exec ${fd}>&-" 2>/dev/null || :
     }
     _rebuild_clash_line() { printf '%s' '- {name: "lock-probe"}'; }
     _hysteria_clash_line() { printf '%s' '- {name: "lock-probe"}'; }
@@ -824,9 +809,16 @@ XH_CLASH_PROBE=$(_clash_lock_probe xray _sync_node_clash "$CLASH_PROBE_META")
 XH_HY_PROBE=$(_clash_lock_probe hysteria _hysteria_sync_clash "$CLASH_PROBE_META")
 # 已持锁时的嵌套调用必须直接执行(经 XRAY_DEPLOY_LOCK_HELD), 不得再等一次锁(那会 14s 后失败)
 XH_NESTED_PROBE=$(_clash_lock_probe nested _with_config_lock _sync_node_clash "$CLASH_PROBE_META")
-check_eq 'Xray clash write holds the config lock' 'xray=held rc=0 leak=no' "$XH_CLASH_PROBE"
-check_eq 'Hysteria clash write holds the config lock' 'hysteria=held rc=0 leak=no' "$XH_HY_PROBE"
-check_eq 'nested clash sync is reentrant' 'nested=held rc=0 leak=no' "$XH_NESTED_PROBE"
+# 有 flock 的宿主必须看到 held(真检查); 无 flock 时探针只能报 unknown, 接受但不再当作持锁证据。
+_check_lock_probe() {   # <名称> <探针输出>
+    case "$2" in
+        *"=held rc=0 leak=no"|*"=unknown rc=0 leak=no") pass "$1" ;;
+        *) fail "$1 (expected held|unknown, got [$2])" ;;
+    esac
+}
+_check_lock_probe 'Xray clash write holds the config lock' "$XH_CLASH_PROBE"
+_check_lock_probe 'Hysteria clash write holds the config lock' "$XH_HY_PROBE"
+_check_lock_probe 'nested clash sync is reentrant' "$XH_NESTED_PROBE"
 
 
 
@@ -1266,6 +1258,13 @@ _test_reset_restore_mixed_lib() {
     return "$ok"
 }
 check 'reset snapshot restore rejects mixed-lib without shared constant' _test_reset_restore_mixed_lib
+# install.sh 与 lib/00-common.sh 的 _flock_ensure 靠人肉同步, 漂移会让安装器与加载器选到不同锁后端。
+if diff -q <(sed -n '/^_flock_ensure()/,/^}/p' "$ROOT/install.sh") \
+           <(sed -n '/^_flock_ensure()/,/^}/p' "$ROOT/lib/00-common.sh") >/dev/null 2>&1; then
+    pass '_flock_ensure 两份副本一致'
+else
+    fail '_flock_ensure 副本漂移: install.sh 与 lib/00-common.sh 不一致'
+fi
 # 专属行为套件在独立进程内运行, 不泄漏服务/配置桩到本套件。
 for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then

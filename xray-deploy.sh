@@ -13,27 +13,17 @@ export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(dirname "$SELF_PATH")"
 
-# 等安装锁前记录已打开入口 inode；发布会替换路径，不能仅比路径名。
-_bootstrap_entry_open_identity() {
-    local fd target
-    for fd in /proc/"$$"/fd/*; do
-        target=$(readlink "$fd" 2>/dev/null) || continue
-        target="${target% (deleted)}"
-        [ "$target" = "$SELF_PATH" ] || continue
-        stat -Lc '%d:%i' "$fd" 2>/dev/null && return 0
-    done
-    return 1
-}
-_BOOTSTRAP_ENTRY_ID=$(_bootstrap_entry_open_identity 2>/dev/null || true)
+# 等锁前记录入口 inode；发布会替换路径，取锁后需比对是否已换代。
+_BOOTSTRAP_ENTRY_ID=$(stat -Lc '%d:%i' "$SELF_PATH" 2>/dev/null) || _BOOTSTRAP_ENTRY_ID=""
 
 # lib 目录: 优先与本脚本同目录的 lib/, 否则 /opt/xray-deploy/lib(安装后)
 LIB_DIR="$SCRIPT_DIR/lib"
 [ -d "$LIB_DIR" ] || LIB_DIR="/opt/xray-deploy/lib"
 
-# LIB_MODULES 与安装器一致；source 前逐项检查可读，缺模块即拒绝不完整安装。
+# LIB_MODULES 与安装器一致；source 失败即拒绝不完整安装。
 LIB_MODULES="00-common 10-system 20-xray-core 30-geo 35-warp 40-cloudflared 45-logrotate 50-nodes 51-reality-pq 55-hysteria 90-menu"
 
-# 模块检查/source 前持安装读锁，避免混用不同发布代的文件。
+# source 前持安装读锁，避免混用不同发布代的文件。
 _BOOTSTRAP_LOCK_ROOT="/var/lock/xray-deploy"
 if ! mkdir -p "$_BOOTSTRAP_LOCK_ROOT" 2>/dev/null; then
     _BOOTSTRAP_LOCK_ROOT="/run/lock/xray-deploy"
@@ -45,91 +35,19 @@ fi
 _BOOTSTRAP_LOCK_FILE="$_BOOTSTRAP_LOCK_ROOT/install.lock.fd"
 _BOOTSTRAP_LOCK_DIR="$_BOOTSTRAP_LOCK_ROOT/install.lock"
 _BOOTSTRAP_LOCK_FD=""
-_BOOTSTRAP_LOCK_MODE=""
 _BOOTSTRAP_MARKER_HELD=0
 
-_bootstrap_lock_file_open_status() {  # 0=open, 1=not open, 2=observation unknown
-    local want="$1" matches find_rc p pid target
-    if command -v find >/dev/null 2>&1; then
-        matches=$(find /proc/[0-9]*/fd -type l -lname "$want" -print -quit 2>/dev/null)
-        find_rc=$?
-        if [ "$find_rc" -eq 0 ]; then
-            [ -n "$matches" ] && return 0
-            return 1
-        fi
-    fi
-    [ -d /proc ] || return 2
-    for p in /proc/[0-9]*/fd/*; do
-        pid=${p#/proc/}; pid=${pid%%/*}
-        [ "$pid" = "${BASHPID:-$$}" ] && continue
-        target=$(readlink "$p" 2>/dev/null) || return 2
-        [ "$target" = "$want" ] && return 0
-    done
-    return 1
-}
-
-_bootstrap_flock_marker_take() {  # caller already owns the install flock
-    local devino witness owner
-    devino=$(stat -c '%d:%i' "$_BOOTSTRAP_LOCK_FILE" 2>/dev/null) || devino=""
-    [ -n "$devino" ] || { echo "[错误] 无法读取安装锁文件标识, 模块加载中止" >&2; return 1; }
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        if mkdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null; then
-            owner="${BASHPID:-$$}"
-            if printf '%s\n' "$owner" > "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null \
-               && printf '%s\n' "$devino" > "$_BOOTSTRAP_LOCK_DIR/.witness" 2>/dev/null \
-               && [ "$(cat "$_BOOTSTRAP_LOCK_DIR/.witness" 2>/dev/null)" = "$devino" ]; then
-                return 0
-            fi
-            # mkdir 刚成功, 目录必属本次调用; 见证写入失败也必须清理, 否则残留无 .witness 的锁目录无法自愈。
-            rm -rf "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null
-            echo "[错误] 无法建立安装锁跨后端见证标记, 模块加载中止" >&2
-            return 1
-        fi
-        if [ -d "$_BOOTSTRAP_LOCK_DIR" ] && [ ! -L "$_BOOTSTRAP_LOCK_DIR" ] \
-           && [ -f "$_BOOTSTRAP_LOCK_DIR/.witness" ] && [ ! -L "$_BOOTSTRAP_LOCK_DIR/.witness" ]; then
-            witness=$(cat "$_BOOTSTRAP_LOCK_DIR/.witness" 2>/dev/null) || witness=""
-            if [ "$witness" = "$devino" ]; then
-                if rm -rf "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null \
-                   && [ ! -e "$_BOOTSTRAP_LOCK_DIR" ] && [ ! -L "$_BOOTSTRAP_LOCK_DIR" ]; then
-                    continue
-                fi
-                echo "[错误] 无法清理安装锁陈旧 flock 见证, 模块加载中止" >&2
-                return 1
-            fi
-            echo "[错误] 安装锁见证身份不符, 拒绝接管: $_BOOTSTRAP_LOCK_DIR" >&2
-            return 1
-        fi
-        sleep 1
-    done
-    echo "[错误] 等待安装 mkdir 后端互斥超时或发现残留锁, 模块加载中止" >&2
-    return 1
-}
-
 _bootstrap_lock_release() {
-    local rc=0 owner witness devino
+    local rc=0 owner
     if [ "${_BOOTSTRAP_MARKER_HELD:-0}" = "1" ]; then
-        if [ "$_BOOTSTRAP_LOCK_MODE" = flock ]; then
-            owner=$(cat "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null) || owner=""
-            witness=$(cat "$_BOOTSTRAP_LOCK_DIR/.witness" 2>/dev/null) || witness=""
-            devino=$(stat -c '%d:%i' "$_BOOTSTRAP_LOCK_FILE" 2>/dev/null) || devino=""
-            if [ "$owner" = "${BASHPID:-$$}" ] && [ -n "$devino" ] && [ "$witness" = "$devino" ] \
-               && rm -rf "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null \
-               && [ ! -e "$_BOOTSTRAP_LOCK_DIR" ] && [ ! -L "$_BOOTSTRAP_LOCK_DIR" ]; then
-                :
-            else
-                echo "[错误] 安装锁见证归属/身份校验失败或无法删除, 保留: $_BOOTSTRAP_LOCK_DIR" >&2
-                rc=1
-            fi
+        owner=$(cat "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null) || owner=""
+        if [ "$owner" = "${BASHPID:-$$}" ] \
+           && rm -f "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null \
+           && rmdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null; then
+            :
         else
-            owner=$(cat "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null) || owner=""
-            if [ "$owner" = "${BASHPID:-$$}" ] \
-               && rm -f "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null \
-               && rmdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null; then
-                :
-            else
-                echo "[错误] 安装 mkdir 锁归属校验/释放失败, 保留: $_BOOTSTRAP_LOCK_DIR" >&2
-                rc=1
-            fi
+            echo "[错误] 安装 mkdir 锁归属校验/释放失败, 保留: $_BOOTSTRAP_LOCK_DIR" >&2
+            rc=1
         fi
         _BOOTSTRAP_MARKER_HELD=0
     fi
@@ -156,14 +74,6 @@ if command -v flock >/dev/null 2>&1; then
         eval "exec ${_BOOTSTRAP_LOCK_FD}>&-" 2>/dev/null
         exit 1
     fi
-    _BOOTSTRAP_LOCK_MODE=flock
-    if ! _bootstrap_flock_marker_take; then
-        flock -u "$_BOOTSTRAP_LOCK_FD" 2>/dev/null || :
-        eval "exec ${_BOOTSTRAP_LOCK_FD}>&-" 2>/dev/null
-        _BOOTSTRAP_LOCK_FD=""
-        exit 1
-    fi
-    _BOOTSTRAP_MARKER_HELD=1
 else
     if ! mkdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null; then
         # 无 flock 的退路: 先等在跑的实例释放; 仅当持锁进程已消失(残留)才清理后重试。
@@ -191,7 +101,6 @@ else
             exit 1
         fi
     fi
-    _BOOTSTRAP_LOCK_MODE="mkdir"
     _BOOTSTRAP_MARKER_HELD=1
     if ! printf '%s\n' "${BASHPID:-$$}" > "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null; then
         rmdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null || :
@@ -199,25 +108,13 @@ else
         echo "[错误] 无法写入安装发布锁持有者记录, 模块加载中止" >&2
         exit 1
     fi
-    _bootstrap_lock_file_open_status "$_BOOTSTRAP_LOCK_FILE"; _bootstrap_lrc=$?
-    case "$_bootstrap_lrc" in
-        0|2)
-            echo "[错误] 安装 flock 主锁被占用或无法确认, 模块加载中止" >&2
-            _bootstrap_lock_release || :
-            exit 1
-            ;;
-    esac
 fi
 trap '_bootstrap_lock_release' EXIT
 
 if [ -n "$_BOOTSTRAP_ENTRY_ID" ]; then
     _bootstrap_published_id=$(stat -Lc '%d:%i' "$SELF_PATH" 2>/dev/null) || _bootstrap_published_id=""
-    if [ -z "$_bootstrap_published_id" ]; then
-        echo "[错误] 无法确认当前发布的入口脚本身份, 拒绝加载模块" >&2
-        exit 1
-    fi
-    if [ "$_bootstrap_published_id" != "$_BOOTSTRAP_ENTRY_ID" ]; then
-        # 等锁期间入口代已变：先释锁再 exec 当前入口，由新进程重新复核。
+    if [ -n "$_bootstrap_published_id" ] && [ "$_bootstrap_published_id" != "$_BOOTSTRAP_ENTRY_ID" ]; then
+        # 等锁期间入口代已变：释锁后 exec 当前入口，避免旧入口 + 新 lib 混代加载。
         echo "[信息] 等待安装期间入口版本已更新, 重新启动当前版本" >&2
         _bootstrap_lock_release || exit 1
         trap - EXIT
@@ -243,14 +140,6 @@ for _txn_dir in "$_DEPLOY_ROOT"/.install-rollback.*; do
     exit 1
 done
 
-for _m in $LIB_MODULES; do
-    if [ ! -r "$LIB_DIR/${_m}.sh" ]; then
-        echo "[错误] 缺少或不可读的模块: $LIB_DIR/${_m}.sh" >&2
-        echo "       安装不完整(或 lib 与主脚本版本不一致), 请重新执行 install.sh --update" >&2
-        exit 1
-    fi
-done
-
 unset _DEPLOY_ROOT
 
 # source 公共层(定义所有常量与 DEPLOY_DIR 等)
@@ -268,10 +157,10 @@ if ! _bootstrap_lock_release; then
     exit 1
 fi
 trap - EXIT
-unset -f _bootstrap_entry_open_identity _bootstrap_lock_file_open_status _bootstrap_flock_marker_take _bootstrap_lock_release
+unset -f _bootstrap_lock_release
 unset _BOOTSTRAP_ENTRY_ID _bootstrap_published_id
 unset _BOOTSTRAP_LOCK_ROOT _BOOTSTRAP_LOCK_FILE _BOOTSTRAP_LOCK_DIR _BOOTSTRAP_LOCK_FD
-unset _BOOTSTRAP_LOCK_MODE _BOOTSTRAP_MARKER_HELD _bootstrap_locked _bootstrap_i _bootstrap_lrc _bootstrap_took _bootstrap_holder
+unset _BOOTSTRAP_MARKER_HELD _bootstrap_locked _bootstrap_i _bootstrap_took _bootstrap_holder
 
 # 公共初始化: init 系统探测 + 目录确保; 失败即退出。
 # root 已由入口 main 统一校验(本函数仅经 main → _init_runtime/_cron_init 调用)。

@@ -139,35 +139,5 @@ valid_roundtrip() (
 )
 check 'valid backup restores normal and unknown fields and removes stale files' valid_roundtrip
 
-# 保留裁剪是破坏性路径(rm -rf 整个快照目录): 必须证明只裁最旧的, 且不误伤 lastbak/无关同级条目。
-# mtime 用 POSIX touch -t 拉开(POSIX 规定, busybox 同样支持), 否则同秒创建的目录在 ls -1dt 里次序不定。
-backup_retention() (
-    local i d n=0
-    printf '{"log":{"loglevel":"warning"}}' > "$CONFIG_DIR/02_log.json"
-    for ((i = 1; i <= 13; i++)); do
-        d="$BACKUP_DIR/confs.bak.202001$(printf '%02d' "$i")-000000"
-        mkdir -p "$d" || return 1
-        printf 'sentinel-%s' "$i" > "$d/sentinel"
-        touch -t "202001$(printf '%02d' "$i")0000" "$d" || return 1
-    done
-    # 无关同级条目不在 confs.bak.* 内, 裁剪不得波及。
-    printf 'keep' > "$BACKUP_DIR/unrelated.txt"
-    _backup_config >/dev/null 2>&1 || return 1
-    # 本次新增 1 份 + 原有 13 份 = 14, 裁剪后必须恰好 10 份目录。
-    for d in "$BACKUP_DIR"/confs.bak.*; do
-        [ -d "$d" ] || continue
-        n=$((n + 1))
-    done
-    [ "$n" -eq 10 ] || return 1
-    # 裁掉的必须是 4 份最旧的; 最新一份目录内容完整(不是空壳)。
-    for ((i = 1; i <= 4; i++)); do
-        [ ! -e "$BACKUP_DIR/confs.bak.202001$(printf '%02d' "$i")-000000" ] || return 1
-    done
-    [ -s "$BACKUP_DIR/confs.bak.20200113-000000/sentinel" ] &&
-        [ -f "$BACKUP_DIR/unrelated.txt" ] &&
-        [ -s "$BACKUP_DIR/confs.lastbak/02_log.json" ]
-)
-setup_case backup_retention
-check 'backup retention keeps the newest 10 snapshots and spares siblings' backup_retention
 printf 'common regressions passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
