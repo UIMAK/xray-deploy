@@ -1053,7 +1053,7 @@ _xray_core_txn_recover_locked() {
 # durable 才 cleanup。这样每个崩溃点都可重入: phase 还没写成功就从原 snapshot 再做一遍。
 _xray_core_recover_rollback_locked() {
     local j="$1" bin bak pre was_running old_ver old_state_ver old_ch unit sprev phase scope
-    local service_pre service_masked run_ok=1 disk_ok=1 state_ok=1 runtime_touched=1
+    local service_pre service_masked run_ok=1 disk_ok=1 state_ok=1 runtime_touched=1 binary_lost=0
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
     bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
     pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
@@ -1090,19 +1090,32 @@ _xray_core_recover_rollback_locked() {
     fi
 
     # 1. binary pre-state 由**显式布尔值**描述, 绝不从 old_version 是否为空推断。
+    # 快照与 live binary 同时不存在 = 当前无核心: 不重放, 也不阻塞 geo/service/state 回滚。
+    # live binary 仍在而快照丢失则来源不明, 仍按 disk_ok=0 保留 journal。
     if [ "$txn_touched_binary" -eq 0 ]; then
         # 旧 Geo full 账本仍检查恢复源; 新 dat 账本不拥有 binary 快照。
         if [ "$scope" = full ] && [ "$pre" = true ]; then
             if [ ! -f "$bak" ] || [ -L "$bak" ]; then
-                disk_ok=0
-                _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
+                if _xray_core_path_present "$bin"; then
+                    disk_ok=0
+                    _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
+                else
+                    binary_lost=1
+                    _warn "旧 binary 快照与 live binary 均不存在, 按无核心继续回滚: $bak"
+                fi
             fi
-            _warn "本次为 Geo 事务且未跨过替换点, binary 按未变更处理(不重放旧快照)"
+            [ "$binary_lost" -eq 1 ] || \
+                _warn "本次为 Geo 事务且未跨过替换点, binary 按未变更处理(不重放旧快照)"
         fi
     elif [ "$pre" = true ]; then
         if [ ! -f "$bak" ] || [ -L "$bak" ]; then
-            disk_ok=0
-            _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
+            if _xray_core_path_present "$bin"; then
+                disk_ok=0
+                _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
+            else
+                binary_lost=1
+                _warn "旧 binary 快照与 live binary 均不存在, 按无核心继续回滚: $bak"
+            fi
         elif ! _xray_restore_file_atomic "$bak" "$bin" 755; then
             disk_ok=0
             _error "旧 binary 原子还原失败: $bin (恢复源保留: $bak)"
@@ -1234,6 +1247,21 @@ _xray_core_recover_rollback_locked() {
     if [ "$runtime_touched" -eq 0 ]; then
         run_ok=1
         _warn "Geo 事务尚未触碰运行态, 保持当前 Xray 运行状态"
+    elif [ "$binary_lost" -eq 1 ]; then
+        # 无 binary 可启动: 只确认事务期间的实例已停止, 不尝试重启。
+        if ! declare -F _xray_is_running >/dev/null 2>&1; then
+            run_ok=0
+            _error "核心 binary 已不存在, 且缺少进程状态探测, 无法确认 Xray 已停止"
+        elif _xray_is_running; then
+            if ! _xray_stop_and_verify; then
+                run_ok=0
+                _error "核心 binary 已不存在, 但无法确认 Xray 已停止"
+            else
+                _warn "核心 binary 已不存在, 已确认 Xray 停止"
+            fi
+        else
+            _warn "核心 binary 已不存在, Xray 保持停止"
+        fi
     elif [ "$pre" = true ] && [ "$was_running" = true ]; then
         if ! _restart_xray_verified; then
             run_ok=0
@@ -2375,7 +2403,7 @@ _restart_xray_verified() {
 # 查询失败/未知不等于停止; 缺 _xray_is_running 时拒绝破坏性操作。
 # 日常 status 仍走 _xray_is_running, 破坏性路径用下方更严格 stopped 判据。
 # ---------------------------------------------------------------------------
-# 破坏性操作必须有正向停止证据; systemd 查询失败/未知不得等同于已停止。
+# 破坏性操作必须有正向停止证据; 服务查询失败/未知不得等同于已停止。
 # 返回 0=确认停止, 1=仍运行/过渡, 2=无法观察。
 _xray_stopped_state() {
     case "$INIT_SYSTEM" in
@@ -2401,6 +2429,23 @@ _xray_stopped_state() {
             [ "$mainpid" = "0" ] && return 0
             return 1
             ;;
+        openrc)
+            # OpenRC 的 status 退出码不能当判据(已停止=3、服务不存在=1), 只解析文本;
+            # 文本报 started/running 直接判运行, 不把进程扫描当唯一证据。
+            # init 文件缺失只说明没有服务定义, 仍需排除手工启动的自有实例。
+            local unit status_out=""
+            unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
+            if [ -n "$unit" ] && _xray_core_path_present "$unit"; then
+                status_out=$(rc-service xray status 2>/dev/null) || :
+                case "$status_out" in
+                    *started*|*running*) return 1 ;;
+                esac
+            fi
+            # 进程扫描是终局判据; /proc 不可读时不能把"扫不到"当成已停止。
+            [ -d /proc ] || return 2
+            _proc_any_named xray "$XRAY_BIN" && return 1
+            return 0
+            ;;
         *) return 2 ;;
     esac
 }
@@ -2418,16 +2463,32 @@ _xray_stop_and_verify() {
         _tip "请执行 install.sh --update 同步全部模块后重试"
         return 1
     fi
-    _manage_xray stop >/dev/null 2>&1 || return 1
-    local i
+    # stop 的返回码不是停止判据: OpenRC 上服务不存在时 rc-service stop 恒为 1(已停止为 0),
+    # 拿它当判据会让全新机器上的安装/切换/回滚永久失败。只记录返回码用于失败诊断。
+    local stop_rc=0 i state probe=""
+    _manage_xray stop >/dev/null 2>&1 || stop_rc=$?
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        if [ "${INIT_SYSTEM:-}" = systemd ]; then
-            _xray_stopped_state && return 0
-        else
-            _xray_is_running || return 0
+        _xray_stopped_state
+        state=$?
+        probe="_xray_stopped_state rc=${state}"
+        [ "$state" -ne 0 ] || return 0
+        # 2=查询不可用, 退回既有的 pidfile/进程判活; direct 后端一直走这条。
+        if [ "$state" -eq 2 ]; then
+            if _xray_is_running; then
+                probe="${probe}, _xray_is_running rc=0"
+            else
+                return 0
+            fi
         fi
         sleep 1
     done
+    local manual
+    case "${INIT_SYSTEM:-}" in
+        openrc) manual="rc-service xray status; rc-service xray stop" ;;
+        systemd) manual="systemctl status xray" ;;
+        *) manual="ps -ef | grep -F '$XRAY_BIN'" ;;
+    esac
+    _error "无法确认 Xray 已停止 (stop 返回码=${stop_rc}, 最后观测 ${probe}); 请人工确认: ${manual}"
     return 1
 }
 

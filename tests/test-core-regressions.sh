@@ -26,6 +26,11 @@ trap cleanup EXIT
         *) printf 'SUMMARY pass=0 fail=1 (unit path literal changed; fix the rewrite)\n'; exit 1 ;;
     esac
     verified_restart_definition=$(declare -f _restart_xray_verified)
+    # _xray_stop_and_verify 在下方被整体桩掉(事务用例直接改 RUNNING), 停止判据用例
+    # 需要真实实现, 所以先留存定义, 用例内再 eval 回来。
+    stop_and_verify_definition=$(declare -f _xray_stop_and_verify)
+    [ -n "$stop_and_verify_definition" ] ||
+        { printf 'SUMMARY pass=0 fail=1 (declare -f _xray_stop_and_verify failed)\n'; exit 1; }
     PASS=0 FAIL=0
     _info() { :; }
     _success() { :; }
@@ -172,6 +177,51 @@ trap cleanup EXIT
         [ "$phase" != replacing ] || old_dat || return 1
         settled && [ "$(cat "$XRAY_BIN")" = binary-original ]
     }
+    # 旧 binary 快照与 live binary 同时消失 = 当前无核心, 事务必须继续回滚而不是永久阻塞。
+    core_binary_lost() {
+        fixture core-binary-lost
+        RUNNING=true
+        local stage="$BIN_DIR/.xray-dl.recovery-lost" j
+        _xray_core_journal_write 26.9.8 stable v26.10.17 preview "$stage" core || return 1
+        j="$STATE_DIR/coretxn.json"
+        _xray_core_snapshot_binary "$j" && _xray_service_snapshot && _xref_snapshot_geo_dats "$j" || return 1
+        mkdir -p "$stage" || return 1
+        _xray_core_journal_phase snapshotted && _xray_core_journal_phase replacing || return 1
+        command rm -f "$XRAY_BIN" "$XRAY_BIN.bak"
+        _xray_core_txn_recover_locked || return 1
+        [ ! -e "$XRAY_BIN" ] && [ "$RUNNING" = false ] && [ "$RESTARTS" -eq 0 ] && old_dat && settled
+    }
+    # live binary 仍在而快照丢失来源不明: 保持阻塞, journal 与现场全部保留。
+    core_binary_backup_lost() {
+        fixture core-bak-lost
+        RUNNING=true
+        local stage="$BIN_DIR/.xray-dl.backup-lost" j
+        _xray_core_journal_write 26.9.8 stable v26.10.17 preview "$stage" core || return 1
+        j="$STATE_DIR/coretxn.json"
+        _xray_core_snapshot_binary "$j" && _xray_service_snapshot && _xref_snapshot_geo_dats "$j" || return 1
+        mkdir -p "$stage" || return 1
+        _xray_core_journal_phase snapshotted && _xray_core_journal_phase replacing || return 1
+        command rm -f "$XRAY_BIN.bak"
+        _xray_core_txn_recover_locked && return 1
+        [ "$(jq -r .phase "$j")" = replacing ] &&
+            [ "$(cat "$XRAY_BIN")" = binary-original ] && [ "$RESTARTS" -eq 0 ]
+    }
+    # Geo full 账本同一规则: 两个 binary 都不存在时不阻塞 dat 回滚。
+    legacy_geo_binary_lost() {
+        fixture legacy-geo-binary-lost
+        command rm "$UNIT"; printf 'old-service' > "$UNIT"
+        _xray_core_journal_write 26.9.8 stable geo-update stable '' geo || return 1
+        local j="$STATE_DIR/coretxn.json" stage
+        _meta_update "$j" 'del(.snapshot_scope)' || return 1
+        stage=$(jq -r .staging_dir "$j")
+        mkdir "$stage" && cp "$DEPLOY_DIR/download/"*.dat "$stage/" || return 1
+        _xray_service_snapshot && _xray_core_snapshot_binary "$j" && _xref_snapshot_geo_dats "$j" || return 1
+        _xray_core_journal_phase snapshotted && _xray_core_journal_phase replacing || return 1
+        command mv -f "$stage/geoip.dat" "$ASSET_DIR/geoip.dat"
+        command rm -f "$XRAY_BIN" "$XRAY_BIN.bak"
+        _xray_core_txn_recover_locked || return 1
+        old_dat && settled && [ ! -e "$XRAY_BIN" ]
+    }
     core_snapshot_guard() {
         fixture core-snapshot
         INIT_SYSTEM=direct
@@ -226,6 +276,72 @@ trap cleanup EXIT
         [ "$owned" = yes ] || [ ! -f "$DEPLOY_DIR/actions" ] || return 1
         ! grep -Eq 'start|write' "$DEPLOY_DIR/actions" 2>/dev/null
     )
+    # 停止判据用例: 用真实 _xray_stop_and_verify(上方被桩掉) + openrc 后端,
+    # 按两台故障机的实测返回码复刻形状; rc-service/_proc_any_named/sleep 全部桩掉。
+    stop_missing_openrc_service() {
+        fixture stop-missing-openrc
+        INIT_SYSTEM=openrc
+        command rm -f "$UNIT"
+        rc-service() { return 1; }
+        _proc_any_named() { return 1; }
+        sleep() { :; }
+        eval "$stop_and_verify_definition"
+        _xray_stop_and_verify
+        local rc=$?
+        unset -f rc-service _proc_any_named sleep
+        [ "$rc" -eq 0 ]
+    }
+    stop_openrc_stop_rc_nonzero() {
+        fixture stop-openrc-rc-nonzero
+        INIT_SYSTEM=openrc
+        command rm -f "$UNIT"; printf '#!/sbin/openrc-run\n' > "$UNIT"
+        rc-service() {
+            case "${2:-}" in status) printf ' * status: stopped\n'; return 3 ;; esac
+            return 1
+        }
+        _proc_any_named() { return 1; }
+        sleep() { :; }
+        eval "$stop_and_verify_definition"
+        _xray_stop_and_verify
+        local rc=$?
+        unset -f rc-service _proc_any_named sleep
+        [ "$rc" -eq 0 ]
+    }
+    stop_openrc_running_blocks() {
+        fixture stop-openrc-running
+        INIT_SYSTEM=openrc
+        command rm -f "$UNIT"; printf '#!/sbin/openrc-run\n' > "$UNIT"
+        rc-service() {
+            case "${2:-}" in status) printf ' * status: started\n'; return 0 ;; esac
+            return 0
+        }
+        _proc_any_named() { return 0; }
+        sleep() { :; }
+        eval "$stop_and_verify_definition"
+        _xray_stop_and_verify
+        local rc=$?
+        unset -f rc-service _proc_any_named sleep
+        [ "$rc" -eq 1 ] &&
+            grep -Fq '无法确认 Xray 已停止' "$TMP/messages" &&
+            grep -Fq 'rc-service xray status' "$TMP/messages"
+    }
+    # status 文本是独立证据: 进程扫描没命中也不能把 started 判成已停止。
+    stop_openrc_status_started_no_scan() {
+        fixture stop-openrc-started-noscan
+        INIT_SYSTEM=openrc
+        command rm -f "$UNIT"; printf '#!/sbin/openrc-run\n' > "$UNIT"
+        rc-service() {
+            case "${2:-}" in status) printf ' * status: started\n'; return 0 ;; esac
+            return 0
+        }
+        _proc_any_named() { return 1; }
+        sleep() { :; }
+        eval "$stop_and_verify_definition"
+        _xray_stop_and_verify
+        local rc=$?
+        unset -f rc-service _proc_any_named sleep
+        [ "$rc" -eq 1 ] && grep -Fq 'rc-service xray status' "$TMP/messages"
+    }
     check 'masked Geo success keeps original mask inode and stopped runtime' masked_success
     check 'dat snapshot scope preserves unrelated binary/service backups and skips their fsync' dat_ownership
     check 'second dat rename failure restores both dat files and running runtime' second_dat_failure
@@ -243,6 +359,10 @@ trap cleanup EXIT
     check 'direct stop refuses unknown executable ownership' direct_failure stop 0 no
     check 'direct stop confirms exit even when kill reports success' direct_failure stop 0 yes
     check 'verified direct restart rejects unchanged old running instance' direct_failure verified 1 yes
+    check 'openrc stop treats a missing init script as already stopped' stop_missing_openrc_service
+    check 'openrc stop rc=1 with stopped status and no process confirms stop' stop_openrc_stop_rc_nonzero
+    check 'openrc stop blocks on started status while an owned process runs' stop_openrc_running_blocks
+    check 'openrc stopped state keeps started status authoritative over process scan' stop_openrc_status_started_no_scan
     # Low1: journal 字段读取失败不能被进程替换吞掉。
     journal_rc_probe() {
         local saved rc1=0 rc2=0
@@ -273,6 +393,9 @@ trap cleanup EXIT
         [ "${out[5]}" = core ] && [ "${out[6]}" = full ]
     }
     check 'journal fields keep order and defaults' journal_fields_probe
+    check 'core rollback settles as no-core when snapshot and live binary are both gone' core_binary_lost
+    check 'core rollback still blocks when only the binary snapshot is gone' core_binary_backup_lost
+    check 'legacy Geo rollback settles as no-core when both binaries are gone' legacy_geo_binary_lost
 
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
