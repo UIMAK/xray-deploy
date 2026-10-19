@@ -557,10 +557,17 @@ _hy2_no_hop_rules_at_all() {
         esac
         runtime_clean=1
     else
-        # 无 iptables 时仅内核从未使用 nat 可证明无规则；持久化文件缺失不构成 runtime 证据。
+        # 无 iptables 时须实测 nft 规则集: 规则虽只经 iptables 创建, xtables-nft 下仍落在 nf_tables。
+        # 查询失败保持 UNKNOWN; 内核从未使用 nat 才可仅凭 /proc 判定, 持久化文件缺失不构成 runtime 证据。
         if command -v nft >/dev/null 2>&1; then
-            _warn "iptables 不可用但检测到 nft, 无法确认是否存在跳跃规则"
-            return 1
+            if ! q=$(nft list ruleset 2>/dev/null); then
+                _warn "iptables 不可用且 nft list ruleset 查询失败, 无法确认是否存在跳跃规则"
+                return 1
+            fi
+            if printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop"; then
+                _warn "iptables 不可用但 nft 规则集中仍含 xray-deploy-hy2-hop 跳跃规则"
+                return 1
+            fi
         fi
         if [ -e /proc/net/ip_tables_names ]; then
             if ! q=$(cat /proc/net/ip_tables_names 2>/dev/null); then
@@ -1513,10 +1520,14 @@ _hy2_cleanup_all_hops() {
         metadata_hop=1
     fi
     if [ "$metadata_hop" -eq 1 ] && ! command -v iptables >/dev/null 2>&1; then
-        # metadata says we own hop rules, but cannot issue precise -D or verify runtime:
-        # preserve the deployment tree.
-        _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
-        return 1
+        # metadata 声明有 hop 规则但无 iptables 可精确 -D: 先实测证明 runtime 干净才继续,
+        # 否则保留部署树, 不猜测规则已清空。
+        if _hy2_no_hop_rules_at_all; then
+            _warn "iptables 不可用, 但未发现端口跳跃规则残留(hop metadata 按无残留继续清理)"
+        else
+            _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
+            return 1
+        fi
     fi
     if command -v iptables >/dev/null 2>&1 && [ -d "$NODES_DIR" ]; then
         local _cand_all _cand

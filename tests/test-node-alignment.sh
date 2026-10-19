@@ -415,6 +415,95 @@ consts_probe() {
 }
 check 'literal constants: sni default, hop field removal, inbound tag removal' consts_probe
 
+# 无 iptables 的 nft 主机: 跳跃规则判定必须实测 nft 规则集, 不能凭"检测到 nft"直接判 UNKNOWN。
+nft_saved_path="$PATH" nft_saved_nodes="$NODES_DIR"
+nft_bin="$TMP/nftbin"
+mkdir -p "$nft_bin" "$TMP/nft-ipt" "$TMP/nft-initd" "$TMP/nft-conf" "$TMP/nft-nodes" || exit 1
+cat > "$nft_bin/nft" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$NFT_OUT"
+exit "${NFT_RC:-0}"
+EOF
+chmod +x "$nft_bin/nft" || exit 1
+# 桩只替换目标动作: 假 nft 进 PATH 首位, iptables/ip6tables 仍不可见; 持久化路径指向空临时目录。
+PATH="$nft_bin:$PATH"
+NFT_OUT='' NFT_RC=0
+export NFT_OUT NFT_RC
+HY2_IPTABLES_DIR="$TMP/nft-ipt" HY2_INITD_DIR="$TMP/nft-initd" HY2_CONF_DIR="$TMP/nft-conf"
+NODES_DIR="$TMP/nft-nodes"
+
+nft_fixture_env() {
+    ! command -v iptables >/dev/null 2>&1 && ! command -v ip6tables >/dev/null 2>&1 \
+        && command -v nft >/dev/null 2>&1
+}
+check 'nft fixture: iptables hidden, nft resolved from PATH' nft_fixture_env
+
+nft_empty_probe() {
+    local rc=0
+    NFT_OUT='' NFT_RC=0
+    _hy2_no_hop_rules_at_all || rc=$?
+    eq "$rc" 0
+}
+check 'nft-only: empty ruleset proves no hop rules' nft_empty_probe
+
+nft_unrelated_probe() {
+    local rc=0
+    NFT_OUT='table inet filter { chain input { type filter hook input priority 0; accept } }' NFT_RC=0
+    _hy2_no_hop_rules_at_all || rc=$?
+    eq "$rc" 0
+}
+check 'nft-only: unrelated nft rules do not block proof' nft_unrelated_probe
+
+nft_tag_probe() {
+    local rc=0
+    NFT_OUT='table ip nat { chain PREROUTING { counter comment "xray-deploy-hy2-hop" } }' NFT_RC=0
+    _hy2_no_hop_rules_at_all || rc=$?
+    eq "$rc" 1
+}
+check 'nft-only: residual hop tag stays unproven' nft_tag_probe
+
+nft_query_fail_probe() {
+    local rc=0
+    : > "$TMP/warnings"
+    NFT_OUT='' NFT_RC=1
+    _hy2_no_hop_rules_at_all || rc=$?
+    eq "$rc" 1 && grep -qF 'nft list ruleset 查询失败' "$TMP/warnings"
+}
+check 'nft-only: failed nft query is fail-closed and names nft' nft_query_fail_probe
+
+nft_cleanup_plain_probe() {
+    local rc=0
+    printf '%s' '{"protocol":"hysteria2","port":443}' > "$NODES_DIR/plain.json"
+    NFT_OUT='' NFT_RC=0
+    _hy2_cleanup_all_hops || rc=$?
+    eq "$rc" 0
+}
+check 'nft-only cleanup: no hop metadata and clean nft succeeds' nft_cleanup_plain_probe
+
+nft_cleanup_meta_probe() {
+    local rc=0
+    : > "$TMP/warnings"
+    printf '%s' '{"protocol":"hysteria2","port":443,"hop_ranges":["10000:10010"]}' > "$NODES_DIR/hop.json"
+    NFT_OUT='' NFT_RC=0
+    _hy2_cleanup_all_hops || rc=$?
+    eq "$rc" 0 && grep -qF '按无残留继续清理' "$TMP/warnings"
+}
+check 'nft-only cleanup: hop metadata continues when nft proves clean' nft_cleanup_meta_probe
+
+nft_cleanup_residual_probe() {
+    local rc=0
+    : > "$TMP/errors"
+    printf '%s' '{"protocol":"hysteria2","port":443,"hop_ranges":["10000:10010"]}' > "$NODES_DIR/hop.json"
+    NFT_OUT='table ip nat { chain PREROUTING { counter comment "xray-deploy-hy2-hop" } }' NFT_RC=0
+    _hy2_cleanup_all_hops || rc=$?
+    eq "$rc" 1 && grep -qF '已保留节点数据' "$TMP/errors"
+}
+check 'nft-only cleanup: residual hop rule keeps hop metadata undeleted' nft_cleanup_residual_probe
+
+PATH="$nft_saved_path"
+NODES_DIR="$nft_saved_nodes"
+unset HY2_IPTABLES_DIR HY2_INITD_DIR HY2_CONF_DIR
+
 printf 'node-alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
 )
