@@ -1056,16 +1056,14 @@ _hy2_hop_teardown_all() {
             continue
         fi
         [ "$proto" = "hysteria2" ] || continue
-        if ! hop_port=$(jq -r '.port // empty' "$NODES_DIR/${tag}.json" 2>/dev/null); then
-            _error "节点元数据损坏, 无法确认端口: $tag"
-            _HY2_HOP_SKIP+=("$tag")
-            continue
-        fi
-        [[ "$hop_port" =~ ^[0-9]+$ ]] || {
-            _error "节点元数据损坏(端口无效): $tag"
-            _HY2_HOP_SKIP+=("$tag")
-            continue
-        }
+        # 端口缺失/无效则无法定位规则目标; 保留节点避免孤儿 DNAT。
+        hop_port=$(jq -r '.port // empty' "$NODES_DIR/${tag}.json" 2>/dev/null)
+        case "$hop_port" in
+            ''|*[!0-9]*)
+                _error "节点元数据损坏(端口缺失或无效), 无法确认端口: $tag"
+                _HY2_HOP_SKIP+=("$tag")
+                continue ;;
+        esac
         # metadata.port 必须与真实监听一致；否则规则目标无法安全定位。
         local cfg_port
         cfg_port=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
@@ -1109,13 +1107,11 @@ _hy2_hop_teardown_all() {
 _HY2_DEL_KEEP=()
 _hy2_filter_skipped() {
     _HY2_DEL_KEEP=()
-    local t s skip
+    local t skip=$'\n'
+    for t in "${_HY2_HOP_SKIP[@]}"; do skip+="$t"$'\n'; done
     for t in "$@"; do
-        skip=0
-        for s in "${_HY2_HOP_SKIP[@]}"; do
-            [ "$s" = "$t" ] && { skip=1; break; }
-        done
-        [ "$skip" -eq 0 ] && _HY2_DEL_KEEP+=("$t")
+        case "$skip" in *$'\n'"$t"$'\n'*) continue ;; esac
+        _HY2_DEL_KEEP+=("$t")
     done
 }
 
@@ -1165,44 +1161,48 @@ _hy2_hop_retarget() {
     return 0
 }
 
-# 在内存中生成完整新 metadata: 传入 hop 字段变换后的 hopmeta 内容, 重建分享链接(读临时文件,
-# 因为 _rebuild_hy2_link 从文件读), 输出 newmeta(hop 字段 + 新 share_link)。失败返回 1(未落地任何文件)。
+# 在内存中生成完整新 metadata(重建分享链接要读文件, 故先写临时文件); 失败返回 1, 不落地任何文件。
+#   _hy2_gen_newmeta <meta> <hopmeta>      hop 字段已变换, 只重写 share_link
+#   _hy2_gen_newmeta <meta> "" <newport>   端口、名称与分享链接一起更新
 _hy2_gen_newmeta() {
-    local meta="$1" hopmeta="$2" tmp_meta newlink rc
-    tmp_meta=$(mktemp "${meta}.hop.XXXXXX") || return 1
-    printf '%s' "$hopmeta" > "$tmp_meta" || { rm -f "$tmp_meta"; return 1; }
+    local meta="$1" hopmeta="$2" newport="${3:-}" tmp_meta newlink rc suffix=.hop newname=""
+    if [ -n "$newport" ]; then
+        suffix=.port
+        local oldport name
+        oldport=$(jq -r '.port' "$meta") || return 1
+        [ -n "$oldport" ] || return 1
+        name=$(jq -r '.name' "$meta") || return 1
+        # 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
+        newname=$(_rename_node_with_port "$name" "$oldport" "$newport")
+    fi
+    tmp_meta=$(mktemp "${meta}${suffix}.XXXXXX") || return 1
+    if [ -n "$newport" ]; then
+        # 临时文件必须同时承载新端口与新名称: 链接的 #fragment 取 .name, 只改端口会让重建出的
+        # 链接停在旧名。与 Reality 分支"临时文件承载新 port + 新 name 再重建"同源。
+        jq --argjson p "$newport" --arg n "$newname" '.port=$p | .name=$n' "$meta" > "$tmp_meta" \
+            || { rm -f "$tmp_meta"; return 1; }
+    else
+        printf '%s' "$hopmeta" > "$tmp_meta" || { rm -f "$tmp_meta"; return 1; }
+    fi
     newlink=$(_rebuild_hy2_link "$tmp_meta"); rc=$?
     # 两种失败必须区分(同 _hy2_sync_derived): 不可表达(gecko 自定义尺寸) ⇒ 链接留空
     # 是正常结果, clash 能完整承载该尺寸; 元数据缺字段 ⇒ 无法安全重建, 拒绝(不写坏链接)。
     if [ "$rc" != 0 ] && ! _hy2_link_unexpressible "$tmp_meta"; then
         rm -f "$tmp_meta"
-        return 1
+        # 无链接身份的(测试/采纳)元数据没有可丢的链接, 只更新端口与名称。
+        if [ -z "$newport" ] || [ "$(jq -r 'has("share_link") or has("uuid")' "$meta" 2>/dev/null)" != false ]; then
+            return 1
+        fi
+        jq --argjson p "$newport" --arg n "$newname" '.port=$p | .name=$n' "$meta"
+        return
     fi
     rm -f "$tmp_meta"
-    jq --arg l "$newlink" '.share_link=$l' <<< "$hopmeta"
-}
-
-# 新 metadata 只在内存构造；端口、名称与分享链接必须一起更新。
-_hy2_gen_port_newmeta() {
-    local meta="$1" newport="$2" oldport tmpm newlink rc name newname
-    oldport=$(jq -r '.port' "$meta")
-    [ -n "$oldport" ] || return 1
-    name=$(jq -r '.name' "$meta")
-    # 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
-    newname=$(_rename_node_with_port "$name" "$oldport" "$newport")
-    tmpm=$(mktemp "${meta}.port.XXXXXX") || return 1
-    # 临时文件必须同时承载新端口与新名称: 链接的 #fragment 取 .name, 只改端口会让重建出的
-    # 链接停在旧名。与 Reality 分支"临时文件承载新 port + 新 name 再重建"同源。
-    jq --argjson p "$newport" --arg n "$newname" '.port=$p | .name=$n' "$meta" > "$tmpm" || { rm -f "$tmpm"; return 1; }
-    newlink=$(_rebuild_hy2_link "$tmpm"); rc=$?
-    # 同 _hy2_sync_derived: gecko 自定义尺寸 ⇒ 链接留空(正常); 元数据缺字段 ⇒ 拒绝
-    if [ "$rc" != 0 ] && ! _hy2_link_unexpressible "$tmpm"; then
-        rm -f "$tmpm"
-        return 1
+    if [ -n "$newport" ]; then
+        jq --argjson p "$newport" --arg n "$newname" --arg l "$newlink" \
+           '.port=$p | .name=$n | .share_link=$l' "$meta"
+    else
+        jq --arg l "$newlink" '.share_link=$l' <<< "$hopmeta"
     fi
-    rm -f "$tmpm"
-    jq --argjson p "$newport" --arg n "$newname" --arg l "$newlink" \
-       '.port=$p | .name=$n | .share_link=$l' "$meta"
 }
 
 # hy2+hop 端口事务在锁内：journal→DNAT→metadata→config，失败逆序恢复。
@@ -1239,16 +1239,9 @@ _hy2_port_txn_locked() {
         _error "config 中的 Hysteria2 端口已变化, 拒绝开始端口事务: $tag"
         return 1
     fi
-    if ! newmeta=$(_hy2_gen_port_newmeta "$meta" "$newport"); then
-        if [ "$(jq -r 'has("share_link") or has("uuid")' <<< "$orig" 2>/dev/null)" = false ]; then
-            local old_name new_name
-            old_name=$(jq -r '.name // empty' <<< "$orig" 2>/dev/null)
-            new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
-            newmeta=$(jq --argjson p "$newport" --arg n "$new_name" '.port=$p | .name=$n' <<< "$orig") || return 1
-        else
-            _error "无法从当前元数据重建端口链接, 事务未开始: $tag"
-            return 1
-        fi
+    if ! newmeta=$(_hy2_gen_newmeta "$meta" "" "$newport"); then
+        _error "无法从当前元数据重建端口链接, 事务未开始: $tag"
+        return 1
     fi
     # journal 先于第一个 runtime 变更；写失败不触碰真实状态。
     if ! _port_txn_journal_write "$meta" "$meta" hy2hop "$oldport" "$newport" "$ranges" "$orig" "$newmeta"; then
@@ -1296,9 +1289,9 @@ _hy2_port_txn_locked() {
 _modify_port_hop() {
     local tag="$1" meta="$2" oldport="$3" newport="$4"; shift 4
     local ranges="$*" newmeta display
-    display=$(_read_hop_ranges_display "$meta")
+    display=$(_read_hop_ranges_raw "$meta")
     local old_name; old_name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
-    newmeta=$(_hy2_gen_port_newmeta "$meta" "$newport") || { _error "生成新元数据失败"; return 1; }
+    newmeta=$(_hy2_gen_newmeta "$meta" "" "$newport") || { _error "生成新元数据失败"; return 1; }
     _info "检测到端口跳跃规则, 正在统一事务更新(config/metadata/iptables)..."
     # shellcheck disable=SC2086
     if ! _hy2_port_txn "$tag" "$meta" "$oldport" "$newport" "$newmeta" $ranges; then
@@ -1390,11 +1383,6 @@ _hy2_hop_meta_ok() {
         fi
     fi
     return 0
-}
-
-# 从元数据读取端口跳跃范围(人类可读格式: 保留逗号/短横线)
-_read_hop_ranges_display() {
-    _read_hop_ranges_raw "$1"
 }
 
 # 列出所有 xray-deploy 端口跳跃规则(IPv4 + IPv6)
@@ -4099,9 +4087,9 @@ _rebuild_hy2_link() {
         [ "$obfs_kind" = "gecko" ] && ! _hy2_obfs_size_is_default "$meta" && return 1
         link="${link}&obfs=${obfs_kind}&obfs-password=$(_url_encode "$obfs_pw")"
     fi
-    # 端口跳跃端口(如果已配置, 统一通过 _read_hop_ranges_display 读取)
+    # 端口跳跃端口(如果已配置, 统一通过 _read_hop_ranges_raw 读取)
     local hop_ports
-    hop_ports=$(_read_hop_ranges_display "$meta" 2>/dev/null)
+    hop_ports=$(_read_hop_ranges_raw "$meta" 2>/dev/null)
     [ -n "$hop_ports" ] && link="${link}&mport=$(_url_encode "$hop_ports")"
     link="${link}#$(_url_encode "$name")"
     echo "$link"
@@ -4156,7 +4144,7 @@ _hy2_clash_line() {
     fi
     # 端口跳跃: 引号必须有 —— flow 映射上下文里裸逗号会被解析成字段分隔符
     local hop_ports
-    hop_ports=$(_read_hop_ranges_display "$meta" 2>/dev/null)
+    hop_ports=$(_read_hop_ranges_raw "$meta" 2>/dev/null)
     [ -n "$hop_ports" ] && line="${line}, ports: \"${hop_ports}\""
     [ "$self_signed" = "true" ] && line="${line}, skip-cert-verify: true"
     printf '%s}' "$line"
@@ -5103,16 +5091,9 @@ _port_txn_build_newmeta() {
     old_name=$(jq -r '.name // empty' <<< "$orig" 2>/dev/null) || return 1
     new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
     if [ "$proto" = hysteria2 ]; then
-        if newmeta=$(_hy2_gen_port_newmeta "$meta" "$newport"); then
-            printf '%s' "$newmeta"
-            return 0
-        fi
-        # Test/adopted metadata without any link identity can only update its numeric port/name.
-        if [ "$(jq -r 'has("share_link") or has("uuid")' <<< "$orig")" = false ]; then
-            jq --argjson p "$newport" --arg n "$new_name" '.port=$p | .name=$n' <<< "$orig"
-            return $?
-        fi
-        return 1
+        newmeta=$(_hy2_gen_newmeta "$meta" "" "$newport") || return 1
+        printf '%s' "$newmeta"
+        return 0
     fi
     tmpm=$(mktemp "${meta}.port.XXXXXX") || return 1
     if ! jq --argjson p "$newport" --arg n "$new_name" '.port=$p | .name=$n' <<< "$orig" > "$tmpm"; then
@@ -5202,14 +5183,13 @@ _hy2_hop_available() { command -v iptables >/dev/null 2>&1; }
 # 已提交收敛new，否则old并回退DNAT；metadata须匹配old/new，外部更新保留现场。
 # 所有journal收敛才返回0；隔离不删除证据、保留待重试均返回1阻断后续写入。
 _ptx_journal_quarantine() {
-    local j="$1" why="$2" dest i
-    # 不覆盖既有 .corrupt 证据: 依次找第一个空位(.corrupt / .corrupt.1 / … / .corrupt.9)。
-    # 恢复在 config 锁内执行, 不存在并发竞争; 全被占满则保留原文件(仍不删)。
-    dest=""
-    for i in "" .1 .2 .3 .4 .5 .6 .7 .8 .9; do
-        [ -e "${j}.corrupt${i}" ] || { dest="${j}.corrupt${i}"; break; }
-    done
-    if [ -n "$dest" ] && mv -f "$j" "$dest" 2>/dev/null; then
+    local j="$1" why="$2"
+    local dest="${j}.corrupt"
+    # 不覆盖上一份隔离证据: .corrupt 已存在则改用 .corrupt.1; 两档都占则保留原文件(仍不删)。
+    [ -e "$dest" ] && dest="${j}.corrupt.1"
+    if [ -e "$dest" ]; then
+        _warn "端口事务 journal ${why}, 两档隔离位(${j##*/}.corrupt[.1])均已占用, 原文件保留待人工核对(未删除): $j"
+    elif mv -f "$j" "$dest" 2>/dev/null; then
         _warn "端口事务 journal ${why}, 已隔离为 ${dest##*/} 待人工核对: $j"
     else
         _warn "端口事务 journal ${why}, 且隔离失败, 原文件保留待人工核对(未删除): $j"
@@ -5491,7 +5471,7 @@ _modify_port() {
 
     if [ "$proto" = "hysteria2" ]; then
         # Hy2派生只走 _hy2_sync_derived；不能独立拼链接丢失不可表达语义。
-        newmeta=$(_hy2_gen_port_newmeta "$meta" "$newport") || {
+        newmeta=$(_hy2_gen_newmeta "$meta" "" "$newport") || {
             _error "生成新元数据失败(元数据缺少必要字段), 端口未修改"
             _tip "请使用 [查看节点] 核对, 或删除后重建该节点"
             _press_any_key; return 1
@@ -5802,7 +5782,7 @@ _hy2_toggle_hop() {
         [ "$proto" = "hysteria2" ] || continue
         local tag name port ranges_display
         tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        ranges_display=$(_read_hop_ranges_display "$f")
+        ranges_display=$(_read_hop_ranges_raw "$f")
         tags+=("$tag")
         if [ -n "$ranges_display" ]; then
             printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${GREEN}%s${NC}\n" "$i" "$name" "$port" "$ranges_display"
@@ -5825,7 +5805,7 @@ _hy2_toggle_hop() {
     local cur_ranges
     cur_ranges=$(_read_hop_ranges "$meta")
     local cur_display
-    cur_display=$(_read_hop_ranges_display "$meta")
+    cur_display=$(_read_hop_ranges_raw "$meta")
 
     if [ -n "$cur_ranges" ]; then
         # 已启用 → 禁用
@@ -5908,7 +5888,7 @@ _hy2_view_hop() {
         [ "$proto" = "hysteria2" ] || continue
         local name port ranges_display
         name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        ranges_display=$(_read_hop_ranges_display "$f")
+        ranges_display=$(_read_hop_ranges_raw "$f")
         if [ -n "$ranges_display" ]; then
             echo -e "  ${GREEN}●${NC} ${name}: ${CYAN}${ranges_display}${NC} → ${port} (UDP)"
             found=1

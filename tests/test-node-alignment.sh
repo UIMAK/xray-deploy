@@ -23,7 +23,6 @@ lacks() { ! contains "$1" "$2"; }
 _info() { :; }; _tip() { :; }; _success() { :; }; _warn() { :; }; _error() { printf '%s\n' "$*" >> "$TMP/errors"; }
 _url_encode() { jq -rn --arg v "$1" '$v | @uri'; }
 _yaml_dq() { local v; v=$(jq -rn --arg v "$1" '$v | @json'); printf '%s' "${v:1:${#v}-2}"; }
-_read_hop_ranges_display() { :; }
 actual_config_jq=$(declare -f _config_jq)
 _config_jq() { printf call >> "$TMP/preflight"; return 1; }
 _ensure_unique_name() { return 0; }

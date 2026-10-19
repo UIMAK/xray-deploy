@@ -1038,18 +1038,30 @@ _hysteria_node_txn_locked() {
         fi
         return "$rc"
     }
+    # 回滚 config + 节点元数据(+ 可选运行状态), 结果写 _HY_RB_*; 全部成功返回 0。
+    _hysteria_node_txn_rollback() {
+        _HY_RB_CFG=失败; _HY_RB_META=失败; _HY_RB_STATE=失败
+        _hysteria_restore_config && _HY_RB_CFG=已还原
+        _hysteria_node_txn_meta_rollback && _HY_RB_META=已还原
+        if [ "${1:-}" = state ]; then
+            _hysteria_recover_to_state "$was_running" && _HY_RB_STATE=已恢复
+        fi
+        if [ "$_HY_RB_META" = 已还原 ] && [ -n "$meta_bak" ]; then
+            rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
+        fi
+        if [ "$_HY_RB_CFG" != 已还原 ] || [ "$_HY_RB_META" != 已还原 ]; then
+            return 1
+        fi
+        if [ "${1:-}" = state ] && [ "$_HY_RB_STATE" != 已恢复 ]; then
+            return 1
+        fi
+        return 0
+    }
     if [ "$meta_op" = "create" ]; then
         if ! _atomic_write_json "$meta_file" "$meta_content"; then
             _error "节点元数据写入失败, 回滚配置与节点状态"
-            local cfg_ok=0 meta_ok=0 state_ok=0
-            _hysteria_restore_config && cfg_ok=1
-            _hysteria_node_txn_meta_rollback && meta_ok=1
-            _hysteria_recover_to_state "$was_running" && state_ok=1
-            if [ "$meta_ok" -eq 1 ] && [ -n "$meta_bak" ]; then
-                rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
-            fi
-            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ] || [ "$state_ok" -ne 1 ]; then
-                _error "节点元数据失败后回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败) service=$([ "$state_ok" -eq 1 ] && echo 已恢复 || echo 失败))"
+            if ! _hysteria_node_txn_rollback state; then
+                _error "节点元数据失败后回滚未完成(config=$_HY_RB_CFG meta=$_HY_RB_META service=$_HY_RB_STATE)"
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file; 保留的回滚备份请勿删除: ${meta_bak:-无}"
             else
                 _error "节点元数据写入失败, 已回滚配置与节点状态"
@@ -1059,15 +1071,8 @@ _hysteria_node_txn_locked() {
     elif [ "$meta_op" = "delete" ]; then
         if ! rm -f "$meta_file"; then
             _error "节点元数据删除失败(权限/只读?), 回滚配置与节点状态"
-            local cfg_ok=0 meta_ok=0 state_ok=0
-            _hysteria_restore_config && cfg_ok=1
-            _hysteria_node_txn_meta_rollback && meta_ok=1
-            _hysteria_recover_to_state "$was_running" && state_ok=1
-            if [ "$meta_ok" -eq 1 ] && [ -n "$meta_bak" ]; then
-                rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
-            fi
-            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ] || [ "$state_ok" -ne 1 ]; then
-                _error "节点元数据删除失败后回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败) service=$([ "$state_ok" -eq 1 ] && echo 已恢复 || echo 失败))"
+            if ! _hysteria_node_txn_rollback state; then
+                _error "节点元数据删除失败后回滚未完成(config=$_HY_RB_CFG meta=$_HY_RB_META service=$_HY_RB_STATE)"
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file; 保留的回滚备份请勿删除: ${meta_bak:-无}"
             else
                 _error "节点元数据删除失败, 已回滚配置与节点状态"
@@ -1078,15 +1083,8 @@ _hysteria_node_txn_locked() {
     if [ "$was_running" = "running" ]; then
         if ! _hysteria_restart_verified; then
             _error "hysteria 启动失败, 回滚配置与节点状态"
-            local cfg_ok=0
-            _hysteria_restore_config && cfg_ok=1
-            local meta_ok=0
-            _hysteria_node_txn_meta_rollback && meta_ok=1
-            if [ "$meta_ok" -eq 1 ] && [ -n "$meta_bak" ]; then
-                rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
-            fi
-            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ]; then
-                _error "回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败)), 已进入降级状态"
+            if ! _hysteria_node_txn_rollback; then
+                _error "回滚未完成(config=$_HY_RB_CFG meta=$_HY_RB_META), 已进入降级状态"
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file; 保留的回滚备份请勿删除: ${meta_bak:-无}"
                 return 1
             fi
@@ -1101,15 +1099,8 @@ _hysteria_node_txn_locked() {
     else
         if ! _hysteria_validate_transient; then
             _error "hysteria 配置验证失败(瞬态启动), 回滚配置与节点状态"
-            local cfg_ok=0
-            _hysteria_restore_config && cfg_ok=1
-            local meta_ok=0
-            _hysteria_node_txn_meta_rollback && meta_ok=1
-            if [ "$meta_ok" -eq 1 ] && [ -n "$meta_bak" ]; then
-                rm -f "$meta_bak" 2>/dev/null || _warn "节点回滚备份清理失败: $meta_bak"
-            fi
-            if [ "$cfg_ok" -ne 1 ] || [ "$meta_ok" -ne 1 ]; then
-                _error "回滚未完成(config=$([ "$cfg_ok" -eq 1 ] && echo 已还原 || echo 失败) meta=$([ "$meta_ok" -eq 1 ] && echo 已还原 || echo 失败)), 已进入降级状态"
+            if ! _hysteria_node_txn_rollback; then
+                _error "回滚未完成(config=$_HY_RB_CFG meta=$_HY_RB_META), 已进入降级状态"
                 _tip "请人工核对: $HYSTERIA_CONFIG 与 $meta_file; 保留的回滚备份请勿删除: ${meta_bak:-无}"
                 return 1
             fi
@@ -1134,18 +1125,6 @@ _hysteria_node_txn_locked() {
     return 0
 }
 
-_hysteria_server_txn_txn_wrapper() {
-    [ "$#" -ge 2 ] || { _error "server_txn 参数不足"; return 1; }
-    local meta_filter="${!#}"
-    local config_filter="${*: -2:1}"
-    local jq_args=("${@:1:$#-2}")
-    if [ "${#jq_args[@]}" -gt 0 ]; then
-        _hysteria_server_txn_locked "$config_filter" "$meta_filter" "${jq_args[@]}"
-    else
-        _hysteria_server_txn_locked "$config_filter" "$meta_filter"
-    fi
-}
-
 # TLS 证书对与配置共同验证；失败保留原证书及运行状态。
 _hysteria_tls_server_txn_locked() {
     [ "$#" -ge 3 ] || { _error "TLS transaction 参数不足"; return 1; }
@@ -1156,7 +1135,7 @@ _hysteria_tls_server_txn_locked() {
         _hysteria_tls_pair_finish no "$stage" || true
         return 1
     fi
-    _hysteria_server_txn_txn_wrapper "$@" || rc=$?
+    _hysteria_server_txn_locked "$@" || rc=$?
     if [ "$rc" -eq 0 ]; then
         _hysteria_tls_pair_finish yes "$stage" || return 1
         return 0
@@ -1694,10 +1673,10 @@ _hysteria_tls_menu() {
         return 0
     fi
     local tls_stage="${HY_TLS_STAGE_DIR:-}"
-    if ! _hysteria_tls_server_txn "$tls_stage" --argjson blk "$HY_TLS_JSON" \
-         --arg m "$HY_TLS_MODE" --arg s "$HY_TLS_SNI" --arg p "$HY_TLS_PIN" \
+    if ! _hysteria_tls_server_txn "$tls_stage" \
          '. + $blk | if $blk | has("tls") then del(.acme) else del(.tls) end' \
-         '.tls_mode=$m | .sni=$s | .pin=$p'; then
+         '.tls_mode=$m | .sni=$s | .pin=$p' \
+         --argjson blk "$HY_TLS_JSON" --arg m "$HY_TLS_MODE" --arg s "$HY_TLS_SNI" --arg p "$HY_TLS_PIN"; then
         [ -n "$tls_stage" ] && [ -d "$tls_stage" ] && _warn "TLS 暂存现场已保留: $tls_stage"
         _error "TLS 设置失败"
         _press_any_key

@@ -22,7 +22,7 @@ _xray_arch_asset() {
 # ---------------------------------------------------------------------------
 # 通过 GitHub API 取指定通道最新 release 的 tag
 #   stable: releases/latest; preview: releases 里最新的 prerelease
-# jq 解析 release 对象; 无 jq 时按字段边界兜底, curl 失败再用 wget。
+# jq 解析 release 对象; curl 失败再用 wget。
 # ---------------------------------------------------------------------------
 _xray_fetch_tag() {
     local channel="$1" body tag
@@ -31,11 +31,7 @@ _xray_fetch_tag() {
             body=$(curl -fsSL --max-time 20 "$XRAY_REPO_API/latest" 2>/dev/null) \
                 || body=$(wget -q -T 20 -O- "$XRAY_REPO_API/latest" 2>/dev/null)
             [ -z "$body" ] && return 1
-            # 优先 jq; 兜底 BRE grep(busybox 稳)
             tag=$(echo "$body" | jq -r '.tag_name // empty' 2>/dev/null)
-            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-                tag=$(echo "$body" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/')
-            fi
             ;;
         preview)
             body=$(curl -fsSL --max-time 20 "$XRAY_REPO_API?per_page=30" 2>/dev/null) \
@@ -43,36 +39,6 @@ _xray_fetch_tag() {
             [ -z "$body" ] && return 1
             # 优先 jq: 第一个 prerelease==true 的 tag_name
             tag=$(echo "$body" | jq -r '[.[] | select(.prerelease == true)] | .[0].tag_name // empty' 2>/dev/null)
-            # 兜底(无 jq): 记住"最近一个 tag_name", 遇到 prerelease:true 即输出 —— 只依赖对象
-            # 内字段先后(GitHub 稳定顺序), 不依赖行距(旧 grep -B5 固定窗口会取错版本)。
-            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-                # 先按对象边界拆行; 否则紧凑单行 JSON 里贪婪的 sub 只保留最后一个 tag_name。
-                tag=$(printf '%s' "$body" | awk '
-                    # 先按对象边界把每个 release 拆成独立记录, 再逐记录扫描。
-                    # 用 awk 的 gsub+split 而不是 sed: sed 的替换串里带换行在不同实现上
-                    # 行为不一致(实测 GNU sed 直接报 unterminated substitution), 且 busybox
-                    # 的 sed 也不保证支持这种写法。POSIX awk 的 gsub/split 到处都有。
-                    {
-                        gsub(/\},\{/, "}\n{")
-                        n = split($0, _rec, "\n")
-                        for (_i = 1; _i <= n; _i++) {
-                            # rec 保留原始记录; 标签抽取必须写到**另一个**变量 —— 就地改写
-                            # rec 会把 "prerelease" 文本一起抹掉, 后面的判定就永远不成立
-                            # (实测: 取到了 tag 却一个都没输出, 整个兜底静默失效)。
-                            rec = _rec[_i]
-                            if (rec ~ /"tag_name"[[:space:]]*:/) {
-                                tag = rec
-                                sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
-                                sub(/".*/, "", tag)
-                                last = tag
-                            }
-                            if (rec ~ /"prerelease"[[:space:]]*:[[:space:]]*true/) {
-                                print last; exit
-                            }
-                        }
-                    }
-                ')
-            fi
             ;;
         *) return 1 ;;
     esac
@@ -231,10 +197,6 @@ _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutatio
         _error "旧 binary snapshot 缺失/为空, 不允许替换: $binbak"
         return 3
     fi
-    if [ "$pre" = false ] && _xray_core_path_present "$XRAY_BIN"; then
-        _error "事务前不存在的 binary 在 replacing 前已被外部创建, 停止提交"
-        return 3
-    fi
     if ! mv -f "${tmp_dir}/xray" "$XRAY_BIN"; then
         _error "新二进制替换失败(磁盘空间/IO/只读?)"
         return 3
@@ -280,11 +242,6 @@ _xref_snapshot_geo_dats() {  # <journal> -- unique transaction paths are recorde
             [ -f "$src" ] && [ ! -L "$src" ] || { _error "$gd.dat 在快照阶段消失或不是普通文件: $src"; return 1; }
             ! _xray_core_path_present "$bak" || { _error "$gd.dat 唯一快照路径已存在, 拒绝覆盖: $bak"; return 1; }
             cp -p "$src" "$bak" 2>/dev/null || { rm -f "$bak" 2>/dev/null; return 1; }
-            if ! cmp -s "$src" "$bak" 2>/dev/null; then
-                rm -f "$bak" 2>/dev/null
-                _error "$gd.dat 快照不完整(磁盘空间/IO?): $bak"
-                return 1
-            fi
         else
             ! _xray_core_path_present "$src" || { _error "$gd.dat 在快照阶段被外部创建: $src"; return 1; }
             ! _xray_core_path_present "$bak" || { _error "$gd.dat 唯一快照路径已存在: $bak"; return 1; }
@@ -403,7 +360,7 @@ _with_core_lock() {
         return 1
     fi
 
-    if command -v flock >/dev/null 2>&1; then
+    if _flock_ensure; then
         if ! eval "exec {CORE_LOCK_FD}>>\"\$lockf\""; then
             _error "无法创建核心锁文件 $lockf(目录不可写?), 放弃本次操作"
             return 1
@@ -425,10 +382,6 @@ _with_core_lock() {
             _xray_core_lock_fd_reset
             return 1
         fi
-        if ! _xray_primary_flock_marker_take "$CORE_LOCK_FD" "$lockf" "$fallback_dir" "核心锁"; then
-            _xray_core_lock_fd_reset
-            return 1
-        fi
         # 子 shell 内执行: 使 CORE_LOCK_FD 与 HELD 标记的作用域跟着这次加锁一起消失,
         # 调用方不必手工回滚环境(与 _with_config_lock 同款做法)。
         (
@@ -437,7 +390,6 @@ _with_core_lock() {
             "$@"
         )
         rc=$?
-        _xray_primary_flock_marker_release "$lockf" "$fallback_dir" "核心锁" || rc=1
         _xray_core_lock_fd_reset
         return "$rc"
     fi
@@ -508,7 +460,7 @@ _with_deploy_install_lock() {
     }
     # 主锁文件在目录外, 竞争者不会被卸载的 `rm -rf` 拆成新旧 inode。
 
-    if command -v flock >/dev/null 2>&1; then
+    if _flock_ensure; then
         if ! eval "exec {DEPLOY_INSTALL_LOCK_FD}>>\"\$lock_file\""; then
             _error "无法创建安装锁文件 $lock_file, 放弃本次卸载"
             return 1
@@ -522,13 +474,8 @@ _with_deploy_install_lock() {
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
-        if ! _xray_primary_flock_marker_take "$DEPLOY_INSTALL_LOCK_FD" "$lock_file" "$lock_dir" "安装锁"; then
-            eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-            return 1
-        fi
         if ! mkdir -p "$deploy_path" 2>/dev/null; then
             _error "无法创建部署目录 $deploy_path, 放弃本次操作"
-            _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || :
             eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
             return 1
         fi
@@ -538,7 +485,6 @@ _with_deploy_install_lock() {
             "$@"
         )
         rc=$?
-        _xray_primary_flock_marker_release "$lock_file" "$lock_dir" "安装锁" || rc=1
         eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
         return "$rc"
     fi
@@ -629,15 +575,9 @@ _xray_core_fsync_file_dir() {  # best-effort durability for an artifact and its 
 # 事务恢复源字段读取(快照/清理两处的收敛入口): binbak stage sprev gip gsp operation scope。
 # 其余阶段的直接 jq 读取点保持原状; 新增读取优先收敛到本函数, 避免口径漂移。
 # 任一字段读不出来都必须让调用方看见: 账本不可用不能当成空值。
-_xray_core_journal_fields() {  # <journal>
-    local j="$1"
-    jq -r '.binary_backup' "$j" 2>/dev/null || return 1
-    jq -r '.staging_dir' "$j" 2>/dev/null || return 1
-    jq -r '.service_prev' "$j" 2>/dev/null || return 1
-    jq -r '.geoip_backup' "$j" 2>/dev/null || return 1
-    jq -r '.geosite_backup' "$j" 2>/dev/null || return 1
-    jq -r '.operation // "core"' "$j" 2>/dev/null || return 1
-    jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null || return 1
+_xray_core_journal_fields() {  # <journal>; 7 行: binbak stage sprev gip gsp operation scope
+    jq -r '.binary_backup, .staging_dir, .service_prev, .geoip_backup, .geosite_backup,
+           (.operation // "core"), (.snapshot_scope // "full")' "$1" 2>/dev/null
 }
 
 _xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
@@ -771,86 +711,10 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
     _atomic_write_json "$j" "$payload"
 }
 
-# 最终验证全体恢复源后才能进入 snapshotted。单个 snapshot helper 的 cmp 保证写入当时完整;
-# 这里再验证 journal 引用的全部 sidecar 都在, 让该 phase 成为可依赖的屏障。
-#
-_xray_core_snapshots_ok() {  # <journal>
-    local j="$1" bin bak pre gd src unit sprev service_pre service_masked flag want operation scope
-    scope=$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null) || return 1
-    if [ "$scope" = full ]; then
-        bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
-        bak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
-        pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
-        if [ "$pre" = true ]; then
-            [ -f "$bak" ] && [ ! -L "$bak" ] || { _error "binary 恢复源缺失/无效: $bak"; return 1; }
-        else
-            ! _xray_core_path_present "$bak" || { _error "首次安装不应存在 binary 恢复源: $bak"; return 1; }
-        fi
-    fi
-
-    for gd in geoip geosite; do
-        src="$ASSET_DIR/${gd}.dat"
-        pre=$(jq -r --arg g "$gd" '.[$g + "_preexisted"]' "$j" 2>/dev/null) || return 1
-        bak=$(jq -r --arg g "$gd" '.[$g + "_backup"]' "$j" 2>/dev/null) || return 1
-        if [ "$pre" = true ]; then
-            [ -f "$bak" ] && [ ! -L "$bak" ] || { _error "$gd.dat 恢复源缺失/无效: $bak"; return 1; }
-        else
-            ! _xray_core_path_present "$bak" || { _error "原先不存在的 $gd.dat 却有恢复源: $bak"; return 1; }
-        fi
-    done
-
-    if [ "$scope" = full ]; then
-        unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
-        sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
-        service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-        service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
-        if [ -n "$unit" ]; then
-            flag="${sprev}.enabled"
-            [ -f "$flag" ] && [ ! -L "$flag" ] || { _error "service enable snapshot 缺失/无效: $flag"; return 1; }
-            want=$(cat "$flag" 2>/dev/null) || return 1
-            case "$want" in enabled|disabled) ;; *) _error "service enable snapshot 内容非法: $flag"; return 1 ;; esac
-            if [ "$service_pre" = true ]; then
-                if [ ! -f "$sprev" ] || [ -L "$sprev" ] || _xray_core_path_present "${sprev}.absent"; then
-                    _error "pre-existing service snapshot 缺失/含糊: $sprev"; return 1
-                fi
-                _xray_core_path_present "${sprev}.masked" && {
-                    _error "pre-existing service 不应存在 mask 恢复源: ${sprev}.masked"; return 1; }
-            else
-                _xray_core_path_present "$sprev" && { _error "新 service 不应存在内容快照: $sprev"; return 1; }
-                [ -f "${sprev}.absent" ] && [ ! -L "${sprev}.absent" ] || {
-                    _error "service absent 标记缺失/无效: ${sprev}.absent"; return 1; }
-                if [ "$service_masked" = true ]; then
-                    [ -L "${sprev}.masked" ] && [ "$(readlink "${sprev}.masked" 2>/dev/null)" = /dev/null ] || {
-                        _error "service mask 恢复源缺失/无效: ${sprev}.masked"; return 1; }
-                elif _xray_core_path_present "${sprev}.masked"; then
-                    _error "非 masked service 不应存在 mask 恢复源: ${sprev}.masked"
-                    return 1
-                fi
-            fi
-        fi
-    fi
-
-    local stage f
-    stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
-    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || operation=core
-    # snapshotted 前要求 staging 与全部恢复源存在; _xray_core_journal_ok 只验 schema, 不检查文件系统。
-    [ -d "$stage" ] || { _error "staging source 缺失: $stage"; return 1; }
-    case "$operation" in
-        core)
-            [ -f "$stage/xray" ] || { _error "core staging binary 缺失: $stage/xray"; return 1; }
-            ;;
-        geo)
-            for f in geoip geosite; do
-                [ -f "$stage/$f.dat" ] && [ ! -L "$stage/$f.dat" ] || { _error "$f.dat Geo staging 缺失"; return 1; }
-            done
-            ;;
-    esac
-    return 0
-}
-
 # 阶段必须按唯一 transition 表单向推进。失败必须被调用方消费, 不得推进真实状态。
 _xray_core_journal_phase() {
-    local next="$1" j cur allowed=0
+    local next="$1" j cur allowed=0 srcs_text f
+    local -a srcs
     j=$(_xray_core_journal_path)
     [ -f "$j" ] || { _error "核心事务账本缺失, 无法推进 phase=$next"; return 1; }
     cur=$(jq -r '.phase // empty' "$j" 2>/dev/null) || cur=""
@@ -863,9 +727,26 @@ _xray_core_journal_phase() {
     esac
     [ "$allowed" -eq 1 ] || { _error "非法核心事务 phase 转移: ${cur:-?} → $next"; return 1; }
     if [ "$next" = snapshotted ]; then
-        if ! _xray_core_journal_ok "$j" || ! _xray_core_snapshots_ok "$j"; then
+        if ! _xray_core_journal_ok "$j"; then
             _error "恢复源未完整通过最终校验, 不推进 snapshotted"; return 1
         fi
+        # journal 已验 schema; 这里只确认它引用的恢复源都还在(存在性, 不做第三轮 cmp)。
+        srcs_text=$(jq -r '
+            (if (((.snapshot_scope // "full") == "full") and (.binary_preexisted // false)) then .binary_backup else empty end),
+            (if (.geoip_preexisted // false) then .geoip_backup else empty end),
+            (if (.geosite_preexisted // false) then .geosite_backup else empty end),
+            (if ((.snapshot_scope // "full") == "full") and ((.unit // "") != "") then
+                (.service_prev + ".enabled"),
+                (if (.service_preexisted // false) then .service_prev else .service_prev + ".absent" end),
+                (if (.service_masked // false) then .service_prev + ".masked" else empty end)
+             else empty end),
+            .staging_dir
+        ' "$j" 2>/dev/null) || {
+            _error "无法读取 coretxn 恢复源清单, 不推进 snapshotted"; return 1; }
+        mapfile -t srcs <<< "$srcs_text"
+        for f in "${srcs[@]}"; do
+            _xray_core_path_present "$f" || { _error "coretxn 恢复源缺失: $f"; return 1; }
+        done
         _xray_core_snapshots_fsync "$j" || {
             _error "无法枚举 coretxn 恢复源, 不推进 snapshotted"; return 1; }
     elif [ "$next" = committed ] || [ "$next" = rolled_back ]; then
@@ -889,22 +770,12 @@ _xray_core_journal_drop() {
     return 0
 }
 
-# 任意 journal (包括 committed/rolled_back 的 cleanup journal) 都必须先恢复/清理, 不能新开覆盖。
-# **调用场景**: 核心事务准入(_install_or_switch_xray / _xray_commit_staged / geo 提交) ——
-# 它回答的是"能否开新核心事务", 因此终态但未 cleanup 的账本同样算 pending(防止覆盖证据)。
+# 核心事务是否未收敛(0=未收敛): BLOCKED/.corrupt/解析失败/非终态 phase 都必须先恢复;
+# committed/rolled_back 已收敛(只剩 cleanup, 不阻塞 config 写入); 无账本返回 1。
+# **调用场景**: 核心事务准入 与 config 写闸门 —— 判据是"真实状态是否收敛", 不是"账本是否还在";
+# 残留终态账本由 recovery 清理, 新事务另有 _xray_core_journal_write 拒绝覆盖账本兜底。
+# 只判 phase; 完整 schema 校验由 recovery 的 _xray_core_journal_ok 负责, 不复制校验器。
 _xray_core_txn_pending() {
-    local j; j=$(_xray_core_journal_path)
-    _xray_core_path_present "$(_xray_core_blocked_path)" && return 0
-    _xray_core_path_present "${j}.corrupt" && return 0
-    # 任意 journal 都要先让 recovery 清理(含 committed/rolled_back 的残留 cleanup),
-    # 否则新事务可能覆盖旧证据或误认 stale snapshots。
-    _xray_core_path_present "$j"
-}
-
-# config 写闸门仅阻塞未收敛核心事务; _xray_core_txn_pending 则把终态 cleanup journal 也算 pending。
-# committed/rolled_back 已收敛可写配置; BLOCKED/.corrupt/解析失败/非法或非终态均 fail-closed。
-# 此处只判 phase; 完整 schema 校验由 recovery 的 _xray_core_journal_ok 负责, 不复制校验器。
-_xray_core_txn_unsettled() {
     local j phase
     j=$(_xray_core_journal_path)
     _xray_core_path_present "$(_xray_core_blocked_path)" && return 0
@@ -920,12 +791,12 @@ _xray_core_txn_unsettled() {
 # ---------------------------------------------------------------------------
 # 统一 reset/core/port 写闸门: 只看磁盘事实, 未收敛即拒绝普通 config/metadata 写入。
 # 调用者持 config lock, 且检查 + 实际写入须在同一 core lock 屏障内(锁序 config → core)。
-# reset/port journal 在 config lock 内判; core 非终态判据见 _xray_core_txn_unsettled。
+# reset/port journal 在 config lock 内判; core 判据见 _xray_core_txn_pending。
 # XD_PORT_TXN_ACTIVE=1 仅豁免当前端口事务自身 journal, 标记限定在事务锁子 shell。
 # 返回 0=放行, 1=拒绝且已报原因; 混装缺 helper 按段跳过, 不引入粘滞状态。
 # ---------------------------------------------------------------------------
 _core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无阻塞; 3=未收敛
-    _xray_core_txn_unsettled && return 3
+    _xray_core_txn_pending && return 3
     return 0
 }
 
@@ -1581,24 +1452,6 @@ _install_or_switch_xray() {
         *) _error "未知通道: $channel"; return 1 ;;
     esac
     _ensure_dirs || return 1
-    # 同一长驻菜单会话里的上次 committed/rolled_back cleanup 失败也要重试, 不能只等下次 xd 启动。
-    # 若是未收敛 mutation, recovery 会回滚; 若 BLOCKED/损坏则仍由 pending gate fail closed。
-    if ! _xray_core_txn_recover; then
-        _error "核心事务恢复/清理未能完成, 拒绝开始新的切换"
-        return 1
-    fi
-    # 在取件**之前**先看一眼门禁: 明知有未收敛事务就不该白下载一遍(几十 MB)。
-    # 真正的门禁仍在锁内那一次(锁外取件期间可能有另一个会话产生账本)。
-    if _xray_core_txn_pending; then
-        _error "存在未完成的核心切换事务, 已拒绝开始新的切换"
-        if [ -f "$(_xray_core_blocked_path)" ]; then
-            _tip "事务账本已损坏或状态未知(BLOCKED): 请人工核对现场后删除"
-            _tip "  $(_xray_core_blocked_path)  $(_xray_core_journal_path).corrupt"
-        else
-            _tip "请先按提示处理并删除账本: $(_xray_core_journal_path)"
-        fi
-        return 1
-    fi
     if [ "$channel" = "custom" ]; then
         tag="$explicit_tag"
         _info "指定版本: ${tag}"
@@ -1916,7 +1769,7 @@ _safe_nofile() {
 # ---------------------------------------------------------------------------
 # unit 与 env 版本门控相关, 必须与 binary 同时快照/恢复。
 # 原有 unit 留内容与执行权限, 原无 unit 留 .absent 以撤销新文件。
-# 快照存 BACKUP_DIR, confs 备份轮转不碰它; 具体源由 journal 的 txn_id 绑定。
+# 快照存 BACKUP_DIR, 不在 confs.lastbak 备份范围内; 具体源由 journal 的 txn_id 绑定。
 # ---------------------------------------------------------------------------
 # 当前 init 后端对应的 unit 路径(direct 后端无 unit ⇒ 返回 1)
 _xray_service_unit_path() {
@@ -2102,16 +1955,12 @@ _xray_service_restore_enable() {  # <标志文件路径> [keep_snapshot]
                 ;;
         esac
     fi
-    current=$(_xray_service_enable_state) || {
-        _error "service 自启状态恢复后不可读取(期望 ${want}, action_rc=${action_rc}), 快照保留: $flag"
-        return 1
-    }
-    if [ "$current" != "$want" ]; then
-        _error "service 自启状态未收敛(期望 ${want}, 实际 ${current}, action_rc=${action_rc}), 快照保留: $flag"
+    if [ "$action_rc" -ne 0 ]; then
+        _error "恢复 service 自启状态失败(action_rc=${action_rc}), 快照保留: $flag"
         return 1
     fi
     [ "$keep" = keep ] || rm -f "$flag" 2>/dev/null
-    _warn "已恢复 service 开机自启状态(${want})"
+    _warn "已执行 service 开机自启状态恢复(${want})"
     return 0
 }
 
@@ -2200,11 +2049,6 @@ _xray_service_snapshot() {
         return 1
     fi
     cp -f "$unit" "$prev" 2>/dev/null || { rm -f "$prev"; return 1; }
-    if ! cmp -s "$unit" "$prev" 2>/dev/null; then
-        rm -f "$prev"
-        _error "service 快照与原文件不一致(磁盘空间/IO?), 视为快照失败"
-        return 1
-    fi
     return 0
 }
 

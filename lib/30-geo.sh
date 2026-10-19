@@ -351,15 +351,7 @@ _auto_migrate_geo_autoupdate() {
         return 0
     fi
     _config_present || [ "$transition" = "off_pending" ] || return 0
-    _with_config_lock _auto_migrate_geo_autoupdate_locked
-}
-_auto_migrate_geo_autoupdate_locked() {
-    local transition; transition=$(_geo_transition_get)
-    if [ "$transition" != "off_pending" ] && [ "$(_state_get geo_cron 2>/dev/null)" != "on" ]; then
-        return 0
-    fi
-    _config_present || [ "$transition" = "off_pending" ] || return 0
-    _with_config_write_barrier _auto_migrate_geo_autoupdate_write
+    _with_config_lock _with_config_write_barrier _auto_migrate_geo_autoupdate_write
 }
 
 _auto_migrate_geo_autoupdate_write() {
@@ -441,12 +433,6 @@ _geo_next_run_hint() {
     local hrc=2
     if declare -F _crontab_has_marker >/dev/null 2>&1; then
         _crontab_has_marker "$GEO_CRON_MARKER"; hrc=$?
-    elif declare -F _crontab_read >/dev/null 2>&1; then
-        # 混装旧 lib 缺三态 helper: 退回底层读取原语, 读失败保持"未知", 不谎报"未开启"。
-        local cur
-        if cur=$(_crontab_read); then
-            if printf '%s\n' "$cur" | grep -Fq -- "$GEO_CRON_MARKER"; then hrc=0; else hrc=1; fi
-        fi
     fi
     case "$hrc" in
         0) echo "每月 1/4/7/.../31 号 03:00 (系统 cron)" ;;

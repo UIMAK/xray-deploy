@@ -2,85 +2,20 @@
 # lib/51-reality-pq.sh — 单次 tls ping 判定组名+证书长度，再本地生成ML-DSA-65。
 # 官方 reality.md：X25519MLKEM768 且证书链>3500；服务端seed，客户端verify/pqv。
 
-# _pq_run_bounded <秒> <命令...> 保留stdout/返回码，超时124。
-# 优先 timeout -k，缺失/不支持硬杀则后台看门狗；临时文件失败返回125。
-_pq_fallback_stop() {
-    local pid="$1" pidfile="$2" use_setsid="$3" child_pgid=""
-    if [ "$use_setsid" -eq 1 ]; then
-        # setsid --wait may fork under job control; let its wrapper record the real session leader.
-        if [ -n "$pidfile" ] && [ ! -s "$pidfile" ] && kill -0 "$pid" 2>/dev/null; then
-            sleep 1
-        fi
-        [ -n "$pidfile" ] && child_pgid=$(cat "$pidfile" 2>/dev/null || true)
-        if [[ "$child_pgid" =~ ^[0-9]+$ ]] && [ "$child_pgid" -gt 1 ]; then
-            kill -9 -- "-$child_pgid" 2>/dev/null || true
-        fi
-    elif command -v pkill >/dev/null 2>&1; then
-        pkill -9 -P "$pid" 2>/dev/null || true
-    fi
-    kill -9 "$pid" 2>/dev/null || true
-}
-
-_pq_fallback_cleanup() {
-    local rc=$?
-    trap - EXIT
-    trap '' HUP INT TERM
-    if [ -n "${_pq_bounded_pid:-}" ]; then
-        _pq_fallback_stop "$_pq_bounded_pid" "${_pq_bounded_pidfile:-}" "${_pq_bounded_use_setsid:-0}"
-        wait "$_pq_bounded_pid" 2>/dev/null || true
-    fi
-    [ -n "${_pq_bounded_tmp:-}" ] && rm -f "$_pq_bounded_tmp"
-    [ -n "${_pq_bounded_pidfile:-}" ] && rm -f "$_pq_bounded_pidfile"
-    exit "$rc"
-}
-
-_pq_fallback_signal() { exit "$1"; }
-
+# 优先 timeout -k(TERM 被忽略时仍能 KILL)；busybox timeout 无 -k 则只能发 TERM；
+# 宿主无 timeout 时无界直接执行, 属可接受风险。
 _pq_run_bounded() {
     local secs="$1"; shift
-    if command -v timeout >/dev/null 2>&1; then
-        # 仅使用支持 -k 的timeout；TERM被忽略时仍需KILL，探测用5秒避免负载误判。
-        if timeout -k 1 5 true >/dev/null 2>&1; then
-            # 同样静音被测命令 stderr(与下方 fallback 口径一致): 调用方只消费 stdout 与返回码。
-            timeout -k 2 "$secs" "$@" 2>/dev/null
-            return $?
-        fi
+    if ! command -v timeout >/dev/null 2>&1; then
+        "$@" 2>/dev/null
+        return $?
     fi
-    # 无timeout或不支持-k走同一硬杀看门狗；不能退回无硬杀timeout。
-    (
-    local tmp rc use_setsid=0 pidfile="" i=0
-    local _pq_bounded_tmp="" _pq_bounded_pidfile="" _pq_bounded_pid="" _pq_bounded_use_setsid=0
-    # The fallback runs in this function's subshell so these traps never replace caller traps.
-    trap _pq_fallback_cleanup EXIT
-    trap '_pq_fallback_signal 129' HUP
-    trap '_pq_fallback_signal 130' INT
-    trap '_pq_fallback_signal 143' TERM
-    tmp=$(mktemp) || { _warn "无法创建临时文件(磁盘满/只读?), 无法有界执行"; exit 125; }
-    _pq_bounded_tmp=$tmp
-    if command -v setsid >/dev/null 2>&1 && setsid --wait true >/dev/null 2>&1; then
-        use_setsid=1
-        _pq_bounded_use_setsid=1
-        pidfile=$(mktemp) || { _warn "无法创建进程跟踪文件(磁盘满/只读?), 无法有界执行"; exit 125; }
-        _pq_bounded_pidfile=$pidfile
-        # The wrapper records the actual session leader: setsid --wait can fork under job control.
-        { setsid --wait sh -c 'printf "%s\n" "$$" > "$1"; shift; exec "$@"' _ "$pidfile" "$@" > "$tmp" 2>/dev/null & _pq_bounded_pid=$!; }
-    else
-        { "$@" > "$tmp" 2>/dev/null & _pq_bounded_pid=$!; }
+    # 探测用 5 秒, 避免负载下误判; 被测命令 stderr 静音(调用方只消费 stdout 与返回码)。
+    if timeout -k 1 5 true >/dev/null 2>&1; then
+        timeout -k 2 "$secs" "$@" 2>/dev/null
+        return $?
     fi
-    while kill -0 "$_pq_bounded_pid" 2>/dev/null && [ "$i" -lt "$secs" ]; do
-        sleep 1; i=$((i+1))
-    done
-    if kill -0 "$_pq_bounded_pid" 2>/dev/null; then
-        _pq_fallback_stop "$_pq_bounded_pid" "$pidfile" "$use_setsid"
-        wait "$_pq_bounded_pid" 2>/dev/null || true
-        _pq_bounded_pid=""
-        exit 124
-    fi
-    if wait "$_pq_bounded_pid"; then rc=0; else rc=$?; fi
-    _pq_bounded_pid=""
-    cat "$tmp" 2>/dev/null
-    exit "$rc"
-    )
+    timeout "$secs" "$@" 2>/dev/null
 }
 
 # 按大小写不敏感标签取 seed/verify；兼容冒号、空格与等号，缺失返回1。
@@ -122,9 +57,9 @@ _detect_reality_pq() {
 
     _info "检测 Reality 后量子兼容性: $target"
     local ping_out ping_rc=0
-    # 同一次 tls ping 同时读取组名和链长；网络探测用15秒有界wrapper，失败不使用半截stdout。
-    # 不在此处吞 stderr: 被测命令的 stderr 由 _pq_run_bounded 内部静音,
-    # 而 wrapper 自身("无法创建临时文件"等)的诊断必须留给用户排障。
+    # 同一次 tls ping 同时读取组名和链长；宿主有 timeout 时经 _pq_run_bounded 限时15秒,
+    # 无 timeout 时无界执行。返回码非0或输出为空即判未知, 不使用半截stdout。
+    # 不在此处吞 stderr: 被测命令的 stderr 由 _pq_run_bounded 内部静音, 本函数只消费 stdout 与返回码。
     ping_out=$(_pq_run_bounded 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" tls ping "$target") || ping_rc=$?
 
     if [ "$ping_rc" -ne 0 ]; then
@@ -162,7 +97,7 @@ _detect_reality_pq() {
         return 1
     fi
 
-    # mldsa65是本地命令；保留有界wrapper以限制进程执行时间。
+    # mldsa65 是本地命令；宿主有 timeout 时经 _pq_run_bounded 限时, 否则直接执行。
     _info "目标支持后量子(证书长度 ${length} > 3500),生成 ML-DSA-65 密钥对..."
     local mldsa_out mldsa_rc=0
     mldsa_out=$(_pq_run_bounded 15 env XRAY_LOCATION_ASSET= "$XRAY_BIN" mldsa65 2>/dev/null) || mldsa_rc=$?
@@ -182,6 +117,7 @@ _detect_reality_pq() {
         return 2
     fi
     # Sampled Xray v25.9.11/v25.12.8/v26.3.27/v26.7.11/v26.9.9 emit RawURLEncoding: seed=32B, public key=1952B.
+    # 43/2603 即该编码的 32B/1952B 长度; 长度或字符集不符一律按未知(rc=2, 保留已有 PQ 配置)。
     local _rawurl_re='^[A-Za-z0-9_-]+$'
     if [ "${#pq_seed}" -ne 43 ] || [ "${#pq_verify}" -ne 2603 ] \
        || ! [[ "$pq_seed" =~ $_rawurl_re ]] || ! [[ "$pq_verify" =~ $_rawurl_re ]]; then
