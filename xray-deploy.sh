@@ -14,7 +14,18 @@ SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(dirname "$SELF_PATH")"
 
 # 等锁前记录入口 inode；发布会替换路径，取锁后需比对是否已换代。
-_BOOTSTRAP_ENTRY_ID=$(stat -Lc '%d:%i' "$SELF_PATH" 2>/dev/null) || _BOOTSTRAP_ENTRY_ID=""
+# 取 bash 已打开的那份文件(fd)：路径 inode 在替换后已指向新版本，不能代表正在执行的入口。
+_bootstrap_entry_open_identity() {
+    local fd target
+    for fd in /proc/"$$"/fd/*; do
+        target=$(readlink "$fd" 2>/dev/null) || continue
+        target="${target% (deleted)}"
+        [ "$target" = "$SELF_PATH" ] || continue
+        stat -Lc '%d:%i' "$fd" 2>/dev/null && return 0
+    done
+    return 1
+}
+_BOOTSTRAP_ENTRY_ID=$(_bootstrap_entry_open_identity 2>/dev/null || true)
 
 # lib 目录: 优先与本脚本同目录的 lib/, 否则 /opt/xray-deploy/lib(安装后)
 LIB_DIR="$SCRIPT_DIR/lib"
@@ -157,7 +168,7 @@ if ! _bootstrap_lock_release; then
     exit 1
 fi
 trap - EXIT
-unset -f _bootstrap_lock_release
+unset -f _bootstrap_lock_release _bootstrap_entry_open_identity
 unset _BOOTSTRAP_ENTRY_ID _bootstrap_published_id
 unset _BOOTSTRAP_LOCK_ROOT _BOOTSTRAP_LOCK_FILE _BOOTSTRAP_LOCK_DIR _BOOTSTRAP_LOCK_FD
 unset _BOOTSTRAP_MARKER_HELD _bootstrap_locked _bootstrap_i _bootstrap_took _bootstrap_holder
