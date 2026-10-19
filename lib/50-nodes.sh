@@ -594,10 +594,13 @@ _hy2_no_hop_rules_at_all() {
             fi
             if printf '%s\n' "$q" | grep -qx "nat"; then
                 if command -v ip6tables >/dev/null 2>&1; then
-                    q=$(ip6tables -t nat -S PREROUTING 2>/dev/null) || return 1
+                    if ! q=$(ip6tables -t nat -S PREROUTING 2>/dev/null); then
+                        _warn "ip6tables 查询失败, 无法确认是否存在 IPv6 跳跃规则"
+                        return 1
+                    fi
                     printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
                 else
-                    _warn "iptables 不可用且内核注册了 IPv6 nat 表, 无法确认是否存在 IPv6 跳跃规则"
+                    _warn "iptables 不可用且内核注册了 IPv6 nat 表, 无法确认是否存在 IPv6 跳跃规则; 安装 ip6tables 后重试可解除"
                     return 1
                 fi
             fi

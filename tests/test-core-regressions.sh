@@ -204,7 +204,8 @@ trap cleanup EXIT
         command rm -f "$XRAY_BIN.bak"
         _xray_core_txn_recover_locked && return 1
         [ "$(jq -r .phase "$j")" = replacing ] &&
-            [ "$(cat "$XRAY_BIN")" = binary-original ] && [ "$RESTARTS" -eq 0 ]
+            [ "$(cat "$XRAY_BIN")" = binary-original ] &&
+            [ "$RUNNING" = false ] && [ "$RESTARTS" -eq 0 ] && [ ! -e "$XRAY_BIN.bak" ]
     }
     # Geo full 账本同一规则: 两个 binary 都不存在时不阻塞 dat 回滚。
     legacy_geo_binary_lost() {
@@ -220,7 +221,8 @@ trap cleanup EXIT
         command mv -f "$stage/geoip.dat" "$ASSET_DIR/geoip.dat"
         command rm -f "$XRAY_BIN" "$XRAY_BIN.bak"
         _xray_core_txn_recover_locked || return 1
-        old_dat && settled && [ ! -e "$XRAY_BIN" ]
+        old_dat && settled && [ ! -e "$XRAY_BIN" ] &&
+            [ "$RUNNING" = false ] && [ "$RESTARTS" -eq 0 ]
     }
     core_snapshot_guard() {
         fixture core-snapshot
@@ -342,6 +344,24 @@ trap cleanup EXIT
         unset -f rc-service _proc_any_named sleep
         [ "$rc" -eq 1 ] && grep -Fq 'rc-service xray status' "$TMP/messages"
     }
+    # starting/stopping 同样是"未停止": 进程可能还没拉起, 不能靠进程扫描兜底。
+    stop_openrc_transition_blocks() {
+        local st="$1" expect="$2" rc=0
+        fixture "stop-openrc-$st"
+        INIT_SYSTEM=openrc
+        command rm -f "$UNIT"; printf '#!/sbin/openrc-run\n' > "$UNIT"
+        rc-service() {
+            case "${2:-}" in status) printf ' * status: %s\n' "$st"; return 0 ;; esac
+            return 0
+        }
+        _proc_any_named() { return 1; }
+        sleep() { :; }
+        eval "$stop_and_verify_definition"
+        _xray_stop_and_verify
+        rc=$?
+        unset -f rc-service _proc_any_named sleep
+        [ "$rc" -eq "$expect" ]
+    }
     # systemd 的 state=2 是"查询不可用", 不是"已停止": 修复前会退回 _xray_is_running
     # (systemctl 失败时它也返回 1), 于是把观察不到当成已停止, 破坏性路径继续执行。
     stop_systemd_query_unavailable_blocks() {
@@ -393,6 +413,8 @@ trap cleanup EXIT
     check 'openrc stop rc=1 with stopped status and no process confirms stop' stop_openrc_stop_rc_nonzero
     check 'openrc stop blocks on started status while an owned process runs' stop_openrc_running_blocks
     check 'openrc stopped state keeps started status authoritative over process scan' stop_openrc_status_started_no_scan
+    check 'openrc starting status blocks even before a process exists' stop_openrc_transition_blocks starting 1
+    check 'openrc stopping status is not taken as stopped' stop_openrc_transition_blocks stopping 1
     check 'systemd query failure never confirms stop' stop_systemd_query_unavailable_blocks
     check 'direct unobservable state falls back to pidfile/process liveness' stop_direct_unobservable_falls_back
     # Low1: journal 字段读取失败不能被进程替换吞掉。

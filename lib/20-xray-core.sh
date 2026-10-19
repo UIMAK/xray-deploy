@@ -2431,14 +2431,14 @@ _xray_stopped_state() {
             ;;
         openrc)
             # OpenRC 的 status 退出码不能当判据(已停止=3、服务不存在=1), 只解析文本;
-            # 文本报 started/running 直接判运行, 不把进程扫描当唯一证据。
+            # 文本报 started/starting/running/stopping 直接判运行, 不把进程扫描当唯一证据。
             # init 文件缺失只说明没有服务定义, 仍需排除手工启动的自有实例。
             local unit status_out=""
             unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
             if [ -n "$unit" ] && _xray_core_path_present "$unit"; then
                 status_out=$(rc-service xray status 2>/dev/null) || :
                 case "$status_out" in
-                    *started*|*running*) return 1 ;;
+                    *started*|*starting*|*running*|*stopping*) return 1 ;;
                 esac
             fi
             # 进程扫描是终局判据; /proc 不可读时不能把"扫不到"当成已停止。

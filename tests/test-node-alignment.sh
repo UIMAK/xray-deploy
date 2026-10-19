@@ -539,6 +539,23 @@ nft_legacy_v6_unreadable_probe() {
 }
 check 'nft-only: unreadable IPv6 x_tables registry is fail-closed' nft_legacy_v6_unreadable_probe
 
+# ip6tables 可用但查询失败: 必须 fail-closed 并点名 ip6tables, 不能静默当成无残留。
+nft_legacy_v6_query_fail_probe() {
+    local rc=0 saved_path="$PATH"
+    : > "$TMP/warnings"
+    printf 'nat\n' > "$TMP/nft-proc/ip6_tables_names"
+    mkdir -p "$TMP/ip6bin" || return 1
+    printf '#!/bin/sh\nexit 1\n' > "$TMP/ip6bin/ip6tables" || return 1
+    chmod +x "$TMP/ip6bin/ip6tables" || return 1
+    NFT_OUT='' NFT_RC=0
+    PATH="$TMP/ip6bin:$PATH"
+    _hy2_no_hop_rules_at_all || rc=$?
+    PATH="$saved_path"
+    rm -f "$TMP/nft-proc/ip6_tables_names"
+    eq "$rc" 1 && grep -qF 'ip6tables 查询失败' "$TMP/warnings"
+}
+check 'nft-only: failed ip6tables query is fail-closed and names ip6tables' nft_legacy_v6_query_fail_probe
+
 nft_cleanup_legacy_v6_probe() {
     local rc=0
     : > "$TMP/errors"
