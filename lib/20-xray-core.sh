@@ -2472,8 +2472,10 @@ _xray_stop_and_verify() {
         state=$?
         probe="_xray_stopped_state rc=${state}"
         [ "$state" -ne 0 ] || return 0
-        # 2=查询不可用, 退回既有的 pidfile/进程判活; direct 后端一直走这条。
-        if [ "$state" -eq 2 ]; then
+        # 2=查询不可用: 只有 direct 后端(无服务查询)退回 pidfile/进程判活;
+        # systemd/openrc 的查询失败不得当成已停止, 继续轮询到报错返回 1。
+        if [ "$state" -eq 2 ] && [ "${INIT_SYSTEM:-}" != systemd ] && \
+           [ "${INIT_SYSTEM:-}" != openrc ]; then
             if _xray_is_running; then
                 probe="${probe}, _xray_is_running rc=0"
             else

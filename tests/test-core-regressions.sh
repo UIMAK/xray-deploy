@@ -342,6 +342,36 @@ trap cleanup EXIT
         unset -f rc-service _proc_any_named sleep
         [ "$rc" -eq 1 ] && grep -Fq 'rc-service xray status' "$TMP/messages"
     }
+    # systemd 的 state=2 是"查询不可用", 不是"已停止": 修复前会退回 _xray_is_running
+    # (systemctl 失败时它也返回 1), 于是把观察不到当成已停止, 破坏性路径继续执行。
+    stop_systemd_query_unavailable_blocks() {
+        fixture stop-systemd-query
+        INIT_SYSTEM=systemd
+        _manage_xray() { return 0; }
+        systemctl() { return 1; }
+        _proc_any_named() { return 1; }
+        sleep() { :; }
+        eval "$stop_and_verify_definition"
+        _xray_stop_and_verify
+        local rc=$?
+        unset -f _manage_xray systemctl _proc_any_named sleep
+        [ "$rc" -eq 1 ] &&
+            grep -Fq '无法确认 Xray 已停止' "$TMP/messages" &&
+            grep -Fq 'systemctl status xray' "$TMP/messages"
+    }
+    # direct 后端没有服务查询, state=2 是常态: pidfile/进程回退必须保留。
+    stop_direct_unobservable_falls_back() {
+        fixture stop-direct-fallback
+        INIT_SYSTEM=direct
+        _manage_xray() { return 0; }
+        _xray_is_running() { return 1; }
+        sleep() { :; }
+        eval "$stop_and_verify_definition"
+        _xray_stop_and_verify
+        local rc=$?
+        unset -f _manage_xray _xray_is_running sleep
+        [ "$rc" -eq 0 ]
+    }
     check 'masked Geo success keeps original mask inode and stopped runtime' masked_success
     check 'dat snapshot scope preserves unrelated binary/service backups and skips their fsync' dat_ownership
     check 'second dat rename failure restores both dat files and running runtime' second_dat_failure
@@ -363,6 +393,8 @@ trap cleanup EXIT
     check 'openrc stop rc=1 with stopped status and no process confirms stop' stop_openrc_stop_rc_nonzero
     check 'openrc stop blocks on started status while an owned process runs' stop_openrc_running_blocks
     check 'openrc stopped state keeps started status authoritative over process scan' stop_openrc_status_started_no_scan
+    check 'systemd query failure never confirms stop' stop_systemd_query_unavailable_blocks
+    check 'direct unobservable state falls back to pidfile/process liveness' stop_direct_unobservable_falls_back
     # Low1: journal 字段读取失败不能被进程替换吞掉。
     journal_rc_probe() {
         local saved rc1=0 rc2=0
