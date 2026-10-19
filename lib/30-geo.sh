@@ -71,10 +71,25 @@ _geo_source_url() {
     _geo_url_for "$src" "$kind" "$cgs" "$cgi"
 }
 
+# custom 两条链接都存在且合法才算有效; label 与 assets 回落共用这一判据。
+_geo_custom_links_valid() {
+    local cgs="" cgi=""
+    cgs=$(_state_get geo_geosite_url 2>/dev/null) || cgs=""
+    cgi=$(_state_get geo_geoip_url 2>/dev/null) || cgi=""
+    _geo_url_valid "$cgs" && _geo_url_valid "$cgi"
+}
+
+# 链接无效时 label 必须与菜单实际显示的回落 URL 一致, 不能只写"自定义链接"。
 _geo_source_label() {
     case "$(_geo_source_name)" in
         loyal) printf '%s' "Loyalsoldier/v2ray-rules-dat (完整版)" ;;
-        custom) printf '%s' "自定义链接" ;;
+        custom)
+            if _geo_custom_links_valid; then
+                printf '%s' "自定义链接"
+            else
+                printf '%s' "自定义链接(链接无效, 已回落默认)"
+            fi
+            ;;
         *) printf '%s' "XTLS/Xray-rules-dat (默认)" ;;
     esac
 }
@@ -93,14 +108,31 @@ _geo_builtin_source_drifted() {
     return 1
 }
 
+# assets 唯一构造点: 本地文件名恒为 geosite.dat / geoip.dat, 远端名随源变化。
+# 省略链接时从 state 取 custom 链接; 任一链接非法则整体回落默认源(与 _geo_source_url 同判据)。
+_geo_assets_json() {
+    local src="$1" cgs="${2:-}" cgi="${3:-}"
+    if [ "$src" = "custom" ]; then
+        [ -n "$cgs" ] || { cgs=$(_state_get geo_geosite_url 2>/dev/null) || cgs=""; }
+        [ -n "$cgi" ] || { cgi=$(_state_get geo_geoip_url 2>/dev/null) || cgi=""; }
+        if ! _geo_url_valid "$cgs" || ! _geo_url_valid "$cgi"; then
+            src="xtls"
+            cgs=""
+            cgi=""
+        fi
+    fi
+    jq -n \
+        --arg u1 "$(_geo_url_for "$src" geosite "$cgs" "$cgi")" \
+        --arg u2 "$(_geo_url_for "$src" geoip "$cgs" "$cgi")" \
+        '[{url: $u1, file: "geosite.dat"}, {url: $u2, file: "geoip.dat"}]'
+}
+
 # 生成 geodata JSON: cron 五字段、assets URL 必须 HTTPS; 供 --argjson 使用。
 # 省略 outbound 时下载遵循 Xray 路由, 不等于固定直连。
 _geo_geodata_json() {
-    jq -n \
-        --arg cron "$GEO_CRON_EXPR" \
-        --arg u1 "$(_geo_source_url geosite)" \
-        --arg u2 "$(_geo_source_url geoip)" \
-        '{cron: $cron, assets: [ {url: $u1, file: "geosite.dat"}, {url: $u2, file: "geoip.dat"} ]}'
+    local assets
+    assets=$(_geo_assets_json "$(_geo_source_name)") || return 1
+    jq -n --arg cron "$GEO_CRON_EXPR" --argjson a "$assets" '{cron: $cron, assets: $a}'
 }
 
 # 状态唯一查询点: 非空 .geodata.cron 优先, 否则读 legacy geo_cron。
@@ -735,11 +767,7 @@ _geo_apply_source() {
         _geo_url_valid "$cgi" || { _error "geoip 链接无效"; return 1; }
     fi
     if [ "$(_geo_auto_mechanism)" = "builtin" ]; then
-        assets=$(jq -n \
-            --arg u1 "$(_geo_url_for "$src" geosite "$cgs" "$cgi")" \
-            --arg u2 "$(_geo_url_for "$src" geoip "$cgs" "$cgi")" \
-            '[{url: $u1, file: "geosite.dat"}, {url: $u2, file: "geoip.dat"}]') \
-            || { _error "生成 assets 失败"; return 1; }
+        assets=$(_geo_assets_json "$src" "$cgs" "$cgi") || { _error "生成 assets 失败"; return 1; }
         if ! _mutate_config --argjson a "$assets" '.geodata.assets = $a'; then
             _error "写入 geodata.assets 失败(配置已回滚), 数据源未变更"
             return 1
@@ -755,6 +783,8 @@ _geo_apply_source() {
     _success "数据源已切换: $(_geo_source_label)"
     _info "geosite: $(_geo_source_url geosite)"
     _info "geoip:   $(_geo_source_url geoip)"
+    # 只换链接不动已落地的 dat: 必须提示再触发一次下载才会真正换源。
+    _info "本次只切换下载链接与 state, 本地 dat 仍是旧源数据; 按 [1] 立即更新即可马上换源"
     return 0
 }
 

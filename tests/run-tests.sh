@@ -700,6 +700,68 @@ fi
 rm -f "$STATE_DIR/geo_source" "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
 _config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
 
+printf '== Geo data source apply contracts ==\n'
+# 回滚契约: config 写入失败时数据源必须保持原值, 不能只改一半 state。
+if (
+    _state_set geo_source loyal
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _mutate_config() { return 1; }
+    _geo_apply_source xtls >/dev/null 2>&1 && exit 1
+    [ "$(_geo_source_name)" = loyal ]
+); then
+    pass 'builtin switch failure keeps the previous source'
+else
+    fail 'builtin switch failure keeps the previous source'
+fi
+# custom 的第二个参数同样要校验: 非法 geoip 链接整体拒绝, 不碰 config 也不写 state。
+GEO_BAD_MARK="$TMP/geo-bad-mutate"
+rm -f "$GEO_BAD_MARK"
+if (
+    _state_set geo_source loyal
+    rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _mutate_config() { : > "$GEO_BAD_MARK"; return 0; }
+    _geo_apply_source custom 'https://a.test/gs.dat' 'ftp://a.test/gi.dat' >/dev/null 2>&1 && exit 1
+    [ "$(_geo_source_name)" = loyal ] && [ ! -e "$GEO_BAD_MARK" ] && [ ! -e "$STATE_DIR/geo_geosite_url" ]
+); then
+    pass 'custom switch rejects an invalid geoip link without touching config or state'
+else
+    fail 'custom switch rejects an invalid geoip link without touching config or state'
+fi
+# 切换只换链接: 必须提示本地 dat 仍是旧源数据, 否则用户会以为已经换源。
+GEO_APPLY_HINT="$TMP/geo-apply-hint"
+(
+    _geo_auto_mechanism() { printf 'off'; }
+    _geo_apply_source xtls
+) > "$GEO_APPLY_HINT" 2>&1
+if contains '本地 dat 仍是旧源数据' "$(cat "$GEO_APPLY_HINT" 2>/dev/null)"; then
+    pass 'source switch hints that the local dat still holds the old source'
+else
+    fail 'source switch hints that the local dat still holds the old source'
+fi
+# label 必须与实际显示的回落 URL 一致, 不能只写"自定义链接"。
+_state_set geo_source custom
+rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+check_eq 'custom label reports the fallback when links are missing' \
+    '自定义链接(链接无效, 已回落默认)' "$(_geo_source_label)"
+_state_set geo_geosite_url 'https://example.test/gs.dat'
+_state_set geo_geoip_url 'ftp://example.test/gi.dat'
+check_eq 'custom label reports the fallback for an invalid link' \
+    '自定义链接(链接无效, 已回落默认)' "$(_geo_source_label)"
+_state_set geo_geoip_url 'https://example.test/gi.dat'
+check_eq 'valid custom links keep the plain label' '自定义链接' "$(_geo_source_label)"
+# assets 只有一个构造点: 助手与 geodata JSON 必须给出同一份 assets。
+_state_set geo_source xtls
+rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+GEO_ASSETS=$(_geo_assets_json xtls)
+check_eq 'assets helper keeps the fixed local file names' 'geosite.dat geoip.dat' \
+    "$(printf '%s' "$GEO_ASSETS" | jq -r '[.[].file] | join(" ")')"
+check_eq 'assets helper maps the geoip URL' "$GEO_U_XTLS_GEOIP" \
+    "$(printf '%s' "$GEO_ASSETS" | jq -r '.[1].url')"
+check_eq 'geodata json reuses the assets helper' "$(printf '%s' "$GEO_ASSETS" | jq -c '.')" \
+    "$(_geo_geodata_json | jq -c '.assets')"
+rm -f "$STATE_DIR/geo_source" "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+
 printf '== logrotate state contracts ==\n'
 rm -f "$STATE_DIR/logrotate_enabled"
 check_eq 'missing logrotate state is unset' unset "$(_logrotate_enabled_state)"
