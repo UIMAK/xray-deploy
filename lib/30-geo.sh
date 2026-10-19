@@ -1,7 +1,7 @@
 #!/bin/bash
 # lib/30-geo.sh — Geo 更新、路由精简与 DNS 设置。
 # Geo 自动更新默认 OFF; ≥ v26.4.25 用内置 geodata, 旧核心用系统 cron。
-# 数据源 Loyalsoldier/v2ray-rules-dat, 落点 $ASSET_DIR; 下载失败保留旧 dat。
+# 数据源默认 XTLS/Xray-rules-dat, 可切 Loyalsoldier 或自定义链接; 落点 $ASSET_DIR, 下载失败保留旧 dat。
 # 内置 assets.file 必须预先存在, 否则核心拒绝启动; 见 _geo_set_auto_update。
 # DNS 写入走 _mutate_config 的重启与回滚; 见 _dns_apply。
 
@@ -23,13 +23,83 @@ _geo_transition_clear() {
     return 0
 }
 
+# 数据源只记预设名, 链接由常量给: 上游改名只改常量, 老机器不留死链。
+_geo_source_name() {
+    local src=""
+    src=$(_state_get geo_source 2>/dev/null) || src=""
+    case "$src" in
+        xtls|loyal|custom) printf '%s' "$src" ;;
+        *) printf '%s' "xtls" ;;
+    esac
+}
+
+_geo_url_valid() {
+    local u="${1:-}"
+    case "$u" in
+        "https://"?*) ;;
+        *) return 1 ;;
+    esac
+    case "$u" in
+        *[[:space:]]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# 唯一 URL 映射点; 远端文件名按源不同, 本地落点恒为 geosite.dat / geoip.dat。
+_geo_url_for() {
+    local src="$1" kind="$2" cgs="${3:-}" cgi="${4:-}"
+    case "$src:$kind" in
+        xtls:geosite) printf '%s' "$GEO_SRC_XTLS_GEOSITE" ;;
+        xtls:*) printf '%s' "$GEO_SRC_XTLS_GEOIP" ;;
+        loyal:geosite) printf '%s' "$GEO_SRC_LOYAL_GEOSITE" ;;
+        loyal:*) printf '%s' "$GEO_SRC_LOYAL_GEOIP" ;;
+        custom:geosite) printf '%s' "$cgs" ;;
+        *) printf '%s' "$cgi" ;;
+    esac
+}
+
+# 当前选择的下载 URL; custom 两条链接缺失/非法时静默回落默认源。
+_geo_source_url() {
+    local kind="$1" src="" cgs="" cgi=""
+    src=$(_geo_source_name)
+    if [ "$src" = "custom" ]; then
+        cgs=$(_state_get geo_geosite_url 2>/dev/null) || cgs=""
+        cgi=$(_state_get geo_geoip_url 2>/dev/null) || cgi=""
+        _geo_url_valid "$cgs" || src="xtls"
+        _geo_url_valid "$cgi" || src="xtls"
+    fi
+    _geo_url_for "$src" "$kind" "$cgs" "$cgi"
+}
+
+_geo_source_label() {
+    case "$(_geo_source_name)" in
+        loyal) printf '%s' "Loyalsoldier/v2ray-rules-dat (完整版)" ;;
+        custom) printf '%s' "自定义链接" ;;
+        *) printf '%s' "XTLS/Xray-rules-dat (默认)" ;;
+    esac
+}
+
+# 内置定时生效时 config 的 assets 才是实际下载源; 与当前选择不一致需重新应用。
+_geo_builtin_source_drifted() {
+    _config_present || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    local cron="" urls=""
+    cron=$(_config_jq -r '.geodata.cron // ""' 2>/dev/null) || return 1
+    [ -n "$cron" ] || return 1
+    urls=$(_config_jq -r '.geodata.assets[]?.url // empty' 2>/dev/null) || return 1
+    [ -n "$urls" ] || return 1
+    case "$urls" in *"$(_geo_source_url geosite)"*) ;; *) return 0 ;; esac
+    case "$urls" in *"$(_geo_source_url geoip)"*) ;; *) return 0 ;; esac
+    return 1
+}
+
 # 生成 geodata JSON: cron 五字段、assets URL 必须 HTTPS; 供 --argjson 使用。
 # 省略 outbound 时下载遵循 Xray 路由, 不等于固定直连。
 _geo_geodata_json() {
     jq -n \
         --arg cron "$GEO_CRON_EXPR" \
-        --arg u1 "$GEO_BASE/geosite.dat" \
-        --arg u2 "$GEO_BASE/geoip.dat" \
+        --arg u1 "$(_geo_source_url geosite)" \
+        --arg u2 "$(_geo_source_url geoip)" \
         '{cron: $cron, assets: [ {url: $u1, file: "geosite.dat"}, {url: $u2, file: "geoip.dat"} ]}'
 }
 
@@ -119,12 +189,13 @@ _geo_update() {
     tmp=$(mktemp -d) || { _error "无法创建 Geo 下载临时目录, 更新中止"; return 1; }
     local ts
     ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
-    _info "[$ts] 开始更新 Geo 数据..."
+    _info "[$ts] 开始更新 Geo 数据 (数据源: $(_geo_source_label))..."
 
     # 两个 dat 成组提交; 任一下载失败由锁内 coretxn 拒绝整组, 保留旧数据。
+    # 远端文件名随源变化(geoip-full.dat 等), 落点恒为 $tmp/$f。
     local ok=1 f url t sz
     for f in geosite.dat geoip.dat; do
-        url="$GEO_BASE/$f"
+        url=$(_geo_source_url "${f%%.dat}")
         t="${tmp}/${f}"
         _info "下载 $f <- $url"
         if ! _http_download "$url" "$t" 60; then
@@ -651,6 +722,85 @@ _route_rules_menu() {
     done
 }
 
+# 切换数据源: 内置定时生效时先改 config(verified restart 后立即生效), 再记 state。
+# 只替换 .geodata.assets, 保留用户手改的 .geodata.cron; cron/off 机制下只记 state。
+_geo_apply_source() {
+    local src="$1" cgs="${2:-}" cgi="${3:-}" assets=""
+    case "$src" in
+        xtls|loyal|custom) ;;
+        *) _error "未知数据源: $src"; return 1 ;;
+    esac
+    if [ "$src" = "custom" ]; then
+        _geo_url_valid "$cgs" || { _error "geosite 链接无效"; return 1; }
+        _geo_url_valid "$cgi" || { _error "geoip 链接无效"; return 1; }
+    fi
+    if [ "$(_geo_auto_mechanism)" = "builtin" ]; then
+        assets=$(jq -n \
+            --arg u1 "$(_geo_url_for "$src" geosite "$cgs" "$cgi")" \
+            --arg u2 "$(_geo_url_for "$src" geoip "$cgs" "$cgi")" \
+            '[{url: $u1, file: "geosite.dat"}, {url: $u2, file: "geoip.dat"}]') \
+            || { _error "生成 assets 失败"; return 1; }
+        if ! _mutate_config --argjson a "$assets" '.geodata.assets = $a'; then
+            _error "写入 geodata.assets 失败(配置已回滚), 数据源未变更"
+            return 1
+        fi
+    fi
+    _state_set geo_source "$src" || _warn "数据源已生效, 但状态写入失败; 请重新切换一次"
+    if [ "$src" = "custom" ]; then
+        _state_set geo_geosite_url "$cgs" 2>/dev/null || _warn "geosite 链接未能记录"
+        _state_set geo_geoip_url "$cgi" 2>/dev/null || _warn "geoip 链接未能记录"
+    else
+        rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url" 2>/dev/null
+    fi
+    _success "数据源已切换: $(_geo_source_label)"
+    _info "geosite: $(_geo_source_url geosite)"
+    _info "geoip:   $(_geo_source_url geoip)"
+    return 0
+}
+
+# 必答字段: 空值或非 https 重问该字段, EOF 取消。
+_geo_prompt_url() {
+    local label="$1" val=""
+    while :; do
+        read -rp "  $label: " val || return 1
+        if _geo_url_valid "$val"; then
+            printf '%s' "$val"
+            return 0
+        fi
+        _warn "请输入 https:// 开头的完整链接(不能含空格)"
+    done
+}
+
+_geo_set_source() {
+    local src="" gs="" gi="" choice=""
+    while :; do
+        clear
+        echo
+        echo -e "  ${CYAN}【切换 Geo 数据源】${NC}"
+        echo -e "  当前: $(_geo_source_label)"
+        echo
+        echo -e "  ${GREEN}[1]${NC} XTLS/Xray-rules-dat (官方, 默认)"
+        echo -e "  ${GREEN}[2]${NC} Loyalsoldier/v2ray-rules-dat (完整版)"
+        echo -e "  ${GREEN}[3]${NC} 自定义 geosite / geoip 链接"
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  请选择: " choice || return 0
+        case "${choice:-0}" in
+            1) src="xtls"; break ;;
+            2) src="loyal"; break ;;
+            3)
+                gs=$(_geo_prompt_url "geosite 链接") || return 0
+                gi=$(_geo_prompt_url "geoip 链接") || return 0
+                src="custom"; break
+                ;;
+            0) return 0 ;;
+            *) _warn "无效"; _press_any_key ;;
+        esac
+    done
+    _geo_apply_source "$src" "$gs" "$gi" || { _press_any_key; return 1; }
+    _press_any_key
+    return 0
+}
+
 # Geo 菜单复用 _geo_auto_mechanism, 不单靠 legacy state 判断内置更新。
 _geo_menu() {
     clear
@@ -658,6 +808,7 @@ _geo_menu() {
     echo -e "  ${CYAN}【Geo 数据自动更新】${NC}"
     local state; state=$(_geo_auto_state)
     local mech; mech=$(_geo_auto_mechanism)
+    local choice=""
     if [ "$state" = "on" ]; then
         echo -e "  当前状态: ${GREEN}● 已开启${NC}"
         echo -e "  下次执行: $(_geo_next_run_hint)"
@@ -669,7 +820,12 @@ _geo_menu() {
     else
         echo -e "  当前状态: ${RED}○ 已关闭${NC}"
     fi
-    echo -e "  数据源: Loyalsoldier/v2ray-rules-dat (完整版)"
+    echo -e "  数据源: $(_geo_source_label)"
+    echo -e "    geosite: $(_geo_source_url geosite)"
+    echo -e "    geoip:   $(_geo_source_url geoip)"
+    if _geo_builtin_source_drifted; then
+        echo -e "  ${YELLOW}注: 内置定时的下载链接仍是旧数据源, 进 [4] 重新应用一次即可同步(会重启核心)${NC}"
+    fi
     echo -e "  落点: $ASSET_DIR (config env 的 XRAY_LOCATION_ASSET)"
     echo
     echo -e "  ${GREEN}[1]${NC} 立即更新一次"
@@ -679,12 +835,14 @@ _geo_menu() {
         echo -e "  ${GREEN}[2]${NC} 开启自动更新(定期)"
     fi
     echo -e "  ${GREEN}[3]${NC} 路由规则(小内存优化: 精简 geo 引用)"
+    echo -e "  ${GREEN}[4]${NC} 切换数据源"
     echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  请选择: " choice
-    case "$choice" in
+    read -rp "  请选择: " choice || return 0
+    case "${choice:-0}" in
         1) _geo_update ;;
         2) if [ "$state" = "on" ]; then _geo_set_auto_update off; else _geo_set_auto_update on; fi ;;
         3) _route_rules_menu; return ;;
+        4) _geo_set_source; return ;;
         0) return ;;
         *) _warn "无效" ;;
     esac

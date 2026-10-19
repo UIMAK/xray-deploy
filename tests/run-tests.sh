@@ -567,6 +567,139 @@ else
     fail 'Geo off_pending deletes the geodata field file'
 fi
 
+printf '== Geo data source selection ==\n'
+GEO_U_XTLS_GEOSITE='https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat'
+GEO_U_XTLS_GEOIP='https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-full.dat'
+GEO_U_LOYAL_GEOSITE='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
+GEO_U_LOYAL_GEOIP='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
+rm -f "$STATE_DIR/geo_source" "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+
+check_eq 'default Geo source is XTLS' xtls "$(_geo_source_name)"
+check_eq 'XTLS geosite URL keeps the upstream file name' "$GEO_U_XTLS_GEOSITE" "$(_geo_source_url geosite)"
+check_eq 'XTLS geoip URL uses geoip-full.dat' "$GEO_U_XTLS_GEOIP" "$(_geo_source_url geoip)"
+
+_state_set geo_source loyal
+check_eq 'Loyalsoldier geosite URL' "$GEO_U_LOYAL_GEOSITE" "$(_geo_source_url geosite)"
+check_eq 'Loyalsoldier geoip URL' "$GEO_U_LOYAL_GEOIP" "$(_geo_source_url geoip)"
+
+_state_set geo_source custom
+_state_set geo_geosite_url 'https://example.test/gs.dat'
+_state_set geo_geoip_url 'https://example.test/gi.dat'
+check_eq 'custom geosite URL is used verbatim' 'https://example.test/gs.dat' "$(_geo_source_url geosite)"
+check_eq 'custom geoip URL is used verbatim' 'https://example.test/gi.dat' "$(_geo_source_url geoip)"
+_state_set geo_geoip_url 'ftp://example.test/gi.dat'
+check_eq 'broken custom geoip falls back to the default geosite' "$GEO_U_XTLS_GEOSITE" "$(_geo_source_url geosite)"
+check_eq 'broken custom geoip falls back to the default geoip' "$GEO_U_XTLS_GEOIP" "$(_geo_source_url geoip)"
+_state_set geo_source bogus
+check_eq 'unknown Geo source falls back to the default' xtls "$(_geo_source_name)"
+rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+
+_state_set geo_source xtls
+GEO_GD=$(_geo_geodata_json)
+check_eq 'geodata assets keep fixed local file names' 'geosite.dat geoip.dat' \
+    "$(printf '%s' "$GEO_GD" | jq -r '[.assets[].file] | join(" ")')"
+check_eq 'geodata geoip asset points at geoip-full.dat' "$GEO_U_XTLS_GEOIP" \
+    "$(printf '%s' "$GEO_GD" | jq -r '.assets[1].url')"
+
+# 下载阶段必须"远端全量、落点固定": URL 随源变化, 目标文件名恒为 geosite.dat/geoip.dat。
+GEO_DL_XTLS="$TMP/geo-dl-xtls"
+(
+    _geo_transition_clear
+    _ensure_dirs() { return 0; }
+    _with_config_lock() { "$@"; }
+    _with_core_lock() { "$@"; }
+    _geo_update_commit_and_finalize_locked() { return 0; }
+    _http_download() { printf '%s -> %s\n' "$1" "${2##*/}" >> "$GEO_DL_XTLS"; return 91; }
+    _geo_update
+) >/dev/null 2>&1
+check_eq 'download maps the XTLS geosite URL onto geosite.dat' "$GEO_U_XTLS_GEOSITE -> geosite.dat" \
+    "$(sed -n '1p' "$GEO_DL_XTLS" 2>/dev/null)"
+check_eq 'download maps geoip-full.dat onto geoip.dat' "$GEO_U_XTLS_GEOIP -> geoip.dat" \
+    "$(sed -n '2p' "$GEO_DL_XTLS" 2>/dev/null)"
+
+GEO_DL_LOYAL="$TMP/geo-dl-loyal"
+(
+    _geo_transition_clear
+    _ensure_dirs() { return 0; }
+    _with_config_lock() { "$@"; }
+    _with_core_lock() { "$@"; }
+    _geo_update_commit_and_finalize_locked() { return 0; }
+    _http_download() { printf '%s -> %s\n' "$1" "${2##*/}" >> "$GEO_DL_LOYAL"; return 91; }
+    _state_set geo_source loyal
+    _geo_update
+) >/dev/null 2>&1
+check_eq 'download maps the Loyalsoldier geosite URL onto geosite.dat' "$GEO_U_LOYAL_GEOSITE -> geosite.dat" \
+    "$(sed -n '1p' "$GEO_DL_LOYAL" 2>/dev/null)"
+check_eq 'download maps the Loyalsoldier geoip URL onto geoip.dat' "$GEO_U_LOYAL_GEOIP -> geoip.dat" \
+    "$(sed -n '2p' "$GEO_DL_LOYAL" 2>/dev/null)"
+
+# 内置定时生效时切换必须改写 config 的 assets; cron/off 机制只记 state。
+GEO_MUTATE_ARGS="$TMP/geo-mutate-args"
+rm -f "$GEO_MUTATE_ARGS"
+(
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _mutate_config() { printf '%s\n' "$@" > "$GEO_MUTATE_ARGS"; return 0; }
+    _geo_apply_source xtls
+) >/dev/null 2>&1
+GEO_MUTATE_TEXT=$(cat "$GEO_MUTATE_ARGS" 2>/dev/null)
+if contains "$GEO_U_XTLS_GEOIP" "$GEO_MUTATE_TEXT" && contains '.geodata.assets = $a' "$GEO_MUTATE_TEXT"; then
+    pass 'builtin switch rewrites the geodata assets only'
+else
+    fail "builtin switch rewrites the geodata assets only [$GEO_MUTATE_TEXT]"
+fi
+check_eq 'builtin switch records the source name' xtls "$(_state_get geo_source)"
+
+GEO_MUTATE_MARK="$TMP/geo-mutate-called"
+rm -f "$GEO_MUTATE_MARK"
+if (
+    _geo_auto_mechanism() { printf 'off'; }
+    _mutate_config() { : > "$GEO_MUTATE_MARK"; return 0; }
+    _geo_apply_source loyal >/dev/null 2>&1
+    [ ! -e "$GEO_MUTATE_MARK" ] && [ "$(_state_get geo_source)" = loyal ]
+); then
+    pass 'cron/off switch records state without touching config'
+else
+    fail 'cron/off switch records state without touching config'
+fi
+
+if (
+    _geo_auto_mechanism() { printf 'off'; }
+    _geo_apply_source custom 'https://a.test/gs.dat' 'https://a.test/gi.dat' >/dev/null 2>&1 || exit 1
+    [ "$(_state_get geo_geosite_url)" = 'https://a.test/gs.dat' ] \
+        && [ "$(_state_get geo_geoip_url)" = 'https://a.test/gi.dat' ] \
+        && [ "$(_geo_source_url geoip)" = 'https://a.test/gi.dat' ]
+); then
+    pass 'custom switch stores both links'
+else
+    fail 'custom switch stores both links'
+fi
+if (
+    _geo_auto_mechanism() { printf 'off'; }
+    _geo_apply_source custom 'ftp://a.test/gs.dat' 'https://a.test/gi.dat' >/dev/null 2>&1 && exit 1
+    [ "$(_state_get geo_source)" = custom ]
+); then
+    pass 'custom switch rejects a non-https link'
+else
+    fail 'custom switch rejects a non-https link'
+fi
+
+# 老版本写下的 assets 仍指向旧源: 内置定时生效时必须提示重新应用。
+_config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]},"geodata":{"cron":"0 3 */3 * *","assets":[{"url":"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat","file":"geosite.dat"},{"url":"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat","file":"geoip.dat"}]}}' >/dev/null 2>&1
+_state_set geo_source xtls
+if _geo_builtin_source_drifted; then
+    pass 'legacy assets are reported as drifted'
+else
+    fail 'legacy assets are reported as drifted'
+fi
+_state_set geo_source loyal
+if _geo_builtin_source_drifted; then
+    fail 'assets matching the selected source are not drifted'
+else
+    pass 'assets matching the selected source are not drifted'
+fi
+rm -f "$STATE_DIR/geo_source" "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+_config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
+
 printf '== logrotate state contracts ==\n'
 rm -f "$STATE_DIR/logrotate_enabled"
 check_eq 'missing logrotate state is unset' unset "$(_logrotate_enabled_state)"
