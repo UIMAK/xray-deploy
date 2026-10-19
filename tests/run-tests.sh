@@ -761,6 +761,192 @@ check_eq 'assets helper maps the geoip URL' "$GEO_U_XTLS_GEOIP" \
 check_eq 'geodata json reuses the assets helper' "$(printf '%s' "$GEO_ASSETS" | jq -c '.')" \
     "$(_geo_geodata_json | jq -c '.assets')"
 rm -f "$STATE_DIR/geo_source" "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+echo '== Custom geodata assets =='
+GEO_EXTRA_PATH="$STATE_DIR/geo_extra_assets"
+GEO_EXTRA_BIG="$TMP/geo-extra-big.dat"
+printf '%4096s' '' | tr ' ' 'x' > "$GEO_EXTRA_BIG"
+GEO_EXTRA_MUTATE="$TMP/geo-extra-mutate"
+GEO_EXTRA_FILTER="$TMP/geo-extra-filter"
+GEO_EXTRA_TOUCHED="$TMP/geo-extra-config-touched"
+rm -f "$GEO_EXTRA_PATH" "$GEO_EXTRA_MUTATE" "$GEO_EXTRA_FILTER" "$GEO_EXTRA_TOUCHED"
+
+# 添加: 先下载落盘(Xray 只认资源目录内已存在的普通文件), builtin 下再写 config, 最后记 state。
+if (
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _with_core_lock() { "$@"; }
+    _http_download() { cp "$GEO_EXTRA_BIG" "$2"; return 0; }
+    _mutate_config() { printf '%s' "$3" > "$GEO_EXTRA_MUTATE"; printf '%s' "$4" > "$GEO_EXTRA_FILTER"; return 0; }
+    { echo 'https://a.test/my.dat'; echo 'my.dat'; } | _geo_extra_add
+) >/dev/null 2>&1; then
+    pass 'custom geodata add completes under builtin'
+else
+    fail 'custom geodata add completes under builtin'
+fi
+check_eq 'custom geodata add records the state line' 'my.dat	https://a.test/my.dat' \
+    "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+check 'custom geodata add lands the dat file' test -s "$ASSET_DIR/my.dat"
+check_eq 'custom geodata add rewrites only the assets field' '.geodata.assets = $a' \
+    "$(cat "$GEO_EXTRA_FILTER" 2>/dev/null)"
+check_eq 'custom geodata add puts the entry into assets' 'my.dat https://a.test/my.dat' \
+    "$(jq -r '.[] | select(.file=="my.dat") | .file + " " + .url' "$GEO_EXTRA_MUTATE" 2>/dev/null)"
+check_eq 'custom geodata add keeps both builtin assets' 'geosite.dat geoip.dat' \
+    "$(jq -r '[.[] | select(.file=="geosite.dat" or .file=="geoip.dat") | .file] | join(" ")' "$GEO_EXTRA_MUTATE" 2>/dev/null)"
+check_eq 'geodata json carries the extras' 'my.dat' \
+    "$(_geo_geodata_json | jq -r '.assets[] | select(.file=="my.dat") | .file' 2>/dev/null)"
+
+# 回车取链接末段: 去掉 ?query 与 #fragment; cron/off 机制只记 state, 不写 config。
+if (
+    _geo_auto_mechanism() { printf 'off'; }
+    _with_core_lock() { "$@"; }
+    _http_download() { cp "$GEO_EXTRA_BIG" "$2"; return 0; }
+    _mutate_config() { : > "$GEO_EXTRA_TOUCHED"; return 0; }
+    { echo 'https://a.test/dl/zeta.dat?token=1#frag'; echo ''; } | _geo_extra_add
+) >/dev/null 2>&1; then
+    pass 'custom geodata add accepts the default file name'
+else
+    fail 'custom geodata add accepts the default file name'
+fi
+check 'default file name drops query and fragment' test -s "$ASSET_DIR/zeta.dat"
+check_eq 'default file name is recorded in state' 'zeta.dat' \
+    "$(awk -F'	' '$1=="zeta.dat"{print $1}' "$GEO_EXTRA_PATH" 2>/dev/null)"
+check 'cron/off mechanism adds without touching config' test ! -e "$GEO_EXTRA_TOUCHED"
+
+# 非法输入只重问该字段: 非 https 链接、含 / 或 ..、内置名、重名都不能落 state。
+if (
+    _geo_auto_mechanism() { printf 'off'; }
+    _with_core_lock() { "$@"; }
+    _http_download() { cp "$GEO_EXTRA_BIG" "$2"; return 0; }
+    _mutate_config() { : > "$GEO_EXTRA_TOUCHED"; return 0; }
+    {
+        echo 'ftp://a.test/rs.dat'
+        echo 'https://a.test/rs.dat'
+        echo '../evil.dat'
+        echo 'geoip.dat'
+        echo 'zeta.dat'
+        echo 'rs.dat'
+    } | _geo_extra_add
+) >/dev/null 2>&1; then
+    pass 'custom geodata add re-asks invalid input'
+else
+    fail 'custom geodata add re-asks invalid input'
+fi
+check_eq 're-asked url keeps the valid link' 'https://a.test/rs.dat' \
+    "$(awk -F'	' '$1=="rs.dat"{print $2}' "$GEO_EXTRA_PATH" 2>/dev/null)"
+check 'rejected file names never land a file' test ! -e "$DEPLOY_DIR/evil.dat"
+check_eq 'rejected file names leave three entries' '3' \
+    "$(wc -l < "$GEO_EXTRA_PATH" 2>/dev/null | tr -d ' ')"
+
+# 下载失败/体积不足: 不动 config 与 state, 资源目录里也不留半成品。
+GEO_EXTRA_BEFORE=$(cat "$GEO_EXTRA_PATH" 2>/dev/null)
+if (
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _with_core_lock() { "$@"; }
+    _http_download() { return 1; }
+    _mutate_config() { : > "$GEO_EXTRA_TOUCHED"; return 0; }
+    { echo 'https://a.test/fail.dat'; echo 'fail.dat'; } | _geo_extra_add
+) >/dev/null 2>&1; then
+    fail 'download failure aborts the add'
+else
+    pass 'download failure aborts the add'
+fi
+check 'download failure leaves no dat file' test ! -e "$ASSET_DIR/fail.dat"
+check 'download failure does not touch config' test ! -e "$GEO_EXTRA_TOUCHED"
+check_eq 'download failure keeps the state lines' "$GEO_EXTRA_BEFORE" "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+check_eq 'download failure leaves no temp file' '0' \
+    "$(find "$ASSET_DIR" -maxdepth 1 -name '.geo-extra.*' 2>/dev/null | wc -l | tr -d ' ')"
+if (
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _with_core_lock() { "$@"; }
+    _http_download() { printf 'tiny' > "$2"; return 0; }
+    _mutate_config() { : > "$GEO_EXTRA_TOUCHED"; return 0; }
+    { echo 'https://a.test/small.dat'; echo 'small.dat'; } | _geo_extra_add
+) >/dev/null 2>&1; then
+    fail 'a sub-1KB download aborts the add'
+else
+    pass 'a sub-1KB download aborts the add'
+fi
+check 'sub-1KB download leaves no dat file' test ! -e "$ASSET_DIR/small.dat"
+check 'sub-1KB download does not touch config' test ! -e "$GEO_EXTRA_TOUCHED"
+check_eq 'sub-1KB download keeps the state lines' "$GEO_EXTRA_BEFORE" "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+
+# assets 写失败: 删除刚下载的文件并中止, state 不动。
+if (
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _with_core_lock() { "$@"; }
+    _http_download() { cp "$GEO_EXTRA_BIG" "$2"; return 0; }
+    _mutate_config() { return 1; }
+    { echo 'https://a.test/cf.dat'; echo 'cf.dat'; } | _geo_extra_add
+) >/dev/null 2>&1; then
+    fail 'failed assets write rolls the add back'
+else
+    pass 'failed assets write rolls the add back'
+fi
+check 'failed assets write removes the downloaded file' test ! -e "$ASSET_DIR/cf.dat"
+check_eq 'failed assets write keeps the state lines' "$GEO_EXTRA_BEFORE" "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+
+# extras 只交给 Xray 内置定时下载: xd geo-update 仍只取两个内置 dat。
+GEO_DL_EXTRA="$TMP/geo-dl-extra"
+rm -f "$GEO_DL_EXTRA"
+(
+    _geo_transition_clear
+    _ensure_dirs() { return 0; }
+    _with_config_lock() { "$@"; }
+    _with_core_lock() { "$@"; }
+    _geo_update_commit_and_finalize_locked() { return 0; }
+    _http_download() { echo "$1 -> $(basename "$2")" >> "$GEO_DL_EXTRA"; return 91; }
+    _geo_update
+) >/dev/null 2>&1
+check_eq 'geo update downloads only the two builtin dat files' 'geosite.dat geoip.dat' \
+    "$(awk '{print $3}' "$GEO_DL_EXTRA" 2>/dev/null | paste -sd' ' -)"
+
+# 删除: builtin 下先重写不含该项的 assets, 再删 state 行与本地文件。
+GEO_EXTRA_DEL="$TMP/geo-extra-del"
+rm -f "$GEO_EXTRA_DEL"
+if (
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _with_core_lock() { "$@"; }
+    _mutate_config() { printf '%s' "$3" > "$GEO_EXTRA_DEL"; return 0; }
+    echo '1' | _geo_extra_delete
+) >/dev/null 2>&1; then
+    pass 'custom geodata delete completes under builtin'
+else
+    fail 'custom geodata delete completes under builtin'
+fi
+GEO_EXTRA_LEFT=$(cat "$GEO_EXTRA_PATH" 2>/dev/null)
+check 'custom geodata delete removes the local file' test ! -e "$ASSET_DIR/my.dat"
+check_eq 'custom geodata delete drops the state line' 'zeta.dat rs.dat' \
+    "$(awk -F'	' '{print $1}' "$GEO_EXTRA_PATH" 2>/dev/null | paste -sd' ' -)"
+check_eq 'custom geodata delete rewrites assets without the entry' '0' \
+    "$(jq -r '[.[] | select(.file=="my.dat")] | length' "$GEO_EXTRA_DEL" 2>/dev/null)"
+check_eq 'custom geodata delete keeps the other extras in assets' 'zeta.dat rs.dat' \
+    "$(jq -r '[.[] | select(.file=="zeta.dat" or .file=="rs.dat") | .file] | join(" ")' "$GEO_EXTRA_DEL" 2>/dev/null)"
+if (
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _with_core_lock() { "$@"; }
+    _mutate_config() { return 1; }
+    echo '1' | _geo_extra_delete
+) >/dev/null 2>&1; then
+    fail 'failed assets write aborts the delete'
+else
+    pass 'failed assets write aborts the delete'
+fi
+check_eq 'failed delete keeps the state lines' "$GEO_EXTRA_LEFT" "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+check 'failed delete keeps the local file' test -f "$ASSET_DIR/zeta.dat"
+
+# 菜单: [19] Geo 下有 [5] 入口, 子菜单列出条目并说明非内置机制只下载一次。
+GEO_MENU_OUT="$TMP/geo-menu-out"
+echo '0' | _geo_menu > "$GEO_MENU_OUT" 2>&1
+check 'geo menu offers custom geodata' contains '自定义 geodata' "$(cat "$GEO_MENU_OUT" 2>/dev/null)"
+GEO_SUB_OUT="$TMP/geo-sub-out"
+(
+    _geo_auto_mechanism() { printf 'cron'; }
+    echo '0' | _geo_extra_menu
+) > "$GEO_SUB_OUT" 2>&1
+check 'custom geodata submenu lists the entries' contains 'zeta.dat <- https://a.test/dl/zeta.dat' "$(cat "$GEO_SUB_OUT" 2>/dev/null)"
+check 'custom geodata submenu offers add and delete' contains '[2]' "$(cat "$GEO_SUB_OUT" 2>/dev/null)"
+check 'custom geodata submenu warns about one-shot downloads' contains '不会随定时更新' "$(cat "$GEO_SUB_OUT" 2>/dev/null)"
+
+rm -f "$GEO_EXTRA_PATH" "$ASSET_DIR/my.dat" "$ASSET_DIR/zeta.dat" "$ASSET_DIR/rs.dat"
 
 printf '== logrotate state contracts ==\n'
 rm -f "$STATE_DIR/logrotate_enabled"

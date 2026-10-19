@@ -108,10 +108,11 @@ _geo_builtin_source_drifted() {
     return 1
 }
 
-# assets 唯一构造点: 本地文件名恒为 geosite.dat / geoip.dat, 远端名随源变化。
+# assets 唯一构造点: 内置两项的本地文件名恒为 geosite.dat / geoip.dat, 远端名随源变化。
 # 省略链接时从 state 取 custom 链接; 任一链接非法则整体回落默认源(与 _geo_source_url 同判据)。
+# assets 一律 = 两个内置项 + 所有 extras; extras 只存在于 state, 见 _geo_extra_assets_json。
 _geo_assets_json() {
-    local src="$1" cgs="${2:-}" cgi="${3:-}"
+    local src="$1" cgs="${2:-}" cgi="${3:-}" extras=""
     if [ "$src" = "custom" ]; then
         [ -n "$cgs" ] || { cgs=$(_state_get geo_geosite_url 2>/dev/null) || cgs=""; }
         [ -n "$cgi" ] || { cgi=$(_state_get geo_geoip_url 2>/dev/null) || cgi=""; }
@@ -121,10 +122,12 @@ _geo_assets_json() {
             cgi=""
         fi
     fi
+    extras=$(_geo_extra_assets_json) || return 1
     jq -n \
         --arg u1 "$(_geo_url_for "$src" geosite "$cgs" "$cgi")" \
         --arg u2 "$(_geo_url_for "$src" geoip "$cgs" "$cgi")" \
-        '[{url: $u1, file: "geosite.dat"}, {url: $u2, file: "geoip.dat"}]'
+        --argjson extra "$extras" \
+        '([{url: $u1, file: "geosite.dat"}, {url: $u2, file: "geoip.dat"}] + $extra)'
 }
 
 # 生成 geodata JSON: cron 五字段、assets URL 必须 HTTPS; 供 --argjson 使用。
@@ -831,6 +834,239 @@ _geo_set_source() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# 自定义 geodata: state/geo_extra_assets 每行 "file<TAB>url" 是唯一真相,
+# config 的 .geodata.assets 是派生(两个内置项 + 所有 extras)。
+# Xray 要求 assets.file 是资源目录内已存在的普通文件, 所以先下载再写 config。
+# ---------------------------------------------------------------------------
+_geo_extra_path() {
+    printf '%s' "$STATE_DIR/geo_extra_assets"
+}
+
+# extras 数组 JSON; 文件不存在或空行视为没有 extras。
+_geo_extra_assets_json() {
+    local path=""
+    path=$(_geo_extra_path)
+    if [ ! -f "$path" ]; then
+        printf '[]'
+        return 0
+    fi
+    awk -F'\t' 'NF >= 2 && $1 != "" { printf "%s\t%s\n", $1, $2 }' "$path" \
+        | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {url: .[1], file: .[0]})'
+}
+
+_geo_extra_exists() {
+    local target="$1" name="" url=""
+    [ -f "$(_geo_extra_path)" ] || return 1
+    while IFS=$'\t' read -r name url; do
+        [ "$name" = "$target" ] && return 0
+    done < "$(_geo_extra_path)"
+    return 1
+}
+
+# 文件名只允许 [A-Za-z0-9._-]; 不能含 / 或 .., 不能占用内置两项, 不能与已有条目重名。
+_geo_extra_file_valid() {
+    local f="${1:-}"
+    case "$f" in
+        ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    case "$f" in
+        geosite.dat|geoip.dat) return 1 ;;
+        *..*) return 1 ;;
+    esac
+    ! _geo_extra_exists "$f"
+}
+
+# 默认文件名取链接最后一段, 去掉 ?query 与 #fragment。
+_geo_url_basename() {
+    local u="$1"
+    u="${u%%#*}"
+    u="${u%%\?*}"
+    printf '%s' "${u##*/}"
+}
+
+# 重写 state 去掉指定 file 的行; 任一步失败都保留原文件。
+_geo_extra_remove_line() {
+    local target="$1" path="" tmp=""
+    path=$(_geo_extra_path)
+    [ -f "$path" ] || return 0
+    tmp=$(mktemp "$STATE_DIR/geo_extra_assets.tmp.XXXXXX") || return 1
+    if ! awk -F'\t' -v f="$target" '$1 != f' "$path" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp" 2>/dev/null || ! mv -f "$tmp" "$path"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+# 添加: 先下载落盘(Xray 只认已存在的普通文件), builtin 机制下再写 config, 最后记 state。
+# 下载或体积失败时不改 config/state, 同目录 mv 保证资源目录里不留半成品。
+_geo_extra_add() {
+    local url="" file="" default_name="" tmp="" sz=0 assets=""
+    echo
+    url=$(_geo_prompt_url "geodata 链接") || return 0
+    default_name=$(_geo_url_basename "$url")
+    while :; do
+        read -rp "  文件名(直接回车用 ${default_name:-链接末段}): " file || return 0
+        [ -n "$file" ] || file="$default_name"
+        _geo_extra_file_valid "$file" && break
+        if [ -z "$file" ]; then
+            _warn "无法从链接推断文件名, 请手动输入"
+        elif _geo_extra_exists "$file"; then
+            _warn "文件名已存在: $file (如需替换, 请先在 [2] 删除该条目)"
+        elif [ "$file" = "geosite.dat" ] || [ "$file" = "geoip.dat" ]; then
+            _warn "geosite.dat / geoip.dat 是内置数据文件, 请换一个文件名"
+        else
+            _warn "文件名只能包含字母/数字/./_/-, 且不能含 / 或 .."
+        fi
+        file=""
+    done
+    mkdir -p "$ASSET_DIR" 2>/dev/null || { _error "无法创建资源目录 $ASSET_DIR"; return 1; }
+    tmp=$(mktemp "$ASSET_DIR/.geo-extra.XXXXXX") || { _error "无法创建下载临时文件"; return 1; }
+    _info "下载 $file <- $url"
+    if ! _http_download "$url" "$tmp" 60; then
+        rm -f "$tmp"
+        _error "下载失败, 已取消(未改动 config/state)"
+        return 1
+    fi
+    # 至少 1KB: 挡住错误页面与空响应, 避免把非 geodata 内容写进 assets。
+    sz=$(stat -c%s "$tmp" 2>/dev/null || stat -f%z "$tmp" 2>/dev/null || echo 0)
+    if [ "${sz:-0}" -lt 1024 ] 2>/dev/null; then
+        rm -f "$tmp"
+        _error "下载内容体积异常(${sz}B), 已取消(未改动 config/state)"
+        return 1
+    fi
+    chmod 644 "$tmp" 2>/dev/null || { rm -f "$tmp"; _error "无法设置 $file 的文件权限"; return 1; }
+    if ! _with_core_lock mv -f "$tmp" "$ASSET_DIR/$file"; then
+        rm -f "$tmp"
+        _error "写入 $ASSET_DIR/$file 失败, 已取消"
+        return 1
+    fi
+    if [ "$(_geo_auto_mechanism)" = "builtin" ]; then
+        if ! assets=$(_geo_assets_json "$(_geo_source_name)"); then
+            rm -f "$ASSET_DIR/$file"
+            _error "生成 assets 失败, 已删除刚下载的文件"
+            return 1
+        fi
+        if ! assets=$(printf '%s' "$assets" | jq --arg f "$file" --arg u "$url" '. + [{url: $u, file: $f}]'); then
+            rm -f "$ASSET_DIR/$file"
+            _error "生成 assets 失败, 已删除刚下载的文件"
+            return 1
+        fi
+        if ! _mutate_config --argjson a "$assets" '.geodata.assets = $a'; then
+            rm -f "$ASSET_DIR/$file"
+            _error "写入 geodata.assets 失败(配置已回滚), 已删除刚下载的文件"
+            return 1
+        fi
+    fi
+    if ! printf '%s\t%s\n' "$file" "$url" >> "$(_geo_extra_path)"; then
+        _warn "文件已下载, 但 state 记录写入失败; 请手工补记或删除 $ASSET_DIR/$file"
+        return 1
+    fi
+    _success "已添加自定义 geodata: $file <- $url"
+    return 0
+}
+
+# 删除: builtin 机制下先重写 config(失败即中止, state 不动), 再删 state 行与本地文件。
+_geo_extra_delete() {
+    local path="" count=0 i=0 sel="" target="" name="" url="" assets=""
+    path=$(_geo_extra_path)
+    if [ ! -s "$path" ]; then
+        _warn "还没有自定义 geodata 条目"
+        return 0
+    fi
+    echo
+    while IFS=$'\t' read -r name url; do
+        [ -n "$name" ] || continue
+        count=$((count + 1))
+        echo -e "    ${CYAN}[$count]${NC} $name <- $url"
+    done < "$path"
+    echo
+    read -rp "  请选择要删除的编号(0 取消): " sel || return 0
+    case "$sel" in
+        ''|0) return 0 ;;
+        *[!0-9]*) _warn "无效编号"; return 1 ;;
+    esac
+    while IFS=$'\t' read -r name url; do
+        [ -n "$name" ] || continue
+        i=$((i + 1))
+        [ "$i" = "$sel" ] && target="$name"
+    done < "$path"
+    if [ -z "$target" ]; then
+        _warn "无效编号"
+        return 1
+    fi
+    if [ "$(_geo_auto_mechanism)" = "builtin" ]; then
+        if ! assets=$(_geo_assets_json "$(_geo_source_name)"); then
+            _error "生成 assets 失败, 未删除"
+            return 1
+        fi
+        if ! assets=$(printf '%s' "$assets" | jq --arg f "$target" '[.[] | select(.file != $f)]'); then
+            _error "生成 assets 失败, 未删除"
+            return 1
+        fi
+        if ! _mutate_config --argjson a "$assets" '.geodata.assets = $a'; then
+            _error "写入 geodata.assets 失败(配置已回滚), 未删除"
+            return 1
+        fi
+    fi
+    if ! _geo_extra_remove_line "$target"; then
+        _error "从 state 删除记录失败, 本地文件与配置未继续改动"
+        return 1
+    fi
+    if ! _with_core_lock rm -f "$ASSET_DIR/$target"; then
+        _warn "本地文件删除失败: $ASSET_DIR/$target"
+    fi
+    _success "已删除自定义 geodata: $target"
+    return 0
+}
+
+# 子菜单: 先列已有条目; 非内置定时机制要说明这些文件不随定时更新。
+_geo_extra_menu() {
+    local choice="" mech="" path="" n=0 name="" url=""
+    while true; do
+        clear
+        echo
+        echo -e "  ${CYAN}【自定义 geodata】${NC}"
+        mech=$(_geo_auto_mechanism)
+        path=$(_geo_extra_path)
+        n=0
+        if [ -s "$path" ]; then
+            echo -e "  已有条目:"
+            while IFS=$'\t' read -r name url; do
+                [ -n "$name" ] || continue
+                n=$((n + 1))
+                echo -e "    ${CYAN}[$n]${NC} $name <- $url"
+            done < "$path"
+        else
+            echo -e "  已有条目: ${YELLOW}无${NC}"
+        fi
+        echo
+        if [ "$mech" = "builtin" ]; then
+            echo -e "  这些文件写在 .geodata.assets, 由 Xray 内置定时下载"
+        else
+            echo -e "  ${YELLOW}系统 cron/手动机制下这些文件只在添加时下载一次, 不会随定时更新${NC}"
+        fi
+        echo -e "  落点: $ASSET_DIR"
+        echo
+        echo -e "  ${GREEN}[1]${NC} 添加"
+        echo -e "  ${GREEN}[2]${NC} 删除"
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        echo
+        read -rp "  请选择: " choice || return 0
+        case "${choice:-0}" in
+            1) _geo_extra_add ;;
+            2) _geo_extra_delete ;;
+            0) return ;;
+            *) _warn "无效选择" ;;
+        esac
+        _press_any_key
+    done
+}
+
 # Geo 菜单复用 _geo_auto_mechanism, 不单靠 legacy state 判断内置更新。
 _geo_menu() {
     clear
@@ -866,6 +1102,7 @@ _geo_menu() {
     fi
     echo -e "  ${GREEN}[3]${NC} 路由规则(小内存优化: 精简 geo 引用)"
     echo -e "  ${GREEN}[4]${NC} 切换数据源"
+    echo -e "  ${GREEN}[5]${NC} 自定义 geodata(添加/删除)"
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  请选择: " choice || return 0
     case "${choice:-0}" in
@@ -873,6 +1110,7 @@ _geo_menu() {
         2) if [ "$state" = "on" ]; then _geo_set_auto_update off; else _geo_set_auto_update on; fi ;;
         3) _route_rules_menu; return ;;
         4) _geo_set_source; return ;;
+        5) _geo_extra_menu; return ;;
         0) return ;;
         *) _warn "无效" ;;
     esac
