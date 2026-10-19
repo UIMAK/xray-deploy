@@ -515,10 +515,18 @@ _hy2_iptables_persist_files() {
     fi
 }
 
+# x_tables 注册表路径(4=ip_tables_names, 6=ip6_tables_names); 未设 HY2_PROC_NET 时等价 /proc/net。
+_hy2_xt_names_path() {
+    case "${1:-4}" in
+        6) printf '%s\n' "${HY2_PROC_NET:-/proc/net}/ip6_tables_names" ;;
+        *) printf '%s\n' "${HY2_PROC_NET:-/proc/net}/ip_tables_names" ;;
+    esac
+}
+
 # 确认无 hop 必须观察 runtime，再确认持久化文件无规则；无法观察返回 UNKNOWN。
 # IPv6 三态 ip6tables/absent/unknown：仅无 nft 且未注册 nat 可判 absent；其余保守拒绝。
 _hy2_ipv6_state() {
-    local q
+    local q p6
     if command -v ip6tables >/dev/null 2>&1; then
         printf 'ip6tables\n'; return 0
     fi
@@ -526,8 +534,9 @@ _hy2_ipv6_state() {
     if command -v nft >/dev/null 2>&1; then
         printf 'unknown nft\n'; return 0
     fi
-    if [ -e /proc/net/ip6_tables_names ]; then
-        if ! q=$(cat /proc/net/ip6_tables_names 2>/dev/null); then
+    p6=$(_hy2_xt_names_path 6)
+    if [ -e "$p6" ]; then
+        if ! q=$(cat "$p6" 2>/dev/null); then
             printf 'unknown proc_unreadable\n'; return 0
         fi
         printf '%s\n' "$q" | grep -qx "nat" && { printf 'unknown proc_nat\n'; return 0; }
@@ -537,7 +546,7 @@ _hy2_ipv6_state() {
 
 # 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
 _hy2_no_hop_rules_at_all() {
-    local q f runtime_clean=0 persist_files persist_rc
+    local q f p4 p6 runtime_clean=0 persist_files persist_rc
     if command -v iptables >/dev/null 2>&1; then
         q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
         printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
@@ -557,16 +566,44 @@ _hy2_no_hop_rules_at_all() {
         esac
         runtime_clean=1
     else
-        # 无 iptables 时仅内核从未使用 nat 可证明无规则；持久化文件缺失不构成 runtime 证据。
+        # 无 iptables 时须实测 nft 规则集: 规则虽只经 iptables 创建, xtables-nft 下仍落在 nf_tables。
+        # 查询失败保持 UNKNOWN; 内核从未使用 nat 才可仅凭 /proc 判定, 持久化文件缺失不构成 runtime 证据。
         if command -v nft >/dev/null 2>&1; then
-            _warn "iptables 不可用但检测到 nft, 无法确认是否存在跳跃规则"
-            return 1
+            if ! q=$(nft list ruleset 2>/dev/null); then
+                _warn "iptables 不可用且 nft list ruleset 查询失败, 无法确认是否存在跳跃规则"
+                return 1
+            fi
+            if printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop"; then
+                _warn "iptables 不可用但 nft 规则集中仍含 xray-deploy-hy2-hop 跳跃规则"
+                return 1
+            fi
         fi
-        if [ -e /proc/net/ip_tables_names ]; then
-            if ! q=$(cat /proc/net/ip_tables_names 2>/dev/null); then
+        p4=$(_hy2_xt_names_path 4)
+        if [ -e "$p4" ]; then
+            if ! q=$(cat "$p4" 2>/dev/null); then
                 return 1   # 存在但读不到(权限/容器限制): UNKNOWN
             fi
             printf '%s\n' "$q" | grep -qx "nat" && return 1   # nat 表在用, 但无从查询内容
+        fi
+        # nft 实测干净只排除 nf_tables; legacy ip6tables 规则不进 nft, 须另看 IPv6 注册表。
+        p6=$(_hy2_xt_names_path 6)
+        if [ -e "$p6" ]; then
+            if ! q=$(cat "$p6" 2>/dev/null); then
+                _warn "无法读取 IPv6 x_tables 注册表, 无法确认是否存在 IPv6 跳跃规则"
+                return 1
+            fi
+            if printf '%s\n' "$q" | grep -qx "nat"; then
+                if command -v ip6tables >/dev/null 2>&1; then
+                    if ! q=$(ip6tables -t nat -S PREROUTING 2>/dev/null); then
+                        _warn "ip6tables 查询失败, 无法确认是否存在 IPv6 跳跃规则"
+                        return 1
+                    fi
+                    printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
+                else
+                    _warn "iptables 不可用且内核注册了 IPv6 nat 表, 无法确认是否存在 IPv6 跳跃规则; 安装 ip6tables 后重试可解除"
+                    return 1
+                fi
+            fi
         fi
         runtime_clean=1
     fi
@@ -1513,10 +1550,14 @@ _hy2_cleanup_all_hops() {
         metadata_hop=1
     fi
     if [ "$metadata_hop" -eq 1 ] && ! command -v iptables >/dev/null 2>&1; then
-        # metadata says we own hop rules, but cannot issue precise -D or verify runtime:
-        # preserve the deployment tree.
-        _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
-        return 1
+        # metadata 声明有 hop 规则但无 iptables 可精确 -D: 先实测证明 runtime 干净才继续,
+        # 否则保留部署树, 不猜测规则已清空。
+        if _hy2_no_hop_rules_at_all; then
+            _warn "iptables 不可用, 但未发现端口跳跃规则残留(hop metadata 按无残留继续清理)"
+        else
+            _error "iptables 不可用, 无法安全清理端口跳跃规则(存在 hop metadata), 已保留节点数据"
+            return 1
+        fi
     fi
     if command -v iptables >/dev/null 2>&1 && [ -d "$NODES_DIR" ]; then
         local _cand_all _cand
