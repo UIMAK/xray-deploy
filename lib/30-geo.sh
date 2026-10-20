@@ -920,7 +920,7 @@ _geo_extra_add() {
         elif [ "$file" = "geosite.dat" ] || [ "$file" = "geoip.dat" ]; then
             _warn "geosite.dat / geoip.dat 是内置数据文件, 请换一个文件名"
         else
-            _warn "文件名只能包含字母/数字/./_/-, 且不能含 / 或 .."
+            _warn "文件名只能包含字母/数字/./_/-, 且不能是 . 或含 / 或 .."
         fi
         file=""
     done
@@ -971,7 +971,7 @@ _geo_extra_add() {
 }
 
 # 删除: builtin 机制下先重写 config(失败即中止, state 不动), 再删 state 行与本地文件。
-# state 记录的文件名含 / 或 .. 时中止, 避免 rm 落到资源目录之外。
+# state 记录的文件名是 . 或含 / 或 .. 时中止, 避免 rm 落到资源目录本身或之外。
 _geo_extra_delete() {
     local path="" count=0 i=0 sel="" target="" name="" url="" assets="" mech=""
     path=$(_geo_extra_path)
