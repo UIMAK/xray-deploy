@@ -46,7 +46,11 @@ export CMD_NAME="xd"                            # 快捷命令名(用户确认)
 
 # GitHub 资产
 export XRAY_REPO_API="https://api.github.com/repos/XTLS/Xray-core/releases"
-export GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+# Geo 数据源: 远端文件名各源不同(geoip-full.dat / geoip.dat ...), 本地落点恒为 geoip.dat。
+export GEO_SRC_XTLS_GEOSITE="https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat"
+export GEO_SRC_XTLS_GEOIP="https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-full.dat"
+export GEO_SRC_LOYAL_GEOSITE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+export GEO_SRC_LOYAL_GEOIP="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
 export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
 
 
