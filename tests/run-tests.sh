@@ -821,6 +821,7 @@ if (
         echo 'ftp://a.test/rs.dat'
         echo 'https://a.test/rs.dat'
         echo '../evil.dat'
+        echo '.'
         echo 'geoip.dat'
         echo 'zeta.dat'
         echo 'rs.dat'
@@ -835,6 +836,11 @@ check_eq 're-asked url keeps the valid link' 'https://a.test/rs.dat' \
 check 'rejected file names never land a file' test ! -e "$DEPLOY_DIR/evil.dat"
 check_eq 'rejected file names leave three entries' '3' \
     "$(wc -l < "$GEO_EXTRA_PATH" 2>/dev/null | tr -d ' ')"
+if _geo_extra_file_valid '.'; then
+    fail 'file name "." is rejected'
+else
+    pass 'file name "." is rejected'
+fi
 
 # 下载失败/体积不足: 不动 config 与 state, 资源目录里也不留半成品。
 GEO_EXTRA_BEFORE=$(cat "$GEO_EXTRA_PATH" 2>/dev/null)
@@ -971,6 +977,19 @@ check_eq 'rejected delete keeps both state lines' 'zeta.dat ../evil.dat' \
 check 'rejected delete leaves the outside file alone' test -f "$DEPLOY_DIR/evil.dat"
 check 'rejected delete does not touch config' test ! -e "$GEO_EXTRA_TOUCHED3"
 rm -f "$DEPLOY_DIR/evil.dat"
+# "." 同样不是普通文件: 删除时同样中止, 不删 state 行。
+printf '.\thttps://a.test/dot\n' > "$GEO_EXTRA_PATH"
+if (
+    _geo_auto_mechanism() { printf 'off'; }
+    _with_core_lock() { "$@"; }
+    echo '1' | _geo_extra_delete
+) >/dev/null 2>&1; then
+    fail 'delete rejects the current directory as a file name'
+else
+    pass 'delete rejects the current directory as a file name'
+fi
+check_eq 'rejected dot delete keeps the state line' '.' \
+    "$(awk -F'\t' '{print $1}' "$GEO_EXTRA_PATH" 2>/dev/null)"
 printf 'zeta.dat	https://a.test/dl/zeta.dat\n' > "$GEO_EXTRA_PATH"
 
 # state 行删除失败时, builtin 下的提示必须承认 config 已经改过。

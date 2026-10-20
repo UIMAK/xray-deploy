@@ -864,7 +864,7 @@ _geo_extra_exists() {
     return 1
 }
 
-# 文件名只允许 [A-Za-z0-9._-]; 不能含 / 或 .., 不能占用内置两项, 不能与已有条目重名。
+# 文件名只允许 [A-Za-z0-9._-]; 不能是 . 或含 .., 不能占用内置两项, 不能与已有条目重名。
 _geo_extra_file_valid() {
     local f="${1:-}"
     case "$f" in
@@ -872,7 +872,7 @@ _geo_extra_file_valid() {
     esac
     case "$f" in
         geosite.dat|geoip.dat) return 1 ;;
-        *..*) return 1 ;;
+        .|*..*) return 1 ;;
     esac
     ! _geo_extra_exists "$f"
 }
@@ -1001,7 +1001,7 @@ _geo_extra_delete() {
         return 1
     fi
     case "$target" in
-        */*|*..*)
+        */*|*..*|.)
             _error "state 记录的文件名异常($target), 已中止; 请手工检查 $path"
             return 1
             ;;
