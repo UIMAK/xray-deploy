@@ -933,6 +933,57 @@ fi
 check_eq 'failed delete keeps the state lines' "$GEO_EXTRA_LEFT" "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
 check 'failed delete keeps the local file' test -f "$ASSET_DIR/zeta.dat"
 
+# 删除: cron/off 机制不写 config, 只删 state 行与本地文件。
+GEO_EXTRA_TOUCHED2="$TMP/geo-extra-config-touched-2"
+rm -f "$GEO_EXTRA_TOUCHED2"
+if (
+    _geo_auto_mechanism() { printf 'off'; }
+    _with_core_lock() { "$@"; }
+    _mutate_config() { : > "$GEO_EXTRA_TOUCHED2"; return 0; }
+    echo '2' | _geo_extra_delete
+) >/dev/null 2>&1; then
+    pass 'cron/off mechanism delete completes'
+else
+    fail 'cron/off mechanism delete completes'
+fi
+check 'cron/off mechanism delete skips config' test ! -e "$GEO_EXTRA_TOUCHED2"
+check_eq 'cron/off mechanism delete drops the state line' 'zeta.dat' \
+    "$(awk -F'	' '{print $1}' "$GEO_EXTRA_PATH" 2>/dev/null | paste -sd' ' -)"
+check 'cron/off mechanism delete removes the local file' test ! -e "$ASSET_DIR/rs.dat"
+
+# state 里的文件名越界(含 / 或 ..)时中止删除: 不写 config, 不动 state, 不 rm。
+printf 'zeta.dat	https://a.test/dl/zeta.dat\n../evil.dat	https://a.test/evil.dat\n' > "$GEO_EXTRA_PATH"
+printf 'keep' > "$DEPLOY_DIR/evil.dat"
+GEO_EXTRA_TOUCHED3="$TMP/geo-extra-config-touched-3"
+rm -f "$GEO_EXTRA_TOUCHED3"
+if (
+    _geo_auto_mechanism() { printf 'off'; }
+    _with_core_lock() { "$@"; }
+    _mutate_config() { : > "$GEO_EXTRA_TOUCHED3"; return 0; }
+    echo '2' | _geo_extra_delete
+) >/dev/null 2>&1; then
+    fail 'delete rejects a file name outside the asset dir'
+else
+    pass 'delete rejects a file name outside the asset dir'
+fi
+check_eq 'rejected delete keeps both state lines' 'zeta.dat ../evil.dat' \
+    "$(awk -F'	' '{print $1}' "$GEO_EXTRA_PATH" 2>/dev/null | paste -sd' ' -)"
+check 'rejected delete leaves the outside file alone' test -f "$DEPLOY_DIR/evil.dat"
+check 'rejected delete does not touch config' test ! -e "$GEO_EXTRA_TOUCHED3"
+rm -f "$DEPLOY_DIR/evil.dat"
+printf 'zeta.dat	https://a.test/dl/zeta.dat\n' > "$GEO_EXTRA_PATH"
+
+# state 行删除失败时, builtin 下的提示必须承认 config 已经改过。
+GEO_EXTRA_MSG="$TMP/geo-extra-del-msg"
+(
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _with_core_lock() { "$@"; }
+    _mutate_config() { return 0; }
+    _geo_extra_remove_line() { return 1; }
+    echo '1' | _geo_extra_delete
+) > "$GEO_EXTRA_MSG" 2>&1
+check 'state write failure message admits the config change' contains '配置已移除 zeta.dat' "$(cat "$GEO_EXTRA_MSG" 2>/dev/null)"
+
 # 菜单: [19] Geo 下有 [5] 入口, 子菜单列出条目并说明非内置机制只下载一次。
 GEO_MENU_OUT="$TMP/geo-menu-out"
 echo '0' | _geo_menu > "$GEO_MENU_OUT" 2>&1

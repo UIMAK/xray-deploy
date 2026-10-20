@@ -971,8 +971,9 @@ _geo_extra_add() {
 }
 
 # 删除: builtin 机制下先重写 config(失败即中止, state 不动), 再删 state 行与本地文件。
+# state 记录的文件名含 / 或 .. 时中止, 避免 rm 落到资源目录之外。
 _geo_extra_delete() {
-    local path="" count=0 i=0 sel="" target="" name="" url="" assets=""
+    local path="" count=0 i=0 sel="" target="" name="" url="" assets="" mech=""
     path=$(_geo_extra_path)
     if [ ! -s "$path" ]; then
         _warn "还没有自定义 geodata 条目"
@@ -999,7 +1000,14 @@ _geo_extra_delete() {
         _warn "无效编号"
         return 1
     fi
-    if [ "$(_geo_auto_mechanism)" = "builtin" ]; then
+    case "$target" in
+        */*|*..*)
+            _error "state 记录的文件名异常($target), 已中止; 请手工检查 $path"
+            return 1
+            ;;
+    esac
+    mech=$(_geo_auto_mechanism)
+    if [ "$mech" = "builtin" ]; then
         if ! assets=$(_geo_assets_json "$(_geo_source_name)"); then
             _error "生成 assets 失败, 未删除"
             return 1
@@ -1014,7 +1022,11 @@ _geo_extra_delete() {
         fi
     fi
     if ! _geo_extra_remove_line "$target"; then
-        _error "从 state 删除记录失败, 本地文件与配置未继续改动"
+        if [ "$mech" = "builtin" ]; then
+            _error "配置已移除 $target, 但 state 记录删除失败; 本地文件仍在, 请手工删除 $path 中对应那一行"
+        else
+            _error "state 记录删除失败, 配置与本地文件均未改动; 请手工删除 $path 中对应那一行"
+        fi
         return 1
     fi
     if ! _with_core_lock rm -f "$ASSET_DIR/$target"; then
