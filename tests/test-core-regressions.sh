@@ -72,6 +72,45 @@ trap cleanup EXIT
         : > "$TMP/messages"
         : > "$TMP/service-actions"
     }
+    service_templates() {
+        local systemd_unit="$TMP/systemd-service" openrc_unit="$TMP/openrc-service"
+        local systemd_definition openrc_definition
+        DEPLOY_DIR="$TMP/service-templates"
+        BIN_DIR="$DEPLOY_DIR/bin" ASSET_DIR="$DEPLOY_DIR/assets" CONFIG_DIR="$DEPLOY_DIR/confs"
+        XRAY_BIN="$BIN_DIR/xray"
+        # 模板函数把 service 路径写死在函数体内; 重写函数定义到 scratch,
+        # 避免仅替换 cat 时真实重定向已在调用前创建 /etc 文件。
+        systemd_definition=$(declare -f _create_xray_systemd_service)
+        openrc_definition=$(declare -f _create_xray_openrc_service)
+        case "$systemd_definition" in
+            *'/etc/systemd/system/xray.service'*) ;;
+            *) return 1 ;;
+        esac
+        case "$openrc_definition" in
+            *'/etc/init.d/xray'*) ;;
+            *) return 1 ;;
+        esac
+        eval "${systemd_definition//\/etc\/systemd\/system\/xray.service/\$systemd_unit}"
+        eval "${openrc_definition//\/etc\/init.d\/xray/\$openrc_unit}"
+        INIT_SYSTEM=systemd
+        chmod() { return 0; }
+        systemctl() { return 0; }
+        _create_xray_systemd_service || return 1
+        INIT_SYSTEM=openrc
+        rc-update() { return 0; }
+        _create_xray_openrc_service || return 1
+        grep -Fq 'NoNewPrivileges=true' "$systemd_unit" &&
+            grep -Fq 'RestartPreventExitStatus=23' "$systemd_unit" &&
+            grep -Fq "ExecStart=$XRAY_BIN run -confdir $CONFIG_DIR" "$systemd_unit" &&
+            ! grep -Eq '^(User|Group|CapabilityBoundingSet|AmbientCapabilities)=' "$systemd_unit" &&
+            grep -Fq 'respawn_max=20' "$openrc_unit" &&
+            grep -Fq 'respawn_period=600' "$openrc_unit" &&
+            grep -Fq 'no_new_privs=yes' "$openrc_unit" &&
+            ! grep -Eq '^(capabilities|command_user|extra_commands)=' "$openrc_unit" &&
+            ! grep -Eq '^(checkconfig|start_pre)\(\)' "$openrc_unit" &&
+            grep -Fq "command=\"$XRAY_BIN\"" "$openrc_unit" &&
+            grep -Fq "command_args=\"run -confdir $CONFIG_DIR\"" "$openrc_unit"
+    }
     check() {
         local label="$1"; shift
         if ( "$@" ); then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$label"; fi
@@ -430,6 +469,7 @@ trap cleanup EXIT
         [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ]
     }
     check 'journal field read failure aborts snapshot and cleanup' journal_rc_probe
+    check 'service templates adopt standard hardening without changing runtime ownership' service_templates
 
     # B4: 字段顺序与默认值保持稳定。
     journal_fields_probe() {

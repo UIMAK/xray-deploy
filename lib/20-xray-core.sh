@@ -2085,6 +2085,8 @@ _xray_service_snapshot() {
 # XRAY_LOCATION_ASSET 优先走配置的 env 段(docs/config/env.md, 核心 ≥
 # v26.7.11 在构建模块前应用该段并替换同名进程变量)。仅当已安装核心 < v26.7.11(不识别
 # env 段)时才在 service 文件注入同名环境变量兜底 —— 版本读不到时保守保留注入(旧行为)。
+# 官方 unit 的 User/Group 与 capability 字段依赖独立 xray 用户和对应目录 ownership；
+# 本项目部署树仍由 root 以 0700/0600 独占管理, 因此只同步不依赖权限迁移的安全字段。
 # 注意: _install_or_switch_xray 先替换二进制再调本函数, 这里读到的是"新"核心版本。
 # ---------------------------------------------------------------------------
 _create_xray_systemd_service() {
@@ -2115,6 +2117,7 @@ ${env_line}
 NoNewPrivileges=true
 ExecStart=${XRAY_BIN} run -confdir ${CONFIG_DIR}
 Restart=on-failure
+RestartPreventExitStatus=23
 RestartSec=3
 ${nofile_line}
 
@@ -2156,6 +2159,9 @@ description="A unified platform for anti-censorship (xray-deploy)"
 
 supervisor=supervise-daemon
 respawn_delay=5
+# 与 systemd StartLimitIntervalSec/StartLimitBurst 对齐: 600 秒内最多 20 次 respawn。
+respawn_max=20
+respawn_period=600
 
 pidfile="/run/\${RC_SVCNAME}.pid"
 # nofile 抬到 65535, 若当前 hard 上限更低则抬到该上限(见 _safe_nofile); 完全探测不到时此行为空。
@@ -2164,6 +2170,7 @@ pidfile="/run/\${RC_SVCNAME}.pid"
 ${rc_ulimit_line}
 # 不静态设置 capabilities: supervise-daemon 裁剪 bounding set 的 prctl 在受限容器内会
 # EPERM 并中止启动; 且 iptables 由管理脚本以 root 执行, xray 进程运行期不需要 NET_ADMIN/RAW。
+no_new_privs=yes
 ${sd_env_line}
 
 command="${XRAY_BIN}"
