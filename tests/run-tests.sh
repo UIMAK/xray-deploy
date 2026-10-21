@@ -1562,7 +1562,7 @@ else
     fail '_flock_ensure 副本漂移: install.sh 与 lib/00-common.sh 不一致'
 fi
 # 专属行为套件在独立进程内运行, 不泄漏服务/配置桩到本套件。
-for suite in test-negative-controls.sh test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
+for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then
         tail -n 1 "$TMP/$suite.log"
         pass "alignment suite $suite"

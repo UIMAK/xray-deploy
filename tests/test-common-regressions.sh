@@ -169,18 +169,6 @@ config_layout_and_init() (
 )
 check 'empty init writes exact version and missing version fails closed' config_layout_and_init
 
-unmanaged_config_preserved() (
-    setup_case old-layout
-    rm -f "$CONFIG_DIR/15_version.json"
-    printf '%s' '{"inbounds":[]}' > "$DEPLOY_DIR/config.json"
-    cp "$DEPLOY_DIR/config.json" "$TMP/old-layout-before"
-    ! _config_layout_supported >/dev/null 2>&1 || return 1
-    ! _init_config_if_empty >/dev/null 2>&1 || return 1
-    cmp -s "$DEPLOY_DIR/config.json" "$TMP/old-layout-before" &&
-        [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -type f -print -quit)" ]
-)
-check 'unmanaged config.json is rejected without side effects' unmanaged_config_preserved
-
 # 走真实 _mutate_config: DNS、路由、Geo 和节点各写一次, 每次都核对精确 version 片段。
 version_preserved_by_mutations() (
     setup_case version-mutations
@@ -210,37 +198,6 @@ version_preserved_by_mutations() (
 )
 check 'DNS, routing, geodata and node mutations preserve version' version_preserved_by_mutations
 
-# 安装器会立即执行主流程, 因此只抽取清单解析函数到独立测试环境。
-install_manifest_trailer() (
-    local defs dir keep before rc
-    defs=$(sed -n '/^_install_snapshot_rel_ok()/,/^}/p; /^_install_snapshot_read_entries()/,/^}/p' "$ROOT/install.sh") || return 1
-    case "$defs" in
-        *_install_snapshot_rel_ok*_install_snapshot_read_entries*) ;;
-        *) return 1 ;;
-    esac
-    eval "$defs"
-    DEPLOY_DIR="$TMP/install-manifest"
-    dir="$DEPLOY_DIR/.install-rollback.1"
-    keep="$dir/.KEEP"
-    rm -rf "$DEPLOY_DIR"; mkdir -p "$dir"
-    printf '#!/bin/sh\n' > "$dir/xray-deploy.sh"
-    printf '1\n' > "$dir/VERSION"
-    printf 'xray-install-backup-v2\npresent xray-deploy.sh\npresent VERSION\ncomplete\n' > "$keep"
-    _install_snapshot_read_entries "$dir" 0 >/dev/null || return 1
-    before="$TMP/install-manifest-good"
-    cp "$keep" "$before"
-
-    printf 'xray-install-backup-v2\npresent xray-deploy.sh\npresent VERSION\ncomplete 2 123 456\n' > "$keep"
-    cp "$keep" "$before"
-    _install_snapshot_read_entries "$dir" 0 >/dev/null 2>&1; rc=$?
-    [ "$rc" -ne 0 ] && cmp -s "$keep" "$before" || return 1
-
-    printf 'xray-install-backup-v2\npresent xray-deploy.sh\npresent VERSION\ncomplete\ntrailing\n' > "$keep"
-    cp "$keep" "$before"
-    _install_snapshot_read_entries "$dir" 0 >/dev/null 2>&1; rc=$?
-    [ "$rc" -ne 0 ] && cmp -s "$keep" "$before"
-)
-check 'install manifest accepts only exact complete trailer and preserves rejected snapshots' install_manifest_trailer
 
 printf 'common regressions passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

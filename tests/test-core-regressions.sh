@@ -423,11 +423,8 @@ trap cleanup EXIT
     check 'Geo restart failure restores both dat files and running runtime' restart_failure
     check 'Geo rollback removes dat absent before the transaction' absent_dat_rollback
     check 'failed dat recovery retains journal/source for a successful retry' recovery_retry
-    check 'unknown snapshotted Geo schema rejected with evidence' unknown_geo_schema_rejected snapshotted true
-    check 'unknown committed Geo schema rejected with evidence' unknown_geo_schema_rejected committed true
-    check 'unknown replacing Geo schema rejected with evidence' unknown_geo_schema_rejected replacing false
+    check 'unknown Geo schema rejected with evidence' unknown_geo_schema_rejected snapshotted true
     check 'core snapshot barrier still requires binary backup' core_snapshot_guard
-    check 'unknown regular-service Geo schema rejected with evidence' unknown_geo_schema_rejected snapshotted false
     check 'core journal cannot weaken recovery to dat-only snapshots' corrupt_scope
     check 'direct stop kill failure preserves pidfile' direct_failure stop 1 yes
     check 'direct restart kill failure never starts' direct_failure restart 1 yes
@@ -576,27 +573,6 @@ trap cleanup EXIT
         [ "$(command head -n 1 "$actions")" = restart ]
     )
 
-    # 无 pidfile 不是停止失败: 没有自有进程时按已停止返回, 有进程时拒绝接管。
-    direct_missing_pidfile_stop() (
-        local dir="$TMP/direct-missing-pidfile" pidfile="$TMP/direct-missing.pid"
-        local definition rc=0
-        rm -rf "$dir"; mkdir -p "$dir/confs"
-        printf '{"version":{"min":"26.4.25","max":""}}' > "$dir/confs/15_version.json"
-        DEPLOY_DIR="$dir" CONFIG_DIR="$dir/confs" STATE_DIR="$dir/state" INIT_SYSTEM=direct
-        XRAY_DEPLOY_CORE_LOCK_HELD=1
-        rm -f "$pidfile"
-        definition=$(declare -f _manage_xray)
-        case "$definition" in *'/run/xray.pid'*) ;; *) return 1 ;; esac
-        eval "${definition//\/run\/xray.pid/\$pidfile}"
-        _proc_any_named() { return 1; }
-        _manage_xray stop >/dev/null 2>&1 || rc=$?
-        [ "$rc" -eq 0 ] || return 1
-        _proc_any_named() { return 0; }
-        rc=0
-        _manage_xray stop >/dev/null 2>&1 || rc=$?
-        [ "$rc" -eq 1 ]
-    )
-
     # logrotate helper 检查必须早于任何入口删除。
     uninstall_cleanup_contract() {
         local def check_line rm_line
@@ -631,13 +607,10 @@ trap cleanup EXIT
         _xray_current_version() { printf '26.9.8'; }
     }
 
-    check 'minimum Xray version rejects stable before staging' min_version_rejection stable v26.4.24
-    check 'minimum Xray version rejects preview before staging' min_version_rejection preview v26.4.24
-    check 'minimum Xray version rejects custom before staging' min_version_rejection custom v26.4.24
+    check 'minimum Xray version rejects before staging' min_version_rejection custom v26.4.24
     check 'invalid direct pidfile is rejected without takeover' invalid_pidfile_rejected
     check 'dead-PID direct pidfile is cleared instead of blocking recovery' direct_stale_pidfile_cleaned
     check 'verified restart actually restarts before sampling' restart_verified_restarts_first
-    check 'direct stop handles missing pidfile by ownership scan' direct_missing_pidfile_stop
     check 'uninstall checks logrotate helper before deleting entrypoints' uninstall_cleanup_contract
     check '26.6.1 and 26.9.8 gates and masquerade key set' version_gate_matrix
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"

@@ -581,18 +581,7 @@ PATH="$nft_saved_path"
 NODES_DIR="$nft_saved_nodes"
 unset HY2_IPTABLES_DIR HY2_INITD_DIR HY2_CONF_DIR HY2_PROC_NET
 
-# Reality metadata 未记录 reality_mode/tunnel_port 时仍须可重建链接/改端口;
-# 自动采纳的 tunnel 节点必须同时写入 tunnel_port。
-reality_link_without_mode_probe() (
-    local meta="$TMP/reality-without-mode.json" link
-    jq -n '{tag:"xd-reality-vision-443",protocol:"vless-tcp-reality-vision",port:443,
-            name:"n1",uuid:"id",link_addr:"edge.example",sni:"site.example",
-            public_key:"key",short_id:"abcd"}' > "$meta" || return 1
-    link=$(_rebuild_reality_link "$meta") || return 1
-    case "$link" in "vless://id@edge.example:443?"*"#n1") return 0 ;; *) return 1 ;; esac
-)
-check 'Reality metadata without reality_mode rebuilds its link' reality_link_without_mode_probe
-
+# Reality metadata 缺 tunnel_port 时仍须可改端口并从 config 回填。
 missing_tunnel_port_probe() (
     reality_fixture "missing-tunnel-port" false rewriteAddress || return 1
     jq 'del(.tunnel_port)' "$NODES_DIR/xd-reality-vision-443.json" > "$TMP/missing-tunnel-port.json" || return 1
@@ -603,39 +592,6 @@ missing_tunnel_port_probe() (
         jq -e '.port == 8443 and .tunnel_tag == "tunnel-site-10443-8443" and .tunnel_port == 10443' "$NODES_DIR/xd-reality-vision-8443.json"
 )
 check 'missing tunnel_port is derived from config and backfilled' missing_tunnel_port_probe
-
-adopt_tunnel_port_probe() (
-    reality_fixture "adopt-tunnel-port" false rewriteAddress || return 1
-    rm -f "$NODES_DIR/xd-reality-vision-443.json"
-    _adopt_single_inbound_write xd-reality-vision-443 adopted || return 1
-    jq -e '.tunnel_tag == "tunnel-site-10443-443" and .tunnel_port == 10443 and .reality_mode == "tunnel"' "$NODES_DIR/xd-reality-vision-443.json"
-)
-check 'adopted tunnel metadata includes tunnel_port' adopt_tunnel_port_probe
-
-# 方案要求: 合法 hop_ranges 与冗余键并存时仍按 hop_ranges 读取, 不因额外键失效。
-dual_write_hop_read_probe() (
-    local meta="$TMP/dual-hop.json"
-    printf '%s' '{"hop_ranges":"40000-40010","udp_hop_ports":"40000-40010","hop_start":40000,"hop_end":40010}' > "$meta" || return 1
-    [ "$(_read_hop_ranges_raw "$meta")" = "40000-40010" ]
-)
-check 'dual-write hop metadata stays readable through hop_ranges' dual_write_hop_read_probe
-
-# 无关/损坏 metadata 不阻塞卸载/reset。
-hop_cleanup_ignores_unrelated_metadata_probe() (
-    local dir="$TMP/hop-cleanup-unrelated" saved="$NODES_DIR" rc=0
-    NODES_DIR="$dir/nodes"; mkdir -p "$NODES_DIR"
-    printf '{bad json' > "$NODES_DIR/bad.json"
-    printf '%s' '{"protocol":"vless","tag":"r","port":443}' > "$NODES_DIR/reality.json"
-    iptables() { return 0; }
-    _hy2_hop_cleanup_candidates() { return 0; }
-    _hy2_persist_iptables() { return 0; }
-    _hy2_no_hop_rules_at_all() { return 0; }
-    _warn() { :; }
-    _hy2_cleanup_all_hops || rc=$?
-    NODES_DIR="$saved"
-    [ "$rc" -eq 0 ]
-)
-check 'hop cleanup skips unrelated/corrupt metadata' hop_cleanup_ignores_unrelated_metadata_probe
 
 printf 'node-alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

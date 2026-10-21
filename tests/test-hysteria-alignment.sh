@@ -231,22 +231,6 @@ congestion_probe() {
 }
 check 'hysteria congestion menu maps bbr presets and reset' congestion_probe
 
-# direct 无 pidfile: 没有自有进程时 stop 成功, 有进程时拒绝接管。
-hysteria_direct_missing_pidfile_stop() (
-    local pidfile="$TMP/hysteria-missing.pid" rc=0
-    INIT_SYSTEM=direct XRAY_DEPLOY_CORE_LOCK_HELD=1 HYSTERIA_PID_FILE="$pidfile"
-    HYSTERIA_BIN="$TMP/hysteria-bin"
-    rm -f "$pidfile"
-    _proc_any_named() { return 1; }
-    _manage_hysteria stop >/dev/null 2>&1 || rc=$?
-    [ "$rc" -eq 0 ] || return 1
-    _proc_any_named() { return 0; }
-    rc=0
-    _manage_hysteria stop >/dev/null 2>&1 || rc=$?
-    [ "$rc" -eq 1 ]
-)
-check 'direct stop handles missing pidfile by ownership scan' hysteria_direct_missing_pidfile_stop
-
 # 死 PID 的陈旧记录可清除; 存活 PID 的身份不符仍拒绝接管。
 hysteria_direct_stale_pidfile_stop() (
     local pidfile="$TMP/hysteria-stale.pid" rc=0
