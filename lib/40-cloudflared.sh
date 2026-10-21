@@ -583,7 +583,7 @@ _cf_exe_owned() {
         _proc_exe_is_strict "$1" "$2"
         return $?
     fi
-    _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认进程归属, 跳过"
+    _warn "缺少进程归属助手 _proc_exe_is_strict, 无法确认进程归属, 跳过"
     return 2
 }
 
@@ -838,7 +838,7 @@ _cf_kill_all() {
                     case "$_cf_own_rc" in
                         0) kill "$_pf_pid" 2>/dev/null || true ;;
                         2) _cf_strict_missing=1
-                           _warn "pidfile 记录的 PID $_pf_pid 归属无法确认(lib 版本过旧), 未发送信号"
+                           _warn "pidfile 记录的 PID $_pf_pid 归属无法确认, 未发送信号"
                            _tip "请重跑 install.sh --update 同步模块后重试" ;;
                         *) _warn "pidfile 记录的 PID $_pf_pid 同名但归属无法确认(非本脚本的 cloudflared?), 未发送信号"
                            _tip "若该进程确实属于本服务, 请手动检查后处理" ;;
@@ -905,12 +905,12 @@ _cf_kill_all() {
         _tip "检测到非本脚本管理的 cloudflared 进程:${others}(未触碰)"
     fi
     if [ -n "$unclear" ]; then
-        _warn "以下 cloudflared 进程归属无法确认(exe 不可读或 lib 版本过旧):${unclear}"
+        _warn "以下 cloudflared 进程归属无法确认(exe 不可读或缺少归属助手):${unclear}"
         _tip "它们可能仍属于本服务; 若隧道行为异常, 请手动确认"
         return 1
     fi
     if [ "$_cf_strict_missing" -eq 1 ]; then
-        _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认 cloudflared 进程归属"
+        _warn "缺少进程归属助手 _proc_exe_is_strict, 无法确认 cloudflared 进程归属"
         _tip "请重跑 install.sh --update 同步模块后重试"
         return 1
     fi

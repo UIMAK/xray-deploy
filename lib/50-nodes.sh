@@ -193,15 +193,8 @@ _hy2_gecko_supported() {
 }
 
 # masquerade 仅改 hysteriaSettings.masquerade，独立于 finalmask.udp；Xray 使用扁平字段。
-# >=v26.3.23 支持基本字段，>=v26.9.8 支持 unix/xForwarded(transport_method.go/hysteria/hub.go)。
-_HY2_MASQ_MIN_VER="26.3.23"
+# >=v26.9.8 支持 unix/xForwarded(transport_method.go/hysteria/hub.go)。
 _HY2_MASQ_UNIX_MIN_VER="26.9.8"
-_hy2_masq_supported() {
-    [ -x "$XRAY_BIN" ] || return 1
-    declare -F _xray_version_ge >/dev/null 2>&1 || return 1
-    _xray_version_ge "$_HY2_MASQ_MIN_VER"
-}
-
 # unix socket / xForwarded 的可用性(比 masquerade 本体更晚引入)
 _hy2_masq_unix_supported() {
     [ -x "$XRAY_BIN" ] || return 1
@@ -231,7 +224,7 @@ XD_MASQ_JQ_SET='(.inbounds[] | select(.tag == $t) | .streamSettings.hysteriaSett
 XD_MASQ_JQ_CLEAR='del(.inbounds[] | select(.tag == $t) | .streamSettings.hysteriaSettings.masquerade)'
 
 # 禁用端口跳跃时删除的 hop 字段集合(唯一真相)。
-XD_HOP_JQ_DEL_FIELDS='del(.hop_ranges) | del(.hop_start) | del(.hop_end) | del(.udp_hop_ports)'
+XD_HOP_JQ_DEL_FIELDS='del(.hop_ranges)'
 
 # Hy2 自签证书默认域名(唯一真相): 未显式指定时的 CN/SAN 与分享链接 SNI 回退值。
 XD_HY2_DEFAULT_SNI='build.nvidia.com'
@@ -887,8 +880,11 @@ _hy2_hop_txn_locked() {
     local op="$1" meta="$2" port="$4"; shift 4
     local created tag orig current_port current_ranges requested_ranges hopmeta newmeta range normalized rs re
     # 非 config writer 的 runtime+metadata 事务也必须遵守同一 pending guard。
-    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
-       && ! _txn_allow_config_write; then
+    if ! declare -F _txn_allow_config_write >/dev/null 2>&1; then
+        _error "缺少配置事务闸门助手; 已拒绝写入(fail-closed)"
+        return 1
+    fi
+    if ! _txn_allow_config_write; then
         return 1
     fi
     orig=$(cat "$meta" 2>/dev/null) || { _error "读取 Hysteria2 元数据失败: $meta"; return 1; }
@@ -900,7 +896,7 @@ _hy2_hop_txn_locked() {
         return 1
     fi
     _hy2_hop_meta_ok "$tag" || return 1
-    current_ranges=$(_read_hop_ranges "$meta")
+    current_ranges=$(_read_hop_ranges "$meta") || return 1
     requested_ranges="$*"
     if [ "$op" = add ]; then
         [ -z "$current_ranges" ] || { _error "节点端口跳跃状态已变化, 请重新选择"; return 1; }
@@ -916,7 +912,7 @@ _hy2_hop_txn_locked() {
             else normalized="${normalized:+$normalized,}$rs-$re"
             fi
         done
-        hopmeta=$(jq --arg r "$normalized" '.hop_ranges=$r | .udp_hop_ports=$r | del(.hop_start) | del(.hop_end)' <<< "$orig") || return 1
+        hopmeta=$(jq --arg r "$normalized" '.hop_ranges=$r' <<< "$orig") || return 1
     elif [ "$op" = remove ]; then
         [ -n "$current_ranges" ] && [ "$current_ranges" = "$requested_ranges" ] || {
             _error "节点端口跳跃范围已变化, 请重新选择"; return 1;
@@ -996,15 +992,18 @@ _hy2_hop_apply() {
 }
 
 # Remove only transaction-owned family-tagged records emitted by _hy2_add_hop_rules.
-# Records are v4:<range> or v6:<range>; an untagged legacy record is treated as v4.
+# Records must carry v4:<range> or v6:<range>.
 _hy2_remove_created_hop_rules() {
     local port="$1" rec family range cmd q specs line remain rc=0
     shift
     for rec in "$@"; do
+        case "$rec" in v4:?*|v6:?*) ;; *) _error "跳跃事务记录缺少 family, 拒绝清理"; return 1 ;; esac
+    done
+    for rec in "$@"; do
         case "$rec" in
             v4:*) family=v4; range="${rec#v4:}" ;;
             v6:*) family=v6; range="${rec#v6:}" ;;
-            *) family=v4; range="$rec" ;;
+            *) return 1 ;;
         esac
         [ -n "$range" ] || continue
         if [ "$family" = v6 ]; then cmd=ip6tables; else cmd=iptables; fi
@@ -1114,7 +1113,7 @@ _hy2_hop_teardown_all() {
             _HY2_HOP_SKIP+=("$tag")
             continue
         }
-        ranges=$(_read_hop_ranges "$NODES_DIR/${tag}.json")
+        ranges=$(_read_hop_ranges "$NODES_DIR/${tag}.json") || return 1
         [ -n "$ranges" ] || continue
         # 存在 hop 规则但 iptables 不可用 → 无法安全删除(fail-closed; 与单删一致)
         if ! command -v iptables >/dev/null 2>&1; then
@@ -1158,7 +1157,7 @@ _hy2_hop_restore_after_teardown() {
     for tag in "${_HY2_HOP_TD[@]}"; do
         local pp rr
         pp=$(jq -r '.port' "$NODES_DIR/${tag}.json" 2>/dev/null)
-        rr=$(_read_hop_ranges "$NODES_DIR/${tag}.json")
+        rr=$(_read_hop_ranges "$NODES_DIR/${tag}.json") || return 1
         # shellcheck disable=SC2086
         if ! _hy2_hop_reverse remove "$pp" $rr 2>/dev/null; then
             _error "恢复端口跳跃规则失败: $tag, 请手动检查 iptables"
@@ -1265,7 +1264,7 @@ _hy2_port_txn_locked() {
         return 1
     fi
     if ! _hy2_hop_meta_ok "$tag"; then return 1; fi
-    current_ranges=$(_read_hop_ranges "$meta")
+    current_ranges=$(_read_hop_ranges "$meta") || return 1
     if [ "$current_ranges" != "$ranges" ]; then
         _error "节点端口跳跃范围已变化, 请重新选择端口: $tag"
         return 1
@@ -1326,7 +1325,7 @@ _hy2_port_txn_locked() {
 _modify_port_hop() {
     local tag="$1" meta="$2" oldport="$3" newport="$4"; shift 4
     local ranges="$*" newmeta display
-    display=$(_read_hop_ranges_raw "$meta")
+    display=$(_read_hop_ranges_raw "$meta") || return 1
     local old_name; old_name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     newmeta=$(_hy2_gen_newmeta "$meta" "" "$newport") || { _error "生成新元数据失败"; return 1; }
     _info "检测到端口跳跃规则, 正在统一事务更新(config/metadata/iptables)..."
@@ -1343,25 +1342,17 @@ _modify_port_hop() {
     return 0
 }
 
-# 从元数据读取端口跳跃范围(原样串, 逗号/短横线); 兼容旧格式 hop_start/hop_end。
+# 从元数据读取当前端口跳跃范围。未识别的字段直接忽略。
 _read_hop_ranges_raw() {
-    local meta="$1" ranges hop_s hop_e
-    ranges=$(jq -r '.hop_ranges // empty' "$meta" 2>/dev/null)
-    [ -z "$ranges" ] && ranges=$(jq -r '.udp_hop_ports // empty' "$meta" 2>/dev/null)
-    if [ -n "$ranges" ]; then
-        printf '%s' "$ranges"
-        return
-    fi
-    hop_s=$(jq -r '.hop_start // empty' "$meta" 2>/dev/null)
-    hop_e=$(jq -r '.hop_end // empty' "$meta" 2>/dev/null)
-    if [ -n "$hop_s" ] && [ -n "$hop_e" ]; then
-        if [ "$hop_s" = "$hop_e" ]; then printf '%s' "$hop_s"; else printf '%s-%s' "$hop_s" "$hop_e"; fi
-    fi
+    local meta="$1"
+    jq -r '.hop_ranges // empty' "$meta" 2>/dev/null
 }
 
-# iptables 用冒号段/空格分隔形式(兼容 hop_ranges/udp_hop_ports 旧格式)。
+# iptables 使用冒号段和空格分隔形式。
 _read_hop_ranges() {
-    _read_hop_ranges_raw "$1" | tr ',' ' ' | tr '-' ':'
+    local ranges
+    ranges=$(_read_hop_ranges_raw "$1") || return 1
+    printf '%s' "$ranges" | tr ',' ' ' | tr '-' ':'
 }
 
 # HY2 hop metadata 校验区分无hop与损坏；损坏时拒绝破坏性操作。
@@ -1372,52 +1363,40 @@ _hy2_hop_meta_ok() {
         _error "节点元数据损坏, 无法安全读取: $tag"
         return 1
     fi
-    local f v r hs he s e toks tok
-    for f in hop_ranges udp_hop_ports; do
-        if jq -e "has(\"$f\")" "$meta" >/dev/null 2>&1; then
-            v=$(jq -r ".$f" "$meta" 2>/dev/null)
-            if [ -z "$v" ]; then
-                _error "节点 hop 字段为空, 无法安全操作: $tag ($f)"
-                return 1
-            fi
-            toks=$(printf '%s' "$v" | tr ',' ' ' | tr '-' ':')
-            # 字段存在但无任何有效 token(",," 等 → 只剩空白) → 损坏, 不当作"无 hop"
-            local ntok=0
-            for tok in $toks; do
-                ntok=$((ntok+1))
-                if [[ "$tok" =~ ^[0-9]+$ ]]; then
-                    if ! { [ "$tok" -ge 1 ] && [ "$tok" -le 65535 ]; }; then
-                        _error "节点 hop 端口越界(1-65535), 无法安全操作: $tag ($f=$tok)"
-                        return 1
-                    fi
-                elif [[ "$tok" =~ ^([0-9]+):([0-9]+)$ ]]; then
-                    s="${BASH_REMATCH[1]}"; e="${BASH_REMATCH[2]}"
-                    if ! { [ "$s" -ge 1 ] && [ "$s" -le 65535 ] && [ "$e" -ge 1 ] && [ "$e" -le 65535 ] && [ "$s" -le "$e" ]; }; then
-                        _error "节点 hop 范围非法(start/end 或越界), 无法安全操作: $tag ($f=$tok)"
-                        return 1
-                    fi
-                else
-                    _error "节点 hop 范围无法解析, 无法安全操作: $tag ($f=$tok)"
-                    return 1
-                fi
-            done
-            [ "$ntok" -gt 0 ] || {
-                _error "节点 hop 字段无有效范围, 无法安全操作: $tag ($f=$v)"
-                return 1
-            }
-        fi
-    done
-    if jq -e 'has("hop_start") or has("hop_end")' "$meta" >/dev/null 2>&1; then
-        hs=$(jq -r '.hop_start // empty' "$meta" 2>/dev/null)
-        he=$(jq -r '.hop_end // empty' "$meta" 2>/dev/null)
-        # 旧格式键存在即须 hs/he 均为非空数字且 1-65535、start<=end
-        if [ -z "$hs" ] || [ -z "$he" ] || \
-           ! [[ "$hs" =~ ^[0-9]+$ ]] || ! [[ "$he" =~ ^[0-9]+$ ]] || \
-           [ "$hs" -lt 1 ] || [ "$hs" -gt 65535 ] || \
-           [ "$he" -lt 1 ] || [ "$he" -gt 65535 ] || [ "$hs" -gt "$he" ]; then
-            _error "节点旧格式 hop 范围非法(数值/边界), 无法安全操作: $tag"
+    _read_hop_ranges_raw "$meta" >/dev/null || return 1
+    # 唯一受支持的 hop 字段; 旧字段已由 _read_hop_ranges_raw 拒绝。
+    local f="hop_ranges" v s e toks tok
+    if jq -e "has(\"$f\")" "$meta" >/dev/null 2>&1; then
+        v=$(jq -r ".$f" "$meta" 2>/dev/null)
+        if [ -z "$v" ]; then
+            _error "节点 hop 字段为空, 无法安全操作: $tag ($f)"
             return 1
         fi
+        toks=$(printf '%s' "$v" | tr ',' ' ' | tr '-' ':')
+        # 字段存在但无任何有效 token(",," 等 → 只剩空白) → 损坏, 不当作"无 hop"
+        local ntok=0
+        for tok in $toks; do
+            ntok=$((ntok+1))
+            if [[ "$tok" =~ ^[0-9]+$ ]]; then
+                if ! { [ "$tok" -ge 1 ] && [ "$tok" -le 65535 ]; }; then
+                    _error "节点 hop 端口越界(1-65535), 无法安全操作: $tag ($f=$tok)"
+                    return 1
+                fi
+            elif [[ "$tok" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                s="${BASH_REMATCH[1]}"; e="${BASH_REMATCH[2]}"
+                if ! { [ "$s" -ge 1 ] && [ "$s" -le 65535 ] && [ "$e" -ge 1 ] && [ "$e" -le 65535 ] && [ "$s" -le "$e" ]; }; then
+                    _error "节点 hop 范围非法(start/end 或越界), 无法安全操作: $tag ($f=$tok)"
+                    return 1
+                fi
+            else
+                _error "节点 hop 范围无法解析, 无法安全操作: $tag ($f=$tok)"
+                return 1
+            fi
+        done
+        [ "$ntok" -gt 0 ] || {
+            _error "节点 hop 字段无有效范围, 无法安全操作: $tag ($f=$v)"
+            return 1
+        }
     fi
     return 0
 }
@@ -1444,7 +1423,7 @@ _hy2_hop_cleanup_candidates() {
         [ "$proto" = "hysteria2" ] || continue
         port=$(jq -r '.port' "$f" 2>/dev/null)
         [ -n "$port" ] || continue
-        ranges=$(_read_hop_ranges "$f")
+        ranges=$(_read_hop_ranges "$f") || return 1
         [ -n "$ranges" ] || continue
         any=1
         break
@@ -1474,7 +1453,7 @@ _hy2_hop_cleanup_candidates() {
         [ "$proto" = "hysteria2" ] || continue
         port=$(jq -r '.port' "$f" 2>/dev/null)
         [ -n "$port" ] || continue
-        ranges=$(_read_hop_ranges "$f")
+        ranges=$(_read_hop_ranges "$f") || return 1
         [ -n "$ranges" ] || continue
         # 目标端口在节点间唯一(即 hy2 监听端口), 故按 target 取到的就是本节点的全部规则;
         # 即便 metadata 的 range 与 runtime 有出入, 作为"恢复源"取超集也是安全的(回滚只补缺失项)。
@@ -1545,10 +1524,22 @@ _hy2_restore_hop_rules_checked() {
 _hy2_cleanup_all_hops() {
     local found=0 residual=0 metadata_hop=0
     local saved=()
-    if [ -d "$NODES_DIR" ] && grep -lq 'hop_ranges\|udp_hop_ports\|hop_start\|hop_end' \
-        "$NODES_DIR"/*.json 2>/dev/null; then
-        metadata_hop=1
-    fi
+    local meta
+    for meta in "$NODES_DIR"/*.json; do
+        [ -f "$meta" ] || continue
+        local tag="${meta##*/}"
+        tag="${tag%.json}"
+        local proto=""
+        proto=$(jq -r '.protocol // empty' "$meta" 2>/dev/null) || proto=""
+        # 只有 Hy2 节点拥有 hop 规则; 非 Hy2/不可解析的 metadata 不参与校验,
+        # 避免无关节点损坏时阻塞卸载/reset。
+        if [ "$proto" != "hysteria2" ]; then
+            jq -e . "$meta" >/dev/null 2>&1 || _warn "节点元数据损坏, 跳过 hop 清理检查: $tag"
+            continue
+        fi
+        _hy2_hop_meta_ok "$tag" || return 1
+        if jq -e 'has("hop_ranges")' "$meta" >/dev/null 2>&1; then metadata_hop=1; fi
+    done
     if [ "$metadata_hop" -eq 1 ] && ! command -v iptables >/dev/null 2>&1; then
         # metadata 声明有 hop 规则但无 iptables 可精确 -D: 先实测证明 runtime 干净才继续,
         # 否则保留部署树, 不猜测规则已清空。
@@ -1575,7 +1566,7 @@ _hy2_cleanup_all_hops() {
             [ "$proto" = "hysteria2" ] || continue
             local port ranges
             port=$(jq -r '.port' "$f" 2>/dev/null)
-            ranges=$(_read_hop_ranges "$f")
+            ranges=$(_read_hop_ranges "$f") || return 1
             if [ -n "$ranges" ] && [ -n "$port" ]; then
                 # shellcheck disable=SC2086
                 _hy2_remove_hop_rules "$port" $ranges || residual=1
@@ -1771,9 +1762,11 @@ _mutate_config_locked() {
 
 _mutate_config_write() {
     # 统一闸门: reset / core(仅非终态) / port 三套账本任一未收敛即拒绝。
-    # 混装旧 lib 缺 helper 时放行(declare -F 守卫在 helper 内)。
-    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
-       && ! _txn_allow_config_write; then
+    if ! declare -F _txn_allow_config_write >/dev/null 2>&1; then
+        _error "缺少配置事务闸门助手; 已拒绝写入(fail-closed)"
+        return 1
+    fi
+    if ! _txn_allow_config_write; then
         return 1
     fi
     if ! _backup_config; then
@@ -2258,8 +2251,11 @@ _auto_tag_tagless_inbounds_locked() {
 
 _auto_tag_tagless_inbounds_write() {
     # 本函数是直写 config 的入口(不经 _mutate_config), 必须自带核心事务闸门。
-    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
-       && ! _txn_allow_config_write; then
+    if ! declare -F _txn_allow_config_write >/dev/null 2>&1; then
+        _error "缺少配置事务闸门助手; 已拒绝写入(fail-closed)"
+        return 1
+    fi
+    if ! _txn_allow_config_write; then
         return 1
     fi
     # 一次性读取所有入站的 tag/port/listen, 减少 jq 调用
@@ -2346,18 +2342,6 @@ _find_reality_tunnel_tag() {
         [ "$n" -gt 1 ] && return 2
         return 1
     fi
-    # target 缺失(旧版/手工配置) → legacy tag 后缀 fallback, 同样 count==1 才绑定
-    local pport
-    pport=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
-    [[ "$pport" =~ ^[0-9]+$ ]] || return 1
-    n=$(_config_jq -r --arg sfx "-${pport}" '[.inbounds[] | select(.protocol == "tunnel") | select(.tag | endswith($sfx))] | length' 2>/dev/null)
-    [[ "$n" =~ ^[0-9]+$ ]] || return 1
-    if [ "$n" -eq 1 ]; then
-        ttag=$(_config_jq -r --arg sfx "-${pport}" '[.inbounds[] | select(.protocol == "tunnel") | select(.tag | endswith($sfx)) | .tag][0]' 2>/dev/null)
-        printf '%s' "$ttag"
-        return 0
-    fi
-    [ "$n" -gt 1 ] && return 2
     return 1
 }
 
@@ -2428,8 +2412,11 @@ _adopt_single_inbound_locked() {
 _adopt_single_inbound_write() {
     local tag="$1" suffix="${2:-adopted}"
     # 采纳写 metadata(不经 _mutate_config), 同样属于"未收敛核心事务期间不得变更现场"。
-    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
-       && ! _txn_allow_config_write; then
+    if ! declare -F _txn_allow_config_write >/dev/null 2>&1; then
+        _error "缺少配置事务闸门助手; 已拒绝写入(fail-closed)"
+        return 1
+    fi
+    if ! _txn_allow_config_write; then
         return 1
     fi
     local proto port listen
@@ -2476,7 +2463,17 @@ _adopt_single_inbound_write() {
         return 1
     }
     if [ "$rmode" = "tunnel" ]; then
-        meta_json=$(echo "$meta_json" | jq --arg ttag "$ttag" '. + {tunnel_tag:$ttag}') || {
+        # tunnel_port 必须与 tunnel_tag 一起写入: 端口事务按 metadata 判定 tunnel 归属,
+        # 只有 tag 会让自动采纳的节点在改端口时被当作"字段缺失"拒绝。
+        local tport=""
+        tport=$(_config_jq -r --arg tg "$ttag" \
+            '.inbounds[] | select(.tag == $tg and .protocol == "tunnel") | .port // empty' 2>/dev/null) || tport=""
+        if [ -n "$ttag" ] && ! _validate_port "$tport"; then
+            _warn "采纳失败: 无法从 config 推导 tunnel 端口($tag)"
+            return 1
+        fi
+        meta_json=$(echo "$meta_json" | jq --arg ttag "$ttag" --argjson tport "${tport:-0}" \
+            '. + {tunnel_tag:$ttag} | (if $ttag != "" then . + {tunnel_port:$tport} else . end)') || {
             _warn "采纳失败: 元数据生成失败($tag)"
             return 1
         }
@@ -2944,31 +2941,6 @@ _generate_vless_enc_keys() {
                 print
             }
         ' | head -1)
-        # section-aware grep+sed 兜底: awk 窄化到目标 section, 再 grep+sed 提取值
-        if [ -z "$VLESS_ENC_DECRYPTION" ] || [ -z "$VLESS_ENC_ENCRYPTION" ]; then
-            local section
-            section=$(echo "$output" | awk -v target="$auth_type" '
-                /^Authentication:/ { line = tolower($0); gsub(/-/, "", line); in_section = (index(line, target) > 0); next }
-                in_section { print }
-            ')
-            if [ -z "$VLESS_ENC_DECRYPTION" ]; then
-                VLESS_ENC_DECRYPTION=$(echo "$section" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-            fi
-            if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
-                VLESS_ENC_ENCRYPTION=$(echo "$section" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-            fi
-        fi
-    else
-        # 旧版格式回退: jq 优先(纯 JSON 场景)
-        VLESS_ENC_DECRYPTION=$(echo "$output" | jq -r '.decryption // empty' 2>/dev/null)
-        VLESS_ENC_ENCRYPTION=$(echo "$output" | jq -r '.encryption // empty' 2>/dev/null)
-        # grep + sed 兜底(输出含额外文本时 jq 会失败)
-        if [ -z "$VLESS_ENC_DECRYPTION" ]; then
-            VLESS_ENC_DECRYPTION=$(echo "$output" | grep '"decryption"' | sed -n 's/.*"decryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-        fi
-        if [ -z "$VLESS_ENC_ENCRYPTION" ]; then
-            VLESS_ENC_ENCRYPTION=$(echo "$output" | grep '"encryption"' | sed -n 's/.*"encryption"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-        fi
     fi
 
     if [ -z "$VLESS_ENC_DECRYPTION" ] || [ -z "$VLESS_ENC_ENCRYPTION" ]; then
@@ -4130,7 +4102,7 @@ _rebuild_hy2_link() {
     fi
     # 端口跳跃端口(如果已配置, 统一通过 _read_hop_ranges_raw 读取)
     local hop_ports
-    hop_ports=$(_read_hop_ranges_raw "$meta" 2>/dev/null)
+    hop_ports=$(_read_hop_ranges_raw "$meta" 2>/dev/null) || return 1
     [ -n "$hop_ports" ] && link="${link}&mport=$(_url_encode "$hop_ports")"
     link="${link}#$(_url_encode "$name")"
     echo "$link"
@@ -4185,7 +4157,7 @@ _hy2_clash_line() {
     fi
     # 端口跳跃: 引号必须有 —— flow 映射上下文里裸逗号会被解析成字段分隔符
     local hop_ports
-    hop_ports=$(_read_hop_ranges_raw "$meta" 2>/dev/null)
+    hop_ports=$(_read_hop_ranges_raw "$meta" 2>/dev/null) || return 1
     [ -n "$hop_ports" ] && line="${line}, ports: \"${hop_ports}\""
     [ "$self_signed" = "true" ] && line="${line}, skip-cert-verify: true"
     printf '%s}' "$line"
@@ -4379,6 +4351,9 @@ _rebuild_reality_link() {
         _error "节点元数据缺少必要字段(uuid/link_addr/port/sni/public_key/short_id/name), 无法重建分享链接: $meta"
         return 1
     fi
+    # 分享链接参数与 direct/tunnel 拓扑无关, 不要求 reality_mode/tunnel_port:
+    # metadata 未记录这些字段时, 查看节点/改 SNI/改端口仍必须能重建链接。
+    # 拓扑字段的有效性由 _reality_node_mode 与端口事务各自校验。
     local enc; enc=$(jq -r '.encryption // "none"' "$meta")
     local enc_param
     if [ "$enc" != "none" ] && [ -n "$enc" ]; then
@@ -4845,7 +4820,7 @@ _delete_node_apply_single() {
     fi
     if [ "$proto" = "hysteria2" ]; then
         _hy2_hop_meta_ok "$tag" || return 1
-        ranges=$(_read_hop_ranges "$NODES_DIR/${tag}.json")
+        ranges=$(_read_hop_ranges "$NODES_DIR/${tag}.json") || return 1
         if [ -n "$ranges" ]; then
             # 存在 hop 规则但 iptables 不可用 → 无法安全删除(否则删 config/metadata
             # 留孤儿 DNAT, 且 metadata 已删后无法追溯 dport 归属)
@@ -4925,26 +4900,22 @@ _reality_port_txn_locked() {
     local tunnel_tag="" tunnel_port trc rmode
     rmode=$(_reality_node_mode "$tag")
     if [ "$rmode" = "tunnel" ]; then
-        # 缺tunnel_tag由配置唯一关联推导；歧义拒绝，不能盲选。
         tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
         tunnel_port=$(jq -r '.tunnel_port // empty' "$meta" 2>/dev/null)
         if [ -z "$tunnel_tag" ]; then
-            tunnel_tag=$(_find_reality_tunnel_tag "$tag"); trc=$?
-            if [ "$trc" != "0" ]; then
-                _error "无法唯一关联 Reality tunnel (rc=${trc}), 无法安全修改端口: $tag"
-                _tip "请检查配置的 realitySettings.target 与 tunnel 入站, 或删除后重建节点"
-                return 1
-            fi
-        else
-            # 已有tunnel_tag仍需交叉校验真实target/port；metadata不能单独证明归属。
-            if ! _config_jq -e --arg tg "$tunnel_tag" \
-                '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
-                >/dev/null 2>&1; then
-                _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
-                _tip "请检查配置中是否仍有该 tunnel 入站, 缺失时删除该节点后重建"
-                return 1
-            fi
+            _error "Reality tunnel 关联 tag 缺失, 请重新创建节点: $tag"
+            return 1
         fi
+        # 已有tunnel_tag仍需交叉校验真实target/port；metadata不能单独证明归属。
+        if ! _config_jq -e --arg tg "$tunnel_tag" \
+            '[.inbounds[] | select(.tag == $tg and .protocol == "tunnel")] | length > 0' \
+            >/dev/null 2>&1; then
+            _error "metadata 记录的 tunnel_tag (${tunnel_tag}) 在 config 中不存在, 无法安全修改端口"
+            _tip "请检查配置中是否仍有该 tunnel 入站, 缺失时删除该节点后重建"
+            return 1
+        fi
+        # tunnel_port 以 config 为准: metadata 可能未记录该字段,
+        # 下方会从 tunnel inbound 重新读取; 这里不再因 metadata 缺字段拒绝。
     fi
 
     # 主 tag 前缀(xd-reality-vision / xd-reality-xhttp) + 新端口
@@ -4954,6 +4925,10 @@ _reality_port_txn_locked() {
     if [ -n "$tunnel_tag" ]; then
         tunnel_port=$(_config_jq -er --arg tg "$tunnel_tag" \
             '.inbounds[] | select(.tag == $tg and .protocol == "tunnel") | .port') || return 1
+        if ! _validate_port "$tunnel_port"; then
+            _error "config 中的 tunnel 端口无效, 无法安全修改端口: $tunnel_tag"
+            return 1
+        fi
         # 先以 metadata 交叉确认共享引用；旧节点即使 config target 缺失/格式异常，
         # 也不能把仍被引用的 tunnel 当成独占资源。
         local peer peer_tunnel
@@ -5008,10 +4983,10 @@ _reality_port_txn_locked() {
     old_name=$(jq -r '.name' "$meta")
     # 仅替换 "-<oldport>" 后缀, 全局子串替换会破坏名称中含端口号的其他数字
     new_name=$(_rename_node_with_port "$old_name" "$oldport" "$newport")
-    # 顺带回填 reality_mode —— 旧节点(无该字段)改端口后元数据自描述, 不再依赖推导
+    # 顺带回填 reality_mode/tunnel_port —— 旧节点(无这些字段)改端口后元数据自描述, 不再依赖推导
     if ! jq --argjson p "$newport" --arg nt "$new_tag" --arg ntg "$new_tunnel_tag" \
-        --arg nn "$new_name" --arg rm "$rmode" \
-        '.port=$p | .tag=$nt | (if $ntg != "" then .tunnel_tag=$ntg else . end) | .name=$nn | .reality_mode=$rm' \
+        --arg nn "$new_name" --arg rm "$rmode" --argjson tp "${tunnel_port:-0}" \
+        '.port=$p | .tag=$nt | (if $ntg != "" then .tunnel_tag=$ntg | .tunnel_port=$tp else . end) | .name=$nn | .reality_mode=$rm' \
         "$meta" > "$tmpm"; then
         rm -f "$tmpm"; _error "生成元数据失败"; return 1
     fi
@@ -5112,8 +5087,11 @@ _port_txn_journal_write() {  # <old_path> <new_path> <kind> <oldport> <newport> 
     done
     # (b) 统一闸门: reset / core 账本未收敛同样禁止开启端口事务(port 段由上面的检查承担,
     #     或在事务临界区内被 XD_PORT_TXN_ACTIVE 跳过)。
-    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
-       && ! _txn_allow_config_write; then
+    if ! declare -F _txn_allow_config_write >/dev/null 2>&1; then
+        _error "缺少配置事务闸门助手; 已拒绝写入(fail-closed)"
+        return 1
+    fi
+    if ! _txn_allow_config_write; then
         return 1
     fi
     local payload
@@ -5477,7 +5455,7 @@ _modify_port() {
             _press_any_key; return 1
         fi
         local ranges
-        ranges=$(_read_hop_ranges "$meta")
+        ranges=$(_read_hop_ranges "$meta") || return 1
         if [ -n "$ranges" ]; then
             if ! command -v iptables >/dev/null 2>&1; then
                 _error "节点已启用端口跳跃, 但 iptables 不可用, 无法安全修改端口: $tag"
@@ -5823,7 +5801,7 @@ _hy2_toggle_hop() {
         [ "$proto" = "hysteria2" ] || continue
         local tag name port ranges_display
         tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        ranges_display=$(_read_hop_ranges_raw "$f")
+        ranges_display=$(_read_hop_ranges_raw "$f") || return 1
         tags+=("$tag")
         if [ -n "$ranges_display" ]; then
             printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${GREEN}%s${NC}\n" "$i" "$name" "$port" "$ranges_display"
@@ -5844,9 +5822,9 @@ _hy2_toggle_hop() {
     local meta="$NODES_DIR/${tag}.json"
     local port; port=$(jq -r '.port' "$meta")
     local cur_ranges
-    cur_ranges=$(_read_hop_ranges "$meta")
+    cur_ranges=$(_read_hop_ranges "$meta") || return 1
     local cur_display
-    cur_display=$(_read_hop_ranges_raw "$meta")
+    cur_display=$(_read_hop_ranges_raw "$meta") || return 1
 
     if [ -n "$cur_ranges" ]; then
         # 已启用 → 禁用
@@ -5901,7 +5879,7 @@ _hy2_toggle_hop() {
         # runtime add -> 原子持久化 -> 原子提交 metadata; 任一步失败回滚, 不永久分叉
         local hopmeta newmeta
         hopmeta=$(jq --arg r "$normalized" \
-                   '.hop_ranges=$r | .udp_hop_ports=$r | del(.hop_start) | del(.hop_end)' "$meta") || { _error "生成元数据失败"; _press_any_key; return; }
+                   '.hop_ranges=$r' "$meta") || { _error "生成元数据失败"; _press_any_key; return; }
         newmeta=$(_hy2_gen_newmeta "$meta" "$hopmeta") || { _error "重建分享链接失败"; _press_any_key; return; }
         # shellcheck disable=SC2086
         if ! _hy2_hop_txn add "$meta" "$newmeta" "$port" $parsed; then
@@ -5929,7 +5907,7 @@ _hy2_view_hop() {
         [ "$proto" = "hysteria2" ] || continue
         local name port ranges_display
         name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        ranges_display=$(_read_hop_ranges_raw "$f")
+        ranges_display=$(_read_hop_ranges_raw "$f") || return 1
         if [ -n "$ranges_display" ]; then
             echo -e "  ${GREEN}●${NC} ${name}: ${CYAN}${ranges_display}${NC} → ${port} (UDP)"
             found=1

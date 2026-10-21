@@ -40,7 +40,6 @@ DEPLOY_DIR="$scratch/deploy"
 BIN_DIR="$DEPLOY_DIR/bin"
 ASSET_DIR="$DEPLOY_DIR/assets"
 CONFIG_DIR="$DEPLOY_DIR/confs"
-LEGACY_CONFIG_FILE="$DEPLOY_DIR/config.json"
 NODES_DIR="$DEPLOY_DIR/nodes"
 CERT_DIR="$DEPLOY_DIR/certs"
 LOG_DIR="$DEPLOY_DIR/logs"
@@ -371,27 +370,5 @@ for scenario in forceDown ordinaryUp ordinaryDown; do
     done
 done
 
-if [ -n "$ws" ] && [ -n "$ss" ] && [ -n "$hy" ]; then
-    legacy=$(jq -n --argjson ws "$ws" --argjson ss "$ss" --argjson hy "$hy" \
-        --arg asset "$ASSET_DIR" \
-        '{env:{XRAY_LOCATION_ASSET:$asset},log:{loglevel:"warning"},routing:{rules:[]},
-          inbounds:[$ws,$ss,$hy],outbounds:[{protocol:"freedom",tag:"direct"}]}')
-    printf '%s\n' "$legacy" > "$LEGACY_CONFIG_FILE"
-    if _config_migrate_legacy && [ ! -e "$LEGACY_CONFIG_FILE" ] && [ -s "${LEGACY_CONFIG_FILE}.bak" ] \
-       && [ "$(cat "$scratch/service-calls")" = create ] \
-       && [ "$(printf '%s' "$legacy" | jq -cS .)" = "$(_config_merged | jq -cS .)" ]; then
-        test_confdir legacy-migration "$CONFIG_DIR"
-        if _config_migrate_legacy && [ "$(cat "$scratch/service-calls")" = create ] \
-           && [ "$(printf '%s' "$legacy" | jq -cS .)" = "$(_config_merged | jq -cS .)" ]; then
-            record PASS 'legacy-migration-idempotent (config and service stub unchanged)'
-        else
-            record FAIL legacy-migration-idempotent
-        fi
-    else
-        record FAIL 'legacy-migration (rename, semantic preservation or isolated service stub failed)'
-    fi
-else
-    record FAIL 'legacy-migration (missing rendered inbound)'
-fi
 printf 'RESULT: %s passed, %s failed, %s skipped\n' "$passed" "$failed" "$skipped"
 [ "$failed" -eq 0 ]

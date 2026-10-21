@@ -1,5 +1,5 @@
 #!/bin/bash
-# xray-deploy.sh — xd 主入口；geo-update（旧核心 cron）与 timed-restart 共用初始化。
+# xray-deploy.sh — xd 主入口；geo-update 与 timed-restart 共用初始化。
 
 set -u
 
@@ -197,10 +197,6 @@ _cron_init() {
     if ! _ensure_base_deps >/dev/null 2>&1; then
         _warn "基础依赖安装失败, 部分功能可能不可用(cron 子命令可能失败)"
     fi
-    # 旧版单文件 config.json → confs/ 的迁移也在这里兜一次(cron 子命令不经过菜单)。
-    if declare -F _config_migrate_legacy >/dev/null 2>&1; then
-        _config_migrate_legacy || _warn "旧单文件配置迁移失败, 请从主菜单检查"
-    fi
 }
 
 # 主调度
@@ -210,14 +206,14 @@ main() {
     # 子命令: geo-update(cron 调用)
     if [ "${1:-}" = "geo-update" ]; then
         [ "$#" -eq 1 ] || { _error "geo-update 不接受额外参数: $*"; exit 2; }
-        _cron_init
+        _cron_init || exit 1
         _geo_update
         exit $?
     fi
     # 子命令: timed-restart(cron 调用)
     if [ "${1:-}" = "timed-restart" ]; then
         [ "$#" -eq 1 ] || { _error "timed-restart 不接受额外参数: $*"; exit 2; }
-        _cron_init
+        _cron_init || exit 1
         _timed_restart_do
         exit $?
     fi

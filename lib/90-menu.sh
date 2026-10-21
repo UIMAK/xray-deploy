@@ -100,7 +100,7 @@ _print_status_bar() {
         hyline="  Hysteria2 v${hver#v}: ${hst}"
     fi
 
-    # Geo(真相源: confs/14_geodata.json 的 geodata.cron, 兼容旧 state)
+    # Geo(真相源: confs/14_geodata.json 的 geodata.cron)
     local geostate; geostate=$(_geo_auto_state 2>/dev/null); [ -z "$geostate" ] && geostate="off"
     local geostr
     [ "$geostate" = "on" ] && geostr="${GREEN}● 自动${NC}" || geostr="${RED}○ 手动${NC}"
@@ -150,11 +150,14 @@ _main_menu() {
         _tip "请在交互式终端中运行 xd(或为 stdin 连接一个 tty)"
         exit 1
     fi
-    # 启动链：reset → core → legacy → port → tag → adopt → env → geo。
-    # reset/core 先分别恢复；任一失败阻塞 legacy 至 geo，legacy/port/tag/adopt 失败停止后续。
+    # 启动链：reset → core → port → tag → adopt → env。
+    # reset/core 先分别恢复；任一失败阻塞 port 至 env，port/tag/adopt 失败停止后续。
     RESET_RECOVERY_FAILED=0
     local reset_rc=0
-    if declare -F _reset_config_recover >/dev/null 2>&1; then
+    if ! declare -F _reset_config_recover >/dev/null 2>&1; then
+        _error "缺少 reset 恢复助手, 已停止启动期维护(fail-closed)"
+        reset_rc=1
+    else
         _reset_config_recover || reset_rc=$?
     fi
     if [ "$reset_rc" -ne 0 ]; then
@@ -164,55 +167,57 @@ _main_menu() {
     # core 恢复先于任何维护写入；运行态未知则停止链。
     CORE_RECOVERY_FAILED=0
     local core_rc=0
-    if declare -F _xray_core_txn_recover >/dev/null 2>&1; then
+    if ! declare -F _xray_core_txn_recover >/dev/null 2>&1; then
+        _error "缺少核心事务恢复助手, 已停止启动期维护(fail-closed)"
+        core_rc=1
+    else
         _xray_core_txn_recover || core_rc=$?
     fi
     if [ "$core_rc" -ne 0 ]; then
         CORE_RECOVERY_FAILED=1
         _error "Xray 核心事务未收敛(账本/恢复源已保留): 已跳过全部启动期 config 维护, 请处理后重启脚本"
     fi
-    # legacy/port/tag/adopt 失败置阻塞，防止叠加写入。
+    # port/tag/adopt 失败置阻塞，防止叠加写入。
     STARTUP_MAINT_BLOCKED=0
     if [ "$RESET_RECOVERY_FAILED" -ne 0 ] || [ "$CORE_RECOVERY_FAILED" -ne 0 ]; then
         STARTUP_MAINT_BLOCKED=1
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        # legacy 先于 port 恢复，确保旧部署 confs 的合并视图可读。
-        if declare -F _config_migrate_legacy >/dev/null 2>&1; then
-            if ! _config_migrate_legacy; then
-                STARTUP_MAINT_BLOCKED=1
-                _error "旧单文件配置迁移失败: 已停止后续启动维护, 请检查后重启脚本"
-            fi
-        fi
-    fi
-    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
         # port 恢复先于普通写入；未收敛账本会使写闸门拒绝。
-        if declare -F _port_txn_recover >/dev/null 2>&1; then
-            if ! _port_txn_recover; then
-                STARTUP_MAINT_BLOCKED=1
-                _error "端口事务恢复未收敛(未完成项已保留 journal/证据), 已停止后续启动维护"
-            fi
+        if ! declare -F _port_txn_recover >/dev/null 2>&1; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "缺少端口事务恢复助手, 已停止后续启动维护(fail-closed)"
+        elif ! _port_txn_recover; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "端口事务恢复未收敛(未完成项已保留 journal/证据), 已停止后续启动维护"
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        if declare -F _auto_tag_tagless_inbounds >/dev/null 2>&1; then
-            if ! _auto_tag_tagless_inbounds; then
-                STARTUP_MAINT_BLOCKED=1
-                _error "启动期自动分配 inbound tag 失败(配置不可解析/写入失败): 已停止后续启动维护"
-            fi
+        if ! declare -F _auto_tag_tagless_inbounds >/dev/null 2>&1; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "缺少 inbound tag 维护助手, 已停止后续启动维护(fail-closed)"
+        elif ! _auto_tag_tagless_inbounds; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "启动期自动分配 inbound tag 失败(配置不可解析/写入失败): 已停止后续启动维护"
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        if declare -F _auto_adopt_orphans >/dev/null 2>&1; then
-            if ! _auto_adopt_orphans; then
-                STARTUP_MAINT_BLOCKED=1
-                _error "启动期自动采纳孤儿入站失败(配置不可解析/元数据写入失败): 已停止后续启动维护"
-            fi
+        if ! declare -F _auto_adopt_orphans >/dev/null 2>&1; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "缺少孤儿入站采纳助手, 已停止后续启动维护(fail-closed)"
+        elif ! _auto_adopt_orphans; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "启动期自动采纳孤儿入站失败(配置不可解析/元数据写入失败): 已停止后续启动维护"
         fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        if declare -F _auto_ensure_config_env >/dev/null 2>&1; then _auto_ensure_config_env; fi
-        if declare -F _auto_migrate_geo_autoupdate >/dev/null 2>&1; then _auto_migrate_geo_autoupdate; fi
+        if ! declare -F _auto_ensure_config_env >/dev/null 2>&1; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "缺少配置环境维护助手, 已停止后续启动维护(fail-closed)"
+        elif ! _auto_ensure_config_env; then
+            STARTUP_MAINT_BLOCKED=1
+            _error "配置环境维护失败, 已停止后续启动维护"
+        fi
     fi
     local choice
 
@@ -426,7 +431,7 @@ _timed_restart_menu() {
     cron_line="${cron_expr} ${cmd_path} timed-restart ${marker}"
     # 缺 _crontab_replace 拒绝写入，裸管道会将读失败变成清空。
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
-        _error "lib 版本过旧(00-common 缺 _crontab_replace), 无法写入 crontab"
+        _error "缺少 crontab 助手 _crontab_replace, 无法写入 crontab"
         _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
         _press_any_key; return
     fi
@@ -475,7 +480,7 @@ _timed_restart_menu() {
 _timed_restart_disable() {
     local marker="# xray-deploy-timed-restart"
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
-        _error "lib 版本过旧(00-common 缺 _crontab_replace), 无法清理 crontab"
+        _error "缺少 crontab 助手 _crontab_replace, 无法清理 crontab"
         _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
         return 1
     fi
@@ -485,7 +490,7 @@ _timed_restart_disable() {
         _crontab_has_marker "$marker" || has_rc=$?
     else
         # 缺三态判据拒绝，不猜 off 或退回裸管道。
-        _error "lib 版本过旧(00-common 缺 _crontab_has_marker), 无法确认定时任务状态"
+        _error "缺少 crontab 助手 _crontab_has_marker, 无法确认定时任务状态"
         _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
         return 1
     fi
@@ -533,48 +538,6 @@ _cf_fb_pids() {
     done
 }
 
-# 混装缺卸载 helper 的 cloudflared 兜底；以文件/进程事实判成功。
-_uninstall_cloudflared_fallback() {
-    if [ -x /usr/local/bin/cloudflared ]; then
-        _info "卸载 cloudflared (fallback)..."
-        /usr/local/bin/cloudflared service uninstall 2>/dev/null || true
-        local pids
-        pids=$(_cf_fb_pids)
-        if [ -n "$pids" ]; then
-            local pid
-            for pid in $pids; do kill -15 "$pid" 2>/dev/null || true; done
-            sleep 2
-            pids=$(_cf_fb_pids)
-            for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
-            sleep 1
-        fi
-        case "$INIT_SYSTEM" in
-            systemd)
-                systemctl disable cloudflared 2>/dev/null || true
-                rm -f /etc/systemd/system/cloudflared.service
-                systemctl daemon-reload 2>/dev/null || true ;;
-            openrc)
-                rc-update del cloudflared default 2>/dev/null || true
-                rm -f /etc/init.d/cloudflared ;;
-        esac
-        rm -f /usr/local/bin/cloudflared
-        rm -f "$STATE_DIR"/cf_*
-        # 校验 binary 消失且无进程；pidof 漏报由 _cf_fb_pids 兜底。
-        if [ -e /usr/local/bin/cloudflared ]; then
-            _error "cloudflared 二进制删除失败, 请手动检查 /usr/local/bin/cloudflared"
-            return 1
-        fi
-        # 同样验证文件/进程事实，见 _cf_fb_pids。
-        if [ -n "$(_cf_fb_pids)" ]; then
-            _warn "cloudflared 文件已删除, 但仍有残留进程, 请手动确认"
-            return 1
-        fi
-        _success "cloudflared 已卸载 (fallback)"
-    else
-        _warn "cloudflared 未安装"
-    fi
-}
-
 # 卸载菜单
 _uninstall_menu() {
     local choice ans
@@ -605,10 +568,11 @@ _uninstall_menu() {
                     fi
                     # 文件已删但进程仍在可返回 1，必须如实报告。
                     local cf_rc=0
-                    if declare -F _uninstall_cloudflared >/dev/null 2>&1; then
-                        _uninstall_cloudflared || cf_rc=$?
+                    if ! declare -F _uninstall_cloudflared >/dev/null 2>&1; then
+                        _error "缺少 cloudflared 卸载助手, 已保留现场(fail-closed)"
+                        cf_rc=1
                     else
-                        _uninstall_cloudflared_fallback || cf_rc=$?
+                        _uninstall_cloudflared || cf_rc=$?
                     fi
                     if [ "$cf_rc" -ne 0 ]; then
                         _error "cloudflared 卸载未完全成功(见上方原因), 请手动确认进程与文件已清理"
@@ -643,12 +607,7 @@ _reset_config() {
         esac
     fi
     # 全站破坏性锁序 install → config → core，防卸载拆掉正在写的部署树。
-    if declare -F _with_deploy_install_lock >/dev/null 2>&1; then
-        _with_deploy_install_lock _with_config_lock _reset_config_locked
-    else
-        # 混装旧 lib 的兼容降级: 至少保留原 config 锁保护, 不退回裸执行。
-        _with_config_lock _reset_config_locked
-    fi
+    _with_deploy_install_lock _with_config_lock _reset_config_locked
 }
 
 # reset：prepared → committed → runtime_verified，仅第三阶段清理。
@@ -706,7 +665,7 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_
     local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0 f content=""
     if [ "$had_config" -eq 1 ]; then
         if [ -z "${JQ_MERGE_OBJECTS:-}" ]; then
-            _error "缺少合并常量(lib/00-common.sh 可能是旧版本), 配置回滚已中止"
+            _error "缺少合并常量, 配置回滚已中止"
             _tip "请在主菜单执行 [检测脚本更新] 完整更新一次后重试"
             return 1
         fi
@@ -835,11 +794,7 @@ _reset_config_commit_finish_locked() {   # <journal> <snapshot> <had_json> <spec
 _reset_config_recover() {
     local journal; journal=$(_reset_journal_path)
     [ -e "$journal" ] || [ -e "$(_reset_snapshot_path)" ] || _reset_journal_quarantine_exists "$journal" || return 0
-    if declare -F _with_deploy_install_lock >/dev/null 2>&1; then
-        _with_deploy_install_lock _with_config_lock _reset_config_recover_locked
-    else
-        _with_config_lock _reset_config_recover_locked
-    fi
+    _with_deploy_install_lock _with_config_lock _reset_config_recover_locked
 }
 
 _reset_config_recover_locked() {
@@ -991,26 +946,25 @@ _reset_config_locked() {
     fi
     # hop 候选先入 journal 再清理；枚举失败拒绝，空数组只表示确认无候选。
     local specs_json="[]" hop_specs="" cand_rc=0
-    if declare -F _hy2_hop_cleanup_candidates >/dev/null 2>&1; then
-        hop_specs=$(_hy2_hop_cleanup_candidates 2>/dev/null) || cand_rc=$?
-        if [ "$cand_rc" -ne 0 ]; then
-            _error "无法枚举待清理的端口跳跃规则(恢复源获取失败), 已取消重置以保护 metadata/runtime 一致性"
+    if ! declare -F _hy2_hop_cleanup_candidates >/dev/null 2>&1 \
+       || ! declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
+        _error "缺少端口跳跃清理助手, 拒绝在无账本保护下执行重置"
+        _tip "请执行 install.sh --update 同步全部模块后重试"
+        rm -rf "$snapshot" 2>/dev/null
+        return 1
+    fi
+    hop_specs=$(_hy2_hop_cleanup_candidates 2>/dev/null) || cand_rc=$?
+    if [ "$cand_rc" -ne 0 ]; then
+        _error "无法枚举待清理的端口跳跃规则(恢复源获取失败), 已取消重置以保护 metadata/runtime 一致性"
+        rm -rf "$snapshot" 2>/dev/null
+        return 1
+    fi
+    if [ -n "$hop_specs" ]; then
+        if ! specs_json=$(printf '%s\n' "$hop_specs" | jq -R -s 'split("\n") | map(select(length > 0)) | unique' 2>/dev/null); then
+            _error "无法序列化端口跳跃恢复源, 已取消重置以保护 metadata/runtime 一致性"
             rm -rf "$snapshot" 2>/dev/null
             return 1
         fi
-        if [ -n "$hop_specs" ]; then
-            if ! specs_json=$(printf '%s\n' "$hop_specs" | jq -R -s 'split("\n") | map(select(length > 0)) | unique' 2>/dev/null); then
-                _error "无法序列化端口跳跃恢复源, 已取消重置以保护 metadata/runtime 一致性"
-                rm -rf "$snapshot" 2>/dev/null
-                return 1
-            fi
-        fi
-    elif declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        # 有清理却无候选枚举能力则拒绝，防止无账本删除 hop。
-        _error "lib 版本不匹配(缺 hop 恢复源枚举助手), 拒绝在无账本保护下执行端口跳跃清理"
-        _tip "请先执行 install.sh --update 同步全部模块, 再重试重置"
-        rm -rf "$snapshot" 2>/dev/null
-        return 1
     fi
     if ! _reset_journal_write "$journal" "$snapshot" "prepared" "$had_json" "$specs_json"; then
         _error "无法写入 reset 事务日志(磁盘空间/权限?), 已取消重置以保护现有数据"
@@ -1018,12 +972,10 @@ _reset_config_locked() {
         return 1
     fi
     # 先清 hop 再删 config/metadata；失败按 journal 幂等回补，见 _reset_config_abort_locked。
-    if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        if ! _hy2_cleanup_all_hops; then
-            _error "端口跳跃规则清理失败, 正在回滚本次重置"
-            _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
-            return 1
-        fi
+    if ! _hy2_cleanup_all_hops; then
+        _error "端口跳跃规则清理失败, 正在回滚本次重置"
+        _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
+        return 1
     fi
     if [ -d "$NODES_DIR" ]; then
         # mv 成功才置 nodes_moved，失败不可恢复不存在的副本。
@@ -1240,12 +1192,6 @@ _hy2_masq_menu() {
     local choice
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
-    # masquerade 要求 v26.3.23，旧核心静默忽略该字段，必须先拒绝。
-    if ! _hy2_masq_supported; then
-        _error "当前核心不支持 masquerade 页面伪装(需 Xray >= v${_HY2_MASQ_MIN_VER})"
-        _tip "旧核心会静默忽略该字段(伪装不生效且无任何报错); 请先升级/切换 Xray 核心"
-        _press_any_key; return
-    fi
     echo; echo -e "  ${CYAN}【HTTP/3 页面伪装 masquerade】${NC}"
     echo -e "  ${YELLOW}作用: 非 Hysteria 客户端(普通浏览器/扫描器)连上本端口时返回什么 HTTP 页面${NC}"
     echo -e "  ${YELLOW}与 [5] 混淆(FinalMask.udp)是两个独立机制 —— 混淆改链路上的 QUIC 字节, 本项改 HTTP 页面${NC}"
@@ -2113,7 +2059,7 @@ _reality_domain_menu() {
     if [ "$preflight_mode" != "direct" ]; then
         preflight_tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
         if [ -z "$preflight_tunnel_tag" ]; then
-            _warn "该节点缺少 tunnel_tag 元数据(可能为旧版本创建或手动添加)"
+            _warn "该节点缺少 tunnel_tag 元数据"
             _warn "域名切换将仅更新 Reality inbound, 不会更新 tunnel inbound 和路由规则"
             read -rp "  继续? [y/N]: " ans
             case "$ans" in y|Y) allow_missing_tunnel=1 ;; *) _info "已取消"; _press_any_key; continue ;; esac

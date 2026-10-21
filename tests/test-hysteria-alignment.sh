@@ -231,5 +231,47 @@ congestion_probe() {
 }
 check 'hysteria congestion menu maps bbr presets and reset' congestion_probe
 
+# 死 PID 的陈旧记录可清除; 存活 PID 的身份不符仍拒绝接管。
+hysteria_direct_stale_pidfile_stop() (
+    local pidfile="$TMP/hysteria-stale.pid" rc=0
+    INIT_SYSTEM=direct XRAY_DEPLOY_CORE_LOCK_HELD=1 HYSTERIA_PID_FILE="$pidfile"
+    HYSTERIA_BIN="$TMP/hysteria-bin"
+    printf '999999 123 hysteria\n' > "$pidfile"
+    _proc_any_named() { return 1; }
+    _manage_hysteria stop >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] && [ ! -e "$pidfile" ] || return 1
+    printf '%s 123 hysteria\n' "$$" > "$pidfile"
+    _manage_hysteria stop >/dev/null 2>&1 && return 1
+    [ -e "$pidfile" ]
+)
+check 'dead-PID hysteria record is cleared, live mismatch is refused' hysteria_direct_stale_pidfile_stop
+
+# restart 失败但旧进程仍在: 身份未变化必须判失败, 不能只凭 running 状态。
+hysteria_restart_rejects_unchanged_identity() (
+    INIT_SYSTEM=direct
+    sleep() { :; }
+    _hysteria_proc_identity() { printf '123:456'; }
+    _manage_hysteria() { [ "$1" = status ] && printf 'running'; return 0; }
+    ! _hysteria_restart_verified
+)
+check 'hysteria restart rejects unchanged old process identity' hysteria_restart_rejects_unchanged_identity
+
+# 身份读不到不能当作"进程已更换": 重启前或重启后任一读不到都必须 fail-closed。
+hysteria_restart_requires_readable_identity() (
+    INIT_SYSTEM=direct
+    sleep() { :; }
+    _manage_hysteria() { [ "$1" = status ] && printf 'running'; return 0; }
+    _hysteria_proc_identity() { return 1; }
+    _hysteria_restart_verified && return 1
+    local marker="$TMP/hy-id-once"
+    : > "$marker"
+    _hysteria_proc_identity() {
+        if [ -s "$marker" ]; then return 1; fi
+        printf '1:1' > "$marker"; printf '1:1'
+    }
+    ! _hysteria_restart_verified
+)
+check 'hysteria restart fails closed when identity is unreadable' hysteria_restart_requires_readable_identity
+
 printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

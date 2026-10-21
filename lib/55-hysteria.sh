@@ -347,11 +347,10 @@ _hysteria_is_running() {
             esac
             ;;
         direct)
-            if [ -n "$(_xd_pidfile_starttime "$HYSTERIA_PID_FILE")" ]; then
-                _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" || return 1
-            fi
+            _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" || return 1
             anchor=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null)
-            _hysteria_pid_is_ours "${anchor:-}" && return 0
+            _hysteria_pid_is_ours "${anchor:-}"
+            return $?
             ;;
         openrc)
             anchor=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null)
@@ -388,12 +387,11 @@ _hysteria_proc_tree_has_bin() {
     local depth=4   # 见上方契约说明: 实现假设, 超出即返回 1(fail-closed)
     [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
     [ "$anchor" != "0" ] || return 1
-    if declare -F _proc_exe_is_strict >/dev/null 2>&1; then
-        _proc_exe_is_strict "$anchor" "$HYSTERIA_BIN" && return 0
-    else
-        _warn "lib 版本过旧(00-common 缺 _proc_exe_is_strict), 无法确认进程归属, 跳过"
+    if ! declare -F _proc_exe_is_strict >/dev/null 2>&1; then
+        _error "缺少严格进程归属助手 _proc_exe_is_strict, 已拒绝破坏性操作(fail-closed)"
         return 1
     fi
+    _proc_exe_is_strict "$anchor" "$HYSTERIA_BIN" && return 0
     for p in /proc/[0-9]*; do
         c="${p#/proc/}"
         cur="$c"
@@ -425,7 +423,7 @@ _manage_hysteria() {
                 restart)
                     systemctl reset-failed "$HYSTERIA_SVC" 2>/dev/null
                     systemctl restart "$HYSTERIA_SVC" 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
-                status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
+                status) if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
         openrc)
@@ -456,36 +454,69 @@ _manage_hysteria() {
                     if _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" && _hysteria_pid_is_ours "${dpid0:-}"; then
                         echo "running"
                     else
-                        rm -f "$HYSTERIA_PID_FILE"
+                        if [ -e "$HYSTERIA_PID_FILE" ] || [ -L "$HYSTERIA_PID_FILE" ]; then
+                            # 记录的 PID 已不存在 = 陈旧记录, 清除后继续启动; PID 仍存活但
+                            # 身份不符才拒绝, 避免接管其它进程。
+                            if [ -n "$dpid0" ] && [ -d "/proc/$dpid0" ]; then
+                                _error "direct 身份记录与存活进程不符, 保留记录并拒绝启动"; return 1
+                            fi
+                            rm -f "$HYSTERIA_PID_FILE"
+                        fi
+                        if _proc_any_named hysteria "$HYSTERIA_BIN"; then
+                            _error "已存在未记录的自有 Hysteria 进程, 拒绝重复启动"; return 1
+                        fi
                         (
                             cd "$HYSTERIA_DATA_DIR" 2>/dev/null || cd /
                             exec nohup "$HYSTERIA_BIN" server -c "$HYSTERIA_CONFIG" --disable-update-check \
                                 >>"$HYSTERIA_LOG_FILE" 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&-
                         ) &
-                        _xd_pidfile_write "$HYSTERIA_PID_FILE" "$!"
+                        local started_pid=$!
                         sleep 1
+                        _xd_pidfile_write "$HYSTERIA_PID_FILE" "$started_pid" || return 1
                         dpid1=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
                         if [ -z "$dpid1" ] || ! _hysteria_pid_is_ours "$dpid1"; then
                             _warn "Hysteria 启动失败, 进程已退出(查看 $HYSTERIA_LOG_FILE)"
-                            rm -f "$HYSTERIA_PID_FILE"
                             return 1
                         fi
                     fi
                     ;;
                 stop)
-                    if [ -f "$HYSTERIA_PID_FILE" ]; then
+                    if [ -e "$HYSTERIA_PID_FILE" ] || [ -L "$HYSTERIA_PID_FILE" ]; then
                         local dpid _hy_st
                         dpid=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE")
+                        if ! _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE"; then
+                            # 记录的 PID 已不存在 = 陈旧记录, 清除后按已停止继续; PID 仍存活但
+                            # 身份不符才拒绝, 避免误杀复用该 PID 的其它进程。
+                            if [ -n "$dpid" ] && [ -d "/proc/$dpid" ]; then
+                                _error "direct 身份记录与存活进程不符, 保留记录"; return 1
+                            fi
+                            rm -f "$HYSTERIA_PID_FILE"
+                            if _proc_any_named hysteria "$HYSTERIA_BIN"; then
+                                _error "direct 记录已陈旧但存在自有 Hysteria 进程, 拒绝扫描接管"; return 1
+                            fi
+                            return 0
+                        fi
                         _hy_st=$(_xd_pidfile_starttime "$HYSTERIA_PID_FILE")
-                        if [ -n "$dpid" ] && _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" \
-                           && _hysteria_pid_is_ours "$dpid"; then
-                            _xd_kill_pid_graceful "$dpid" 5 "$_hy_st"
+                        if [ -n "$dpid" ] && _hysteria_pid_is_ours "$dpid"; then
+                            _xd_kill_pid_graceful "$dpid" 5 "$_hy_st" || return 1
+                            _xd_pid_unchanged "$dpid" "$_hy_st" && return 1
+                        else
+                            _error "direct 进程归属无法确认, 保留记录"; return 1
+                        fi
+                    else
+                        # 无 pidfile 不等于仍在运行: 仅在确实扫描到自有进程时拒绝,
+                        # 否则按"可能已停止"返回成功, 由 _hysteria_stopped_state 的归属扫描复核。
+                        if _proc_any_named hysteria "$HYSTERIA_BIN"; then
+                            _error "direct 身份记录缺失且存在自有 Hysteria 进程, 拒绝扫描接管"; return 1
                         fi
                     fi
                     rm -f "$HYSTERIA_PID_FILE"
                     ;;
-                restart) _manage_hysteria stop; sleep 2; _manage_hysteria start ;;
-                status)  if _hysteria_is_running; then echo "running"; else echo "stopped"; fi ;;
+                restart) _manage_hysteria stop || return 1; sleep 2; _manage_hysteria start ;;
+                status)
+                    if _hysteria_is_running; then echo "running"
+                    elif [ -e "$HYSTERIA_PID_FILE" ] || [ -L "$HYSTERIA_PID_FILE" ] || _proc_any_named hysteria "$HYSTERIA_BIN"; then echo "unknown"
+                    else echo "stopped"; fi ;;
             esac
             ;;
     esac
@@ -554,7 +585,41 @@ _hysteria_kill_stale_supervisor() {
 }
 
 # 重启后验证核心存活；官方无 check/validate 子命令。
+# 重启验证用: 当前后端主进程身份(PID:starttime)。未运行/无法确认时输出空。
+_hysteria_proc_identity() {
+    local pid="" st=""
+    case "$INIT_SYSTEM" in
+        systemd)
+            pid=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null) || pid=""
+            # systemd < 230 不支持 --value: 退回解析非 value 输出。
+            if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+                pid=$(systemctl show -p MainPID "$HYSTERIA_SVC" 2>/dev/null | sed -n 's/^MainPID=//p')
+            fi
+            [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "0" ] || return 1
+            ;;
+        openrc)
+            pid=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null) || return 1
+            [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 1
+            ;;
+        direct)
+            _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" || return 1
+            pid=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE") || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    st=$(_proc_starttime "$pid") || return 1
+    printf '%s:%s' "$pid" "$st"
+}
+
 _hysteria_restart_verified() {
+    # 运行中的服务必须先拿到身份, 否则无法证明旧进程已退出; 身份不可读直接拒绝。
+    local before="" after="" was_running=0
+    if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then was_running=1; fi
+    before=$(_hysteria_proc_identity 2>/dev/null) || before=""
+    if [ "$was_running" -eq 1 ] && [ -z "$before" ]; then
+        _error "Hysteria 正在运行但无法确认进程身份, 拒绝重启(无法验证旧进程已退出)"
+        return 1
+    fi
     _manage_hysteria restart 2>/dev/null
     if [ "$(_manage_hysteria status 2>/dev/null)" != "running" ]; then
         _manage_hysteria start 2>/dev/null
@@ -563,6 +628,21 @@ _hysteria_restart_verified() {
         sleep 1
         [ "$(_manage_hysteria status 2>/dev/null)" = "running" ] || return 1
     done
+    # 重启后必须有可读身份; 重试几次避免瞬时读取失败, 仍失败则 fail-closed。
+    for _ in 1 2 3; do
+        after=$(_hysteria_proc_identity 2>/dev/null) || after=""
+        [ -n "$after" ] && break
+        sleep 1
+    done
+    if [ -z "$after" ]; then
+        _error "Hysteria 重启后无法确认进程身份, 拒绝判定成功"
+        return 1
+    fi
+    # 只要重启前读到了身份, 重启后就不得是同一个进程; 不能依赖 was_running 的瞬时状态判断。
+    if [ -n "$before" ] && [ "$after" = "$before" ]; then
+        _error "Hysteria 重启后进程身份未变化($before), 旧进程仍在运行"
+        return 1
+    fi
     return 0
 }
 
@@ -1373,7 +1453,12 @@ _hysteria_prompt_tls() {
             fi
             HY_TLS_JSON=$(jq -n --arg c "$HYSTERIA_CERT_DIR/cert.pem" --arg k "$HYSTERIA_CERT_DIR/key.pem" \
                 '{tls: {cert: $c, key: $k, sniGuard: "disable"}}')
-            HY_TLS_MODE="selfsigned"; HY_TLS_SNI="$host"; HY_TLS_PIN=""
+            HY_TLS_PIN=$(openssl x509 -in "$HY_TLS_STAGE_DIR/cert.pem" -noout -fingerprint -sha256 2>/dev/null) || return 1
+            HY_TLS_PIN="${HY_TLS_PIN#*=}"
+            if ! [[ "$HY_TLS_PIN" =~ ^([[:xdigit:]]{2}:){31}[[:xdigit:]]{2}$ ]]; then
+                _error "无法读取自签证书 SHA256 pin"; return 1
+            fi
+            HY_TLS_MODE="selfsigned"; HY_TLS_SNI="$host"
             return 0
             ;;
         2)
@@ -1526,7 +1611,7 @@ _hysteria_check_hop_conflicts() {
     local tok_arr=()
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
-        ranges=$(_read_hop_ranges "$f")
+        ranges=$(_read_hop_ranges "$f") || return 1
         [ -n "$ranges" ] || continue
         read -ra tok_arr <<< "$ranges"
         for tok in "${tok_arr[@]}"; do
@@ -1684,7 +1769,7 @@ _hysteria_tls_menu() {
     fi
     _hysteria_rebuild_all_links || _warn "部分分享链接重建失败"
     _success "TLS 已切换: $(_hysteria_tls_desc)"
-    [ "$HY_TLS_MODE" = "selfsigned" ] && _tip "自签证书: 客户端使用 insecure=1, 不验证证书身份"
+    [ "$HY_TLS_MODE" = "selfsigned" ] && _tip "自签证书: 客户端通过 pinSHA256 校验证书身份"
     [ "$HY_TLS_MODE" = "acme" ] && _tip "ACME 模式: 客户端无需 insecure; 证书由官方核心自动续期"
     _press_any_key
     return 0
@@ -2059,7 +2144,17 @@ _hysteria_build_link() {
     tls_mode=$(_hysteria_meta_get tls_mode)
     sni=$(_hysteria_meta_get sni)
     if [ "$tls_mode" = "selfsigned" ]; then
-        params="insecure=1"
+        local pin
+        pin=$(_hysteria_meta_get pin)
+        if [ -z "$pin" ] && [ -f "$HYSTERIA_CERT_DIR/cert.pem" ]; then
+            # metadata 未记录 pin 时从已发布证书按需推导, 不改变 pinSHA256 语义。
+            pin=$(openssl x509 -in "$HYSTERIA_CERT_DIR/cert.pem" -noout -fingerprint -sha256 2>/dev/null) || pin=""
+            pin="${pin#*=}"
+        fi
+        if ! [[ "$pin" =~ ^([[:xdigit:]]{64}|([[:xdigit:]]{2}:){31}[[:xdigit:]]{2})$ ]]; then
+            _error "自签证书 pin 缺失或无效, 请重新签发证书或生成节点"; return 1
+        fi
+        params="insecure=1&pinSHA256=$(_url_encode "$pin")"
     fi
     [ -n "$sni" ] && params="${params}${params:+&}sni=$(_url_encode "$sni")"
     local o_type o_pw
@@ -3070,6 +3165,7 @@ _hysteria_stopped_state() {
             return 0
             ;;
         direct)
+            { [ ! -e "$HYSTERIA_PID_FILE" ] && [ ! -L "$HYSTERIA_PID_FILE" ]; } || return 1
             _proc_any_named hysteria "$HYSTERIA_BIN" && return 1
             return 0
             ;;
@@ -3078,6 +3174,10 @@ _hysteria_stopped_state() {
 
 # 强杀后再次 stop 再复验终态；Restart=on-failure 可能自动重拉。
 _hysteria_stop_and_verify() {
+    if [ "$INIT_SYSTEM" = direct ]; then
+        _manage_hysteria stop 2>/dev/null || { _hysteria_stopped_state; return $?; }
+        _hysteria_stopped_state; return $?
+    fi
     _manage_hysteria stop 2>/dev/null
     local p exe
     for _ in 1 2 3 4 5 6 7 8; do
@@ -3191,13 +3291,6 @@ _hysteria_uninstall_locked() {
     return 0
 }
 
-# 仅清理废弃的手选变体键并提示；变体已改为 CPU 自动选择。
-_hysteria_purge_legacy_variant_state() {
-    [ -f "$STATE_DIR/hysteria_variant" ] || return 0
-    rm -f "$STATE_DIR/hysteria_variant" \
-        && _warn "已移除废弃记录 state/hysteria_variant: AVX 变体现在按 CPU 能力自动选择(支持即优先使用)"
-}
-
 # 停服及 service 清理成功才允许整站卸载；避免文件删除后遗留进程。
 _hysteria_cleanup_before_uninstall() {
     _hysteria_stop_and_verify || return 1
@@ -3210,7 +3303,6 @@ _hysteria_cleanup_before_uninstall() {
 _hysteria_menu() {
     local choice
     _hysteria_ensure_dirs || { _press_any_key; return 0; }
-    declare -F _hysteria_purge_legacy_variant_state >/dev/null 2>&1 && _hysteria_purge_legacy_variant_state
     while true; do
         clear
         echo

@@ -1,27 +1,11 @@
 #!/bin/bash
 # lib/30-geo.sh — Geo 更新、路由精简与 DNS 设置。
-# Geo 自动更新默认 OFF; ≥ v26.4.25 用内置 geodata, 旧核心用系统 cron。
+# Geo 自动更新默认 OFF, 使用 Xray 内置 geodata。
 # 数据源默认 XTLS/Xray-rules-dat, 可切 Loyalsoldier 或自定义链接; 落点 $ASSET_DIR, 下载失败保留旧 dat。
 # 内置 assets.file 必须预先存在, 否则核心拒绝启动; 见 _geo_set_auto_update。
 # DNS 写入走 _mutate_config 的重启与回滚; 见 _dns_apply。
 
-GEO_CRON_MARKER="# xray-deploy-geo-update"
-GEO_TRANSITION_KEY="geo_update_transition"
-# day-of-month 的 */3 是每月 1/4/7/.../31 号, 跨月不保证每隔三天。
 GEO_CRON_EXPR="0 3 */3 * *"
-
-_geo_transition_get() {
-    _state_get "$GEO_TRANSITION_KEY" 2>/dev/null
-}
-
-_geo_transition_clear() {
-    rm -f "$STATE_DIR/$GEO_TRANSITION_KEY" 2>/dev/null
-    if [ -e "$STATE_DIR/$GEO_TRANSITION_KEY" ]; then
-        _warn "Geo 关闭待清理标记无法删除: $STATE_DIR/$GEO_TRANSITION_KEY"
-        return 1
-    fi
-    return 0
-}
 
 # 数据源只记预设名, 链接由常量给: 上游改名只改常量, 老机器不留死链。
 _geo_source_name() {
@@ -138,15 +122,14 @@ _geo_geodata_json() {
     jq -n --arg cron "$GEO_CRON_EXPR" --argjson a "$assets" '{cron: $cron, assets: $a}'
 }
 
-# 状态唯一查询点: 非空 .geodata.cron 优先, 否则读 legacy geo_cron。
-# 输出 builtin|cron|off, _geo_auto_state 映射为 on|off, 避免各菜单自行猜状态。
+# 状态只读取配置中的 geodata.cron。
+# 输出 builtin|off, _geo_auto_state 映射为 on|off。
 _geo_auto_mechanism() {
     local c=""
     if _config_present && command -v jq >/dev/null 2>&1; then
         c=$(_config_jq -r '.geodata.cron // empty' 2>/dev/null)
     fi
     [ -n "$c" ] && { echo "builtin"; return 0; }
-    [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] && { echo "cron"; return 0; }
     echo "off"
 }
 
@@ -196,7 +179,7 @@ _ensure_cron_running() {
 }
 
 # 下载与体积校验在锁外; live dat 提交与恢复由 coretxn 负责。
-# 提交和旧 cron 清理持 config → core 锁, 防止核心切换或配置写入覆盖恢复源。
+# 提交持 config → core 锁, 防止核心切换或配置写入覆盖恢复源。
 _geo_update() {
     _ensure_dirs || return 1
     # 非交互输出落日志, 避免 cron 邮件噪音; 日志不可写时保留终端诊断。
@@ -208,12 +191,6 @@ _geo_update() {
         else
             _warn "无法写入日志 $GEO_LOG, 本次输出未落盘"
         fi
-    fi
-    # off_pending 优先完成关闭, 防止残留 cron 在明确关闭意图下继续更新 dat。
-    if [ "$(_geo_transition_get)" = "off_pending" ]; then
-        _info "检测到 Geo 关闭操作待收敛, 本次跳过数据更新"
-        _auto_migrate_geo_autoupdate || return 1
-        return 0
     fi
     if ! declare -F _with_core_lock >/dev/null 2>&1; then
         _error "缺少核心互斥锁, 拒绝更新 Geo 数据"
@@ -249,21 +226,12 @@ _geo_update() {
     done
 
     local rc=0
-    _with_config_lock _with_core_lock _geo_update_commit_and_finalize_locked "$tmp" "$ts" "$ok" || rc=$?
+    _with_config_lock _with_core_lock _geo_update_commit_locked "$tmp" "$ts" "$ok" || rc=$?
     rm -rf "$tmp"
     return "$rc"
 }
 
-# 持 config → core 锁完成提交和兜底清理; 同次 runtime 收敛才证明可以移除旧 cron。
-_geo_update_commit_and_finalize_locked() {
-    local tmp="$1" ts="$2" ok="$3"
-    _geo_update_commit_locked "$tmp" "$ts" "$ok" || return $?
-    _geo_finalize_legacy_cron_locked || true
-    return 0
-}
-
-# 锁内交给 _xray_core_geo_update_locked 收敛 pending coretxn 后再快照和改写 dat。
-# 恢复未收敛不得覆盖旧恢复源; 本模块不自行重放 binary/service。
+# 持 config → core 锁提交 Geo 数据。
 _geo_update_commit_locked() {
     local tmp="$1" ts="$2" ok="$3"
     if ! declare -F _xray_core_geo_update_locked >/dev/null 2>&1; then
@@ -273,259 +241,26 @@ _geo_update_commit_locked() {
     _xray_core_geo_update_locked "$tmp" "$ts" "$ok"
 }
 
-# 启动迁移保留旧 cron, 只有 dat 提交和 runtime 收敛成功后才能清理该兜底。
-_geo_finalize_legacy_cron_locked() {
-    [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
-    [ "$(_geo_transition_get)" = "off_pending" ] && return 0
-    [ -x "$XRAY_BIN" ] && _xray_version_ge "26.4.25" || return 0
-    _config_present && command -v jq >/dev/null 2>&1 || return 0
-    [ "$(_config_jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' 2>/dev/null)" = "1" ] || return 0
-
-    if ! _geo_remove_cron_line; then
-        _warn "Geo 数据已更新, 但旧系统 cron 兜底未能移除; 下次成功更新会重试"
-        return 1
-    fi
-    if ! _state_set geo_cron "off"; then
-        _warn "旧系统 cron 已移除, 但 geo_cron 状态未能清除; 下次成功更新会重试"
-        return 1
-    fi
-    _info "Geo 更新已成功提交, 已移除旧系统 cron 兜底"
-    return 0
-}
-
-# _geo_set_auto_update on|off: ≥ v26.4.25 写内置 geodata, 旧核心走系统 cron。
-# 关闭先记 off_pending, config 修改失败由 _mutate_config 回滚并留待下次关闭恢复。
 _geo_set_auto_update() {
-    local action="$1"
+    local action="$1" gd
     case "$action" in
         on)
-            if [ -x "$XRAY_BIN" ] && _xray_version_ge "26.4.25"; then
-                # assets.file 构建会检查存在性, 启用前必须齐备; 见本模块头部。
-                if [ ! -f "$ASSET_DIR/geosite.dat" ] || [ ! -f "$ASSET_DIR/geoip.dat" ]; then
-                    _warn "assets/ 下缺少 geosite.dat 或 geoip.dat, 无法启用 Xray 内置更新"
-                    _tip "请先在上层菜单选择 [1] 立即更新一次(或安装核心时会自动放入), 再开启自动更新"
-                    return 1
-                fi
-                if [ "$(_geo_transition_get)" = "off_pending" ]; then
-                    _geo_transition_clear || { _error "Geo 关闭清理仍未完成, 暂不能重新开启"; return 1; }
-                fi
-                local gd
-                gd=$(_geo_geodata_json) || { _error "生成 geodata 配置失败"; return 1; }
-                if _mutate_config --argjson gd "$gd" '.geodata = $gd'; then
-                    # verified-restart 后可清旧 cron; 清理失败保留 on 作为兜底与重试证据。
-                    if _geo_remove_cron_line >/dev/null 2>&1; then
-                        _state_set geo_cron "off" 2>/dev/null || \
-                            _warn "旧 geo_cron 状态未能清除(内置定时已生效, 后续更新会重试)"
-                    else
-                        _state_set geo_cron "on" 2>/dev/null || \
-                            _warn "旧系统 cron 仍可能存在, 且 geo_cron 状态未能保留"
-                        _warn "旧系统 cron 行未能移除; 保留为兜底, 下次成功 geo-update 后重试"
-                    fi
-                    _success "Geo 自动更新已开启 (Xray 内置: $GEO_CRON_EXPR, 热重载)"
-                    return 0
-                fi
-                _error "写入 geodata 配置失败(配置已回滚)"
+            if [ ! -f "$ASSET_DIR/geosite.dat" ] || [ ! -f "$ASSET_DIR/geoip.dat" ]; then
+                _warn "assets/ 下缺少 geosite.dat 或 geoip.dat, 请先立即更新一次"
                 return 1
             fi
-            # 版本门控未通过只走 cron, 不能假定核心支持 geodata。
-            _geo_set_auto_update_cron on
+            gd=$(_geo_geodata_json) || return 1
+            _mutate_config --argjson gd "$gd" '.geodata = $gd' || return 1
+            _success "Geo 自动更新已开启 (Xray 内置: $GEO_CRON_EXPR, 热重载)"
             ;;
         off)
-            # 先记录 off 意图, 清理失败后启动恢复只能继续关闭, 不得重新迁移为开启。
-            if ! _state_set "$GEO_TRANSITION_KEY" "off_pending"; then
-                _error "无法记录 Geo 关闭意图, 未做任何变更"
-                return 1
-            fi
-            local has_geo=0 off_failed=0
-            if _config_present; then
-                if ! command -v jq >/dev/null 2>&1; then
-                    _warn "无法检查 config 中的 geodata, 保留关闭重试标记"
-                    off_failed=1
-                elif ! has_geo=$(_config_jq -r 'if has("geodata") then 1 else 0 end' 2>/dev/null); then
-                    _warn "无法读取 config 中的 geodata, 保留关闭重试标记"
-                    off_failed=1
-                    has_geo=unknown
-                fi
-            fi
-            if [ "$has_geo" = "1" ] && ! _mutate_config 'del(.geodata)'; then
-                _error "移除 geodata 配置失败(配置已回滚), 将在下次启动重试关闭"
-                off_failed=1
-            fi
-            if _geo_remove_cron_line >/dev/null 2>&1; then
-                _state_set geo_cron "off" 2>/dev/null || {
-                    _warn "系统 cron 已移除, 但 geo_cron 状态写入失败"
-                    off_failed=1
-                }
-            else
-                _warn "系统 cron 行未能移除, 请手动检查 crontab (${GEO_CRON_MARKER})"
-                _state_set geo_cron "on" 2>/dev/null || \
-                    _warn "cron 清理失败且 geo_cron 重试状态无法持久化"
-                off_failed=1
-            fi
-            if [ "$off_failed" -eq 0 ]; then
-                _geo_transition_clear || off_failed=1
-            fi
-            if [ "$off_failed" -eq 1 ]; then
-                _tip "关闭清理尚未完成, 后续启动会继续关闭且不会重新启用"
-                return 1
-            fi
+            _mutate_config 'del(.geodata)' || return 1
             _success "Geo 自动更新已关闭"
             ;;
-        *) _warn "未知动作: $action"; return 1 ;;
+        *) return 1 ;;
     esac
 }
 
-# _geo_set_auto_update_cron on|off: 旧核心回退路径, 先改 crontab 再记状态。
-_geo_set_auto_update_cron() {
-    local action="$1"
-    # cron PATH 受限, 用命令绝对路径兜底; 调度语义见 GEO_CRON_EXPR。
-    local cmd
-    cmd="$(command -v "$CMD_NAME" 2>/dev/null || echo "/usr/local/bin/$CMD_NAME") geo-update"
-    local cron_line="$GEO_CRON_EXPR $cmd ${GEO_CRON_MARKER}"
-
-    case "$action" in
-        on)
-            if [ "$(_geo_transition_get)" = "off_pending" ]; then
-                _geo_transition_clear || { _error "Geo 关闭清理仍未完成, 暂不能重新开启"; return 1; }
-            fi
-            # _crontab_replace 统一去重与写入; 读失败不动原表, 混装缺 helper 时拒绝写。
-            if ! declare -F _crontab_replace >/dev/null 2>&1; then
-                _error "lib 版本过旧(00-common 缺 _crontab_replace), 无法写入 crontab"
-                _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
-                return 1
-            fi
-            if ! _crontab_replace "$GEO_CRON_MARKER" "$cron_line"; then
-                _error "写入 crontab 失败"; return 1
-            fi
-            # 守护与记账失败要撤刚写的行, 避免残留任务日后无状态执行本脚本。
-            if _ensure_cron_running; then
-                if ! _state_set geo_cron "on"; then
-                    if _geo_remove_cron_line >/dev/null 2>&1; then
-                        _state_set geo_cron "off" 2>/dev/null || \
-                            _warn "cron 行已回滚, 但 geo_cron 状态无法恢复为 off"
-                    else
-                        _warn "geo_cron 状态写入失败, 且 crontab 回滚失败; 请手动检查 ${GEO_CRON_MARKER}"
-                        _state_set geo_cron "on" 2>/dev/null || \
-                            _warn "cron 行仍可能存在, 但 geo_cron 重试状态无法持久化"
-                    fi
-                    _error "Geo 自动更新已取消: geo_cron 状态持久化失败"
-                    return 1
-                fi
-                _warn "已开启 (系统 cron 方案: 当前核心 < v26.4.25, 不支持 Xray 内置 geodata)"
-                _tip "更新到 ≥ v26.4.25 后会自动切换到 Xray 内置定时, 无需系统 cron"
-                _success "Geo 自动更新已开启 (每月 1/4/7/.../31 号 03:00 执行)"
-            else
-                # 回滚失败仍须告警, 不能把残留无人值守任务隐藏为已取消。
-                # 且回滚失败时不得把 geo_cron 写成 off: 残留 cron 开机仍会执行, 写 off 会让 UI 谎报"已关闭"。
-                if _geo_remove_cron_line >/dev/null 2>&1; then
-                    _state_set geo_cron "off" 2>/dev/null || \
-                        _warn "cron 守护未启动且 cron 行已回滚, 但 geo_cron 状态写入失败"
-                    _warn "cron 守护进程未能启动, 自动更新已取消"
-                    _tip "请确保系统中有 cron 守护进程, 安装后重试"
-                else
-                    _warn "crontab 回滚失败, 请手动检查项目定时任务 (${GEO_CRON_MARKER})"
-                    _state_set geo_cron "on" 2>/dev/null || \
-                        _warn "cron 行可能仍残留, 但 geo_cron 状态无法持久化"
-                    # 回滚失败时 cron 行仍在, 不能沿用上面"已取消"的口径, 否则与保留的 geo_cron=on 矛盾。
-                    _warn "cron 守护进程未能启动; 残留 cron 行仍会执行, 自动更新未真正取消"
-                    _tip "请确保系统中有 cron 守护进程; 如需停止自动更新, 请手动移除上方标记的 cron 行"
-                fi
-                # 显式失败, 不让最后一次 state 写成功把“已取消”洗成返回 0。
-                return 1
-            fi
-            ;;
-        off)
-            # cron 行是更新机制本身: 删除失败不改 state, 不能误报已关闭。
-            # 通用关闭还处理 config 回滚与 off_pending 恢复; 见 _geo_set_auto_update。
-            if ! _geo_remove_cron_line; then
-                _error "移除 geo 定时任务失败(crontab 不可读/不可写?), 自动更新仍是开启状态"
-                _tip "请手动检查 crontab 中的 ${GEO_CRON_MARKER} 行, 或修复 crontab 权限后重试"
-                return 1
-            fi
-            _state_set geo_cron "off" || _warn "geo_cron 状态写入失败, 状态显示可能不准"
-            _success "Geo 自动更新已关闭"
-            ;;
-    esac
-}
-
-# 启动迁移仅在 ≥ v26.4.25 且 dat 齐备时写 geodata, 不重启; 旧 cron 留作运行兜底。
-# 首次成功更新后由 _geo_finalize_legacy_cron_locked 清理; off_pending 永远优先继续关闭。
-# 整份 config RMW 持 config 锁和写屏障, 避免覆盖并发节点写入或未收敛事务。
-_auto_migrate_geo_autoupdate() {
-    local transition; transition=$(_geo_transition_get)
-    if [ "$transition" != "off_pending" ] && [ "$(_state_get geo_cron 2>/dev/null)" != "on" ]; then
-        return 0
-    fi
-    _config_present || [ "$transition" = "off_pending" ] || return 0
-    _with_config_lock _with_config_write_barrier _auto_migrate_geo_autoupdate_write
-}
-
-_auto_migrate_geo_autoupdate_write() {
-    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
-       && ! _txn_allow_config_write; then
-        return 1
-    fi
-    local transition has_geo=0 content
-    transition=$(_geo_transition_get)
-    if _config_present; then
-        command -v jq >/dev/null 2>&1 || return 1
-        has_geo=$(_config_jq -r 'if has("geodata") then 1 else 0 end' 2>/dev/null) || return 1
-    fi
-
-    if [ "$transition" = "off_pending" ]; then
-        if [ "$has_geo" = "1" ] && ! _mutate_config 'del(.geodata)'; then
-            _warn "Geo 关闭恢复未能提交并验证 Xray 重启, 保留重试标记"
-            return 1
-        fi
-        if ! _geo_remove_cron_line; then
-            _warn "Geo 关闭清理仍未完成, 保留重试标记; 不会重新启用"
-            return 1
-        fi
-        if ! _state_set geo_cron "off"; then
-            _warn "旧 cron 已移除, 但 geo_cron 状态写入失败; 保留关闭重试标记"
-            return 1
-        fi
-        if _geo_transition_clear; then
-            _info "已完成 Geo 自动更新关闭清理"
-        else
-            # 标记未清会让后续每次启动重跑清理; 不能静默吞掉, 否则收敛永远不完成也无告警。
-            _warn "Geo 关闭清理最后一步失败(off_pending 标记未清除), 下次启动会重试"
-            return 1
-        fi
-        return 0
-    fi
-
-    [ "$(_state_get geo_cron 2>/dev/null)" = "on" ] || return 0
-    _config_present && command -v jq >/dev/null 2>&1 || return 0
-    local has_enabled_gd
-    has_enabled_gd=$(_config_jq -r 'if (.geodata.cron // "") != "" then 1 else 0 end' 2>/dev/null) || return 0
-    # 配置已写不等于 runtime 已加载; 不重启的迁移必须保留旧 cron, 见函数入口契约。
-    [ "$has_enabled_gd" = "1" ] && return 0
-
-    if [ -x "$XRAY_BIN" ] && _xray_version_ge "26.4.25" \
-       && [ -f "$ASSET_DIR/geosite.dat" ] && [ -f "$ASSET_DIR/geoip.dat" ]; then
-        local gd
-        gd=$(_geo_geodata_json) || return 0
-        content=$(_config_jq --argjson gd "$gd" '.geodata = $gd' 2>/dev/null) || return 0
-        [ -n "$content" ] || return 0
-        if _config_write_merged "$content" 2>/dev/null; then
-            _info "已写入 Geo 内置定时($GEO_CRON_EXPR); 暂保留旧系统 cron, 首次成功更新后切换"
-        fi
-    fi
-}
-
-_geo_remove_cron_line() {
-    # 写路径缺安全 helper 时拒绝操作, 裸管道会在读失败时清空用户 crontab。
-    if ! declare -F _crontab_replace >/dev/null 2>&1; then
-        _error "lib 版本过旧(00-common 缺 _crontab_replace), 已跳过 crontab 清理"
-        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
-        return 1
-    fi
-    # 读取失败保留原表; 安全替换契约见 _crontab_replace。
-    _crontab_replace "$GEO_CRON_MARKER"
-}
-
-# 展示调度提示: 优先原样回显 geodata.cron, 旧 cron 仅给默认调度的粗略提示。
 _geo_next_run_hint() {
     local c=""
     if _config_present && command -v jq >/dev/null 2>&1; then
@@ -535,25 +270,16 @@ _geo_next_run_hint() {
         echo "Xray 内置定时: ${c} (每月 1/4/7/.../31 号 03:00, 热重载)"
         return
     fi
-    # 走 _crontab_has_marker 的三态: 读失败(2)不能当成"未开启", 否则与 geo_cron state 分裂。
-    local hrc=2
-    if declare -F _crontab_has_marker >/dev/null 2>&1; then
-        _crontab_has_marker "$GEO_CRON_MARKER"; hrc=$?
-    fi
-    case "$hrc" in
-        0) echo "每月 1/4/7/.../31 号 03:00 (系统 cron)" ;;
-        1) echo "未开启" ;;
-        *) echo "未知(crontab 不可读, 无法确认系统 cron 任务)" ;;
-    esac
+    echo "未开启"
 }
 
 # 精简/恢复共用 _config_edit_preflight, 并检查共享常量。
-# 混装旧 lib 缺常量时明确拒绝, 避免 set -u 崩菜单或向 --argjson 传空值。
+# 缺少共享常量时明确拒绝, 避免 set -u 崩菜单或向 --argjson 传空值。
 _route_preflight() {
     _config_edit_preflight "修改路由规则" || return 1
     if [ -z "${XRAY_DEFAULT_ROUTING_RULES_JSON:-}" ] || [ -z "${XRAY_PRIVATE_BLOCK_RULE_JSON:-}" ] \
        || [ -z "${XRAY_PRIVATE_BLOCK_RULE_TAG:-}" ]; then
-        _error "缺少默认规则常量(lib/00-common.sh 可能是旧版本), 无法修改路由规则"
+        _error "缺少默认规则常量, 无法修改路由规则"
         _tip "请在主菜单执行 [检测脚本更新] 完整更新一次后重试"
         return 1
     fi
@@ -1060,7 +786,7 @@ _geo_extra_menu() {
         if [ "$mech" = "builtin" ]; then
             echo -e "  这些文件写在 .geodata.assets, 由 Xray 内置定时下载"
         else
-            echo -e "  ${YELLOW}系统 cron/手动机制下这些文件只在添加时下载一次, 不会随定时更新${NC}"
+            echo -e "  ${YELLOW}内置 Geo 自动更新关闭时, 这些文件只在添加时下载一次, 不会随定时更新${NC}"
         fi
         echo -e "  落点: $ASSET_DIR"
         echo
@@ -1079,22 +805,17 @@ _geo_extra_menu() {
     done
 }
 
-# Geo 菜单复用 _geo_auto_mechanism, 不单靠 legacy state 判断内置更新。
+# Geo 菜单复用 _geo_auto_mechanism, 按当前 geodata 配置判断内置更新。
 _geo_menu() {
     clear
     echo
     echo -e "  ${CYAN}【Geo 数据自动更新】${NC}"
     local state; state=$(_geo_auto_state)
-    local mech; mech=$(_geo_auto_mechanism)
     local choice=""
     if [ "$state" = "on" ]; then
         echo -e "  当前状态: ${GREEN}● 已开启${NC}"
         echo -e "  下次执行: $(_geo_next_run_hint)"
-        if [ "$mech" = "cron" ]; then
-            echo -e "  更新机制: ${YELLOW}系统 cron(当前核心 < v26.4.25, 不支持 Xray 内置)${NC}"
-        else
-            echo -e "  更新机制: ${GREEN}Xray 内置定时(热重载, 无需系统 cron)${NC}"
-        fi
+        echo -e "  更新机制: ${GREEN}Xray 内置定时(热重载)${NC}"
     else
         echo -e "  当前状态: ${RED}○ 已关闭${NC}"
     fi
@@ -1301,7 +1022,7 @@ _dns_set_strategy() {
 _dns_restore_default() {
     _config_edit_preflight "修改 DNS 配置" || return 1
     if [ -z "${XRAY_DEFAULT_DNS_JSON:-}" ]; then
-        _error "缺少默认 DNS 常量(lib/00-common.sh 可能是旧版本), 无法恢复默认"
+        _error "缺少默认 DNS 常量, 无法恢复默认"
         _tip "请先在主菜单执行 [检测脚本更新] 完整更新一次后重试"
         return 1
     fi
