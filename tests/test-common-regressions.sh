@@ -145,7 +145,7 @@ valid_roundtrip() (
 )
 check 'valid backup restores normal and unknown fields and removes stale files' valid_roundtrip
 
-# 新装必须一次性写出精确版本片段; 缺片段必须在写入前失败并保留现场。
+# 新装必须一次性写出精确版本片段; 已有配置没有 version 片段时仍可读写。
 config_layout_and_init() (
     setup_case layout-init
     rm -f "$CONFIG_DIR/15_version.json"
@@ -162,12 +162,14 @@ config_layout_and_init() (
     rm -f "$CONFIG_DIR"/*.json
     printf '%s' '{"log":{"loglevel":"debug"}}' > "$CONFIG_DIR/02_log.json"
     cp "$CONFIG_DIR/02_log.json" "$TMP/init-missing-version"
-    ! _config_layout_supported >/dev/null 2>&1 || return 1
-    ! _init_config_if_empty >/dev/null 2>&1 || return 1
+    _config_layout_supported >/dev/null 2>&1 || return 1
+    _init_config_if_empty >/dev/null 2>&1 || return 1
     cmp -s "$CONFIG_DIR/02_log.json" "$TMP/init-missing-version" || return 1
-    [ "$(find "$CONFIG_DIR" -maxdepth 1 -type f | wc -l)" -eq 1 ]
+    [ "$(find "$CONFIG_DIR" -maxdepth 1 -type f | wc -l)" -eq 1 ] || return 1
+    _config_write_merged '{"log":{"loglevel":"info"}}' || return 1
+    _config_jq -e '.log.loglevel == "info" and (has("version") | not)' >/dev/null 2>&1
 )
-check 'empty init writes exact version and missing version fails closed' config_layout_and_init
+check 'empty init writes exact version and existing config without version stays usable' config_layout_and_init
 
 # 走真实 _mutate_config: DNS、路由、Geo 和节点各写一次, 每次都核对精确 version 片段。
 version_preserved_by_mutations() (

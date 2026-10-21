@@ -616,15 +616,6 @@ _config_layout_supported() {
         _error "检测到未纳入管理的配置文件: $DEPLOY_DIR/config.json; 请先移走后重试"
         return 1
     fi
-    local fragment present=0
-    for fragment in "$CONFIG_DIR"/*.json "$CONFIG_DIR"/*.jsonc; do
-        if [ -e "$fragment" ] || [ -L "$fragment" ]; then present=1; break; fi
-    done
-    [ "$present" -eq 0 ] && return 0
-    if ! jq -e 'type == "object" and keys == ["version"] and (.version | type == "object" and .min == "26.4.25" and .max == "")' "$CONFIG_DIR/15_version.json" >/dev/null 2>&1; then
-        _error "配置不完整: 缺少有效的 confs/15_version.json"
-        return 1
-    fi
     return 0
 }
 
@@ -665,7 +656,7 @@ _config_write_merged() {   # <完整配置 JSON> [目标目录]
     local content="$1" dir="${2:-$CONFIG_DIR}"
     [ -n "$content" ] || return 1
     [ "$dir" != "$CONFIG_DIR" ] || _config_layout_supported || return 1
-    printf '%s' "$content" | jq -e 'type == "object" and .version == {min:"26.4.25",max:""}' >/dev/null 2>&1 || return 1
+    printf '%s' "$content" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
     _config_layout_valid "$dir" repair || return 1
     mkdir -p "$dir" || return 1
     local k v f split rc=0 written=$'\n'
