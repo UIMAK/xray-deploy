@@ -243,7 +243,7 @@ _main_menu() {
         echo
         echo -e "  ${CYAN}【配置与更新】${NC}"
         _menu_row 17 "检查配置"     18 "DNS 设置"
-        _menu_row 19 "Geo 自动更新" 20 "检测脚本更新"
+        _menu_row 19 "Geo 管理"     20 "检测脚本更新"
         echo
         echo -e "  ${CYAN}【核心管理】${NC}"
         _menu_row 21 "Xray 核心管理" 22 "卸载"
