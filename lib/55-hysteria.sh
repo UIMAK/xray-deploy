@@ -585,10 +585,40 @@ _hysteria_kill_stale_supervisor() {
 }
 
 # 重启后验证核心存活；官方无 check/validate 子命令。
+# 重启验证用: 当前后端主进程身份(PID:starttime)。未运行/无法确认时输出空。
+_hysteria_proc_identity() {
+    local pid="" st=""
+    case "$INIT_SYSTEM" in
+        systemd)
+            pid=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null) || return 1
+            [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "0" ] || return 1
+            ;;
+        openrc)
+            pid=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE" 2>/dev/null) || return 1
+            [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 1
+            ;;
+        direct)
+            _xd_pidfile_identity_ok "$HYSTERIA_PID_FILE" || return 1
+            pid=$(_xd_pidfile_pid "$HYSTERIA_PID_FILE") || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    st=$(_proc_starttime "$pid") || return 1
+    printf '%s:%s' "$pid" "$st"
+}
+
 _hysteria_restart_verified() {
+    # 记录重启前身份: restart 失败但旧进程仍 running 时, 仅凭 status 会误判成功。
+    local before="" after=""
+    before=$(_hysteria_proc_identity 2>/dev/null) || before=""
     _manage_hysteria restart 2>/dev/null
     if [ "$(_manage_hysteria status 2>/dev/null)" != "running" ]; then
         _manage_hysteria start 2>/dev/null
+    fi
+    after=$(_hysteria_proc_identity 2>/dev/null) || after=""
+    if [ -n "$before" ] && [ "$before" = "$after" ]; then
+        _error "Hysteria 重启后进程身份未变化($before), 旧进程仍在运行"
+        return 1
     fi
     for _ in 1 2 3 4 5 6 7 8; do
         sleep 1

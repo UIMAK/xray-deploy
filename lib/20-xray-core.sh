@@ -2354,11 +2354,34 @@ _manage_xray() {
 # ---------------------------------------------------------------------------
 # 重启 xray 并确认稳定运行(取代 _mutate_config 的预跑 xray -test)。
 # 低内存 VPS 上 xray -test 会与运行中的实例同时加载两份二进制+geo, 触发 OOM;
-# 改为重启后做存活确认: 先 sleep 1s 再查, 之后完整观察 8s, 期间任何一次
-# 不为 running 都立即判失败。8s > openrc respawn_delay=5, 至少覆盖一个崩溃-重生周期,
-# 避免坏配置在启动后短暂 running、随后崩溃却被误判成功。
+# 改为重启后做存活确认: 启动前记录主进程身份, restart 后身份必须变化(证明旧进程已退出),
+# 再完整观察 8s, 期间任何一次不为 running 都立即判失败。8s > openrc respawn_delay=5,
+# 至少覆盖一个崩溃-重生周期, 避免坏配置在启动后短暂 running、随后崩溃却被误判成功。
 # 坏配置/被 OOM 进不了持续 running 态 → 返回 1 触发上层回滚。
 # ---------------------------------------------------------------------------
+# 重启验证用: 当前后端主进程身份(PID:starttime)。未运行/无法确认时输出空。
+# restart 失败但旧进程仍在时, 仅看 status 会把旧进程当成新进程; 身份变化是"确实换过进程"的正向证据。
+_xray_proc_identity() {
+    local pid="" st=""
+    case "$INIT_SYSTEM" in
+        systemd)
+            pid=$(systemctl show -p MainPID --value xray 2>/dev/null) || return 1
+            [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "0" ] || return 1
+            ;;
+        openrc)
+            pid=$(_xd_pidfile_pid /run/xray.pid 2>/dev/null) || return 1
+            [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 1
+            ;;
+        direct)
+            _xd_pidfile_identity_ok /run/xray.pid || return 1
+            pid=$(_xd_pidfile_pid /run/xray.pid) || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    st=$(_proc_starttime "$pid") || return 1
+    printf '%s:%s' "$pid" "$st"
+}
+
 _restart_xray_verified() {
     # restart + 8 秒健康观察作为一个不可穿插的 runtime mutation 临界区。
     # shellcheck disable=SC2031
@@ -2370,13 +2393,19 @@ _restart_xray_verified() {
         _with_core_lock _restart_xray_verified
         return $?
     fi
-    # 必须先真正重启, 8s 采样只验证"新进程是否稳定", 不能把旧进程仍在运行当成成功。
+    # 记录重启前身份: restart 失败但旧进程仍 running 时, 仅凭 status 会误判成功。
+    local before="" after="" i
+    before=$(_xray_proc_identity 2>/dev/null) || before=""
     # restart 的返回码不作为判据(OpenRC 在过渡态可能非 0): 随后统一用 status 决定是否补 start。
     _manage_xray restart 2>/dev/null || :
     if [ "$(_manage_xray status 2>/dev/null)" != "running" ]; then
         _manage_xray start 2>/dev/null
     fi
-    local i
+    after=$(_xray_proc_identity 2>/dev/null) || after=""
+    if [ -n "$before" ] && [ "$before" = "$after" ]; then
+        _error "Xray 重启后进程身份未变化($before), 旧进程仍在运行, 新配置未生效"
+        return 1
+    fi
     for i in 1 2 3 4 5 6 7 8; do
         sleep 1
         [ "$(_manage_xray status 2>/dev/null)" = "running" ] || return 1

@@ -246,5 +246,15 @@ hysteria_direct_stale_pidfile_stop() (
 )
 check 'dead-PID hysteria record is cleared, live mismatch is refused' hysteria_direct_stale_pidfile_stop
 
+# restart 失败但旧进程仍在: 身份未变化必须判失败, 不能只凭 running 状态。
+hysteria_restart_rejects_unchanged_identity() (
+    INIT_SYSTEM=direct
+    sleep() { :; }
+    _hysteria_proc_identity() { printf '123:456'; }
+    _manage_hysteria() { [ "$1" = status ] && printf 'running'; return 0; }
+    ! _hysteria_restart_verified
+)
+check 'hysteria restart rejects unchanged old process identity' hysteria_restart_rejects_unchanged_identity
+
 printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

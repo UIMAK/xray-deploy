@@ -572,6 +572,16 @@ trap cleanup EXIT
         [ "$(command head -n 1 "$actions")" = restart ]
     )
 
+    # restart 失败但旧进程仍在: 身份未变化必须判失败, 不能只凭 running 状态。
+    restart_verified_rejects_unchanged_identity() (
+        XRAY_DEPLOY_CORE_LOCK_HELD=1
+        eval "$verified_restart_definition"
+        sleep() { :; }
+        _xray_proc_identity() { printf '123:456'; }
+        _manage_xray() { [ "$1" = status ] && printf 'running'; return 0; }
+        ! _restart_xray_verified
+    )
+
     # logrotate helper 检查必须早于任何入口删除。
     uninstall_cleanup_contract() {
         local def check_line rm_line
@@ -610,6 +620,7 @@ trap cleanup EXIT
     check 'invalid direct pidfile is rejected without takeover' invalid_pidfile_rejected
     check 'dead-PID direct pidfile is cleared instead of blocking recovery' direct_stale_pidfile_cleaned
     check 'verified restart actually restarts before sampling' restart_verified_restarts_first
+    check 'verified restart rejects unchanged old process identity' restart_verified_rejects_unchanged_identity
     check 'uninstall checks logrotate helper before deleting entrypoints' uninstall_cleanup_contract
     check '26.6.1 and 26.9.8 gates and masquerade key set' version_gate_matrix
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
