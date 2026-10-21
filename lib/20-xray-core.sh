@@ -2367,7 +2367,9 @@ _xray_proc_identity() {
         systemd)
             pid=$(systemctl show -p MainPID --value xray 2>/dev/null) || pid=""
             # systemd < 230 不支持 --value: 退回解析非 value 输出。
-            [ -n "$pid" ] || pid=$(systemctl show -p MainPID xray 2>/dev/null | sed -n 's/^MainPID=//p')
+            if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+                pid=$(systemctl show -p MainPID xray 2>/dev/null | sed -n 's/^MainPID=//p')
+            fi
             [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "0" ] || return 1
             ;;
         openrc)
@@ -2422,7 +2424,8 @@ _restart_xray_verified() {
         _error "Xray 重启后无法确认进程身份, 拒绝判定成功"
         return 1
     fi
-    if [ "$was_running" -eq 1 ] && [ "$after" = "$before" ]; then
+    # 只要重启前读到了身份, 重启后就不得是同一个进程; 不能依赖 was_running 的瞬时状态判断。
+    if [ -n "$before" ] && [ "$after" = "$before" ]; then
         _error "Xray 重启后进程身份未变化($before), 旧进程仍在运行, 新配置未生效"
         return 1
     fi
