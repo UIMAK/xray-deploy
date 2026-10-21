@@ -160,7 +160,7 @@ _install_backup() {
     fi
     mkdir -p "$ROLLBACK_DIR" 2>/dev/null || return 1
     keep_tmp="$ROLLBACK_DIR/.KEEP.tmp.$$"
-    # 版本号 v2 不变：尾行兼容旧 'complete <count> <crc> <bytes>' 与现 'complete' 两种。
+    # 清单尾行只接受准确的 complete。
     printf '%s\n' 'xray-install-backup-v2' > "$keep_tmp" 2>/dev/null || return 1
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
@@ -235,11 +235,11 @@ _install_snapshot_read_entries() {
     IFS= read -r line <&3 || { exec 3<&-; return 1; }
     if [ "$line" != xray-install-backup-v2 ]; then
         exec 3<&-
-        echo "[错误] 旧版或未校验的恢复清单不能自动恢复, 保留现场供人工处理: $keep" >&2
+        echo "[错误] 恢复清单格式无法识别, 不能自动恢复, 保留现场供人工处理: $keep" >&2
         return 1
     fi
     while IFS= read -r line <&3 || [ -n "$line" ]; do
-        case "$line" in complete|complete\ *) trailer=1; break ;; esac
+        case "$line" in complete) trailer=1; break ;; esac
         [[ "$line" =~ ^(present|absent)[[:space:]]([^[:space:]]+)$ ]] || { exec 3<&-; return 1; }
         state="${BASH_REMATCH[1]}"; rel="${BASH_REMATCH[2]}"
         _install_snapshot_rel_ok "$rel" || { exec 3<&-; return 1; }
@@ -743,10 +743,10 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     if [ -n "$tpl_missing" ]; then
         echo "[错误] 本地源 templates/ 缺少:${tpl_missing}"; exit 1
     fi
-    # VERSION 必须非空，且在备份前拒绝缺失，避免旧版本号残留。
+    # VERSION 必须非空，且在备份前拒绝缺失，避免版本号残留。
     if [ ! -s "${LOCAL_DIR}/VERSION" ]; then
         echo "[错误] 本地源缺少 VERSION(或为空), 安装中止"
-        echo "       更新检查以它为本地真相源, 缺失会让部署目录保留旧版本号"
+        echo "       更新检查以它为本地真相源, 缺失会导致更新检查使用错误的版本号"
         exit 1
     fi
 

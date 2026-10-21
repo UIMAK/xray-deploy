@@ -12,7 +12,6 @@ export DEPLOY_DIR="/opt/xray-deploy"
 export BIN_DIR="$DEPLOY_DIR/bin"
 export ASSET_DIR="$DEPLOY_DIR/assets"          # 资源目录(geoip.dat/geosite.dat)
 export CONFIG_DIR="$DEPLOY_DIR/confs"          # 多文件配置目录: 一个顶层字段一个文件
-export LEGACY_CONFIG_FILE="$DEPLOY_DIR/config.json"   # 旧版单文件配置; 仅迁移时读一次
 export NODES_DIR="$DEPLOY_DIR/nodes"           # 每节点元数据
 export CERT_DIR="$DEPLOY_DIR/certs"
 export LOG_DIR="$DEPLOY_DIR/logs"
@@ -417,7 +416,7 @@ _validate_json_text() {
 
 # ---------------------------------------------------------------------------
 # Reality tunnel tag: Tunnel-<sni>-<tunnel_port>-<reality_port>; 截断 SNI 使总长 ≤200。
-# 关联按 realitySettings.target 端口与 legacy 后缀推导, 不依赖完整显示域名。
+# 关联由 metadata.tunnel_tag 与配置中的回环 target 核验。
 # 用法: tag=$(_gen_tunnel_tag <sni> <tunnel_port> <reality_port>)
 # ---------------------------------------------------------------------------
 _gen_tunnel_tag() {
@@ -612,7 +611,25 @@ _config_layout_valid() {
 }
 
 # 合并管理器的一字段一文件布局(输出到 stdout)。
+_config_layout_supported() {
+    if [ -e "$DEPLOY_DIR/config.json" ] || [ -L "$DEPLOY_DIR/config.json" ]; then
+        _error "检测到未纳入管理的配置文件: $DEPLOY_DIR/config.json; 请先移走后重试"
+        return 1
+    fi
+    local fragment present=0
+    for fragment in "$CONFIG_DIR"/*.json "$CONFIG_DIR"/*.jsonc; do
+        if [ -e "$fragment" ] || [ -L "$fragment" ]; then present=1; break; fi
+    done
+    [ "$present" -eq 0 ] && return 0
+    if ! jq -e 'type == "object" and keys == ["version"] and (.version | type == "object" and .min == "26.4.25" and .max == "")' "$CONFIG_DIR/15_version.json" >/dev/null 2>&1; then
+        _error "配置不完整: 缺少有效的 confs/15_version.json"
+        return 1
+    fi
+    return 0
+}
+
 _config_merged() {
+    _config_layout_supported || return 1
     _config_layout_valid || return 1
     local files=()
     local f
@@ -647,7 +664,8 @@ _config_jq() {
 _config_write_merged() {   # <完整配置 JSON> [目标目录]
     local content="$1" dir="${2:-$CONFIG_DIR}"
     [ -n "$content" ] || return 1
-    printf '%s' "$content" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
+    [ "$dir" != "$CONFIG_DIR" ] || _config_layout_supported || return 1
+    printf '%s' "$content" | jq -e 'type == "object" and .version == {min:"26.4.25",max:""}' >/dev/null 2>&1 || return 1
     _config_layout_valid "$dir" repair || return 1
     mkdir -p "$dir" || return 1
     local k v f split rc=0 written=$'\n'
@@ -671,114 +689,6 @@ _config_write_merged() {   # <完整配置 JSON> [目标目录]
             rm -f "$old" || return 1
         fi
     done
-    return 0
-}
-
-# 旧配置作为本次迁移恢复源; service/启动失败恢复原路径、service 和运行态。
-_config_migrate_legacy() {
-    [ -f "${LEGACY_CONFIG_FILE}.bak" ] && return 0
-    _config_present && return 0
-    [ -f "$LEGACY_CONFIG_FILE" ] && [ -s "$LEGACY_CONFIG_FILE" ] || return 0
-    local content snapshot="" snapshot_dir="" unit="" running=0 failed=0 mask_taken=0 unit_masked=0
-    content=$(jq . "$LEGACY_CONFIG_FILE" 2>/dev/null) || {
-        _error "旧配置文件解析失败, 未迁移(保持原样): $LEGACY_CONFIG_FILE"
-        return 1
-    }
-    [ -n "$content" ] || return 1
-    if [ -x "$XRAY_BIN" ]; then
-        snapshot=$(mktemp -d) || return 1
-        unit=$(_xray_service_unit_path) || unit=""
-        if [ -n "$unit" ]; then
-            # 只判定一次并缓存: 两次判定之间若 unit 被外部改回普通文件, 会导致既无 mask 快照也无 service 快照,
-            # 回滚时把 unit 直接删掉。缓存消除该 TOCTOU 窗口。
-            if [ "${INIT_SYSTEM:-}" = systemd ] && _xray_service_is_masked "$unit"; then
-                unit_masked=1
-                snapshot_dir=$(mktemp -d "$(dirname "$unit")/.xray-migrate.XXXXXX") || { rm -rf "$snapshot"; return 1; }
-                rm -rf "$snapshot"
-                snapshot=$snapshot_dir
-            fi
-            if [ "$unit_masked" -eq 1 ]; then
-                _xray_service_take_mask_snapshot "$unit" "$snapshot/masked" || {
-                    rm -rf "$snapshot"
-                    _error "无法安全快照 stale systemd mask, 取消配置迁移"
-                    return 1
-                }
-                mask_taken=1
-                systemctl daemon-reload || {
-                    _xray_service_restore_mask "$unit" "$snapshot/masked" >/dev/null 2>&1 || :
-                    systemctl daemon-reload >/dev/null 2>&1 || :
-                    rm -rf "$snapshot"
-                    _error "移除 stale systemd mask 后 daemon-reload 失败"
-                    return 1
-                }
-            elif [ -f "$unit" ]; then
-                cp -p "$unit" "$snapshot/service" || { rm -rf "$snapshot"; return 1; }
-            fi
-            _xray_service_snapshot_enable "$snapshot/enabled" || {
-                if [ -f "$snapshot/masked" ]; then
-                    _xray_service_restore_mask "$unit" "$snapshot/masked" >/dev/null 2>&1 || :
-                    systemctl daemon-reload >/dev/null 2>&1 || :
-                fi
-                rm -rf "$snapshot"
-                return 1
-            }
-        fi
-        [ "$(_manage_xray status 2>/dev/null)" = running ] && running=1
-    fi
-    if ! _config_write_merged "$content"; then
-        rm -f "$CONFIG_DIR"/*.json
-        if [ "$mask_taken" -eq 1 ] && [ -f "$snapshot/masked" ]; then
-            _xray_service_restore_mask "$unit" "$snapshot/masked" >/dev/null 2>&1 || :
-            systemctl daemon-reload >/dev/null 2>&1 || :
-        fi
-        [ -z "$snapshot" ] || rm -rf "$snapshot"
-        _error "配置迁移写入失败, 旧配置保持原样"
-        return 1
-    fi
-    if ! mv -f "$LEGACY_CONFIG_FILE" "${LEGACY_CONFIG_FILE}.bak"; then
-        rm -f "$CONFIG_DIR"/*.json
-        if [ "$mask_taken" -eq 1 ] && [ -f "$snapshot/masked" ]; then
-            _xray_service_restore_mask "$unit" "$snapshot/masked" >/dev/null 2>&1 || :
-            systemctl daemon-reload >/dev/null 2>&1 || :
-        fi
-        [ -z "$snapshot" ] || rm -rf "$snapshot"
-        return 1
-    fi
-    if [ -n "$snapshot" ]; then
-        _create_xray_service || failed=1
-        if [ "$failed" -eq 0 ] && [ "$running" -eq 1 ]; then
-            _restart_xray_verified || failed=1
-        fi
-        if [ "$failed" -eq 1 ]; then
-            _manage_xray stop
-            mv -f "${LEGACY_CONFIG_FILE}.bak" "$LEGACY_CONFIG_FILE" || return 1
-            if [ -n "$unit" ]; then
-                if [ -f "$snapshot/masked" ]; then
-                    _xray_service_restore_mask "$unit" "$snapshot/masked" || return 1
-                    if [ "${INIT_SYSTEM:-}" = systemd ]; then
-                        systemctl daemon-reload || return 1
-                    fi
-                elif [ -f "$snapshot/service" ]; then
-                    _xray_service_restore_file "$snapshot/service" "$unit" || return 1
-                else
-                    rm -f "$unit" || return 1
-                    if [ "${INIT_SYSTEM:-}" = systemd ]; then
-                        systemctl daemon-reload || return 1
-                    fi
-                fi
-                _xray_service_restore_enable "$snapshot/enabled" || _warn "旧 service 开机状态恢复失败, 继续恢复运行状态"
-            fi
-            rm -f "$CONFIG_DIR"/*.json || return 1
-            if [ "$running" -eq 1 ]; then
-                _restart_xray_verified || _error "旧配置已恢复, 但 Xray 启动仍失败"
-            fi
-            rm -rf "$snapshot"
-            _error "配置迁移失败, 已恢复旧配置与 service"
-            return 1
-        fi
-        rm -rf "$snapshot"
-    fi
-    _info "配置已迁移到 $CONFIG_DIR(旧文件保留为 ${LEGACY_CONFIG_FILE}.bak)"
     return 0
 }
 
@@ -1071,8 +981,7 @@ _xd_kill_pid_graceful() {
 }
 
 # ---------------------------------------------------------------------------
-# direct pidfile 记录 PID starttime; 同名同路径也须区分进程化身。
-# 兼容旧纯 PID / OpenRC pidfile: 无 starttime 时仅检查存活, 属已声明的 best-effort。
+# direct pidfile 严格记录 PID starttime comm; OpenRC 的 PID 仅作进程树锚点。
 # ---------------------------------------------------------------------------
 _xd_pidfile_pid() {   # <file> -> stdout: 规范 PID, 否则空
     local f="${1:-}" pid=""
@@ -1083,40 +992,37 @@ _xd_pidfile_pid() {   # <file> -> stdout: 规范 PID, 否则空
     printf '%s' "$pid"
 }
 
-_xd_pidfile_starttime() {   # <file> -> stdout: 记录的 starttime, 无则空
-    local f="${1:-}" pid="" st=""
-    [ -f "$f" ] || return 0
-    read -r pid st < "$f" 2>/dev/null || true
-    [ -n "$st" ] || return 0
-    [[ "$st" =~ ^[0-9]+$ ]] || return 0
-    printf '%s' "$st"
+_xd_pidfile_record() {
+    local record
+    record=$(cat "$1" 2>/dev/null) || return 1
+    [[ "$record" =~ ^([1-9][0-9]{0,6})[[:blank:]]+([0-9]+)[[:blank:]]+([^[:space:]]+)$ ]] || return 1
+    printf '%s' "$record"
 }
 
-# 写入 "PID starttime"; starttime 读不到时只写 PID(调用方语义退化为旧行为)。
-_xd_pidfile_write() {   # <file> <pid>
-    local f="${1:-}" pid="${2:-}" st
-    [ -n "$f" ] || return 1
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    st=$(_proc_starttime "$pid") || st=""
-    if [ -n "$st" ]; then
-        printf '%s %s\n' "$pid" "$st" > "$f"
-    else
-        printf '%s\n' "$pid" > "$f"
-    fi
+_xd_pidfile_starttime() {
+    local record pid starttime comm
+    record=$(_xd_pidfile_record "$1") || return 1
+    read -r pid starttime comm <<< "$record"
+    printf '%s' "$starttime"
 }
 
-# 记录的身份是否仍指向同一进程: 有 starttime 时必须相符; 无 starttime 时只要求 PID 仍存在。
-_xd_pidfile_identity_ok() {   # <file>
-    local f="${1:-}" pid st
-    [ -f "$f" ] || return 1
-    pid=$(_xd_pidfile_pid "$f")
-    [ -n "$pid" ] || return 1
-    [ -d "/proc/$pid" ] || return 1
-    st=$(_xd_pidfile_starttime "$f")
-    if [ -n "$st" ]; then
-        _xd_pid_unchanged "$pid" "$st" || return 1
-    fi
-    return 0
+_xd_pidfile_write() {
+    local file="$1" pid="$2" starttime comm
+    [[ "$pid" =~ ^[1-9][0-9]{0,6}$ ]] || return 1
+    starttime=$(_proc_starttime "$pid") || return 1
+    [[ "$starttime" =~ ^[0-9]+$ ]] || return 1
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
+    [[ "$comm" =~ ^[^[:space:]]+$ ]] || return 1
+    _xd_pid_unchanged "$pid" "$starttime" || return 1
+    printf '%s %s %s\n' "$pid" "$starttime" "$comm" > "$file"
+}
+
+_xd_pidfile_identity_ok() {
+    local record pid starttime comm
+    record=$(_xd_pidfile_record "$1") || return 1
+    read -r pid starttime comm <<< "$record"
+    _xd_pid_unchanged "$pid" "$starttime" || return 1
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "$comm" ]
 }
 
 # kill 专用 exe 判定: 身份读不到即拒绝; 判活 _proc_exe_is 为防重复启动而 fail-open。
@@ -1338,14 +1244,14 @@ _with_config_lock() {
 # ---------------------------------------------------------------------------
 # 普通 config/metadata 核心屏障: 已持 config lock 后再取 core lock。
 # 检查 + 写入 + verified restart 必须同一临界区, 防止 TOCTOU。
-# 锁序 config → core, 核心事务不反向取锁; HELD 标记支持嵌套, 混装缺 helper 时直接执行。
+# 锁序 config → core, 核心事务不反向取锁; HELD 标记支持嵌套, 缺少锁助手时拒绝写入。
 # ---------------------------------------------------------------------------
 _with_config_write_barrier() {
-    if declare -F _with_core_lock >/dev/null 2>&1; then
-        _with_core_lock "$@"
-        return $?
+    if ! declare -F _with_core_lock >/dev/null 2>&1; then
+        _error "缺少核心锁助手 _with_core_lock; 已拒绝配置写入(fail-closed)"
+        return 1
     fi
-    "$@"
+    _with_core_lock "$@"
 }
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ trap cleanup EXIT
 (
     . "$ROOT/lib/00-common.sh"
     . "${CORE_REGRESSIONS_MODULE:-$ROOT/lib/20-xray-core.sh}"
+    . "$ROOT/lib/50-nodes.sh"
     # Map the allowlisted unit path to scratch while keeping real schema checks.
     # 必须确认替换真的发生: 否则 eval 的是未修改函数, 会以真实系统路径运行却仍报 PASS。
     journal_ok_definition=$(declare -f _xray_core_journal_ok)
@@ -52,6 +53,7 @@ trap cleanup EXIT
         case "$1" in daemon-reload) return 0 ;; is-enabled) printf 'disabled\n'; return 1 ;; esac
         return 99
     }
+    _ensure_dirs() { return 0; }
     fixture() {
         DEPLOY_DIR="$TMP/$1" BIN_DIR="$TMP/$1/bin" ASSET_DIR="$TMP/$1/assets"
         STATE_DIR="$TMP/$1/state" BACKUP_DIR="$TMP/$1/backups"
@@ -73,7 +75,7 @@ trap cleanup EXIT
         : > "$TMP/service-actions"
     }
     service_templates() {
-        local systemd_unit="$TMP/systemd-service" openrc_unit="$TMP/openrc-service"
+        local version systemd_unit openrc_unit
         local systemd_definition openrc_definition
         DEPLOY_DIR="$TMP/service-templates"
         BIN_DIR="$DEPLOY_DIR/bin" ASSET_DIR="$DEPLOY_DIR/assets" CONFIG_DIR="$DEPLOY_DIR/confs"
@@ -90,26 +92,40 @@ trap cleanup EXIT
             *'/etc/init.d/xray'*) ;;
             *) return 1 ;;
         esac
-        eval "${systemd_definition//\/etc\/systemd\/system\/xray.service/\$systemd_unit}"
-        eval "${openrc_definition//\/etc\/init.d\/xray/\$openrc_unit}"
         INIT_SYSTEM=systemd
         chmod() { return 0; }
         systemctl() { return 0; }
-        _create_xray_systemd_service || return 1
-        INIT_SYSTEM=openrc
         rc-update() { return 0; }
-        _create_xray_openrc_service || return 1
-        grep -Fq 'NoNewPrivileges=true' "$systemd_unit" &&
-            grep -Fq 'RestartPreventExitStatus=23' "$systemd_unit" &&
-            grep -Fq "ExecStart=$XRAY_BIN run -confdir $CONFIG_DIR" "$systemd_unit" &&
-            ! grep -Eq '^(User|Group|CapabilityBoundingSet|AmbientCapabilities)=' "$systemd_unit" &&
-            grep -Fq 'respawn_max=20' "$openrc_unit" &&
-            grep -Fq 'respawn_period=600' "$openrc_unit" &&
-            grep -Fq 'no_new_privs=yes' "$openrc_unit" &&
-            ! grep -Eq '^(capabilities|command_user|extra_commands)=' "$openrc_unit" &&
-            ! grep -Eq '^(checkconfig|start_pre)\(\)' "$openrc_unit" &&
-            grep -Fq "command=\"$XRAY_BIN\"" "$openrc_unit" &&
-            grep -Fq "command_args=\"run -confdir $CONFIG_DIR\"" "$openrc_unit"
+        for version in 26.7.10 26.7.11; do
+            systemd_unit="$TMP/systemd-service-$version"
+            openrc_unit="$TMP/openrc-service-$version"
+            eval "${systemd_definition//\/etc\/systemd\/system\/xray.service/\$systemd_unit}"
+            eval "${openrc_definition//\/etc\/init.d\/xray/\$openrc_unit}"
+            _xray_current_version() { printf '%s' "$version"; }
+            INIT_SYSTEM=systemd
+            _create_xray_systemd_service || return 1
+            INIT_SYSTEM=openrc
+            _create_xray_openrc_service || return 1
+            grep -Fq 'NoNewPrivileges=true' "$systemd_unit" || return 1
+            grep -Fq 'RestartPreventExitStatus=23' "$systemd_unit" || return 1
+            grep -Fq "ExecStart=$XRAY_BIN run -confdir $CONFIG_DIR" "$systemd_unit" || return 1
+            ! grep -Eq '^(User|Group|CapabilityBoundingSet|AmbientCapabilities)=' "$systemd_unit" || return 1
+            grep -Fq 'respawn_max=20' "$openrc_unit" || return 1
+            grep -Fq 'respawn_period=600' "$openrc_unit" || return 1
+            grep -Fq 'no_new_privs=yes' "$openrc_unit" || return 1
+            ! grep -Eq '^(capabilities|command_user|extra_commands)=' "$openrc_unit" || return 1
+            ! grep -Eq '^(checkconfig|start_pre)\(\)' "$openrc_unit" || return 1
+            grep -Fq "command=\"$XRAY_BIN\"" "$openrc_unit" || return 1
+            grep -Fq "command_args=\"run -confdir $CONFIG_DIR\"" "$openrc_unit" || return 1
+            if [ "$version" = 26.7.10 ]; then
+                grep -Fq "Environment=XRAY_LOCATION_ASSET=$ASSET_DIR" "$systemd_unit" || return 1
+                grep -Fq "supervise_daemon_args=\"--env XRAY_LOCATION_ASSET=$ASSET_DIR\"" "$openrc_unit" || return 1
+            else
+                ! grep -Fq 'XRAY_LOCATION_ASSET=' "$systemd_unit" || return 1
+                ! grep -Fq 'XRAY_LOCATION_ASSET=' "$openrc_unit" || return 1
+            fi
+        done
+        _xray_current_version() { printf '26.9.8'; }
     }
     check() {
         local label="$1"; shift
@@ -188,33 +204,20 @@ trap cleanup EXIT
         unset -f mv
         _xray_core_txn_recover_locked && old_dat && [ "$RUNNING" = true ] && settled
     }
-    legacy_geo() {
+    unknown_geo_schema_rejected() {
         local phase="$1" masked="$2"
-        fixture "legacy-$phase-$masked"
-        [ "$masked" = true ] || { command rm "$UNIT"; printf 'old-service' > "$UNIT"; }
+        fixture "old-$phase-$masked"
         _xray_core_journal_write 26.9.8 stable geo-update stable '' geo || return 1
-        local j="$STATE_DIR/coretxn.json" stage
-        # Stable old-schema fixture; no snapshot_scope existed in old Geo journals.
-        _meta_update "$j" 'del(.snapshot_scope)' || return 1
-        stage=$(jq -r .staging_dir "$j")
-        mkdir "$stage" && cp "$DEPLOY_DIR/download/"*.dat "$stage/" || return 1
-        _xray_service_snapshot && _xray_core_snapshot_binary "$j" && _xref_snapshot_geo_dats "$j" || return 1
-        _xray_core_journal_phase snapshotted || return 1
-        if [ "$phase" = replacing ]; then
-            _xray_core_journal_phase replacing || return 1
-            command mv -f "$stage/geoip.dat" "$ASSET_DIR/geoip.dat"
-        elif [ "$phase" = committed ]; then
-            _xray_core_journal_phase replacing || return 1
-            command mv -f "$stage/geoip.dat" "$ASSET_DIR/geoip.dat"
-            command mv -f "$stage/geosite.dat" "$ASSET_DIR/geosite.dat"
-            _xray_core_journal_phase geo_replaced && _xray_core_journal_phase restart_verified &&
-                _xray_core_journal_phase committed || return 1
-        fi
-        _xray_core_txn_recover_locked || return 1
-        if [ "$masked" = true ]; then [ -L "$UNIT" ] && [ "$(readlink "$UNIT")" = /dev/null ] || return 1
-        else [ "$(cat "$UNIT")" = old-service ] || return 1; fi
-        [ "$phase" != replacing ] || old_dat || return 1
-        settled && [ "$(cat "$XRAY_BIN")" = binary-original ]
+        local journal="$STATE_DIR/coretxn.json" stage
+        stage=$(jq -r .staging_dir "$journal")
+        mkdir "$stage" || return 1
+        printf preserved > "$stage/evidence"
+        _meta_update "$journal" '.phase = $phase | del(.snapshot_scope)' --arg phase "$phase" || return 1
+        cp "$journal" "$DEPLOY_DIR/journal-before"
+        _xray_core_txn_recover_locked && return 1
+        cmp -s "${journal}.corrupt" "$DEPLOY_DIR/journal-before" && [ -e "$STATE_DIR/coretxn.blocked" ] &&
+            [ "$(cat "$stage/evidence")" = preserved ] && old_dat &&
+            [ "$(cat "$XRAY_BIN")" = binary-original ] && [ "$RESTARTS" -eq 0 ]
     }
     # 旧 binary 快照与 live binary 同时消失 = 当前无核心, 事务必须继续回滚而不是永久阻塞。
     core_binary_lost() {
@@ -245,23 +248,6 @@ trap cleanup EXIT
         [ "$(jq -r .phase "$j")" = replacing ] &&
             [ "$(cat "$XRAY_BIN")" = binary-original ] &&
             [ "$RUNNING" = false ] && [ "$RESTARTS" -eq 0 ] && [ ! -e "$XRAY_BIN.bak" ]
-    }
-    # Geo full 账本同一规则: 两个 binary 都不存在时不阻塞 dat 回滚。
-    legacy_geo_binary_lost() {
-        fixture legacy-geo-binary-lost
-        command rm "$UNIT"; printf 'old-service' > "$UNIT"
-        _xray_core_journal_write 26.9.8 stable geo-update stable '' geo || return 1
-        local j="$STATE_DIR/coretxn.json" stage
-        _meta_update "$j" 'del(.snapshot_scope)' || return 1
-        stage=$(jq -r .staging_dir "$j")
-        mkdir "$stage" && cp "$DEPLOY_DIR/download/"*.dat "$stage/" || return 1
-        _xray_service_snapshot && _xray_core_snapshot_binary "$j" && _xref_snapshot_geo_dats "$j" || return 1
-        _xray_core_journal_phase snapshotted && _xray_core_journal_phase replacing || return 1
-        command mv -f "$stage/geoip.dat" "$ASSET_DIR/geoip.dat"
-        command rm -f "$XRAY_BIN" "$XRAY_BIN.bak"
-        _xray_core_txn_recover_locked || return 1
-        old_dat && settled && [ ! -e "$XRAY_BIN" ] &&
-            [ "$RUNNING" = false ] && [ "$RESTARTS" -eq 0 ]
     }
     core_snapshot_guard() {
         fixture core-snapshot
@@ -437,11 +423,11 @@ trap cleanup EXIT
     check 'Geo restart failure restores both dat files and running runtime' restart_failure
     check 'Geo rollback removes dat absent before the transaction' absent_dat_rollback
     check 'failed dat recovery retains journal/source for a successful retry' recovery_retry
-    check 'legacy snapshotted Geo journal restores moved mask' legacy_geo snapshotted true
-    check 'legacy committed Geo journal restores moved mask' legacy_geo committed true
-    check 'legacy replacing Geo journal restores dat without rewriting binary/service' legacy_geo replacing false
+    check 'unknown snapshotted Geo schema rejected with evidence' unknown_geo_schema_rejected snapshotted true
+    check 'unknown committed Geo schema rejected with evidence' unknown_geo_schema_rejected committed true
+    check 'unknown replacing Geo schema rejected with evidence' unknown_geo_schema_rejected replacing false
     check 'core snapshot barrier still requires binary backup' core_snapshot_guard
-    check 'legacy Geo regular service snapshot remains compatible' legacy_geo snapshotted false
+    check 'unknown regular-service Geo schema rejected with evidence' unknown_geo_schema_rejected snapshotted false
     check 'core journal cannot weaken recovery to dat-only snapshots' corrupt_scope
     check 'direct stop kill failure preserves pidfile' direct_failure stop 1 yes
     check 'direct restart kill failure never starts' direct_failure restart 1 yes
@@ -480,7 +466,7 @@ trap cleanup EXIT
         mapfile -t out <<< "$fields"
         [ "${#out[@]}" -eq 7 ] || return 1
         [ "${out[0]}" = /b ] && [ "${out[1]}" = /s ] && [ "${out[2]}" = /sp ] && [ "${out[3]}" = /gip ] && [ "${out[4]}" = /gsp ] && [ "${out[5]}" = geo ] && [ "${out[6]}" = geo ] || return 1
-        printf '%s\n' '{"binary_backup":"","staging_dir":"","service_prev":"","geoip_backup":"","geosite_backup":""}' > "$j"
+        printf '%s\n' '{"binary_backup":"","staging_dir":"","service_prev":"","geoip_backup":"","geosite_backup":"","operation":"core"}' > "$j"
         fields=$(_xray_core_journal_fields "$j") || return 1
         mapfile -t out <<< "$fields"
         [ "${#out[@]}" -eq 7 ] || return 1
@@ -489,8 +475,171 @@ trap cleanup EXIT
     check 'journal fields keep order and defaults' journal_fields_probe
     check 'core rollback settles as no-core when snapshot and live binary are both gone' core_binary_lost
     check 'core rollback still blocks when only the binary snapshot is gone' core_binary_backup_lost
-    check 'legacy Geo rollback settles as no-core when both binaries are gone' legacy_geo_binary_lost
 
+    min_version_rejection() (
+        local channel="$1" tag="$2" dir="$TMP/min-version-$1"
+        rm -rf "$dir"; mkdir -p "$dir"
+        eval "_xray_fetch_tag() { printf '%s' \"$tag\" > \"$dir/fetch\"; printf '%s\\n' \"$tag\"; }"
+        eval "$(declare -f _xray_version_at_least)"
+        _config_layout_supported() { : > "$dir/layout"; return 0; }
+        _xray_stage_release() { : > "$dir/stage"; return 0; }
+        _with_core_lock() { : > "$dir/lock"; "$@"; }
+        _install_or_switch_xray_locked() { : > "$dir/commit"; return 0; }
+        _manage_xray() { : > "$dir/service"; return 0; }
+        _error() { printf '%s\n' "$*" >&2; }
+        local fetch_called=0
+        [ -e "$dir/fetch" ] && fetch_called=1
+        local out rc=0
+        [ "$fetch_called" -eq 0 ] || return 1
+        if [ "$channel" = custom ]; then
+            out=$(_install_or_switch_xray custom "$tag" 2>&1) || rc=$?
+            [ ! -e "$dir/fetch" ] || return 1
+        else
+            out=$(_install_or_switch_xray "$channel" 2>&1) || rc=$?
+            [ "$(cat "$dir/fetch" 2>/dev/null)" = "$tag" ] || { printf 'fetch=%s expected=%s\n' "$(cat "$dir/fetch" 2>/dev/null)" "$tag" >&2; return 1; }
+        fi
+        [ "$rc" -eq 1 ] || { printf 'rc=%s out=%s\n' "$rc" "$out" >&2; return 1; }
+        case "$out" in
+            *"仅支持 Xray-core v26.4.25 及以上, 已拒绝: $tag"*) ;;
+            *) printf 'unexpected=%s\n' "$out" >&2; return 1 ;;
+        esac
+        if [ -e "$dir/layout" ] || [ -e "$dir/stage" ] || [ -e "$dir/lock" ] || [ -e "$dir/commit" ] || [ -e "$dir/service" ]; then
+            printf 'unexpected side effect in %s\n' "$dir" >&2
+            return 1
+        fi
+    )
+
+    invalid_pidfile_rejected() {
+        local dir="$TMP/direct-old-pidfile" pidfile="$TMP/direct-old.pid"
+        local definition start_rc=0 stop_rc=0 status
+        rm -rf "$dir"; mkdir -p "$dir/confs"
+        printf '{"version":{"min":"26.4.25","max":""}}' > "$dir/confs/15_version.json"
+        DEPLOY_DIR="$dir" CONFIG_DIR="$dir/confs" STATE_DIR="$dir/state" INIT_SYSTEM=direct
+        XRAY_DEPLOY_CORE_LOCK_HELD=1
+        # 用存活 PID 模拟"两列记录 + 进程仍在": 必须拒绝接管, 不能清记录后重启。
+        printf '%s 123' "$$" > "$pidfile"
+        cp "$pidfile" "$TMP/direct-old.pid.before"
+        definition=$(declare -f _manage_xray)
+        case "$definition" in
+            *'/run/xray.pid'*) ;;
+            *) return 1 ;;
+        esac
+        eval "${definition//\/run\/xray.pid/\$pidfile}"
+        _proc_any_named() { : > "$TMP/direct-old.scan"; return 1; }
+        _proc_exe_is_strict() { : > "$TMP/direct-old.exe"; return 1; }
+        _xd_pidfile_write() { : > "$TMP/direct-old.write"; return 0; }
+        _manage_xray start >/dev/null 2>&1 || start_rc=$?
+        _manage_xray stop >/dev/null 2>&1 || stop_rc=$?
+        status=$(_manage_xray status 2>/dev/null) || :
+        [ "$start_rc" -ne 0 ] && [ "$stop_rc" -ne 0 ] && [ "$status" = unknown ] &&
+            cmp -s "$pidfile" "$TMP/direct-old.pid.before" &&
+            [ ! -e "$TMP/direct-old.scan" ] && [ ! -e "$TMP/direct-old.exe" ] &&
+            [ ! -e "$TMP/direct-old.write" ]
+    }
+
+    # 死 PID 的陈旧记录必须可清除; 否则崩溃后 direct 启动/停止/卸载都会被卡住。
+    direct_stale_pidfile_cleaned() (
+        local dir="$TMP/direct-stale-pidfile" pidfile="$TMP/direct-stale.pid"
+        local definition rc=0
+        rm -rf "$dir"; mkdir -p "$dir/confs"
+        printf '{"version":{"min":"26.4.25","max":""}}' > "$dir/confs/15_version.json"
+        DEPLOY_DIR="$dir" CONFIG_DIR="$dir/confs" STATE_DIR="$dir/state" INIT_SYSTEM=direct
+        XRAY_DEPLOY_CORE_LOCK_HELD=1 XRAY_BIN="$dir/xray"
+        printf '999999 123 xray\n' > "$pidfile"
+        definition=$(declare -f _manage_xray)
+        case "$definition" in *'/run/xray.pid'*) ;; *) return 1 ;; esac
+        eval "${definition//\/run\/xray.pid/\$pidfile}"
+        _proc_any_named() { return 1; }
+        _xd_pidfile_write() { return 1; }
+        nohup() { return 1; }
+        sleep() { :; }
+        _manage_xray stop >/dev/null 2>&1 || rc=$?
+        [ "$rc" -eq 0 ] && [ ! -e "$pidfile" ] || return 1
+        printf '999999 123 xray\n' > "$pidfile"
+        _manage_xray start >/dev/null 2>&1 || :
+        [ ! -e "$pidfile" ]
+    )
+
+    # P0: 8s 采样必须建立在真实 restart 之后; 只采样会把"旧进程仍 running"误判为成功。
+    restart_verified_restarts_first() (
+        local actions="$TMP/restart-actions"
+        : > "$actions"
+        XRAY_DEPLOY_CORE_LOCK_HELD=1
+        eval "$verified_restart_definition"
+        _manage_xray() {
+            printf '%s\n' "$1" >> "$actions"
+            [ "$1" = status ] && printf 'running'
+            return 0
+        }
+        sleep() { :; }
+        _restart_xray_verified || return 1
+        [ "$(command head -n 1 "$actions")" = restart ]
+    )
+
+    # 无 pidfile 不是停止失败: 没有自有进程时按已停止返回, 有进程时拒绝接管。
+    direct_missing_pidfile_stop() (
+        local dir="$TMP/direct-missing-pidfile" pidfile="$TMP/direct-missing.pid"
+        local definition rc=0
+        rm -rf "$dir"; mkdir -p "$dir/confs"
+        printf '{"version":{"min":"26.4.25","max":""}}' > "$dir/confs/15_version.json"
+        DEPLOY_DIR="$dir" CONFIG_DIR="$dir/confs" STATE_DIR="$dir/state" INIT_SYSTEM=direct
+        XRAY_DEPLOY_CORE_LOCK_HELD=1
+        rm -f "$pidfile"
+        definition=$(declare -f _manage_xray)
+        case "$definition" in *'/run/xray.pid'*) ;; *) return 1 ;; esac
+        eval "${definition//\/run\/xray.pid/\$pidfile}"
+        _proc_any_named() { return 1; }
+        _manage_xray stop >/dev/null 2>&1 || rc=$?
+        [ "$rc" -eq 0 ] || return 1
+        _proc_any_named() { return 0; }
+        rc=0
+        _manage_xray stop >/dev/null 2>&1 || rc=$?
+        [ "$rc" -eq 1 ]
+    )
+
+    # logrotate helper 检查必须早于任何入口删除。
+    uninstall_cleanup_contract() {
+        local def check_line rm_line
+        def=$(declare -f _uninstall_xray_locked)
+        check_line=$(printf '%s\n' "$def" | grep -n '_logrotate_cleanup' | head -n 1 | cut -d: -f1)
+        rm_line=$(printf '%s\n' "$def" | grep -n 'rm -f /usr/local/bin' | head -n 1 | cut -d: -f1)
+        [ -n "$check_line" ] && [ -n "$rm_line" ] && [ "$check_line" -lt "$rm_line" ]
+    }
+
+    version_gate_matrix() {
+        eval "$(declare -f _xray_version_ge)"
+        local dir="$TMP/version-gates" version gecko unix expected_gecko expected_unix
+        mkdir -p "$dir"; printf '#!/bin/sh\nexit 0\n' > "$dir/xray"; chmod +x "$dir/xray"
+        XRAY_BIN="$dir/xray"
+        for version in 26.6.0 26.6.1 26.9.7 26.9.8; do
+            _xray_current_version() { printf '%s' "$version"; }
+            gecko=0; unix=0
+            _hy2_gecko_supported || gecko=$?
+            _hy2_masq_unix_supported || unix=$?
+            case "$version" in
+                26.6.0) expected_gecko=1; expected_unix=1 ;;
+                26.6.1) expected_gecko=0; expected_unix=1 ;;
+                26.9.7) expected_gecko=0; expected_unix=1 ;;
+                26.9.8) expected_gecko=0; expected_unix=0 ;;
+            esac
+            [ "$gecko" -eq "$expected_gecko" ] && [ "$unix" -eq "$expected_unix" ] || return 1
+        done
+        _xray_current_version() { printf '26.9.7'; }
+        _hy2_masq_known_keys_json | jq -e 'index("xForwarded") | not' >/dev/null || return 1
+        _xray_current_version() { printf '26.9.8'; }
+        _hy2_masq_known_keys_json | jq -e 'index("xForwarded")' >/dev/null || return 1
+        _xray_current_version() { printf '26.9.8'; }
+    }
+
+    check 'minimum Xray version rejects stable before staging' min_version_rejection stable v26.4.24
+    check 'minimum Xray version rejects preview before staging' min_version_rejection preview v26.4.24
+    check 'minimum Xray version rejects custom before staging' min_version_rejection custom v26.4.24
+    check 'invalid direct pidfile is rejected without takeover' invalid_pidfile_rejected
+    check 'dead-PID direct pidfile is cleared instead of blocking recovery' direct_stale_pidfile_cleaned
+    check 'verified restart actually restarts before sampling' restart_verified_restarts_first
+    check 'direct stop handles missing pidfile by ownership scan' direct_missing_pidfile_stop
+    check 'uninstall checks logrotate helper before deleting entrypoints' uninstall_cleanup_contract
+    check '26.6.1 and 26.9.8 gates and masquerade key set' version_gate_matrix
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
 )

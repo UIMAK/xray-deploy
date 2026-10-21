@@ -75,9 +75,13 @@ _xray_current_version() {
 # 未安装/版本读不到/畸形版本 → 返回 1(fail-closed), 调用方走旧核心路径。
 # ---------------------------------------------------------------------------
 _xray_version_ge() {
-    local min="$1" cur i x y
-    cur=$(_xray_current_version 2>/dev/null)
-    [ -n "$cur" ] || return 1
+    local current
+    current=$(_xray_current_version 2>/dev/null) || return 1
+    _xray_version_at_least "$current" "$1"
+}
+
+_xray_version_at_least() {
+    local cur="$1" min="$2" i x y
     # 两侧都可能带 "v" 前缀, 先剥掉。
     # 版本门控绝不猜畸形输入: 畸形版本 = 未知能力, 调用方必须走旧核心路径。
     cur="${cur#v}"; cur="${cur#V}"
@@ -577,7 +581,7 @@ _xray_core_fsync_file_dir() {  # best-effort durability for an artifact and its 
 # 任一字段读不出来都必须让调用方看见: 账本不可用不能当成空值。
 _xray_core_journal_fields() {  # <journal>; 7 行: binbak stage sprev gip gsp operation scope
     jq -r '.binary_backup, .staging_dir, .service_prev, .geoip_backup, .geosite_backup,
-           (.operation // "core"), (.snapshot_scope // "full")' "$1" 2>/dev/null
+           (.operation), (.snapshot_scope // "full")' "$1" 2>/dev/null
 }
 
 _xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
@@ -608,7 +612,7 @@ _xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
 
 _xray_core_production_fsync() {  # <journal>; best effort before terminal phase/cleanup
     local j="$1" operation bin unit
-    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || return 1
+    operation=$(jq -r '.operation' "$j" 2>/dev/null) || return 1
     case "$operation" in
         core)
             bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
@@ -652,7 +656,7 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
         stage="$ASSET_DIR/.xray-geo-txn.${txn_id}"
         ! _xray_core_path_present "$stage" || { _error "Geo 事务暂存目录已存在, 拒绝覆盖: $stage"; return 1; }
     fi
-    sprev=$(_xray_service_prev_path)
+    sprev=$(_xray_service_prev_path) || return 1
     unit=$(_xray_service_unit_path 2>/dev/null || printf '')
     if [ -n "$unit" ] && _xray_core_path_present "$unit"; then
         # A masked unit is not a valid service snapshot source. The installer
@@ -738,7 +742,7 @@ _xray_core_journal_phase() {
             (if ((.snapshot_scope // "full") == "full") and ((.unit // "") != "") then
                 (.service_prev + ".enabled"),
                 (if (.service_preexisted // false) then .service_prev else .service_prev + ".absent" end),
-                (if (.service_masked // false) then .service_prev + ".masked" else empty end)
+                (if (.service_masked) then .service_prev + ".masked" else empty end)
              else empty end),
             .staging_dir
         ' "$j" 2>/dev/null) || {
@@ -793,7 +797,7 @@ _xray_core_txn_pending() {
 # 调用者持 config lock, 且检查 + 实际写入须在同一 core lock 屏障内(锁序 config → core)。
 # reset/port journal 在 config lock 内判; core 判据见 _xray_core_txn_pending。
 # XD_PORT_TXN_ACTIVE=1 仅豁免当前端口事务自身 journal, 标记限定在事务锁子 shell。
-# 返回 0=放行, 1=拒绝且已报原因; 混装缺 helper 按段跳过, 不引入粘滞状态。
+# 返回 0=放行, 1=拒绝且已报原因; 缺少任一锁/账本 helper 时 fail-closed。
 # ---------------------------------------------------------------------------
 _core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无阻塞; 3=未收敛
     _xray_core_txn_pending && return 3
@@ -801,9 +805,12 @@ _core_txn_pending_probe() {   # 仅由 _with_core_lock 在锁内调用: 0=无阻
 }
 
 _txn_allow_config_write() {
-    # 1) reset 账本(90-menu 定义; 缺 helper 的混装版本跳过)
-    if declare -F _reset_journal_path >/dev/null 2>&1 \
-       && [ -e "$(_reset_journal_path 2>/dev/null)" ]; then
+    # 1) reset 账本(90-menu 定义); 缺 helper 的混装版本不得继续写配置。
+    if ! declare -F _reset_journal_path >/dev/null 2>&1; then
+        _error "缺少 reset 账本助手 _reset_journal_path; 已拒绝本次配置写入(fail-closed)"
+        return 1
+    fi
+    if [ -e "$(_reset_journal_path 2>/dev/null)" ]; then
         _error "存在未收敛的 reset 事务日志, 已拒绝本次配置写入"
         _tip "请重启脚本让 reset 事务先收敛(账本/快照已保留)"
         return 1
@@ -818,8 +825,12 @@ _txn_allow_config_write() {
             return 1
         done
     fi
-    # 3) core 账本: 在 core lock 内判定
-    declare -F _core_txn_pending_probe >/dev/null 2>&1 || return 0
+    # 3) core 账本: 在 core lock 内判定; helper 缺失时不得放行。
+    if ! declare -F _core_txn_pending_probe >/dev/null 2>&1 \
+       || ! declare -F _with_core_lock >/dev/null 2>&1; then
+        _error "缺少核心事务探测/锁助手; 已拒绝本次配置写入(fail-closed)"
+        return 1
+    fi
     local rc=0
     _with_core_lock _core_txn_pending_probe || rc=$?
     case "$rc" in
@@ -839,9 +850,8 @@ _xray_core_journal_ok() {
     local service_pre service_masked gip gsp
     jq -e '
       (.phase | type == "string" and test("^(prepared|snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)$")) and
-      ((.operation // "core") | (type == "string" and test("^(core|geo)$"))) and
-      ((has("snapshot_scope") | not) or .snapshot_scope == "full" or
-        (.operation == "geo" and .snapshot_scope == "dat")) and
+      ((.operation == "core" and (has("snapshot_scope") | not)) or
+       (.operation == "geo" and .snapshot_scope == "dat")) and
       (.txn_id | type == "string" and length > 0 and test("^[A-Za-z0-9._-]+$")) and
       (.old_version | type == "string") and (.old_state_version | type == "string") and
       (.old_channel | type == "string") and (.channel | type == "string") and
@@ -854,7 +864,7 @@ _xray_core_journal_ok() {
       (.staging_dir | type == "string" and length > 0) and
       (.geoip_preexisted | type == "boolean") and (.geoip_backup | type == "string" and length > 0) and
       (.geosite_preexisted | type == "boolean") and (.geosite_backup | type == "string" and length > 0) and
-      (.service_preexisted | type == "boolean") and ((.service_masked // false) | type == "boolean")
+      (.service_preexisted | type == "boolean") and ((.service_masked) | type == "boolean")
     ' "$j" >/dev/null 2>&1 || return 1
     phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
     id=$(jq -r '.txn_id' "$j" 2>/dev/null) || return 1
@@ -865,11 +875,11 @@ _xray_core_journal_ok() {
     unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
-    operation=$(jq -r '.operation // "core"' "$j" 2>/dev/null) || operation=core
+    operation=$(jq -r '.operation' "$j" 2>/dev/null) || return 1
     gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
     gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-    service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
+    service_masked=$(jq -r '.service_masked' "$j" 2>/dev/null) || return 1
 
     [ "$service_masked" = false ] || [ "$service_pre" = false ] || return 1
     [ "$bin" = "$XRAY_BIN" ] && [ "$binbak" = "$XRAY_BIN.bak" ] || return 1
@@ -954,7 +964,7 @@ _xray_core_cleanup_sources() {  # <journal>
     local j="$1" binbak stage sprev gip gsp phase service_masked scope left=0 f
     local -a sources jf fields
     phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
-    service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
+    service_masked=$(jq -r '.service_masked' "$j" 2>/dev/null) || return 1
     fields=$(_xray_core_journal_fields "$j") || return 1
     mapfile -t jf <<< "$fields"
     [ "${#jf[@]}" -eq 7 ] || return 1
@@ -1020,20 +1030,9 @@ _xray_core_txn_recover_locked() {
     if ! _xray_core_journal_ok "$j"; then _xray_core_journal_quarantine "$j" "schema 不合法"; return 1; fi
     phase=$(jq -r '.phase' "$j" 2>/dev/null)
 
-    # committed / rolled_back 都是终态: Geo 旧账本仍需先恢复曾被移动的 mask，再清理。
+    # committed / rolled_back 终态只重试清理。
     case "$phase" in
         committed|rolled_back)
-            if [ "$phase" = committed ] && [ "$(jq -r '.operation // "core"' "$j" 2>/dev/null)" = geo ] &&
-               [ "$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null)" = full ] &&
-               [ "$(jq -r '.service_masked // false' "$j" 2>/dev/null)" = true ]; then
-                local legacy_unit legacy_prev
-                legacy_unit=$(jq -r '.unit // empty' "$j" 2>/dev/null) || return 1
-                legacy_prev=$(jq -r '.service_prev // empty' "$j" 2>/dev/null) || return 1
-                if [ -n "$legacy_unit" ] && [ -L "${legacy_prev}.masked" ]; then
-                    _xray_service_restore_mask "$legacy_unit" "${legacy_prev}.masked" || return 1
-                    systemctl daemon-reload >/dev/null 2>&1 || return 1
-                fi
-            fi
             _xray_core_cleanup_after_commit "$j" || return 1
             return 0
             ;;
@@ -1064,17 +1063,17 @@ _xray_core_recover_rollback_locked() {
     unit=$(jq -r '.unit' "$j" 2>/dev/null) || unit=""
     sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
     service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-    service_masked=$(jq -r '.service_masked // false' "$j" 2>/dev/null) || return 1
+    service_masked=$(jq -r '.service_masked' "$j" 2>/dev/null) || return 1
     phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
 
     _warn "检测到未完成的核心切换事务(阶段: $(jq -r '.phase' "$j" 2>/dev/null)), 正在回滚..."
 
-    # 新 Geo 只拥有 dat; 旧 Geo 的 full 快照仍核对恢复源, 不重放 binary。
+    # Geo 事务只拥有 dat, 不重放 binary/service。
     # core 跨 replacing 后重放 binary/service; 缺失/损坏恢复源仍失败并保留 journal。
-    local txn_touched_binary=1 txn_touched_service=1
+    local txn_touched_binary=1
     scope=$(jq -r '.snapshot_scope // "full"' "$j" 2>/dev/null) || return 1
-    if [ "$(jq -r '.operation // "core"' "$j" 2>/dev/null)" = geo ]; then
-        txn_touched_binary=0; txn_touched_service=0
+    if [ "$(jq -r '.operation' "$j" 2>/dev/null)" = geo ]; then
+        txn_touched_binary=0
         case "$phase" in
             geo_replaced|restart_verified|committed) ;;
             *) runtime_touched=0 ;;
@@ -1092,22 +1091,8 @@ _xray_core_recover_rollback_locked() {
     # 1. binary pre-state 由**显式布尔值**描述, 绝不从 old_version 是否为空推断。
     # 快照与 live binary 同时不存在 = 当前无核心: 不重放, 也不阻塞 geo/service/state 回滚。
     # live binary 仍在而快照丢失则来源不明, 仍按 disk_ok=0 保留 journal。
-    if [ "$txn_touched_binary" -eq 0 ]; then
-        # 旧 Geo full 账本仍检查恢复源; 新 dat 账本不拥有 binary 快照。
-        if [ "$scope" = full ] && [ "$pre" = true ]; then
-            if [ ! -f "$bak" ] || [ -L "$bak" ]; then
-                if _xray_core_path_present "$bin"; then
-                    disk_ok=0
-                    _error "事务旧 binary 恢复源丢失或不是普通文件: $bak"
-                else
-                    binary_lost=1
-                    _warn "旧 binary 快照与 live binary 均不存在, 按无核心继续回滚: $bak"
-                fi
-            fi
-            [ "$binary_lost" -eq 1 ] || \
-                _warn "本次为 Geo 事务且未跨过替换点, binary 按未变更处理(不重放旧快照)"
-        fi
-    elif [ "$pre" = true ]; then
+    if [ "$txn_touched_binary" -eq 1 ]; then
+    if [ "$pre" = true ]; then
         if [ ! -f "$bak" ] || [ -L "$bak" ]; then
             if _xray_core_path_present "$bin"; then
                 disk_ok=0
@@ -1132,33 +1117,14 @@ _xray_core_recover_rollback_locked() {
         fi
     fi
 
+    fi
+
     # 2. geo sources 是 transaction-unique 路径, 且 restore 保留 source 以支持 crash replay。
     _xref_restore_geo_dats "$j" || disk_ok=0
 
     # 3. service: 显式 pre-existence 由 journal 绑定。快照损坏或两种状态标记
     # 同时存在时拒绝写回/删除, 保留 journal 和恢复源等待人工处理。
-    #    **Geo 事务未跨过替换点时只校验、不写回**(见上方 Geo mutation 范围): 该事务从未创建/改写 unit,
-    #    用快照覆盖 live unit 只会把"绕过 core lock 的外部改动"静默回退。
-    if [ "$scope" = full ] && [ -n "$unit" ] && [ "$txn_touched_service" -eq 0 ]; then
-        if [ "$service_masked" = true ]; then
-            if ! _xray_service_restore_mask "$unit" "${sprev}.masked"; then
-                disk_ok=0
-                _error "原有 systemd mask 无法恢复: $unit"
-            else
-                systemctl daemon-reload >/dev/null 2>&1 || {
-                    disk_ok=0
-                    _error "恢复 systemd mask 后 daemon-reload 失败"
-                }
-            fi
-        elif [ "$service_pre" = true ]; then
-            if [ -f "$sprev" ] && [ ! -L "$sprev" ] && ! _xray_core_path_present "${sprev}.absent"; then
-                _warn "本次为 Geo 事务且未跨过替换点, service 按未变更处理(不重放旧快照)"
-            else
-                disk_ok=0
-                _error "service pre-existing 快照缺失/含糊, 保留 journal: $sprev"
-            fi
-        fi
-    elif [ "$scope" = full ] && [ -n "$unit" ]; then
+    if [ "$scope" = full ] && [ -n "$unit" ]; then
         if [ "$service_pre" = true ]; then
             if [ -f "$sprev" ] && [ ! -L "$sprev" ] && ! _xray_core_path_present "${sprev}.absent"; then
                 if ! _xray_service_restore_file "$sprev" "$unit"; then
@@ -1222,24 +1188,6 @@ _xray_core_recover_rollback_locked() {
         fi
         _tip "账本: $j"
         return 1
-    fi
-
-    # Legacy Geo journals may have moved the mask before the dat-only scope marker existed.
-    if [ "$scope" = full ] && [ "$(jq -r '.operation // "core"' "$j" 2>/dev/null)" = geo ] &&
-       [ "$phase" = committed ] && [ "$service_masked" = true ] && [ -n "$unit" ]; then
-        if [ -L "${sprev}.masked" ]; then
-            if ! _xray_service_restore_mask "$unit" "${sprev}.masked"; then
-                _error "旧 Geo 事务的 systemd mask 无法恢复: $unit"
-                return 1
-            fi
-        elif ! _xray_service_is_masked "$unit"; then
-            _error "旧 Geo 事务的 systemd mask 恢复源缺失且 live unit 未 mask: $unit"
-            return 1
-        fi
-        systemctl daemon-reload >/dev/null 2>&1 || {
-            _error "旧 Geo 事务的 systemd daemon-reload 失败, journal 保留待重试"
-            return 1
-        }
     fi
 
     # 4. Runtime 必须回到事务前的运行态, 不把用户主动停止的核心意外启动。
@@ -1490,6 +1438,11 @@ _install_or_switch_xray() {
         }
         _info "${channel} 通道最新版本: ${tag}"
     fi
+    if ! _xray_version_at_least "$tag" "26.4.25"; then
+        _error "仅支持 Xray-core v26.4.25 及以上, 已拒绝: $tag"
+        return 1
+    fi
+    _config_layout_supported || return 1
     # ---- 阶段一(锁外): 下载/校验/解压到自有 staging ----
     staged=$(_xray_stage_release "$tag")
     if [ -z "$staged" ] || [ ! -f "${staged}/xray" ]; then
@@ -1524,8 +1477,7 @@ _install_or_switch_xray_locked() {
         _tip "请先按提示处理: $(_xray_core_journal_path) / $(_xray_core_blocked_path)"
         return 1
     fi
-    # 在旧 service 快照前完成布局迁移, 回滚快照始终引用存在的配置路径。
-    _config_migrate_legacy || return 1
+    _config_layout_supported || return 1
     cur=$(_xray_current_version 2>/dev/null) || cur=""
     prev_channel=$(_state_get channel 2>/dev/null) || prev_channel=""
 
@@ -1636,6 +1588,7 @@ _init_config_if_empty() {
 }
 
 _init_config_if_empty_locked() {
+    _config_layout_supported || return 1
     if _config_present; then
         return 0
     fi
@@ -1648,6 +1601,7 @@ _init_config_if_empty_locked() {
     # XRAY_DEFAULT_ROUTING_RULES_JSON 注入 —— 两个默认常量是唯一真相(00-common),
     # DNS 菜单的"恢复默认"与路由规则的"恢复默认"复用同一份, 不允许两处硬编码。
     local base='{
+  "version": {"min": "26.4.25", "max": ""},
   "env": {
     "XRAY_LOCATION_ASSET": "'"$ASSET_DIR"'"
   },
@@ -1702,8 +1656,11 @@ _auto_ensure_config_env_locked() {
 }
 
 _auto_ensure_config_env_write() {
-    if declare -F _txn_allow_config_write >/dev/null 2>&1 \
-       && ! _txn_allow_config_write; then
+    if ! declare -F _txn_allow_config_write >/dev/null 2>&1; then
+        _error "缺少配置事务闸门助手; 已拒绝写入(fail-closed)"
+        return 1
+    fi
+    if ! _txn_allow_config_write; then
         return 1
     fi
     local need
@@ -1870,8 +1827,8 @@ _xray_service_restore_mask() {  # <unit> <snapshot symlink>
 }
 
 _xray_service_prev_path() {
-    # 每笔事务唯一快照路径, journal 写入 txn_id 后才调用。没有 txn_id 的旧/测试调用保留 legacy 名。
-    printf '%s' "$BACKUP_DIR/xray-service.${XRAY_CORE_TXN_ID:-legacy}.prev"
+    [[ "${XRAY_CORE_TXN_ID:-}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    printf '%s' "$BACKUP_DIR/xray-service.${XRAY_CORE_TXN_ID}.prev"
 }
 
 # 查询当前 service 的持久化 enable state。将读取逻辑集中, 使快照与恢复后的
@@ -2041,7 +1998,7 @@ _xray_service_snapshot() {
     unit=$(_xray_service_unit_path) || return 0    # direct 后端: 无 unit 可写, 无需快照
     j=$(_xray_core_journal_path)
     pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-    prev=$(_xray_service_prev_path)
+    prev=$(_xray_service_prev_path) || return 1
     mkdir -p "$BACKUP_DIR" || return 1
     if _xray_core_path_present "$prev" || _xray_core_path_present "${prev}.absent" || \
        _xray_core_path_present "${prev}.enabled" || _xray_core_path_present "${prev}.masked"; then
@@ -2246,15 +2203,11 @@ _xray_is_running() {
             fi
             ;;
         direct)
-            # direct 有 starttime 时身份为权威; 化身不符直接 stopped, 不得被全机扫描兜底绕过。
-            if [ -n "$(_xd_pidfile_starttime /run/xray.pid)" ]; then
-                _xd_pidfile_identity_ok /run/xray.pid || return 1
-            fi
-            anchor=$(_xd_pidfile_pid /run/xray.pid 2>/dev/null)
-            if [ -n "$anchor" ] && [ -d "/proc/$anchor" ]; then
-                _proc_named_under "$anchor" xray && return 0
-            fi
-            # 无身份记录(旧版纯 PID pidfile / 文件缺失)时保留既有兜底
+            _xd_pidfile_identity_ok /run/xray.pid || return 1
+            anchor=$(_xd_pidfile_pid /run/xray.pid) || return 1
+            _proc_exe_is_strict "$anchor" "$XRAY_BIN" || return 1
+            _proc_named_under "$anchor" xray
+            return $?
             ;;
     esac
     # 兜底: 全机扫描 comm==xray, 但只承认 exe 指向本脚本自己的二进制的进程,
@@ -2273,8 +2226,11 @@ _manage_xray() {
     case "$action" in
         start|stop|restart)
             # shellcheck disable=SC2031
-            if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
-               declare -F _with_core_lock >/dev/null 2>&1; then
+            if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ]; then
+                if ! declare -F _with_core_lock >/dev/null 2>&1; then
+                    _error "缺少核心锁助手, 已拒绝 xray ${action}(fail-closed)"
+                    return 1
+                fi
                 _with_core_lock _manage_xray "$@"
                 return $?
             fi
@@ -2318,54 +2274,77 @@ _manage_xray() {
         direct)
             case "$action" in
                 start)
+                    _config_layout_supported || return 1
                     local dpid0="" dpid1=""
                     dpid0=$(_xd_pidfile_pid /run/xray.pid)
-                    # PID reuse 防护: pidfile 记录的**身份**(PID + 启动时 starttime)必须仍然成立,
-                    # 且 comm 仍是 xray, 才算已在运行; 旧 xray 退出后 PID 若被复用(即使复用者也是
-                    # xray), 记录的身份对不上, 陈旧 pidfile 应清掉再正常启动。
-                    if [ -n "$dpid0" ] && _xd_pidfile_identity_ok /run/xray.pid \
-                       && [ "$(cat "/proc/$dpid0/comm" 2>/dev/null)" = "xray" ]; then
-                        echo "running"
-                    else
-                        rm -f /run/xray.pid
-                        local -a config_args=(-confdir "$CONFIG_DIR")
-                        if ! _config_present && [ -s "$LEGACY_CONFIG_FILE" ]; then
-                            config_args=(-config "$LEGACY_CONFIG_FILE")
+                    if [ -e /run/xray.pid ] || [ -L /run/xray.pid ]; then
+                        if _xd_pidfile_identity_ok /run/xray.pid && _proc_exe_is_strict "$dpid0" "$XRAY_BIN"; then
+                            echo "running"; return 0
                         fi
-                        XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true nohup "$XRAY_BIN" run "${config_args[@]}" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- &
-                        _xd_pidfile_write /run/xray.pid "$!"
-                        sleep 1
-                        dpid1=$(_xd_pidfile_pid /run/xray.pid)
-                        if [ -z "$dpid1" ] || [ "$(cat "/proc/$dpid1/comm" 2>/dev/null)" != "xray" ]; then
-                            _warn "Xray 启动失败,进程已退出"
-                            rm -f /run/xray.pid
+                        # 记录的 PID 已不存在 = 陈旧记录, 清除后继续启动; PID 仍存活但身份不符
+                        # (PID 复用/记录不符)才拒绝, 避免接管其它进程。
+                        if [ -n "$dpid0" ] && [ -d "/proc/$dpid0" ]; then
+                            _error "direct 身份记录与存活进程不符, 保留记录并拒绝启动"
                             return 1
                         fi
+                        rm -f /run/xray.pid
+                    fi
+                    if _proc_any_named xray "$XRAY_BIN"; then
+                        _error "已存在未记录的自有 Xray 进程, 拒绝重复启动"
+                        return 1
+                    fi
+                    local -a config_args=(-confdir "$CONFIG_DIR")
+                    XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true nohup "$XRAY_BIN" run "${config_args[@]}" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- &
+                    dpid1=$!
+                    sleep 1
+                    _xd_pidfile_write /run/xray.pid "$dpid1" || return 1
+                    dpid1=$(_xd_pidfile_pid /run/xray.pid)
+                    if [ -z "$dpid1" ] || [ "$(cat "/proc/$dpid1/comm" 2>/dev/null)" != "xray" ]; then
+                        _warn "Xray 启动失败,进程已退出"
+                        return 1
                     fi
                     ;;
                 stop)
-                    if [ -f /run/xray.pid ]; then
+                    if [ -e /run/xray.pid ] || [ -L /run/xray.pid ]; then
                         local dpid _xray_st
                         dpid=$(_xd_pidfile_pid /run/xray.pid)
-                        # 身份链闭合: 复核过的 starttime 必须**传进** kill helper,
-                        # 否则 helper 自己重读 starttime, 两次读取之间 PID 仍可能被复用 —— 会出现
-                        # "复核的是 A 进程、杀的是 B 进程"。comm 检查只作附加收窄。
+                        if ! _xd_pidfile_identity_ok /run/xray.pid; then
+                            # 记录的 PID 已不存在 = 陈旧记录, 清除后按已停止继续; PID 仍存活但
+                            # 身份不符才拒绝, 避免误杀复用该 PID 的其它进程。
+                            if [ -n "$dpid" ] && [ -d "/proc/$dpid" ]; then
+                                _error "direct 身份记录与存活进程不符, 保留记录并拒绝停止"; return 1
+                            fi
+                            rm -f /run/xray.pid
+                            if _proc_any_named xray "$XRAY_BIN"; then
+                                _error "direct 记录已陈旧但存在自有 Xray 进程, 拒绝扫描接管"; return 1
+                            fi
+                            return 0
+                        fi
                         _xray_st=$(_xd_pidfile_starttime /run/xray.pid)
-                        if [ -n "$dpid" ] && _xd_pidfile_identity_ok /run/xray.pid \
-                           && [ "$(cat "/proc/$dpid/comm" 2>/dev/null)" = "xray" ]; then
-                            [ -n "$_xray_st" ] || _xray_st=$(_proc_starttime "$dpid") || return 1
+                        if [ -n "$dpid" ] && [ "$(cat "/proc/$dpid/comm" 2>/dev/null)" = "xray" ]; then
                             if ! _proc_exe_is_strict "$dpid" "$XRAY_BIN" ||
                                ! _xd_kill_pid_graceful "$dpid" 5 "$_xray_st" ||
                                _xd_pid_unchanged "$dpid" "$_xray_st"; then
                                 _error "Xray 停止失败或进程归属无法确认, 保留 pidfile"
                                 return 1
                             fi
+                        else
+                            _error "direct 进程归属无法确认, 保留记录"; return 1
+                        fi
+                    else
+                        # 无 pidfile 不等于仍在运行: 全新安装/手工清理后停止必须能继续。
+                        # 仅在确实扫描到自有进程时拒绝(没有身份记录无法安全接管),
+                        # 否则按"可能已停止"返回成功, 由 _xray_stop_and_verify 的归属扫描复核。
+                        if _proc_any_named xray "$XRAY_BIN"; then
+                            _error "direct 身份记录缺失且存在自有 Xray 进程, 拒绝扫描接管"; return 1
                         fi
                     fi
                     rm -f /run/xray.pid
                     ;;
                 restart) _manage_xray stop || return 1; sleep 2; _manage_xray start ;;
-                status)  if _xray_is_running; then echo "running"; else echo "stopped"; fi ;;
+                status)
+                    if { [ -e /run/xray.pid ] || [ -L /run/xray.pid ]; } && ! _xd_pidfile_identity_ok /run/xray.pid; then echo "unknown"
+                    elif _xray_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
             ;;
         *)
@@ -2387,12 +2366,16 @@ _manage_xray() {
 _restart_xray_verified() {
     # restart + 8 秒健康观察作为一个不可穿插的 runtime mutation 临界区。
     # shellcheck disable=SC2031
-    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
-       declare -F _with_core_lock >/dev/null 2>&1; then
+    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ]; then
+        if ! declare -F _with_core_lock >/dev/null 2>&1; then
+            _error "缺少核心锁助手, 已拒绝重启(fail-closed)"
+            return 1
+        fi
         _with_core_lock _restart_xray_verified
         return $?
     fi
-    # 成败以 8s 真实判活采样为准; restart rc 仅决定是否补 start, 不替代业务健康证据。
+    # 必须先真正重启, 8s 采样只验证"新进程是否稳定", 不能把旧进程仍在运行当成成功。
+    # restart 的返回码不作为判据(OpenRC 在过渡态可能非 0): 随后统一用 status 决定是否补 start。
     _manage_xray restart 2>/dev/null || :
     if [ "$(_manage_xray status 2>/dev/null)" != "running" ]; then
         _manage_xray start 2>/dev/null
@@ -2453,6 +2436,15 @@ _xray_stopped_state() {
             _proc_any_named xray "$XRAY_BIN" && return 1
             return 0
             ;;
+        direct)
+            if [ -e /run/xray.pid ] || [ -L /run/xray.pid ]; then
+                _xd_pidfile_identity_ok /run/xray.pid || return 2
+                return 1
+            fi
+            [ -d /proc ] || return 2
+            _proc_any_named xray "$XRAY_BIN" && return 1
+            return 0
+            ;;
         *) return 2 ;;
     esac
 }
@@ -2460,35 +2452,24 @@ _xray_stopped_state() {
 _xray_stop_and_verify() {
     # stop 与完整 liveness 确认不可被核心 transaction 的 restart 插入。
     # shellcheck disable=SC2031
-    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ] && \
-       declare -F _with_core_lock >/dev/null 2>&1; then
+    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" != 1 ]; then
+        if ! declare -F _with_core_lock >/dev/null 2>&1; then
+            _error "缺少核心锁助手, 已拒绝停止确认(fail-closed)"
+            return 1
+        fi
         _with_core_lock _xray_stop_and_verify
         return $?
-    fi
-    if ! declare -F _xray_is_running >/dev/null 2>&1; then
-        _error "lib 版本过旧(缺 _xray_is_running), 无法确认 Xray 是否退出, 已中止破坏性操作"
-        _tip "请执行 install.sh --update 同步全部模块后重试"
-        return 1
     fi
     # stop 的返回码不是停止判据: OpenRC 上服务不存在时 rc-service stop 恒为 1(已停止为 0),
     # 拿它当判据会让全新机器上的安装/切换/回滚永久失败。只记录返回码用于失败诊断。
     local stop_rc=0 i state probe=""
     _manage_xray stop >/dev/null 2>&1 || stop_rc=$?
+    if [ "$INIT_SYSTEM" = direct ] && { [ -e /run/xray.pid ] || [ -L /run/xray.pid ]; } && [ "$stop_rc" -ne 0 ]; then return 1; fi
     for i in 1 2 3 4 5 6 7 8 9 10; do
         _xray_stopped_state
         state=$?
         probe="_xray_stopped_state rc=${state}"
         [ "$state" -ne 0 ] || return 0
-        # 2=查询不可用: 只有 direct 后端(无服务查询)退回 pidfile/进程判活;
-        # systemd/openrc 的查询失败不得当成已停止, 继续轮询到报错返回 1。
-        if [ "$state" -eq 2 ] && [ "${INIT_SYSTEM:-}" != systemd ] && \
-           [ "${INIT_SYSTEM:-}" != openrc ]; then
-            if _xray_is_running; then
-                probe="${probe}, _xray_is_running rc=0"
-            else
-                return 0
-            fi
-        fi
         sleep 1
     done
     local manual
@@ -2520,6 +2501,26 @@ _uninstall_xray_config_locked() {
 }
 
 _uninstall_xray_locked() {
+    # 所有 helper 能力检查必须早于停止/删除等不可逆动作: 缺失时直接中止,
+    # 避免停掉服务、删掉入口后才发现卸载无法完成, 留下半卸载状态。
+    if ! declare -F _logrotate_cleanup >/dev/null 2>&1; then
+        _error "缺少 logrotate 清理助手, 已中止卸载(未做任何删除)"
+        _tip "请先执行 install.sh --update 同步全部模块后重试"
+        return 1
+    fi
+    if ! declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
+        _error "缺少端口跳跃清理助手, 已中止卸载(未做任何删除)"
+        return 1
+    fi
+    if ! declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
+        _error "缺少官方 Hysteria2 清理助手, 已中止卸载(未做任何删除)"
+        return 1
+    fi
+    if ! declare -F _crontab_replace >/dev/null 2>&1; then
+        _error "缺少 crontab 清理助手, 已中止卸载(未做任何删除)"
+        _tip "请先执行 install.sh --update 同步全部模块后重试"
+        return 1
+    fi
     # 确认进程退出后才删文件; 失败保留管理入口, 见 _xray_stop_and_verify。
     if ! _xray_stop_and_verify; then
         _error "xray 进程未能停止, 已中止卸载(文件未删除), 请手动处理后重试"
@@ -2528,19 +2529,15 @@ _uninstall_xray_locked() {
     fi
     # 清理端口跳跃 iptables 规则必须在任何外部卸载动作之前: 失败时保留部署树和
     # metadata, 同时避免留下已失去管理入口的 DNAT 规则。
-    if declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        if ! _hy2_cleanup_all_hops; then
-            _error "端口跳跃规则清理失败, 已中止卸载(部署目录与节点元数据保留), 请处理后重试"
-            return 1
-        fi
+    if ! _hy2_cleanup_all_hops; then
+        _error "端口跳跃规则清理失败, 已中止卸载(部署目录与节点元数据保留), 请处理后重试"
+        return 1
     fi
     # 官方 Hysteria2 前置清理可因停止/服务定义失败而中止, 因此必须早于 Xray unit、快捷命令与
     # 二进制 symlink 的删除; 否则 abort 会留下 Hysteria 孤儿服务但已失去管理入口。
-    if declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
-        if ! _hysteria_cleanup_before_uninstall; then
-            _error "官方 Hysteria2 清理未完成, 已中止 Xray 卸载(部署数据与 Xray 管理入口保留), 请处理后重试"
-            return 1
-        fi
+    if ! _hysteria_cleanup_before_uninstall; then
+        _error "官方 Hysteria2 清理未完成, 已中止 Xray 卸载(部署数据与 Xray 管理入口保留), 请处理后重试"
+        return 1
     fi
     case "$INIT_SYSTEM" in
         systemd)
@@ -2553,24 +2550,12 @@ _uninstall_xray_locked() {
             rm -f /etc/init.d/xray
             ;;
     esac
-    # cron 清理只走 _crontab_replace(见 00-common 读取/返回码契约); 混装缺 helper 宁可保留行。
-    if declare -F _crontab_replace >/dev/null 2>&1; then
-        # ${VAR:-字面量} 兜底: 30-geo 在加载顺序上晚于本模块, 且混装旧 lib 时该常量可能缺失
-        # (set -u 下裸用会崩)。marker 值是稳定契约, 字面量兜底与 30-geo 的常量同源。
-        _crontab_replace "${GEO_CRON_MARKER:-# xray-deploy-geo-update}" >/dev/null 2>&1 || \
-            _warn "未能移除 geo 定时任务, 请手动检查 crontab"
-        _crontab_replace "# xray-deploy-timed-restart" >/dev/null 2>&1 || \
-            _warn "未能移除定时重启任务, 请手动检查 crontab"
-    else
-        _warn "lib 版本过旧(缺 _crontab_replace), 已跳过 crontab 清理, 请手动检查项目定时任务"
-    fi
+    _crontab_replace "# xray-deploy-timed-restart" >/dev/null 2>&1 || \
+        _warn "未能移除定时重启任务, 请手动检查 crontab"
     # 删快捷命令(xd) + xray symlink
     rm -f /usr/local/bin/"$CMD_NAME"
     [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ] && rm -f /usr/local/bin/xray
-    # 清理 logrotate 配置
-    if declare -F _logrotate_cleanup >/dev/null 2>&1; then
-        _logrotate_cleanup
-    fi
+    _logrotate_cleanup
     # 删部署目录(含 config/nodes/assets/logs/state/lib/templates)。rm -rf 的 rc 不能吞掉;
     # 部分删除失败时必须报告未完成, 不能把残留安装报成已卸载。
     if ! rm -rf "$DEPLOY_DIR" 2>/dev/null || [ -e "$DEPLOY_DIR" ] || [ -L "$DEPLOY_DIR" ]; then
@@ -2578,7 +2563,7 @@ _uninstall_xray_locked() {
         _tip "请检查权限/只读文件系统后重试"
         return 1
     fi
-    _success "Xray 已卸载干净(/opt/xray-deploy、xd 命令、系统 cron 已清除)"
+    _success "Xray 已卸载干净(/opt/xray-deploy、xd 命令、项目定时重启任务已清理)"
 }
 
 # ---------------------------------------------------------------------------

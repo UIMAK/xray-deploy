@@ -83,7 +83,7 @@ fi
     # 用 stdin 的完整配置重建 scratch 配置目录(仍按一字段一文件拆分)。
     cfg_reset() {
         local content
-        content=$(jq -c .) || return 1
+        content=$(jq -c '. + {version:{min:"26.4.25",max:""}}') || return 1
         rm -f "$CONFIG_DIR"/*.json
         _config_write_merged "$content"
     }

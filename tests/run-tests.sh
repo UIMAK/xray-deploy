@@ -39,7 +39,6 @@ contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 
 DEPLOY_DIR="$TMP/deploy"
 CONFIG_DIR="$DEPLOY_DIR/confs"
-LEGACY_CONFIG_FILE="$DEPLOY_DIR/config.json"
 BACKUP_DIR="$DEPLOY_DIR/backups"
 STATE_DIR="$DEPLOY_DIR/state"
 ASSET_DIR="$DEPLOY_DIR/assets"
@@ -87,29 +86,13 @@ if _config_present; then fail 'empty config dir is not present'; else pass 'empt
 check_eq 'empty config dir merges to {}' '{}' "$(_config_merged)"
 if _config_write_merged 'not-json' >/dev/null 2>&1; then fail 'merge write rejects malformed JSON'; else pass 'merge write rejects malformed JSON'; fi
 
-# 一次性迁移: 旧单文件 config.json 拆进 confs 并改名 .bak; 再跑一次是幂等 no-op。
-printf '{"log":{"loglevel":"warning"},"inbounds":[]}\n' > "$LEGACY_CONFIG_FILE"
-if _config_migrate_legacy >/dev/null 2>&1 \
-   && [ -f "$LEGACY_CONFIG_FILE.bak" ] && [ ! -e "$LEGACY_CONFIG_FILE" ] \
-   && [ -f "$CONFIG_DIR/02_log.json" ] && [ -f "$CONFIG_DIR/07_inbounds.json" ]; then
-    pass 'legacy config migrates into confs'
-else
-    fail 'legacy config migrates into confs'
-fi
-_config_migrate_legacy >/dev/null 2>&1
-check_eq 'migration is idempotent' 'warning' "$(_config_jq -r '.log.loglevel')"
-# 用不到的模块不生成文件: 迁移结果里不该出现空壳的 04_dns.json。
-if [ -f "$CONFIG_DIR/04_dns.json" ]; then fail 'unused module files are not created'; else pass 'unused module files are not created'; fi
-# 坏掉的旧配置必须被拒绝且不改名(否则用户配置会被一份解析失败的碎片顶掉)。
-rm -f "$CONFIG_DIR"/*.json "$LEGACY_CONFIG_FILE.bak"
-printf '{"log":\n' > "$LEGACY_CONFIG_FILE"
-if _config_migrate_legacy >/dev/null 2>&1; then fail 'unparseable legacy config is rejected'; else pass 'unparseable legacy config is rejected'; fi
-if [ -f "$LEGACY_CONFIG_FILE" ] && [ ! -e "$LEGACY_CONFIG_FILE.bak" ]; then pass 'rejected migration leaves the legacy file alone'; else fail 'rejected migration leaves the legacy file alone'; fi
-rm -f "$LEGACY_CONFIG_FILE"
-
+printf '{"inbounds":[]}' > "$DEPLOY_DIR/config.json"
+if _init_config_if_empty >/dev/null 2>&1; then fail 'unmanaged config.json rejected'; else pass 'unmanaged config.json rejected'; fi
+check 'unmanaged config.json preserved' test -f "$DEPLOY_DIR/config.json"
+rm -f "$DEPLOY_DIR/config.json"
 # 一个顶层字段一个文件, 文件名固定, 未知字段落 99_ 前缀; 文件内容保留 {"<字段>": <值>} 外壳
 # (xray -confdir 按文件合并, 裸值文件会让合并报 "Cannot index object with number")。
-_config_write_merged '{"log":{"loglevel":"debug"},"routing":{"rules":[]},"customTop":1}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"debug"},"routing":{"rules":[]},"customTop":1}' >/dev/null 2>&1
 if [ -f "$CONFIG_DIR/05_routing.json" ] && [ -f "$CONFIG_DIR/99_customTop.json" ]; then
     pass 'top-level field maps to its fixed file name'
 else
@@ -117,15 +100,15 @@ else
 fi
 check_eq 'conf file keeps the top-level key wrapper' 'routing' "$(jq -r 'keys[0]' "$CONFIG_DIR/05_routing.json")"
 # del(.geodata) 必须真的删掉 14_geodata.json, 否则关掉 Geo 定时后核心仍会加载 geodata 段。
-_config_write_merged '{"log":{},"geodata":{"cron":"0 3 */3 * *"}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{},"geodata":{"cron":"0 3 */3 * *"}}' >/dev/null 2>&1
 [ -f "$CONFIG_DIR/14_geodata.json" ] || fail 'geodata field file is created'
-_config_write_merged '{"log":{}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{}}' >/dev/null 2>&1
 if [ -e "$CONFIG_DIR/14_geodata.json" ]; then fail 'removed field deletes its file'; else pass 'removed field deletes its file'; fi
 
 # 备份/回滚的单位是整个 confs 目录。
-_config_write_merged '{"log":{"loglevel":"warning"}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"}}' >/dev/null 2>&1
 _backup_config >/dev/null 2>&1
-_config_write_merged '{"log":{"loglevel":"debug"}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"debug"}}' >/dev/null 2>&1
 _restore_config >/dev/null 2>&1
 check_eq 'rollback restores the backed-up conf dir' 'warning' "$(_config_jq -r '.log.loglevel')"
 # 写入闸门: 事务禁止改配置时, jq 变更必须被拒绝(否则崩溃恢复期间会二次损坏现场)。
@@ -143,9 +126,9 @@ if _config_jq -r '.log.loglevel' >/dev/null 2>&1; then
 else
     pass 'unreadable conf dir makes _config_jq fail visibly'
 fi
-_config_write_merged '{"log":{"loglevel":"warning"}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"}}' >/dev/null 2>&1
 # DNS 编辑只动 04_dns.json, 不另跑核心预检。
-_config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
 _dns_apply_ok() {
     local rc=0
     (
@@ -229,13 +212,13 @@ check 'routing alias supports inverted external geo references' jq -e "$GEO_RULE
 if jq -e "$GEO_RULE_REF_JQ" <<< '{"domains":["domain:example.com"]}' >/dev/null; then
     fail 'literal routing alias does not consume geo data'
 else pass 'literal routing alias does not consume geo data'; fi
-_config_write_merged '{"dns":{"servers":[{"unexpectedIPs":["geoip:private","!ext:custom.dat:cn"]}],"hosts":{"geosite:cn":"127.0.0.1","ext:hosts.dat:ads":"127.0.0.1","domain:example.com":"127.0.0.1"}},"routing":{"rules":[]}}'
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"dns":{"servers":[{"unexpectedIPs":["geoip:private","!ext:custom.dat:cn"]}],"hosts":{"geosite:cn":"127.0.0.1","ext:hosts.dat:ads":"127.0.0.1","domain:example.com":"127.0.0.1"}},"routing":{"rules":[]}}'
 check_eq 'DNS counts unexpectedIPs and geo hosts keys' '4' "$(_route_dns_geo_count)"
-_config_write_merged '{"dns":{"servers":[{"domains":["geosite:cn"],"expectedIPs":["geoip:cn"],"expectIPs":["ext:custom.dat:cn"]}]}}'
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"dns":{"servers":[{"domains":["geosite:cn"],"expectedIPs":["geoip:cn"],"expectIPs":["ext:custom.dat:cn"]}]}}'
 check_eq 'DNS retains existing geo field coverage' '3' "$(_route_dns_geo_count)"
-_config_write_merged '{"dns":{"hosts":{"!geosite:cn":"127.0.0.1","ext:hosts.dat:ads":"127.0.0.1","domain:example.com":"127.0.0.1"}}}'
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"dns":{"hosts":{"!geosite:cn":"127.0.0.1","ext:hosts.dat:ads":"127.0.0.1","domain:example.com":"127.0.0.1"}}}'
 check_eq 'DNS hosts keys count even without upstream objects' '2' "$(_route_dns_geo_count)"
-_config_write_merged '{"dns":{"hosts":null,"servers":["1.1.1.1"]}}'
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"dns":{"hosts":null,"servers":["1.1.1.1"]}}'
 check_eq 'DNS missing optional fields consumes no geo data' '0' "$(_route_dns_geo_count)"
 
 printf '== launch contract (confdir + strict JSON) ==\n'
@@ -243,7 +226,7 @@ printf '== launch contract (confdir + strict JSON) ==\n'
 # config 的 env 段 —— Xray 必须先选定 JSON 解析器才能读配置。这里注入 env 后检查配置里除了
 # XRAY_LOCATION_ASSET 没有别的键、且没有任何值指向 confs 目录; 有人"顺手"把严格开关塞进
 # env 段时这条会立刻变红。
-_config_write_merged '{"log":{},"inbounds":[]}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{},"inbounds":[]}' >/dev/null 2>&1
 _auto_ensure_config_env_write >/dev/null 2>&1
 check_eq 'config env carries only XRAY_LOCATION_ASSET' 'XRAY_LOCATION_ASSET' "$(_config_jq -r '.env | keys_unsorted | join(",")')"
 check_eq 'config env value points at the asset dir' "$ASSET_DIR" "$(_config_jq -r '.env.XRAY_LOCATION_ASSET')"
@@ -284,9 +267,9 @@ if _logrotate_render_config | grep -q 'rotate 7'; then pass 'logrotate renderer 
 _state_set logrotate_retention 999999999999999999999999
 if _logrotate_render_config | grep -q 'rotate 30'; then pass 'long retention is bounded'; else fail 'long retention is bounded'; fi
 
-# state 读写往返用命名空间化的测试键, 不借用生产 GEO_TRANSITION_KEY(否则会污染后续迁移用例)。
-_state_set xd_test_state_roundtrip off_pending
-check_eq 'state marker persists' off_pending "$(_state_get xd_test_state_roundtrip)"
+# state 读写往返用命名空间化的测试键, 不借用生产 state marker(否则会污染后续迁移用例)。
+_state_set xd_test_state_roundtrip sample-value
+check_eq 'state marker persists' sample-value "$(_state_get xd_test_state_roundtrip)"
 rm -f "$STATE_DIR/xd_test_state_roundtrip"
 
 printf '{"name":"shared-name"}\n' > "$NODES_DIR/xray.json"
@@ -303,7 +286,7 @@ ss() { printf 'Netid State Local Address:Port Peer Address:Port\n'; }
 _xh_hop_conflict() {   # $1=入站 JSON, $2/$3=跳跃范围, $4=exclude; 判为冲突返回 0
     local saved_cfg="$CONFIG_DIR" saved_nodes="$NODES_DIR" rc
     CONFIG_DIR="$XH_PORT_CONFS"; NODES_DIR="$XH_NODES_EMPTY"
-    _config_write_merged "$(printf '{"inbounds":[%s]}' "$1")" >/dev/null 2>&1
+    _config_write_merged "$(printf '{"version":{"min":"26.4.25","max":""},"inbounds":[%s]}' "$1")" >/dev/null 2>&1
     _hysteria_check_hop_conflicts "$2" "$3" ${4:+"$4"} >/dev/null 2>&1; rc=$?
     CONFIG_DIR="$saved_cfg"; NODES_DIR="$saved_nodes"
     [ "$rc" -ne 0 ]
@@ -519,16 +502,17 @@ else
     fail "PQ supported forwards generated keys [$XH_PQ_MENU_OUT]"
 fi
 
-# Without an authoritative liveness helper, stop is not proof of exit.
+# A failed stop whose terminal state cannot be verified must remain destructive-failure.
 if (
     XRAY_STOP_SENTINEL="$TMP/xray-stop-called"
     INIT_SYSTEM=direct
     XRAY_DEPLOY_CORE_LOCK_HELD=1
     unset -f _xray_is_running
-    _with_core_lock() { "$@"; }
-    _manage_xray() { printf 'stop\n' >> "$XRAY_STOP_SENTINEL"; }
+    _manage_xray() { printf 'stop\n' >> "$XRAY_STOP_SENTINEL"; return 1; }
+    _xray_stopped_state() { return 2; }
+    sleep() { :; }
     _xray_stop_and_verify >/dev/null 2>&1 && exit 1
-    [ ! -e "$XRAY_STOP_SENTINEL" ]
+    [ -e "$XRAY_STOP_SENTINEL" ]
 ); then
     pass 'Xray destructive stop refuses unverifiable liveness'
 else
@@ -538,35 +522,11 @@ fi
 printf '== config check and Geo state ==\n'
 : > "$ASSET_DIR/geosite.dat"
 : > "$ASSET_DIR/geoip.dat"
-GEO_TRANSITION_KEY=geo_update_transition
-_state_set geo_cron on
-# 启用内置 geodata 定时: geodata 段必须落到自己的字段文件里, 旧 cron 兜底状态保留
-# (首次成功更新后才 retire, 见 _geo_finalize_legacy_cron_locked)。
-_config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
-# _test_udp_snapshot 里的 CONFIG_DIR 改向只在子 shell 内, 外层值不受影响。
-# shellcheck disable=SC2031
-if _auto_migrate_geo_autoupdate >/dev/null 2>&1 \
-   && [ "$(_config_jq -r '.geodata.cron // empty')" = "$GEO_CRON_EXPR" ] \
-   && [ -f "$CONFIG_DIR/14_geodata.json" ] \
-   && [ "$(_state_get geo_cron)" = on ]; then
-    pass 'Geo migration writes the geodata field file'
-else
-    fail 'Geo migration writes the geodata field file'
-fi
-# 关闭待清理(off_pending): geodata 字段必须连同 14_geodata.json 一起删掉, 并退休旧 cron。
-if (
-    _crontab_replace() { return 0; }
-    _state_set "$GEO_TRANSITION_KEY" off_pending
-    _auto_migrate_geo_autoupdate >/dev/null 2>&1 || exit 1
-    # shellcheck disable=SC2031
-    [ ! -e "$CONFIG_DIR/14_geodata.json" ] || exit 1
-    [ "$(_state_get geo_cron)" = off ]
-); then
-    pass 'Geo off_pending deletes the geodata field file'
-else
-    fail 'Geo off_pending deletes the geodata field file'
-fi
-
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
+check 'Geo builtin cron enabled' _geo_set_auto_update on
+check_eq 'Geo builtin expression' "$GEO_CRON_EXPR" "$(_config_jq -r '.geodata.cron')"
+check 'Geo builtin cron disabled' _geo_set_auto_update off
+check 'Geo disable removes geodata fragment' test ! -e "$CONFIG_DIR/14_geodata.json"
 printf '== Geo data source selection ==\n'
 GEO_U_XTLS_GEOSITE='https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat'
 GEO_U_XTLS_GEOIP='https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-full.dat'
@@ -604,11 +564,10 @@ check_eq 'geodata geoip asset points at geoip-full.dat' "$GEO_U_XTLS_GEOIP" \
 # 下载阶段必须"远端全量、落点固定": URL 随源变化, 目标文件名恒为 geosite.dat/geoip.dat。
 GEO_DL_XTLS="$TMP/geo-dl-xtls"
 (
-    _geo_transition_clear
     _ensure_dirs() { return 0; }
     _with_config_lock() { "$@"; }
     _with_core_lock() { "$@"; }
-    _geo_update_commit_and_finalize_locked() { return 0; }
+    _geo_update_commit_locked() { return 0; }
     _http_download() { printf '%s -> %s\n' "$1" "${2##*/}" >> "$GEO_DL_XTLS"; return 91; }
     _geo_update
 ) >/dev/null 2>&1
@@ -619,11 +578,10 @@ check_eq 'download maps geoip-full.dat onto geoip.dat' "$GEO_U_XTLS_GEOIP -> geo
 
 GEO_DL_LOYAL="$TMP/geo-dl-loyal"
 (
-    _geo_transition_clear
     _ensure_dirs() { return 0; }
     _with_config_lock() { "$@"; }
     _with_core_lock() { "$@"; }
-    _geo_update_commit_and_finalize_locked() { return 0; }
+    _geo_update_commit_locked() { return 0; }
     _http_download() { printf '%s -> %s\n' "$1" "${2##*/}" >> "$GEO_DL_LOYAL"; return 91; }
     _state_set geo_source loyal
     _geo_update
@@ -633,7 +591,7 @@ check_eq 'download maps the Loyalsoldier geosite URL onto geosite.dat' "$GEO_U_L
 check_eq 'download maps the Loyalsoldier geoip URL onto geoip.dat' "$GEO_U_LOYAL_GEOIP -> geoip.dat" \
     "$(sed -n '2p' "$GEO_DL_LOYAL" 2>/dev/null)"
 
-# 内置定时生效时切换必须改写 config 的 assets; cron/off 机制只记 state。
+# 内置定时生效时切换必须改写 config 的 assets; 关闭时只记 state。
 GEO_MUTATE_ARGS="$TMP/geo-mutate-args"
 rm -f "$GEO_MUTATE_ARGS"
 (
@@ -684,7 +642,7 @@ else
 fi
 
 # 老版本写下的 assets 仍指向旧源: 内置定时生效时必须提示重新应用。
-_config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]},"geodata":{"cron":"0 3 */3 * *","assets":[{"url":"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat","file":"geosite.dat"},{"url":"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat","file":"geoip.dat"}]}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"},"routing":{"rules":[]},"geodata":{"cron":"0 3 */3 * *","assets":[{"url":"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat","file":"geosite.dat"},{"url":"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat","file":"geoip.dat"}]}}' >/dev/null 2>&1
 _state_set geo_source xtls
 if _geo_builtin_source_drifted; then
     pass 'legacy assets are reported as drifted'
@@ -698,7 +656,7 @@ else
     pass 'assets matching the selected source are not drifted'
 fi
 rm -f "$STATE_DIR/geo_source" "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
-_config_write_merged '{"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
 
 printf '== Geo data source apply contracts ==\n'
 # 回滚契约: config 写入失败时数据源必须保持原值, 不能只改一半 state。
@@ -894,11 +852,10 @@ check_eq 'failed assets write keeps the state lines' "$GEO_EXTRA_BEFORE" "$(cat 
 GEO_DL_EXTRA="$TMP/geo-dl-extra"
 rm -f "$GEO_DL_EXTRA"
 (
-    _geo_transition_clear
     _ensure_dirs() { return 0; }
     _with_config_lock() { "$@"; }
     _with_core_lock() { "$@"; }
-    _geo_update_commit_and_finalize_locked() { return 0; }
+    _geo_update_commit_locked() { return 0; }
     _http_download() { echo "$1 -> $(basename "$2")" >> "$GEO_DL_EXTRA"; return 91; }
     _geo_update
 ) >/dev/null 2>&1
@@ -1273,30 +1230,6 @@ _check_lock_probe 'nested clash sync is reentrant' "$XH_NESTED_PROBE"
 
 
 
-_state_set "$GEO_TRANSITION_KEY" off_pending
-GEO_SKIP_MARKER="$TMP/geo-download-called"
-(
-    _ensure_dirs() { return 0; }
-    _auto_migrate_geo_autoupdate() { : > "$GEO_SKIP_MARKER"; return 0; }
-    _http_download() { return 91; }
-    _geo_update
-) >/dev/null 2>&1
-if [ -e "$GEO_SKIP_MARKER" ]; then pass 'Geo off_pending skips legacy update'; else fail 'Geo off_pending skips legacy update'; fi
-rm -f "$GEO_SKIP_MARKER"
-if (
-    _geo_transition_clear
-    _xray_version_ge() { return 0; }
-    _geo_remove_cron_line() { return 0; }
-    _state_set geo_cron on
-    _config_write_merged '{"geodata":{"cron":"0 3 */3 * *"}}' >/dev/null 2>&1
-    _geo_finalize_legacy_cron_locked >/dev/null 2>&1
-    [ "$(_state_get geo_cron)" = off ]
-); then
-    pass 'Geo finalizer retires legacy fallback after update'
-else
-    fail 'Geo finalizer retires legacy fallback after update'
-fi
-
 HYSTERIA_CERT="$TMP/selfsigned.pem"
 HYSTERIA_PIN=$(printf '%064d' 7)
 printf 'test cert\n' > "$HYSTERIA_CERT"
@@ -1304,12 +1237,23 @@ printf '{"listen":":443","tls":{"cert":"%s"},"bandwidth":{"up":"100 mbps","down"
 printf '{"tls_mode":"selfsigned","sni":"example.test","pin":"%s"}\n' "$HYSTERIA_PIN" > "$HYSTERIA_SERVER_META"
 printf '{"auth":"secret","name":"node-a","link_addr":"198.51.100.7","protocol":"hysteria2"}\n' > "$HYSTERIA_NODE_META"
 uri=$(_hysteria_build_link "$HYSTERIA_NODE_META" 2>/dev/null)
-if contains 'insecure=1' "$uri" && ! contains 'pinSHA256=' "$uri"; then pass 'self-signed URI uses insecure without pin'; else fail 'self-signed URI uses insecure without pin'; fi
+if contains 'insecure=1' "$uri" && contains "pinSHA256=$HYSTERIA_PIN" "$uri"; then pass 'self-signed URI includes official pinSHA256'; else fail 'self-signed URI includes official pinSHA256'; fi
 line=$(_hysteria_clash_line "$HYSTERIA_NODE_META" 2>/dev/null)
 if contains 'skip-cert-verify: true' "$line" && ! contains 'fingerprint:' "$line"; then pass 'Mihomo self-signed entry skips verification without fingerprint'; else fail 'Mihomo self-signed entry skips verification without fingerprint'; fi
 if contains 'down: "100 mbps"' "$line" && contains 'up: "10 mbps"' "$line"; then pass 'server bandwidth maps to client directions'; else fail 'server bandwidth maps to client directions'; fi
 printf '{"tls_mode":"selfsigned","sni":"example.test","pin":""}\n' > "$HYSTERIA_SERVER_META"
-if contains 'insecure=1' "$(_hysteria_build_link "$HYSTERIA_NODE_META" 2>/dev/null)"; then pass 'legacy self-signed metadata without pin remains exportable'; else fail 'legacy self-signed metadata without pin remains exportable'; fi
+if _hysteria_build_link "$HYSTERIA_NODE_META" >/dev/null 2>&1; then fail 'missing self-signed pin rejected'; else pass 'missing self-signed pin rejected'; fi
+# metadata 未记录 pin 时, 可从已发布证书推导; 证书也不存在时才拒绝。
+if command -v openssl >/dev/null 2>&1; then
+    mkdir -p "$HYSTERIA_CERT_DIR"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMP/pin-test.key" \
+        -out "$HYSTERIA_CERT_DIR/cert.pem" -days 1 -subj '/CN=example.test' >/dev/null 2>&1
+    uri=$(_hysteria_build_link "$HYSTERIA_NODE_META" 2>/dev/null)
+    if contains 'pinSHA256=' "$uri"; then pass 'self-signed metadata without pin derives it from the published cert'; else fail 'self-signed metadata without pin derives it from the published cert'; fi
+    rm -f "$HYSTERIA_CERT_DIR/cert.pem" "$TMP/pin-test.key"
+else
+    pass 'self-signed pin derivation skipped (openssl unavailable)'
+fi
 
 printf '== Hysteria terminal stop and reset quarantine ==\n'
 if (
@@ -1376,79 +1320,23 @@ if _parse_hop_ranges '20000-30000' >/dev/null 2>&1 \
 else
     fail 'hop range parser rejects multi-dash entries'
 fi
-# 关闭失败且 cron 回滚失败时不得把 geo_cron 写成 off(残留 cron 仍在跑, 会谎报已关闭)。
-if (
-    _ensure_cron_running() { return 1; }
-    _geo_remove_cron_line() { return 1; }
-    _crontab_replace() { return 0; }
-    _state_set geo_cron on
-    _geo_set_auto_update_cron on >/dev/null 2>&1
-    [ "$(_state_get geo_cron)" = on ]
-); then pass 'failed cron rollback keeps geo_cron on'; else fail 'failed cron rollback keeps geo_cron on'; fi
-# 关闭成功且回滚成功时才置 off。
-if (
-    _ensure_cron_running() { return 1; }
-    _geo_remove_cron_line() { return 0; }
-    _crontab_replace() { return 0; }
-    _state_set geo_cron on
-    _geo_set_auto_update_cron on >/dev/null 2>&1
-    [ "$(_state_get geo_cron)" = off ]
-); then pass 'successful cron rollback records geo_cron off'; else fail 'successful cron rollback records geo_cron off'; fi
 if (
     CONFIG_DIR="$TMP/duplicate-confs"
     mkdir -p "$CONFIG_DIR"
     printf '{"inbounds":[{"tag":"one"}]}' > "$CONFIG_DIR/one.json"
     printf '{"inbounds":[{"tag":"two"}]}' > "$CONFIG_DIR/two.json"
     _config_merged >/dev/null 2>&1 && exit 1
-    _config_write_merged '{"inbounds":[]}' >/dev/null 2>&1 && exit 1
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"inbounds":[]}' >/dev/null 2>&1 && exit 1
     [ "$(jq -r '.inbounds[0].tag' "$CONFIG_DIR/one.json")" = one ] &&
         [ "$(jq -r '.inbounds[0].tag' "$CONFIG_DIR/two.json")" = two ]
 ); then pass 'duplicate top-level fragments refuse read/write without data loss'; else fail 'duplicate top-level fragments refuse read/write without data loss'; fi
 if (
     CONFIG_DIR="$TMP/delete-failure-confs"
-    _config_write_merged '{"dns":{"servers":["1.1.1.1"]}}' || exit 1
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"dns":{"servers":["1.1.1.1"]}}' || exit 1
     rm() { [ "${*: -1}" = "$CONFIG_DIR/04_dns.json" ] && return 1; command rm "$@"; }
-    _config_write_merged '{}' >/dev/null 2>&1 && exit 1
+    _config_write_merged '{"version":{"min":"26.4.25","max":""}}' >/dev/null 2>&1 && exit 1
     [ -f "$CONFIG_DIR/04_dns.json" ]
 ); then pass 'field deletion failure propagates'; else fail 'field deletion failure propagates'; fi
-
-_test_migration_restore() (
-    local failure="$1" state="$2"
-    CONFIG_DIR="$TMP/migration-$failure-$state/confs"
-    LEGACY_CONFIG_FILE="$TMP/migration-$failure-$state/config.json"
-    XRAY_BIN=/bin/true
-    local unit="$TMP/migration-$failure-$state/service" attempts=0 current="$state"
-    mkdir -p "$CONFIG_DIR"
-    printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
-    printf 'legacy-service' > "$unit"
-    _xray_service_unit_path() { printf '%s' "$unit"; }
-    _xray_service_snapshot_enable() { printf disabled > "$1"; }
-    _xray_service_restore_enable() { [ "$failure" != enable ] && [ "$(cat "$1")" = disabled ]; }
-    _xray_service_restore_file() { cp "$1" "$2"; }
-    _manage_xray() { case "$1" in status) printf '%s' "$current" ;; stop) current=stopped ;; esac; }
-    _create_xray_service() { printf confdir-service > "$unit"; [ "$failure" != service ] && [ "$failure" != enable ]; }
-    _restart_xray_verified() { attempts=$((attempts+1)); current=running; [ "$failure" = enable ] || [ "$attempts" -gt 1 ]; }
-    _config_migrate_legacy >/dev/null 2>&1 && exit 1
-    [ -f "$LEGACY_CONFIG_FILE" ] && [ ! -e "$LEGACY_CONFIG_FILE.bak" ] &&
-        [ "$(cat "$unit")" = legacy-service ] && ! _config_present &&
-        [ "$current" = "$state" ]
-)
-check 'restart failure restores legacy layout and running state' _test_migration_restore restart running
-check 'service creation failure restores legacy layout and stopped state' _test_migration_restore service stopped
-check 'enable restoration failure still restarts restored running service' _test_migration_restore enable running
-if (
-    CONFIG_DIR="$TMP/stopped-migration/confs"
-    LEGACY_CONFIG_FILE="$TMP/stopped-migration/config.json"
-    XRAY_BIN=/bin/true
-    mkdir -p "$CONFIG_DIR"; printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
-    _xray_service_unit_path() { return 1; }
-    # 记录 service 动作: 断言迁移没有 start/restart 一个原本停止的服务。
-    _manage_xray() { printf '%s\n' "$1" >> "$TMP/stopped-migration/actions"; printf stopped; }
-    _create_xray_service() { return 0; }
-    _restart_xray_verified() { printf 'restart\n' >> "$TMP/stopped-migration/actions"; return 1; }
-    _config_migrate_legacy >/dev/null 2>&1 && [ -f "$LEGACY_CONFIG_FILE.bak" ] &&
-        ! grep -Eq 'start|restart' "$TMP/stopped-migration/actions" 2>/dev/null
-); then pass 'successful migration leaves stopped service stopped'; else fail 'successful migration leaves stopped service stopped'; fi
 
 # Third-party uninstallers may leave a systemd mask symlink at the managed unit
 # path. Reinstall must recognize that stale mask before snapshotting.
@@ -1467,7 +1355,7 @@ if (
     MASK_UNIT="$MASK_ROOT/xray.service"
     MASK_JOURNAL="$MASK_ROOT/coretxn.json"
     BACKUP_DIR="$MASK_ROOT/backups"
-    XRAY_CORE_TXN_ID=legacy; export XRAY_CORE_TXN_ID
+    XRAY_CORE_TXN_ID=testtxn; export XRAY_CORE_TXN_ID
     mkdir -p "$BACKUP_DIR"
     ln -s /dev/null "$MASK_UNIT"
     printf '{"service_preexisted":false}' > "$MASK_JOURNAL"
@@ -1483,10 +1371,10 @@ if (
     }
     _xray_service_snapshot
     [ ! -e "$MASK_UNIT" ] && [ ! -L "$MASK_UNIT" ] &&
-        [ -L "$BACKUP_DIR/xray-service.legacy.prev.masked" ] &&
-        [ "$(readlink -f "$BACKUP_DIR/xray-service.legacy.prev.masked")" = /dev/null ] &&
-        [ "$(cat "$BACKUP_DIR/xray-service.legacy.prev.enabled")" = disabled ] &&
-        [ -f "$BACKUP_DIR/xray-service.legacy.prev.absent" ]
+        [ -L "$BACKUP_DIR/xray-service.testtxn.prev.masked" ] &&
+        [ "$(readlink -f "$BACKUP_DIR/xray-service.testtxn.prev.masked")" = /dev/null ] &&
+        [ "$(cat "$BACKUP_DIR/xray-service.testtxn.prev.enabled")" = disabled ] &&
+        [ -f "$BACKUP_DIR/xray-service.testtxn.prev.absent" ]
 ); then pass 'stale systemd mask is snapshotted before removal'; else fail 'stale systemd mask is snapshotted before removal'; fi
 if (
     INIT_SYSTEM=systemd
@@ -1503,8 +1391,8 @@ if (
     MASK_JOURNAL="$MASK_ROOT/coretxn.json"
     BACKUP_DIR="$MASK_ROOT/backups"
     mkdir -p "$BACKUP_DIR"
-    ln -s /dev/null "$BACKUP_DIR/xray-service.legacy.prev.masked"
-    printf '{"phase":"prepared","service_masked":true,"binary_backup":"%s/b","staging_dir":"%s/s","service_prev":"%s/xray-service.legacy.prev","geoip_backup":"%s/g","geosite_backup":"%s/h"}' "$MASK_ROOT" "$MASK_ROOT" "$BACKUP_DIR" "$MASK_ROOT" "$MASK_ROOT" > "$MASK_JOURNAL"
+    ln -s /dev/null "$BACKUP_DIR/xray-service.testtxn.prev.masked"
+    printf '{"phase":"prepared","service_masked":true,"binary_backup":"%s/b","staging_dir":"%s/s","service_prev":"%s/xray-service.testtxn.prev","geoip_backup":"%s/g","geosite_backup":"%s/h"}' "$MASK_ROOT" "$MASK_ROOT" "$BACKUP_DIR" "$MASK_ROOT" "$MASK_ROOT" > "$MASK_JOURNAL"
     _xray_core_path_present() { [ -e "$1" ] || [ -L "$1" ]; }
     _xray_core_journal_path() { printf '%s' "$MASK_JOURNAL"; }
     _xray_service_unit_path() { printf '%s' "$MASK_UNIT"; }
@@ -1525,15 +1413,6 @@ if (
     _xray_service_restore_mask "$MASK_UNIT" "$MASK_SNAPSHOT" &&
         [ -L "$MASK_UNIT" ] && [ "$(readlink -f "$MASK_UNIT")" = /dev/null ]
 ); then pass 'stale systemd mask restores from transaction snapshot'; else fail 'stale systemd mask restores from transaction snapshot'; fi
-if (
-    _xray_core_txn_recover_locked() { return 0; }
-    _xray_core_txn_pending() { return 1; }
-    _config_migrate_legacy() { printf migrated > "$TMP/ordered-migration"; }
-    _xray_core_journal_write() { [ -f "$TMP/ordered-migration" ] && printf seen > "$TMP/ordered-journal"; return 1; }
-    _install_or_switch_xray_locked stable "$TMP" v26.9.9 >/dev/null 2>&1
-    [ -f "$TMP/ordered-journal" ]
-); then pass 'migration precedes core journal and service snapshot'; else fail 'migration precedes core journal and service snapshot'; fi
-
 if (
     R_LISTEN=127.0.0.1 R_PORT=12345 R_TAG=test
     R_UUID=11111111-1111-1111-1111-111111111111 R_PATH='/api?a=1&b=2'
@@ -1561,14 +1440,12 @@ _test_xray_hop_conflict() (
     CONFIG_DIR="$TMP/xray-hop-check/confs"
     NODES_DIR="$TMP/xray-hop-check/nodes"
     mkdir -p "$NODES_DIR"
-    _config_write_merged '{"inbounds":[]}' || exit 1
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"inbounds":[]}' || exit 1
     printf '%s' "$1" > "$NODES_DIR/xh.json"
     ! _hysteria_check_hop_conflicts 40001 40001 >/dev/null 2>&1
 )
 check 'official single listen rejects Xray singleton hop' _test_xray_hop_conflict '{"hop_ranges":"40001"}'
 check 'official single listen rejects Xray range hop' _test_xray_hop_conflict '{"hop_ranges":"40000-40002"}'
-check 'official checks legacy udp_hop_ports' _test_xray_hop_conflict '{"udp_hop_ports":"40000-40002"}'
-check 'official checks legacy hop_start and hop_end' _test_xray_hop_conflict '{"hop_start":40000,"hop_end":40002}'
 if _xh_hop_conflict '{"protocol":"vless","port":443,"streamSettings":{"network":"tcp"}}' 443 443; then fail 'official UDP single port permits same-number TCP inbound'; else pass 'official UDP single port permits same-number TCP inbound'; fi
 
 _test_official_port_menu() (
@@ -1578,9 +1455,9 @@ _test_official_port_menu() (
     HYSTERIA_CONFIG="$TMP/official-menu-$mode-$port-$udp/hy.json"
     mkdir -p "$NODES_DIR"
     if [ "$udp" = tcp ]; then
-        _config_write_merged '{"inbounds":[{"protocol":"vless","port":443,"streamSettings":{"network":"tcp"}}]}' || exit 1
+        _config_write_merged '{"version":{"min":"26.4.25","max":""},"inbounds":[{"protocol":"vless","port":443,"streamSettings":{"network":"tcp"}}]}' || exit 1
     else
-        _config_write_merged '{"inbounds":[]}' || exit 1
+        _config_write_merged '{"version":{"min":"26.4.25","max":""},"inbounds":[]}' || exit 1
         printf '{"hop_ranges":"40000-40002"}' > "$NODES_DIR/xh.json"
     fi
     printf '{"listen":":8443"}' > "$HYSTERIA_CONFIG"
@@ -1598,46 +1475,13 @@ check 'official disable-hop menu rejects DNAT hop overlap' _test_official_port_m
 check 'official change-listen menu permits TCP-only same number' _test_official_port_menu 1 443 tcp
 
 if (
-    CONFIG_DIR="$TMP/first-install/confs"
-    LEGACY_CONFIG_FILE="$TMP/first-install/config.json"
-    XRAY_BIN="$TMP/first-install/absent-binary"
-    mkdir -p "$CONFIG_DIR"; printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
-    _create_xray_service() { exit 1; }
-    _config_migrate_legacy >/dev/null 2>&1 && [ -f "$LEGACY_CONFIG_FILE.bak" ] && _config_present
-); then pass 'offline legacy migration does not require installed binary'; else fail 'offline legacy migration does not require installed binary'; fi
-if (
     CONFIG_DIR="$TMP/broken-duplicate/confs"
     mkdir -p "$CONFIG_DIR"
     printf '{"dns":{}}' > "$CONFIG_DIR/a.json"
     printf '{"dns":{}}' > "$CONFIG_DIR/b.json"
     printf broken > "$CONFIG_DIR/broken.json"
-    ! _config_write_merged '{}' >/dev/null 2>&1
+    ! _config_write_merged '{"version":{"min":"26.4.25","max":""}}' >/dev/null 2>&1
 ); then pass 'malformed fragment cannot bypass duplicate field guard'; else fail 'malformed fragment cannot bypass duplicate field guard'; fi
-_test_direct_config_source() (
-    local layout="$1"
-    CONFIG_DIR="$TMP/direct-$layout/confs"
-    LEGACY_CONFIG_FILE="$TMP/direct-$layout/config.json"
-    mkdir -p "$CONFIG_DIR"
-    printf '{"inbounds":[]}' > "$LEGACY_CONFIG_FILE"
-    [ "$layout" != confdir ] || printf '{"inbounds":[]}' > "$CONFIG_DIR/07_inbounds.json"
-    INIT_SYSTEM=direct XRAY_DEPLOY_CORE_LOCK_HELD=1
-    _xd_pidfile_pid() { printf '%s' "$$"; }
-    _xd_pidfile_identity_ok() { return 1; }
-    _xd_pidfile_write() { :; }
-    sleep() { :; }
-    rm() { [ "$1" = -f ] && [ "$2" = /run/xray.pid ]; }
-    cat() { if [ "$1" = "/proc/$$/comm" ]; then printf xray; else command cat "$@"; fi; }
-    nohup() { printf '%s\n' "$@" > "$TMP/direct-$layout/args"; }
-    _manage_xray start >/dev/null 2>&1
-    wait
-    local expected=-config source="$LEGACY_CONFIG_FILE"
-    if [ "$layout" = confdir ]; then expected=-confdir; source="$CONFIG_DIR"; fi
-    [ "$(sed -n '3p' "$TMP/direct-$layout/args")" = "$expected" ] &&
-        [ "$(sed -n '4p' "$TMP/direct-$layout/args")" = "$source" ]
-)
-check 'direct restored legacy service starts from existing single file' _test_direct_config_source legacy
-check 'direct migrated service prefers nonempty confdir' _test_direct_config_source confdir
-
 # B13c: reset 快照恢复经 JQ_MERGE_OBJECTS 合并配置片段。
 _reset_restore_stage="$TMP/reset-restore-stage"
 _reset_restore_dir="$TMP/reset-restore-confs"
@@ -1647,6 +1491,7 @@ _test_reset_snapshot_restore() {
     _reset_fsync_required() { return 0; }
     rm -rf "$_reset_restore_stage" "$_reset_restore_dir"
     mkdir -p "$_reset_restore_stage/confs" "$_reset_restore_dir"
+    printf '{"version":{"min":"26.4.25","max":""}}' > "$_reset_restore_stage/confs/15_version.json"
     printf '%s\n' '{"log":{"loglevel":"debug"}}' > "$_reset_restore_stage/confs/02_log.json"
     printf '%s\n' '{"inbounds":[{"tag":"a"}]}' > "$_reset_restore_stage/confs/07_inbounds.json"
     DEPLOY_DIR="$TMP/reset-restore-deploy" CONFIG_DIR="$_reset_restore_dir"
@@ -1676,7 +1521,7 @@ _test_reset_snapshot_missing() {
 check 'reset snapshot restore keeps scene when fragments are missing' _test_reset_snapshot_missing
 
 
-# B13 guard: 混装旧 lib(缺 JQ_MERGE_OBJECTS)时明确拒绝, 不走 unbound variable 通用失败。
+# B13 guard: 缺少 JQ_MERGE_OBJECTS 时明确拒绝, 不走 unbound variable 通用失败。
 _test_reset_restore_mixed_lib() {
     local stage="$TMP/reset-mixed-stage" dir="$TMP/reset-mixed-confs" out ok=0
     rm -rf "$stage" "$dir"
@@ -1717,7 +1562,7 @@ else
     fail '_flock_ensure 副本漂移: install.sh 与 lib/00-common.sh 不一致'
 fi
 # 专属行为套件在独立进程内运行, 不泄漏服务/配置桩到本套件。
-for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
+for suite in test-negative-controls.sh test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then
         tail -n 1 "$TMP/$suite.log"
         pass "alignment suite $suite"

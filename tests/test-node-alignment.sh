@@ -39,7 +39,11 @@ multi_delete_routing() (
     _with_config_lock() { "$@"; }
     _backup_config() { return 0; }
     _restart_xray_verified() { return 0; }
-    _config_write_merged '{"inbounds":[{"tag":"tun-a"},{"tag":"tun-b"},{"tag":"node-1"}],"routing":{"rules":[{"inboundTag":["tun-a"],"outboundTag":"direct"},{"inboundTag":["tun-a","other"],"outboundTag":"block"},{"inboundTag":"tun-a","outboundTag":"scalar"},{"inboundTag":"tun-a,tun-b","outboundTag":"scalar-list"},{"inboundTag":"tun-ab","outboundTag":"prefix-keep"},{"inboundTag":["tun-ab"],"outboundTag":"prefix-keep2"},{"inboundTag":["keep"],"outboundTag":"direct"},{"inboundTag":null,"outboundTag":"block"}]}}' || exit 1
+    _reset_journal_path() { printf '%s\n' "$STATE_DIR/reset.txn"; }
+    _core_txn_pending_probe() { return 0; }
+    _with_core_lock() { "$@"; }
+    _txn_allow_config_write() { _with_core_lock _core_txn_pending_probe; }
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"inbounds":[{"tag":"tun-a"},{"tag":"tun-b"},{"tag":"node-1"}],"routing":{"rules":[{"inboundTag":["tun-a"],"outboundTag":"direct"},{"inboundTag":["tun-a","other"],"outboundTag":"block"},{"inboundTag":"tun-a","outboundTag":"scalar"},{"inboundTag":"tun-a,tun-b","outboundTag":"scalar-list"},{"inboundTag":"tun-ab","outboundTag":"prefix-keep"},{"inboundTag":["tun-ab"],"outboundTag":"prefix-keep2"},{"inboundTag":["keep"],"outboundTag":"direct"},{"inboundTag":null,"outboundTag":"block"}]}}' || exit 1
     printf '{"tag":"node-1","name":"n","protocol":"vless-tcp-reality-vision","tunnel_tag":"tun-a"}' > "$NODES_DIR/node-1.json"
     _hy2_hop_teardown_all() { return 0; }
     _hy2_filter_skipped() { _HY2_DEL_KEEP=("$@"); }
@@ -179,6 +183,11 @@ done
 eval "$actual_config_jq"
 _with_config_lock() { "$@"; }
 _restart_xray_verified() { return 0; }
+# 真实事务闸门要求 reset/core 探测 helper 存在；本套件不创建任何未收敛账本。
+_reset_journal_path() { printf '%s\n' "$STATE_DIR/reset.txn"; }
+_core_txn_pending_probe() { return 0; }
+_with_core_lock() { "$@"; }
+_txn_allow_config_write() { _with_core_lock _core_txn_pending_probe; }
 _warn() { printf '%s\n' "$*" >> "$TMP/warnings"; }
 reality_fixture() {
     local dir="$1" shared="$2" addr_key="$3" peer_host="${4:-127.0.0.1}"
@@ -186,7 +195,7 @@ reality_fixture() {
     BACKUP_DIR="$TMP/$dir/backup" CLASH_YAML="$TMP/$dir/clash.yaml"
     mkdir -p "$CONFIG_DIR" "$NODES_DIR"
     jq -n --arg key "$addr_key" --arg peer "$peer_host:10443" --argjson shared "$shared" '
-        {inbounds:[
+        {version:{min:"26.4.25",max:""},inbounds:[
             {tag:"xd-reality-vision-443",protocol:"vless",port:443,
              streamSettings:{network:"raw",security:"reality",realitySettings:{target:"127.0.0.1:10443",serverNames:["site.example"]}}},
             {tag:"tunnel-site-10443-443",protocol:"tunnel",listen:"127.0.0.1",port:10443,
@@ -407,7 +416,7 @@ consts_probe() {
     printf '%s' '{"auth":"pw","link_addr":"1.2.3.4","port":443,"congestion":"bbr","name":"n1","sni":"custom.example"}' > "$meta"
     link=$(_rebuild_hy2_link "$meta") || return 1
     [[ "$link" == *"sni=custom.example"* ]] || return 1
-    hopdel=$(jq "$XD_HOP_JQ_DEL_FIELDS" <<< '{"port":123,"hop_ranges":["1:2"],"hop_start":1,"hop_end":2,"udp_hop_ports":[1],"other":"x"}') || return 1
+    hopdel=$(jq "$XD_HOP_JQ_DEL_FIELDS" <<< '{"port":123,"hop_ranges":"1-2","other":"x"}') || return 1
     [ "$(jq -c . <<< "$hopdel")" = '{"port":123,"other":"x"}' ] || return 1
     ind=$(jq "$XD_NODE_JQ_DEL_INBOUND" --arg t b <<< '{"inbounds":[{"tag":"a"},{"tag":"b"},"scalar",{"no":"tag"}]}') || return 1
     [ "$(jq -c . <<< "$ind")" = '{"inbounds":[{"tag":"a"},"scalar",{"no":"tag"}]}' ] || return 1
@@ -486,7 +495,7 @@ check 'nft-only cleanup: no hop metadata and clean nft succeeds' nft_cleanup_pla
 nft_cleanup_meta_probe() {
     local rc=0
     : > "$TMP/warnings"
-    printf '%s' '{"protocol":"hysteria2","port":443,"hop_ranges":["10000:10010"]}' > "$NODES_DIR/hop.json"
+    printf '%s' '{"protocol":"hysteria2","port":443,"hop_ranges":"10000-10010"}' > "$NODES_DIR/hop.json"
     NFT_OUT='' NFT_RC=0
     _hy2_cleanup_all_hops || rc=$?
     eq "$rc" 0 && grep -qF '按无残留继续清理' "$TMP/warnings"
@@ -496,7 +505,7 @@ check 'nft-only cleanup: hop metadata continues when nft proves clean' nft_clean
 nft_cleanup_residual_probe() {
     local rc=0
     : > "$TMP/errors"
-    printf '%s' '{"protocol":"hysteria2","port":443,"hop_ranges":["10000:10010"]}' > "$NODES_DIR/hop.json"
+    printf '%s' '{"protocol":"hysteria2","port":443,"hop_ranges":"10000-10010"}' > "$NODES_DIR/hop.json"
     NFT_OUT='table ip nat { chain PREROUTING { counter comment "xray-deploy-hy2-hop" } }' NFT_RC=0
     _hy2_cleanup_all_hops || rc=$?
     eq "$rc" 1 && grep -qF '已保留节点数据' "$TMP/errors"
@@ -560,7 +569,7 @@ nft_cleanup_legacy_v6_probe() {
     local rc=0
     : > "$TMP/errors"
     printf 'nat\n' > "$TMP/nft-proc/ip6_tables_names"
-    printf '%s' '{"protocol":"hysteria2","port":443,"hop_ranges":["10000:10010"]}' > "$NODES_DIR/hop.json"
+    printf '%s' '{"protocol":"hysteria2","port":443,"hop_ranges":"10000-10010"}' > "$NODES_DIR/hop.json"
     NFT_OUT='' NFT_RC=0
     _hy2_cleanup_all_hops || rc=$?
     rm -f "$TMP/nft-proc/ip6_tables_names"
@@ -571,6 +580,62 @@ check 'nft-only cleanup: legacy IPv6 nat registry keeps hop metadata undeleted' 
 PATH="$nft_saved_path"
 NODES_DIR="$nft_saved_nodes"
 unset HY2_IPTABLES_DIR HY2_INITD_DIR HY2_CONF_DIR HY2_PROC_NET
+
+# Reality metadata 未记录 reality_mode/tunnel_port 时仍须可重建链接/改端口;
+# 自动采纳的 tunnel 节点必须同时写入 tunnel_port。
+reality_link_without_mode_probe() (
+    local meta="$TMP/reality-without-mode.json" link
+    jq -n '{tag:"xd-reality-vision-443",protocol:"vless-tcp-reality-vision",port:443,
+            name:"n1",uuid:"id",link_addr:"edge.example",sni:"site.example",
+            public_key:"key",short_id:"abcd"}' > "$meta" || return 1
+    link=$(_rebuild_reality_link "$meta") || return 1
+    case "$link" in "vless://id@edge.example:443?"*"#n1") return 0 ;; *) return 1 ;; esac
+)
+check 'Reality metadata without reality_mode rebuilds its link' reality_link_without_mode_probe
+
+missing_tunnel_port_probe() (
+    reality_fixture "missing-tunnel-port" false rewriteAddress || return 1
+    jq 'del(.tunnel_port)' "$NODES_DIR/xd-reality-vision-443.json" > "$TMP/missing-tunnel-port.json" || return 1
+    mv "$TMP/missing-tunnel-port.json" "$NODES_DIR/xd-reality-vision-443.json" || return 1
+    local rc=0
+    _reality_port_txn xd-reality-vision-443 "$NODES_DIR/xd-reality-vision-443.json" 443 8443 || rc=$?
+    eq "$rc" 0 &&
+        jq -e '.port == 8443 and .tunnel_tag == "tunnel-site-10443-8443" and .tunnel_port == 10443' "$NODES_DIR/xd-reality-vision-8443.json"
+)
+check 'missing tunnel_port is derived from config and backfilled' missing_tunnel_port_probe
+
+adopt_tunnel_port_probe() (
+    reality_fixture "adopt-tunnel-port" false rewriteAddress || return 1
+    rm -f "$NODES_DIR/xd-reality-vision-443.json"
+    _adopt_single_inbound_write xd-reality-vision-443 adopted || return 1
+    jq -e '.tunnel_tag == "tunnel-site-10443-443" and .tunnel_port == 10443 and .reality_mode == "tunnel"' "$NODES_DIR/xd-reality-vision-443.json"
+)
+check 'adopted tunnel metadata includes tunnel_port' adopt_tunnel_port_probe
+
+# 方案要求: 合法 hop_ranges 与冗余键并存时仍按 hop_ranges 读取, 不因额外键失效。
+dual_write_hop_read_probe() (
+    local meta="$TMP/dual-hop.json"
+    printf '%s' '{"hop_ranges":"40000-40010","udp_hop_ports":"40000-40010","hop_start":40000,"hop_end":40010}' > "$meta" || return 1
+    [ "$(_read_hop_ranges_raw "$meta")" = "40000-40010" ]
+)
+check 'dual-write hop metadata stays readable through hop_ranges' dual_write_hop_read_probe
+
+# 无关/损坏 metadata 不阻塞卸载/reset。
+hop_cleanup_ignores_unrelated_metadata_probe() (
+    local dir="$TMP/hop-cleanup-unrelated" saved="$NODES_DIR" rc=0
+    NODES_DIR="$dir/nodes"; mkdir -p "$NODES_DIR"
+    printf '{bad json' > "$NODES_DIR/bad.json"
+    printf '%s' '{"protocol":"vless","tag":"r","port":443}' > "$NODES_DIR/reality.json"
+    iptables() { return 0; }
+    _hy2_hop_cleanup_candidates() { return 0; }
+    _hy2_persist_iptables() { return 0; }
+    _hy2_no_hop_rules_at_all() { return 0; }
+    _warn() { :; }
+    _hy2_cleanup_all_hops || rc=$?
+    NODES_DIR="$saved"
+    [ "$rc" -eq 0 ]
+)
+check 'hop cleanup skips unrelated/corrupt metadata' hop_cleanup_ignores_unrelated_metadata_probe
 
 printf 'node-alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

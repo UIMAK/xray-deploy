@@ -8,6 +8,9 @@ trap 'rm -rf "$TMP"' EXIT
 # 依赖缺失必须显式失败: 否则 jq 桩退路会让断言以错误原因"通过"。
 command -v jq >/dev/null 2>&1 || { echo 'FAIL - jq is required' >&2; exit 1; }
 . "${XRAY_COMMON_TEST_SOURCE:-$ROOT/lib/00-common.sh}"
+. "$ROOT/lib/20-xray-core.sh"
+. "$ROOT/lib/30-geo.sh"
+. "$ROOT/lib/50-nodes.sh"
 _fsync_path() { :; }
 PASS=0 FAIL=0
 check() {
@@ -20,10 +23,12 @@ check() {
 # 用 $1 作目录名, 每次重建 confs 与 confs.lastbak。
 setup_case() {
     local name="$1"
+    DEPLOY_DIR="$TMP/$name"
     CONFIG_DIR="$TMP/$name/confs"
     BACKUP_DIR="$TMP/$name/backups"
     rm -rf "${TMP:?}/$name"
     mkdir -p "$CONFIG_DIR" "$BACKUP_DIR/confs.lastbak"
+    printf '{"version":{"min":"26.4.25","max":""}}' > "$CONFIG_DIR/15_version.json"
 }
 
 producer_failure() (
@@ -41,7 +46,7 @@ producer_failure() (
         fi
         command jq "$@"
     }
-    _config_write_merged '{"log":{"loglevel":"error"}}' >/dev/null 2>&1; rc=$?
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"error"}}' >/dev/null 2>&1; rc=$?
     [ "$rc" -ne 0 ] && cmp -s "$CONFIG_DIR/02_log.json" "$TMP/original-log" &&
         cmp -s "$CONFIG_DIR/07_inbounds.json" "$TMP/original-inbounds"
 )
@@ -59,15 +64,15 @@ partial_commit() (
     local n=0
     _atomic_write_json() {
         n=$((n+1))
-        [ "$n" -ge 2 ] && return 1
+        [ "$n" -ge 3 ] && return 1
         command mkdir -p "$(dirname "$1")" && printf '%s' "$2" > "$1"
     }
-    _config_write_merged '{"log":{"loglevel":"error"},"inbounds":[{"tag":"x"}]}' >/dev/null 2>&1
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"error"},"inbounds":[{"tag":"x"}]}' >/dev/null 2>&1
     rc=$?
-    # 失败时不得报告成功; 且必须证明失败发生在首个片段已落盘之后(n=2),
+    # 失败时不得报告成功; 且必须证明失败发生在首个片段已落盘之后(n=3),
     # 否则断言可能因"写入前就失败"而假通过, 没覆盖真正的半提交窗口。
     # 契约: 失败由调用方清理, 这里核对首片段已变为新值、次片段保持原字节。
-    [ "$rc" -ne 0 ] && [ "$n" -eq 2 ] &&
+    [ "$rc" -ne 0 ] && [ "$n" -eq 3 ] &&
         jq -e '.log.loglevel == "error"' "$CONFIG_DIR/02_log.json" >/dev/null 2>&1 &&
         cmp -s "$CONFIG_DIR/07_inbounds.json" "$TMP/pc-inbounds"
 )
@@ -113,6 +118,7 @@ check 'zero-fragment lastbak fails closed and keeps live bytes' empty_backup_dir
 empty_object_restore() (
     printf '{"log":{"loglevel":"debug"}}' > "$CONFIG_DIR/02_log.json"
     printf '{}' > "$BACKUP_DIR/confs.lastbak/02_log.json"
+    printf '{"version":{"min":"26.4.25","max":""}}' > "$BACKUP_DIR/confs.lastbak/15_version.json"
     _restore_config >/dev/null 2>&1 || return 1
     [ ! -e "$CONFIG_DIR/02_log.json" ]
 )
@@ -131,13 +137,110 @@ check 'valid fragment plus empty fragment rejects the entire restore' mixed_rest
 
 valid_roundtrip() (
     setup_case roundtrip
-    _config_write_merged '{"log":{"loglevel":"warning"},"customTop":{"text":"a\nb"},"inbounds":[]}' || return 1
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"},"customTop":{"text":"a\nb"},"inbounds":[]}' || return 1
     cp "$CONFIG_DIR"/*.json "$BACKUP_DIR/confs.lastbak/" || return 1
-    _config_write_merged '{"log":{"loglevel":"debug"},"dns":{"servers":[]}}' || return 1
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"debug"},"dns":{"servers":[]}}' || return 1
     _restore_config >/dev/null 2>&1 || return 1
     _config_jq -e '.log.loglevel == "warning" and .customTop.text == "a\nb" and .inbounds == [] and (has("dns") | not)' >/dev/null
 )
 check 'valid backup restores normal and unknown fields and removes stale files' valid_roundtrip
+
+# 新装必须一次性写出精确版本片段; 缺片段必须在写入前失败并保留现场。
+config_layout_and_init() (
+    setup_case layout-init
+    rm -f "$CONFIG_DIR/15_version.json"
+    _config_present && return 1
+    _init_config_if_empty >/dev/null 2>&1 || return 1
+    _config_jq -e '.version == {"min":"26.4.25","max":""}' >/dev/null 2>&1 || return 1
+
+    rm -f "$CONFIG_DIR"/*.json
+    _init_config_if_empty >/dev/null 2>&1 || return 1
+    _config_jq -e '.version == {"min":"26.4.25","max":""}
+        and (.inbounds | type == "array")
+        and (.outbounds | type == "array")' >/dev/null 2>&1 || return 1
+
+    rm -f "$CONFIG_DIR"/*.json
+    printf '%s' '{"log":{"loglevel":"debug"}}' > "$CONFIG_DIR/02_log.json"
+    cp "$CONFIG_DIR/02_log.json" "$TMP/init-missing-version"
+    ! _config_layout_supported >/dev/null 2>&1 || return 1
+    ! _init_config_if_empty >/dev/null 2>&1 || return 1
+    cmp -s "$CONFIG_DIR/02_log.json" "$TMP/init-missing-version" || return 1
+    [ "$(find "$CONFIG_DIR" -maxdepth 1 -type f | wc -l)" -eq 1 ]
+)
+check 'empty init writes exact version and missing version fails closed' config_layout_and_init
+
+unmanaged_config_preserved() (
+    setup_case old-layout
+    rm -f "$CONFIG_DIR/15_version.json"
+    printf '%s' '{"inbounds":[]}' > "$DEPLOY_DIR/config.json"
+    cp "$DEPLOY_DIR/config.json" "$TMP/old-layout-before"
+    ! _config_layout_supported >/dev/null 2>&1 || return 1
+    ! _init_config_if_empty >/dev/null 2>&1 || return 1
+    cmp -s "$DEPLOY_DIR/config.json" "$TMP/old-layout-before" &&
+        [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -type f -print -quit)" ]
+)
+check 'unmanaged config.json is rejected without side effects' unmanaged_config_preserved
+
+# 走真实 _mutate_config: DNS、路由、Geo 和节点各写一次, 每次都核对精确 version 片段。
+version_preserved_by_mutations() (
+    setup_case version-mutations
+    mkdir -p "$BACKUP_DIR" "$STATE_DIR" "$ASSET_DIR" "$NODES_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$TMP/version-mutations-xray"
+    chmod +x "$TMP/version-mutations-xray"
+    XRAY_BIN="$TMP/version-mutations-xray"
+    printf 'geo' > "$ASSET_DIR/geosite.dat"
+    printf 'geo' > "$ASSET_DIR/geoip.dat"
+    _state_set() { :; }
+    _deploy_lock_root() { printf '%s' "$TMP/version-mutations-locks"; }
+    mkdir -p "$TMP/version-mutations-locks"
+    _with_config_lock() { "$@"; }
+    _txn_allow_config_write() { return 0; }
+    _backup_config() { return 0; }
+    _restart_xray_verified() { return 0; }
+    _config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"},"routing":{"rules":[]},"inbounds":[],"outbounds":[]}' || return 1
+    _dns_apply '.dns = {"servers":["1.1.1.1"]}' || return 1
+    _config_jq -e '.version == {"min":"26.4.25","max":""}' >/dev/null 2>&1 || return 1
+    _mutate_config '.routing.rules = [{"inboundTag":["node-a"],"outboundTag":"direct"}]' || return 1
+    _config_jq -e '.version == {"min":"26.4.25","max":""}' >/dev/null 2>&1 || return 1
+    _geo_set_auto_update on || return 1
+    _config_jq -e '.version == {"min":"26.4.25","max":""} and (.geodata.cron | length > 0)' >/dev/null 2>&1 || return 1
+    _commit_inbound '{"tag":"node-a","protocol":"freedom"}' || return 1
+    _config_jq -e '.version == {"min":"26.4.25","max":""}
+        and any(.inbounds[]?; .tag == "node-a")' >/dev/null 2>&1
+)
+check 'DNS, routing, geodata and node mutations preserve version' version_preserved_by_mutations
+
+# 安装器会立即执行主流程, 因此只抽取清单解析函数到独立测试环境。
+install_manifest_trailer() (
+    local defs dir keep before rc
+    defs=$(sed -n '/^_install_snapshot_rel_ok()/,/^}/p; /^_install_snapshot_read_entries()/,/^}/p' "$ROOT/install.sh") || return 1
+    case "$defs" in
+        *_install_snapshot_rel_ok*_install_snapshot_read_entries*) ;;
+        *) return 1 ;;
+    esac
+    eval "$defs"
+    DEPLOY_DIR="$TMP/install-manifest"
+    dir="$DEPLOY_DIR/.install-rollback.1"
+    keep="$dir/.KEEP"
+    rm -rf "$DEPLOY_DIR"; mkdir -p "$dir"
+    printf '#!/bin/sh\n' > "$dir/xray-deploy.sh"
+    printf '1\n' > "$dir/VERSION"
+    printf 'xray-install-backup-v2\npresent xray-deploy.sh\npresent VERSION\ncomplete\n' > "$keep"
+    _install_snapshot_read_entries "$dir" 0 >/dev/null || return 1
+    before="$TMP/install-manifest-good"
+    cp "$keep" "$before"
+
+    printf 'xray-install-backup-v2\npresent xray-deploy.sh\npresent VERSION\ncomplete 2 123 456\n' > "$keep"
+    cp "$keep" "$before"
+    _install_snapshot_read_entries "$dir" 0 >/dev/null 2>&1; rc=$?
+    [ "$rc" -ne 0 ] && cmp -s "$keep" "$before" || return 1
+
+    printf 'xray-install-backup-v2\npresent xray-deploy.sh\npresent VERSION\ncomplete\ntrailing\n' > "$keep"
+    cp "$keep" "$before"
+    _install_snapshot_read_entries "$dir" 0 >/dev/null 2>&1; rc=$?
+    [ "$rc" -ne 0 ] && cmp -s "$keep" "$before"
+)
+check 'install manifest accepts only exact complete trailer and preserves rejected snapshots' install_manifest_trailer
 
 printf 'common regressions passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

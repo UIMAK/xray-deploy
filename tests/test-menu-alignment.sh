@@ -42,7 +42,6 @@ fi
 
     DEPLOY_DIR="$TMP/deploy"
     CONFIG_DIR="$DEPLOY_DIR/confs"
-    LEGACY_CONFIG_FILE="$DEPLOY_DIR/config.json"
     NODES_DIR="$DEPLOY_DIR/nodes"
     BACKUP_DIR="$DEPLOY_DIR/backups"
     STATE_DIR="$DEPLOY_DIR/state"
@@ -92,6 +91,7 @@ fi
     fixture() {
         local cc="$1" up="$2" down="${3-90 mbps}"
         CONFIG_FAIL=no
+        printf '{"version":{"min":"26.4.25","max":""}}' > "$CONFIG_DIR/15_version.json"
         jq -n --arg t "$TAG" --arg cc "$cc" --arg up "$up" --arg down "$down" '
             {inbounds: [
                 {tag: $t, protocol: "hysteria", port: 443,
@@ -490,12 +490,10 @@ fi
             _success() { printf '%s\n' "$*" >> "$TMP/success"; }
             _reset_config_recover() { return 0; }
             _xray_core_txn_recover() { return 0; }
-            _config_migrate_legacy() { return 0; }
             _port_txn_recover() { return 0; }
             _auto_tag_tagless_inbounds() { return 0; }
             _auto_adopt_orphans() { return 0; }
             _auto_ensure_config_env() { return 0; }
-            _auto_migrate_geo_autoupdate() { return 0; }
             _manage_xray() { printf '%s\n' "$*" >> "$TMP/service-calls"; return "$STOP_RC"; }
             # 12 = 主菜单的 [停止 Xray]; 编号变更时同步 lib/90-menu.sh 的 case 分支。
             _main_menu <<< $'12\n0'
@@ -533,7 +531,7 @@ fi
         BACKUP_DIR="$dir/backups" STATE_DIR="$dir/state" CLASH_YAML="$dir/clash.yaml"
         XRAY_BIN="$dir/bin/xray"
         mkdir -p "$CONFIG_DIR" "$NODES_DIR" "$BACKUP_DIR" "$STATE_DIR"
-        _config_write_merged '{"inbounds":[]}' >/dev/null 2>&1 || return 1
+        _config_write_merged '{"version":{"min":"26.4.25","max":""},"inbounds":[]}' >/dev/null 2>&1 || return 1
         local snapshot="$dir/.reset-snapshot"
         mkdir -p "$snapshot"
         # 模拟"已收敛但残留未清": 收敛返回 0, 快照仍在。
@@ -545,7 +543,7 @@ fi
         _reset_fsync_rename() { return 0; }
         _hy2_hop_cleanup_candidates() { return 0; }
         _hy2_cleanup_all_hops() { return 0; }
-        _init_config_if_empty() { _config_write_merged '{"inbounds":[]}' >/dev/null 2>&1; }
+        _init_config_if_empty() { _config_write_merged '{"version":{"min":"26.4.25","max":""},"inbounds":[]}' >/dev/null 2>&1; }
         _restart_xray_verified() { return 0; }
         _reset_config_locked >/dev/null 2>&1
         local rc=$?
