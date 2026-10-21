@@ -558,10 +558,13 @@ trap cleanup EXIT
 
     # P0: 8s 采样必须建立在真实 restart 之后; 只采样会把"旧进程仍 running"误判为成功。
     restart_verified_restarts_first() (
-        local actions="$TMP/restart-actions"
-        : > "$actions"
+        local actions="$TMP/restart-actions" marker="$TMP/restart-identity"
+        : > "$actions"; : > "$marker"
         XRAY_DEPLOY_CORE_LOCK_HELD=1
         eval "$verified_restart_definition"
+        _xray_proc_identity() {
+            if [ -s "$marker" ]; then printf '2:2'; else printf '1:1' > "$marker"; printf '1:1'; fi
+        }
         _manage_xray() {
             printf '%s\n' "$1" >> "$actions"
             [ "$1" = status ] && printf 'running'
@@ -569,7 +572,7 @@ trap cleanup EXIT
         }
         sleep() { :; }
         _restart_xray_verified || return 1
-        [ "$(command head -n 1 "$actions")" = restart ]
+        command grep -qx restart "$actions"
     )
 
     # restart 失败但旧进程仍在: 身份未变化必须判失败, 不能只凭 running 状态。
@@ -579,6 +582,23 @@ trap cleanup EXIT
         sleep() { :; }
         _xray_proc_identity() { printf '123:456'; }
         _manage_xray() { [ "$1" = status ] && printf 'running'; return 0; }
+        ! _restart_xray_verified
+    )
+
+    # 身份读不到不能当作"进程已更换": 重启前或重启后任一读不到都必须 fail-closed。
+    restart_verified_requires_readable_identity() (
+        XRAY_DEPLOY_CORE_LOCK_HELD=1
+        eval "$verified_restart_definition"
+        sleep() { :; }
+        _manage_xray() { [ "$1" = status ] && printf 'running'; return 0; }
+        _xray_proc_identity() { return 1; }
+        _restart_xray_verified && return 1
+        local marker="$TMP/xray-id-once"
+        : > "$marker"
+        _xray_proc_identity() {
+            if [ -s "$marker" ]; then return 1; fi
+            printf '1:1' > "$marker"; printf '1:1'
+        }
         ! _restart_xray_verified
     )
 
@@ -621,6 +641,7 @@ trap cleanup EXIT
     check 'dead-PID direct pidfile is cleared instead of blocking recovery' direct_stale_pidfile_cleaned
     check 'verified restart actually restarts before sampling' restart_verified_restarts_first
     check 'verified restart rejects unchanged old process identity' restart_verified_rejects_unchanged_identity
+    check 'verified restart fails closed when identity is unreadable' restart_verified_requires_readable_identity
     check 'uninstall checks logrotate helper before deleting entrypoints' uninstall_cleanup_contract
     check '26.6.1 and 26.9.8 gates and masquerade key set' version_gate_matrix
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"

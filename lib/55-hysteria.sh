@@ -590,7 +590,9 @@ _hysteria_proc_identity() {
     local pid="" st=""
     case "$INIT_SYSTEM" in
         systemd)
-            pid=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null) || return 1
+            pid=$(systemctl show -p MainPID --value "$HYSTERIA_SVC" 2>/dev/null) || pid=""
+            # systemd < 230 不支持 --value: 退回解析非 value 输出。
+            [ -n "$pid" ] || pid=$(systemctl show -p MainPID "$HYSTERIA_SVC" 2>/dev/null | sed -n 's/^MainPID=//p')
             [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "0" ] || return 1
             ;;
         openrc)
@@ -608,22 +610,36 @@ _hysteria_proc_identity() {
 }
 
 _hysteria_restart_verified() {
-    # 记录重启前身份: restart 失败但旧进程仍 running 时, 仅凭 status 会误判成功。
-    local before="" after=""
+    # 运行中的服务必须先拿到身份, 否则无法证明旧进程已退出; 身份不可读直接拒绝。
+    local before="" after="" was_running=0
+    if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then was_running=1; fi
     before=$(_hysteria_proc_identity 2>/dev/null) || before=""
+    if [ "$was_running" -eq 1 ] && [ -z "$before" ]; then
+        _error "Hysteria 正在运行但无法确认进程身份, 拒绝重启(无法验证旧进程已退出)"
+        return 1
+    fi
     _manage_hysteria restart 2>/dev/null
     if [ "$(_manage_hysteria status 2>/dev/null)" != "running" ]; then
         _manage_hysteria start 2>/dev/null
-    fi
-    after=$(_hysteria_proc_identity 2>/dev/null) || after=""
-    if [ -n "$before" ] && [ "$before" = "$after" ]; then
-        _error "Hysteria 重启后进程身份未变化($before), 旧进程仍在运行"
-        return 1
     fi
     for _ in 1 2 3 4 5 6 7 8; do
         sleep 1
         [ "$(_manage_hysteria status 2>/dev/null)" = "running" ] || return 1
     done
+    # 重启后必须有可读身份; 重试几次避免瞬时读取失败, 仍失败则 fail-closed。
+    for _ in 1 2 3; do
+        after=$(_hysteria_proc_identity 2>/dev/null) || after=""
+        [ -n "$after" ] && break
+        sleep 1
+    done
+    if [ -z "$after" ]; then
+        _error "Hysteria 重启后无法确认进程身份, 拒绝判定成功"
+        return 1
+    fi
+    if [ "$was_running" -eq 1 ] && [ "$after" = "$before" ]; then
+        _error "Hysteria 重启后进程身份未变化($before), 旧进程仍在运行"
+        return 1
+    fi
     return 0
 }
 

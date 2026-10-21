@@ -256,5 +256,22 @@ hysteria_restart_rejects_unchanged_identity() (
 )
 check 'hysteria restart rejects unchanged old process identity' hysteria_restart_rejects_unchanged_identity
 
+# 身份读不到不能当作"进程已更换": 重启前或重启后任一读不到都必须 fail-closed。
+hysteria_restart_requires_readable_identity() (
+    INIT_SYSTEM=direct
+    sleep() { :; }
+    _manage_hysteria() { [ "$1" = status ] && printf 'running'; return 0; }
+    _hysteria_proc_identity() { return 1; }
+    _hysteria_restart_verified && return 1
+    local marker="$TMP/hy-id-once"
+    : > "$marker"
+    _hysteria_proc_identity() {
+        if [ -s "$marker" ]; then return 1; fi
+        printf '1:1' > "$marker"; printf '1:1'
+    }
+    ! _hysteria_restart_verified
+)
+check 'hysteria restart fails closed when identity is unreadable' hysteria_restart_requires_readable_identity
+
 printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
