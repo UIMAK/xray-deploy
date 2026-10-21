@@ -150,8 +150,8 @@ _main_menu() {
         _tip "请在交互式终端中运行 xd(或为 stdin 连接一个 tty)"
         exit 1
     fi
-    # 启动链：reset → core → layout → port → tag → adopt → env。
-    # reset/core 先分别恢复；任一失败阻塞 layout 至 env，layout/port/tag/adopt 失败停止后续。
+    # 启动链：reset → core → port → tag → adopt → env。
+    # reset/core 先分别恢复；任一失败阻塞 port 至 env，port/tag/adopt 失败停止后续。
     RESET_RECOVERY_FAILED=0
     local reset_rc=0
     if ! declare -F _reset_config_recover >/dev/null 2>&1; then
@@ -177,16 +177,10 @@ _main_menu() {
         CORE_RECOVERY_FAILED=1
         _error "Xray 核心事务未收敛(账本/恢复源已保留): 已跳过全部启动期 config 维护, 请处理后重启脚本"
     fi
-    # layout/port/tag/adopt 失败置阻塞，防止叠加写入。
+    # port/tag/adopt 失败置阻塞，防止叠加写入。
     STARTUP_MAINT_BLOCKED=0
     if [ "$RESET_RECOVERY_FAILED" -ne 0 ] || [ "$CORE_RECOVERY_FAILED" -ne 0 ]; then
         STARTUP_MAINT_BLOCKED=1
-    fi
-    if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
-        if ! _config_layout_supported; then
-            STARTUP_MAINT_BLOCKED=1
-            _error "配置布局不受支持, 已停止后续启动维护"
-        fi
     fi
     if [ "$STARTUP_MAINT_BLOCKED" -eq 0 ]; then
         # port 恢复先于普通写入；未收敛账本会使写闸门拒绝。

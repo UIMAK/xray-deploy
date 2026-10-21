@@ -370,25 +370,5 @@ for scenario in forceDown ordinaryUp ordinaryDown; do
     done
 done
 
-# 未纳入管理的 config.json 必须 fail closed: 不写 confs、不创建/重启服务, 且文件逐字保留。
-unmanaged=$(jq -n --argjson ws "$ws" --argjson ss "$ss" --argjson hy "$hy" \
-    --arg asset "$ASSET_DIR" \
-    '{env:{XRAY_LOCATION_ASSET:$asset},log:{loglevel:"warning"},routing:{rules:[]},
-      inbounds:[$ws,$ss,$hy],outbounds:[{protocol:"freedom",tag:"direct"}]}')
-unmanaged_file="$DEPLOY_DIR/config.json"
-unmanaged_bytes=$(printf '%s' "$unmanaged" | jq -cS .)
-printf '%s\n' "$unmanaged" > "$unmanaged_file"
-: > "$scratch/service-calls"
-if _config_layout_supported > "$scratch/layout.log" 2>&1; then
-    record FAIL 'unmanaged-config-rejected (accepted config.json)'
-elif ! grep -qF '检测到未纳入管理的配置文件' "$scratch/layout.log"; then
-    record FAIL 'unmanaged-config-rejected (wrong diagnostic)'
-elif [ "$(jq -cS . "$unmanaged_file")" != "$unmanaged_bytes" ] || \
-     find "$CONFIG_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q . || \
-     [ -s "$scratch/service-calls" ]; then
-    record FAIL 'unmanaged-config-rejected (mutation or service side effect)'
-else
-    record PASS 'unmanaged-config-rejected (file retained, no confs or service writes)'
-fi
 printf 'RESULT: %s passed, %s failed, %s skipped\n' "$passed" "$failed" "$skipped"
 [ "$failed" -eq 0 ]

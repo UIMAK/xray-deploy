@@ -197,7 +197,6 @@ _cron_init() {
     if ! _ensure_base_deps >/dev/null 2>&1; then
         _warn "基础依赖安装失败, 部分功能可能不可用(cron 子命令可能失败)"
     fi
-    _config_layout_supported || return 1
 }
 
 # 主调度

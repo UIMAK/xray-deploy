@@ -610,17 +610,7 @@ _config_layout_valid() {
     return 0
 }
 
-# 合并管理器的一字段一文件布局(输出到 stdout)。
-_config_layout_supported() {
-    if [ -e "$DEPLOY_DIR/config.json" ] || [ -L "$DEPLOY_DIR/config.json" ]; then
-        _error "检测到未纳入管理的配置文件: $DEPLOY_DIR/config.json; 请先移走后重试"
-        return 1
-    fi
-    return 0
-}
-
 _config_merged() {
-    _config_layout_supported || return 1
     _config_layout_valid || return 1
     local files=()
     local f
@@ -655,7 +645,6 @@ _config_jq() {
 _config_write_merged() {   # <完整配置 JSON> [目标目录]
     local content="$1" dir="${2:-$CONFIG_DIR}"
     [ -n "$content" ] || return 1
-    [ "$dir" != "$CONFIG_DIR" ] || _config_layout_supported || return 1
     printf '%s' "$content" | jq -e 'type == "object"' >/dev/null 2>&1 || return 1
     _config_layout_valid "$dir" repair || return 1
     mkdir -p "$dir" || return 1

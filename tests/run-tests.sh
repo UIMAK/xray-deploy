@@ -86,10 +86,6 @@ if _config_present; then fail 'empty config dir is not present'; else pass 'empt
 check_eq 'empty config dir merges to {}' '{}' "$(_config_merged)"
 if _config_write_merged 'not-json' >/dev/null 2>&1; then fail 'merge write rejects malformed JSON'; else pass 'merge write rejects malformed JSON'; fi
 
-printf '{"inbounds":[]}' > "$DEPLOY_DIR/config.json"
-if _init_config_if_empty >/dev/null 2>&1; then fail 'unmanaged config.json rejected'; else pass 'unmanaged config.json rejected'; fi
-check 'unmanaged config.json preserved' test -f "$DEPLOY_DIR/config.json"
-rm -f "$DEPLOY_DIR/config.json"
 # 一个顶层字段一个文件, 文件名固定, 未知字段落 99_ 前缀; 文件内容保留 {"<字段>": <值>} 外壳
 # (xray -confdir 按文件合并, 裸值文件会让合并报 "Cannot index object with number")。
 _config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"debug"},"routing":{"rules":[]},"customTop":1}' >/dev/null 2>&1

@@ -478,7 +478,6 @@ trap cleanup EXIT
         rm -rf "$dir"; mkdir -p "$dir"
         eval "_xray_fetch_tag() { printf '%s' \"$tag\" > \"$dir/fetch\"; printf '%s\\n' \"$tag\"; }"
         eval "$(declare -f _xray_version_at_least)"
-        _config_layout_supported() { : > "$dir/layout"; return 0; }
         _xray_stage_release() { : > "$dir/stage"; return 0; }
         _with_core_lock() { : > "$dir/lock"; "$@"; }
         _install_or_switch_xray_locked() { : > "$dir/commit"; return 0; }
@@ -500,7 +499,7 @@ trap cleanup EXIT
             *"仅支持 Xray-core v26.4.25 及以上, 已拒绝: $tag"*) ;;
             *) printf 'unexpected=%s\n' "$out" >&2; return 1 ;;
         esac
-        if [ -e "$dir/layout" ] || [ -e "$dir/stage" ] || [ -e "$dir/lock" ] || [ -e "$dir/commit" ] || [ -e "$dir/service" ]; then
+        if [ -e "$dir/stage" ] || [ -e "$dir/lock" ] || [ -e "$dir/commit" ] || [ -e "$dir/service" ]; then
             printf 'unexpected side effect in %s\n' "$dir" >&2
             return 1
         fi

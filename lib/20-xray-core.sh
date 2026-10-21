@@ -1442,7 +1442,6 @@ _install_or_switch_xray() {
         _error "仅支持 Xray-core v26.4.25 及以上, 已拒绝: $tag"
         return 1
     fi
-    _config_layout_supported || return 1
     # ---- 阶段一(锁外): 下载/校验/解压到自有 staging ----
     staged=$(_xray_stage_release "$tag")
     if [ -z "$staged" ] || [ ! -f "${staged}/xray" ]; then
@@ -1477,7 +1476,6 @@ _install_or_switch_xray_locked() {
         _tip "请先按提示处理: $(_xray_core_journal_path) / $(_xray_core_blocked_path)"
         return 1
     fi
-    _config_layout_supported || return 1
     cur=$(_xray_current_version 2>/dev/null) || cur=""
     prev_channel=$(_state_get channel 2>/dev/null) || prev_channel=""
 
@@ -1588,7 +1586,6 @@ _init_config_if_empty() {
 }
 
 _init_config_if_empty_locked() {
-    _config_layout_supported || return 1
     if _config_present; then
         return 0
     fi
@@ -2274,7 +2271,6 @@ _manage_xray() {
         direct)
             case "$action" in
                 start)
-                    _config_layout_supported || return 1
                     local dpid0="" dpid1=""
                     dpid0=$(_xd_pidfile_pid /run/xray.pid)
                     if [ -e /run/xray.pid ] || [ -L /run/xray.pid ]; then

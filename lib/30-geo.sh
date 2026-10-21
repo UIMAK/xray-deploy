@@ -181,7 +181,6 @@ _ensure_cron_running() {
 # 下载与体积校验在锁外; live dat 提交与恢复由 coretxn 负责。
 # 提交持 config → core 锁, 防止核心切换或配置写入覆盖恢复源。
 _geo_update() {
-    _config_layout_supported || return 1
     _ensure_dirs || return 1
     # 非交互输出落日志, 避免 cron 邮件噪音; 日志不可写时保留终端诊断。
     if [ ! -t 0 ]; then
@@ -234,7 +233,6 @@ _geo_update() {
 
 # 持 config → core 锁提交 Geo 数据。
 _geo_update_commit_locked() {
-    _config_layout_supported || return 1
     local tmp="$1" ts="$2" ok="$3"
     if ! declare -F _xray_core_geo_update_locked >/dev/null 2>&1; then
         _error "缺少 coretxn Geo 提交入口, 拒绝修改 live dat"

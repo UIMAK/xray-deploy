@@ -162,7 +162,6 @@ config_layout_and_init() (
     rm -f "$CONFIG_DIR"/*.json
     printf '%s' '{"log":{"loglevel":"debug"}}' > "$CONFIG_DIR/02_log.json"
     cp "$CONFIG_DIR/02_log.json" "$TMP/init-missing-version"
-    _config_layout_supported >/dev/null 2>&1 || return 1
     _init_config_if_empty >/dev/null 2>&1 || return 1
     cmp -s "$CONFIG_DIR/02_log.json" "$TMP/init-missing-version" || return 1
     [ "$(find "$CONFIG_DIR" -maxdepth 1 -type f | wc -l)" -eq 1 ] || return 1
