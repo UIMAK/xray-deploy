@@ -20,8 +20,29 @@ _xray_arch_asset() {
 }
 
 # ---------------------------------------------------------------------------
+# 从 releases 列表 JSON 里取版本最高的 tag(含 prerelease)
+# 预览通道的语义是"最新版": 最新稳定版可能比最新 prerelease 新
+# (如 stable v26.10.21 / prerelease v26.9.30), 只按 prerelease 过滤会把预览装成降级。
+# 非 vX.Y.Z 的 tag 不参与比较; 没有可用 tag 返回 1。
+# ---------------------------------------------------------------------------
+_xray_newest_tag() {
+    local body="${1:-}" tags="" t tag=""
+    tags=$(printf '%s' "$body" | jq -r '.[]? | .tag_name // empty' 2>/dev/null) || return 1
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        t=$(_xray_canon_tag "$t") || continue
+        if [ -z "$tag" ]; then tag="$t"; continue; fi
+        _xray_version_at_least "$tag" "$t" || tag="$t"
+    done <<< "$tags"
+    [ -n "$tag" ] || return 1
+    printf '%s\n' "$tag"
+}
+
+# ---------------------------------------------------------------------------
 # 通过 GitHub API 取指定通道最新 release 的 tag
-#   stable: releases/latest; preview: releases 里最新的 prerelease
+#   stable : releases/latest, 即最新正式版
+#   preview: 全部 release(含 prerelease)里版本号最高的那个 —— 最新稳定版更新时
+#            预览版就等于稳定版, 不会退回更旧的 prerelease
 # jq 解析 release 对象; curl 失败再用 wget。
 # ---------------------------------------------------------------------------
 _xray_fetch_tag() {
@@ -34,11 +55,11 @@ _xray_fetch_tag() {
             tag=$(echo "$body" | jq -r '.tag_name // empty' 2>/dev/null)
             ;;
         preview)
-            body=$(curl -fsSL --max-time 20 "$XRAY_REPO_API?per_page=30" 2>/dev/null) \
-                || body=$(wget -q -T 20 -O- "$XRAY_REPO_API?per_page=30" 2>/dev/null)
+            # 列表按发布时间倒序, 10 条足够覆盖最新版本并容忍个别乱序; 页越大整页 JSON 越占内存。
+            body=$(curl -fsSL --max-time 20 "$XRAY_REPO_API?per_page=10" 2>/dev/null) \
+                || body=$(wget -q -T 20 -O- "$XRAY_REPO_API?per_page=10" 2>/dev/null)
             [ -z "$body" ] && return 1
-            # 优先 jq: 第一个 prerelease==true 的 tag_name
-            tag=$(echo "$body" | jq -r '[.[] | select(.prerelease == true)] | .[0].tag_name // empty' 2>/dev/null)
+            tag=$(_xray_newest_tag "$body") || return 1
             ;;
         *) return 1 ;;
     esac
@@ -2631,7 +2652,7 @@ _xray_core_menu() {
     fi
     echo
     echo -e "  ${GREEN}[1]${NC} 稳定版(stable)"
-    echo -e "  ${GREEN}[2]${NC} 预览版(preview)"
+    echo -e "  ${GREEN}[2]${NC} 预览版(preview, 取最新版含预发布)"
     echo -e "  ${GREEN}[3]${NC} 安装指定版本 (X.Y.Z)"
     echo -e "  ${GREEN}[0]${NC} 返回"
     echo
