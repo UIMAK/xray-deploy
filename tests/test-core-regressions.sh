@@ -636,7 +636,29 @@ trap cleanup EXIT
         _xray_current_version() { printf '26.9.8'; }
     }
 
+    # 预览通道 = 全部 release(含稳定版)里版本最高的一个; 只过滤 prerelease 会在
+    # "最新稳定版比最新 prerelease 新"时把预览装成降级(stable v26.10.21 vs prerelease v26.9.30)。
+    newest_tag_probe() {
+        [ "$(_xray_newest_tag '[{"tag_name":"v26.10.21","prerelease":false},{"tag_name":"v26.9.30","prerelease":true},{"tag_name":"v26.3.27","prerelease":false}]')" = v26.10.21 ] || return 1
+        [ "$(_xray_newest_tag '[{"tag_name":"v26.10.17","prerelease":true},{"tag_name":"v26.9.8","prerelease":false}]')" = v26.10.17 ] || return 1
+        # 最高版本排在列表末尾: 按位置取(.[0] 或首个 prerelease)都会选错, 只有比版本才对。
+        [ "$(_xray_newest_tag '[{"tag_name":"v26.9.30","prerelease":true},{"tag_name":"v26.10.21","prerelease":false}]')" = v26.10.21 ] || return 1
+        [ "$(_xray_newest_tag '[{"tag_name":"nightly"},{"tag_name":"v26.9.8"}]')" = v26.9.8 ] || return 1
+        _xray_newest_tag '[]' >/dev/null 2>&1 && return 1
+        _xray_newest_tag '{"message":"API rate limit exceeded"}' >/dev/null 2>&1 && return 1
+        return 0
+    }
+    # 桩不能复用名为 body 的变量: _xray_fetch_tag 内的 local body 会遮蔽它, 桩只会输出空串。
+    preview_fetch_probe() (
+        local payload='[{"tag_name":"v26.10.21","prerelease":false},{"tag_name":"v26.9.30","prerelease":true}]'
+        curl() { printf '%s' "$payload"; }
+        wget() { return 1; }
+        [ "$(_xray_fetch_tag preview)" = v26.10.21 ]
+    )
+
     check 'minimum Xray version rejects before staging' min_version_rejection custom v26.4.24
+    check 'preview channel picks the highest version across all releases' newest_tag_probe
+    check 'preview fetch goes through the newest-release picker' preview_fetch_probe
     check 'invalid direct pidfile is rejected without takeover' invalid_pidfile_rejected
     check 'dead-PID direct pidfile is cleared instead of blocking recovery' direct_stale_pidfile_cleaned
     check 'verified restart actually restarts before sampling' restart_verified_restarts_first
