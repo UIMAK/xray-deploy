@@ -248,6 +248,15 @@ _menu_row_plain=$(_menu_row 1 "添加节点" 2 "查看节点" | sed $'s/\033\[[0
 if contains '[2] 查看节点' "$_menu_row_plain"; then pass 'two-column row keeps the right cell'; else fail 'two-column row keeps the right cell'; fi
 check_eq 'two-column row aligns the right cell' 23 "$(_menu_display_width "${_menu_row_plain%%\[2\]*}")"
 
+printf '== cron field shapes ==\n'
+# 注释声明只接受 *、N、N-M、*/S、N-M/S 与逗号列表; "*-5"/"5/3" 会让 crond 静默不执行。
+for _cron_ok in '*' '5' '1-5' '*/3' '1-5/3' '0,30'; do
+    check "cron field accepts [$_cron_ok]" _cron_field_valid "$_cron_ok"
+done
+for _cron_bad in '*-5' '5/3' '*/0' '1-5/0' '5,' ''; do
+    if _cron_field_valid "$_cron_bad"; then fail "cron field rejects [$_cron_bad]"; else pass "cron field rejects [$_cron_bad]"; fi
+done
+
 printf '== atomic JSON and locks ==\n'
 check 'atomic JSON write' _atomic_write_json "$DEPLOY_DIR/atomic.json" '{"ok":true}'
 if _atomic_write_json "$DEPLOY_DIR/bad.json" 'not-json' >/dev/null 2>&1; then fail 'atomic JSON rejects malformed input'; else pass 'atomic JSON rejects malformed input'; fi
@@ -944,6 +953,21 @@ fi
 check_eq 'rejected dot delete keeps the state line' '.' \
     "$(awk -F'\t' '{print $1}' "$GEO_EXTRA_PATH" 2>/dev/null)"
 printf 'zeta.dat	https://a.test/dl/zeta.dat\n' > "$GEO_EXTRA_PATH"
+
+# 编号按十进制归一: "01" 与 "1" 同义, 不能被当成无效编号拒绝。
+printf 'pad.dat	https://a.test/pad.dat\n' > "$TMP/geo-pad.tsv"
+printf 'pad' > "$ASSET_DIR/pad.dat"
+if (
+    _geo_extra_path() { printf '%s' "$TMP/geo-pad.tsv"; }
+    _geo_auto_mechanism() { printf 'off'; }
+    _with_core_lock() { "$@"; }
+    echo '01' | _geo_extra_delete
+) >/dev/null 2>&1; then
+    pass 'delete accepts a zero-padded index'
+else
+    fail 'delete accepts a zero-padded index'
+fi
+check 'zero-padded delete removes the chosen file' test ! -e "$ASSET_DIR/pad.dat"
 
 # state 行删除失败时, builtin 下的提示必须承认 config 已经改过。
 GEO_EXTRA_MSG="$TMP/geo-extra-del-msg"

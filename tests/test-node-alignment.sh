@@ -179,6 +179,22 @@ for proto in vless-xhttp-cdn vless-ws-cdn; do
     check "$proto Clash defaults Chrome" contains "$line" '"client-fingerprint": "chrome"'
 done
 
+# 缺必填字段时重建必须失败: 调用方据此保留旧 share_link, 不能写出连不通的链接。
+jq -n '{protocol:"vless-ws-cdn",name:"cdn",link_addr:"edge.example",port:80,uuid:"id",host:"site.example",path:"/p"}' > "$TMP/cdn-full.json"
+link=$(_rebuild_cdn_link "$TMP/cdn-full.json") || link=""
+check "cdn rebuild keeps host when fields exist" contains "$link" 'host=site.example'
+jq 'del(.path)' "$TMP/cdn-full.json" > "$TMP/cdn-no-path.json"
+rc=0; out=$(_rebuild_cdn_link "$TMP/cdn-no-path.json") || rc=$?
+check "cdn rebuild rejects missing path" eq "$rc" 1
+check "cdn rebuild prints nothing on failure" eq "$out" ""
+jq -n '{protocol:"vless-enc",name:"enc",link_addr:"1.2.3.4",port:443,uuid:"id",encryption:"QUJD"}' > "$TMP/enc-full.json"
+link=$(_rebuild_vless_enc_link "$TMP/enc-full.json") || link=""
+check "enc rebuild keeps encryption when fields exist" contains "$link" 'encryption=QUJD'
+jq 'del(.encryption)' "$TMP/enc-full.json" > "$TMP/enc-no-key.json"
+rc=0; out=$(_rebuild_vless_enc_link "$TMP/enc-no-key.json") || rc=$?
+check "enc rebuild rejects missing encryption" eq "$rc" 1
+check "enc rebuild prints nothing on failure" eq "$out" ""
+
 # Real port transactions and recovery run against confdir/metadata fixtures; no host locks/services.
 eval "$actual_config_jq"
 _with_config_lock() { "$@"; }
@@ -188,6 +204,19 @@ _reset_journal_path() { printf '%s\n' "$STATE_DIR/reset.txn"; }
 _core_txn_pending_probe() { return 0; }
 _with_core_lock() { "$@"; }
 _txn_allow_config_write() { _with_core_lock _core_txn_pending_probe; }
+# 反向关联与正向同判据: 任意回环host+端口都算引用, 手改 target host 不能让删除漏掉在用节点。
+refs_reality_for() (
+    local dir="$TMP/reality-refs-$1"
+    CONFIG_DIR="$dir/confs" NODES_DIR="$dir/nodes" STATE_DIR="$dir/state" BACKUP_DIR="$dir/backup"
+    mkdir -p "$CONFIG_DIR" "$NODES_DIR" "$STATE_DIR" "$BACKUP_DIR"
+    jq -n '{inbounds:[
+        {tag:"reality-a",protocol:"vless",streamSettings:{realitySettings:{target:"127.0.0.2:4444"}}},
+        {tag:"reality-b",protocol:"vless",streamSettings:{realitySettings:{target:"[::1]:4444"}}},
+        {tag:"reality-c",protocol:"vless",streamSettings:{realitySettings:{target:"10.1.1.1:4444"}}},
+        {tag:"tun-4444",protocol:"tunnel",port:4444}]}' > "$CONFIG_DIR/07_inbounds.json"
+    _find_reality_for_tunnel_tag tun-4444 | sort | tr '\n' ' '
+)
+check 'reverse tunnel refs accept any loopback target' eq 'reality-a reality-b ' "$(refs_reality_for 1)"
 _warn() { printf '%s\n' "$*" >> "$TMP/warnings"; }
 reality_fixture() {
     local dir="$1" shared="$2" addr_key="$3" peer_host="${4:-127.0.0.1}"
