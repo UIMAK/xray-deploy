@@ -151,6 +151,53 @@ check 'multi-range warning identifies manager limitation' contains '本管理器
 check 'multi-range warning acknowledges official support' contains '官方 listen 支持多段' "$reason"
 reject 'manager listen parser refuses multi-range' _hysteria_listen_port_part ':20000-30000,40000-50000'
 
+printf '== self-signed TLS installs missing openssl ==\n'
+# 缺 openssl 时就地补装, 而不是要求用户手工安装; pin 推导用桩代替真实证书。
+cat > "$TMP/fake-hysteria" <<'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --cert) cert=$2; shift ;;
+        --key) key=$2; shift ;;
+    esac
+    shift
+done
+printf cert > "${cert:?}"
+printf key > "${key:?}"
+EOF
+chmod +x "$TMP/fake-hysteria"
+fake_pin() { local p='' i; for i in $(seq 1 31); do p="${p}AB:"; done; printf 'sha256 Fingerprint=%sAB\n' "$p"; }
+(
+    HYSTERIA_BIN="$TMP/fake-hysteria"
+    command() {
+        if [ "${1:-}" = -v ] && [ "${2:-}" = openssl ] && [ ! -f "$TMP/openssl.installed" ]; then return 1; fi
+        builtin command "$@"
+    }
+    _pkg_install() { : > "$TMP/openssl.installed"; }
+    openssl() { fake_pin; }
+    _hysteria_prompt_tls <<< $'1\n\n' > "$TMP/selfsigned.log" 2>&1
+    printf '%s' "$?" > "$TMP/selfsigned.rc"
+    printf '%s' "$HY_TLS_PIN" > "$TMP/selfsigned.pin"
+)
+eq 'missing openssl is installed instead of reported' 0 "$(cat "$TMP/selfsigned.rc")"
+check 'auto-install reaches the package manager' test -f "$TMP/openssl.installed"
+eq 'self-signed pin derived after install' "$(fake_pin | sed 's/^sha256 Fingerprint=//')" "$(cat "$TMP/selfsigned.pin")"
+# 上一用例的暂存目录会干扰清理断言, 先清空证书目录。
+rm -rf "$HYSTERIA_CERT_DIR"; mkdir -p "$HYSTERIA_CERT_DIR"
+(
+    HYSTERIA_BIN="$TMP/fake-hysteria"
+    command() {
+        if [ "${1:-}" = -v ] && [ "${2:-}" = openssl ]; then return 1; fi
+        builtin command "$@"
+    }
+    _pkg_install() { return 1; }
+    _hysteria_prompt_tls <<< $'1\n\n' > "$TMP/selfsigned-fail.log" 2>&1
+    printf '%s' "$?" > "$TMP/selfsigned-fail.rc"
+)
+eq 'failed install still aborts pin derivation' 1 "$(cat "$TMP/selfsigned-fail.rc")"
+check 'failed install reports openssl unusable' grep -q 'openssl 安装后仍不可用' "$TMP/selfsigned-fail.log"
+check 'failed install discards staged key' test -z "$(ls -A "$HYSTERIA_CERT_DIR" 2>/dev/null | grep '\.tls-stage\.')"
+
 printf '== bootstrap zero bandwidth ==\n'
 # Exercise the complete input/JSON assembly path without publishing files or starting a service.
 (
