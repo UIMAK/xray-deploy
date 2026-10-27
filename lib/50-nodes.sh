@@ -2368,15 +2368,23 @@ _node_protocol_safe() {
 
 # 反向关联只认回环target+端口；无parent保留孤儿，歧义拒绝自动删除。
 _find_reality_for_tunnel_tag() {
-    local tag="$1" proto tport target
+    local tag="$1" proto tport cands rt target thost
     proto=$(_detect_inbound_protocol "$tag")
     [ "$proto" = "tunnel" ] || return 0
     tport=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .port // empty' 2>/dev/null)
     [[ "$tport" =~ ^[0-9]+$ ]] || return 0
-    target="127.0.0.1:${tport}"
-    _config_jq -r --arg target "$target" \
-        '[.inbounds[] | select(.protocol == "vless") | select((.streamSettings.realitySettings.target // "") == $target) | .tag][]' \
-        2>/dev/null
+    # 与正向关联同一判据(任意回环host+端口): 手改成 127.0.0.2/[::1] 的target也算引用,
+    # 否则删除tunnel时会把仍在用的入站和路由一并删掉。
+    cands=$(_config_jq -r '.inbounds[] | select(.protocol == "vless") | [(.tag // ""), (.streamSettings.realitySettings.target // "")] | @tsv' 2>/dev/null) || return 2
+    while IFS=$'\t' read -r rt target; do
+        [ -n "$rt" ] && [ -n "$target" ] || continue
+        thost="${target%:*}"
+        thost="${thost#[}"
+        thost="${thost%]}"
+        _is_reality_loopback_host "$thost" || continue
+        [ "${target##*:}" = "$tport" ] || continue
+        printf '%s\n' "$rt"
+    done <<< "$cands"
 }
 
 # ---------------------------------------------------------------------------
@@ -4383,12 +4391,17 @@ _rebuild_reality_link() {
 _rebuild_vless_enc_link() {
     local meta="$1"
     local uuid host port flow enc name
-    uuid=$(jq -r '.uuid' "$meta")
-    host=$(jq -r '.link_addr' "$meta")
-    port=$(jq -r '.port' "$meta")
+    uuid=$(jq -r '.uuid // empty' "$meta")
+    host=$(jq -r '.link_addr // empty' "$meta")
+    port=$(jq -r '.port // empty' "$meta")
     flow=$(jq -r '.flow // empty' "$meta")
-    enc=$(jq -r '.encryption // "none"' "$meta")
-    name=$(jq -r '.name' "$meta")
+    # encryption 是 vless-enc 的客户端认证参数, 缺失时无法拼出可连接链接; 失败让调用方保留旧链接。
+    enc=$(jq -r '.encryption // empty' "$meta")
+    name=$(jq -r '.name // empty' "$meta")
+    if [ -z "$uuid" ] || [ -z "$host" ] || [ -z "$port" ] || [ -z "$enc" ] || [ -z "$name" ]; then
+        _error "节点元数据缺少必要字段(uuid/link_addr/port/encryption/name), 无法重建分享链接: $meta"
+        return 1
+    fi
     local link_ip; link_ip=$(_link_host "$host")
     local enc_encoded; enc_encoded=$(_url_encode "$enc")
     local link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_encoded}&security=none&type=tcp"
@@ -4402,11 +4415,15 @@ _rebuild_vless_enc_link() {
 _rebuild_cdn_link() {
     local meta="$1"
     local uuid host path name proto preferred_addr preferred_port sni fp alpn
-    uuid=$(jq -r '.uuid' "$meta")
-    host=$(jq -r '.host' "$meta")
+    uuid=$(jq -r '.uuid // empty' "$meta")
+    host=$(jq -r '.host // empty' "$meta")
     path=$(jq -r '.path // empty' "$meta")
-    name=$(jq -r '.name' "$meta")
-    proto=$(jq -r '.protocol' "$meta")
+    name=$(jq -r '.name // empty' "$meta")
+    proto=$(jq -r '.protocol // empty' "$meta")
+    if [ -z "$uuid" ] || [ -z "$host" ] || [ -z "$path" ] || [ -z "$name" ]; then
+        _error "节点元数据缺少必要字段(uuid/host/path/name), 无法重建分享链接: $meta"
+        return 1
+    fi
     preferred_addr=$(jq -r '.preferred_addr // .host' "$meta")
     preferred_port=$(jq -r '.preferred_port // "443"' "$meta")
     sni=$(jq -r '.sni // .host' "$meta")
@@ -4509,12 +4526,19 @@ _view_nodes() {
         [ -f "$f" ] || continue
         n=$((n+1))
         if [ "$n" -eq "$idx" ]; then
-            local name link auth
+            local name link auth proto
             name=$(jq -r '.name' "$f"); link=$(jq -r '.share_link' "$f")
             auth=$(jq -r '.auth // "—"' "$f" 2>/dev/null)
+            proto=$(jq -r '.protocol // empty' "$f" 2>/dev/null)
             echo
             echo -e "  ${CYAN}【${name}】${NC}"
-            [ "$auth" != "—" ] && echo -e "  认证算法: ${auth}"
+            # HY2 的 auth 是认证密码, ENC 的 auth 是认证算法, 不能共用"认证算法"标签。
+            if [ "$auth" != "—" ]; then
+                case "$proto" in
+                    hysteria2) echo -e "  认证密码: ${auth}" ;;
+                    *)         echo -e "  认证算法: ${auth}" ;;
+                esac
+            fi
             # 空链接可能是无法表达的gecko自定义尺寸；显示提示，不拼造连接信息。
             if [ -z "$link" ] || [ "$link" = "null" ]; then
                 echo -e "  ${YELLOW}该节点当前无可用分享链接${NC}"
@@ -5640,9 +5664,11 @@ _update_listen() {
     case "$proto" in *-cdn)
         echo -e "  ${YELLOW}该节点为 CDN 协议, 必须使用 CDN 域名${NC}"
         echo -e "  当前链接服务器地址: ${oldaddr}"
-        read -rp "  请输入 CDN 域名: " newaddr
-        # CDN只接受域名；复用 _validate_domain，避免IPv4被当作域名。
-        _validate_domain "$newaddr" || { _warn "CDN 节点须填域名, 而非 IP"; _press_any_key; return; }
+        read -rp "  请输入 CDN 域名(回车保持当前地址): " newaddr
+        # CDN只接受域名；复用 _validate_domain，避免IPv4被当作域名。回车沿用旧地址。
+        if [ -n "$newaddr" ]; then
+            _validate_domain "$newaddr" || { _warn "CDN 节点须填域名, 而非 IP"; _press_any_key; return; }
+        fi
         ;;
     *)
         if _is_listen_loopback "$newlisten"; then

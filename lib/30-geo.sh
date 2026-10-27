@@ -717,10 +717,12 @@ _geo_extra_delete() {
         ''|0) return 0 ;;
         *[!0-9]*) _warn "无效编号"; return 1 ;;
     esac
+    # 编号按十进制归一(10#): 否则 "01" 这类输入永远不等于计数 i。
+    sel=$((10#$sel))
     while IFS=$'\t' read -r name url; do
         [ -n "$name" ] || continue
         i=$((i + 1))
-        [ "$i" = "$sel" ] && target="$name"
+        [ "$i" -eq "$sel" ] && target="$name"
     done < "$path"
     if [ -z "$target" ]; then
         _warn "无效编号"
