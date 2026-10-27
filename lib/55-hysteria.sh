@@ -1453,12 +1453,15 @@ _hysteria_prompt_tls() {
             fi
             HY_TLS_JSON=$(jq -n --arg c "$HYSTERIA_CERT_DIR/cert.pem" --arg k "$HYSTERIA_CERT_DIR/key.pem" \
                 '{tls: {cert: $c, key: $k, sniGuard: "disable"}}')
-            # pin 只能由 openssl 推导, 而基础依赖不含它; 缺失时明确报错并清掉暂存私钥。
+            # pin 只能由 openssl 推导, 而基础依赖不含它; 缺失时就地补装(同启动依赖), 装后仍缺才放弃。
             if ! command -v openssl >/dev/null 2>&1; then
-                rm -rf "$HY_TLS_STAGE_DIR"
-                HY_TLS_STAGE_DIR=""
-                _error "缺少 openssl, 无法推导自签证书 SHA256 pin; 请先安装 openssl"
-                return 1
+                _pkg_install openssl
+                if ! command -v openssl >/dev/null 2>&1; then
+                    rm -rf "$HY_TLS_STAGE_DIR"
+                    HY_TLS_STAGE_DIR=""
+                    _error "openssl 安装后仍不可用, 无法推导自签证书 SHA256 pin"
+                    return 1
+                fi
             fi
             if ! HY_TLS_PIN=$(openssl x509 -in "$HY_TLS_STAGE_DIR/cert.pem" -noout -fingerprint -sha256 2>/dev/null); then
                 HY_TLS_PIN=""
