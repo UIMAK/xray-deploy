@@ -1453,10 +1453,22 @@ _hysteria_prompt_tls() {
             fi
             HY_TLS_JSON=$(jq -n --arg c "$HYSTERIA_CERT_DIR/cert.pem" --arg k "$HYSTERIA_CERT_DIR/key.pem" \
                 '{tls: {cert: $c, key: $k, sniGuard: "disable"}}')
-            HY_TLS_PIN=$(openssl x509 -in "$HY_TLS_STAGE_DIR/cert.pem" -noout -fingerprint -sha256 2>/dev/null) || return 1
+            # pin 只能由 openssl 推导, 而基础依赖不含它; 缺失时明确报错并清掉暂存私钥。
+            if ! command -v openssl >/dev/null 2>&1; then
+                rm -rf "$HY_TLS_STAGE_DIR"
+                HY_TLS_STAGE_DIR=""
+                _error "缺少 openssl, 无法推导自签证书 SHA256 pin; 请先安装 openssl"
+                return 1
+            fi
+            if ! HY_TLS_PIN=$(openssl x509 -in "$HY_TLS_STAGE_DIR/cert.pem" -noout -fingerprint -sha256 2>/dev/null); then
+                HY_TLS_PIN=""
+            fi
             HY_TLS_PIN="${HY_TLS_PIN#*=}"
             if ! [[ "$HY_TLS_PIN" =~ ^([[:xdigit:]]{2}:){31}[[:xdigit:]]{2}$ ]]; then
-                _error "无法读取自签证书 SHA256 pin"; return 1
+                rm -rf "$HY_TLS_STAGE_DIR"
+                HY_TLS_STAGE_DIR=""
+                _error "无法读取自签证书 SHA256 pin"
+                return 1
             fi
             HY_TLS_MODE="selfsigned"; HY_TLS_SNI="$host"
             return 0
@@ -3111,6 +3123,8 @@ _hysteria_service_menu() {
         2)
             if _manage_hysteria stop; then
                 _success "已停止"
+            else
+                _error "停止失败(查看日志)"
             fi
             ;;
         3)
