@@ -622,6 +622,27 @@ missing_tunnel_port_probe() (
 )
 check 'missing tunnel_port is derived from config and backfilled' missing_tunnel_port_probe
 
+metadata_unlink_failure_probe() (
+    local d="$TMP/metadata-unlink-failure" tag=meta-fail
+    mkdir -p "$d/nodes" || return 1
+    NODES_DIR="$d/nodes"
+    CLASH_YAML="$d/clash.yaml"
+    printf '%s\n' '{"tag":"meta-fail","protocol":"vless","name":"meta-fail"}' > "$NODES_DIR/$tag.json" || return 1
+    _node_identity() { printf 'identity'; }
+    _node_protocol_safe() { printf 'vless'; }
+    _mutate_config() { return 0; }
+    _remove_node_from_yaml_by_tag() { return 0; }
+    _hy2_purge_self_certs() { :; }
+    _HY2_HOP_TD=()
+    rm() {
+        case "$*" in *"/$tag.json"*) return 1 ;; esac
+        command rm "$@"
+    }
+    _delete_node_apply_single "$tag" identity >/dev/null 2>&1 && return 1
+    [ -f "$NODES_DIR/$tag.json" ]
+)
+check 'metadata unlink failure prevents delete success' metadata_unlink_failure_probe
+
 printf 'node-alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
 )

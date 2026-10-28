@@ -484,9 +484,36 @@ _route_rules_menu() {
 }
 
 # 切换数据源: 内置定时生效时先改 config(verified restart 后立即生效), 再记 state。
-# 只替换 .geodata.assets, 保留用户手改的 .geodata.cron; cron/off 机制下只记 state。
+# state 是数据源真相源; 任一步 state 写入失败都回滚本次 config/state, 不报告成功。
+_geo_source_state_restore() {
+    local source_had="$1" source="$2" geosite_had="$3" geosite="$4" geoip_had="$5" geoip="$6"
+    local rc=0
+    if [ "$source_had" -eq 1 ]; then
+        _state_set geo_source "$source" || rc=1
+    else
+        rm -f "$STATE_DIR/geo_source" 2>/dev/null || rc=1
+    fi
+    if [ "$geosite_had" -eq 1 ]; then
+        _state_set geo_geosite_url "$geosite" || rc=1
+    else
+        rm -f "$STATE_DIR/geo_geosite_url" 2>/dev/null || rc=1
+    fi
+    if [ "$geoip_had" -eq 1 ]; then
+        _state_set geo_geoip_url "$geoip" || rc=1
+    else
+        rm -f "$STATE_DIR/geo_geoip_url" 2>/dev/null || rc=1
+    fi
+    return "$rc"
+}
+
 _geo_apply_source() {
-    local src="$1" cgs="${2:-}" cgi="${3:-}" assets=""
+    _with_config_lock _with_config_write_barrier _geo_apply_source_locked "$@"
+}
+
+_geo_apply_source_locked() {
+    local src="$1" cgs="${2:-}" cgi="${3:-}" assets="" mech
+    local source_had=0 old_source="" geosite_had=0 old_geosite="" geoip_had=0 old_geoip=""
+    local state_ok=1
     case "$src" in
         xtls|loyal|custom) ;;
         *) _error "未知数据源: $src"; return 1 ;;
@@ -495,19 +522,60 @@ _geo_apply_source() {
         _geo_url_valid "$cgs" || { _error "geosite 链接无效"; return 1; }
         _geo_url_valid "$cgi" || { _error "geoip 链接无效"; return 1; }
     fi
-    if [ "$(_geo_auto_mechanism)" = "builtin" ]; then
+    # 先读取旧 state；读不到就不能安全回滚，不能继续改 config。
+    if [ -e "$STATE_DIR/geo_source" ]; then
+        source_had=1
+        old_source=$(_state_get geo_source 2>/dev/null) || {
+            _error "读取旧 geo_source 状态失败, 已取消数据源切换"
+            return 1
+        }
+    fi
+    if [ -e "$STATE_DIR/geo_geosite_url" ]; then
+        geosite_had=1
+        old_geosite=$(_state_get geo_geosite_url 2>/dev/null) || {
+            _error "读取旧 geo_geosite_url 状态失败, 已取消数据源切换"
+            return 1
+        }
+    fi
+    if [ -e "$STATE_DIR/geo_geoip_url" ]; then
+        geoip_had=1
+        old_geoip=$(_state_get geo_geoip_url 2>/dev/null) || {
+            _error "读取旧 geo_geoip_url 状态失败, 已取消数据源切换"
+            return 1
+        }
+    fi
+    mech=$(_geo_auto_mechanism)
+    if [ "$mech" = "builtin" ]; then
         assets=$(_geo_assets_json "$src" "$cgs" "$cgi") || { _error "生成 assets 失败"; return 1; }
         if ! _mutate_config --argjson a "$assets" '.geodata.assets = $a'; then
             _error "写入 geodata.assets 失败(配置已回滚), 数据源未变更"
             return 1
         fi
     fi
-    _state_set geo_source "$src" || _warn "数据源已生效, 但状态写入失败; 请重新切换一次"
+    _state_set geo_source "$src" || state_ok=0
     if [ "$src" = "custom" ]; then
-        _state_set geo_geosite_url "$cgs" 2>/dev/null || _warn "geosite 链接未能记录"
-        _state_set geo_geoip_url "$cgi" 2>/dev/null || _warn "geoip 链接未能记录"
+        _state_set geo_geosite_url "$cgs" || state_ok=0
+        _state_set geo_geoip_url "$cgi" || state_ok=0
     else
-        rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url" 2>/dev/null
+        rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url" 2>/dev/null || state_ok=0
+    fi
+    if [ "$state_ok" -ne 1 ]; then
+        local rollback_ok=1
+        if [ "$mech" = "builtin" ]; then
+            if ! _restore_config; then
+                _error "状态写入失败后, config 回滚失败; 请手动核对 $CONFIG_DIR"
+                rollback_ok=0
+            elif ! _restart_xray_verified; then
+                _error "状态写入失败后, config 已回滚但 Xray 未能稳定运行"
+                rollback_ok=0
+            fi
+        fi
+        if ! _geo_source_state_restore "$source_had" "$old_source" "$geosite_had" "$old_geosite" "$geoip_had" "$old_geoip"; then
+            _error "状态写入失败且旧 state 未能完整恢复; 请手动核对 $STATE_DIR"
+            rollback_ok=0
+        fi
+        [ "$rollback_ok" -eq 1 ] && _error "数据源状态写入失败, 数据源未变更"
+        return 1
     fi
     _success "数据源已切换: $(_geo_source_label)"
     _info "geosite: $(_geo_source_url geosite)"

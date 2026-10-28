@@ -4644,6 +4644,16 @@ _delete_node() {
 }
 
 # 删除apply必须已持锁；身份不一致取消，返回0已提交/1失败。
+_delete_node_meta_file() {
+    local tag="$1" meta
+    meta="$NODES_DIR/${tag}.json"
+    if ! rm -f "$meta" 2>/dev/null || [ -e "$meta" ] || [ -L "$meta" ]; then
+        _error "节点 metadata 删除失败: $meta"
+        return 1
+    fi
+    return 0
+}
+
 _delete_node_apply_all() {
     local tags=() tag f
     for f in "$NODES_DIR"/*.json; do
@@ -4698,15 +4708,16 @@ _delete_node_apply_all() {
                    or (.inboundTag as $ib | ([$rm[] | . as $t | (($ib | if type == "string" then split(",") else . end) | index($t)) == null] | all))))' && all_ok=1
     fi
     if [ "$all_ok" -eq 1 ]; then
+        # config 已提交；teardown 规则不再属于可回滚集合。metadata 逐个落账，
+        # 任一 unlink 失败都停止成功路径，避免幽灵节点被报告成已删除。
+        _HY2_HOP_TD=()
         for tag in "${del_all[@]}"; do
-            # 先删 metadata 再删 YAML 会读不到 name; 但 YAML 删除失败不阻断,
+            # 先删 JSON 再删 YAML 会读不到 name; 但 YAML 删除失败不阻断,
             # 顺序仍是"先 YAML(读 json 的 name) 后 json"
             _remove_node_from_yaml_by_tag "$tag" || \
                 _warn "Clash YAML 同步删除失败($tag), 可手工编辑 ${CLASH_YAML} 清除该行"
-            rm -f "$NODES_DIR/${tag}.json"
+            _delete_node_meta_file "$tag" || return 1
         done
-        # 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
-        _HY2_HOP_TD=()
         # 仅在"确实全删干净"时才截断 clash.yaml; 有保留节点时不能清空
         if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ] && [ -f "$CLASH_YAML" ]; then
             printf 'proxies:\n' > "$CLASH_YAML"
@@ -4786,18 +4797,17 @@ _delete_node_apply_multi() {
     fi
 
     if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
+        _HY2_HOP_TD=()
         # 消费 YAML 删除返回值, 失败则累计并显式告警(不静默; clash.yaml 属派生导出)
         local yaml_fail=0
         for dt in "${del_tags[@]}"; do
             # 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
             _remove_node_from_yaml_by_tag "$dt" || yaml_fail=1
-            rm -f "$NODES_DIR/${dt}.json"
+            _delete_node_meta_file "$dt" || return 1
         done
         # 不再指向不存在的"重新生成 Clash 配置"功能, 给出真实可执行的路径
         [ "$yaml_fail" -eq 1 ] && \
             _warn "部分节点 Clash YAML 同步删除失败, 已从 Xray 删除; 可手工编辑 ${CLASH_YAML} 删除对应行"
-        # 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
-        _HY2_HOP_TD=()
         _success "已删除 ${#del_tags[@]} 个节点"
         _hy2_purge_self_certs
         return 0
@@ -4881,9 +4891,8 @@ _delete_node_apply_single() {
         if ! _remove_node_from_yaml_by_tag "$tag"; then
             _warn "Clash YAML 同步删除失败($tag), 节点已从 Xray 删除; 可手工编辑 ${CLASH_YAML} 删除对应行"
         fi
-        rm -f "$NODES_DIR/${tag}.json"
-        # 删除事务已完整提交, 清空 teardown 记录, 避免跨事务污染
         _HY2_HOP_TD=()
+        _delete_node_meta_file "$tag" || return 1
         _success "节点已删除"
         _hy2_purge_self_certs
         return 0

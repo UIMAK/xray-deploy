@@ -3074,7 +3074,11 @@ _hysteria_change_password() {
     echo -e "  节点: ${GREEN}${name}${NC}"
     echo -e "  ${YELLOW}改密码会让所有已分发的分享链接/客户端配置立即失效, 需重新分发${NC}"
     auth=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
-    read -rp "  新密码 (回车随机): " auth2
+    if ! read -rp "  新密码 (回车随机): " auth2; then
+        _info "已取消"
+        _press_any_key
+        return 0
+    fi
     auth=${auth2:-$auth}
     _validate_json_text "$auth" || { _error "密码含非法字符"; _press_any_key; return; }
     local tmp_meta

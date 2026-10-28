@@ -267,6 +267,11 @@ _xref_snapshot_geo_dats() {  # <journal> -- unique transaction paths are recorde
             [ -f "$src" ] && [ ! -L "$src" ] || { _error "$gd.dat 在快照阶段消失或不是普通文件: $src"; return 1; }
             ! _xray_core_path_present "$bak" || { _error "$gd.dat 唯一快照路径已存在, 拒绝覆盖: $bak"; return 1; }
             cp -p "$src" "$bak" 2>/dev/null || { rm -f "$bak" 2>/dev/null; return 1; }
+            if ! cmp -s "$src" "$bak" 2>/dev/null; then
+                rm -f "$bak" 2>/dev/null
+                _error "$gd.dat 快照内容与原文件不一致: $bak"
+                return 1
+            fi
         else
             ! _xray_core_path_present "$src" || { _error "$gd.dat 在快照阶段被外部创建: $src"; return 1; }
             ! _xray_core_path_present "$bak" || { _error "$gd.dat 唯一快照路径已存在: $bak"; return 1; }
@@ -2052,6 +2057,11 @@ _xray_service_snapshot() {
         return 1
     fi
     cp -f "$unit" "$prev" 2>/dev/null || { rm -f "$prev"; return 1; }
+    if ! cmp -s "$unit" "$prev" 2>/dev/null; then
+        rm -f "$prev"
+        _error "service 快照内容与 unit 不一致: $prev"
+        return 1
+    fi
     return 0
 }
 
