@@ -710,6 +710,41 @@ if (
 else
     fail 'custom switch rejects an invalid geoip link without touching config or state'
 fi
+_geo_source_state_failure_probe() (
+    printf '%s' loyal > "$STATE_DIR/geo_source"
+    rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _mutate_config() { : > "$TMP/geo-state-mutate"; return 0; }
+    _restore_config() { : > "$TMP/geo-state-restore"; return 0; }
+    _restart_xray_verified() { : > "$TMP/geo-state-restart"; return 0; }
+    _state_set() {
+        if [ "$1" = geo_source ] && [ ! -e "$TMP/geo-state-fail-once" ]; then
+            : > "$TMP/geo-state-fail-once"
+            return 1
+        fi
+        printf '%s' "$2" > "$STATE_DIR/$1"
+    }
+    _geo_apply_source xtls >/dev/null 2>&1 && return 1
+    [ -e "$TMP/geo-state-mutate" ] && [ -e "$TMP/geo-state-restore" ] && [ -e "$TMP/geo-state-restart" ] || return 1
+    [ "$(_geo_source_name)" = loyal ]
+)
+check 'geo source state failure rolls back config and reports failure' _geo_source_state_failure_probe
+
+_geo_custom_state_failure_probe() (
+    printf '%s' loyal > "$STATE_DIR/geo_source"
+    rm -f "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
+    _geo_auto_mechanism() { printf 'builtin'; }
+    _mutate_config() { return 0; }
+    _restore_config() { return 0; }
+    _restart_xray_verified() { return 0; }
+    _state_set() {
+        [ "$1" = geo_geosite_url ] && return 1
+        printf '%s' "$2" > "$STATE_DIR/$1"
+    }
+    _geo_apply_source custom 'https://a.test/gs.dat' 'https://a.test/gi.dat' >/dev/null 2>&1 && return 1
+    [ "$(_geo_source_name)" = loyal ] && [ ! -e "$STATE_DIR/geo_geosite_url" ] && [ ! -e "$STATE_DIR/geo_geoip_url" ]
+)
+check 'custom geo state failure restores the previous source state' _geo_custom_state_failure_probe
 # 切换只换链接: 必须提示本地 dat 仍是旧源数据, 否则用户会以为已经换源。
 GEO_APPLY_HINT="$TMP/geo-apply-hint"
 (
