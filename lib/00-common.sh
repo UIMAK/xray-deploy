@@ -502,6 +502,10 @@ _fsync_path() {   # <path>
 # ---------------------------------------------------------------------------
 _atomic_write_json() {
     local target="$1" content="$2" tmp
+    if [ -d "$target" ]; then
+        _error "目标路径是目录, 拒绝原子写入: $target"
+        return 1
+    fi
     # tmp 构造必须完整成功(磁盘满/IO/配额时可能写一半), 否则 mv 会把损坏 JSON 当成正式文件提交
     tmp=$(mktemp "${target}.XXXXXX") || { _error "无法创建临时 JSON 文件: $target"; return 1; }
     if ! printf '%s' "$content" > "$tmp"; then
@@ -708,6 +712,10 @@ _state_get() {
 
 _state_set() {
     local key="$1" val="$2" tmp
+    if [ -d "$STATE_DIR/$key" ]; then
+        _error "状态路径是目录, 拒绝写入: $STATE_DIR/$key"
+        return 1
+    fi
     # mkdir/printf/mv 任一步失败返回 1 并清理 tmp; 唯一临时名防止并发写入交错。
     # state 可含凭据, 写入后必须 chmod 600。
     mkdir -p "$STATE_DIR" || return 1

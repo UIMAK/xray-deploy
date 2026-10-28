@@ -258,10 +258,29 @@ for _cron_bad in '*-5' '5/3' '*/0' '1-5/0' '5,' ''; do
 done
 
 printf '== atomic JSON and locks ==\n'
+_atomic_target_dir_probe() (
+    local d="$TMP/atomic-target-dir"
+    rm -rf "$d"
+    mkdir -p "$d/target"
+    _atomic_write_json "$d/target" '{"ok":true}' >/dev/null 2>&1 && return 1
+    [ -d "$d/target" ] || return 1
+    [ -z "$(find "$d/target" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
+)
+_state_target_dir_probe() (
+    local d="$TMP/state-target-dir"
+    rm -rf "$d"
+    mkdir -p "$d/state/item"
+    STATE_DIR="$d/state"
+    _state_set item value >/dev/null 2>&1 && return 1
+    [ -d "$d/state/item" ] || return 1
+    [ -z "$(find "$d/state/item" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
+)
 check 'atomic JSON write' _atomic_write_json "$DEPLOY_DIR/atomic.json" '{"ok":true}'
 if _atomic_write_json "$DEPLOY_DIR/bad.json" 'not-json' >/dev/null 2>&1; then fail 'atomic JSON rejects malformed input'; else pass 'atomic JSON rejects malformed input'; fi
 check 'config lock body runs' _with_config_lock bash -c 'test -d "$1"' _ "$DEPLOY_DIR"
 check 'core lock body runs' _with_core_lock bash -c 'test -d "$1"' _ "$DEPLOY_DIR"
+check 'atomic JSON rejects a directory target without nesting the temp file' _atomic_target_dir_probe
+check 'state write rejects a directory target without nesting the temp file' _state_target_dir_probe
 
 printf '== logrotate and Geo state ==\n'
 _state_set logrotate_frequency daily

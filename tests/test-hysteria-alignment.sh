@@ -320,5 +320,24 @@ hysteria_restart_requires_readable_identity() (
 )
 check 'hysteria restart fails closed when identity is unreadable' hysteria_restart_requires_readable_identity
 
+hysteria_password_eof_probe() (
+    local meta="$TMP/eof-password-node.json"
+    mkdir -p "$TMP/eof-password-data" || return 1
+    printf '%s\n' '{"auth":"old-password","name":"eof-node","link_addr":"example.test"}' > "$meta" || return 1
+    HYSTERIA_NODE_META="$meta"
+    HYSTERIA_DATA_DIR="$TMP/eof-password-data"
+    _hysteria_gate() { return 0; }
+    _hysteria_node_exists() { return 0; }
+    _hysteria_node_broken() { return 1; }
+    _hysteria_link_preflight() { return 0; }
+    _hysteria_node_txn() { : > "$TMP/eof-password-txn"; return 0; }
+    _hysteria_print_link() { return 0; }
+    _press_any_key() { :; }
+    rm -f "$TMP/eof-password-txn"
+    _hysteria_change_password </dev/null >/dev/null 2>&1
+    [ ! -e "$TMP/eof-password-txn" ]
+)
+check 'EOF while changing password cancels before transaction' hysteria_password_eof_probe
+
 printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

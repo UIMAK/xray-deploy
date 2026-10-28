@@ -655,10 +655,33 @@ trap cleanup EXIT
         wget() { return 1; }
         [ "$(_xray_fetch_tag preview)" = v26.10.21 ]
     )
+    geo_snapshot_cmp_probe() (
+        fixture snapshot-geo-cmp
+        local journal="$BACKUP_DIR/geo-snapshot.json"
+        printf '{"geoip_preexisted":true,"geosite_preexisted":true,"geoip_backup":"%s","geosite_backup":"%s"}\n' \
+            "$ASSET_DIR/geoip.bak" "$ASSET_DIR/geosite.bak" > "$journal"
+        cp() { printf 'wrong-snapshot' > "$3"; return 0; }
+        _xref_snapshot_geo_dats "$journal" >/dev/null 2>&1 && return 1
+        [ ! -e "$ASSET_DIR/geoip.bak" ] && [ ! -e "$ASSET_DIR/geosite.bak" ]
+    )
+    service_snapshot_cmp_probe() (
+        fixture snapshot-service-cmp
+        rm -f "$UNIT"
+        printf 'unit-original' > "$UNIT"
+        printf '{"service_preexisted":true}\n' > "$STATE_DIR/coretxn.json"
+        XRAY_CORE_TXN_ID=snapshot-test
+        export XRAY_CORE_TXN_ID
+        _xray_service_enable_state() { printf 'disabled'; }
+        cp() { printf 'wrong-snapshot' > "$3"; return 0; }
+        _xray_service_snapshot >/dev/null 2>&1 && return 1
+        [ ! -e "$BACKUP_DIR/xray-service.snapshot-test.prev" ]
+    )
 
     check 'minimum Xray version rejects before staging' min_version_rejection custom v26.4.24
     check 'preview channel picks the highest version across all releases' newest_tag_probe
     check 'preview fetch goes through the newest-release picker' preview_fetch_probe
+    check 'Geo snapshot rejects content that differs from the source' geo_snapshot_cmp_probe
+    check 'service snapshot rejects content that differs from the unit' service_snapshot_cmp_probe
     check 'invalid direct pidfile is rejected without takeover' invalid_pidfile_rejected
     check 'dead-PID direct pidfile is cleared instead of blocking recovery' direct_stale_pidfile_cleaned
     check 'verified restart actually restarts before sampling' restart_verified_restarts_first
