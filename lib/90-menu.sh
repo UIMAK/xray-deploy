@@ -1768,7 +1768,9 @@ _hy2_obfs_menu() {
         1|2)
             otype="salamander"
             opw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
-            read -rp "  混淆密码 (回车随机): " opw_in
+            if ! read -rp "  混淆密码 (回车随机): " opw_in; then
+                _info "已取消"; return
+            fi
             opw=${opw_in:-$opw}
             _validate_json_text "$opw" || { _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; _press_any_key; return; }
             if [ "$obfs_choice" = "2" ]; then

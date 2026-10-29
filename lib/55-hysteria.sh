@@ -1825,7 +1825,9 @@ _hysteria_obfs_menu() {
         1|2)
             local otype; [ "$choice" = "2" ] && otype="gecko" || otype="salamander"
             pw=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 16)
-            read -rp "  混淆密码 (回车随机): " pw2
+            if ! read -rp "  混淆密码 (回车随机): " pw2; then
+                _info "已取消"; return 0
+            fi
             pw=${pw2:-$pw}
             _validate_json_text "$pw" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{)"; _press_any_key; return 0; }
             if [ "$otype" = "gecko" ] && [ "$cur_type" = "gecko" ]; then
@@ -1877,8 +1879,8 @@ _hysteria_bandwidth_menu() {
     read -rp "  请选择: " choice || return 0
     case "$choice" in
         1)
-            read -rp "  up (如 100 mbps / 1g, 回车保持): " up
-            read -rp "  down (如 100 mbps / 1g, 回车保持): " down
+            _hysteria_ask_value_reason "  up (如 100 mbps / 1g, 回车保持): " up 1 _hysteria_bandwidth_reason || return 0
+            _hysteria_ask_value_reason "  down (如 100 mbps / 1g, 回车保持): " down 1 _hysteria_bandwidth_reason || return 0
             up=$(_normalize_bandwidth "${up:-$cur_up}")
             down=$(_normalize_bandwidth "${down:-$cur_down}")
             if ! _hysteria_config_txn --arg up "$up" --arg down "$down" \

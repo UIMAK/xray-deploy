@@ -12,6 +12,9 @@ command -v jq >/dev/null 2>&1 || { echo 'FAIL - jq is required' >&2; exit 1; }
 . "$ROOT/lib/30-geo.sh"
 . "$ROOT/lib/50-nodes.sh"
 _fsync_path() { :; }
+# 锁根同样隔离: 测试不应依赖 /var/lock 或 root 权限。
+_deploy_lock_root() { printf '%s' "$TMP/locks"; }
+mkdir -p "$TMP/locks"
 PASS=0 FAIL=0
 check() {
     local name="$1"; shift
@@ -26,6 +29,15 @@ setup_case() {
     DEPLOY_DIR="$TMP/$name"
     CONFIG_DIR="$TMP/$name/confs"
     BACKUP_DIR="$TMP/$name/backups"
+    # 00-common 在 source 时按 /opt/xray-deploy 展开这些全局目录; 子套件进程不继承
+    # runner 的临时目录, 必须在这里逐个覆盖, 否则会写进真实部署目录。
+    ASSET_DIR="$DEPLOY_DIR/assets"
+    STATE_DIR="$DEPLOY_DIR/state"
+    NODES_DIR="$DEPLOY_DIR/nodes"
+    LOG_DIR="$DEPLOY_DIR/logs"
+    CERT_DIR="$DEPLOY_DIR/certs"
+    BIN_DIR="$DEPLOY_DIR/bin"
+    XRAY_BIN="$BIN_DIR/xray"
     rm -rf "${TMP:?}/$name"
     mkdir -p "$CONFIG_DIR" "$BACKUP_DIR/confs.lastbak"
     printf '{"version":{"min":"26.4.25","max":""}}' > "$CONFIG_DIR/15_version.json"
