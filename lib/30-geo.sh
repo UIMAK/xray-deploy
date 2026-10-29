@@ -785,8 +785,10 @@ _geo_extra_delete() {
         ''|0) return 0 ;;
         *[!0-9]*) _warn "无效编号"; return 1 ;;
     esac
-    # 编号按十进制归一(10#): 否则 "01" 这类输入永远不等于计数 i。
-    sel=$((10#$sel))
+    # 编号归一交给 _xd_index_from_choice: 去前导零并限长, 防超长数字在 10# 算术里回绕;
+    # 它返回零基下标并拒绝 0, 这里 +1 还原菜单的 1 基编号。
+    sel=$(_xd_index_from_choice "$sel" "$count") || { _warn "无效编号"; return 1; }
+    sel=$((sel + 1))
     while IFS=$'\t' read -r name url; do
         [ -n "$name" ] || continue
         i=$((i + 1))

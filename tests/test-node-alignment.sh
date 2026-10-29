@@ -224,13 +224,13 @@ reality_fixture() {
     BACKUP_DIR="$TMP/$dir/backup" CLASH_YAML="$TMP/$dir/clash.yaml"
     mkdir -p "$CONFIG_DIR" "$NODES_DIR"
     jq -n --arg key "$addr_key" --arg peer "$peer_host:10443" --argjson shared "$shared" '
-        {version:{min:"26.4.25",max:""},inbounds:[
+        {version:{min:"26.4.25",max:""},inbounds:([
             {tag:"xd-reality-vision-443",protocol:"vless",port:443,
              streamSettings:{network:"raw",security:"reality",realitySettings:{target:"127.0.0.1:10443",serverNames:["site.example"]}}},
             {tag:"tunnel-site-10443-443",protocol:"tunnel",listen:"127.0.0.1",port:10443,
              settings:{($key):"site.example",rewritePort:443,allowedNetwork:"tcp"}}
         ] + (if $shared then [{tag:"xd-reality-xhttp-9443",protocol:"vless",port:9443,
-             streamSettings:{network:"xhttp",security:"reality",realitySettings:{target:$peer,serverNames:["site.example"]}}}] else [] end),
+             streamSettings:{network:"xhttp",security:"reality",realitySettings:{target:$peer,serverNames:["site.example"]}}}] else [] end)),
          routing:{rules:[{type:"field",inboundTag:["tunnel-site-10443-443"],domain:["full:site.example"],outboundTag:"direct"}]}}
     ' > "$DEPLOY_DIR/config-before.json"
     _config_write_merged "$(cat "$DEPLOY_DIR/config-before.json")" || return 1
