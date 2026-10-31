@@ -2628,8 +2628,13 @@ _uninstall_xray_locked() {
             rm -f /etc/init.d/xray
             ;;
     esac
-    _crontab_replace "# xray-deploy-timed-restart" >/dev/null 2>&1 || \
+    if _crontab_replace "# xray-deploy-timed-restart" >/dev/null 2>&1; then
+        if [ "$mode" = keep-panel ]; then
+            _state_set timed_restart "off" || _warn "定时重启任务已移除, 但状态清除失败, 请检查 $STATE_DIR/timed_restart"
+        fi
+    else
         _warn "未能移除定时重启任务, 请手动检查 crontab"
+    fi
     # 整站卸载才移除管理入口; 单独卸载核心时保留 xd 和面板数据, 以便后续重新安装/管理。
     if [ "$mode" = all ]; then
         rm -f /usr/local/bin/"$CMD_NAME"
