@@ -545,24 +545,34 @@ _uninstall_menu() {
     echo
     echo -e "  ${RED}【卸载 / 重置】${NC}"
     echo -e "  ${GREEN}[1]${NC} 重置配置为默认(含 routing 规则, 清空节点)"
-    echo -e "  ${GREEN}[2]${NC} 仅卸载 Xray"
-    echo -e "  ${GREEN}[3]${NC} 卸载 Xray + cloudflared"
+    echo -e "  ${GREEN}[2]${NC} 仅卸载 Xray(保留面板与数据)"
+    echo -e "  ${GREEN}[3]${NC} 卸载 Xray + cloudflared(保留面板与数据)"
+    echo -e "  ${GREEN}[4]${NC} 全部删除(Xray + cloudflared + 面板与数据)"
     echo -e "  ${GREEN}[0]${NC} 取消"
     read -rp "  选择: " choice
-    # 整站卸载不可逆，执行前 y/N 确认。
     case "$choice" in
         1) _reset_config ;;
         2)
-            read -rp "  确认卸载 Xray(删除配置/节点/证书/全部数据, 不可恢复)? [y/N]: " ans
-            case "$ans" in y|Y) _uninstall_xray ;; *) _info "已取消" ;; esac
+            read -rp "  确认卸载 Xray 核心与服务(保留面板及全部数据)? [y/N]: " ans
+            case "$ans" in y|Y) _uninstall_xray keep-panel ;; *) _info "已取消" ;; esac
             ;;
-        3)
-            read -rp "  确认卸载 Xray + cloudflared(删除全部数据与隧道, 不可恢复)? [y/N]: " ans
+        3|4)
+            local uninstall_mode=keep-panel
+            if [ "$choice" = 4 ]; then
+                uninstall_mode=all
+                read -rp "  确认卸载 Xray + cloudflared 并删除面板及全部数据, 不可恢复? [y/N]: " ans
+            else
+                read -rp "  确认卸载 Xray + cloudflared(保留面板及全部数据)? [y/N]: " ans
+            fi
             case "$ans" in
                 y|Y)
                     # Xray 卸载 rc 1 报残留；cloudflared 独立，仍执行用户请求。
                     local xray_rc=0
-                    _uninstall_xray || xray_rc=$?
+                    if [ "$uninstall_mode" = all ]; then
+                        _uninstall_xray || xray_rc=$?
+                    else
+                        _uninstall_xray keep-panel || xray_rc=$?
+                    fi
                     if [ "$xray_rc" -ne 0 ]; then
                         _error "Xray 卸载未完成(见上方原因), 部署目录可能仍然存在, 请处理后重试"
                     fi
