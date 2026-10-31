@@ -611,6 +611,50 @@ trap cleanup EXIT
         [ -n "$check_line" ] && [ -n "$rm_line" ] && [ "$check_line" -lt "$rm_line" ]
     }
 
+    uninstall_keep_panel_contract() (
+        local root="$TMP/uninstall-keep-panel"
+        DEPLOY_DIR="$root/deploy" XRAY_BIN="$root/deploy/bin/xray" CMD_NAME=xd INIT_SYSTEM=direct
+        STATE_DIR="$DEPLOY_DIR/state" CRON_RC=0
+        mkdir -p "$DEPLOY_DIR/bin" "$DEPLOY_DIR/confs" "$DEPLOY_DIR/nodes" "$STATE_DIR"
+        : > "$XRAY_BIN"
+        : > "$DEPLOY_DIR/xray-deploy.sh"
+        : > "$DEPLOY_DIR/confs/05_routing.json"
+        : > "$DEPLOY_DIR/nodes/node.json"
+        printf '0 */3 * * *\n' > "$STATE_DIR/timed_restart"
+        _crontab_replace() { printf 'cron\n' >> "$root/actions"; return "$CRON_RC"; }
+        _state_set() {
+            [ "$1" = timed_restart ] && printf '%s\n' "$2" > "$STATE_DIR/timed_restart" \
+                && printf 'state:%s\n' "$2" >> "$root/actions"
+        }
+        _xray_stop_and_verify() { return 0; }
+        _success() { :; }
+        _error() { printf '%s\n' "$*" >> "$root/errors"; }
+        _warn() { :; }
+        readlink() { return 1; }
+        rm() {
+            local target="${*: -1}"
+            printf '%s\n' "$target" >> "$root/removed"
+            if [ "$target" = "$XRAY_BIN" ]; then command rm -f "$XRAY_BIN"; fi
+            return 0
+        }
+        _hy2_cleanup_all_hops() { printf 'hop-cleanup\n' >> "$root/actions"; return 99; }
+        _hysteria_cleanup_before_uninstall() { printf 'hysteria-cleanup\n' >> "$root/actions"; return 99; }
+        _logrotate_cleanup() { printf 'logrotate-cleanup\n' >> "$root/actions"; return 99; }
+        _uninstall_xray_locked keep-panel || return 1
+        [ ! -e "$XRAY_BIN" ] && [ -f "$DEPLOY_DIR/xray-deploy.sh" ] \
+            && [ -f "$DEPLOY_DIR/confs/05_routing.json" ] && [ -f "$DEPLOY_DIR/nodes/node.json" ] || return 1
+        [ "$(cat "$STATE_DIR/timed_restart")" = off ] \
+            && [ "$(cat "$root/actions")" = $'cron\nstate:off' ] \
+            && ! grep -qFx /usr/local/bin/xd "$root/removed" || return 1
+        : > "$root/actions"
+        : > "$XRAY_BIN"
+        printf '0 */6 * * *\n' > "$STATE_DIR/timed_restart"
+        CRON_RC=1
+        _uninstall_xray_locked keep-panel || return 1
+        [ "$(cat "$STATE_DIR/timed_restart")" = '0 */6 * * *' ] \
+            && [ "$(cat "$root/actions")" = cron ]
+    )
+
     version_gate_matrix() {
         eval "$(declare -f _xray_version_ge)"
         local dir="$TMP/version-gates" version gecko unix expected_gecko expected_unix
@@ -688,6 +732,7 @@ trap cleanup EXIT
     check 'verified restart rejects unchanged old process identity' restart_verified_rejects_unchanged_identity
     check 'verified restart fails closed when identity is unreadable' restart_verified_requires_readable_identity
     check 'uninstall checks logrotate helper before deleting entrypoints' uninstall_cleanup_contract
+    check 'Xray-only uninstall preserves manager and data' uninstall_keep_panel_contract
     check '26.6.1 and 26.9.8 gates and masquerade key set' version_gate_matrix
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]

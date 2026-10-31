@@ -2558,7 +2558,7 @@ _xray_stop_and_verify() {
 }
 
 # ---------------------------------------------------------------------------
-# 卸载 Xray(停服务 + 删 service + 删部署目录 + 清快捷命令 + 清 crontab)
+# 卸载 Xray; keep-panel 仅移除核心/服务, 保留管理器与全部数据。
 # ---------------------------------------------------------------------------
 _uninstall_xray() {
     # 外层取 install, 下层 config → core; 稳定锁均在部署树外, 卸载不拆分 inode。
@@ -2576,20 +2576,24 @@ _uninstall_xray_config_locked() {
 }
 
 _uninstall_xray_locked() {
+    local mode="${1:-all}"
     # 所有 helper 能力检查必须早于停止/删除等不可逆动作: 缺失时直接中止,
     # 避免停掉服务、删掉入口后才发现卸载无法完成, 留下半卸载状态。
-    if ! declare -F _logrotate_cleanup >/dev/null 2>&1; then
-        _error "缺少 logrotate 清理助手, 已中止卸载(未做任何删除)"
-        _tip "请先执行 install.sh --update 同步全部模块后重试"
-        return 1
-    fi
-    if ! declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
-        _error "缺少端口跳跃清理助手, 已中止卸载(未做任何删除)"
-        return 1
-    fi
-    if ! declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
-        _error "缺少官方 Hysteria2 清理助手, 已中止卸载(未做任何删除)"
-        return 1
+    case "$mode" in keep-panel|all) ;; *) _error "未知卸载模式: $mode"; return 1 ;; esac
+    if [ "$mode" = all ]; then
+        if ! declare -F _logrotate_cleanup >/dev/null 2>&1; then
+            _error "缺少 logrotate 清理助手, 已中止卸载(未做任何删除)"
+            _tip "请先执行 install.sh --update 同步全部模块后重试"
+            return 1
+        fi
+        if ! declare -F _hy2_cleanup_all_hops >/dev/null 2>&1; then
+            _error "缺少端口跳跃清理助手, 已中止卸载(未做任何删除)"
+            return 1
+        fi
+        if ! declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
+            _error "缺少官方 Hysteria2 清理助手, 已中止卸载(未做任何删除)"
+            return 1
+        fi
     fi
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
         _error "缺少 crontab 清理助手, 已中止卸载(未做任何删除)"
@@ -2602,17 +2606,16 @@ _uninstall_xray_locked() {
         _tip "可先到 xd 主菜单 [查看状态] 确认服务与版本"
         return 1
     fi
-    # 清理端口跳跃 iptables 规则必须在任何外部卸载动作之前: 失败时保留部署树和
-    # metadata, 同时避免留下已失去管理入口的 DNAT 规则。
-    if ! _hy2_cleanup_all_hops; then
-        _error "端口跳跃规则清理失败, 已中止卸载(部署目录与节点元数据保留), 请处理后重试"
-        return 1
-    fi
-    # 官方 Hysteria2 前置清理可因停止/服务定义失败而中止, 因此必须早于 Xray unit、快捷命令与
-    # 二进制 symlink 的删除; 否则 abort 会留下 Hysteria 孤儿服务但已失去管理入口。
-    if ! _hysteria_cleanup_before_uninstall; then
-        _error "官方 Hysteria2 清理未完成, 已中止 Xray 卸载(部署数据与 Xray 管理入口保留), 请处理后重试"
-        return 1
+    if [ "$mode" = all ]; then
+        # 整站卸载时先清跳跃规则与独立 Hysteria2, 失败则保留管理入口。
+        if ! _hy2_cleanup_all_hops; then
+            _error "端口跳跃规则清理失败, 已中止卸载(部署目录与节点元数据保留), 请处理后重试"
+            return 1
+        fi
+        if ! _hysteria_cleanup_before_uninstall; then
+            _error "官方 Hysteria2 清理未完成, 已中止 Xray 卸载(部署数据与 Xray 管理入口保留), 请处理后重试"
+            return 1
+        fi
     fi
     case "$INIT_SYSTEM" in
         systemd)
@@ -2625,11 +2628,28 @@ _uninstall_xray_locked() {
             rm -f /etc/init.d/xray
             ;;
     esac
-    _crontab_replace "# xray-deploy-timed-restart" >/dev/null 2>&1 || \
+    if _crontab_replace "# xray-deploy-timed-restart" >/dev/null 2>&1; then
+        if [ "$mode" = keep-panel ]; then
+            _state_set timed_restart "off" || _warn "定时重启任务已移除, 但状态清除失败, 请检查 $STATE_DIR/timed_restart"
+        fi
+    else
         _warn "未能移除定时重启任务, 请手动检查 crontab"
-    # 删快捷命令(xd) + xray symlink
-    rm -f /usr/local/bin/"$CMD_NAME"
-    [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ] && rm -f /usr/local/bin/xray
+    fi
+    # 整站卸载才移除管理入口; 单独卸载核心时保留 xd 和面板数据, 以便后续重新安装/管理。
+    if [ "$mode" = all ]; then
+        rm -f /usr/local/bin/"$CMD_NAME"
+    fi
+    if [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ]; then
+        rm -f /usr/local/bin/xray
+    fi
+    if [ "$mode" = keep-panel ]; then
+        if ! rm -f "$XRAY_BIN" 2>/dev/null || [ -e "$XRAY_BIN" ] || [ -L "$XRAY_BIN" ]; then
+            _error "Xray 核心文件删除失败, 面板与数据已保留: $XRAY_BIN"
+            return 1
+        fi
+        _success "Xray 核心与服务已卸载, 面板及全部数据已保留"
+        return 0
+    fi
     _logrotate_cleanup
     # 删部署目录(含 config/nodes/assets/logs/state/lib/templates)。rm -rf 的 rc 不能吞掉;
     # 部分删除失败时必须报告未完成, 不能把残留安装报成已卸载。
