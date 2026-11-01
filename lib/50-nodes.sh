@@ -181,39 +181,11 @@ _hy2_obfs_mask_block() {
     printf '%s' "{\"type\": \"${otype}\", \"settings\": {\"password\": \"${opw}\", \"${XD_UDP_OUR_MARKER}\": true${size_json:+, \"packetSize\": ${size_json}}}}"
 }
 
-# gecko 要求 >=v26.6.1；v26.3.27~v26.5.9 无 packetSize，v26.7.11 改为 Int32Range。
-# 依据 infra/conf/transport_internet.go 各 tag；旧核心静默忽略未知字段，必须先门控。
-_HY2_GECKO_MIN_VER="v26.6.1"
-_hy2_gecko_supported() {
-    [ -x "$XRAY_BIN" ] || return 1
-    declare -F _xray_version_ge >/dev/null 2>&1 || return 1
-    # _xray_version_ge <min>: 内部自取当前版本(纯数字三段比较, busybox 安全);
-    # 版本读不到时返回 1 = 不满足, 正好是保守侧。
-    _xray_version_ge "$_HY2_GECKO_MIN_VER"
-}
-
 # masquerade 仅改 hysteriaSettings.masquerade，独立于 finalmask.udp；Xray 使用扁平字段。
-# >=v26.9.8 支持 unix/xForwarded(transport_method.go/hysteria/hub.go)。
-_HY2_MASQ_UNIX_MIN_VER="26.9.8"
-# unix socket / xForwarded 的可用性(比 masquerade 本体更晚引入)
-_hy2_masq_unix_supported() {
-    [ -x "$XRAY_BIN" ] || return 1
-    declare -F _xray_version_ge >/dev/null 2>&1 || return 1
-    _xray_version_ge "$_HY2_MASQ_UNIX_MIN_VER"
-}
+# unix socket 与 xForwarded 由协议支持(transport_method.go/hysteria/hub.go), 不再按版本探测。
 
 # 完整已知字段按 Masquerade json tag 清理；保留未知字段以免覆盖外部配置。
 XD_MASQ_KNOWN_KEYS_JSON='["type","dir","url","rewriteHost","xForwarded","insecure","content","headers","statusCode"]'
-
-# 本机支持字段按核心版本筛选；旧核心未知字段不能显示为已生效。
-XD_MASQ_KNOWN_KEYS_BASE_JSON='["type","dir","url","rewriteHost","insecure","content","headers","statusCode"]'
-_hy2_masq_known_keys_json() {
-    if _hy2_masq_unix_supported; then
-        printf '%s' "$XD_MASQ_KNOWN_KEYS_JSON"
-    else
-        printf '%s' "$XD_MASQ_KNOWN_KEYS_BASE_JSON"
-    fi
-}
 
 # 集合写入(唯一入口)。$m = 新 masquerade 对象, $known = 已知字段表。
 # 只命中选中 tag 的那一个入站; 路径不存在时 jq 会自动补齐 streamSettings/hysteriaSettings。
@@ -278,7 +250,6 @@ _hy2_masq_url_invalid() {
             printf '%s' ""
             return ;;
         unix://*)
-            _hy2_masq_unix_supported || { printf '%s' "Unix socket 伪装需要 Xray >= v${_HY2_MASQ_UNIX_MIN_VER}(当前核心不支持, 写入会被静默忽略)"; return; }
             sock="${u#unix://}"
             case "$sock" in
                 /*) printf '%s' "" ;;
@@ -287,7 +258,6 @@ _hy2_masq_url_invalid() {
             return ;;
         /*)
             # 裸绝对路径等价 unix(核心 case "", "unix" 取 u.Path 作 socket 路径)
-            _hy2_masq_unix_supported || { printf '%s' "Unix socket 伪装需要 Xray >= v${_HY2_MASQ_UNIX_MIN_VER}(当前核心不支持, 写入会被静默忽略)"; return; }
             printf '%s' ""
             return ;;
     esac
@@ -340,13 +310,8 @@ _hy2_masq_json_file() {
 # proxy 参数为 rewriteHost/insecure/xForwarded 布尔字面量；headers 是 JSON 对象。
 _hy2_masq_json_proxy() {
     local xf="${4:-}"
-    if _hy2_masq_unix_supported; then
-        jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" --argjson xf "${xf:-false}" \
-            '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins, xForwarded: $xf}'
-    else
-        jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" \
-            '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins}'
-    fi
+    jq -nc --arg u "$1" --argjson rh "$2" --argjson ins "$3" --argjson xf "${xf:-false}" \
+        '{type: "proxy", url: $u, rewriteHost: $rh, insecure: $ins, xForwarded: $xf}'
 }
 
 # $2 = 状态码字符串(空 = 用核心默认 200); $3 = headers JSON 对象
@@ -367,10 +332,7 @@ _hy2_masq_apply() {
     if [ -z "$payload" ]; then
         _mutate_config --arg t "$tag" "$XD_MASQ_JQ_CLEAR"
     else
-        # known 表必须按本机核心能力取(见 _hy2_masq_known_keys_json): 旧核心上把
-        # xForwarded 排除在"已知"之外, 它才会作为 unknown key 被原样保留。
-        local known
-        known=$(_hy2_masq_known_keys_json)
+        local known="$XD_MASQ_KNOWN_KEYS_JSON"
         _mutate_config --arg t "$tag" --argjson m "$payload" --argjson known "$known" "$XD_MASQ_JQ_SET"
     fi
 }
@@ -2667,114 +2629,11 @@ _enc_meta_json() {   # <meta_json>; 未启用加密时原样返回
 }
 
 # ---------------------------------------------------------------------------
-# 协议1: VLESS+TCP+Reality+Vision (可选 直连 / Tunnel 模式, 见 _prompt_reality_mode)
 # ---------------------------------------------------------------------------
-_add_vless_tcp_reality_vision() {
-    _prompt_reality_mode || return 1
-    local mode="$REALITY_MODE" mode_label="直连模式"
-    [ "$mode" = "tunnel" ] && mode_label="Tunnel 模式·防偷跑"
-    echo -e "\n  ${CYAN}=== VLESS+TCP+Reality+Vision (${mode_label}) ===${NC}"
-    local sni
-    read -rp "  伪装域名 (默认 www.amd.com): " sni
-    sni=${sni:-www.amd.com}
-    # SNI 会被拼进 tunnel inbound tag, 含空格/引号会破坏按 tag 的关联匹配
-    _validate_domain "$sni" || { _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $sni"; return 1; }
-
-    _prompt_reality_ports "$mode" "$sni" || return 1
-    local port="$REALITY_PORT" tunnel_port="$REALITY_TUNNEL_PORT"
-
-    local default_name="Reality-Vision-${port}"
-    _node_name_prompt || return 1
-
-    local uuid; uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
-    _generate_reality_keys || return 1
-
-    local pq_seed="" pq_verify=""
-    if _detect_reality_pq "${sni}:443"; then
-        # PQ_SEED/PQ_VERIFY 由 51-reality-pq.sh 的 _detect_reality_pq 写入。
-        # shellcheck disable=SC2153
-        pq_seed="$PQ_SEED"
-        # shellcheck disable=SC2153
-        pq_verify="$PQ_VERIFY"
-    fi
-
-    _enc_opts_prompt || return 1
-
-    local tag="xd-reality-vision-${port}"
-    local tunnel_tag=""
-    local listen="::"
-    local reality_json
-
-    if [ "$mode" = "tunnel" ]; then
-        # tag 长度封顶(见 _gen_tunnel_tag), 避免最长合法 SNI 拼出 270+ 字符的 tag
-        tunnel_tag=$(_gen_tunnel_tag "$sni" "$tunnel_port" "$port")
-        # 渲染 tunnel inbound
-        R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
-        local tunnel_json
-        tunnel_json=$(_render_template "$(_tpl_path tunnel)") || return 1
-
-        # 渲染 reality inbound (target → 127.0.0.1:<tunnel_port>)
-        R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
-        R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
-        R_SHORT_ID="$REALITY_SHORT_ID" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
-        reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision-tunnel)") || return 1
-
-    else
-        # 直连: target = <sni>:443, 只提交 1 个入站, 不写任何路由规则
-        R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
-        R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
-        R_SHORT_ID="$REALITY_SHORT_ID" R_MLDSA65_SEED="$pq_seed"
-        reality_json=$(_render_template "$(_tpl_path vless-tcp-reality-vision-direct)") || return 1
-    fi
-
-    #  连接地址询问必须在 config 提交前完成, config+metadata 由事务一次性提交
-    local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
-    local link_ip; link_ip=$(_link_host "$addr")
-    local enc_param
-    enc_param=$(_enc_param)
-    # 分享链接标准(XTLS VMess/VLESS 提案): type 必须是 tcp(不是 raw)、REALITY 时 fp 不可省略
-    # 且默认 chrome、sni 等 URL 字段 Value 一律 encodeURIComponent。
-    local link
-    link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=tcp&flow=xtls-rprx-vision&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
-    [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
-    link="${link}#$(_url_encode "$name")"
-
-    local enc_clash; enc_clash=$(_enc_clash_suffix)
-    # 所有用户字段经 _yaml_dq 双引号转义；派生YAML不能改变字段结构。
-    local clash
-    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, network: tcp}"
-
-    # reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
-    local meta_json
-    meta_json=$(jq -n \
-        --arg tag "$tag" --arg name "$name" --arg proto "vless-tcp-reality-vision" \
-        --arg mode "$mode" \
-        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
-        --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
-        --arg sid "$REALITY_SHORT_ID" --arg pqv "$pq_verify" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link}')
-    if [ "$mode" = "tunnel" ]; then
-        meta_json=$(echo "$meta_json" | jq \
-            --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
-            '. + {tunnel_tag:$ttag,tunnel_port:$tport}')
-    fi
-    meta_json=$(_enc_meta_json "$meta_json")
-    # 原子提交( config + metadata + 派生 YAML(metadata 失败会回滚入站/路由)。
-    if [ "$mode" = "tunnel" ]; then
-        _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" "$clash" "$name" || return 1
-    else
-        _commit_node_txn "$tag" "$reality_json" "$meta_json" "$clash" "$name" || return 1
-    fi
-
-    _success "节点 [${name}] 创建成功"
-    if [ "$mode" = "tunnel" ]; then
-        _tip "Tunnel: ${tunnel_port} → ${sni}:443 | Reality: ${port}"
-    else
-        _tip "直连: Reality ${port} → target ${sni}:443 (无 tunnel 入站/路由规则)"
-    fi
-    [ -n "$pq_verify" ] && _tip "已启用后量子签名 (pqv)"
-    echo -e "  ${CYAN}分享链接:${NC} ${link}"
-}
+# 协议1/2: VLESS+Reality (TCP+Vision / XHTTP), 可选 直连 / Tunnel, 见 _prompt_reality_mode
+# ---------------------------------------------------------------------------
+_add_vless_tcp_reality_vision() { _add_reality_node tcp; }
+_add_vless_xhttp_reality() { _add_reality_node xhttp; }
 
 # 交互输入帮助: 读取 Wire 路径与 CDN 目标, 写入调用方作用域(path / host,preferred_addr,preferred_port)。
 _prompt_wire_path() {   # <显示名 XHTTP|WS>
@@ -2799,14 +2658,31 @@ _prompt_cdn_host() {   # 读 CDN Host + 优选地址 + 优选端口
     [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
 }
 
-# ---------------------------------------------------------------------------
-# 协议2: VLESS+XHTTP+Reality (可选 直连 / Tunnel 模式, 见 _prompt_reality_mode)
-# ---------------------------------------------------------------------------
-_add_vless_xhttp_reality() {
+# 两种线协议共用创建流程; 只有标题/tag/模板名/链接字段/clash 字段按 wire 分叉。
+_add_reality_node() {   # <tcp|xhttp>
+    local wire="$1" title tpl_prefix tag_prefix name_prefix
+    case "$wire" in
+        tcp)
+            title="VLESS+TCP+Reality+Vision"
+            tpl_prefix="vless-tcp-reality-vision"
+            tag_prefix="xd-reality-vision"
+            name_prefix="Reality-Vision"
+            ;;
+        xhttp)
+            title="VLESS+XHTTP+Reality"
+            tpl_prefix="vless-xhttp-reality"
+            tag_prefix="xd-reality-xhttp"
+            name_prefix="Reality-XHTTP"
+            ;;
+        *)
+            _error "未知 Reality 线协议: $wire"
+            return 1
+            ;;
+    esac
     _prompt_reality_mode || return 1
     local mode="$REALITY_MODE" mode_label="直连模式"
     [ "$mode" = "tunnel" ] && mode_label="Tunnel 模式·防偷跑"
-    echo -e "\n  ${CYAN}=== VLESS+XHTTP+Reality (${mode_label}) ===${NC}"
+    echo -e "\n  ${CYAN}=== ${title} (${mode_label}) ===${NC}"
     local sni
     read -rp "  伪装域名 (默认 www.amd.com): " sni
     sni=${sni:-www.amd.com}
@@ -2816,10 +2692,12 @@ _add_vless_xhttp_reality() {
     _prompt_reality_ports "$mode" "$sni" || return 1
     local port="$REALITY_PORT" tunnel_port="$REALITY_TUNNEL_PORT"
 
-    local path
-    _prompt_wire_path XHTTP || return 1
+    local path=""
+    if [ "$wire" = "xhttp" ]; then
+        _prompt_wire_path XHTTP || return 1
+    fi
 
-    local default_name="Reality-XHTTP-${port}"
+    local default_name="${name_prefix}-${port}"
     _node_name_prompt || return 1
 
     local uuid; uuid=$(_gen_uuid) || { _error "UUID 生成失败"; return 1; }
@@ -2836,57 +2714,78 @@ _add_vless_xhttp_reality() {
 
     _enc_opts_prompt || return 1
 
-    local tag="xd-reality-xhttp-${port}"
+    local tag="${tag_prefix}-${port}"
     local tunnel_tag=""
     local listen="::"
     local reality_json
 
     if [ "$mode" = "tunnel" ]; then
-        # tag 长度封顶(见 _gen_tunnel_tag)
+        # tag 长度封顶(见 _gen_tunnel_tag), 避免最长合法 SNI 拼出 270+ 字符的 tag
         tunnel_tag=$(_gen_tunnel_tag "$sni" "$tunnel_port" "$port")
-
+        # 渲染 tunnel inbound
         R_LISTEN="127.0.0.1" R_PORT="$tunnel_port" R_TAG="$tunnel_tag" R_TARGET="$sni"
         local tunnel_json
         tunnel_json=$(_render_template "$(_tpl_path tunnel)") || return 1
 
+        # 渲染 reality inbound (target → 127.0.0.1:<tunnel_port>)
         R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
         R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
         R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
-        reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality-tunnel)") || return 1
+        reality_json=$(_render_template "$(_tpl_path "${tpl_prefix}-tunnel")") || return 1
 
     else
-        # 直连: target = <sni>:443, 单入站提交, 无路由规则
+        # 直连: target = <sni>:443, 只提交 1 个入站, 不写任何路由规则
         R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
         R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
         R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_MLDSA65_SEED="$pq_seed"
-        reality_json=$(_render_template "$(_tpl_path vless-xhttp-reality-direct)") || return 1
+        reality_json=$(_render_template "$(_tpl_path "${tpl_prefix}-direct")") || return 1
     fi
 
-    #  连接地址询问必须在 config 提交前完成
+    #  连接地址询问必须在 config 提交前完成, config+metadata 由事务一次性提交
     local addr; addr=$(_ask_link_addr) || { _error "未获取到客户端连接地址(输入已结束), 已取消(未写入 config)"; return 1; }
     local link_ip; link_ip=$(_link_host "$addr")
     local enc_param
     enc_param=$(_enc_param)
+    # 分享链接标准(XTLS VMess/VLESS 提案): type 必须是 tcp(不是 raw)、REALITY 时 fp 不可省略
+    # 且默认 chrome、sni 等 URL 字段 Value 一律 encodeURIComponent。
     local link
-    link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+    link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=${wire}"
+    if [ "$wire" = "xhttp" ]; then
+        link="${link}&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+    else
+        link="${link}&flow=xtls-rprx-vision&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
+    fi
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
     local enc_clash; enc_clash=$(_enc_clash_suffix)
-    # clash yaml (mihomo 格式): 见 _add_vless_tcp_reality_vision 同处注释 ——
-    # support-x25519mlkem768 必须显式开启, client-fingerprint 用 chrome。
+    # clash yaml(mihomo): 所有用户字段经 _yaml_dq 双引号转义; support-x25519mlkem768
+    # 必须显式开启, client-fingerprint 用 chrome; 派生 YAML 不能改变字段结构。
+    local c_flow="" c_net="" c_tail=""
+    if [ "$wire" = "xhttp" ]; then
+        c_net="network: xhttp"
+        c_tail=", \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}"
+    else
+        c_flow=", flow: xtls-rprx-vision"
+        c_net="network: tcp"
+    fi
     local clash
-    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
+    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid${c_flow}, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, ${c_net}${c_tail}}"
 
     # reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
-    local meta_json
+    local meta_json meta_filter
+    if [ "$wire" = "xhttp" ]; then
+        meta_filter='{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link}'
+    else
+        meta_filter='{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link}'
+    fi
     meta_json=$(jq -n \
-        --arg tag "$tag" --arg name "$name" --arg proto "vless-xhttp-reality" \
+        --arg tag "$tag" --arg name "$name" --arg proto "$tpl_prefix" \
         --arg mode "$mode" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
         --arg sid "$REALITY_SHORT_ID" --arg path "$path" --arg pqv "$pq_verify" --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link}')
+        "$meta_filter")
     if [ "$mode" = "tunnel" ]; then
         meta_json=$(echo "$meta_json" | jq \
             --arg ttag "$tunnel_tag" --argjson tport "$tunnel_port" \
@@ -3053,37 +2952,64 @@ _add_vless_enc() {
 }
 
 # ---------------------------------------------------------------------------
-# 协议4: VLESS+XHTTP(无TLS, 必须套CDN)
+# 协议4/5: VLESS+XHTTP / VLESS+WS (无TLS, 必须套 CDN)
 # ---------------------------------------------------------------------------
-_add_vless_xhttp_cdn() {
-    echo -e "\n  ${CYAN}=== VLESS+XHTTP (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
+_add_vless_xhttp_cdn() { _add_cdn_node xhttp; }
+_add_vless_ws_cdn() { _add_cdn_node ws; }
+
+# 两种 CDN 线协议共用创建流程; 只有标题/名称/模板/链接字段/clash 字段按 wire 分叉。
+_add_cdn_node() {   # <xhttp|ws>
+    local wire="$1" title wire_label tpl_prefix tag_prefix name_prefix
+    case "$wire" in
+        xhttp)
+            title="VLESS+XHTTP"
+            wire_label="XHTTP"
+            tpl_prefix="vless-xhttp-cdn"
+            tag_prefix="xd-xhttp-cdn"
+            name_prefix="XHTTP-CDN"
+            ;;
+        ws)
+            title="VLESS+WS"
+            wire_label="WS"
+            tpl_prefix="vless-ws-cdn"
+            tag_prefix="xd-ws-cdn"
+            name_prefix="WS-CDN"
+            ;;
+        *)
+            _error "未知 CDN 线协议: $wire"
+            return 1
+            ;;
+    esac
+    echo -e "\n  ${CYAN}=== ${title} (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
     echo -e "  ${RED}⚠ 该协议不能直连, 客户端须经 CF CDN 回源到本机${NC}"
     local port
     port=$(_input_port tcp) || return 1
     # 走 CDN 建议用 CF 支持的 HTTP 端口(仅警告, 不强制)
-    case "$port" in 80|8080|8880|2052|2082|2086|2095|443|2053|2083|2087|2096|8443) ;; *)
-        _warn "非 CF 推荐端口, 建议使用 80/8080/2052/2086/2095 等, 仍可继续"
-        ;;
-    esac
+    if [ "$wire" = "xhttp" ]; then
+        case "$port" in 80|8080|8880|2052|2082|2086|2095|443|2053|2083|2087|2096|8443) ;; *)
+            _warn "非 CF 推荐端口, 建议使用 80/8080/2052/2086/2095 等, 仍可继续"
+            ;;
+        esac
+    fi
 
     local host preferred_addr preferred_port
     _prompt_cdn_host || return 1
 
     local path
-    _prompt_wire_path XHTTP || return 1
+    _prompt_wire_path "$wire_label" || return 1
 
-    local default_name="XHTTP-CDN-${port}"
+    local default_name="${name_prefix}-${port}"
     _node_name_prompt || return 1
 
     local uuid; uuid=$(_gen_uuid) || return 1
 
     _enc_opts_prompt || return 1
 
-    local tag="xd-xhttp-cdn-${port}"
+    local tag="${tag_prefix}-${port}"
     local listen="::"
     R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path"
     local inbound
-    inbound=$(_render_template "$(_tpl_path vless-xhttp-cdn)") || return 1
+    inbound=$(_render_template "$(_tpl_path "$tpl_prefix")") || return 1
 
     local link_ip; link_ip=$(_link_host "$preferred_addr")
     local enc_param
@@ -3091,73 +3017,45 @@ _add_vless_xhttp_cdn() {
     # 分享链接标准: fp 默认 chrome; 标准无 insecure/allowInsecure 字段(Xray 已移除该配置项),
     # 且本节点经 CF 边缘合法证书, 无需跳过校验; sni/host 必须 encodeURIComponent
     local link
-    link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&alpn=h2&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")#$(_url_encode "$name")"
+    link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome"
+    if [ "$wire" = "xhttp" ]; then
+        link="${link}&alpn=h2&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")"
+    else
+        link="${link}&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")"
+    fi
+    link="${link}#$(_url_encode "$name")"
+
     local enc_clash; enc_clash=$(_enc_clash_suffix)
+    local c_opts
+    if [ "$wire" = "xhttp" ]; then
+        c_opts="network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}"
+    else
+        c_opts="network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}"
+    fi
     local clash
-    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
+    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, ${c_opts}}"
 
+    # xhttp 需要显式 alpn=h2; ws 无该字段, metadata 结构与旧版保持一致
     local meta_json
-    meta_json=$(jq -n \
-        --arg tag "$tag" --arg name "$name" --arg proto "vless-xhttp-cdn" \
-        --argjson port "$port" --arg listen "$listen" \
-        --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
-        --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
-        --arg sni "$host" --arg fp "chrome" --arg alpn "h2" \
-        --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,share_link:$link}')
-    meta_json=$(_enc_meta_json "$meta_json")
-    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
-
-    _success "节点 [${name}] 创建成功"
-    _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
-    echo -e "  ${CYAN}分享链接(经CDN):${NC} ${link}"
-}
-
-# ---------------------------------------------------------------------------
-# 协议5: VLESS+WS(无TLS, 必须套CDN)
-# ---------------------------------------------------------------------------
-_add_vless_ws_cdn() {
-    echo -e "\n  ${CYAN}=== VLESS+WS (无TLS · 必须套 Cloudflare CDN, 禁止直连) ===${NC}"
-    echo -e "  ${RED}⚠ 该协议不能直连, 客户端须经 CF CDN 回源到本机${NC}"
-    local port; port=$(_input_port tcp) || return 1
-
-    local host preferred_addr preferred_port
-    _prompt_cdn_host || return 1
-
-    local path
-    _prompt_wire_path WS || return 1
-
-    local default_name="WS-CDN-${port}"
-    _node_name_prompt || return 1
-
-    local uuid; uuid=$(_gen_uuid) || return 1
-
-    _enc_opts_prompt || return 1
-
-    local tag="xd-ws-cdn-${port}"
-    local listen="::"
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path"
-    local inbound
-    inbound=$(_render_template "$(_tpl_path vless-ws-cdn)") || return 1
-
-    local link_ip; link_ip=$(_link_host "$preferred_addr")
-    local enc_param
-    enc_param=$(_enc_param)
-    local link
-    link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")#$(_url_encode "$name")"
-    local enc_clash; enc_clash=$(_enc_clash_suffix)
-    local clash
-    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
-
-    local meta_json
-    meta_json=$(jq -n \
-        --arg tag "$tag" --arg name "$name" --arg proto "vless-ws-cdn" \
-        --argjson port "$port" --arg listen "$listen" \
-        --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
-        --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
-        --arg sni "$host" --arg fp "chrome" \
-        --arg link "$link" \
-        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,share_link:$link}')
+    if [ "$wire" = "xhttp" ]; then
+        meta_json=$(jq -n \
+            --arg tag "$tag" --arg name "$name" --arg proto "$tpl_prefix" \
+            --argjson port "$port" --arg listen "$listen" \
+            --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
+            --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
+            --arg sni "$host" --arg fp "chrome" --arg alpn "h2" \
+            --arg link "$link" \
+            '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,share_link:$link}')
+    else
+        meta_json=$(jq -n \
+            --arg tag "$tag" --arg name "$name" --arg proto "$tpl_prefix" \
+            --argjson port "$port" --arg listen "$listen" \
+            --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
+            --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
+            --arg sni "$host" --arg fp "chrome" \
+            --arg link "$link" \
+            '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,share_link:$link}')
+    fi
     meta_json=$(_enc_meta_json "$meta_json")
     _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
 
@@ -4012,12 +3910,6 @@ _add_hysteria2() {
             obfs_pw=${obfs_pw_in:-$obfs_pw}
             _validate_json_text "$obfs_pw" || { _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
             if [ "$obfs_choice" = "3" ]; then
-                # gecko先版本门控；旧核心静默忽略packetSize会造成客户端不兼容。
-                if ! _hy2_gecko_supported; then
-                    _error "当前核心不支持 gecko 分片(packetSize 需核心 >= ${_HY2_GECKO_MIN_VER}); 已取消, 未修改任何配置"
-                    _tip "请先升级/切换 Xray 核心(核心版本门控见项目文档), 或改选 [2] 普通 salamander"
-                    return 1
-                fi
                 # gecko必须非空合法packetSize，默认512-1200；同时保存客户端类型与服务端范围。
                 read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " obfs_size
                 obfs_size="${obfs_size:-512-1200}"
@@ -4171,6 +4063,30 @@ _hy2_clash_line() {
     printf '%s}' "$line"
 }
 
+# 派生 YAML upsert: 改名先删旧条目, 再按 name 原位替换或追加。1=至少一处失败(已逐个告警)。
+_yaml_upsert() {   # <line> <name> [old_name]
+    local line="$1" name="$2" old_name="${3:-}" key crc=0
+    if [ -n "$old_name" ] && [ "$old_name" != "$name" ]; then
+        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || {
+            crc=1
+            _warn "Clash YAML 旧条目删除失败(${old_name}), 可手工编辑 ${CLASH_YAML}"
+        }
+    fi
+    key=$(_yaml_dq "$name")
+    if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
+        _replace_node_in_yaml "$line" "$name" || {
+            crc=1
+            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
+        }
+    else
+        _add_node_to_yaml "$line" "$name" || {
+            crc=1
+            _warn "Clash YAML 条目追加失败, 可手工编辑 ${CLASH_YAML}"
+        }
+    fi
+    return "$crc"
+}
+
 # _hy2_sync_derived 统一同步分享链接+Clash；不可表达时清链接但仍同步Clash。
 # config/metadata是权威，派生失败只告警且如实返回，不回滚权威状态。
 _hy2_sync_derived() {
@@ -4198,28 +4114,10 @@ _hy2_sync_derived() {
     # (2) clash.yaml: 可再生派生缓存 —— 失败单独报, 且不回滚权威状态。
     # 必须 upsert(条目在 → 替换; 不在 → 追加), 否则新建节点会静默漏条目。
     nname=$(jq -r '.name // empty' "$meta" 2>/dev/null)
-    local key
     if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
-        # 改名(改端口默认连带改名)时先删旧名条目, 否则旧条目会以"另一个节点"的形态留在
-        # clash.yaml 里指向旧端口(幽灵条目)。与 _sync_node_clash 的 old_name 处理同源。
-        if [ -n "$old_name" ] && [ "$old_name" != "$nname" ]; then
-            _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || {
-                crc=1
-                _warn "Clash YAML 旧条目删除失败(${old_name}), 可手工编辑 ${CLASH_YAML}"
-            }
-        fi
-        key=$(_yaml_dq "$nname")
-        if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
-            _replace_node_in_yaml "$nline" "$nname" || {
-                crc=1
-                _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
-            }
-        else
-            _add_node_to_yaml "$nline" "$nname" || {
-                crc=1
-                _warn "Clash YAML 条目追加失败, 可手工编辑 ${CLASH_YAML}"
-            }
-        fi
+        # 改名(改端口默认连带改名)时由 _yaml_upsert 先删旧名条目, 否则旧条目会以
+        # "另一个节点"的形态留在 clash.yaml 里指向旧端口(幽灵条目)。
+        _yaml_upsert "$nline" "$nname" "$old_name" || crc=1
     else
         crc=1
         _warn "Clash 条目生成失败(元数据不完整), 可手工编辑 ${CLASH_YAML}"
@@ -4310,7 +4208,7 @@ _sync_node_clash() {
 }
 
 _sync_node_clash_locked() {
-    local meta="$1" old_name="${2:-}" line name key crc=0
+    local meta="$1" old_name="${2:-}" line name
     # 元数据缺必填字段时保留 clash 旧行(它可能仍指向一个可用的旧配置), 但如实返回失败
     if ! line=$(_rebuild_clash_line "$meta"); then
         _warn "Clash 条目重建失败(元数据缺少必要字段), clash.yaml 未同步: $meta"
@@ -4318,25 +4216,7 @@ _sync_node_clash_locked() {
     fi
     name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     [ -n "$name" ] || return 1
-    if [ -n "$old_name" ] && [ "$old_name" != "$name" ]; then
-        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || {
-            crc=1
-            _warn "Clash YAML 旧条目删除失败(${old_name}), 可手工编辑 ${CLASH_YAML}"
-        }
-    fi
-    key=$(_yaml_dq "$name")
-    if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
-        _replace_node_in_yaml "$line" "$name" || {
-            crc=1
-            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
-        }
-    else
-        _add_node_to_yaml "$line" "$name" || {
-            crc=1
-            _warn "Clash YAML 条目追加失败, 可手工编辑 ${CLASH_YAML}"
-        }
-    fi
-    return "$crc"
+    _yaml_upsert "$line" "$name" "$old_name"
 }
 
 # Reality分享链接从metadata重建；pqv取客户端verify，不泄露seed。
@@ -4589,7 +4469,7 @@ _delete_node() {
         esac
         # 自签证书询问在锁外完成；把人工思考时间留在临界区外。
         _hy2_ask_purge_self_certs "${tags[@]}"
-        _with_config_lock _delete_node_apply_all
+        _with_config_lock _delete_node_apply_all_locked
         _press_any_key; return
     fi
 
@@ -4654,86 +4534,25 @@ _delete_node_meta_file() {
     return 0
 }
 
-_delete_node_apply_all() {
-    local tags=() tag f
+# 全删入口(持锁): 锁内重新枚举并绑定身份, 之后与多选删除共用同一套过滤/回滚路径。
+# 只删 metadata 里存在的节点; 外来入站不再被一并清空, 与单删/多删口径一致。
+_delete_node_apply_all_locked() {
+    local f t id del_idents=()
     for f in "$NODES_DIR"/*.json; do
         [ -f "$f" ] || continue
-        tags+=("$(basename "$f" .json)")
+        t=$(basename "$f" .json)
+        id=$(_node_identity "$t") || { _error "无法读取节点身份, 已取消: $t"; return 1; }
+        del_idents+=("$t" "$id")
     done
-    if [ ${#tags[@]} -eq 0 ]; then
+    if [ ${#del_idents[@]} -eq 0 ]; then
         _error "当前没有可删除的节点(metadata 为空), 已取消"
         return 1
     fi
-    # 先teardown hop并记录回滚；不能先删metadata丢失规则定位。
-    if ! _hy2_hop_teardown_all "${tags[@]}"; then
-        _error "所有节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
-        return 1
-    fi
-    _hy2_filter_skipped "${tags[@]}"
-    local del_all=("${_HY2_DEL_KEEP[@]}")
-    if [ ${#del_all[@]} -eq 0 ]; then
-        _error "没有可安全删除的节点"
-        return 1
-    fi
-    # 证书询问在锁外，锁内只消费结果；实际purge必须等config提交。
-    local all_filter='.inbounds = [] | .routing.rules |= map(select((type != "object") or .inboundTag == null or ((.inboundTag | type) == "array" and (.inboundTag | length) == 0)))'
-    local all_ok=0
-    if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ]; then
-        _mutate_config "$all_filter" && all_ok=1
-    else
-        local rm_tags=() kt ktt rrc
-        for kt in "${del_all[@]}"; do
-            rm_tags+=("$kt")
-            ktt=$(jq -r '.tunnel_tag // empty' "$NODES_DIR/${kt}.json" 2>/dev/null)
-            [ -n "$ktt" ] || continue
-            _reality_tunnel_has_surviving_refs "$ktt" "${del_all[@]}"; rrc=$?
-            if [ "$rrc" = 0 ]; then
-                continue
-            elif [ "$rrc" = 2 ]; then
-                _warn "无法确认 Reality tunnel 是否仍被引用, 保留 tunnel 与路由规则: $ktt"
-                continue
-            fi
-            rm_tags+=("$ktt")
-        done
-        local rm_json
-        rm_json=$(printf '%s\n' "${rm_tags[@]}" | jq -R . | jq -c -s .) || rm_json=""
-        if [ -z "$rm_json" ]; then
-            _error "生成移除集合失败"
-            _hy2_hop_restore_after_teardown
-            return 1
-        fi
-        _mutate_config --argjson rm "$rm_json" \
-            '.inbounds |= map(select((type != "object") or ((.tag // "") as $tg | ($rm | index($tg)) == null)))
-             | .routing.rules |= map(select((type != "object") or .inboundTag == null
-                   or (.inboundTag as $ib | ([$rm[] | . as $t | (($ib | if type == "string" then split(",") else . end) | index($t)) == null] | all))))' && all_ok=1
-    fi
-    if [ "$all_ok" -eq 1 ]; then
-        # config 已提交；teardown 规则不再属于可回滚集合。metadata 逐个落账，
-        # 任一 unlink 失败都停止成功路径，避免幽灵节点被报告成已删除。
-        _HY2_HOP_TD=()
-        for tag in "${del_all[@]}"; do
-            # 先删 JSON 再删 YAML 会读不到 name; 但 YAML 删除失败不阻断,
-            # 顺序仍是"先 YAML(读 json 的 name) 后 json"
-            _remove_node_from_yaml_by_tag "$tag" || \
-                _warn "Clash YAML 同步删除失败($tag), 可手工编辑 ${CLASH_YAML} 清除该行"
-            _delete_node_meta_file "$tag" || return 1
-        done
-        # 仅在"确实全删干净"时才截断 clash.yaml; 有保留节点时不能清空
-        if [ ${#_HY2_HOP_SKIP[@]} -eq 0 ] && [ -f "$CLASH_YAML" ]; then
-            printf 'proxies:\n' > "$CLASH_YAML"
-        fi
-        _success "已删除 ${#del_all[@]} 个节点"
-        _hy2_purge_self_certs
-        return 0
-    fi
-    # config 提交失败(已回滚): 恢复已 teardown 的 hop 规则
-    _hy2_hop_restore_after_teardown
-    _error "删除失败, 已回滚"
-    return 1
+    _delete_node_apply_multi "${del_idents[@]}"
 }
 
 _delete_node_apply_multi() {
-    # 参数是 tag/fingerprint 交错对( 只有指纹与当前内容一致才允许删除。
+    # 参数是 tag/fingerprint 交错对: 只有指纹与当前内容一致才允许删除。
     local del_tags=() del_idents=() dt now
     while [ "$#" -gt 0 ]; do
         del_tags+=("$1"); shift
@@ -4752,7 +4571,7 @@ _delete_node_apply_multi() {
             return 1
         fi
     done
-    # //同 _delete_node_apply_all —— teardown 在锁内, 逐项判定。
+    # //同全删入口 —— teardown 在锁内, 逐项判定。
     if ! _hy2_hop_teardown_all "${del_tags[@]}"; then
         _error "所选节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
         return 1

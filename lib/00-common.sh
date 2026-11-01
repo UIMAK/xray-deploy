@@ -19,7 +19,7 @@ export STATE_DIR="$DEPLOY_DIR/state"
 export BACKUP_DIR="$STATE_DIR/backup"
 
 export XRAY_BIN="$BIN_DIR/xray"
-# XRAY_LOCATION_ASSET: 核心 ≥ v26.7.11 读 config 的 env 段, 旧核心由 service 文件注入
+# XRAY_LOCATION_ASSET: 正常由 config 的 env 段提供
 # (见 20-xray-core)。这里只是脚本自身调用(xray -test / direct 启动)的进程级回退。
 export XRAY_LOCATION_ASSET="$ASSET_DIR"
 export GEO_LOG="$LOG_DIR/geo.log"
@@ -1124,52 +1124,6 @@ _press_any_key() {
     read -r
 }
 
-# ---------------------------------------------------------------------------
-# 无 flock 时 config.lock.d 原子 mkdir + pid; 既有目录一律拒绝, SIGKILL 残留需人工清理。
-# ---------------------------------------------------------------------------
-_with_config_lock_mkdir() {
-    local deploy_path="${DEPLOY_DIR%/}" lock_dir rc owner
-    lock_dir="$(_deploy_lock_root)/config.lock.d"
-    mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || {
-        _error "无法创建配置锁目录 $(dirname "$lock_dir")(权限/只读文件系统?), 放弃本次修改"
-        return 1
-    }
-    if ! mkdir "$lock_dir" 2>/dev/null; then
-        owner=$(cat "$lock_dir/pid" 2>/dev/null)
-        _error "配置锁目录已存在(可能有其他会话, 或上次被强杀): $lock_dir (pid ${owner:-未知})"
-        _tip "确认没有会话在修改配置后, 请手动删除该锁目录: rm -rf -- '$lock_dir'"
-        return 1
-    fi
-    if ! printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null; then
-        rm -f "$lock_dir/pid" 2>/dev/null
-        rmdir "$lock_dir" 2>/dev/null
-        _error "无法写入配置锁持有者记录 $lock_dir/pid(磁盘空间/权限?), 放弃本次修改"
-        return 1
-    fi
-    if [ ! -d "$deploy_path" ]; then
-        _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $deploy_path"
-        rm -f "$lock_dir/pid" 2>/dev/null
-        rmdir "$lock_dir" 2>/dev/null
-        return 1
-    fi
-    (
-        # 标记只需在 "$@"(及其子进程)内可见: 重入判定发生在锁体内, 子 shell 退出即释放锁,
-        # 外层不需要看到该标记, 故 SC2030 的"改动只在本子 shell"是预期行为。
-        # shellcheck disable=SC2030
-        XRAY_DEPLOY_LOCK_HELD=1
-        export XRAY_DEPLOY_LOCK_HELD
-        "$@"
-    )
-    rc=$?
-    owner=$(cat "$lock_dir/pid" 2>/dev/null)
-    if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
-        _error "配置锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
-        _tip "确认没有配置事务仍在运行后, 请手动检查并清理该锁目录"
-        return 1
-    fi
-    return "$rc"
-}
-
 # 精简 PATH(cron/容器)下 command -v 会漏掉 flock: 补回标准目录, 让后续裸 flock 可用。
 _flock_ensure() {
     command -v flock >/dev/null 2>&1 && return 0
@@ -1182,7 +1136,7 @@ _flock_ensure() {
 
 # ---------------------------------------------------------------------------
 # 配置 RMW 锁: 锁根在部署树外, 卸载不能拆开 inode 导致并发覆盖。
-# 锁序 install → config → core; 本函数不自取 install lock, 无 flock 时 mkdir 退路 fail-closed。
+# 锁序 install → config → core; 本函数不自取 install lock, 缺 flock 直接拒绝。
 # XRAY_DEPLOY_LOCK_HELD=1 支持重入; 子 shell 透传返回码并在退出时释放 fd。
 # ---------------------------------------------------------------------------
 _with_config_lock() {
@@ -1193,8 +1147,9 @@ _with_config_lock() {
         return $?
     fi
     if ! _flock_ensure; then
-        _with_config_lock_mkdir "$@"
-        return $?
+        _error "系统缺少 flock 命令, 无法串行化配置写入, 放弃本次修改"
+        _tip "请安装 util-linux(提供 flock) 后重试"
+        return 1
     fi
     local config_lock_file
     config_lock_file="$(_deploy_lock_root)/config.lock"
@@ -1221,7 +1176,7 @@ _with_config_lock() {
             _error "部署目录不存在, 放弃本次配置修改(可能刚被卸载): $DEPLOY_DIR"
             exit 1
         fi
-        # 同 _with_config_lock_mkdir: 标记只给锁体内使用, 不外泄给调用方。
+        # 标记只给锁体内使用, 不外泄给调用方。
         # shellcheck disable=SC2031
         export XRAY_DEPLOY_LOCK_HELD=1
         "$@"

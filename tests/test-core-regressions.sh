@@ -75,7 +75,7 @@ trap cleanup EXIT
         : > "$TMP/service-actions"
     }
     service_templates() {
-        local version systemd_unit openrc_unit
+        local systemd_unit openrc_unit
         local systemd_definition openrc_definition
         DEPLOY_DIR="$TMP/service-templates"
         BIN_DIR="$DEPLOY_DIR/bin" ASSET_DIR="$DEPLOY_DIR/assets" CONFIG_DIR="$DEPLOY_DIR/confs"
@@ -96,35 +96,28 @@ trap cleanup EXIT
         chmod() { return 0; }
         systemctl() { return 0; }
         rc-update() { return 0; }
-        for version in 26.7.10 26.7.11; do
-            systemd_unit="$TMP/systemd-service-$version"
-            openrc_unit="$TMP/openrc-service-$version"
-            eval "${systemd_definition//\/etc\/systemd\/system\/xray.service/\$systemd_unit}"
-            eval "${openrc_definition//\/etc\/init.d\/xray/\$openrc_unit}"
-            _xray_current_version() { printf '%s' "$version"; }
-            INIT_SYSTEM=systemd
-            _create_xray_systemd_service || return 1
-            INIT_SYSTEM=openrc
-            _create_xray_openrc_service || return 1
-            grep -Fq 'NoNewPrivileges=true' "$systemd_unit" || return 1
-            grep -Fq 'RestartPreventExitStatus=23' "$systemd_unit" || return 1
-            grep -Fq "ExecStart=$XRAY_BIN run -confdir $CONFIG_DIR" "$systemd_unit" || return 1
-            ! grep -Eq '^(User|Group|CapabilityBoundingSet|AmbientCapabilities)=' "$systemd_unit" || return 1
-            grep -Fq 'respawn_max=20' "$openrc_unit" || return 1
-            grep -Fq 'respawn_period=600' "$openrc_unit" || return 1
-            grep -Fq 'no_new_privs=yes' "$openrc_unit" || return 1
-            ! grep -Eq '^(capabilities|command_user|extra_commands)=' "$openrc_unit" || return 1
-            ! grep -Eq '^(checkconfig|start_pre)\(\)' "$openrc_unit" || return 1
-            grep -Fq "command=\"$XRAY_BIN\"" "$openrc_unit" || return 1
-            grep -Fq "command_args=\"run -confdir $CONFIG_DIR\"" "$openrc_unit" || return 1
-            if [ "$version" = 26.7.10 ]; then
-                grep -Fq "Environment=XRAY_LOCATION_ASSET=$ASSET_DIR" "$systemd_unit" || return 1
-                grep -Fq "supervise_daemon_args=\"--env XRAY_LOCATION_ASSET=$ASSET_DIR\"" "$openrc_unit" || return 1
-            else
-                ! grep -Fq 'XRAY_LOCATION_ASSET=' "$systemd_unit" || return 1
-                ! grep -Fq 'XRAY_LOCATION_ASSET=' "$openrc_unit" || return 1
-            fi
-        done
+        systemd_unit="$TMP/systemd-service"
+        openrc_unit="$TMP/openrc-service"
+        eval "${systemd_definition//\/etc\/systemd\/system\/xray.service/\$systemd_unit}"
+        eval "${openrc_definition//\/etc\/init.d\/xray/\$openrc_unit}"
+        INIT_SYSTEM=systemd
+        _create_xray_systemd_service || return 1
+        INIT_SYSTEM=openrc
+        _create_xray_openrc_service || return 1
+        grep -Fq 'NoNewPrivileges=true' "$systemd_unit" || return 1
+        grep -Fq 'RestartPreventExitStatus=23' "$systemd_unit" || return 1
+        grep -Fq "ExecStart=$XRAY_BIN run -confdir $CONFIG_DIR" "$systemd_unit" || return 1
+        ! grep -Eq '^(User|Group|CapabilityBoundingSet|AmbientCapabilities)=' "$systemd_unit" || return 1
+        grep -Fq 'respawn_max=20' "$openrc_unit" || return 1
+        grep -Fq 'respawn_period=600' "$openrc_unit" || return 1
+        grep -Fq 'no_new_privs=yes' "$openrc_unit" || return 1
+        ! grep -Eq '^(capabilities|command_user|extra_commands)=' "$openrc_unit" || return 1
+        ! grep -Eq '^(checkconfig|start_pre)\(\)' "$openrc_unit" || return 1
+        grep -Fq "command=\"$XRAY_BIN\"" "$openrc_unit" || return 1
+        grep -Fq "command_args=\"run -confdir $CONFIG_DIR\"" "$openrc_unit" || return 1
+        # service 不再注入 XRAY_LOCATION_ASSET: 资产目录统一由 config 的 env 段提供。
+        ! grep -Fq 'XRAY_LOCATION_ASSET=' "$systemd_unit" || return 1
+        ! grep -Fq 'XRAY_LOCATION_ASSET=' "$openrc_unit" || return 1
         _xray_current_version() { printf '26.9.8'; }
     }
     check() {
@@ -496,7 +489,7 @@ trap cleanup EXIT
         fi
         [ "$rc" -eq 1 ] || { printf 'rc=%s out=%s\n' "$rc" "$out" >&2; return 1; }
         case "$out" in
-            *"仅支持 Xray-core v26.4.25 及以上, 已拒绝: $tag"*) ;;
+            *"仅支持 Xray-core v26.10.31 及以上, 已拒绝: $tag"*) ;;
             *) printf 'unexpected=%s\n' "$out" >&2; return 1 ;;
         esac
         if [ -e "$dir/stage" ] || [ -e "$dir/lock" ] || [ -e "$dir/commit" ] || [ -e "$dir/service" ]; then
@@ -655,31 +648,6 @@ trap cleanup EXIT
             && [ "$(cat "$root/actions")" = cron ]
     )
 
-    version_gate_matrix() {
-        eval "$(declare -f _xray_version_ge)"
-        local dir="$TMP/version-gates" version gecko unix expected_gecko expected_unix
-        mkdir -p "$dir"; printf '#!/bin/sh\nexit 0\n' > "$dir/xray"; chmod +x "$dir/xray"
-        XRAY_BIN="$dir/xray"
-        for version in 26.6.0 26.6.1 26.9.7 26.9.8; do
-            _xray_current_version() { printf '%s' "$version"; }
-            gecko=0; unix=0
-            _hy2_gecko_supported || gecko=$?
-            _hy2_masq_unix_supported || unix=$?
-            case "$version" in
-                26.6.0) expected_gecko=1; expected_unix=1 ;;
-                26.6.1) expected_gecko=0; expected_unix=1 ;;
-                26.9.7) expected_gecko=0; expected_unix=1 ;;
-                26.9.8) expected_gecko=0; expected_unix=0 ;;
-            esac
-            [ "$gecko" -eq "$expected_gecko" ] && [ "$unix" -eq "$expected_unix" ] || return 1
-        done
-        _xray_current_version() { printf '26.9.7'; }
-        _hy2_masq_known_keys_json | jq -e 'index("xForwarded") | not' >/dev/null || return 1
-        _xray_current_version() { printf '26.9.8'; }
-        _hy2_masq_known_keys_json | jq -e 'index("xForwarded")' >/dev/null || return 1
-        _xray_current_version() { printf '26.9.8'; }
-    }
-
     # 预览通道 = 全部 release(含稳定版)里版本最高的一个; 只过滤 prerelease 会在
     # "最新稳定版比最新 prerelease 新"时把预览装成降级(stable v26.10.21 vs prerelease v26.9.30)。
     newest_tag_probe() {
@@ -721,7 +689,7 @@ trap cleanup EXIT
         [ ! -e "$BACKUP_DIR/xray-service.snapshot-test.prev" ]
     )
 
-    check 'minimum Xray version rejects before staging' min_version_rejection custom v26.4.24
+    check 'minimum Xray version rejects before staging' min_version_rejection custom v26.10.30
     check 'preview channel picks the highest version across all releases' newest_tag_probe
     check 'preview fetch goes through the newest-release picker' preview_fetch_probe
     check 'Geo snapshot rejects content that differs from the source' geo_snapshot_cmp_probe
@@ -733,7 +701,6 @@ trap cleanup EXIT
     check 'verified restart fails closed when identity is unreadable' restart_verified_requires_readable_identity
     check 'uninstall checks logrotate helper before deleting entrypoints' uninstall_cleanup_contract
     check 'Xray-only uninstall preserves manager and data' uninstall_keep_panel_contract
-    check '26.6.1 and 26.9.8 gates and masquerade key set' version_gate_matrix
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
 )

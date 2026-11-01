@@ -527,17 +527,6 @@ _timed_restart_view_log() {
     fi
 }
 
-# 顶层进程 helper：pidof 后补 /proc comm 扫描，避免容器假阴性。
-_cf_fb_pids() {
-    local pids p c
-    pids=$(pidof cloudflared 2>/dev/null | tr ' ' '\n' | grep -e '^[0-9][0-9]*$')
-    [ -n "$pids" ] && printf '%s\n' "$pids"
-    for p in /proc/[0-9]*; do
-        read -r c 2>/dev/null < "$p/comm" || continue
-        [ "$c" = "cloudflared" ] && printf '%s\n' "${p#/proc/}"
-    done
-}
-
 # 卸载菜单
 _uninstall_menu() {
     local choice ans
@@ -1330,18 +1319,15 @@ _hy2_masq_set_proxy() {
         done
         [ "$ins" = "true" ] && _warn "已跳过目标站点证书校验(仅在自签/证书不匹配时需要)"
     fi
-    # xForwarded 仅 >= v26.9.8 支持; 门控通过时才问, 避免让用户选一个会被静默忽略的开关
-    if _hy2_masq_unix_supported; then
-        while true; do
-            read -rp "  回源时补发 X-Forwarded-For/-Proto/-Host? [y/N]: " ans || return 1
-            case "$ans" in
-                ""|n|N) xf="false"; break ;;
-                y|Y) xf="true"; break ;;
-                *) _error "无效输入: ${ans}(请输入 y 或 n, 直接回车 = N)" ;;
-            esac
-        done
-        [ "$xf" = "true" ] && _tip "已开启 X-Forwarded-*: 目标站点会看到真实客户端 IP(隐私相关, 仅在确知需要时开启)"
-    fi
+    while true; do
+        read -rp "  回源时补发 X-Forwarded-For/-Proto/-Host? [y/N]: " ans || return 1
+        case "$ans" in
+            ""|n|N) xf="false"; break ;;
+            y|Y) xf="true"; break ;;
+            *) _error "无效输入: ${ans}(请输入 y 或 n, 直接回车 = N)" ;;
+        esac
+    done
+    [ "$xf" = "true" ] && _tip "已开启 X-Forwarded-*: 目标站点会看到真实客户端 IP(隐私相关, 仅在确知需要时开启)"
     payload=$(_hy2_masq_json_proxy "$url" "$rh" "$ins" "$xf") || { _error "伪装参数构造失败"; _press_any_key; return 1; }
     if ! _hy2_masq_apply "$tag" "$payload"; then
         _error "反向代理设置失败, 已回滚原配置"; _press_any_key; return 1
@@ -1792,12 +1778,6 @@ _hy2_obfs_menu() {
             opw=${opw_in:-$opw}
             _validate_json_text "$opw" || { _error "混淆密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; _press_any_key; return; }
             if [ "$obfs_choice" = "2" ]; then
-                # Gecko 要求 packetSize 能力；不支持拒绝，不替用户降级。
-                if ! _hy2_gecko_supported; then
-                    _error "当前核心不支持 gecko 分片(packetSize 需核心 >= ${_HY2_GECKO_MIN_VER}); 已取消, 未修改任何配置"
-                    _tip "请先升级/切换 Xray 核心, 或改选 [1] 普通 salamander"
-                    _press_any_key; return
-                fi
                 # 空输入写 512-1200（Hysteria 客户端默认）；空尺寸会退化 salamander。
                 read -rp "  packetSize (Int32Range, 如 512-1200; 回车用 Hysteria 官方 gecko 默认 512-1200): " osize
                 osize="${osize:-512-1200}"
@@ -1829,21 +1809,11 @@ _hy2_obfs_menu() {
     _press_any_key
 }
 
-# _hy2_obfs_rollback <tag> <mask_or_empty_or_INVALID> 仅恢复管理层，保留外来层。
-# 空值关闭，__INVALID__ 拒绝回滚，不把未知旧态当无混淆。
+# _hy2_obfs_rollback <tag> <mask_json|空> 仅恢复管理层，保留外来层。
+# 空值即"改动前无自有层", 归一为 null 关闭; 读取失败在事务里已提前取消, 不会传到这里。
 _hy2_obfs_rollback() {
-    local tag="$1" mask="$2"
-    if [ "$mask" = "__INVALID__" ]; then
-        _error "改动前的混淆元数据无法解析, 未回滚配置(请手工核对 ${CONFIG_DIR})"
-        return 1
-    fi
-    if [ -z "$mask" ]; then
-        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new null \
-            "$XD_UDP_JQ_UPSERT"
-    else
-        _mutate_config --arg t "$tag" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" --argjson new "$mask" \
-            "$XD_UDP_JQ_UPSERT"
-    fi
+    _mutate_config --arg t "$1" --arg ourtype "$XD_UDP_OUR_TYPE" --arg ourmark "$XD_UDP_OUR_MARKER" \
+        --argjson new "${2:-null}" "$XD_UDP_JQ_UPSERT"
 }
 # _reality_switch_rollback <meta> <metadata 原文>：权威状态失败一起回滚并验证重启。
 # 须在域名事务 config lock 内，共享 lastbak 才属于本次事务；派生失败另行报告。

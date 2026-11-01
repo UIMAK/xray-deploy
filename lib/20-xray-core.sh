@@ -63,8 +63,8 @@ _xray_fetch_tag() {
             ;;
         *) return 1 ;;
     esac
-    [ -n "$tag" ] && [ "$tag" != "null" ] && echo "$tag" && return 0
-    return 1
+    [ -n "$tag" ] || return 1
+    echo "$tag"
 }
 
 # ---------------------------------------------------------------------------
@@ -90,21 +90,16 @@ _xray_current_version() {
 }
 
 # ---------------------------------------------------------------------------
-# 版本门控: 当前核心是否 >= 最低要求。用法: _xray_version_ge "26.7.11"
-# docs 领先于已发布核心, config 新字段(env/geodata 等)在旧核心上被 Go JSON 静默忽略
-# ⇒ 新特性必须按目标发布版本门控。纯数字三段比较(不用 sort -V, busybox 兼容)。
-# 未安装/版本读不到/畸形版本 → 返回 1(fail-closed), 调用方走旧核心路径。
+# 项目支持的最低核心版本: >=26.10.29 强制 geodata 资产名以 .dat 结尾,
+# >=26.10.31 修 Linux IPv4 MPTCP 远程提权。低于它的核心拒绝安装; config 的
+# version.min 同步写该值。
 # ---------------------------------------------------------------------------
-_xray_version_ge() {
-    local current
-    current=$(_xray_current_version 2>/dev/null) || return 1
-    _xray_version_at_least "$current" "$1"
-}
+XRAY_CORE_MIN_VERSION="26.10.31"
 
 _xray_version_at_least() {
     local cur="$1" min="$2" i x y
     # 两侧都可能带 "v" 前缀, 先剥掉。
-    # 版本门控绝不猜畸形输入: 畸形版本 = 未知能力, 调用方必须走旧核心路径。
+    # 畸形版本不猜能力: 一律按"低于下限"处理, 安装门控据此拒绝。
     cur="${cur#v}"; cur="${cur#V}"
     min="${min#v}"; min="${min#V}"
     [[ "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
@@ -186,8 +181,7 @@ _xray_stage_release() {
         return 1
     fi
 
-    # 取件到此为止: 共享状态(二进制/服务/geo dat)一律留到阶段二的锁内处理。
-    # geo dat 从 staging 就位, 由阶段二带快照地提交。
+    # 取件到此为止: 共享状态(二进制/服务)一律留到阶段二的锁内处理。
     printf '%s' "$tmp_dir"
     return 0
 }
@@ -200,7 +194,7 @@ _xray_stage_release() {
 #   3 = replacing 已 durable, mutation 可能部分发生; caller 必须运行 journal recovery
 # 从 replacing 到恢复完成前, journal 与 snapshots 均不得由调用方直接丢弃。
 _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutation never started; 3=recovery required
-    local tmp_dir="$1" j binbak pre gd tmp phase
+    local tmp_dir="$1" j binbak pre phase
     [ -d "$tmp_dir" ] && [ -f "${tmp_dir}/xray" ] || {
         _error "staging 目录不可用: ${tmp_dir:-（空）}"; return 1; }
     j=$(_xray_core_journal_path)
@@ -231,20 +225,6 @@ _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutatio
         return 3
     fi
 
-    # geo dat 是同一事务的真实状态; 快照在 snapshotted 之前已建好。同目录 temp + cmp + rename,
-    # 任何失败统一 return 3 交给 rollback。
-    for gd in geoip.dat geosite.dat; do
-        [ -f "${tmp_dir}/${gd}" ] || continue
-        tmp=$(mktemp "${ASSET_DIR}/.${gd}.coretxn-new.XXXXXX") || {
-            _error "无法创建 ${gd} 临时文件"; return 3; }
-        if ! cp "${tmp_dir}/${gd}" "$tmp" 2>/dev/null || \
-           ! cmp -s "${tmp_dir}/${gd}" "$tmp" 2>/dev/null || \
-           ! chmod 644 "$tmp" 2>/dev/null || ! mv -f "$tmp" "${ASSET_DIR}/${gd}" 2>/dev/null; then
-            rm -f "$tmp" 2>/dev/null
-            _error "${gd} 原子替换失败, 交由事务恢复"
-            return 3
-        fi
-    done
     _maybe_drop_caches
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
         _error "新二进制无法执行/版本子命令失败, 交由事务恢复"
@@ -352,7 +332,7 @@ _ensure_xray_symlink() {
 # 锁根 /var/lock/xray-deploy 在部署树外; 普通事务锁序 install → config → core。
 # 核心事务不取 config lock; 卸载/reset 持三层锁直到删除/重建完成。
 # flock fd 动态分配并在派生服务时关闭, 防止 fd 冲突与守护进程长期持锁。
-# 无 flock 时 core.lock.d mkdir 退路拒绝残留, 不自动接管。
+# 缺 flock 时直接拒绝, 不做无 flock 的锁退路。
 # ---------------------------------------------------------------------------
 # CORE_LOCK_FD 未持锁恒为 9; 关闭必须经 _xray_core_lock_fd_reset 复位, 防止关错复用 fd。
 # ---------------------------------------------------------------------------
@@ -366,8 +346,8 @@ _xray_core_lock_fd_reset() {
 }
 
 _with_core_lock() {
-    local deploy_path="${DEPLOY_DIR%/}" lockf fallback_dir
-    local i locked=0 rc owner
+    local deploy_path="${DEPLOY_DIR%/}" lockf
+    local i locked=0 rc
     case "$deploy_path" in
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立核心锁: $DEPLOY_DIR"; return 1 ;;
@@ -377,7 +357,6 @@ _with_core_lock() {
         return 1
     fi
     lockf="$(_deploy_lock_root)/core.lock"
-    fallback_dir="$(_deploy_lock_root)/core.lock.d"
     # 已是持锁状态(嵌套调用) ⇒ 直接跑, 不再重复加锁。
     # 嵌套判定必须在 `$DEPLOY_DIR` 存在性检查**之前**: 卸载主体(持锁中)会 `rm -rf "$DEPLOY_DIR"`,
     # 之后的嵌套调用(收尾/提示)在外层事务锁保护下, 不该因目录已被删除而报错。
@@ -390,86 +369,48 @@ _with_core_lock() {
         return 1
     fi
 
-    if _flock_ensure; then
-        if ! eval "exec {CORE_LOCK_FD}>>\"\$lockf\""; then
-            _error "无法创建核心锁文件 $lockf(目录不可写?), 放弃本次操作"
-            return 1
-        fi
-        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-            if flock -n "$CORE_LOCK_FD" 2>/dev/null; then locked=1; break; fi
-            sleep 1
-        done
-        if [ "$locked" -ne 1 ]; then
-            _error "等待核心锁超时(15s), 可能有其他 xd 会话正在切换核心"
-            # 超时路径同样要关掉刚打开的 fd: 菜单是长驻循环, 漏掉会让每次失败泄漏一个 fd,
-            # 最终撞上 ulimit。复位全局见 helper。
-            _xray_core_lock_fd_reset
-            return 1
-        fi
-        # 主锁后才检查部署存在性; 已卸载则 fail-closed, 不重建部署树。
-        if [ ! -d "$deploy_path" ]; then
-            _error "部署目录不存在, 放弃本次操作: $deploy_path"
-            _xray_core_lock_fd_reset
-            return 1
-        fi
-        # 子 shell 内执行: 使 CORE_LOCK_FD 与 HELD 标记的作用域跟着这次加锁一起消失,
-        # 调用方不必手工回滚环境(与 _with_config_lock 同款做法)。
-        (
-            XRAY_DEPLOY_CORE_LOCK_HELD=1
-            export XRAY_DEPLOY_CORE_LOCK_HELD
-            "$@"
-        )
-        rc=$?
+    if ! _flock_ensure; then
+        _error "系统缺少 flock 命令, 无法串行化核心操作, 放弃本次操作"
+        _tip "请安装 util-linux(提供 flock) 后重试"
+        return 1
+    fi
+    if ! eval "exec {CORE_LOCK_FD}>>\"\$lockf\""; then
+        _error "无法创建核心锁文件 $lockf(目录不可写?), 放弃本次操作"
+        return 1
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+        if flock -n "$CORE_LOCK_FD" 2>/dev/null; then locked=1; break; fi
+        sleep 1
+    done
+    if [ "$locked" -ne 1 ]; then
+        _error "等待核心锁超时(15s), 可能有其他 xd 会话正在切换核心"
+        # 超时路径同样要关掉刚打开的 fd: 菜单是长驻循环, 漏掉会让每次失败泄漏一个 fd,
+        # 最终撞上 ulimit。复位全局见 helper。
         _xray_core_lock_fd_reset
-        return "$rc"
-    fi
-
-    # 裁剪版 BusyBox 可能没有 flock: 用独立 mkdir 锁目录并**永不自动接管** —— SIGKILL 残留
-    # 宁可要求人工确认/清理, 也不能用 read→rm→mkdir 的竞态冒险双重放行。
-    if ! mkdir "$fallback_dir" 2>/dev/null; then
-        if [ -d "$fallback_dir" ]; then
-            _error "核心锁目录已存在(可能有其他会话运行, 或上次被强制终止): $fallback_dir"
-        else
-            _error "核心锁路径已被非目录对象占用: $fallback_dir"
-        fi
-        _tip "确认没有核心安装、卸载或服务操作后, 请手动删除锁目录: rm -rf -- '$fallback_dir'"
         return 1
     fi
-    if ! printf '%s\n' "$$" > "$fallback_dir/pid" 2>/dev/null; then
-        rm -f "$fallback_dir/pid" 2>/dev/null
-        rmdir "$fallback_dir" 2>/dev/null
-        _error "无法写入核心锁持有者记录 $fallback_dir/pid, 放弃本次操作"
-        return 1
-    fi
-    # 同 flock 路径: 目录存在性在**锁内**判定(锁外判断会与并发卸载竞态), 锁内不存在则 fail-closed
-    # 退出且不重建目录。
+    # 主锁后才检查部署存在性; 已卸载则 fail-closed, 不重建部署树。
     if [ ! -d "$deploy_path" ]; then
         _error "部署目录不存在, 放弃本次操作: $deploy_path"
-        rm -f "$fallback_dir/pid" 2>/dev/null
-        rmdir "$fallback_dir" 2>/dev/null
+        _xray_core_lock_fd_reset
         return 1
     fi
+    # 子 shell 内执行: 使 CORE_LOCK_FD 与 HELD 标记的作用域跟着这次加锁一起消失,
+    # 调用方不必手工回滚环境(与 _with_config_lock 同款做法)。
     (
-        # 标记只给 "$@" 及其子进程用于重入判定, 子 shell 退出即释放锁, 不外泄给调用方。
-        # shellcheck disable=SC2030
         XRAY_DEPLOY_CORE_LOCK_HELD=1
         export XRAY_DEPLOY_CORE_LOCK_HELD
         "$@"
     )
     rc=$?
-    owner=$(cat "$fallback_dir/pid" 2>/dev/null)
-    if [ "$owner" != "$$" ] || ! rm -f "$fallback_dir/pid" 2>/dev/null || ! rmdir "$fallback_dir" 2>/dev/null; then
-        _error "核心锁释放失败或所有权记录不匹配, 锁目录保留: $fallback_dir"
-        _tip "确认没有核心操作仍在运行后, 请手动检查并清理该锁目录"
-        return 1
-    fi
+    _xray_core_lock_fd_reset
     return "$rc"
 }
 
 # 与 install.sh 同一部署树外安装锁; 卸载锁序 install → config → core。
 _with_deploy_install_lock() {
-    local deploy_path="${DEPLOY_DIR%/}" lock_dir lock_file
-    local DEPLOY_INSTALL_LOCK_FD="" i locked=0 owner tmp rc
+    local deploy_path="${DEPLOY_DIR%/}" lock_file
+    local DEPLOY_INSTALL_LOCK_FD="" i locked=0 rc
     case "$deploy_path" in
         /*) ;;
         *) _error "部署目录必须是绝对路径, 无法建立安装锁: $DEPLOY_DIR"; return 1 ;;
@@ -478,7 +419,6 @@ _with_deploy_install_lock() {
         _error "部署目录路径无效, 无法建立安装锁: $DEPLOY_DIR"
         return 1
     fi
-    lock_dir="$(_deploy_lock_root)/install.lock"
     lock_file="$(_deploy_lock_root)/install.lock.fd"
     if [ "${XRAY_DEPLOY_INSTALL_LOCK_HELD:-0}" = "1" ]; then
         "$@"
@@ -490,91 +430,37 @@ _with_deploy_install_lock() {
     }
     # 主锁文件在目录外, 竞争者不会被卸载的 `rm -rf` 拆成新旧 inode。
 
-    if _flock_ensure; then
-        if ! eval "exec {DEPLOY_INSTALL_LOCK_FD}>>\"\$lock_file\""; then
-            _error "无法创建安装锁文件 $lock_file, 放弃本次卸载"
-            return 1
-        fi
-        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-            if flock -n "$DEPLOY_INSTALL_LOCK_FD" 2>/dev/null; then locked=1; break; fi
-            sleep 1
-        done
-        if [ "$locked" -ne 1 ]; then
-            _error "等待部署安装锁超时(15s), 可能有 install.sh 正在更新"
-            eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-            return 1
-        fi
-        if ! mkdir -p "$deploy_path" 2>/dev/null; then
-            _error "无法创建部署目录 $deploy_path, 放弃本次操作"
-            eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-            return 1
-        fi
-        (
-            XRAY_DEPLOY_INSTALL_LOCK_HELD=1
-            export XRAY_DEPLOY_INSTALL_LOCK_HELD
-            "$@"
-        )
-        rc=$?
-        eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
-        return "$rc"
-    fi
-
-    # 与 install.sh 相同: 无 flock 时 mkdir 锁按 PID 有界等待活持有者, 对死锁/未知锁立即
-    # fail-closed, **永不自动接管**。SIGKILL 残留需人工确认后清理。
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        if mkdir "$lock_dir" 2>/dev/null; then
-            tmp="$lock_dir/.pid.$$"
-            if ! printf '%s\n' "$$" > "$tmp" 2>/dev/null || ! mv -f "$tmp" "$lock_dir/pid" 2>/dev/null; then
-                rm -f "$tmp" "$lock_dir/pid" 2>/dev/null
-                rmdir "$lock_dir" 2>/dev/null
-                _error "无法写入安装锁持有者记录 $lock_dir/pid, 放弃本次卸载"
-                return 1
-            fi
-            if ! mkdir -p "$deploy_path" 2>/dev/null; then
-                _error "无法创建部署目录 $deploy_path, 放弃本次操作"
-                rm -f "$lock_dir/pid" 2>/dev/null
-                rmdir "$lock_dir" 2>/dev/null
-                return 1
-            fi
-            (
-                XRAY_DEPLOY_INSTALL_LOCK_HELD=1
-                export XRAY_DEPLOY_INSTALL_LOCK_HELD
-                "$@"
-            )
-            rc=$?
-            owner=$(cat "$lock_dir/pid" 2>/dev/null)
-            if [ "$owner" != "$$" ] || ! rm -f "$lock_dir/pid" 2>/dev/null || ! rmdir "$lock_dir" 2>/dev/null; then
-                _error "安装锁释放失败或所有权记录不匹配, 锁目录保留: $lock_dir"
-                _tip "确认没有安装/卸载操作仍在运行后, 请手动检查该锁目录"
-                return 1
-            fi
-            return "$rc"
-        fi
-        if [ ! -d "$lock_dir" ]; then
-            _error "安装锁路径被非目录对象占用: $lock_dir"
-            _tip "请手动检查该路径后重试本次卸载"
-            return 1
-        fi
-        owner=$(cat "$lock_dir/pid" 2>/dev/null)
-        case "$owner" in
-            ''|*[!0-9]*) owner="" ;;
-            *) case "$owner" in *[1-9]*) ;; *) owner="" ;; esac ;;
-        esac
-        if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-            if [ "$i" -eq 14 ]; then
-                _error "另一个 install.sh 正在运行(pid $owner), 本次卸载中止"
-                _tip "若确认进程已退出, 请先人工检查并清理: $lock_dir"
-                return 1
-            fi
-            sleep 1
-            continue
-        fi
-        _error "检测到无人持有或无法判定的安装锁: $lock_dir"
-        _tip "确认没有 install.sh 正在运行后, 请手动检查并清理该锁目录"
+    if ! _flock_ensure; then
+        _error "系统缺少 flock 命令, 无法串行化部署安装, 放弃本次卸载"
+        _tip "请安装 util-linux(提供 flock) 后重试"
         return 1
+    fi
+    if ! eval "exec {DEPLOY_INSTALL_LOCK_FD}>>\"\$lock_file\""; then
+        _error "无法创建安装锁文件 $lock_file, 放弃本次卸载"
+        return 1
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+        if flock -n "$DEPLOY_INSTALL_LOCK_FD" 2>/dev/null; then locked=1; break; fi
+        sleep 1
     done
-    _error "等待部署安装锁超时, 本次卸载中止: $lock_dir"
-    return 1
+    if [ "$locked" -ne 1 ]; then
+        _error "等待部署安装锁超时(15s), 可能有 install.sh 正在更新"
+        eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+        return 1
+    fi
+    if ! mkdir -p "$deploy_path" 2>/dev/null; then
+        _error "无法创建部署目录 $deploy_path, 放弃本次操作"
+        eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+        return 1
+    fi
+    (
+        XRAY_DEPLOY_INSTALL_LOCK_HELD=1
+        export XRAY_DEPLOY_INSTALL_LOCK_HELD
+        "$@"
+    )
+    rc=$?
+    eval "exec ${DEPLOY_INSTALL_LOCK_FD}>&-" 2>/dev/null
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -872,8 +758,8 @@ _txn_allow_config_write() {
 }
 
 _xray_core_journal_ok() {
-    local j="$1" id bin binbak pre runtime unit sprev stage stage_name phase operation
-    local service_pre service_masked gip gsp
+    local j="$1" id bin binbak pre runtime unit sprev stage stage_name operation gip gsp
+    local service_pre service_masked fields
     jq -e '
       (.phase | type == "string" and test("^(prepared|snapshotted|replacing|binary_replaced|service_replaced|geo_replaced|restart_verified|committed|rolled_back)$")) and
       ((.operation == "core" and (has("snapshot_scope") | not)) or
@@ -892,20 +778,14 @@ _xray_core_journal_ok() {
       (.geosite_preexisted | type == "boolean") and (.geosite_backup | type == "string" and length > 0) and
       (.service_preexisted | type == "boolean") and ((.service_masked) | type == "boolean")
     ' "$j" >/dev/null 2>&1 || return 1
-    phase=$(jq -r '.phase' "$j" 2>/dev/null) || return 1
-    id=$(jq -r '.txn_id' "$j" 2>/dev/null) || return 1
-    bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
-    binbak=$(jq -r '.binary_backup' "$j" 2>/dev/null) || return 1
-    pre=$(jq -r '.binary_preexisted' "$j" 2>/dev/null) || return 1
-    runtime=$(jq -r '.runtime_was_running' "$j" 2>/dev/null) || return 1
-    unit=$(jq -r '.unit' "$j" 2>/dev/null) || return 1
-    sprev=$(jq -r '.service_prev' "$j" 2>/dev/null) || return 1
-    stage=$(jq -r '.staging_dir' "$j" 2>/dev/null) || return 1
-    operation=$(jq -r '.operation' "$j" 2>/dev/null) || return 1
-    gip=$(jq -r '.geoip_backup' "$j" 2>/dev/null) || return 1
-    gsp=$(jq -r '.geosite_backup' "$j" 2>/dev/null) || return 1
-    service_pre=$(jq -r '.service_preexisted' "$j" 2>/dev/null) || return 1
-    service_masked=$(jq -r '.service_masked' "$j" 2>/dev/null) || return 1
+    # schema 已逐字段校验过类型, 这里一次读出全部约束值(13 次 jq fork 合成一次)。
+    # 用 \x1f 而不是 @tsv: unit 在 direct 后端可以是空串, 制表符属 IFS 空白会把空字段吞掉。
+    fields=$(jq -r '[.txn_id, .binary, .binary_backup, .binary_preexisted,
+                    .runtime_was_running, .unit, .service_prev, .staging_dir,
+                    .operation, .geoip_backup, .geosite_backup,
+                    .service_preexisted, .service_masked] | map(tostring) | join("\u001f")' "$j" 2>/dev/null) || return 1
+    IFS=$'\x1f' read -r id bin binbak pre runtime unit sprev stage operation gip gsp \
+        service_pre service_masked <<< "$fields" || return 1
 
     [ "$service_masked" = false ] || [ "$service_pre" = false ] || return 1
     [ "$bin" = "$XRAY_BIN" ] && [ "$binbak" = "$XRAY_BIN.bak" ] || return 1
@@ -1464,8 +1344,8 @@ _install_or_switch_xray() {
         }
         _info "${channel} 通道最新版本: ${tag}"
     fi
-    if ! _xray_version_at_least "$tag" "26.4.25"; then
-        _error "仅支持 Xray-core v26.4.25 及以上, 已拒绝: $tag"
+    if ! _xray_version_at_least "$tag" "$XRAY_CORE_MIN_VERSION"; then
+        _error "仅支持 Xray-core v${XRAY_CORE_MIN_VERSION} 及以上, 已拒绝: $tag"
         return 1
     fi
     # ---- 阶段一(锁外): 下载/校验/解压到自有 staging ----
@@ -1618,13 +1498,13 @@ _init_config_if_empty_locked() {
     _ensure_dirs || return 1
     # 美化多行格式(便于手动编辑) + dns 段 + routing 规则(bt/广告/私网/CN 走 block)
     # 按 Xray 官方文档顺序排列(env → log → dns → routing → inbounds → outbounds)
-    # env 段设置 XRAY_LOCATION_ASSET(docs/config/env.md): 核心 ≥ v26.7.11 在构建模块前
-    # 应用该段, geo 文件按此路径加载; 旧核心忽略该字段, 由 service 文件注入同名变量兜底。
+    # env 段设置 XRAY_LOCATION_ASSET(docs/config/env.md): 核心在构建模块前应用该段,
+    # geo 文件按此路径加载。
     # dns 段与 routing.rules 都先留空占位, 下面由 XRAY_DEFAULT_DNS_JSON /
     # XRAY_DEFAULT_ROUTING_RULES_JSON 注入 —— 两个默认常量是唯一真相(00-common),
     # DNS 菜单的"恢复默认"与路由规则的"恢复默认"复用同一份, 不允许两处硬编码。
     local base='{
-  "version": {"min": "26.4.25", "max": ""},
+  "version": {"min": "'"$XRAY_CORE_MIN_VERSION"'", "max": ""},
   "env": {
     "XRAY_LOCATION_ASSET": "'"$ASSET_DIR"'"
   },
@@ -1666,7 +1546,7 @@ _init_config_if_empty_locked() {
 }
 
 # ---------------------------------------------------------------------------
-# 启动维护: 缺失 env.XRAY_LOCATION_ASSET 才注入, 保留用户值; ≥v26.7.11 读取 env, 旧核心由 service 兜底。
+# 启动维护: 缺失 env.XRAY_LOCATION_ASSET 才注入, 保留用户值。
 # 仅写磁盘不重启, 下次重启生效; 失败留待下次启动重试。
 # 整段 RMW 在 config lock 与 core write barrier 内, 避免覆盖并发配置与绕过恢复闸门。
 # ---------------------------------------------------------------------------
@@ -2067,9 +1947,8 @@ _xray_service_snapshot() {
 
 # ---------------------------------------------------------------------------
 # 生成 service 文件
-# XRAY_LOCATION_ASSET 优先走配置的 env 段(docs/config/env.md, 核心 ≥
-# v26.7.11 在构建模块前应用该段并替换同名进程变量)。仅当已安装核心 < v26.7.11(不识别
-# env 段)时才在 service 文件注入同名环境变量兜底 —— 版本读不到时保守保留注入(旧行为)。
+# XRAY_LOCATION_ASSET 走配置的 env 段(docs/config/env.md): 核心在构建模块前应用该段,
+# service 文件不再注入同名环境变量。
 # 官方 unit 的 User/Group 与 capability 字段依赖独立 xray 用户和对应目录 ownership；
 # 本项目部署树仍由 root 以 0700/0600 独占管理, 因此只同步不依赖权限迁移的安全字段。
 # 注意: _install_or_switch_xray 先替换二进制再调本函数, 这里读到的是"新"核心版本。
@@ -2078,10 +1957,6 @@ _create_xray_systemd_service() {
     local nofile_line="" env_line="Environment=XRAY_JSON_STRICT=true"
     local _nf; _nf=$(_safe_nofile)
     [ -n "$_nf" ] && nofile_line="LimitNOFILE=$_nf"
-    if ! _xray_version_ge "26.7.11"; then
-        env_line="Environment=XRAY_LOCATION_ASSET=${ASSET_DIR}
-Environment=XRAY_JSON_STRICT=true"
-    fi
     # unit 重定向写入失败即失败; 后续 daemon-reload 成功不能代替写入成功。
     # 权限按后端显式设置, 失败语义由同步 rollback 与 journal recovery 消费。
     if ! cat > /etc/systemd/system/xray.service <<EOF
@@ -2130,11 +2005,6 @@ _create_xray_openrc_service() {
     local _nf; _nf=$(_safe_nofile)
     # 抬到"目标 65535 或当前 hard 上限"(见 _safe_nofile); 只有完全探测不到时才留空
     [ -n "$_nf" ] && rc_ulimit_line="rc_ulimit=\"-n $_nf\""
-    # 核心 ≥ v26.7.11 用 config env 段, 不再经 supervise-daemon 注入; 旧核心保留注入兜底
-    if ! _xray_version_ge "26.7.11"; then
-        sd_env_line="supervise_daemon_args=\"--env XRAY_LOCATION_ASSET=${ASSET_DIR}\"
-export XRAY_JSON_STRICT=true"
-    fi
     # OpenRC init 写入失败必须返回非 0 触发恢复, chmod/enable 成功不能掩盖截断。
     if ! cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run

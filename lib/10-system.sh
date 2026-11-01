@@ -5,8 +5,6 @@
 _detect_init_system() {
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         echo "systemd"
-    elif command -v rc-service >/dev/null 2>&1 && [ -d /etc/init.d ] && [ -d /run/openrc ]; then
-        echo "openrc"
     elif command -v rc-service >/dev/null 2>&1 && [ -d /etc/init.d ]; then
         # 部分 Alpine/容器:有 rc-service 但无 /run/openrc,仍按 openrc 处理
         echo "openrc"

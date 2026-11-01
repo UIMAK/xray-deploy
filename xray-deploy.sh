@@ -44,24 +44,10 @@ if ! mkdir -p "$_BOOTSTRAP_LOCK_ROOT" 2>/dev/null; then
     fi
 fi
 _BOOTSTRAP_LOCK_FILE="$_BOOTSTRAP_LOCK_ROOT/install.lock.fd"
-_BOOTSTRAP_LOCK_DIR="$_BOOTSTRAP_LOCK_ROOT/install.lock"
 _BOOTSTRAP_LOCK_FD=""
-_BOOTSTRAP_MARKER_HELD=0
 
 _bootstrap_lock_release() {
-    local rc=0 owner
-    if [ "${_BOOTSTRAP_MARKER_HELD:-0}" = "1" ]; then
-        owner=$(cat "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null) || owner=""
-        if [ "$owner" = "${BASHPID:-$$}" ] \
-           && rm -f "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null \
-           && rmdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null; then
-            :
-        else
-            echo "[错误] 安装 mkdir 锁归属校验/释放失败, 保留: $_BOOTSTRAP_LOCK_DIR" >&2
-            rc=1
-        fi
-        _BOOTSTRAP_MARKER_HELD=0
-    fi
+    local rc=0
     if [ -n "${_BOOTSTRAP_LOCK_FD:-}" ]; then
         flock -u "$_BOOTSTRAP_LOCK_FD" 2>/dev/null || :
         eval "exec ${_BOOTSTRAP_LOCK_FD}>&-" 2>/dev/null || :
@@ -70,56 +56,25 @@ _bootstrap_lock_release() {
     return "$rc"
 }
 
-if command -v flock >/dev/null 2>&1; then
-    { exec {_BOOTSTRAP_LOCK_FD}>>"$_BOOTSTRAP_LOCK_FILE"; } 2>/dev/null || {
-        echo "[错误] 无法打开安装锁文件, 模块加载中止" >&2
-        exit 1
-    }
-    _bootstrap_locked=0
-    for _bootstrap_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        if flock -n "$_BOOTSTRAP_LOCK_FD" 2>/dev/null; then _bootstrap_locked=1; break; fi
-        sleep 1
-    done
-    if [ "$_bootstrap_locked" -ne 1 ]; then
-        echo "[错误] 等待安装发布锁超时, 模块加载中止" >&2
-        eval "exec ${_BOOTSTRAP_LOCK_FD}>&-" 2>/dev/null
-        exit 1
-    fi
-else
-    if ! mkdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null; then
-        # 无 flock 的退路: 先等在跑的实例释放; 仅当持锁进程已消失(残留)才清理后重试。
-        # 清理用 mv 摘除, 减小两个等待者同时清理同一残留的窗口(不能完全消除, 无需为此加锁)。
-        _bootstrap_took=0
-        for _bootstrap_i in 1 2 3 4 5 6 7 8 9 10; do
-            sleep 1
-            if mkdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null; then _bootstrap_took=1; break; fi
-            # 非正整数(空/非数字/0)视为无法判定持有者, 不能当成"进程已消失"而误删活锁。
-            _bootstrap_holder=$(cat "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null) || _bootstrap_holder=""
-            case "$_bootstrap_holder" in ''|*[!0-9]*|0) _bootstrap_holder="" ;; esac
-            if [ -d /proc ] && [ -n "$_bootstrap_holder" ] && [ ! -d "/proc/$_bootstrap_holder" ]; then
-                if mv "$_BOOTSTRAP_LOCK_DIR" "$_BOOTSTRAP_LOCK_DIR.stale.$$" 2>/dev/null; then
-                    rm -rf "$_BOOTSTRAP_LOCK_DIR.stale.$$" 2>/dev/null || :
-                fi
-            fi
-        done
-        if [ "$_bootstrap_took" -ne 1 ]; then
-            if [ -d "$_BOOTSTRAP_LOCK_DIR" ]; then
-                echo "[错误] 等待安装发布 mkdir 锁超时: 持锁实例仍在运行, 或锁目录残留: $_BOOTSTRAP_LOCK_DIR" >&2
-            else
-                echo "[错误] 等待安装发布 mkdir 锁超时: $_BOOTSTRAP_LOCK_DIR 不是锁目录(残留文件或符号链接), 已中止" >&2
-            fi
-            echo "       确认没有安装实例在运行后, 手动删除该路径再重试。" >&2
-            exit 1
-        fi
-    fi
-    _BOOTSTRAP_MARKER_HELD=1
-    if ! printf '%s\n' "${BASHPID:-$$}" > "$_BOOTSTRAP_LOCK_DIR/pid" 2>/dev/null; then
-        rmdir "$_BOOTSTRAP_LOCK_DIR" 2>/dev/null || :
-        _BOOTSTRAP_MARKER_HELD=0
-        echo "[错误] 无法写入安装发布锁持有者记录, 模块加载中止" >&2
-        exit 1
-    fi
+if ! command -v flock >/dev/null 2>&1; then
+    echo "[错误] 系统缺少 flock 命令, 无法串行化模块加载, 请安装 util-linux" >&2
+    exit 1
 fi
+{ exec {_BOOTSTRAP_LOCK_FD}>>"$_BOOTSTRAP_LOCK_FILE"; } 2>/dev/null || {
+    echo "[错误] 无法打开安装锁文件, 模块加载中止" >&2
+    exit 1
+}
+_bootstrap_locked=0
+for _bootstrap_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+    if flock -n "$_BOOTSTRAP_LOCK_FD" 2>/dev/null; then _bootstrap_locked=1; break; fi
+    sleep 1
+done
+if [ "$_bootstrap_locked" -ne 1 ]; then
+    echo "[错误] 等待安装发布锁超时, 模块加载中止" >&2
+    eval "exec ${_BOOTSTRAP_LOCK_FD}>&-" 2>/dev/null
+    exit 1
+fi
+
 trap '_bootstrap_lock_release' EXIT
 
 if [ -n "$_BOOTSTRAP_ENTRY_ID" ]; then
@@ -170,8 +125,8 @@ fi
 trap - EXIT
 unset -f _bootstrap_lock_release _bootstrap_entry_open_identity
 unset _BOOTSTRAP_ENTRY_ID _bootstrap_published_id
-unset _BOOTSTRAP_LOCK_ROOT _BOOTSTRAP_LOCK_FILE _BOOTSTRAP_LOCK_DIR _BOOTSTRAP_LOCK_FD
-unset _BOOTSTRAP_MARKER_HELD _bootstrap_locked _bootstrap_i _bootstrap_took _bootstrap_holder
+unset _BOOTSTRAP_LOCK_ROOT _BOOTSTRAP_LOCK_FILE _BOOTSTRAP_LOCK_FD
+unset _bootstrap_locked _bootstrap_i
 
 # 公共初始化: init 系统探测 + 目录确保; 失败即退出。
 # root 已由入口 main 统一校验(本函数仅经 main → _init_runtime/_cron_init 调用)。

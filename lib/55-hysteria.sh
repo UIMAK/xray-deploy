@@ -3309,7 +3309,7 @@ _hysteria_uninstall_locked() {
     fi
     rm -f "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META" "$HYSTERIA_LOG_FILE" "$(_hysteria_logrotate_conf)"
     rm -rf "$HYSTERIA_DATA_DIR" "$HYSTERIA_CERT_DIR"
-    rm -f "$STATE_DIR/hysteria_version" "$STATE_DIR/hysteria_variant" "$STATE_DIR/hysteria_asset"
+    rm -f "$STATE_DIR/hysteria_version" "$STATE_DIR/hysteria_asset"
     _success "官方 Hysteria2 已卸载"
     return 0
 }

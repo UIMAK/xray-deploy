@@ -1,10 +1,5 @@
 #!/bin/bash
 
-CF_STATE_AUTOUPDATE="$STATE_DIR/cf_autoupdate"     # on|off
-CF_STATE_HTTP2="$STATE_DIR/cf_http2"               # on|off
-CF_STATE_EDGE_IP="$STATE_DIR/cf_edge_ip"           # off|4|6|auto
-CF_STATE_TOKEN="$STATE_DIR/cf_token"               # 仅清理旧版本遗留
-
 CF_GRACE_DEFAULT=30    # 官方 --grace-period 默认值
 CF_GRACE_MARGIN=5      # 余量: 不在宽限期到点的同一瞬间强杀
 CF_GRACE_MAX=300       # 上限: 防病态配置(cloudflared 自身只接受 <=3 分钟, 4h 只可能是手写错误)
@@ -1084,10 +1079,6 @@ _install_cloudflared() {
         return 1
     fi
     rm -f "${svcfile}.bak"
-    mkdir -p "$STATE_DIR"
-    _state_set cf_autoupdate "$CF_AUTOUPDATE" || _warn "状态持久化失败(cf_autoupdate)"
-    _state_set cf_http2 "$CF_HTTP2" || _warn "状态持久化失败(cf_http2)"
-    _state_set cf_edge_ip "$CF_EDGE_IP" || _warn "状态持久化失败(cf_edge_ip)"
     _success "cloudflared 安装完成(已注册服务并开机自启)"
     _tip "已默认关闭 cloudflared 自动更新、开启 HTTP2 连接（可在 cloudflared 管理中修改）"
     _tip "隧道路由请在 Cloudflare Web 端配置, 本脚本不写 config.yml"
@@ -1151,15 +1142,11 @@ _uninstall_cloudflared() {
         && [ ! -e /var/run/cloudflared.pid ] && [ ! -L /var/run/cloudflared.pid ] || cleanup_rc=1
     rm -f "$CF_BIN" || cleanup_rc=1
     [ ! -e "$CF_BIN" ] && [ ! -L "$CF_BIN" ] || cleanup_rc=1
-    rm -f "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6" || cleanup_rc=1
-    for _cf_state_file in "$CF_STATE_AUTOUPDATE" "$CF_STATE_HTTP2" "$CF_STATE_EDGE_IP" "$CF_STATE_TOKEN" "$STATE_DIR/cf_ipv6"; do
-        [ ! -e "$_cf_state_file" ] && [ ! -L "$_cf_state_file" ] || cleanup_rc=1
-    done
     if [ "$cleanup_rc" -ne 0 ]; then
-        _error "cloudflared 卸载未完全完成, 请检查残留的服务、二进制或状态文件"
+        _error "cloudflared 卸载未完全完成, 请检查残留的服务或二进制"
         return 1
     fi
-    _success "cloudflared 已卸载(二进制/服务/状态已清除)"
+    _success "cloudflared 已卸载(二进制/服务已清除)"
 }
 
 # 已有 service 只改凭据，缺失才注册；失败恢复旧凭据和服务。
@@ -1368,7 +1355,6 @@ _cf_toggle() {
         return 1
     fi
     rm -f "${svcfile}.bak"   # 事务成功, 清理预修改快照(.bak 是"最近一次修改前"的瞬态)
-    _state_set "cf_$key" "$new" || _warn "状态持久化失败(cf_$key)"
     _success "${key} 已切换为 ${new}(cloudflared 已重启, 隧道短暂中断)"
 }
 
@@ -1438,7 +1424,6 @@ _cf_set_edge_ip() {
         return 1
     fi
     rm -f "${svcfile}.bak"   # 事务成功, 清理预修改快照
-    _state_set cf_edge_ip "$val" || _warn "状态持久化失败(cf_edge_ip)"
     _success "协议栈已切换为 $(_cf_edge_ip_label "$val")(cloudflared 已重启, 隧道短暂中断)"
 }
 
