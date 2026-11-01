@@ -520,6 +520,8 @@ fi
         : > "$TMP/menu-draws"
         RC=0
         (
+            UNINSTALL_XRAY_RC="${2:-0}"
+            UNINSTALL_CF_RC="${3:-0}"
             clear() { :; }
             _menu_require_tty() { return 0; }
             _print_logo() { printf 'menu\n' >> "$TMP/menu-draws"; }
@@ -532,8 +534,8 @@ fi
             _auto_adopt_orphans() { return 0; }
             _auto_ensure_config_env() { return 0; }
             _reset_config() { printf 'reset\n' >> "$TMP/uninstall-actions"; }
-            _uninstall_xray() { printf 'xray:%s\n' "${1:-all}" >> "$TMP/uninstall-actions"; }
-            _uninstall_cloudflared() { printf 'cloudflared\n' >> "$TMP/uninstall-actions"; }
+            _uninstall_xray() { printf 'xray:%s\n' "${1:-all}" >> "$TMP/uninstall-actions"; return "$UNINSTALL_XRAY_RC"; }
+            _uninstall_cloudflared() { printf 'cloudflared\n' >> "$TMP/uninstall-actions"; return "$UNINSTALL_CF_RC"; }
             _main_menu <<< "$1"
         ) > "$TMP/output" 2>&1 || RC=$?
     }
@@ -543,6 +545,17 @@ fi
     check 'full uninstall: prompts to exit' grep -qF '按回车键退出...' "$TMP/output"
     check 'full uninstall: does not prompt to continue' test "$(grep -cF '按回车键继续...' "$TMP/output")" -eq 0
     check 'full uninstall: does not redraw main menu' eq "$(cat "$TMP/menu-draws")" menu
+
+    for uninstall_rcs in '1 0' '0 1' '1 1'; do
+        read -r uninstall_xray_rc uninstall_cf_rc <<< "$uninstall_rcs"
+        invoke_uninstall_menu $'22\n4\ny\n\n0' "$uninstall_xray_rc" "$uninstall_cf_rc"
+        uninstall_label="full uninstall xray=$uninstall_xray_rc cloudflared=$uninstall_cf_rc"
+        check "$uninstall_label: exits with failure" eq "$RC" 1
+        check "$uninstall_label: performs both uninstalls" eq "$(cat "$TMP/uninstall-actions")" $'xray:all\ncloudflared'
+        check "$uninstall_label: prompts to exit" grep -qF '按回车键退出...' "$TMP/output"
+        check "$uninstall_label: does not prompt to continue" test "$(grep -cF '按回车键继续...' "$TMP/output")" -eq 0
+        check "$uninstall_label: does not redraw main menu" eq "$(cat "$TMP/menu-draws")" menu
+    done
 
     for uninstall_choice in 1 2 3; do
         case "$uninstall_choice" in
