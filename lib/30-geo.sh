@@ -658,7 +658,15 @@ _geo_extra_exists() {
     return 1
 }
 
-# 文件名只允许 [A-Za-z0-9._-]; 不能是 . 或含 .., 不能占用内置两项, 不能与已有条目重名。
+# 核心 >= v26.10.29(app/geodata New)要求 assets.file 以 .dat 结尾(EqualFold), 否则拒绝启动。
+_geo_extra_name_has_dat() {
+    case "${1:-}" in
+        *.[dD][aA][tT]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 文件名只允许 [A-Za-z0-9._-], 以 .dat 结尾; 不能是 . 或含 .., 不能占用内置两项, 不能与已有条目重名。
 _geo_extra_file_valid() {
     local f="${1:-}"
     case "$f" in
@@ -668,6 +676,7 @@ _geo_extra_file_valid() {
         geosite.dat|geoip.dat) return 1 ;;
         .|*..*) return 1 ;;
     esac
+    _geo_extra_name_has_dat "$f" || return 1
     ! _geo_extra_exists "$f"
 }
 
@@ -677,6 +686,14 @@ _geo_url_basename() {
     u="${u%%#*}"
     u="${u%%\?*}"
     printf '%s' "${u##*/}"
+}
+
+# 核心只解压自身下载的 .gz; 本管理器按原样落地, 压缩内容会以 .dat 名存成坏数据, 故拒绝。
+_geo_extra_url_gz() {
+    case "$(_geo_url_basename "${1:-}")" in
+        *.[gG][zZ]) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # 重写 state 去掉指定 file 的行; 任一步失败都保留原文件。
@@ -702,6 +719,10 @@ _geo_extra_add() {
     local url="" file="" default_name="" tmp="" sz=0 assets=""
     echo
     url=$(_geo_prompt_url "geodata 链接") || return 0
+    if _geo_extra_url_gz "$url"; then
+        _error "不支持 .gz 链接: 请填未压缩的 .dat 链接(核心只解压自身下载的 .gz, 本管理器按原样落地)"
+        return 1
+    fi
     default_name=$(_geo_url_basename "$url")
     while :; do
         read -rp "  文件名(直接回车用 ${default_name:-链接末段}): " file || return 0
@@ -709,10 +730,12 @@ _geo_extra_add() {
         _geo_extra_file_valid "$file" && break
         if [ -z "$file" ]; then
             _warn "无法从链接推断文件名, 请手动输入"
-        elif _geo_extra_exists "$file"; then
-            _warn "文件名已存在: $file (如需替换, 请先在 [2] 删除该条目)"
         elif [ "$file" = "geosite.dat" ] || [ "$file" = "geoip.dat" ]; then
             _warn "geosite.dat / geoip.dat 是内置数据文件, 请换一个文件名"
+        elif ! _geo_extra_name_has_dat "$file"; then
+            _warn "文件名必须以 .dat 结尾(Xray >= v26.10.29 强制要求, 否则核心拒绝启动)"
+        elif _geo_extra_exists "$file"; then
+            _warn "文件名已存在: $file (如需替换, 请先在 [2] 删除该条目)"
         else
             _warn "文件名只能包含字母/数字/./_/-, 且不能是 . 或含 / 或 .."
         fi
