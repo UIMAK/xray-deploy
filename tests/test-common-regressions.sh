@@ -211,6 +211,24 @@ version_preserved_by_mutations() (
 )
 check 'DNS, routing, geodata and node mutations preserve version' version_preserved_by_mutations
 
+# 核心 >= v26.10.29 要求 .geodata.assets[].file 以 .dat 结尾, 否则启动即失败: 添加时直接拒绝非 .dat 名。
+geodata_assets_require_dat() (
+    setup_case geo-dat
+    STATE_DIR="$TMP/geo-dat-state"
+    ASSET_DIR="$TMP/geo-dat-assets"
+    mkdir -p "$STATE_DIR" "$ASSET_DIR"
+    _geo_extra_name_has_dat 'geoip-full.dat' || return 1
+    _geo_extra_name_has_dat 'GEOIP.DAT' || return 1
+    _geo_extra_name_has_dat 'geoip-full' && return 1
+    _geo_extra_file_valid 'custom.dat' || return 1
+    _geo_extra_file_valid 'custom.bin' && return 1
+    _geo_extra_file_valid 'geoip.dat' && return 1
+    _geo_extra_file_valid 'bad name.dat' && return 1
+    _geo_extra_url_gz 'https://example.com/geoip-full.dat.gz' || return 1
+    _geo_extra_url_gz 'https://example.com/geoip-full.dat.gz?x=1' || return 1
+    _geo_extra_url_gz 'https://example.com/geoip-full.dat' && return 1
+)
+check 'custom geodata rejects names without .dat' geodata_assets_require_dat
 
 printf 'common regressions passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
