@@ -587,6 +587,14 @@ _uninstall_menu() {
                     if [ "$cf_rc" -ne 0 ]; then
                         _error "cloudflared 卸载未完全成功(见上方原因), 请手动确认进程与文件已清理"
                     fi
+                    if [ "$uninstall_mode" = all ]; then
+                        local uninstall_rc=0
+                        [ "$xray_rc" -ne 0 ] && uninstall_rc=1
+                        [ "$cf_rc" -ne 0 ] && uninstall_rc=1
+                        echo -e "${YELLOW}按回车键退出...${NC}" >&2
+                        read -r
+                        exit "$uninstall_rc"
+                    fi
                     ;;
                 *) _info "已取消" ;;
             esac
