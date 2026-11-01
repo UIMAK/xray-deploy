@@ -528,8 +528,7 @@ _flock_ensure() {
     return 1
 }
 
-# 安装锁串行化整版本事务：flock 优先，mkdir 退路永不自动接管。
-# 锁根固定 /var/lock/xray-deploy（失败退 /run/lock），不读环境覆盖；子进程可能延续 flock。
+# 安装锁: 锁根固定 /var/lock/xray-deploy（失败退 /run/lock），不读环境覆盖；子进程可能延续 flock。
 _install_lock_root() {
     # 实际创建锁根而非只看权限；调用须在参数校验之后，失败不回落 /opt。
     if mkdir -p /var/lock/xray-deploy 2>/dev/null; then printf '%s' "/var/lock/xray-deploy"; return 0; fi
@@ -539,67 +538,7 @@ _install_lock_root() {
 INSTALL_LOCK_HELD=0
 INSTALL_LOCK_FD=""
 
-_install_lock_owner_pid() {   # [锁目录]; 输出持有者 PID; 非数字/空/**数值为 0** 一律输出空(视为"无法判定")
-    local d="${1:-$INSTALL_LOCK_DIR}" p
-    p=$(cat "$d/pid" 2>/dev/null)
-    case "$p" in
-        ''|*[!0-9]*) printf '%s' '' ;;
-        # 所有零值 PID 均为未知；kill -0 会把进程组误当持有者存活。
-        *)           [ "$((10#$p))" -eq 0 ] && { printf '%s' ''; return 0; }
-                     printf '%s' "$p" ;;
-    esac
-}
-
-_install_lock_write_pid() {   # [锁目录]; 同目录 rename 原子写入, 避免半写
-    local d="${1:-$INSTALL_LOCK_DIR}" t
-    t="$d/.pid.$$"
-    printf '%s\n' "$$" > "$t" 2>/dev/null || return 1
-    mv -f "$t" "$d/pid" 2>/dev/null || { rm -f "$t" 2>/dev/null; return 1; }
-    return 0
-}
-
-# mkdir 锁只删本进程拥有的目录；残留拒绝并交人工处理。
-_install_lock_mkdir_take() {   # <锁目录> <显示名>; 复用同一实现, 无隐藏全局状态
-    local d="$1" label="$2" i pid
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
-        if mkdir "$d" 2>/dev/null; then
-            if _install_lock_write_pid "$d"; then return 0; fi
-            rm -rf "$d" 2>/dev/null
-            echo "[错误] 无法写入${label} $d/pid(磁盘空间/权限?), 安装中止"
-            return 1
-        fi
-        # 路径存在但不是目录 => 明确报错, 不 rm、不等待(等待不会让它变成目录)
-        if [ ! -d "$d" ]; then
-            echo "[错误] ${label}路径存在但不是目录: $d"
-            echo "       请手动处理该路径后重试"
-            return 1
-        fi
-        pid=$(_install_lock_owner_pid "$d")
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            [ "$i" -eq 14 ] && {
-                echo "[错误] 另一个安装正在运行(pid $pid), 本次中止以免两棵树互相覆盖"
-                echo "       若确认该进程已不存在, 请手动删除: $d"
-                return 1; }
-            sleep 1; continue
-        fi
-        # 陈旧或未知锁立即拒绝，保留目录并给出人工处置路径。
-        echo "[错误] 检测到无人持有的${label}(pid ${pid:-未知}): $d"
-        echo "       该目录可能是上次被强杀(SIGKILL)留下的; 确认无其他安装正在运行后,"
-        echo "       请手动删除该目录后重试"
-        return 1
-    done
-    echo "[错误] 等待${label}超时: $d"
-    return 1
-}
-
-_install_lock_mkdir_release() {   # <锁目录>; 归属校验后才删
-    local d="$1" p
-    p=$(_install_lock_owner_pid "$d")
-    [ "$p" = "$$" ] && rm -rf "$d" 2>/dev/null
-    return 0
-}
-
-# 安装锁串行化整版本事务：flock 优先，mkdir 退路永不自动接管。
+# 安装锁串行化整版本事务: 仅 flock 文件锁, 缺 flock 直接拒绝。
 _install_lock_acquire() {
     local lockdir=""
     lockdir=$(dirname "$INSTALL_LOCK_FILE")
@@ -608,37 +547,31 @@ _install_lock_acquire() {
         echo "[错误] 无法创建安装锁目录 $lockdir(权限/只读文件系统?), 安装中止"
         return 1
     }
-    # flock 优先：内核仲裁，最后一个继承 fd 关闭才释放。
-    if _flock_ensure; then
-        # 动态 FD 避免与 config 锁 fd 9 冲突；exec 其他重定向放组外，避免永久污染 stderr。
-        { exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_FILE"; } 2>/dev/null || {
-            INSTALL_LOCK_FD=""
-            echo "[错误] 无法打开安装锁文件 $INSTALL_LOCK_FILE(磁盘空间/权限?)"; return 1; }
-        if flock -n "$INSTALL_LOCK_FD" 2>/dev/null; then
-            INSTALL_LOCK_HELD=1
-            { printf '%s\n' "$$" >&"$INSTALL_LOCK_FD"; } 2>/dev/null || true   # 仅供诊断, 权威在 fd
-            if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
-                echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
-                _install_lock_release
-                return 1
-            fi
-            return 0
-        fi
-        eval "exec ${INSTALL_LOCK_FD}>&-" 2>/dev/null
+    # 内核仲裁, 最后一个继承 fd 关闭才释放。
+    if ! _flock_ensure; then
+        echo "[错误] 系统缺少 flock 命令, 无法串行化安装, 安装中止"
+        echo "       请安装 util-linux(提供 flock) 后重试"
+        return 1
+    fi
+    # 动态 FD 避免与 config 锁 fd 9 冲突；exec 其他重定向放组外，避免永久污染 stderr。
+    { exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_FILE"; } 2>/dev/null || {
         INSTALL_LOCK_FD=""
-        echo "[错误] 另一个安装正在运行(或上一次安装的残留锁尚未释放 —— 它会在持有它的子进程"
-        echo "       退出后释放, 通常数十秒; 启用 retry 时可能更久)。本次中止以免两棵树互相覆盖"
-        return 1
+        echo "[错误] 无法打开安装锁文件 $INSTALL_LOCK_FILE(磁盘空间/权限?)"; return 1; }
+    if flock -n "$INSTALL_LOCK_FD" 2>/dev/null; then
+        INSTALL_LOCK_HELD=1
+        { printf '%s\n' "$$" >&"$INSTALL_LOCK_FD"; } 2>/dev/null || true   # 仅供诊断, 权威在 fd
+        if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
+            echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
+            _install_lock_release
+            return 1
+        fi
+        return 0
     fi
-    # mkdir 退路永不自动接管；主锁后才创建部署树。
-    _install_lock_mkdir_take "$INSTALL_LOCK_DIR" "安装锁" || return 1
-    INSTALL_LOCK_HELD=1
-    if ! mkdir -p "$DEPLOY_DIR" 2>/dev/null; then
-        echo "[错误] 无法创建部署目录 $DEPLOY_DIR, 安装中止"
-        _install_lock_release
-        return 1
-    fi
-    return 0
+    eval "exec ${INSTALL_LOCK_FD}>&-" 2>/dev/null
+    INSTALL_LOCK_FD=""
+    echo "[错误] 另一个安装正在运行(或上一次安装的残留锁尚未释放 —— 它会在持有它的子进程"
+    echo "       退出后释放, 通常数十秒; 启用 retry 时可能更久)。本次中止以免两棵树互相覆盖"
+    return 1
 }
 
 _install_lock_release() {
@@ -648,9 +581,6 @@ _install_lock_release() {
         flock -u "$INSTALL_LOCK_FD" 2>/dev/null
         eval "exec ${INSTALL_LOCK_FD}>&-" 2>/dev/null
         INSTALL_LOCK_FD=""
-    else
-        # mkdir 路径: 归属校验后才删 —— 绝不删别人的锁。
-        _install_lock_mkdir_release "$INSTALL_LOCK_DIR"
     fi
     INSTALL_LOCK_HELD=0
     return 0
@@ -681,13 +611,12 @@ if [ "$IS_UPDATE" -eq 1 ] && [ "$ALLOW_LOCAL" -eq 1 ]; then
     exit 2
 fi
 
-# 参数校验后创建锁根；flock 文件与 mkdir 目录使用不同路径。
+# 参数校验后创建锁根; 安装锁只有 flock 文件。
 INSTALL_LOCK_ROOT="$(_install_lock_root)"
-INSTALL_LOCK_DIR="${INSTALL_LOCK_ROOT}/install.lock"
 INSTALL_LOCK_FILE="${INSTALL_LOCK_ROOT}/install.lock.fd"
 
 # 参数校验后、清理前取安装锁；取锁前装 trap，exec 菜单前显式释放。
-# EXIT trap 不跨 exec；mkdir 的 SIGKILL 残留只交人工处理。
+# EXIT trap 不跨 exec。
 trap '_install_lock_release' EXIT
 trap '_install_abort_signal 130' INT
 trap '_install_abort_signal 143' TERM HUP

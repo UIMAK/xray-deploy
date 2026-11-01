@@ -64,6 +64,7 @@ _restart_xray_verified() { printf 'Unexpected service restart\n' >&2; return 1; 
 mkdir -p "$ASSET_DIR" "$CERT_DIR" "$LOG_DIR" "$STATE_DIR" "$BACKUP_DIR"
 
 version=$("$XRAY_BIN" version)
+core_version=$(printf '%s\n' "${version%%$'\n'*}" | awk '{print $2}')
 printf 'CORE: %s\n' "${version%%$'\n'*}"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=config-test.invalid \
     -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" > "$scratch/openssl.log" 2>&1
@@ -154,7 +155,7 @@ done
 
 R_PORT=18451
 R_TAG='config-test-enc'
-if ! _xray_version_ge 25.8.31; then
+if ! _xray_version_at_least "$core_version" 25.8.31; then
     record SKIP 'vless-enc (requires core >=25.8.31; encryption must not silently fall back to none)'
 elif _generate_vless_enc_keys x25519 > "$scratch/vlessenc.log" 2>&1; then
     R_DECRYPTION="$VLESS_ENC_DECRYPTION"
@@ -228,7 +229,7 @@ R_BRUTAL_PARAMS_BLOCK=''
 R_OBFS_MASK_BLOCK=''
 hy=''
 for mode in plain salamander gecko brutal; do
-    if { [ "$mode" = gecko ] || [ "$mode" = brutal ]; } && ! _xray_version_ge 26.6.1; then
+    if { [ "$mode" = gecko ] || [ "$mode" = brutal ]; } && ! _xray_version_at_least "$core_version" 26.6.1; then
         record SKIP "hy2-$mode-ampersand (packetSize requires core >=26.6.1; old cores silently discard it)"
         continue
     fi

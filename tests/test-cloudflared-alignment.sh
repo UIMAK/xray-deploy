@@ -96,7 +96,7 @@ reset_fixture() {
     CF_CUR_TOKEN_FILE=""; CF_TOKEN_BACKUP_PATH=""; CF_TIMER_WAS_ENABLED=""; CF_TIMER_WAS_ACTIVE=""
     printf no > "$TMP/timer-present"; printf off > "$TMP/timer-enabled"; printf off > "$TMP/timer-active"
     printf 0 > "$TMP/restarts"; : > "$TMP/systemctl"; : > "$TMP/messages"; : > "$TMP/success"
-    rm -f "$TMP/reload-failed" "$TMP/timer-failed" "$CF_UNIT_SYSTEMD" "$CF_UNIT_SYSTEMD.bak" "$CF_UNIT_OPENRC" "$TMP/token" "$TMP/token.bak" "$STATE_DIR/cf_autoupdate" "$STATE_DIR/cf_http2" "$STATE_DIR/cf_edge_ip"
+    rm -f "$TMP/reload-failed" "$TMP/timer-failed" "$CF_UNIT_SYSTEMD" "$CF_UNIT_SYSTEMD.bak" "$CF_UNIT_OPENRC" "$TMP/token" "$TMP/token.bak"
 }
 inline_fixture() { printf 'ExecStart=%s --no-autoupdate tunnel --protocol http2 run --token %s\n# stale token %s\nExecStop=%s cleanup --token %s\n' "$CF_BIN" "$OLD" "$OLD" "$CF_BIN" "$OLD" > "$CF_UNIT_SYSTEMD"; }
 file_fixture() { printf '%s' "$OLD" > "$TMP/token"; printf 'ExecStart=%s --no-autoupdate tunnel --protocol http2 run --token-file %s/token\n' "$CF_BIN" "$TMP" > "$CF_UNIT_SYSTEMD"; }
@@ -193,7 +193,6 @@ RESTART_FAIL=yes
 before=$(cat "$CF_UNIT_SYSTEMD")
 run 1 _cf_toggle http2
 check 'legacy toggle restart failure restores service' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
-check 'failed toggle does not commit state' test ! -e "$STATE_DIR/cf_http2"
 
 reset_fixture
 printf 'ExecStart=%s --autoupdate-freq 24h0m0s tunnel --protocol http2 run --token %s\n' "$CF_BIN" "$OLD" > "$CF_UNIT_SYSTEMD"
@@ -220,7 +219,6 @@ check 'OFF disables timer startup' eq "$(cat "$TMP/timer-enabled")" off
 check 'OFF stops active timer' eq "$(cat "$TMP/timer-active")" off
 check 'OFF stops update worker' contains "$(cat "$TMP/systemctl")" 'stop cloudflared-update.service'
 check 'OFF retains process no-autoupdate' contains "$(cat "$CF_UNIT_SYSTEMD")" --no-autoupdate
-check 'OFF persists matching state' eq "$(cat "$STATE_DIR/cf_autoupdate")" off
 run 0 _read_cf_state
 check 'OFF effective state matches actual behavior' eq "$(_cf_autoupdate_effective)" off
 run 0 _cf_toggle autoupdate
@@ -237,7 +235,6 @@ run 1 _cf_toggle autoupdate
 check 'restart failure restores timer enabled state' eq "$(cat "$TMP/timer-enabled")" on
 check 'restart failure restores timer active state' eq "$(cat "$TMP/timer-active")" on
 check 'timer restart failure restores original service' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
-check 'timer restart failure leaves state uncommitted' test ! -e "$STATE_DIR/cf_autoupdate"
 
 reset_fixture
 file_fixture
@@ -263,7 +260,6 @@ run 0 _install_cloudflared <<< "$NEW"
 check 'fresh install uses service-level no-update-service' contains "$(cat "$TMP/install-args")" "service install --no-update-service $NEW"
 check 'fresh install retains official token-file' contains "$(cat "$CF_UNIT_SYSTEMD")" "run --token-file $TMP/token"
 check 'fresh install defaults HTTP2 on' contains "$(cat "$CF_UNIT_SYSTEMD")" '--protocol http2 run'
-check 'fresh install autoupdate off state' eq "$(cat "$STATE_DIR/cf_autoupdate")" off
 
 reset_fixture
 printf yes > "$TMP/timer-present"; printf on > "$TMP/timer-enabled"; printf on > "$TMP/timer-active"
@@ -284,7 +280,6 @@ for install_failure in timer write restart liveness; do
     run 1 _install_cloudflared <<< "$NEW"
     check "install $install_failure failure restores timer enabled" eq "$(cat "$TMP/timer-enabled")" on
     check "install $install_failure failure restores timer active" eq "$(cat "$TMP/timer-active")" on
-    check "install $install_failure failure does not commit autoupdate state" test ! -e "$STATE_DIR/cf_autoupdate"
 done
 
 reset_fixture

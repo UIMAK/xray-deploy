@@ -73,9 +73,8 @@ check 'valid IPv6 accepted' _validate_listen 2001:db8::1
 if _validate_listen $'::1\ngarbage'; then fail 'multiline listen rejected'; else pass 'multiline listen rejected'; fi
 if _validate_listen 010.0.0.1; then fail 'leading-zero IPv4 rejected'; else pass 'leading-zero IPv4 rejected'; fi
 if _validate_port 0; then fail 'invalid port rejected'; else pass 'invalid port rejected'; fi
-_xray_current_version() { printf '26.9.9\n'; }
-check 'version compare' _xray_version_ge 26.4.25
-if _xray_version_ge 26.x.25 >/dev/null 2>&1; then fail 'version rejects malformed value'; else pass 'version rejects malformed value'; fi
+check 'version compare' _xray_version_at_least 26.9.9 26.6.1
+if _xray_version_at_least 26.x.25 26.6.1 >/dev/null 2>&1; then fail 'version rejects malformed value'; else pass 'version rejects malformed value'; fi
 check_eq 'version tag canonicalization' v26.9.9 "$(_xray_canon_tag 26.9.9)"
 
 printf '== config dir (confs) mechanics ==\n'
@@ -1264,7 +1263,7 @@ printf '== clash derivation runs under the config lock ==\n'
 CLASH_PROBE_META="$TMP/clash-probe.json"
 CLASH_PROBE_STATE="$TMP/clash-probe-state"
 printf '{"name":"lock-probe"}\n' > "$CLASH_PROBE_META"
-_clash_lock_probe() {   # $1=标签, 其余=被观察的调用; 输出 "<标签>=<held|free> rc=<rc> leak=<yes|no>"
+_clash_lock_probe() {   # $1=标签, 其余=被观察的调用; 输出 "<标签>=<held|free> rc=<rc>"
     local label="$1" rc after
     shift
     CLASH_YAML="$TMP/clash-probe-${label}.yaml"
@@ -1283,9 +1282,7 @@ _clash_lock_probe() {   # $1=标签, 其余=被观察的调用; 输出 "<标签>
     _replace_node_in_yaml() { _probe_lock_state > "$CLASH_PROBE_STATE"; return 0; }
     _add_node_to_yaml() { _probe_lock_state > "$CLASH_PROBE_STATE"; return 0; }
     "$@" >/dev/null 2>&1; rc=$?
-    after=no
-    [ -e "$(_deploy_lock_root)/config.lock.d" ] && after=yes
-    printf '%s=%s rc=%s leak=%s\n' "$label" "$(cat "$CLASH_PROBE_STATE" 2>/dev/null)" "$rc" "$after"
+    printf '%s=%s rc=%s\n' "$label" "$(cat "$CLASH_PROBE_STATE" 2>/dev/null)" "$rc"
 }
 XH_CLASH_PROBE=$(_clash_lock_probe xray _sync_node_clash "$CLASH_PROBE_META")
 XH_HY_PROBE=$(_clash_lock_probe hysteria _hysteria_sync_clash "$CLASH_PROBE_META")
@@ -1294,7 +1291,7 @@ XH_NESTED_PROBE=$(_clash_lock_probe nested _with_config_lock _sync_node_clash "$
 # 有 flock 的宿主必须看到 held(真检查); 无 flock 时探针只能报 unknown, 接受但不再当作持锁证据。
 _check_lock_probe() {   # <名称> <探针输出>
     case "$2" in
-        *"=held rc=0 leak=no"|*"=unknown rc=0 leak=no") pass "$1" ;;
+        *"=held rc=0"|*"=unknown rc=0") pass "$1" ;;
         *) fail "$1 (expected held|unknown, got [$2])" ;;
     esac
 }
@@ -1377,13 +1374,12 @@ if (
     printf 'bin' > "$HYSTERIA_BIN"
     printf 'lr' > "$_lr_conf"
     _state_set hysteria_version 2.12.2
-    _state_set hysteria_variant avx
     _state_set hysteria_asset hysteria-linux-amd64
     _hysteria_installed() { return 0; }
     _hysteria_stop_and_verify() { return 0; }
     _hysteria_cleanup_service_units() { return 0; }
     _hysteria_uninstall_locked >/dev/null 2>&1
-    [ ! -e "$STATE_DIR/hysteria_version" ] && [ ! -e "$STATE_DIR/hysteria_variant" ] \
+    [ ! -e "$STATE_DIR/hysteria_version" ] \
         && [ ! -e "$STATE_DIR/hysteria_asset" ] && [ ! -e "$_lr_conf" ]
 ); then pass 'uninstall clears hysteria_asset state'; else fail 'uninstall clears hysteria_asset state'; fi
 # 端口跳跃解析: 只接受单段 a-b; 多 '-' 必须显式拒绝(旧实现用 cut 静默丢弃多余段)。
