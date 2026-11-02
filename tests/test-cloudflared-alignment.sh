@@ -244,6 +244,28 @@ check 'registration backfill writes requested credential' eq "$(cat "$TMP/token"
 check 'registration backfill consumes token backup' test ! -e "$TMP/token.bak"
 
 reset_fixture
+file_fixture
+printf 'ExecStart=%s --no-autoupdate tunnel --grace-period 60s run --token-file %s/token\n' "$CF_BIN" "$TMP" > "$CF_UNIT_SYSTEMD"
+before=$(cat "$CF_UNIT_SYSTEMD")
+run 1 _cf_toggle http2
+check 'custom service toggle refuses lossy rewriting' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
+run 0 _cf_switch_token <<< "$NEW"
+check 'custom service token-file switch preserves extra arguments' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
+check 'custom service token-file switch still succeeds' eq "$(cat "$TMP/token")" "$NEW"
+
+reset_fixture
+: > "$TMP/cf-execstart"
+printf '%s (ignore_errors=yes) -%s\n' "$TMP/a.env" "$TMP/b.env" > "$TMP/cf-envfiles"
+printf 'TUNNEL_GRACE_PERIOD=10s\n' > "$TMP/a.env"
+printf 'TUNNEL_GRACE_PERIOD=45s\n' > "$TMP/b.env"
+check 'EnvironmentFiles last file wins on the systemd path' eq "$(_cf_grace_config "$CF_UNIT_SYSTEMD")" 45s
+CF_LOADSTATE=not-found
+printf 'EnvironmentFile=%s\nEnvironmentFile=-%s\n' "$TMP/a.env" "$TMP/b.env" > "$CF_UNIT_SYSTEMD"
+check 'EnvironmentFiles last file wins in the text fallback' eq "$(_cf_grace_config "$CF_UNIT_SYSTEMD")" 45s
+CF_LOADSTATE=loaded
+rm -f "$TMP/cf-envfiles" "$TMP/cf-execstart" "$TMP/a.env" "$TMP/b.env" "$CF_UNIT_SYSTEMD"
+
+reset_fixture
 INIT_SYSTEM=openrc
 printf 'command="%s"\ncommand_args="--no-autoupdate tunnel --protocol http2 run --token %s"\n' "$CF_BIN" "$OLD" > "$CF_UNIT_OPENRC"
 run 0 _cf_switch_token <<< "$NEW"

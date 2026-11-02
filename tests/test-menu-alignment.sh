@@ -131,13 +131,17 @@ trap 'rm -rf "${TMP:?}"' EXIT
         cp "$TMP/crontab" "$TMP/before-crontab"
         cp "$STATE_DIR/timed_restart" "$TMP/before-timed-state"
         : > "$TMP/cron-writes"
+        : > "$TMP/messages"
+        : > "$TMP/success"
     }
     invoke_cron() {
         RC=0
         (
+            CRON_START_RC="${1:-0}"
             clear() { :; }
             _press_any_key() { :; }
             _tip() { :; }
+            _success() { printf '%s\n' "$*" >> "$TMP/success"; }
             command() {
                 if [ "${1-}" = -v ] && [ "${2-}" = "$CMD_NAME" ]; then
                     printf '/usr/local/bin/%s\n' "$CMD_NAME"
@@ -146,7 +150,7 @@ trap 'rm -rf "${TMP:?}"' EXIT
                 fi
             }
             _with_config_lock() { "$@"; }
-            _ensure_cron_running() { return 0; }
+            _ensure_cron_running() { return "$CRON_START_RC"; }
             crontab() {
                 case "$1" in
                     -l) cat "$TMP/crontab" ;;
@@ -164,14 +168,22 @@ trap 'rm -rf "${TMP:?}"' EXIT
     CMD_NAME=xd
     CRON_WRITE_FAIL=no
     cron_fixture
-    invoke_cron
+    invoke_cron 0
     check 'timed restart keeps unrelated tasks and updates state' \
         bash -c 'grep -q "^15 4 .*backup$" "$1" && grep -q "^0 \*/6 .*timed-restart" "$1" && [ "$(cat "$2")" = "0 */6 * * *" ]' _ \
         "$TMP/crontab" "$STATE_DIR/timed_restart"
 
     cron_fixture
+    invoke_cron 1
+    check 'cron startup failure returns normally' eq "$RC" 0
+    check 'cron startup failure performs no crontab writes' test ! -s "$TMP/cron-writes"
+    check 'cron startup failure preserves crontab bytes' cmp -s "$TMP/before-crontab" "$TMP/crontab"
+    check 'cron startup failure preserves state bytes' cmp -s "$TMP/before-timed-state" "$STATE_DIR/timed_restart"
+    check 'cron startup failure reports daemon failure' grep -qF 'cron 守护进程未能启动' "$TMP/messages"
+
+    cron_fixture
     CRON_WRITE_FAIL=yes
-    invoke_cron
+    invoke_cron 0
     check 'crontab write failure preserves tasks and state' \
         bash -c 'cmp -s "$1" "$2" && cmp -s "$3" "$4"' _ \
         "$TMP/before-crontab" "$TMP/crontab" "$TMP/before-timed-state" "$STATE_DIR/timed_restart"

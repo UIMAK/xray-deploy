@@ -163,16 +163,56 @@ _xray_mem_limit_from_mb() {  # <total_mb>
 }
 
 # 取 MemTotal 与 cgroup v1/v2 限额的最小有效值; 无有效值时不设 GOMEMLIMIT。
-_xray_mem_limit_mib() {  # [meminfo] [cgroup_root]
+_xray_mem_limit_mib() {  # [meminfo] [cgroup_root] [self_cgroup]
     local meminfo="${1:-/proc/meminfo}" cgroup_root="${2:-/sys/fs/cgroup}"
-    local total_mb=0 raw candidate f
+    local self_cgroup="${3:-/proc/self/cgroup}"
+    local total_mb=0 raw candidate f hid ctrls rel suffix v2_rel="" v1_rel=""
+    local -a limit_files=(
+        "$cgroup_root/memory.max"
+        "$cgroup_root/memory.high"
+        "$cgroup_root/memory/memory.limit_in_bytes"
+    )
     raw=$(awk '/^MemTotal:/{print int($2 / 1024); exit}' "$meminfo" 2>/dev/null) || raw=""
     [[ "$raw" =~ ^[0-9]+$ ]] && total_mb=$raw
 
     # cgroup v2: memory.max 是硬上限, memory.high 是更早触发的回收阈值;
     # cgroup v1 的 limit_in_bytes 兼容旧内核/旧 LXC。配额小于 MemTotal 时取配额。
-    for f in "$cgroup_root/memory.max" "$cgroup_root/memory.high" \
-             "$cgroup_root/memory/memory.limit_in_bytes"; do
+    if [ -r "$self_cgroup" ]; then
+        while IFS=: read -r hid ctrls rel; do
+            [ -n "$rel" ] || continue
+            if [ "$hid" = 0 ] && [ -z "$ctrls" ]; then
+                v2_rel=$rel
+            elif [ "$hid" != 0 ]; then
+                case ",$ctrls," in
+                    *,memory,*) v1_rel=$rel ;;
+                esac
+            fi
+        done < "$self_cgroup"
+    fi
+
+    # 容器通常位于嵌套 cgroup; 从当前路径向上逐级加入候选文件。
+    if [ -n "$v2_rel" ]; then
+        suffix=${v2_rel#/}
+        suffix="/${suffix%/}"
+        while :; do
+            limit_files+=("$cgroup_root$suffix/memory.max" "$cgroup_root$suffix/memory.high")
+            [ "$suffix" = / ] && break
+            suffix=${suffix%/*}
+            [ -n "$suffix" ] || suffix=/
+        done
+    fi
+    if [ -n "$v1_rel" ]; then
+        suffix=${v1_rel#/}
+        suffix="/${suffix%/}"
+        while :; do
+            limit_files+=("$cgroup_root/memory$suffix/memory.limit_in_bytes")
+            [ "$suffix" = / ] && break
+            suffix=${suffix%/*}
+            [ -n "$suffix" ] || suffix=/
+        done
+    fi
+
+    for f in "${limit_files[@]}"; do
         [ -r "$f" ] || continue
         raw=$(cat "$f" 2>/dev/null) || continue
         [[ "$raw" =~ ^[0-9]+$ ]] || continue

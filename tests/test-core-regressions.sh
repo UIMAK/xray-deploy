@@ -726,6 +726,22 @@ trap cleanup EXIT
         [ "$(_xray_mem_limit_mib "$mem" "$cg")" = 819 ] || return 1
 
         rm -f "$cg/memory/memory.limit_in_bytes" || return 1
+        mkdir -p "$cg/docker/abc" "$cg/memory/docker/abc" || return 1
+        local cg_self="$TMP/self-cgroup"
+        printf '0::/docker/abc\n' > "$cg_self" || return 1
+        printf '134217728\n' > "$cg/docker/abc/memory.max" || return 1
+        [ "$(_xray_mem_limit_mib "$mem" "$cg" "$cg_self")" = 40 ] || return 1
+
+        rm -f "$cg/docker/abc/memory.max" || return 1
+        printf '134217728\n' > "$cg/docker/memory.max" || return 1
+        [ "$(_xray_mem_limit_mib "$mem" "$cg" "$cg_self")" = 40 ] || return 1
+
+        rm -f "$cg/docker/memory.max" || return 1
+        printf '7:memory:/docker/abc\n' > "$cg_self" || return 1
+        printf '134217728\n' > "$cg/memory/docker/abc/memory.limit_in_bytes" || return 1
+        [ "$(_xray_mem_limit_mib "$mem" "$cg" "$cg_self")" = 40 ] || return 1
+
+        rm -f "$cg/memory/docker/abc/memory.limit_in_bytes" || return 1
         ! _xray_mem_limit_mib "$TMP/missing-meminfo" "$cg" >/dev/null 2>&1
     }
     stage_marker_probe() (
