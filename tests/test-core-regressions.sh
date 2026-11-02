@@ -762,6 +762,45 @@ trap cleanup EXIT
         done
         return 0
     )
+    # 全新安装/assets 为空: release 自带 dat 必须补位, 否则默认路由规则让核心起不来。
+    core_geo_missing_probe() (
+        fixture core-geo-missing
+        INIT_SYSTEM=direct
+        _xray_service_unit_path() { return 1; }
+        _ensure_xray_symlink() { :; }
+        command rm -f "$ASSET_DIR/geoip.dat" "$ASSET_DIR/geosite.dat"
+        local stage="$BIN_DIR/.xray-dl.geo" j
+        mkdir "$stage" || return 1
+        printf '#!/bin/sh\nexit 0\n' > "$stage/xray" && chmod +x "$stage/xray" || return 1
+        printf 'zip-geoip' > "$stage/geoip.dat"
+        printf 'zip-geosite' > "$stage/geosite.dat"
+        _xray_core_journal_write 26.9.8 stable v26.10.31 preview "$stage" || return 1
+        j="$STATE_DIR/coretxn.json"
+        _xray_core_snapshot_binary "$j" && _xref_snapshot_geo_dats "$j" &&
+            _xray_core_journal_phase snapshotted || return 1
+        _xray_commit_staged "$stage" || return 1
+        [ "$(cat "$ASSET_DIR/geoip.dat")" = zip-geoip ] &&
+            [ "$(cat "$ASSET_DIR/geosite.dat")" = zip-geosite ] && [ -x "$XRAY_BIN" ]
+    )
+    # 已有 dat 的机器换核心: 不得用 zip 自带的旧数据覆盖用户更新过的文件。
+    core_geo_preserved_probe() (
+        fixture core-geo-preserved
+        INIT_SYSTEM=direct
+        _xray_service_unit_path() { return 1; }
+        _ensure_xray_symlink() { :; }
+        local stage="$BIN_DIR/.xray-dl.geo" j
+        mkdir "$stage" || return 1
+        printf '#!/bin/sh\nexit 0\n' > "$stage/xray" && chmod +x "$stage/xray" || return 1
+        printf 'zip-geoip' > "$stage/geoip.dat"
+        printf 'zip-geosite' > "$stage/geosite.dat"
+        _xray_core_journal_write 26.9.8 stable v26.10.31 preview "$stage" || return 1
+        j="$STATE_DIR/coretxn.json"
+        _xray_core_snapshot_binary "$j" && _xref_snapshot_geo_dats "$j" &&
+            _xray_core_journal_phase snapshotted || return 1
+        _xray_commit_staged "$stage" || return 1
+        [ "$(cat "$ASSET_DIR/geoip.dat")" = old-geoip ] &&
+            [ "$(cat "$ASSET_DIR/geosite.dat")" = old-geosite ]
+    )
     stale_staging_cleanup_probe() (
         fixture stale-staging
         local dead_pid
@@ -807,6 +846,8 @@ trap cleanup EXIT
     check 'service snapshot rejects content that differs from the unit' service_snapshot_cmp_probe
     check 'GOMEMLIMIT ratio and cgroup v1/v2 limits are bounded' memory_limits_probe
     check 'release staging marks owner before download and cleans failure' stage_marker_probe
+    check 'core install bootstraps missing geo dat from the release' core_geo_missing_probe
+    check 'core install keeps user-updated geo dat untouched' core_geo_preserved_probe
     check 'stale staging cleanup removes only dead owners' stale_staging_cleanup_probe
     check 'drop_caches runs only for a confirmed host' drop_caches_probe
     check 'invalid direct pidfile is rejected without takeover' invalid_pidfile_rejected

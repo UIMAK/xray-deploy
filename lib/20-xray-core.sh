@@ -303,7 +303,7 @@ _xray_stage_release() {
 #   3 = replacing 已 durable, mutation 可能部分发生; caller 必须运行 journal recovery
 # 从 replacing 到恢复完成前, journal 与 snapshots 均不得由调用方直接丢弃。
 _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutation never started; 3=recovery required
-    local tmp_dir="$1" j binbak pre phase
+    local tmp_dir="$1" j binbak pre phase gd gsrc gtmp
     [ -d "$tmp_dir" ] && [ -f "${tmp_dir}/xray" ] || {
         _error "staging 目录不可用: ${tmp_dir:-（空）}"; return 1; }
     j=$(_xray_core_journal_path)
@@ -333,6 +333,24 @@ _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutatio
         _error "新二进制设置执行权限失败"
         return 3
     fi
+
+    # 全新安装时 assets 为空, 而默认 routing 规则引用 geosite/geoip, 核心加载
+    # geosite.dat 失败就会拒绝启动; release zip 自带这两份 dat, 缺失时补位即可。
+    # 已存在则不动: Geo 菜单更新过的数据比 zip 自带的旧版本更可靠。
+    # 快照在 snapshotted 之前已记录 preexisted=false, 回滚会删掉这里新建的文件。
+    for gd in geoip.dat geosite.dat; do
+        gsrc="${tmp_dir}/${gd}"
+        [ -f "$gsrc" ] || continue
+        _xray_core_path_present "$ASSET_DIR/${gd}" && continue
+        gtmp=$(mktemp "${ASSET_DIR}/.${gd}.coretxn-new.XXXXXX") || {
+            _error "无法创建 ${gd} 临时文件"; return 3; }
+        if ! cp "$gsrc" "$gtmp" 2>/dev/null || ! cmp -s "$gsrc" "$gtmp" 2>/dev/null ||
+           ! chmod 644 "$gtmp" 2>/dev/null || ! mv -f "$gtmp" "$ASSET_DIR/${gd}" 2>/dev/null; then
+            rm -f "$gtmp" 2>/dev/null
+            _error "${gd} 原子落地失败, 交由事务恢复"
+            return 3
+        fi
+    done
 
     _maybe_drop_caches
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
