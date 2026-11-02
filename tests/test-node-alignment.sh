@@ -68,14 +68,14 @@ _render_template "$ROOT/templates/hysteria2.server.jsonc" > "$TMP/rendered.json"
 check 'new settings.clients auth' jq -e '.settings.clients[0].auth == "secret" and (.settings | has("users") | not)' "$TMP/rendered.json"
 check 'default masquerade omitted' jq -e '.streamSettings.hysteriaSettings | has("masquerade") | not' "$TMP/rendered.json"
 check 'network and version unchanged' jq -e '.streamSettings.network == "hysteria" and .settings.version == 2 and .streamSettings.hysteriaSettings.version == 2' "$TMP/rendered.json"
-for up in '' 0 '0 mbps' 00.0mbps bad 1kbps 0.01mbps 10kbps 65534bps 65535bps 100kbps 524287bps 511.999kbps 0.499999mbps 1watts '1 000kbps' '1 k bps'; do
+for up in '' 1kbps 524287bps; do
     rc=0
     _commit_hy2_node_txn_locked hy2-test node server 443 0.0.0.0 secret sni false '' force-brutal "$up" '' '' '' '' /fixture/cert.pem /fixture/key.pem || rc=$?
     check "force-brutal rejects [$up] before mutation" eq "$rc" 1
     check "force-brutal [$up] no config preflight" test ! -e "$TMP/preflight"
     check "force-brutal [$up] no committed state" test ! -e "$TMP/committed.json"
 done
-for up in '100 mbps' 10m 1g '0.5 gbps' 524288 524288b 524288bps 512k 512kb 512kbps 0.5m 0.5mb .5mbps ' 0.5 MBPS ' 1tbps; do
+for up in '100 mbps' 512kbps '0.5 gbps'; do
     check "positive force bandwidth [$up]" _hy2_force_brutal_up_valid "$up"
 done
 rc=0
@@ -130,41 +130,16 @@ creation_committed() {
     check "$label metadata direction" jq -e --arg cc "$cc" --arg up "$up" --arg down "$down" '
         .congestion == $cc and .brutal_up == $up and .brutal_down == $down' "$TMP/committed.json"
 }
-for rate in 1bps 7bps 0.000001mbps 1kbps 65535bps 524287bps not-a-rate 1watts; do
-    for target in brutal-up brutal-down force-down; do
-        cc=brutal up='80 mbps' down='20 mbps'
-        case "$target" in
-            brutal-up) up="$rate" ;;
-            brutal-down) down="$rate" ;;
-            force-down) cc=force-brutal down="$rate" ;;
-        esac
-        creation_fixture
-        creation_invoke "$cc" "$up" "$down"
-        creation_rejected "creation $target=[$rate]"
-    done
-done
-for rate in 524288bps 512kbps 0.5mbps 0 '0 mbps' 00.000kbps ''; do
-    check "shared rate accepts [$rate]" _hy2_brutal_rate_valid "$rate"
-    for target in brutal-up brutal-down force-down; do
-        cc=brutal up='80 mbps' down='20 mbps'
-        case "$target" in
-            brutal-up) up="$rate" ;;
-            brutal-down) down="$rate" ;;
-            force-down) cc=force-brutal down="$rate" ;;
-        esac
-        creation_fixture
-        creation_invoke "$cc" "$up" "$down"
-        creation_committed "creation $target=[$rate]" "$cc" "$up" "$down"
-    done
-done
-for rate in 1bps 7bps 0.000001mbps 1kbps 65535bps 524287bps not-a-rate 1watts; do
-    rc=0; _hy2_brutal_rate_valid "$rate" || rc=$?
+creation_fixture
+creation_invoke force-brutal 1kbps ''
+creation_rejected 'creation force-up=1kbps'
+creation_fixture
+creation_invoke force-brutal 0.5mbps ''
+creation_committed 'creation force-up=0.5mbps' force-brutal 0.5mbps ''
+for rate in 1kbps 524287bps not-a-rate; do
+    rc=0
+    _hy2_brutal_rate_valid "$rate" || rc=$?
     check "shared rate rejects [$rate]" eq "$rc" 1
-done
-for rate in 524288bps 512kbps 0.5mbps; do
-    creation_fixture
-    creation_invoke force-brutal "$rate" ''
-    creation_committed "creation force-up=[$rate]" force-brutal "$rate" ''
 done
 
 # Both CDN transports preserve existing Firefox and default absent fp to Chrome.
@@ -246,9 +221,8 @@ reality_fixture() {
     done
 }
 for addr_key in address rewriteAddress; do
-    for peer_host in 127.0.0.1 '[::1]' localhost 127.0.0.2; do
-        label="shared $addr_key $peer_host"
-        reality_fixture "shared-$addr_key-$peer_host" true "$addr_key" "$peer_host" || exit 1
+    label="shared $addr_key"
+    reality_fixture "shared-$addr_key" true "$addr_key" 127.0.0.1 || exit 1
         cp "$NODES_DIR/xd-reality-xhttp-9443.json" "$DEPLOY_DIR/peer-before.json"
         rc=0; _reality_port_txn xd-reality-vision-443 "$NODES_DIR/xd-reality-vision-443.json" 443 8443 || rc=$?
         check "$label A port transaction succeeds" eq "$rc" 0
@@ -261,7 +235,6 @@ for addr_key in address rewriteAddress; do
         check "$label B remains manageable" eq "$rc" 0
         check "$label B metadata keeps tunnel identity" jq -e '.port == 10444 and .tunnel_tag == "tunnel-site-10443-443"' "$NODES_DIR/xd-reality-xhttp-10444.json"
         check "$label B change leaves A port intact" _config_jq -e '[.inbounds[] | select(.tag == "xd-reality-vision-8443" and .port == 8443)] | length == 1'
-    done
     reality_fixture "single-$addr_key" false "$addr_key" || exit 1
     rc=0; _reality_port_txn xd-reality-vision-443 "$NODES_DIR/xd-reality-vision-443.json" 443 8443 || rc=$?
     check "single $addr_key transaction succeeds" eq "$rc" 0

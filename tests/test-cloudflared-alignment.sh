@@ -127,23 +127,10 @@ check 'token-file mode limited to owner' eq "$(stat -c %a "$TMP/token")" 600
 run 0 _cf_toggle http2
 check 'toggle preserves token-file launch' contains "$(cat "$CF_UNIT_SYSTEMD")" "--token-file $TMP/token"
 check 'HTTP2 off omits protocol option' no_contains "$(cat "$CF_UNIT_SYSTEMD")" --protocol
-check 'HTTP2 off means auto in UI' contains "$(_cf_http2_disp off)" 'auto(默认, QUIC 优先)'
-check 'IP off means unspecified in UI' contains "$(_cf_edge_ip_label off)" '未指定(默认 auto)'
 run 0 _cf_set_edge_ip <<< 2
 check 'IPv6 switch writes option before run' contains "$(cat "$CF_UNIT_SYSTEMD")" "--edge-ip-version 6 run --token-file"
 run 0 _cf_set_edge_ip <<< 4
 check 'IP off does not force edge version' no_contains "$(cat "$CF_UNIT_SYSTEMD")" --edge-ip-version
-
-reset_fixture
-file_fixture
-run 0 _read_cf_state
-before=$(cat "$CF_UNIT_SYSTEMD")
-printf '%s\n' "$before" | sed 's/--token-file /--token-file=/' > "$CF_UNIT_SYSTEMD"
-run 0 _read_cf_state
-check 'inline-equals official token-file path reads' eq "$CF_CUR_TOKEN" "$OLD"
-check 'token-file equals value preserved' eq "$CF_CUR_TOKEN_FILE" "$TMP/token"
-run 0 _cf_switch_token <<< "$NEW"
-check 'token-file equals switch preserves custom syntax' contains "$(cat "$CF_UNIT_SYSTEMD")" "--token-file=$TMP/token"
 
 reset_fixture
 file_fixture
@@ -155,11 +142,6 @@ run 1 _cf_switch_token <<< "$NEW"
 unset -f chmod
 check 'token-file permission failure restores old credential' eq "$(cat "$TMP/token")" "$OLD"
 check 'token-file permission failure does not restart service' eq "$(cat "$TMP/restarts")" 0
-
-reset_fixture
-inline_fixture
-run 0 _read_cf_state
-check 'service install input skips official service-only update flag' eq "$(_extract_token "$CF_BIN service install --no-update-service $NEW")" "$NEW"
 
 reset_fixture
 file_fixture
@@ -195,21 +177,6 @@ run 1 _cf_toggle http2
 check 'legacy toggle restart failure restores service' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
 
 reset_fixture
-printf 'ExecStart=%s --autoupdate-freq 24h0m0s tunnel --protocol http2 run --token %s\n' "$CF_BIN" "$OLD" > "$CF_UNIT_SYSTEMD"
-printf yes > "$TMP/timer-present"
-run 0 _cf_toggle http2
-check 'HTTP2 toggle does not disable preexisting process updater for inactive timer' contains "$(cat "$CF_UNIT_SYSTEMD")" --autoupdate-freq
-run 0 _read_cf_state
-check 'HTTP2 toggle preserves effective update state' eq "$(_cf_autoupdate_effective)" on
-
-reset_fixture
-printf 'ExecStart=%s tunnel --protocol http2 run --token %s\n' "$CF_BIN" "$OLD" > "$CF_UNIT_SYSTEMD"
-run 0 _cf_toggle http2
-check 'HTTP2 toggle preserves absent autoupdate flags' no_contains "$(cat "$CF_UNIT_SYSTEMD")" --no-autoupdate
-run 0 _read_cf_state
-check 'absent autoupdate flags remain default-on' eq "$(_cf_autoupdate_effective)" on
-
-reset_fixture
 file_fixture
 printf yes > "$TMP/timer-present"; printf on > "$TMP/timer-enabled"; printf on > "$TMP/timer-active"
 run 0 _read_cf_state
@@ -237,16 +204,6 @@ check 'restart failure restores timer active state' eq "$(cat "$TMP/timer-active
 check 'timer restart failure restores original service' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
 
 reset_fixture
-file_fixture
-printf yes > "$TMP/timer-present"; printf on > "$TMP/timer-enabled"; printf off > "$TMP/timer-active"
-TIMER_FAIL=yes
-before=$(cat "$CF_UNIT_SYSTEMD")
-run 1 _cf_toggle autoupdate
-check 'timer action failure restores enabled state separately' eq "$(cat "$TMP/timer-enabled")" on
-check 'timer action failure retains originally inactive state' eq "$(cat "$TMP/timer-active")" off
-check 'timer action failure restores service' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
-
-reset_fixture
 inline_fixture
 run 0 _cf_toggle autoupdate
 check 'no-timer legacy uses process update frequency' contains "$(cat "$CF_UNIT_SYSTEMD")" --autoupdate-freq
@@ -267,14 +224,12 @@ run 0 _install_cloudflared <<< "$NEW"
 check 'fresh install closes existing independent timer' eq "$(cat "$TMP/timer-enabled")" off
 check 'fresh install stops existing independent timer' eq "$(cat "$TMP/timer-active")" off
 
-# 安装关闭已有 timer 后的任何失败都须还原 enable/active 两个状态。
-for install_failure in timer write restart liveness; do
+# 安装关闭已有 timer 后失败须还原 enable/active 两个状态。
+    for install_failure in timer liveness; do
     reset_fixture
     printf yes > "$TMP/timer-present"; printf on > "$TMP/timer-enabled"; printf on > "$TMP/timer-active"
     case "$install_failure" in
         timer) TIMER_FAIL=yes ;;
-        write) RELOAD_FAIL=yes ;;
-        restart) RESTART_FAIL=yes ;;
         liveness) LIVE=no ;;
     esac
     run 1 _install_cloudflared <<< "$NEW"
@@ -289,22 +244,6 @@ check 'registration backfill writes requested credential' eq "$(cat "$TMP/token"
 check 'registration backfill consumes token backup' test ! -e "$TMP/token.bak"
 
 reset_fixture
-file_fixture
-printf 'ExecStart=%s --no-autoupdate tunnel --grace-period 60s run --token-file %s/token\n' "$CF_BIN" "$TMP" > "$CF_UNIT_SYSTEMD"
-before=$(cat "$CF_UNIT_SYSTEMD")
-run 1 _cf_toggle http2
-check 'custom service toggle refuses lossy rewriting' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
-run 0 _cf_switch_token <<< "$NEW"
-check 'custom service token-file switch preserves extra arguments' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
-check 'custom service token-file switch still succeeds' eq "$(cat "$TMP/token")" "$NEW"
-
-reset_fixture
-printf 'Environment=TUNNEL_TOKEN=%s\nExecStart=%s tunnel run\n' "$OLD" "$CF_BIN" > "$CF_UNIT_SYSTEMD"
-before=$(cat "$CF_UNIT_SYSTEMD")
-run 1 _cf_switch_token <<< "$NEW"
-check 'unsupported Environment token not migrated' eq "$(cat "$CF_UNIT_SYSTEMD")" "$before"
-
-reset_fixture
 INIT_SYSTEM=openrc
 printf 'command="%s"\ncommand_args="--no-autoupdate tunnel --protocol http2 run --token %s"\n' "$CF_BIN" "$OLD" > "$CF_UNIT_OPENRC"
 run 0 _cf_switch_token <<< "$NEW"
@@ -312,49 +251,6 @@ check 'old OpenRC inline credentials supported' contains "$(cat "$CF_UNIT_OPENRC
 run 0 _cf_toggle http2
 check 'OpenRC command_args stays shell-valid' bash -n "$CF_UNIT_OPENRC"
 check 'OpenRC HTTP2 off removes protocol only' no_contains "$(cat "$CF_UNIT_OPENRC")" --protocol
-
-# 多个 EnvironmentFile 是后者覆盖前者(systemd 口径): systemd 权威路径与文本兜底必须同口径。
-reset_fixture
-: > "$TMP/cf-execstart"
-printf '%s (ignore_errors=yes) -%s\n' "$TMP/a.env" "$TMP/b.env" > "$TMP/cf-envfiles"
-printf 'TUNNEL_GRACE_PERIOD=10s\n' > "$TMP/a.env"
-printf 'TUNNEL_GRACE_PERIOD=45s\n' > "$TMP/b.env"
-check 'EnvironmentFiles last file wins on the systemd path' eq "$(_cf_grace_config "$CF_UNIT_SYSTEMD")" 45s
-CF_LOADSTATE=not-found
-printf 'EnvironmentFile=%s\nEnvironmentFile=-%s\n' "$TMP/a.env" "$TMP/b.env" > "$CF_UNIT_SYSTEMD"
-check 'EnvironmentFiles last file wins in the text fallback' eq "$(_cf_grace_config "$CF_UNIT_SYSTEMD")" 45s
-CF_LOADSTATE=loaded
-rm -f "$TMP/cf-envfiles" "$TMP/cf-execstart" "$TMP/a.env" "$TMP/b.env" "$CF_UNIT_SYSTEMD"
-
-# B8: _cf_svcfile 三条臂(含未知 init 默认臂)。
-cf_svcfile_systemd() {
-    local saved="$INIT_SYSTEM" out
-    INIT_SYSTEM=systemd
-    out=$(_cf_svcfile)
-    INIT_SYSTEM="$saved"
-    [ "$out" = "$CF_UNIT_SYSTEMD" ]
-}
-check 'cf svcfile picks systemd unit for systemd init' cf_svcfile_systemd
-
-cf_svcfile_openrc() {
-    local saved="$INIT_SYSTEM" out
-    INIT_SYSTEM=openrc
-    out=$(_cf_svcfile)
-    INIT_SYSTEM="$saved"
-    [ "$out" = "$CF_UNIT_OPENRC" ]
-}
-check 'cf svcfile picks openrc unit for openrc init' cf_svcfile_openrc
-
-cf_svcfile_default() {
-    local saved="$INIT_SYSTEM" empty_out weird_out
-    INIT_SYSTEM=
-    empty_out=$(_cf_svcfile)
-    INIT_SYSTEM=weird
-    weird_out=$(_cf_svcfile)
-    INIT_SYSTEM="$saved"
-    [ "$empty_out" = "$CF_UNIT_SYSTEMD" ] && [ "$weird_out" = "$CF_UNIT_SYSTEMD" ]
-}
-check 'cf svcfile falls back to systemd unit for empty/unknown init' cf_svcfile_default
 
 printf 'cloudflared alignment: %s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

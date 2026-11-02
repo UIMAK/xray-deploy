@@ -205,6 +205,18 @@ _check_root() {
     fi
 }
 
+# 容器检测: drop_caches 等全局副作用只在确认非容器时执行。
+# 0=容器, 1=确认非容器, 其它=无法判断(调用方按 fail-closed 处理)。
+_is_container() {
+    if [ -e /run/.containerenv ] || [ -e /.dockerenv ] || [ -s /run/systemd/container ]; then
+        return 0
+    fi
+    if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container --quiet 2>/dev/null; then
+        return 0
+    fi
+    grep -qaE 'container=|lxc|libpod|podman|docker' /proc/1/environ /proc/1/cgroup 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # 公网 IP 获取(直连节点链接服务器地址用)
 # ---------------------------------------------------------------------------

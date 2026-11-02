@@ -130,15 +130,78 @@ _xray_cached_version() {
 # 用法: _xray_stage_release <tag>   → stdout = staging 目录(失败时非 0, 无输出)
 # ---------------------------------------------------------------------------
 
-# 低内存机器(可用内存<384MB)释放页缓存; 内存充足的机器跳过以避免性能损失
-_maybe_drop_caches() {
-    local avail_kb
+# 低内存机器(可用内存<384MB)释放页缓存; 内存充足或容器内跳过全局副作用。
+_maybe_drop_caches() {  # [drop_caches_path]
+    local avail_kb drop_caches_path="${1:-/proc/sys/vm/drop_caches}"
     avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
-    if [ -n "$avail_kb" ] && [[ "$avail_kb" =~ ^[0-9]+$ ]] && [ "$avail_kb" -lt 393216 ]; then
-        sync 2>/dev/null || true
-        { echo 1 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
-    fi
+    [ -n "$avail_kb" ] && [[ "$avail_kb" =~ ^[0-9]+$ ]] && [ "$avail_kb" -lt 393216 ] || return 0
+    # 0=容器, 1=确认非容器, 其它=无法判断; 只有确认非容器才写全局开关。
+    _is_container
+    [ "$?" -eq 1 ] || return 0
+    sync 2>/dev/null || true
+    { echo 1 > "$drop_caches_path"; } 2>/dev/null || true
     return 0
+}
+
+# 128MB 档只给 Go 5/16(约 40MiB), 其余留给内核/socket/其它进程;
+# 更高档沿用 50%/65%/80% 的保守上限。
+_xray_mem_limit_from_mb() {  # <total_mb>
+    local total_mb="$1" limit
+    [ "$total_mb" -gt 0 ] 2>/dev/null || return 1
+    if [ "$total_mb" -le 128 ]; then
+        limit=$((total_mb * 5 / 16))
+    elif [ "$total_mb" -le 256 ]; then
+        limit=$((total_mb * 50 / 100))
+    elif [ "$total_mb" -le 512 ]; then
+        limit=$((total_mb * 65 / 100))
+    else
+        limit=$((total_mb * 80 / 100))
+    fi
+    [ "$limit" -ge 32 ] || limit=32
+    [ "$limit" -le "$total_mb" ] || limit=$total_mb
+    printf '%s' "$limit"
+}
+
+# 取 MemTotal 与 cgroup v1/v2 限额的最小有效值; 无有效值时不设 GOMEMLIMIT。
+_xray_mem_limit_mib() {  # [meminfo] [cgroup_root]
+    local meminfo="${1:-/proc/meminfo}" cgroup_root="${2:-/sys/fs/cgroup}"
+    local total_mb=0 raw candidate f
+    raw=$(awk '/^MemTotal:/{print int($2 / 1024); exit}' "$meminfo" 2>/dev/null) || raw=""
+    [[ "$raw" =~ ^[0-9]+$ ]] && total_mb=$raw
+
+    # cgroup v2: memory.max 是硬上限, memory.high 是更早触发的回收阈值;
+    # cgroup v1 的 limit_in_bytes 兼容旧内核/旧 LXC。配额小于 MemTotal 时取配额。
+    for f in "$cgroup_root/memory.max" "$cgroup_root/memory.high" \
+             "$cgroup_root/memory/memory.limit_in_bytes"; do
+        [ -r "$f" ] || continue
+        raw=$(cat "$f" 2>/dev/null) || continue
+        [[ "$raw" =~ ^[0-9]+$ ]] || continue
+        # cgroup v1 的无限值哨兵是 19 位; 长度门控也避免 32 位算术溢出。
+        [ "${#raw}" -le 18 ] || continue
+        candidate=$((10#$raw / 1024 / 1024))
+        if [ "$candidate" -gt 0 ] && { [ "$total_mb" -eq 0 ] || [ "$candidate" -lt "$total_mb" ]; }; then
+            total_mb=$candidate
+        fi
+    done
+
+    [ "$total_mb" -ge 32 ] || return 1
+    _xray_mem_limit_from_mb "$total_mb"
+}
+
+# 只清理本脚本的 .xray-dl.*: .active 记录 staging 的父 shell PID;
+# PID 存活或标记缺失/损坏时保留, 避免删掉并发安装的目录。
+_xray_cleanup_stale_staging() {
+    local d pid failed=0
+    [ -n "${BIN_DIR:-}" ] || return 0
+    for d in "$BIN_DIR"/.xray-dl.*; do
+        [ -d "$d" ] || continue
+        pid=$(cat "$d/.active" 2>/dev/null) || continue
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [ "$pid" -gt 0 ] || continue
+        kill -0 "$pid" 2>/dev/null && continue
+        rm -rf -- "$d" 2>/dev/null || { _warn "无法清理残留 staging: $d"; failed=1; }
+    done
+    return "$failed"
 }
 
 # 阶段一只在自有 staging 取件, 不碰共享状态; 网络等待不持 core lock。
@@ -155,10 +218,16 @@ _xray_stage_release() {
 
     local dl_url="https://github.com/XTLS/Xray-core/releases/download/${tag}/${asset}"
     # staging 放在 BIN_DIR 同盘, 保证 mv 使用 rename 而非可能截断目标的跨盘拷贝。
-    # 不清理无法区分的并发 staging/SIGKILL 残留; mktemp 失败必须中止, 防止空路径写向根目录。
+    # .active 记录父 shell PID; 只清理已死 PID 的残留, 不碰并发安装。
     mkdir -p "$BIN_DIR" || { _error "无法创建 $BIN_DIR, 核心替换中止"; return 1; }
+    _xray_cleanup_stale_staging || _warn "清理残留 staging 未完成, 继续核心替换"
     tmp_dir=$(mktemp -d "${BIN_DIR}/.xray-dl.XXXXXX") \
         || { _error "无法在 $BIN_DIR 创建临时目录(磁盘满/只读/inode 耗尽?), 核心替换中止"; return 1; }
+    if ! printf '%s\n' "$$" > "${tmp_dir}/.active"; then
+        _error "无法写入 staging 归属标记(磁盘满/只读?), 核心替换中止"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
     tmp_zip="${tmp_dir}/xray.zip"
 
     _info "下载 Xray-core ${tag} (${asset})"
@@ -1620,8 +1689,13 @@ _xray_test_config() {
     [ -x "$XRAY_BIN" ] || return 1
     # 低内存机器: xray -test 加载完整二进制+geo,预先释放页缓存
     _maybe_drop_caches
+    # GOMEMLIMIT 只能在启动前经 shell/service 环境提供, 不能写进 config.env。
+    local -a env_args=(XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true)
+    local _ml
+    _ml=$(_xray_mem_limit_mib 2>/dev/null) || _ml=""
+    [ -n "$_ml" ] && env_args=(GOMEMLIMIT="${_ml}MiB" "${env_args[@]}")
     # 直接运行,保留完整输出供用户查看
-    XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true "$XRAY_BIN" -test -confdir "$CONFIG_DIR"
+    env "${env_args[@]}" "$XRAY_BIN" -test -confdir "$CONFIG_DIR"
 }
 
 # ---------------------------------------------------------------------------
@@ -1955,8 +2029,12 @@ _xray_service_snapshot() {
 # ---------------------------------------------------------------------------
 _create_xray_systemd_service() {
     local nofile_line="" env_line="Environment=XRAY_JSON_STRICT=true"
+    local mem_line="" _ml
     local _nf; _nf=$(_safe_nofile)
     [ -n "$_nf" ] && nofile_line="LimitNOFILE=$_nf"
+    # GOMEMLIMIT 必须在启动前由 service 环境提供, 不能写进 config.env。
+    _ml=$(_xray_mem_limit_mib 2>/dev/null) || _ml=""
+    [ -n "$_ml" ] && mem_line="Environment=GOMEMLIMIT=${_ml}MiB"
     # unit 重定向写入失败即失败; 后续 daemon-reload 成功不能代替写入成功。
     # 权限按后端显式设置, 失败语义由同步 rollback 与 journal recovery 消费。
     if ! cat > /etc/systemd/system/xray.service <<EOF
@@ -1973,6 +2051,7 @@ StartLimitBurst=20
 [Service]
 Type=simple
 ${env_line}
+${mem_line}
 # Xray 无需运行期提权，限制子进程获得新权限。
 NoNewPrivileges=true
 ExecStart=${XRAY_BIN} run -confdir ${CONFIG_DIR}
@@ -2002,9 +2081,13 @@ EOF
 
 _create_xray_openrc_service() {
     local rc_ulimit_line="" sd_env_line="export XRAY_JSON_STRICT=true"
+    local mem_line="" _ml
     local _nf; _nf=$(_safe_nofile)
     # 抬到"目标 65535 或当前 hard 上限"(见 _safe_nofile); 只有完全探测不到时才留空
     [ -n "$_nf" ] && rc_ulimit_line="rc_ulimit=\"-n $_nf\""
+    # GOMEMLIMIT 必须在启动前由 service 环境提供, 不能写进 config.env。
+    _ml=$(_xray_mem_limit_mib 2>/dev/null) || _ml=""
+    [ -n "$_ml" ] && mem_line="export GOMEMLIMIT=${_ml}MiB"
     # OpenRC init 写入失败必须返回非 0 触发恢复, chmod/enable 成功不能掩盖截断。
     if ! cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
@@ -2027,6 +2110,7 @@ ${rc_ulimit_line}
 # EPERM 并中止启动; 且 iptables 由管理脚本以 root 执行, xray 进程运行期不需要 NET_ADMIN/RAW。
 no_new_privs=yes
 ${sd_env_line}
+${mem_line}
 
 command="${XRAY_BIN}"
 command_args="run -confdir ${CONFIG_DIR}"
@@ -2054,7 +2138,10 @@ _create_xray_service() {
         openrc)  _create_xray_openrc_service ;;
         direct)
             # 无 init 系统:不做 service,提示手动运行
-            _warn "未检测到 systemd/openrc,跳过 service 创建(可手动: XRAY_LOCATION_ASSET=${ASSET_DIR} XRAY_JSON_STRICT=true ${XRAY_BIN} run -confdir ${CONFIG_DIR})"
+            local _ml mem_hint=""
+            _ml=$(_xray_mem_limit_mib 2>/dev/null) || _ml=""
+            [ -n "$_ml" ] && mem_hint="GOMEMLIMIT=${_ml}MiB "
+            _warn "未检测到 systemd/openrc,跳过 service 创建(可手动: ${mem_hint}XRAY_LOCATION_ASSET=${ASSET_DIR} XRAY_JSON_STRICT=true ${XRAY_BIN} run -confdir ${CONFIG_DIR})"
             ;;
         *)
             _error "未知的 init backend: ${INIT_SYSTEM:-未设置}, 无法创建 Xray service"
@@ -2191,7 +2278,11 @@ _manage_xray() {
                         return 1
                     fi
                     local -a config_args=(-confdir "$CONFIG_DIR")
-                    XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true nohup "$XRAY_BIN" run "${config_args[@]}" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- &
+                    local -a run_env=(XRAY_LOCATION_ASSET="$ASSET_DIR" XRAY_JSON_STRICT=true)
+                    local _ml
+                    _ml=$(_xray_mem_limit_mib 2>/dev/null) || _ml=""
+                    [ -n "$_ml" ] && run_env=(GOMEMLIMIT="${_ml}MiB" "${run_env[@]}")
+                    nohup env "${run_env[@]}" "$XRAY_BIN" run "${config_args[@]}" >/dev/null 2>&1 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- &
                     dpid1=$!
                     sleep 1
                     _xd_pidfile_write /run/xray.pid "$dpid1" || return 1

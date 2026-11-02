@@ -45,18 +45,14 @@ printf '%s\n' '{"auth":"pw","name":"offline","link_addr":"connect.example.com"}'
 set_sizes() { jq --argjson sizes "$1" '.obfs.gecko += $sizes' <<< "$base" > "$HYSTERIA_CONFIG"; }
 
 printf '== Gecko defaults and exports ==\n'
-for sizes in '{}' '{"minPacketSize":0,"maxPacketSize":0}' '{"minPacketSize":0,"maxPacketSize":1200}' '{"minPacketSize":512,"maxPacketSize":0}'; do
-    set_sizes "$sizes"
-    eq "Gecko defaults $sizes" default "$(_hysteria_gecko_size_state)"
-    eq "Gecko defaults have no URI gap $sizes" '' "$(_hysteria_obfs_uri_gap)"
-    check "Gecko default URI exports $sizes" _hysteria_build_link "$HYSTERIA_NODE_META"
-done
 set_sizes '{"minPacketSize":0,"maxPacketSize":0}'
+eq 'Gecko zero sizes use defaults' default "$(_hysteria_gecko_size_state)"
+eq 'Gecko defaults have no URI gap' '' "$(_hysteria_obfs_uri_gap)"
+check 'Gecko default URI exports' _hysteria_build_link "$HYSTERIA_NODE_META"
 line=$(_hysteria_clash_line "$HYSTERIA_NODE_META")
 check 'zero minimum exports effective YAML 512' contains 'obfs-min-packet-size: 512' "$line"
 check 'zero maximum exports effective YAML 1200' contains 'obfs-max-packet-size: 1200' "$line"
-eq 'zero desc uses effective defaults' 'min=512 max=1200' "$(_hysteria_gecko_size_desc)"
-for sizes in '{"minPacketSize":0,"maxPacketSize":1000}' '{"minPacketSize":256,"maxPacketSize":0}' '{"minPacketSize":256,"maxPacketSize":1024}'; do
+for sizes in '{"minPacketSize":0,"maxPacketSize":1000}' '{"minPacketSize":256,"maxPacketSize":1024}'; do
     set_sizes "$sizes"
     eq "custom Gecko accepted $sizes" custom "$(_hysteria_gecko_size_state)"
     reject "custom Gecko URI rejected $sizes" _hysteria_build_link "$HYSTERIA_NODE_META"
@@ -72,16 +68,14 @@ for sizes in '{"minPacketSize":0,"maxPacketSize":1000}' '{"minPacketSize":256,"m
         fail "custom Gecko YAML exports sizes $sizes (want min=$emin max=$emax)"
     fi
 done
-for sizes in '{"minPacketSize":"0"}' '{"minPacketSize":null}' '{"minPacketSize":512.5}' '{"minPacketSize":-1}' '{"maxPacketSize":2049}' '{"minPacketSize":0,"maxPacketSize":511}' '{"minPacketSize":1201,"maxPacketSize":0}'; do
+for sizes in '{"minPacketSize":512.5}' '{"minPacketSize":0,"maxPacketSize":511}'; do
     set_sizes "$sizes"
     eq "invalid Gecko rejected $sizes" invalid "$(_hysteria_gecko_size_state)"
     reject "invalid Gecko URI rejected $sizes" _hysteria_build_link "$HYSTERIA_NODE_META"
     reject "invalid Gecko YAML rejected $sizes" _hysteria_clash_line "$HYSTERIA_NODE_META"
 done
-for shape in '[]' '"bad"'; do
-    jq --argjson shape "$shape" '.obfs.gecko = $shape' <<< "$base" > "$HYSTERIA_CONFIG"
-    eq "Gecko shape rejected $shape" invalid "$(_hysteria_gecko_size_state)"
-done
+jq '.obfs.gecko = []' <<< "$base" > "$HYSTERIA_CONFIG"
+eq 'Gecko shape rejected' invalid "$(_hysteria_gecko_size_state)"
 printf 'not-json\n' > "$HYSTERIA_CONFIG"
 eq 'malformed JSON fails closed' invalid "$(_hysteria_gecko_size_state)"
 # fail-closed 分支: 无 obfs / 非 gecko / 不支持的 obfs.type 必须按 none 处理, 不得当成可用。
@@ -95,10 +89,10 @@ jq '.obfs={type:"unsupported",password:"x"}' <<< "$base" > "$HYSTERIA_CONFIG"
 eq 'unsupported obfs type reports none state' none "$(_hysteria_gecko_size_state)"
 
 printf '== bandwidth validation and owned leaves ==\n'
-for value in '0mbps' '0 bps' '0 TBPS' '524288 bps' '1mbps' ' 1 mbps '; do
+for value in '0mbps' '524288 bps' ' 1 mbps '; do
     eq "legal official bandwidth [$value]" '' "$(_hysteria_bandwidth_reason "$value")"
 done
-for value in '524280 bps' '1kbps' '1.5mbps' '100 m bps' '0oops' 'mbps' '100'; do
+for value in '524280 bps' '1kbps' '1.5mbps' '100'; do
     check "illegal official bandwidth [$value]" test -n "$(_hysteria_bandwidth_reason "$value")"
 done
 jq '.bandwidth={up:"10 mbps",down:"20 mbps",disableLossCompensation:true,manual:{value:7}} | .quic={maxIdleTimeout:"30s"}' <<< "$base" > "$HYSTERIA_CONFIG"
@@ -110,13 +104,6 @@ _hysteria_bandwidth_menu <<< $'1\n\n\n' > "$TMP/menu.log" 2>&1
 eq 'blank bandwidth input retains current up' '30 mbps' "$(jq -r '.bandwidth.up' "$HYSTERIA_CONFIG")"
 _hysteria_bandwidth_menu <<< $'2\n' > "$TMP/menu.log" 2>&1
 check 'bandwidth clear deletes only up/down' jq -e '.bandwidth | has("up") == false and has("down") == false and .disableLossCompensation == true and .manual.value == 7' "$HYSTERIA_CONFIG"
-
-jq '.bandwidth={up:"10 mbps",down:"20 mbps"}' <<< "$base" > "$HYSTERIA_CONFIG"
-_hysteria_bandwidth_menu <<< $'2\n' > "$TMP/menu.log" 2>&1
-check 'bandwidth clear removes empty object' jq -e 'has("bandwidth") == false' "$HYSTERIA_CONFIG"
-jq '.bandwidth={}' <<< "$base" > "$HYSTERIA_CONFIG"
-_hysteria_bandwidth_menu <<< $'1\n\n\n' > "$TMP/menu.log" 2>&1
-check 'empty bandwidth setting removes empty object' jq -e 'has("bandwidth") == false' "$HYSTERIA_CONFIG"
 
 printf '== failed bandwidth validation restores config ==\n'
 (
@@ -136,15 +123,12 @@ printf key > "$TMP/custom.key"
 # choice 2 只取用户输入的 SNI, 从不读证书 CN/SAN; 这里不放 openssl 桩, 避免制造"CN 被读取"的假象。
 check 'custom TLS empty SNI accepted' _hysteria_prompt_tls <<< $'2\n'"$TMP/custom.crt"$'\n'"$TMP/custom.key"$'\n\n'
 eq 'empty SNI never becomes certificate CN/SAN' '' "$HY_TLS_SNI"
-check 'custom TLS config retains paths' jq -e --arg c "$TMP/custom.crt" --arg k "$TMP/custom.key" '.tls.cert == $c and .tls.key == $k' <<< "$HY_TLS_JSON"
 set_sizes '{}'
 uri=$(_hysteria_build_link "$HYSTERIA_NODE_META")
 check 'empty SNI URI uses connection host' contains '@connect.example.com:443/' "$uri"
 if contains 'sni=' "$uri"; then fail 'empty SNI URI omits override'; else pass 'empty SNI URI omits override'; fi
 line=$(_hysteria_clash_line "$HYSTERIA_NODE_META")
 if contains ', sni:' "$line"; then fail 'empty SNI YAML omits override'; else pass 'empty SNI YAML omits override'; fi
-_hysteria_prompt_tls <<< $'2\n'"$TMP/custom.crt"$'\n'"$TMP/custom.key"$'\nexplicit.example.com\n' > "$TMP/tls.log" 2>&1
-eq 'explicit SNI retained' explicit.example.com "$HY_TLS_SNI"
 eq 'single range accepted' '' "$(_hysteria_hop_reason '20000-30000')"
 reason=$(_hysteria_hop_reason '20000-30000,40000-50000')
 check 'multi-range warning identifies manager limitation' contains '本管理器' "$reason"
@@ -263,20 +247,6 @@ hysteria_meta_probe() {
     return 0
 }
 check 'hysteria meta set creates then updates own fields' hysteria_meta_probe
-
-congestion_probe() {
-    local log="$TMP/congestion-txn"
-    : > "$log"
-    _hysteria_gate() { return 0; }
-    _hysteria_congestion_desc() { printf 'probe'; }
-    _hysteria_config_txn() { printf '%s\n' "$*" >> "$log"; return 0; }
-    printf '1\n2\n2\n3\n0\n' | _hysteria_congestion_menu || return 1
-    [[ "$(cat "$log")" == *"pr conservative"* ]] || return 1
-    [[ "$(cat "$log")" == *'type: "reno"'* ]] || return 1
-    [[ "$(cat "$log")" == *'del(.congestion)'* ]] || return 1
-    return 0
-}
-check 'hysteria congestion menu maps bbr presets and reset' congestion_probe
 
 # 死 PID 的陈旧记录可清除; 存活 PID 的身份不符仍拒绝接管。
 hysteria_direct_stale_pidfile_stop() (

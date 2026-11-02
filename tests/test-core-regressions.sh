@@ -17,6 +17,11 @@ trap cleanup EXIT
     . "$ROOT/lib/00-common.sh"
     . "${CORE_REGRESSIONS_MODULE:-$ROOT/lib/20-xray-core.sh}"
     . "$ROOT/lib/50-nodes.sh"
+    # 事务用例不碰真实页缓存; drop_caches 用例在子 shell 内恢复真实实现。
+    maybe_drop_caches_definition=$(declare -f _maybe_drop_caches)
+    [ -n "$maybe_drop_caches_definition" ] ||
+        { printf 'SUMMARY pass=0 fail=1 (declare -f _maybe_drop_caches failed)\n'; exit 1; }
+    _maybe_drop_caches() { :; }
     # Map the allowlisted unit path to scratch while keeping real schema checks.
     # 必须确认替换真的发生: 否则 eval 的是未修改函数, 会以真实系统路径运行却仍报 PASS。
     journal_ok_definition=$(declare -f _xray_core_journal_ok)
@@ -75,11 +80,17 @@ trap cleanup EXIT
         : > "$TMP/service-actions"
     }
     service_templates() {
+        local mem="${1:-40}"
         local systemd_unit openrc_unit
         local systemd_definition openrc_definition
         DEPLOY_DIR="$TMP/service-templates"
         BIN_DIR="$DEPLOY_DIR/bin" ASSET_DIR="$DEPLOY_DIR/assets" CONFIG_DIR="$DEPLOY_DIR/confs"
         XRAY_BIN="$BIN_DIR/xray"
+        if [ "$mem" = none ]; then
+            _xray_mem_limit_mib() { return 1; }
+        else
+            _xray_mem_limit_mib() { printf '%s' "$mem"; }
+        fi
         # 模板函数把 service 路径写死在函数体内; 重写函数定义到 scratch,
         # 避免仅替换 cat 时真实重定向已在调用前创建 /etc 文件。
         systemd_definition=$(declare -f _create_xray_systemd_service)
@@ -118,6 +129,13 @@ trap cleanup EXIT
         # service 不再注入 XRAY_LOCATION_ASSET: 资产目录统一由 config 的 env 段提供。
         ! grep -Fq 'XRAY_LOCATION_ASSET=' "$systemd_unit" || return 1
         ! grep -Fq 'XRAY_LOCATION_ASSET=' "$openrc_unit" || return 1
+        if [ "$mem" = none ]; then
+            ! grep -Fq 'GOMEMLIMIT=' "$systemd_unit" || return 1
+            ! grep -Fq 'GOMEMLIMIT=' "$openrc_unit" || return 1
+        else
+            grep -Fq "Environment=GOMEMLIMIT=${mem}MiB" "$systemd_unit" || return 1
+            grep -Fq "export GOMEMLIMIT=${mem}MiB" "$openrc_unit" || return 1
+        fi
         _xray_current_version() { printf '26.9.8'; }
     }
     check() {
@@ -446,6 +464,7 @@ trap cleanup EXIT
     }
     check 'journal field read failure aborts snapshot and cleanup' journal_rc_probe
     check 'service templates adopt standard hardening without changing runtime ownership' service_templates
+    check 'service templates omit GOMEMLIMIT when memory is unknown' service_templates none
 
     # B4: 字段顺序与默认值保持稳定。
     journal_fields_probe() {
@@ -688,12 +707,92 @@ trap cleanup EXIT
         _xray_service_snapshot >/dev/null 2>&1 && return 1
         [ ! -e "$BACKUP_DIR/xray-service.snapshot-test.prev" ]
     )
+    memory_limits_probe() {
+        [ "$(_xray_mem_limit_from_mb 128)" = 40 ] || return 1
+        [ "$(_xray_mem_limit_from_mb 512)" = 332 ] || return 1
+        [ "$(_xray_mem_limit_from_mb 64)" = 32 ] || return 1
+        ! _xray_mem_limit_from_mb 0 >/dev/null 2>&1
+        local mem="$TMP/cgroup-meminfo" cg="$TMP/cgroup"
+        mkdir -p "$cg/memory" || return 1
+        printf 'MemTotal: 1048576 kB\n' > "$mem" || return 1
+
+        printf '134217728\n' > "$cg/memory.max" || return 1
+        [ "$(_xray_mem_limit_mib "$mem" "$cg")" = 40 ] || return 1
+
+        rm -f "$cg/memory.max" "$cg/memory.high" || return 1
+        printf '134217728\n' > "$cg/memory/memory.limit_in_bytes" || return 1
+        [ "$(_xray_mem_limit_mib "$mem" "$cg")" = 40 ] || return 1
+        printf '9223372036854771712\n' > "$cg/memory/memory.limit_in_bytes" || return 1
+        [ "$(_xray_mem_limit_mib "$mem" "$cg")" = 819 ] || return 1
+
+        rm -f "$cg/memory/memory.limit_in_bytes" || return 1
+        ! _xray_mem_limit_mib "$TMP/missing-meminfo" "$cg" >/dev/null 2>&1
+    }
+    stage_marker_probe() (
+        fixture stage-marker
+        _xray_arch_asset() { printf 'Xray-linux-64.zip'; }
+        _pkg_install() { return 0; }
+        _info() { :; }
+        _error() { :; }
+        _http_download() {
+            [ "$(cat "$(dirname "$2")/.active" 2>/dev/null)" = "$$" ] && : > "$TMP/marker-ok"
+            return 1
+        }
+        _xray_stage_release v26.10.31 >/dev/null 2>&1 || :
+        [ -f "$TMP/marker-ok" ] || return 1
+        local d
+        for d in "$BIN_DIR"/.xray-dl.*; do
+            [ -e "$d" ] && return 1
+        done
+        return 0
+    )
+    stale_staging_cleanup_probe() (
+        fixture stale-staging
+        local dead_pid
+        mkdir -p "$BIN_DIR/.xray-dl.live" "$BIN_DIR/.xray-dl.dead" "$BIN_DIR/.xray-dl.nomarker"
+        printf '%s\n' "$$" > "$BIN_DIR/.xray-dl.live/.active"
+        sh -c 'exit 0' &
+        dead_pid=$!
+        wait "$dead_pid" 2>/dev/null
+        printf '%s\n' "$dead_pid" > "$BIN_DIR/.xray-dl.dead/.active"
+        : > "$BIN_DIR/.xray-dl.dead/payload"
+        _xray_cleanup_stale_staging || return 1
+        [ -d "$BIN_DIR/.xray-dl.live" ] || return 1
+        [ -d "$BIN_DIR/.xray-dl.nomarker" ] || return 1
+        [ ! -e "$BIN_DIR/.xray-dl.dead" ]
+    )
+    drop_caches_probe() (
+        local mode path
+        eval "$maybe_drop_caches_definition"
+        awk() { printf '1024\n'; }
+        sync() { :; }
+        _is_container() {
+            case "$mode" in
+                container) return 0 ;;
+                unknown) return 2 ;;
+                *) return 1 ;;
+            esac
+        }
+        for mode in container unknown host; do
+            path="$TMP/drop-caches-$mode"
+            _maybe_drop_caches "$path"
+            if [ "$mode" = host ]; then
+                [ "$(cat "$path" 2>/dev/null)" = 1 ] || return 1
+            else
+                [ ! -s "$path" ] || return 1
+            fi
+        done
+    )
 
     check 'minimum Xray version rejects before staging' min_version_rejection custom v26.10.30
     check 'preview channel picks the highest version across all releases' newest_tag_probe
     check 'preview fetch goes through the newest-release picker' preview_fetch_probe
     check 'Geo snapshot rejects content that differs from the source' geo_snapshot_cmp_probe
     check 'service snapshot rejects content that differs from the unit' service_snapshot_cmp_probe
+    check 'GOMEMLIMIT ratio and cgroup v1/v2 limits are bounded' memory_limits_probe
+    check 'release staging marks owner before download and cleans failure' stage_marker_probe
+    check 'stale staging cleanup removes only dead owners' stale_staging_cleanup_probe
+    check 'drop_caches runs only for a confirmed host' drop_caches_probe
     check 'invalid direct pidfile is rejected without takeover' invalid_pidfile_rejected
     check 'dead-PID direct pidfile is cleared instead of blocking recovery' direct_stale_pidfile_cleaned
     check 'verified restart actually restarts before sampling' restart_verified_restarts_first

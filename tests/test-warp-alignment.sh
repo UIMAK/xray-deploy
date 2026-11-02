@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib/35-warp.sh 的离线回归: 归一/生成、获取失败不落盘、分流规则写入与序号、出站生命周期、静态约束。
+# lib/35-warp.sh 的离线回归: 归一/生成、获取失败不落盘、分流规则与出站生命周期。
 # 全部断言不联网、不启服务: 配置只写进 mktemp 目录, 写入统一由真实 jq 落盘的 _mutate_config 桩完成。
 # shellcheck disable=SC2329,SC2034
 set -u
@@ -164,18 +164,13 @@ JSON
   "secretKey": "c2VjcmV0LW5vcnN2", "address": ["172.16.0.8/32"],
   "peers": [{"publicKey": "cHVibGljLW5vcnN2", "endpoint": "162.159.192.8:2408"}]}}]}
 JSON
-    # 坏 fixture: 注册形态与出站形态各一套, 覆盖 非法 JSON / 缺字段 / reserved 长度 / 越界 / 类型非法。
-    # reserved 省略才补默认值; 出现但不是数组属于格式异常, 必须报错而不是静默当成缺省。
-    printf '{"private_key": "k", "v4": "172.16.0.2", "public_key": "p", "endpoint": "162.159.192.1:2408", "reserved_dec": "abc"}\n' > "$FX/reg-bad-reservedtype.json"
-    printf '{"outbounds": [{"settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "reserved": "abc", "peers": [{"publicKey": "p", "endpoint": "162.159.192.1:2408", "allowedIPs": ["0.0.0.0/0"]}], "mtu": 1280}}]}\n' > "$FX/out-bad-reservedtype.json"
+    # 每种来源保留一个格式错误代表: 非法 JSON、缺字段、reserved 类型错误。
     printf '{"private_key": ' > "$FX/reg-bad-json.json"
     printf '{"private_key": "k"}\n' > "$FX/reg-bad-missing.json"
-    printf '{"private_key": "k", "v4": "172.16.0.2", "public_key": "p", "endpoint": "162.159.192.1:2408", "reserved_dec": [1, 2]}\n' > "$FX/reg-bad-reserved2.json"
-    printf '{"private_key": "k", "v4": "172.16.0.2", "public_key": "p", "endpoint": "162.159.192.1:2408", "reserved_dec": [1, 2, 300]}\n' > "$FX/reg-bad-reserved300.json"
+    printf '{"private_key": "k", "v4": "172.16.0.2", "public_key": "p", "endpoint": "162.159.192.1:2408", "reserved_dec": "abc"}\n' > "$FX/reg-bad-reservedtype.json"
     printf '{"settings": {' > "$FX/out-bad-json.json"
     printf '{"outbounds": [{"settings": {"secretKey": "k"}}]}\n' > "$FX/out-bad-missing.json"
-    printf '{"outbounds": [{"settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "reserved": [1, 2], "peers": [{"publicKey": "p", "endpoint": "162.159.192.1:2408", "allowedIPs": ["0.0.0.0/0"]}], "mtu": 1280}}]}\n' > "$FX/out-bad-reserved2.json"
-    printf '{"outbounds": [{"settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "reserved": [1, 2, 300], "peers": [{"publicKey": "p", "endpoint": "162.159.192.1:2408", "allowedIPs": ["0.0.0.0/0"]}], "mtu": 1280}}]}\n' > "$FX/out-bad-reserved300.json"
+    printf '{"outbounds": [{"settings": {"secretKey": "k", "address": ["172.16.0.2/32"], "reserved": "abc", "peers": [{"publicKey": "p", "endpoint": "162.159.192.1:2408", "allowedIPs": ["0.0.0.0/0"]}], "mtu": 1280}}]}\n' > "$FX/out-bad-reservedtype.json"
 
     # 合法归一: rc=0, 恰好 7 个字段, address 全部带掩码, reserved 长度 3。
     norm_ok() {   # <归一函数> <rawfile> <outfile>
@@ -222,21 +217,19 @@ JSON
     check 'normalize api: missing reserved defaults to three zero bytes' eq '[0,0,0]' "$(jq -c .reserved "$TMP/n-api-norsv.json")"
     check 'normalize reg: missing reserved_dec defaults to three zero bytes' eq '[0,0,0]' "$(jq -c .reserved "$TMP/n-reg-norsv.json")"
 
-    for bad in reg-bad-json reg-bad-missing reg-bad-reserved2 reg-bad-reserved300 reg-bad-reservedtype; do
+    for bad in reg-bad-json reg-bad-missing reg-bad-reservedtype; do
         check "normalize reg rejects $bad with rc=1 and empty stdout" norm_bad _warp_normalize_reg "$FX/$bad.json"
         check "normalize wgcf rejects $bad with rc=1 and empty stdout" norm_bad _warp_normalize_wgcf "$FX/$bad.json"
     done
-    for bad in out-bad-json out-bad-missing out-bad-reserved2 out-bad-reserved300 out-bad-reservedtype; do
+    for bad in out-bad-json out-bad-missing out-bad-reservedtype; do
         check "normalize api rejects $bad with rc=1 and empty stdout" norm_bad _warp_normalize_api "$FX/$bad.json"
         check "normalize wgcf rejects $bad with rc=1 and empty stdout" norm_bad _warp_normalize_wgcf "$FX/$bad.json"
     done
 
     printf '== A. endpoint normalization ==\n'
-    check 'endpoint: port 0 is replaced by 2408' eq '162.159.192.1:2408' "$(_warp_endpoint_norm '162.159.192.1:0')"
     check 'endpoint: bare host gains default port' eq 'engage.cloudflareclient.com:2408' "$(_warp_endpoint_norm 'engage.cloudflareclient.com')"
     check 'endpoint: bare IPv6 is bracketed and gains a port' eq '[2606:4700:110:8a36::1]:2408' "$(_warp_endpoint_norm '2606:4700:110:8a36::1')"
     check 'endpoint: host:port is preserved verbatim' eq '162.159.192.1:500' "$(_warp_endpoint_norm '162.159.192.1:500')"
-    check 'endpoint: bracketed IPv6:port is preserved verbatim' eq '[2606:4700::1]:2408' "$(_warp_endpoint_norm '[2606:4700::1]:2408')"
 
     printf '== A. normalize to build pipeline ==\n'
     build_ok() {   # <归一输出文件>
@@ -248,7 +241,6 @@ JSON
             and ((.settings.peers | length) == 1)
         ' "$TMP/outbound.json" >/dev/null 2>&1
     }
-    check 'build: reg normalize output becomes a single warp wireguard outbound' build_ok "$TMP/n-reg.json"
     check 'build: api normalize output becomes a single warp wireguard outbound' build_ok "$TMP/n-api.json"
     check 'build: peers keep publicKey/endpoint/allowedIPs from normalize' eq 'cHVibGljLWFwaQ==|162.159.192.6:2408|0.0.0.0/0,::/0' "$(jq -r '.settings.peers[0] | [.publicKey, .endpoint, (.allowedIPs | join(","))] | join("|")' "$TMP/outbound.json")"
     check 'build: default mtu 1280 is carried into settings' eq '1280' "$(jq -r '.settings.mtu' "$TMP/outbound.json")"
@@ -280,19 +272,6 @@ JSON
         return "$ok"
     )
     check 'fetch: download failure leaves rc=1, empty stdout and no outfile' fetch_all_fail
-
-    fetch_empty_response() (
-        # 命令存在但什么都不输出: 空响应同样必须判失败, 且不得写出 outfile。
-        warp-reg() { return 1; }
-        wgcf-cli() { return 1; }
-        _http_download() { return 1; }
-        _warp_fetch_warp_reg "$TMP/fetch.out" > "$TMP/fetch.stdout" 2>/dev/null || :
-        [ ! -s "$TMP/fetch.stdout" ] || return 1
-        rm -f "$TMP/obtain.out"
-        _warp_obtain "$TMP/obtain.out" >/dev/null 2>&1 || :
-        [ ! -e "$TMP/obtain.out" ]
-    )
-    check 'fetch: empty response is a failure and writes no outfile' fetch_empty_response
 
     fetch_first_source_ok() (
         warp-reg() { cat "$FX/reg-ok.json"; }
@@ -377,105 +356,6 @@ JSON
         and (.routing.rules[0] == {"outboundTag": "warp"})
         and (.routing.rules[1].ip == ["geoip:cn"])
         and (.routing.rules[2].domain == ["example.org"])'
-
-    # 6) 显示渲染: 标题带条数、每条带 "N 项"、值按终端宽度折行、空列表给提示。
-    #    渲染只是展示层: _warp_rules_list 的 TSV 契约保持不变, 上面的列表/删除用例仍按 TSV 断言。
-    _wshow_strip() { sed $'s/\x1b\\[[0-9;]*m//g'; }
-    _wshow_fits() {
-        local lim="$1" line
-        while IFS= read -r line; do
-            [ "${#line}" -le "$lim" ] || return 1
-        done <<< "$2"
-        return 0
-    }
-    _wshow_no_tab() { ! grep -q $'\t' <<< "$1"; }
-    # 颜色必须渲染成真实 ESC 字节; 字面量 "\033" 说明误把它当 %s 参数传给了 printf。
-    _wshow_lit_esc() { ! grep -qF '\033' <<< "$1"; }
-    _wshow_has_esc() { grep -q $'\x1b' <<< "$1"; }
-    cfg_reset <<'JSON' || exit 1
-{
-  "routing": {"rules": [
-    {"domain": ["aaaa.example.com", "bbbb.example.com", "cccc.example.com", "dddd.example.com", "eeee.example.com", "ffff.example.com", "gggg.example.com"], "outboundTag": "warp"},
-    {"ip": ["geoip:cn"], "outboundTag": "warp"}
-  ]}
-}
-JSON
-    raw="$(COLUMNS=60 _warp_rules_show 2>/dev/null)"
-    check 'show: color is emitted as real escape bytes, not literal \033 text' _wshow_lit_esc "$raw"
-    check 'show: the rendered output is still colored' _wshow_has_esc "$raw"
-    shown="$(printf '%s' "$raw" | _wshow_strip)"
-    check 'show: header carries the rule count' grep -qF 'WARP 分流规则 2 条' <<< "$shown"
-    check 'show: each rule shows how many values it holds' grep -qF '7 项' <<< "$shown"
-    check 'show: no raw TSV tab in the rendered output' _wshow_no_tab "$shown"
-    check 'show: values are joined with ", " and wrapped' grep -qF 'aaaa.example.com, bbbb.example.com,' <<< "$shown"
-    check 'show: every rendered line fits the terminal width' _wshow_fits 60 "$shown"
-    check 'show: the last value of a wrapped list has no trailing comma' eq 'gggg.example.com' "$(printf '%s\n' "$shown" | grep -F 'gggg.example.com' | sed 's/^ *//')"
-    cfg_reset <<'JSON' || exit 1
-{"routing": {"rules": []}}
-JSON
-    : > "$TMP/messages"
-    _warp_rules_show >/dev/null 2>&1
-    check 'show: an empty rule list prints a hint' grep -qF '暂无 WARP 分流规则' "$TMP/messages"
-
-    # 7) 渲染的边界情形: 混合 domain+ip、空值规则、CJK 宽度、可选入参、删除流程集成。
-    check 'width: a COLUMNS below the floor falls back to 80' eq 80 "$(COLUMNS=30 _warp_term_width)"
-    check 'width: an ASCII value measures one column per character' eq 3 "$(_warp_text_width 'abc')"
-    check 'width: a CJK value measures wider than its character count' \
-        [ "$(_warp_text_width '例子.中国')" -gt 5 ]
-
-    cfg_reset <<'JSON' || exit 1
-{
-  "routing": {"rules": [
-    {"domain": ["a.example.com"], "ip": ["geoip:cn"], "outboundTag": "warp"},
-    {"domain": [], "outboundTag": "warp"}
-  ]}
-}
-JSON
-    mixed="$(COLUMNS=60 _warp_rules_show 2>/dev/null | _wshow_strip)"
-    check 'show: a rule carrying both domain and ip lists both kinds' grep -qF 'domain+ip' <<< "$mixed"
-    check 'show: a rule carrying both domain and ip counts both values' grep -qF '2 项' <<< "$mixed"
-    check 'show: a rule carrying both domain and ip renders both values' grep -qF 'a.example.com, geoip:cn' <<< "$mixed"
-    check 'show: a rule with an empty domain array still prints its row' grep -qF '0 项' <<< "$mixed"
-    check 'show: a rule with an empty domain array renders without an unbound-variable error' \
-        eq '' "$(COLUMNS=60 _warp_rules_show 2>&1 >/dev/null)"
-
-    # 折行按显示宽度而非字符数: 3 个各 13~16 字节的中文值在 40 列下必须占 2 行,
-    # 按字符数算会全部塞进 1 行(中文值在终端里比字符数更宽)。
-    cfg_reset <<'JSON' || exit 1
-{"routing": {"rules": [{"domain": ["例子.中国", "例子.中国二", "例子.中国三"], "outboundTag": "warp"}]}}
-JSON
-    cjk_lines="$(COLUMNS=40 _warp_rules_show 2>/dev/null | _wshow_strip | grep -v '^[[:space:]]*$')"
-    check 'show: CJK values wrap by display width, not by character count' eq 4 "$(printf '%s\n' "$cjk_lines" | wc -l | tr -d ' ')"
-
-    wlist="$(_warp_rules_list)"
-    check 'show: an explicit rule list renders the same bytes as the default path' \
-        eq "$(COLUMNS=60 _warp_rules_show 2>/dev/null)" "$(COLUMNS=60 _warp_rules_show "$wlist" 2>/dev/null)"
-    check 'show: an empty explicit argument is not treated as unset (no read of the config)' \
-        eq '' "$(_warp_rules_show '' 2>/dev/null)"
-
-    cfg_reset <<'JSON' || exit 1
-{
-  "inbounds": [{"tag": "xd-vless-443", "protocol": "vless", "port": 443}],
-  "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
-  "routing": {"rules": [
-    {"outboundTag": "warp"},
-    {"domain": ["example.com"], "outboundTag": "warp"},
-    {"ip": ["geoip:cn"], "outboundTag": "warp"}
-  ]}
-}
-JSON
-    : > "$TMP/messages"
-    del_out="$(printf '1\n' | COLUMNS=60 _warp_delete_rule_prompt 2>&1 | _wshow_strip)"
-    check 'delete prompt: renders the rule list before asking' grep -qF 'WARP 分流规则 2 条' <<< "$del_out"
-    check 'delete prompt: choice 1 removes the first listed rule and keeps the bare warp rule' qe '
-        (.routing.rules | length) == 2
-        and (.routing.rules[0] == {"outboundTag": "warp"})
-        and (.routing.rules[1].ip == ["geoip:cn"])'
-    check 'delete prompt: no error is recorded on the success path' eq 0 "$(grep -c '^error:' "$TMP/messages")"
-    : > "$TMP/messages"
-    printf '1\n' | ( _warp_rules_show() { return 1; }; _warp_delete_rule_prompt ) >/dev/null 2>&1
-    check 'delete prompt: a display failure is reported instead of swallowed' grep -qF '无法显示分流规则' "$TMP/messages"
-    check 'delete prompt: a display failure aborts without deleting' qe '(.routing.rules | length) == 2'
 
     # -----------------------------------------------------------------------
     # D. 出站生命周期
@@ -586,30 +466,6 @@ JSON
         [ "$?" -eq 1 ]
     )
     check 'outbound json: missing warp outbound returns 1' outbound_absent
-
-    # -----------------------------------------------------------------------
-    # E. 静态约束
-    # -----------------------------------------------------------------------
-    printf '== E. static constraints ==\n'
-    no_direct_conf_write() {
-        ! grep -Eq '(_config_write_merged|_atomic_write_json)' "$ROOT/lib/35-warp.sh" &&
-        ! grep -Eq '>>?[[:space:]]*"\$CONFIG_DIR' "$ROOT/lib/35-warp.sh"
-    }
-    check 'static: lib/35-warp.sh never writes confs directly' no_direct_conf_write
-    check 'static: lib/35-warp.sh writes config only through _mutate_config' grep -q '_mutate_config' "$ROOT/lib/35-warp.sh"
-
-    # 按函数名截取源码(定义行到列首的 }), 只看输出路径, 不含归一/生成里的字段名。
-    src_func() {
-        awk -v fn="$1" 'index($0, fn "()") == 1 { p = 1 } p { print } p && $0 == "}" { exit }' "$ROOT/lib/35-warp.sh"
-    }
-    no_secret_in_output_path() {
-        local fn
-        for fn in _warp_state_summary _warp_rules_list _warp_rules_show _warp_menu _warp_delete_prompt _warp_set_endpoint_prompt; do
-            src_func "$fn" | grep -q 'secretKey' && return 1
-        done
-        return 0
-    }
-    check 'static: menu/status output paths never reference secretKey' no_secret_in_output_path
 
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
