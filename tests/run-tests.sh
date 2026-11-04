@@ -34,6 +34,7 @@ contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 . "$ROOT/lib/45-logrotate.sh"
 . "$ROOT/lib/50-nodes.sh"
 . "$ROOT/lib/51-reality-pq.sh"
+. "$ROOT/lib/52-outbounds.sh"
 . "$ROOT/lib/55-hysteria.sh"
 . "$ROOT/lib/90-menu.sh"
 
@@ -356,7 +357,7 @@ check 'Xray clash write holds the config lock' _clash_lock_probe xray _sync_node
 check 'Hysteria clash write holds the config lock' _clash_lock_probe hysteria _hysteria_sync_clash "$CLASH_PROBE_META"
 
 printf '== child suites ==\n'
-for suite in test-node-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh \
+for suite in test-node-alignment.sh test-outbound-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh \
     test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then
         tail -n 1 "$TMP/$suite.log"

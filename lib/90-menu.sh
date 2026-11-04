@@ -231,6 +231,7 @@ _main_menu() {
         _menu_row 1 "添加节点"      2 "查看节点"
         _menu_row 3 "删除节点"      4 "修改端口"
         _menu_row 5 "更新监听"      6 "Reality 域名管理"
+        _menu_row 23 "添加出口"
         echo
         echo -e "  ${CYAN}【协议管理】${NC}"
         _menu_row 7 "Xray Hy2 管理" 8 "Hysteria2 管理"
@@ -251,7 +252,7 @@ _main_menu() {
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
         read -rp "  请选择: " choice || exit 0
-        # 编号 1–22 连续，按分组顺序递增；新增项放进所属分组并顺延其后的编号，分组不影响调度。
+        # 编号 1–22 保持稳定；新功能连续追加，显示分组不影响调度。
         case "$choice" in
             1) _add_node; continue ;;
             2) _view_nodes; continue ;;
@@ -277,6 +278,7 @@ _main_menu() {
             20) _check_script_update ;;
             21) _xray_core_menu ;;
             22) _uninstall_menu ;;
+            23) _outbound_add_prompt; _press_any_key; continue ;;
             0) echo -e "${CYAN}再见${NC}"; exit 0 ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
