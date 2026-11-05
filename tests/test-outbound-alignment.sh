@@ -463,6 +463,16 @@ fi
     else
         check 'concatenated links split without separator' false
     fi
+    sep_all='socks5://sep1.example.com:1080#Sep1 socks5://sep2.example.com:1080#Sep2
+socks5://sep3.example.com:1080#Sep3,socks5://sep4.example.com:1080#Sep4;socks5://sep5.example.com:1080#Sep5，socks5://sep6.example.com:1080#Sep6；socks5://sep7.example.com:1080#Sep7socks5://sep8.example.com:1080#Sep8'
+    if _outbound_parse_batch "$sep_all" &&
+        [ "$_OB_COUNT" -eq 8 ] &&
+        jq -e '[.[].tag] == ["Sep1","Sep2","Sep3","Sep4","Sep5","Sep6","Sep7","Sep8"]' \
+            <<< "$_OB_BATCH" >/dev/null 2>&1; then
+        check 'space/newline/comma/semicolon/Chinese separators and concatenation' true
+    else
+        check 'space/newline/comma/semicolon/Chinese separators and concatenation' false
+    fi
     batch_mixed="$l1"$'\n'"tuic://bad@example.com:443#Bad"$'\n'"$l2"
     if _outbound_parse_batch "$batch_mixed" &&
         [ "$_OB_COUNT" -eq 2 ] && [ "$_OB_SKIPPED" -eq 1 ] &&
@@ -535,6 +545,12 @@ fi
         check 'EOF cancels tag prompt' false
     else
         check 'EOF cancels tag prompt' true
+    fi
+    if [ "$(declare -f _outbound_prompt_tag | grep -cF 'read -e -r -p')" -eq 2 ] &&
+        [ "$(declare -f _outbound_add_prompt | grep -cF 'read -e -r -p')" -eq 2 ]; then
+        check 'outbound prompts enable Readline editing' true
+    else
+        check 'outbound prompts enable Readline editing' false
     fi
 
     printf '== config commit ==\n'

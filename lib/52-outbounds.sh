@@ -2198,14 +2198,14 @@ _outbound_prompt_tag() {
             input="${input%$'\r'}"
             [ -n "$input" ] || input="$default"
         elif [ -n "$default" ]; then
-            read -r -p "  ${label} (默认 ${default}): " input || {
+            read -e -r -p "  ${label} (默认 ${default}): " input || {
                 _warn "输入已结束, 已取消"
                 return 1
             }
             input="${input%$'\r'}"
             input="${input:-$default}"
         else
-            read -r -p "  ${label} (链接没有可用 tag, 必须输入): " input || {
+            read -e -r -p "  ${label} (链接没有可用 tag, 必须输入): " input || {
                 _warn "输入已结束, 已取消"
                 return 1
             }
@@ -2258,7 +2258,7 @@ _outbound_add_prompt() {
     }
 
     local first
-    read -r -p "  分享链接: " first || { _warn "输入已结束, 已取消"; return 1; }
+    read -e -r -p "  分享链接: " first || { _warn "输入已结束, 已取消"; return 1; }
     first="${first%$'\r'}"
     _outbound_read_link_inputs "$first"
     _outbound_parse_batch "${_OB_INPUTS[@]}" || {
@@ -2302,7 +2302,7 @@ _outbound_add_prompt() {
         _info "将添加 ${count} 个出口: ${joined}；不会修改默认路由或分流规则"
     fi
     local ans
-    read -r -p "  确认添加? [y/N]: " ans || {
+    read -e -r -p "  确认添加? [y/N]: " ans || {
         _warn "输入已结束, 已取消"
         return 1
     }
