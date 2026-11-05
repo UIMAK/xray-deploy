@@ -231,28 +231,28 @@ _main_menu() {
         _menu_row 1 "添加节点"      2 "查看节点"
         _menu_row 3 "删除节点"      4 "修改端口"
         _menu_row 5 "更新监听"      6 "Reality 域名管理"
-        _menu_row 23 "添加出口"
+        _menu_row 7 "添加出口"
         echo
         echo -e "  ${CYAN}【协议管理】${NC}"
-        _menu_row 7 "Xray Hy2 管理" 8 "Hysteria2 管理"
-        _menu_row 9 "cloudflared 管理" 10 "WARP 管理"
+        _menu_row 8 "Xray Hy2 管理" 9 "Hysteria2 管理"
+        _menu_row 10 "cloudflared 管理" 11 "WARP 管理"
         echo
         echo -e "  ${CYAN}【服务控制】${NC}"
-        _menu_row 11 "重启 Xray"    12 "停止 Xray"
-        _menu_row 13 "查看状态"     14 "查看日志"
-        _menu_row 15 "日志轮换"     16 "定时重启"
+        _menu_row 12 "重启 Xray"    13 "停止 Xray"
+        _menu_row 14 "查看状态"     15 "查看日志"
+        _menu_row 16 "日志轮换"     17 "定时重启"
         echo
         echo -e "  ${CYAN}【配置与更新】${NC}"
-        _menu_row 17 "检查配置"     18 "DNS 设置"
-        _menu_row 19 "Geo 管理"     20 "检测脚本更新"
+        _menu_row 18 "检查配置"     19 "DNS 设置"
+        _menu_row 20 "Geo 管理"     21 "检测脚本更新"
         echo
         echo -e "  ${CYAN}【核心管理】${NC}"
-        _menu_row 21 "Xray 核心管理" 22 "卸载"
+        _menu_row 22 "Xray 核心管理" 23 "卸载"
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
         read -rp "  请选择: " choice || exit 0
-        # 编号 1–22 保持稳定；新功能连续追加，显示分组不影响调度。
+        # 编号按菜单分组顺序连续排列，显示项与调度编号保持一致。
         case "$choice" in
             1) _add_node; continue ;;
             2) _view_nodes; continue ;;
@@ -260,25 +260,25 @@ _main_menu() {
             4) _modify_port; continue ;;
             5) _update_listen; continue ;;
             6) _reality_domain_menu; continue ;;
-            7) _hy2_manage_menu; continue ;;
-            8) _hysteria_menu; continue ;;
-            9) _cloudflared_menu; continue ;;
-            10) _warp_menu; continue ;;
-            11) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
+            7) _outbound_add_prompt; _press_any_key; continue ;;
+            8) _hy2_manage_menu; continue ;;
+            9) _hysteria_menu; continue ;;
+            10) _cloudflared_menu; continue ;;
+            11) _warp_menu; continue ;;
+            12) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
                 _press_any_key ;;
-            12) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
+            13) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
                 _press_any_key ;;
-            13) _view_status ;;
-            14) _view_log ;;
-            15) _logrotate_menu ;;
-            16) _timed_restart_menu ;;
-            17) _check_config ;;
-            18) _dns_menu ;;
-            19) _geo_menu ;;
-            20) _check_script_update ;;
-            21) _xray_core_menu ;;
-            22) _uninstall_menu ;;
-            23) _outbound_add_prompt; _press_any_key; continue ;;
+            14) _view_status ;;
+            15) _view_log ;;
+            16) _logrotate_menu ;;
+            17) _timed_restart_menu ;;
+            18) _check_config ;;
+            19) _dns_menu ;;
+            20) _geo_menu ;;
+            21) _check_script_update ;;
+            22) _xray_core_menu ;;
+            23) _uninstall_menu ;;
             0) echo -e "${CYAN}再见${NC}"; exit 0 ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac

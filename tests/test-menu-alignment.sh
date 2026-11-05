@@ -234,7 +234,7 @@ trap 'rm -rf "${TMP:?}"' EXIT
             _auto_adopt_orphans() { return 0; }
             _auto_ensure_config_env() { return 0; }
             _manage_xray() { printf '%s\n' "$*" >> "$TMP/service-calls"; return "$STOP_RC"; }
-            _main_menu <<< $'12\n0'
+            _main_menu <<< $'13\n0'
         ) > "$TMP/output" 2>&1 || RC=$?
     }
     invoke_stop_menu 1
