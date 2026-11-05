@@ -211,6 +211,41 @@ trap 'rm -rf "${TMP:?}"' EXIT
     )
     check 'reset proceeds past a residual snapshot and cleans it' reset_snapshot_cleanup
 
+    invoke_stop_menu() {
+        local stop_rc="$1"
+        : > "$TMP/success"
+        : > "$TMP/messages"
+        : > "$TMP/service-calls"
+        : > "$TMP/press-calls"
+        RC=0
+        (
+            STOP_RC="$stop_rc"
+            clear() { :; }
+            _menu_require_tty() { return 0; }
+            _print_logo() { :; }
+            _print_status_bar() { :; }
+            _menu_row() { :; }
+            _press_any_key() { printf 'press\n' >> "$TMP/press-calls"; }
+            _success() { printf '%s\n' "$*" >> "$TMP/success"; }
+            _reset_config_recover() { return 0; }
+            _xray_core_txn_recover() { return 0; }
+            _port_txn_recover() { return 0; }
+            _auto_tag_tagless_inbounds() { return 0; }
+            _auto_adopt_orphans() { return 0; }
+            _auto_ensure_config_env() { return 0; }
+            _manage_xray() { printf '%s\n' "$*" >> "$TMP/service-calls"; return "$STOP_RC"; }
+            _main_menu <<< $'12\n0'
+        ) > "$TMP/output" 2>&1 || RC=$?
+    }
+    invoke_stop_menu 1
+    check 'stop failure is dispatched once and reported without success' \
+        bash -c 'test "$1" = 0 && test "$(cat "$2")" = stop && test ! -s "$3" && grep -qF "停止 Xray 失败" "$4" && test "$(cat "$5")" = press' _ \
+        "$RC" "$TMP/service-calls" "$TMP/success" "$TMP/messages" "$TMP/press-calls"
+    invoke_stop_menu 0
+    check 'stop success reports stopped and still pauses' \
+        bash -c 'test "$1" = 0 && test "$(cat "$2")" = stop && test "$(cat "$3")" = 已停止 && test ! -s "$4" && test "$(cat "$5")" = press' _ \
+        "$RC" "$TMP/service-calls" "$TMP/success" "$TMP/messages" "$TMP/press-calls"
+
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
 )
