@@ -104,7 +104,7 @@ _hy2_obfs_size_invalid() {
     fi
 }
 
-# 读取元数据里的 packetSize 值(规范形式, 用于分享链接/clash/回显); 未设置 → 空
+# 读取元数据里的 packetSize 值(规范形式, 用于分享链接与回显); 未设置 → 空
 _hy2_obfs_size_get() {
     local meta="$1"
     jq -r '(.obfs_packet_size // "") | tostring' "$meta" 2>/dev/null
@@ -1183,8 +1183,8 @@ _hy2_gen_newmeta() {
         printf '%s' "$hopmeta" > "$tmp_meta" || { rm -f "$tmp_meta"; return 1; }
     fi
     newlink=$(_rebuild_hy2_link "$tmp_meta"); rc=$?
-    # 两种失败必须区分(同 _hy2_sync_derived): 不可表达(gecko 自定义尺寸) ⇒ 链接留空
-    # 是正常结果, clash 能完整承载该尺寸; 元数据缺字段 ⇒ 无法安全重建, 拒绝(不写坏链接)。
+    # 两种失败必须区分: 不可表达(gecko 自定义尺寸) ⇒ 链接留空是正常结果;
+    # 元数据缺字段 ⇒ 无法安全重建, 拒绝(不写坏链接)。
     if [ "$rc" != 0 ] && ! _hy2_link_unexpressible "$tmp_meta"; then
         rm -f "$tmp_meta"
         # 无链接身份的(测试/采纳)元数据没有可丢的链接, 只更新端口与名称。
@@ -1288,7 +1288,6 @@ _modify_port_hop() {
     local tag="$1" meta="$2" oldport="$3" newport="$4"; shift 4
     local ranges="$*" newmeta display
     display=$(_read_hop_ranges_raw "$meta") || return 1
-    local old_name; old_name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
     newmeta=$(_hy2_gen_newmeta "$meta" "" "$newport") || { _error "生成新元数据失败"; return 1; }
     _info "检测到端口跳跃规则, 正在统一事务更新(config/metadata/iptables)..."
     # shellcheck disable=SC2086
@@ -1298,9 +1297,8 @@ _modify_port_hop() {
         return 1
     fi
     _tip "端口跳跃规则已更新: ${display} → ${newport}"
-    # 派生状态(链接 + clash)走唯一入口, 并传 old_name 删除改名前的 clash 条目
-    # (与 _modify_port 非 hop 路径完全同源; hy2 改端口不存在第二份派生逻辑)
-    _hy2_sync_derived "$meta" "$old_name" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+    # 链接派生与 _modify_port 非 hop 路径同源。
+    _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
     return 0
 }
 
@@ -1787,11 +1785,11 @@ _commit_reality_inbound() {
 }
 
 # 新增节点在锁内复核tag/name，提交metadata与config；失败删除仅本次新建状态。
-_commit_node_txn() {            # <tag> <inbound_json> <meta_json> [<clash_line> <name>]
+_commit_node_txn() {            # <tag> <inbound_json> <meta_json>
     _with_config_lock _commit_node_txn_locked "$@"
 }
 _commit_node_txn_locked() {
-    local tag="$1" inbound="$2" meta_json="$3" clash_line="${4:-}" name="${5:-}"
+    local tag="$1" inbound="$2" meta_json="$3"
     # 锁内占用校验( 锁外的"端口空闲/名称唯一"都是 TOCTOU 检查 —— 并发会话可以
     # 在两次检查之间提交同名/同 tag 节点。这里在真正写入前再验一次, 冲突则整个事务拒绝。
     if [ -e "$NODES_DIR/${tag}.json" ] || \
@@ -1808,11 +1806,10 @@ _commit_node_txn_locked() {
             _error "回滚入站失败, 请手动检查配置: $tag"
         return 1
     fi
-    [ -n "$clash_line" ] && { _add_node_to_yaml "$clash_line" "$name" || true; }
     return 0
 }
 
-_commit_reality_node_txn() {    # <tag> <tunnel_json> <reality_json> <tunnel_tag> <domain> <meta_json> [<clash_line> <name>]
+_commit_reality_node_txn() {    # <tag> <tunnel_json> <reality_json> <tunnel_tag> <domain> <meta_json>
     _with_config_lock _commit_reality_node_txn_locked "$@"
 }
 
@@ -1942,7 +1939,7 @@ _commit_hy2_node_txn_locked() {
     return 0
 }
 _commit_reality_node_txn_locked() {
-    local tag="$1" tunnel="$2" reality="$3" tunnel_tag="$4" domain="$5" meta_json="$6" clash_line="${7:-}" name="${8:-}"
+    local tag="$1" tunnel="$2" reality="$3" tunnel_tag="$4" domain="$5" meta_json="$6"
     # 锁内占用校验( tag 与 tunnel_tag 都必须仍空闲; name 也必须仍唯一。
     if [ -e "$NODES_DIR/${tag}.json" ] || \
        _config_jq -e --arg t "$tag" --arg tt "$tunnel_tag" \
@@ -1964,7 +1961,6 @@ _commit_reality_node_txn_locked() {
             _error "回滚入站/路由失败, 请手动检查配置: $tag"
         return 1
     fi
-    [ -n "$clash_line" ] && { _add_node_to_yaml "$clash_line" "$name" || true; }
     return 0
 }
 
@@ -2101,7 +2097,7 @@ _save_node_meta() {
     return 0
 }
 
-# 节点名必须唯一且精确匹配；Clash/Mihomo 重复名无效，派生缓存按name定位。
+# 节点名必须唯一且精确匹配；metadata 与分享链接按 name 展示。
 _ensure_unique_name() {
     local name="$1" f n rc bad=0
     for f in "$NODES_DIR"/*.json; do
@@ -2611,13 +2607,6 @@ _enc_param() {   # 输出 none 或 url-encoded 加密参数(ENC_ENABLED/ENC_ENCR
     fi
 }
 
-# clash 条目追加的 encryption 后缀; 未启用加密时为空。
-_enc_clash_suffix() {
-    if [ "$ENC_ENABLED" -eq 1 ]; then
-        printf ', encryption: "%s"' "$ENC_ENCRYPTION"
-    fi
-}
-
 _enc_meta_json() {   # <meta_json>; 未启用加密时原样返回
     if [ "$ENC_ENABLED" -eq 1 ]; then
         printf '%s' "$1" | jq \
@@ -2649,7 +2638,7 @@ _prompt_wire_path() {   # <显示名 XHTTP|WS>
 _prompt_cdn_host() {   # 读 CDN Host + 优选地址 + 优选端口
     read -rp "  CDN 域名(Host, 你在 CF 绑定的域名): " host
     [ -z "$host" ] && { _warn "CDN 协议必须填域名"; return 1; }
-    # Host 会进 inbound 模板与 clash 条目; 含空格/引号会破坏模板渲染与 YAML
+    # Host 会进 inbound 模板与分享链接; 含空格/引号会破坏模板渲染与 URL 参数
     _validate_domain "$host" || { _error "CDN 域名格式非法(仅字母/数字/连字符, 点分段): $host"; return 1; }
     read -rp "  优选域名/IP(分享链接使用, 默认 ${host}): " preferred_addr
     preferred_addr=${preferred_addr:-$host}
@@ -2658,7 +2647,7 @@ _prompt_cdn_host() {   # 读 CDN Host + 优选地址 + 优选端口
     [[ "$preferred_port" =~ ^[0-9]+$ && "$preferred_port" -ge 1 && "$preferred_port" -le 65535 ]] || { _warn "端口无效, 使用默认 443"; preferred_port=443; }
 }
 
-# 两种线协议共用创建流程; 只有标题/tag/模板名/链接字段/clash 字段按 wire 分叉。
+# 两种线协议共用创建流程; 只有标题/tag/模板名和链接字段按 wire 分叉。
 _add_reality_node() {   # <tcp|xhttp>
     local wire="$1" title tpl_prefix tag_prefix name_prefix
     case "$wire" in
@@ -2758,20 +2747,6 @@ _add_reality_node() {   # <tcp|xhttp>
     [ -n "$pq_verify" ] && link="${link}&pqv=${pq_verify}"
     link="${link}#$(_url_encode "$name")"
 
-    local enc_clash; enc_clash=$(_enc_clash_suffix)
-    # clash yaml(mihomo): 所有用户字段经 _yaml_dq 双引号转义; support-x25519mlkem768
-    # 必须显式开启, client-fingerprint 用 chrome; 派生 YAML 不能改变字段结构。
-    local c_flow="" c_net="" c_tail=""
-    if [ "$wire" = "xhttp" ]; then
-        c_net="network: xhttp"
-        c_tail=", \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}"
-    else
-        c_flow=", flow: xtls-rprx-vision"
-        c_net="network: tcp"
-    fi
-    local clash
-    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid${c_flow}, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $REALITY_PUBLIC_KEY, short-id: $REALITY_SHORT_ID, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, ${c_net}${c_tail}}"
-
     # reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json meta_filter
     if [ "$wire" = "xhttp" ]; then
@@ -2792,11 +2767,11 @@ _add_reality_node() {   # <tcp|xhttp>
             '. + {tunnel_tag:$ttag,tunnel_port:$tport}')
     fi
     meta_json=$(_enc_meta_json "$meta_json")
-    # 原子提交( config + metadata + 派生 YAML(metadata 失败会回滚入站/路由)。
+    # 原子提交 config + metadata(metadata 失败会回滚入站/路由)。
     if [ "$mode" = "tunnel" ]; then
-        _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" "$clash" "$name" || return 1
+        _commit_reality_node_txn "$tag" "$tunnel_json" "$reality_json" "$tunnel_tag" "$sni" "$meta_json" || return 1
     else
-        _commit_node_txn "$tag" "$reality_json" "$meta_json" "$clash" "$name" || return 1
+        _commit_node_txn "$tag" "$reality_json" "$meta_json" || return 1
     fi
 
     _success "节点 [${name}] 创建成功"
@@ -2928,12 +2903,6 @@ _add_vless_enc() {
     [ -n "$flow" ] && link="${link}&flow=${flow}"
     link="${link}#$(_url_encode "$name")"
 
-    # clash yaml (Clash Meta / mihomo 格式)
-    local clash_flow=""
-    [ -n "$flow" ] && clash_flow=", flow: ${flow}"
-    local clash
-    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, encryption: \"$(_yaml_dq "$VLESS_ENC_ENCRYPTION")\", network: tcp, tls: false${clash_flow}}"
-
     local meta_json
     meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "vless-enc" \
@@ -2942,7 +2911,7 @@ _add_vless_enc() {
         --arg dec "$VLESS_ENC_DECRYPTION" --arg enc "$VLESS_ENC_ENCRYPTION" \
         --arg link "$link" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,flow:$flow,auth:$auth,decryption:$dec,encryption:$enc,share_link:$link}')
-    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
+    _commit_node_txn "$tag" "$inbound" "$meta_json" || return 1
 
     _success "节点 [${name}] 创建成功"
     [ -n "$flow" ] && _tip "已启用 xtls-rprx-vision (splice 优化)"
@@ -2957,7 +2926,7 @@ _add_vless_enc() {
 _add_vless_xhttp_cdn() { _add_cdn_node xhttp; }
 _add_vless_ws_cdn() { _add_cdn_node ws; }
 
-# 两种 CDN 线协议共用创建流程; 只有标题/名称/模板/链接字段/clash 字段按 wire 分叉。
+# 两种 CDN 线协议共用创建流程; 只有标题/名称/模板和链接字段按 wire 分叉。
 _add_cdn_node() {   # <xhttp|ws>
     local wire="$1" title wire_label tpl_prefix tag_prefix name_prefix
     case "$wire" in
@@ -3025,16 +2994,6 @@ _add_cdn_node() {   # <xhttp|ws>
     fi
     link="${link}#$(_url_encode "$name")"
 
-    local enc_clash; enc_clash=$(_enc_clash_suffix)
-    local c_opts
-    if [ "$wire" = "xhttp" ]; then
-        c_opts="network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}"
-    else
-        c_opts="network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}"
-    fi
-    local clash
-    clash="- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$preferred_addr")\", port: $preferred_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": chrome, ${c_opts}}"
-
     # xhttp 需要显式 alpn=h2; ws 无该字段, metadata 结构与旧版保持一致
     local meta_json
     if [ "$wire" = "xhttp" ]; then
@@ -3057,7 +3016,7 @@ _add_cdn_node() {   # <xhttp|ws>
             '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,share_link:$link}')
     fi
     meta_json=$(_enc_meta_json "$meta_json")
-    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
+    _commit_node_txn "$tag" "$inbound" "$meta_json" || return 1
 
     _success "节点 [${name}] 创建成功"
     _warn "请确保: CF 已将该域名指向本机并开启小黄云(代理), SSL 模式 Flexible"
@@ -3126,20 +3085,13 @@ _add_shadowsocks() {
     local link
     link="ss://${b64}@${link_ip}:${port}#$(_url_encode "$name")"
 
-    # mihomo 的 ss `udp` 默认 false(通用字段); 服务端 network 含 udp 才声明,
-    # 否则声明了 UDP 也会连不上(与 _input_port 的协议选择一致)
-    local clash_udp=""
-    [[ "$network_val" == *"udp"* ]] && clash_udp=", udp: true"
-    local clash
-    clash="- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${clash_udp}}"
-
     local meta_json
     meta_json=$(jq -n \
         --arg tag "$tag" --arg name "$name" --arg proto "shadowsocks" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg method "$method" --arg password "$password" --arg link "$link" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,method:$method,password:$password,share_link:$link}')
-    _commit_node_txn "$tag" "$inbound" "$meta_json" "$clash" "$name" || return 1
+    _commit_node_txn "$tag" "$inbound" "$meta_json" || return 1
 
     _success "节点 [${name}] 创建成功"
     echo -e "  ${CYAN}分享链接:${NC} ${link}"
@@ -3915,7 +3867,7 @@ _add_hysteria2() {
                 obfs_size="${obfs_size:-512-1200}"
                 local size_why; size_why=$(_hy2_obfs_size_invalid "$obfs_size")
                 [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; return 1; }
-                # 规范化(排序 + 去前导零)后回写, 使元数据/clash 与 Xray 看到同一区间
+                # 规范化(排序 + 去前导零)后回写, 使元数据与 Xray 看到同一区间
                 obfs_size=$(_hy2_obfs_size_canon "$obfs_size") || { _error "packetSize 规范化失败"; return 1; }
             fi
             # obfs_mask / brutal_block 由提交事务内部构造( 证书与提交同锁)
@@ -3932,9 +3884,8 @@ _add_hysteria2() {
     if [ "$rc" -ne 0 ]; then return "$rc"; fi
 
     local meta="$NODES_DIR/${tag}.json"
-    # 派生状态(链接 + clash)走唯一入口(clash 步骤是 upsert, 新建节点会追加条目);
-    # 失败只告警, 不回滚已提交的 config/metadata。
-    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+    # 链接派生失败只告警, 不回滚已提交的 config/metadata。
+    _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
     local link=""
     link=$(jq -r '.share_link // ""' "$meta" 2>/dev/null)
     # 自签证书的 SNI 在锁内由证书 SAN 决定(子 shell 不传值), 显示时从 metadata 回读
@@ -3957,7 +3908,7 @@ _add_hysteria2() {
     if [ -n "$link" ]; then
         echo -e "  ${CYAN}分享链接:${NC} ${link}"
     else
-        echo -e "  ${YELLOW}分享链接: 无(见上方说明; 客户端配置见 Clash 条目)${NC}"
+        echo -e "  ${YELLOW}分享链接: 无(见上方说明)${NC}"
     fi
 }
 
@@ -4008,90 +3959,11 @@ _rebuild_hy2_link() {
     echo "$link"
 }
 
-# _hy2_clash_line 为唯一Hy2 Clash入口；带宽服务端→客户端交换，metadata方向不变。
-# mihomo up/down触发brutal，ports须引号；gecko用 obfs-min/max-packet-size。
-_hy2_clash_line() {
-    local meta="$1"
-    local name addr port auth sni congestion brutal_up brutal_down self_signed
-    name=$(jq -r '.name // empty' "$meta")
-    addr=$(jq -r '.link_addr // empty' "$meta")
-    port=$(jq -r '.port // empty' "$meta")
-    auth=$(jq -r '.auth // empty' "$meta")
-    sni=$(jq -r --arg d "$XD_HY2_DEFAULT_SNI" '.sni // $d' "$meta")
-    congestion=$(jq -r '.congestion // empty' "$meta")
-    brutal_up=$(jq -r '.brutal_up // empty' "$meta")
-    brutal_down=$(jq -r '.brutal_down // empty' "$meta")
-    self_signed=$(jq -r '.self_signed // "false"' "$meta")
-    # gecko尺寸只在obfs=gecko被mihomo读取；客户端类型不能沿用服务端salamander名称。
-    local obfs_kind obfs_pw obfs_size obfs_min="" obfs_max=""
-    # 未知 obfs_type = 损坏 metadata ⇒ 拒绝产出条目(不写"写着 salamander、服务端在分片"的行)
-    obfs_kind=$(_hy2_obfs_kind "$meta") || return 1
-    obfs_pw=$(jq -r '.obfs_password // empty' "$meta")
-    obfs_size=$(_hy2_obfs_size_get "$meta")
-    if [ "$obfs_kind" = "gecko" ]; then
-        # min/max 必须来自同一规范化结果, 与 Xray 侧的 packetSize 同区间: 直接按 "-"
-        # 切分会把 1500-800 原样导出成 min=1500/max=800, 而 mihomo 要求 max>=min。
-        local obfs_canon
-        obfs_canon=$(_hy2_obfs_size_canon "$obfs_size") || obfs_canon=""
-        obfs_min="${obfs_canon%%-*}"
-        obfs_max="${obfs_canon##*-}"
-        # 有尺寸却解析不出两端 = 畸形元数据; 宁可拒绝也不产出"写着 salamander、服务端在分片"的条目
-        [ -n "$obfs_min" ] && [ -n "$obfs_max" ] || return 1
-    fi
-    if [ -z "$name" ] || [ -z "$addr" ] || [ -z "$port" ] || [ -z "$auth" ]; then
-        _error "节点元数据缺少必要字段(name/link_addr/port/auth), 无法生成 clash 条目: $meta"
-        return 1
-    fi
-    local line
-    line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: $port, password: \"$(_yaml_dq "$auth")\", sni: \"$(_yaml_dq "$sni")\""
-    # brutal/force-brutal: mihomo 以 up/down 触发 brutal 速率控制; 带宽未填则省略(与分享链接一致)
-    if [ "$congestion" = "brutal" ] || [ "$congestion" = "force-brutal" ]; then
-        [ -n "$brutal_down" ] && line="${line}, up: \"$(_yaml_dq "$brutal_down")\""
-        [ -n "$brutal_up" ] && line="${line}, down: \"$(_yaml_dq "$brutal_up")\""
-    fi
-    # 混淆: mihomo 有独立字段可完整表达(含 gecko 分片尺寸; 官方 hy2 URI 无尺寸参数)
-    if [ "$obfs_kind" != "none" ]; then
-        line="${line}, obfs: ${obfs_kind}, obfs-password: \"$(_yaml_dq "$obfs_pw")\""
-        [ -n "$obfs_min" ] && line="${line}, obfs-min-packet-size: ${obfs_min}"
-        [ -n "$obfs_max" ] && line="${line}, obfs-max-packet-size: ${obfs_max}"
-    fi
-    # 端口跳跃: 引号必须有 —— flow 映射上下文里裸逗号会被解析成字段分隔符
-    local hop_ports
-    hop_ports=$(_read_hop_ranges_raw "$meta" 2>/dev/null) || return 1
-    [ -n "$hop_ports" ] && line="${line}, ports: \"${hop_ports}\""
-    [ "$self_signed" = "true" ] && line="${line}, skip-cert-verify: true"
-    printf '%s}' "$line"
-}
-
-# 派生 YAML upsert: 改名先删旧条目, 再按 name 原位替换或追加。1=至少一处失败(已逐个告警)。
-_yaml_upsert() {   # <line> <name> [old_name]
-    local line="$1" name="$2" old_name="${3:-}" key crc=0
-    if [ -n "$old_name" ] && [ "$old_name" != "$name" ]; then
-        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || {
-            crc=1
-            _warn "Clash YAML 旧条目删除失败(${old_name}), 可手工编辑 ${CLASH_YAML}"
-        }
-    fi
-    key=$(_yaml_dq "$name")
-    if [ -f "$CLASH_YAML" ] && grep -qF "name: \"${key}\"" "$CLASH_YAML" 2>/dev/null; then
-        _replace_node_in_yaml "$line" "$name" || {
-            crc=1
-            _warn "Clash YAML 条目同步失败, 可手工编辑 ${CLASH_YAML}"
-        }
-    else
-        _add_node_to_yaml "$line" "$name" || {
-            crc=1
-            _warn "Clash YAML 条目追加失败, 可手工编辑 ${CLASH_YAML}"
-        }
-    fi
-    return "$crc"
-}
-
-# _hy2_sync_derived 统一同步分享链接+Clash；不可表达时清链接但仍同步Clash。
-# config/metadata是权威，派生失败只告警且如实返回，不回滚权威状态。
+# _hy2_sync_derived 只同步分享链接；不可表达时清空链接。
+# config/metadata 是权威，派生失败只告警且如实返回，不回滚权威状态。
 _hy2_sync_derived() {
-    local meta="$1" old_name="${2:-}" link="" nname="" nline="" lrc=0 crc=0
-    # (1) share_link: 派生值, 但写在 metadata 里、是用户直接看到的主输出 —— 失败要单独报。
+    local meta="$1" link="" lrc=0
+    # share_link 是派生值, 但写在 metadata 里、是用户直接看到的主输出 —— 失败要单独报。
     link=$(_rebuild_hy2_link "$meta") || lrc=$?
     if [ "$lrc" -eq 0 ] && [ -n "$link" ]; then
         _meta_update "$meta" '.share_link=$l' --arg l "$link" || {
@@ -4106,117 +3978,12 @@ _hy2_sync_derived() {
         }
         _warn "当前混淆(gecko 带自定义分片尺寸)无法用官方 hy2 链接表达, 已清空分享链接"
         _tip "官方 URI 的 obfs 只表达类型(salamander/gecko), 没有尺寸参数; 只有默认 512-1200 可表达"
-        _tip "请用 Clash 条目(含 obfs-min/max-packet-size)导入客户端"
+        _tip "请在客户端手工填写相同的 gecko 分片尺寸"
     else
         lrc=1
         _warn "分享链接重建失败(元数据缺少必要字段), 已保留原链接"
     fi
-    # (2) clash.yaml: 可再生派生缓存 —— 失败单独报, 且不回滚权威状态。
-    # 必须 upsert(条目在 → 替换; 不在 → 追加), 否则新建节点会静默漏条目。
-    nname=$(jq -r '.name // empty' "$meta" 2>/dev/null)
-    if [ -n "$nname" ] && nline=$(_hy2_clash_line "$meta"); then
-        # 改名(改端口默认连带改名)时由 _yaml_upsert 先删旧名条目, 否则旧条目会以
-        # "另一个节点"的形态留在 clash.yaml 里指向旧端口(幽灵条目)。
-        _yaml_upsert "$nline" "$nname" "$old_name" || crc=1
-    else
-        crc=1
-        _warn "Clash 条目生成失败(元数据不完整), 可手工编辑 ${CLASH_YAML}"
-    fi
-    # 返回码 = 两部分合并(1 = 至少一部分失败)。具体哪一部分失败已在上方分别报出 ——
-    # 调用方只据此提示"详情见上", 不要再把它们混成一句笼统文案。
-    [ "$lrc" -eq 0 ] && [ "$crc" -eq 0 ] && return 0
-    return 1
-}
-
-# _rebuild_clash_line 从metadata重建全协议派生行；缺必要字段返回1不写半成品。
-_rebuild_clash_line() {
-    local meta="$1" proto name addr port uuid enc enc_clash=""
-    proto=$(jq -r '.protocol // empty' "$meta" 2>/dev/null)
-    name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
-    addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
-    port=$(jq -r '.port // empty' "$meta" 2>/dev/null)
-    uuid=$(jq -r '.uuid // empty' "$meta" 2>/dev/null)
-    [ -n "$name" ] && [ -n "$addr" ] && [ -n "$port" ] || return 1
-    enc=$(jq -r '.encryption // "none"' "$meta" 2>/dev/null)
-    if [ -n "$enc" ] && [ "$enc" != "none" ]; then
-        enc_clash=", encryption: \"$(_yaml_dq "$enc")\""
-    fi
-    case "$proto" in
-        hysteria2)
-            _hy2_clash_line "$meta"
-            ;;
-        vless-tcp-reality-vision)
-            local pk sid sni
-            pk=$(jq -r '.public_key // empty' "$meta")
-            sid=$(jq -r '.short_id // empty' "$meta")
-            sni=$(jq -r '.sni // empty' "$meta")
-            [ -n "$uuid" ] && [ -n "$pk" ] && [ -n "$sid" ] && [ -n "$sni" ] || return 1
-            printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, flow: xtls-rprx-vision, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $pk, short-id: $sid, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, network: tcp}"
-            ;;
-        vless-xhttp-reality)
-            local pk sid sni path
-            pk=$(jq -r '.public_key // empty' "$meta")
-            sid=$(jq -r '.short_id // empty' "$meta")
-            sni=$(jq -r '.sni // empty' "$meta")
-            path=$(jq -r '.path // empty' "$meta")
-            [ -n "$uuid" ] && [ -n "$pk" ] && [ -n "$sid" ] && [ -n "$sni" ] && [ -n "$path" ] || return 1
-            printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, network: xhttp, tls: true${enc_clash}, servername: \"$(_yaml_dq "$sni")\", \"reality-opts\": {public-key: $pk, short-id: $sid, support-x25519mlkem768: true}, \"client-fingerprint\": chrome, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\"}}"
-            ;;
-        vless-enc)
-            # enc 节点必有密钥(创建即生成); metadata 缺 encryption 说明是半套元数据, 不重建
-            [ -n "$uuid" ] && [ -n "$enc" ] && [ "$enc" != "none" ] || return 1
-            local flow fl=""
-            flow=$(jq -r '.flow // empty' "$meta")
-            [ -n "$flow" ] && fl=", flow: ${flow}"
-            printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$addr")\", port: $port, udp: true, uuid: $uuid, encryption: \"$(_yaml_dq "$enc")\", network: tcp, tls: false${fl}}"
-            ;;
-        vless-xhttp-cdn|vless-ws-cdn)
-            # CDN 条目指向 CDN 入口(preferred_addr/port), 不是 xray 监听端口
-            local pref_addr pref_port host path fp
-            fp=$(jq -r '.fp // "chrome"' "$meta")
-            pref_addr=$(jq -r '.preferred_addr // .host // empty' "$meta")
-            pref_port=$(jq -r '.preferred_port // "443"' "$meta")
-            host=$(jq -r '.host // empty' "$meta")
-            path=$(jq -r '.path // empty' "$meta")
-            [ -n "$uuid" ] && [ -n "$host" ] && [ -n "$path" ] && [ -n "$pref_addr" ] || return 1
-            [[ "$pref_port" =~ ^[0-9]+$ ]] || pref_port=443
-            if [ "$proto" = "vless-xhttp-cdn" ]; then
-                printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$pref_addr")\", port: $pref_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": \"$(_yaml_dq "$fp")\", network: xhttp, \"xhttp-opts\": {path: \"$(_yaml_dq "$path")\", host: \"$(_yaml_dq "$host")\"}}"
-            else
-                printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: vless, server: \"$(_yaml_dq "$pref_addr")\", port: $pref_port, udp: true, uuid: $uuid, tls: true${enc_clash}, servername: \"$(_yaml_dq "$host")\", \"client-fingerprint\": \"$(_yaml_dq "$fp")\", network: ws, \"ws-opts\": {path: \"$(_yaml_dq "$path")\", headers: {Host: \"$(_yaml_dq "$host")\"}}}"
-            fi
-            ;;
-        shadowsocks)
-            # udp 标志的权威来源是 config 的 settings.network(metadata 未存)
-            # net 给默认值: metadata 缺 tag 时(手工编辑/损坏)上一行短路, set -u 下读 $net 会崩溃
-            local method password net="" udp_clash=""
-            method=$(jq -r '.method // empty' "$meta")
-            password=$(jq -r '.password // empty' "$meta")
-            [ -n "$method" ] && [ -n "$password" ] || return 1
-            local tag; tag=$(jq -r '.tag // empty' "$meta" 2>/dev/null)
-            [ -n "$tag" ] && net=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.network // "tcp,udp"' 2>/dev/null)
-            [[ "$net" == *"udp"* ]] && udp_clash=", udp: true"
-            printf '%s' "- {name: \"$(_yaml_dq "$name")\", type: ss, server: \"$(_yaml_dq "$addr")\", port: $port, cipher: $method, password: \"$(_yaml_dq "$password")\"${udp_clash}}"
-            ;;
-        *) return 1 ;;
-    esac
-}
-
-# _sync_node_clash 失败告警并返回1；调用者保留已提交config/metadata，不伪报同步成功。
-_sync_node_clash() {
-    _with_config_lock _sync_node_clash_locked "$@"
-}
-
-_sync_node_clash_locked() {
-    local meta="$1" old_name="${2:-}" line name
-    # 元数据缺必填字段时保留 clash 旧行(它可能仍指向一个可用的旧配置), 但如实返回失败
-    if ! line=$(_rebuild_clash_line "$meta"); then
-        _warn "Clash 条目重建失败(元数据缺少必要字段), clash.yaml 未同步: $meta"
-        return 1
-    fi
-    name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
-    [ -n "$name" ] || return 1
-    _yaml_upsert "$line" "$name" "$old_name"
+    return "$lrc"
 }
 
 # Reality分享链接从metadata重建；pqv取客户端verify，不泄露seed。
@@ -4424,7 +4191,7 @@ _view_nodes() {
                 echo -e "  ${YELLOW}该节点当前无可用分享链接${NC}"
                 if _hy2_link_unexpressible "$f"; then
                     echo -e "  ${YELLOW}原因: gecko 使用了自定义分片尺寸(官方 hy2 URI 的 obfs 只表达类型, 无尺寸参数)${NC}"
-                    echo -e "  ${YELLOW}请改用 clash/mihomo 条目导入(含 obfs-min/max-packet-size), 见 ${CLASH_YAML}${NC}"
+                    echo -e "  ${YELLOW}请在客户端手工设置相同的 gecko 分片尺寸${NC}"
                 else
                     echo -e "  ${YELLOW}原因: 节点元数据缺少链接所需字段(请删除该节点后重建)${NC}"
                 fi
@@ -4617,16 +4384,9 @@ _delete_node_apply_multi() {
 
     if _mutate_config --argjson all_tags "$all_json" --argjson tun_tags "$tun_json" "$jq_multi"; then
         _HY2_HOP_TD=()
-        # 消费 YAML 删除返回值, 失败则累计并显式告警(不静默; clash.yaml 属派生导出)
-        local yaml_fail=0
         for dt in "${del_tags[@]}"; do
-            # 先删 YAML(需读 json 的 name)再删 json, 否则幽灵节点残留在 clash.yaml
-            _remove_node_from_yaml_by_tag "$dt" || yaml_fail=1
             _delete_node_meta_file "$dt" || return 1
         done
-        # 不再指向不存在的"重新生成 Clash 配置"功能, 给出真实可执行的路径
-        [ "$yaml_fail" -eq 1 ] && \
-            _warn "部分节点 Clash YAML 同步删除失败, 已从 Xray 删除; 可手工编辑 ${CLASH_YAML} 删除对应行"
         _success "已删除 ${#del_tags[@]} 个节点"
         _hy2_purge_self_certs
         return 0
@@ -4706,10 +4466,6 @@ _delete_node_apply_single() {
     fi
     # 自签证书询问在锁外(_delete_node)完成, 这里只消费回答
     if _mutate_config --arg t "$tag" --arg tg "$tunnel_tag" "$jq_filter"; then
-        # 先按name删YAML再删JSON；JSON是派生缓存定位依据。
-        if ! _remove_node_from_yaml_by_tag "$tag"; then
-            _warn "Clash YAML 同步删除失败($tag), 节点已从 Xray 删除; 可手工编辑 ${CLASH_YAML} 删除对应行"
-        fi
         _HY2_HOP_TD=()
         _delete_node_meta_file "$tag" || return 1
         _success "节点已删除"
@@ -4915,9 +4671,6 @@ _reality_port_txn_locked() {
     else
         _success "端口已改为 ${newport}(直连模式, 标签已同步更新)"
     fi
-    # 派生缓存同步失败不撤销已提交端口；如实告警并提示核对。
-    _sync_node_clash "$meta" "$old_name" || \
-        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
 }
 
 # _port_txn 在同锁域执行journal→metadata→config，失败还原metadata；config由 _mutate_config 恢复。
@@ -5350,9 +5103,7 @@ _modify_port() {
         if ! _port_txn "$tag" "$meta" "$newport" "$newmeta" "$oldport"; then
             _press_any_key; return 1
         fi
-        # 链接已随 metadata 一次提交; 这里补 clash 派生缓存(传 old_name: 改名后必须删掉旧名
-        # 条目, 否则 clash.yaml 残留指向旧端口的幽灵条目)
-        _hy2_sync_derived "$meta" "$old_name" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+        _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
         _success "端口已改为 ${newport}"
         _press_any_key
         return 0
@@ -5390,9 +5141,6 @@ _modify_port() {
     if ! _port_txn "$tag" "$meta" "$newport" "$newmeta" "$oldport"; then
         _press_any_key; return 1
     fi
-    # config/metadata 已一致, 同步 clash 派生缓存(端口与名称都可能已变)
-    _sync_node_clash "$meta" "$old_name" || \
-        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
     _success "端口已改为 ${newport}"
     _press_any_key
 }
@@ -5513,7 +5261,7 @@ _update_listen() {
     esac
     [ -z "$newaddr" ] && newaddr="$oldaddr"
 
-    # 地址改写统一 _rewrite_link_addr；URI和Clash派生同步，失败保持权威状态。
+    # 地址改写统一 _rewrite_link_addr；失败时仅更新权威记录。
     local oldlink newlink
     oldlink=$(jq -r '.share_link' "$meta" 2>/dev/null)
     newlink=$(_rewrite_link_addr "$oldlink" "$newaddr")
@@ -5524,114 +5272,8 @@ _update_listen() {
         _press_any_key
         return 1
     fi
-    # 监听/链接地址变化需同步 clash 条目的 server 字段(失败只提示, 不回滚权威状态)
-    _sync_node_clash "$meta" || \
-        _tip "clash 派生缓存未同步(节点本体已生效), 可在 [查看节点] 里核对 ${CLASH_YAML}"
-
     _success "监听已更新为 ${newlisten}, 链接地址更新为 ${newaddr}"
     _press_any_key
-}
-
-# ---------------------------------------------------------------------------
-# clash.yaml 输出辅助(纯文本追加, 不用 jq —— jq 不能解析 yaml)
-# 用法:_add_node_to_yaml <yaml_node_line>   (传入的是一行 yaml 节点: - {name: ...})
-# ---------------------------------------------------------------------------
-CLASH_YAML="$DEPLOY_DIR/clash.yaml"
-
-_add_node_to_yaml() {
-    local line="$1" name="$2"
-    mkdir -p "$DEPLOY_DIR" || return 1
-    if [ ! -f "$CLASH_YAML" ]; then
-        printf 'proxies:\n' > "$CLASH_YAML" || return 1
-    fi
-    # name 由调用方显式传入, 不再从整行反解析 — 避免 YAML 转义/特殊字符
-    # 导致的"解析 name != 实际 name"(name 已是唯一性约束下的稳定身份)
-    if [ -n "$name" ]; then
-        _remove_node_from_yaml_by_name "$name" 2>/dev/null || \
-            _warn "Clash YAML 去重删除旧同名条目失败(${name}), 继续追加"
-    fi
-    if ! printf '  %s\n' "$line" >> "$CLASH_YAML"; then
-        _warn "Clash YAML 追加失败(节点已创建), 可手工编辑 ${CLASH_YAML} 补齐该行"
-        return 1
-    fi
-    return 0
-}
-
-_remove_node_from_yaml_by_name() {
-    local name="$1"
-    [ -f "$CLASH_YAML" ] || return 0
-    local tmp grc=0
-    # mktemp 失败显式报错
-    if ! tmp=$(mktemp); then
-        _error "无法创建临时 Clash YAML 文件"
-        return 1
-    fi
-    # Clash name固定字符串带闭合引号匹配；避免子串/正则误删。
-    local key; key=$(_yaml_dq "$name")
-    grep -vF "name: \"${key}\"" "$CLASH_YAML" > "$tmp" 2>/dev/null
-    grc=$?
-    # grep rc: 0=有选中行(已写入) 1=无选中行(节点不在, 合法) 2=读取/写入错误
-    if [ "$grc" -ge 2 ]; then
-        rm -f "$tmp"
-        _error "Clash YAML 读取/过滤失败(grep rc=$grc)"
-        return 1
-    fi
-    # 过滤结果为空(最后一个节点被删)时保留 proxies: 头, 避免 YAML 变成空文件
-    if [ ! -s "$tmp" ]; then
-        if ! printf 'proxies:\n' > "$tmp"; then
-            rm -f "$tmp"
-            _error "Clash YAML 写入失败"
-            return 1
-        fi
-    fi
-    if ! mv -f "$tmp" "$CLASH_YAML"; then
-        rm -f "$tmp"
-        _error "Clash YAML 替换失败"
-        return 1
-    fi
-    return 0
-}
-
-_remove_node_from_yaml_by_tag() {
-    local tag="$1" name
-    name=$(jq -r '.name' "$NODES_DIR/${tag}.json" 2>/dev/null)
-    # 读不到 name(如 json 已被删/损坏)视为删除失败, 由调用方决定取消或显式告警
-    [ -z "$name" ] && return 1
-    _remove_node_from_yaml_by_name "$name"
-}
-
-# 按精确name原位替换Clash条目；不存在则追加，避免更新生成重复代理。
-_replace_node_in_yaml() {
-    local line="$1" name="$2"
-    [ -f "$CLASH_YAML" ] || return 0
-    local key tmp
-    key=$(_yaml_dq "$name")
-    if ! tmp=$(mktemp); then
-        _error "无法创建临时 Clash YAML 文件"
-        return 1
-    fi
-    local replaced=0 l
-    # || [ -n "$l" ]: read 在 EOF 且末行无结尾换行时返回 1 但 $l 已含该行内容,
-    # 缺此守卫会把最后一行留在循环外 —— 替换中间条目时会随 mv 静默丢掉它
-    while IFS= read -r l || [ -n "$l" ]; do
-        if [ "$replaced" = 0 ] && printf '%s' "$l" | grep -qF "name: \"${key}\""; then
-            printf '  %s\n' "$line" >> "$tmp"
-            replaced=1
-        else
-            printf '%s\n' "$l" >> "$tmp"
-        fi
-    done < "$CLASH_YAML"
-    if [ "$replaced" = 0 ]; then
-        rm -f "$tmp"
-        _warn "Clash YAML 未找到节点 [${name}] 条目, 跳过替换"
-        return 0
-    fi
-    if ! mv -f "$tmp" "$CLASH_YAML"; then
-        rm -f "$tmp"
-        _error "Clash YAML 替换失败"
-        return 1
-    fi
-    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -5697,8 +5339,8 @@ _hy2_toggle_hop() {
                     _press_any_key; return
                 fi
                 _success "端口跳跃已禁用"
-                # 派生状态(链接 + clash)走唯一入口(去掉 mport / ports)
-                _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+                # 分享链接随 metadata 重建(去掉 mport)
+                _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
                 ;;
             *) _info "已取消" ;;
         esac
@@ -5741,8 +5383,8 @@ _hy2_toggle_hop() {
             _press_any_key; return
         fi
         _success "端口跳跃已启用: ${normalized} → ${port}"
-        # 派生状态(链接 + clash)走唯一入口(加入 mport / ports)
-        _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+        # 分享链接随 metadata 重建(加入 mport)
+        _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
         _tip "iptables DNAT 已生效, 客户端可连接范围内任意端口"
         _tip "请确保防火墙/安全组已放行该 UDP 端口范围"
     fi

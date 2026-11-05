@@ -48,7 +48,6 @@ CERT_DIR="$DEPLOY_DIR/certs"
 BIN_DIR="$DEPLOY_DIR/bin"
 LOG_DIR="$DEPLOY_DIR/log"
 GEO_LOG="$LOG_DIR/geo-update.log"
-CLASH_YAML="$DEPLOY_DIR/clash.yaml"
 XRAY_BIN="$BIN_DIR/xray"
 CF_BIN="$TMP/cloudflared"
 HYSTERIA_DATA_DIR="$DEPLOY_DIR/hysteria"
@@ -222,7 +221,6 @@ XH_PQ_MENU_OUT=$(
     _has_reality_nodes() { return 0; }
     clear() { :; }
     _reality_node_mode() { printf direct; }
-    _sync_node_clash() { return 0; }
     _press_any_key() { :; }
     _hy2_select_node() { shift; printf '%s' "${1:-}"; }
     _reality_domain_txn() { printf yes > "$XH_TXN_MARKER"; }
@@ -325,36 +323,6 @@ if (
     echo 2 | _geo_extra_delete
 ) >/dev/null 2>&1; then fail 'custom geodata delete rejects path traversal'; else pass 'custom geodata delete rejects path traversal'; fi
 check 'rejected delete keeps the outside file' test -f "$DEPLOY_DIR/evil.dat"
-
-printf '== clash lock ==\n'
-CLASH_PROBE_META="$TMP/clash-probe.json"
-CLASH_PROBE_STATE="$TMP/clash-probe-state"
-printf '{"name":"lock-probe"}\n' > "$CLASH_PROBE_META"
-_clash_lock_probe() {
-    local label="$1" rc
-    shift
-    CLASH_YAML="$TMP/clash-probe-${label}.yaml"
-    printf 'proxies:\n  - {name: "lock-probe", type: vless}\n' > "$CLASH_YAML"
-    : > "$CLASH_PROBE_STATE"
-    _probe_lock_state() {
-        local fd
-        command -v flock >/dev/null 2>&1 || { printf unknown; return 0; }
-        { exec {fd}>>"$(_deploy_lock_root)/config.lock"; } 2>/dev/null || { printf unknown; return 0; }
-        if flock -n "$fd" 2>/dev/null; then printf free; else printf held; fi
-        eval "exec ${fd}>&-" 2>/dev/null || :
-    }
-    _rebuild_clash_line() { printf '%s' '- {name: "lock-probe"}'; }
-    _hysteria_clash_line() { printf '%s' '- {name: "lock-probe"}'; }
-    _replace_node_in_yaml() { _probe_lock_state > "$CLASH_PROBE_STATE"; }
-    _add_node_to_yaml() { _probe_lock_state > "$CLASH_PROBE_STATE"; }
-    "$@" >/dev/null 2>&1 || rc=$?
-    case "$(cat "$CLASH_PROBE_STATE" 2>/dev/null):${rc:-0}" in
-        held:0|unknown:0) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-check 'Xray clash write holds the config lock' _clash_lock_probe xray _sync_node_clash "$CLASH_PROBE_META"
-check 'Hysteria clash write holds the config lock' _clash_lock_probe hysteria _hysteria_sync_clash "$CLASH_PROBE_META"
 
 printf '== child suites ==\n'
 for suite in test-node-alignment.sh test-outbound-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh \

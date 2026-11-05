@@ -17,7 +17,6 @@ trap 'rm -rf "${TMP:?}"' EXIT
     NODES_DIR="$DEPLOY_DIR/nodes"
     BACKUP_DIR="$DEPLOY_DIR/backups"
     STATE_DIR="$DEPLOY_DIR/state"
-    CLASH_YAML="$DEPLOY_DIR/clash.yaml"
     mkdir -p "$CONFIG_DIR" "$NODES_DIR" "$BACKUP_DIR" "$STATE_DIR"
     TAG=xd-hysteria2-443
     META="$NODES_DIR/$TAG.json"
@@ -80,7 +79,6 @@ trap 'rm -rf "${TMP:?}"' EXIT
             {tag: $t, protocol: "hysteria2", name: "fixture", port: 443,
              auth: "unchanged-auth", share_link: "old-link", custom: {keep: true},
              congestion: $cc, brutal_up: $up, brutal_down: $down}' > "$META" || exit 1
-        printf 'unchanged derived fixture\n' > "$CLASH_YAML"
         cp "$CONFIG_DIR/07_inbounds.json" "$TMP/before-inbounds.json"
         cp "$META" "$TMP/before-meta.json"
         : > "$TMP/writes"
@@ -192,7 +190,7 @@ trap 'rm -rf "${TMP:?}"' EXIT
     reset_snapshot_cleanup() (
         local dir="$TMP/reset-cleanup"
         DEPLOY_DIR="$dir" CONFIG_DIR="$dir/confs" NODES_DIR="$dir/nodes"
-        BACKUP_DIR="$dir/backups" STATE_DIR="$dir/state" CLASH_YAML="$dir/clash.yaml"
+        BACKUP_DIR="$dir/backups" STATE_DIR="$dir/state"
         XRAY_BIN="$dir/bin/xray"
         mkdir -p "$CONFIG_DIR" "$NODES_DIR" "$BACKUP_DIR" "$STATE_DIR"
         _config_write_merged '{"version":{"min":"26.4.25","max":""},"inbounds":[]}' >/dev/null 2>&1 || return 1

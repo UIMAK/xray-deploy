@@ -12,6 +12,7 @@ INSTALL_BIN="/usr/local/bin/${CMD_NAME}"
 DEPLOY_DIR="/opt/xray-deploy"
 INSTALL_LIB_DIR="$DEPLOY_DIR/lib"
 INSTALL_TPL_DIR="$DEPLOY_DIR/templates"
+INSTALL_SUPPORT_DIR="$DEPLOY_DIR/support"
 
 # 本次整版本备份目录；失败保留恢复源，见 _install_backup/_install_rollback。
 ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.$$"
@@ -44,12 +45,19 @@ need=()
 command -v curl  >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || need+=(curl)
 command -v jq    >/dev/null 2>&1 || need+=(jq)
 command -v unzip >/dev/null 2>&1 || need+=(unzip)
+command -v python3 >/dev/null 2>&1 || need+=(python3)
 if [ "${#need[@]}" -gt 0 ]; then
     if command -v apk >/dev/null 2>&1; then apk add --no-cache "${need[@]}" >/dev/null 2>&1
     elif command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq --no-install-recommends "${need[@]}" >/dev/null 2>&1
     fi
     for c in "${need[@]}"; do
-        command -v "$c" >/dev/null 2>&1 || echo "[警告] 依赖 $c 安装失败, 脚本将尝试继续(菜单启动时会再次尝试安装)"
+        if ! command -v "$c" >/dev/null 2>&1; then
+            if [ "$c" = "python3" ]; then
+                echo "[错误] 依赖 python3 安装失败; 分享链接解析依赖 Python 3"
+                exit 1
+            fi
+            echo "[警告] 依赖 $c 安装失败, 脚本将尝试继续(菜单启动时会再次尝试安装)"
+        fi
     done
 fi
 
@@ -104,6 +112,7 @@ _verify_installed() {
     for m in $TPL_NAMES; do
         [ -s "$INSTALL_TPL_DIR/${m}.server.jsonc" ] || bad="$bad templates/${m}.server.jsonc"
     done
+    [ -s "$INSTALL_SUPPORT_DIR/outbound_link.py" ] || bad="$bad support/outbound_link.py"
     [ -s "$DEPLOY_DIR/xray-deploy.sh" ] || bad="$bad xray-deploy.sh"
     if [ -n "$bad" ]; then
         echo "[错误] 安装后复核失败, 以下文件缺失或为空:${bad}"
@@ -120,6 +129,7 @@ _install_relpaths() {
     printf '%s\n' 'xray-deploy.sh' 'VERSION'
     for m in $LIB_MODULES; do printf 'lib/%s.sh\n' "$m"; done
     for t in $TPL_NAMES; do printf 'templates/%s.server.jsonc\n' "$t"; done
+    printf '%s\n' 'support/outbound_link.py'
 }
 
 # 快照内容比对与定向落盘分工不同：前者证明字节完整，后者保证 .KEEP 提交顺序。
@@ -214,6 +224,7 @@ _install_snapshot_rel_ok() {
             base="${rel#templates/}"
             [[ "$base" =~ ^[A-Za-z0-9_-]+\.server\.jsonc$ ]] || return 1
             ;;
+        support/outbound_link.py) ;;
         *) return 1 ;;
     esac
     return 0
@@ -253,6 +264,9 @@ _install_snapshot_read_entries() {
                 ;;
             templates/*)
                 [ ! -L "$d/templates" ] && [ ! -L "$DEPLOY_DIR/templates" ] || { exec 3<&-; return 1; }
+                ;;
+            support/*)
+                [ ! -L "$d/support" ] && [ ! -L "$DEPLOY_DIR/support" ] || { exec 3<&-; return 1; }
                 ;;
         esac
         case "$state" in
@@ -397,8 +411,8 @@ download_all() {
     # mktemp 失败立即中止；空 stage 会把目标拼接到文件系统根。
     local stage
     stage=$(mktemp -d) || { echo "[错误] 无法创建临时目录(/tmp 写满或只读?), 安装中止"; return 1; }
-    local stage_lib="$stage/lib" stage_tpl="$stage/templates"
-    mkdir -p "$stage_lib" "$stage_tpl"
+    local stage_lib="$stage/lib" stage_tpl="$stage/templates" stage_support="$stage/support"
+    mkdir -p "$stage_lib" "$stage_tpl" "$stage_support"
 
     echo "[信息] 下载主脚本..."
     if dl "${REMOTE_BASE}/xray-deploy.sh" "$stage/xray-deploy.sh"; then
@@ -434,6 +448,14 @@ download_all() {
         fi
     done
 
+    echo "[信息] 下载 Python 解析器..."
+    if dl "${REMOTE_BASE}/support/outbound_link.py" "$stage_support/outbound_link.py"; then
+        ok=$((ok+1))
+    else
+        echo "[错误] support/outbound_link.py 下载失败"
+        fail=$((fail+1))
+    fi
+
     echo "[信息] 下载完成: 成功 ${ok}, 失败 ${fail}"
     if [ "$fail" -gt 0 ]; then
         rm -rf "$stage"
@@ -442,7 +464,7 @@ download_all() {
     fi
 
     # 全量取件后执行整版本事务，见 _install_backup。
-    mkdir -p "$DEPLOY_DIR" "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR"
+    mkdir -p "$DEPLOY_DIR" "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR" "$INSTALL_SUPPORT_DIR"
     # 不在备份前删除 ROLLBACK_DIR；.KEEP 占用由 _install_backup 统一判定。
     _bk_rc=0
     _install_backup || _bk_rc=$?
@@ -475,6 +497,7 @@ download_all() {
     for t in $TPL_NAMES; do
         _install_file "$stage_tpl/${t}.server.jsonc" "$INSTALL_TPL_DIR/${t}.server.jsonc" || copy_ok=0
     done
+    _install_file "$stage_support/outbound_link.py" "$INSTALL_SUPPORT_DIR/outbound_link.py" || copy_ok=0
     rm -rf "$stage"
     # 落地/复核失败整体回滚；_install_rollback 报告未恢复路径。
     if [ "$copy_ok" -ne 1 ] || ! _verify_installed; then
@@ -654,7 +677,7 @@ fi
 
 # 首次安装
 echo "[信息] 正在安装 xray-deploy..."
-mkdir -p "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR"
+mkdir -p "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR" "$INSTALL_SUPPORT_DIR"
 
 # 本地源码须显式 --local 或 git 工作树才采用，避免自动信任任意同目录文件。
 LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
@@ -671,6 +694,10 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     done
     if [ -n "$tpl_missing" ]; then
         echo "[错误] 本地源 templates/ 缺少:${tpl_missing}"; exit 1
+    fi
+    if [ ! -s "${LOCAL_DIR}/support/outbound_link.py" ]; then
+        echo "[错误] 本地源缺少 support/outbound_link.py(或为空), 安装中止"
+        exit 1
     fi
     # VERSION 必须非空，且在备份前拒绝缺失，避免版本号残留。
     if [ ! -s "${LOCAL_DIR}/VERSION" ]; then
@@ -708,6 +735,7 @@ if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     for t in $TPL_NAMES; do
         _install_file "${LOCAL_DIR}/templates/${t}.server.jsonc" "$INSTALL_TPL_DIR/${t}.server.jsonc" || local_ok=0
     done
+    _install_file "${LOCAL_DIR}/support/outbound_link.py" "$INSTALL_SUPPORT_DIR/outbound_link.py" || local_ok=0
     if [ "$local_ok" -ne 1 ] || ! _verify_installed; then
         echo "[错误] 本地源落地/复核失败, 正在回滚到更新前状态..."
         # 回滚失败保留唯一恢复源，见 download_all。

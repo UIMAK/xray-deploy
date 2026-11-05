@@ -105,6 +105,7 @@ _ensure_base_deps() {
     command -v wget   >/dev/null 2>&1 || missing+=(wget)
     command -v jq     >/dev/null 2>&1 || missing+=(jq)
     command -v unzip  >/dev/null 2>&1 || missing+=(unzip)
+    command -v python3 >/dev/null 2>&1 || missing+=(python3)
     # tar/cron 通常自带,不强制
     if [ "${#missing[@]}" -gt 0 ]; then
         _pkg_install "${missing[@]}" || return 1

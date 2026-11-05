@@ -24,7 +24,6 @@ HYSTERIA_SERVER_META="$TMP/server.json"
 HYSTERIA_NODE_META="$TMP/node.json"
 HYSTERIA_CERT_DIR="$TMP/certs"
 HYSTERIA_ACME_DIR="$TMP/acme"
-CLASH_YAML="$TMP/clash.yaml"
 mkdir -p "$DEPLOY_DIR" "$BIN_DIR" "$LOG_DIR" "$HYSTERIA_DATA_DIR" "$HYSTERIA_BACKUP_DIR"
 _error() { printf '%s\n' "$*" >&2; }
 _warn() { printf '%s\n' "$*" >&2; }
@@ -49,30 +48,16 @@ set_sizes '{"minPacketSize":0,"maxPacketSize":0}'
 eq 'Gecko zero sizes use defaults' default "$(_hysteria_gecko_size_state)"
 eq 'Gecko defaults have no URI gap' '' "$(_hysteria_obfs_uri_gap)"
 check 'Gecko default URI exports' _hysteria_build_link "$HYSTERIA_NODE_META"
-line=$(_hysteria_clash_line "$HYSTERIA_NODE_META")
-check 'zero minimum exports effective YAML 512' contains 'obfs-min-packet-size: 512' "$line"
-check 'zero maximum exports effective YAML 1200' contains 'obfs-max-packet-size: 1200' "$line"
 for sizes in '{"minPacketSize":0,"maxPacketSize":1000}' '{"minPacketSize":256,"maxPacketSize":1024}'; do
     set_sizes "$sizes"
     eq "custom Gecko accepted $sizes" custom "$(_hysteria_gecko_size_state)"
     reject "custom Gecko URI rejected $sizes" _hysteria_build_link "$HYSTERIA_NODE_META"
-    # 自定义尺寸的意义在于 YAML 能表达它: 必须断言实际 min/max 落到 clash 行, 而非只看 rc。
-    line=$(_hysteria_clash_line "$HYSTERIA_NODE_META")
-    emin=$(jq -r '.obfs.gecko.minPacketSize // 0' "$HYSTERIA_CONFIG")
-    emax=$(jq -r '.obfs.gecko.maxPacketSize // 0' "$HYSTERIA_CONFIG")
-    [ "$emin" = 0 ] && emin=512
-    [ "$emax" = 0 ] && emax=1200
-    if contains "obfs-min-packet-size: $emin" "$line" && contains "obfs-max-packet-size: $emax" "$line"; then
-        pass "custom Gecko YAML exports sizes $sizes"
-    else
-        fail "custom Gecko YAML exports sizes $sizes (want min=$emin max=$emax)"
-    fi
+    check "custom Gecko reports URI gap $sizes" test -n "$(_hysteria_obfs_uri_gap)"
 done
 for sizes in '{"minPacketSize":512.5}' '{"minPacketSize":0,"maxPacketSize":511}'; do
     set_sizes "$sizes"
     eq "invalid Gecko rejected $sizes" invalid "$(_hysteria_gecko_size_state)"
     reject "invalid Gecko URI rejected $sizes" _hysteria_build_link "$HYSTERIA_NODE_META"
-    reject "invalid Gecko YAML rejected $sizes" _hysteria_clash_line "$HYSTERIA_NODE_META"
 done
 jq '.obfs.gecko = []' <<< "$base" > "$HYSTERIA_CONFIG"
 eq 'Gecko shape rejected' invalid "$(_hysteria_gecko_size_state)"
@@ -127,8 +112,6 @@ set_sizes '{}'
 uri=$(_hysteria_build_link "$HYSTERIA_NODE_META")
 check 'empty SNI URI uses connection host' contains '@connect.example.com:443/' "$uri"
 if contains 'sni=' "$uri"; then fail 'empty SNI URI omits override'; else pass 'empty SNI URI omits override'; fi
-line=$(_hysteria_clash_line "$HYSTERIA_NODE_META")
-if contains ', sni:' "$line"; then fail 'empty SNI YAML omits override'; else pass 'empty SNI YAML omits override'; fi
 eq 'single range accepted' '' "$(_hysteria_hop_reason '20000-30000')"
 reason=$(_hysteria_hop_reason '20000-30000,40000-50000')
 check 'multi-range warning identifies manager limitation' contains '本管理器' "$reason"

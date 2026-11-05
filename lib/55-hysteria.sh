@@ -1070,16 +1070,13 @@ _hysteria_node_txn_txn_wrapper() {
     fi
 }
 
-# auth/node 同一事务提交；clash 为派生缓存，失败不回滚权威状态。
+# auth/node 在同一事务提交；失败回滚权威状态。
 _hysteria_node_txn_locked() {
     local config_filter="$1" meta_file="$2" meta_op="$3" meta_content="${4:-}"; shift 4
     _hysteria_config_preflight || return 1
     _hysteria_txn_prologue || return 1
     local was_running="$_HY_TXN_WAS_RUNNING"
-    local meta_had=0 meta_bak="" node_name=""
-    if [ "$meta_op" = "delete" ] && [ -f "$meta_file" ]; then
-        node_name=$(jq -r '.name // empty' "$meta_file" 2>/dev/null)
-    fi
+    local meta_had=0 meta_bak=""
     if [ -f "$meta_file" ]; then
         meta_had=1
         meta_bak=$(mktemp "${meta_file}.bak.XXXXXX") || { _error "无法备份节点元数据"; return 1; }
@@ -1105,13 +1102,8 @@ _hysteria_node_txn_locked() {
                 _warn "节点元数据回滚失败, 保留备份 $meta_bak 并请人工核对 $meta_file"
                 return 1
             fi
-            _hysteria_sync_clash "$meta_file" || true
         else
-            if rm -f "$meta_file"; then
-                if [ -n "$node_name" ]; then
-                    _hysteria_remove_clash_by_name "$node_name" || true
-                fi
-            else
+            if ! rm -f "$meta_file"; then
                 _warn "节点元数据删除失败, 请人工核对 $meta_file"
                 rc=1
             fi
@@ -1194,13 +1186,6 @@ _hysteria_node_txn_locked() {
         fi
     fi
     rm -f "$meta_bak" 2>/dev/null
-    if [ "$meta_op" = "delete" ]; then
-        if [ -n "$node_name" ]; then
-            _hysteria_remove_clash_by_name "$node_name" || true
-        fi
-    else
-        _hysteria_sync_clash "$meta_file" || true
-    fi
     [ -n "$meta_bak" ] && { rm -f "$meta_bak" 2>/dev/null || _warn "临时备份清理失败: $meta_bak"; }
     return 0
 }
@@ -1670,18 +1655,17 @@ _hysteria_node_link() {
     printf '%s' "$link"
 }
 
-# URI 语义缺口不阻断节点操作；clash 是可重建缓存。
+# URI 语义缺口不阻断节点操作；仅提示链接不可生成。
 _hysteria_rebuild_all_links() {
     local gap
     gap=$(_hysteria_obfs_uri_gap)
     if [ -n "$gap" ]; then
-        _warn "分享链接不可生成: ${gap} (clash/mihomo 条目不受影响, 仍会同步)"
+        _warn "分享链接不可生成: ${gap}"
     fi
     [ -f "$HYSTERIA_NODE_META" ] || return 0
     if [ -z "$gap" ] && ! _hysteria_node_link "$HYSTERIA_NODE_META" >/dev/null; then
         _warn "分享链接派生失败(节点元数据缺字段?)"
     fi
-    _hysteria_sync_clash "$HYSTERIA_NODE_META" || return 1
     return 0
 }
 
@@ -1807,7 +1791,7 @@ _hysteria_obfs_menu() {
         case "$(_hysteria_gecko_size_state)" in
             custom)
                 echo -e "  ${YELLOW}注意: 当前 gecko 使用自定义分片尺寸($(_hysteria_gecko_size_desc)), 官方 URI 无法携带,${NC}"
-                echo -e "  ${YELLOW}分享链接将不生成(避免给出语义不完整的链接); clash/mihomo 条目会带该值${NC}"
+                echo -e "  ${YELLOW}分享链接将不生成(避免给出语义不完整的链接); 客户端需手工设置该尺寸${NC}"
                 ;;
             invalid)
                 echo -e "  ${RED}警告: 当前 gecko 分片尺寸非法($(_hysteria_gecko_size_desc)) ——${NC}"
@@ -1889,7 +1873,7 @@ _hysteria_bandwidth_menu() {
                     | if .bandwidth == {} then del(.bandwidth) else . end'; then
                 _error "带宽设置失败"
             else
-                _hysteria_rebuild_all_links || _warn "带宽已更新, 但 clash 派生条目同步失败"
+                _hysteria_rebuild_all_links
                 _success "带宽已更新: up=${up:-不限} down=${down:-不限}"
             fi
             ;;
@@ -1897,7 +1881,7 @@ _hysteria_bandwidth_menu() {
             if ! _hysteria_config_txn 'del(.bandwidth.up, .bandwidth.down) | if .bandwidth == {} then del(.bandwidth) else . end'; then
                 _error "清除失败"
             else
-                _hysteria_rebuild_all_links || _warn "带宽限制已清除, 但 clash 派生条目同步失败"
+                _hysteria_rebuild_all_links
                 _success "带宽限制已清除"
             fi
             ;;
@@ -2111,7 +2095,7 @@ _hysteria_gecko_size_desc() {
     _hysteria_gecko_size_get desc
 }
 
-# URI-Scheme 无 gecko 尺寸字段；自定义/非法尺寸拒绝 URI，合法自定义可导出 YAML。
+# URI-Scheme 无 gecko 尺寸字段；自定义/非法尺寸拒绝 URI，客户端需手工设置尺寸。
 _hysteria_obfs_uri_gap() {
     local o_type
     o_type=$(_hysteria_obfs_get type)
@@ -2195,7 +2179,7 @@ _hysteria_print_link() {
         if [ "$(_hysteria_gecko_size_state)" = "invalid" ]; then
             _tip "该尺寸下服务端根本无法启动, 请先按官方约束修正 $HYSTERIA_CONFIG 的 gecko 分片尺寸"
         else
-            _tip "官方 URI 无法表达 gecko 分片尺寸; 请使用 clash/mihomo 配置(可完整表达), 或在客户端手工设置相同尺寸"
+            _tip "官方 URI 无法表达 gecko 分片尺寸; 请在客户端手工设置相同尺寸"
         fi
         return 1
     fi
@@ -2205,91 +2189,7 @@ _hysteria_print_link() {
     return 0
 }
 
-# 非法尺寸拒绝 YAML，合法自定义尺寸完整透出；server up/down 对应 client down/up。
-_hysteria_clash_line() {
-    local meta="${1:-$HYSTERIA_NODE_META}" name addr auth
-    name=$(jq -r '.name // empty' "$meta" 2>/dev/null)
-    addr=$(jq -r '.link_addr // empty' "$meta" 2>/dev/null)
-    auth=$(jq -r '.auth // empty' "$meta" 2>/dev/null)
-    [ -n "$name" ] && [ -n "$addr" ] && [ -n "$auth" ] || {
-        _error "节点元数据缺少必要字段(name/link_addr/auth), 无法生成 clash 条目"
-        return 1
-    }
-    if [ "$(_hysteria_gecko_size_state)" = "invalid" ]; then
-        _error "检测到非法 gecko 分片尺寸($(_hysteria_gecko_size_desc)): 官方要求 min>=1、max>=min 且 max<=2048; 请先修正 $HYSTERIA_CONFIG"
-        return 1
-    fi
-    local o_type o_pw o_min o_max
-    o_type=$(_hysteria_obfs_get type)
-    if [ -n "$o_type" ]; then
-        case "$o_type" in
-            salamander|gecko) ;;
-            *)
-                _error "obfs 类型 \"$o_type\" 不受支持(官方接受 plain/salamander/gecko), 已拒绝生成 clash 条目; 请修正 $HYSTERIA_CONFIG"
-                return 1
-                ;;
-        esac
-    fi
-    local port_part
-    port_part=$(_hysteria_listen_port_part "$(_hysteria_config_get listen)") || return 1
-    local line
-    line="- {name: \"$(_yaml_dq "$name")\", type: hysteria2, server: \"$(_yaml_dq "$addr")\", port: ${port_part%%-*}, password: \"$(_yaml_dq "$auth")\""
-    local sni; sni=$(_hysteria_meta_get sni)
-    [ -n "$sni" ] && line="${line}, sni: \"$(_yaml_dq "$sni")\""
-    if [ "$(_hysteria_meta_get tls_mode)" = "selfsigned" ]; then
-        line="${line}, skip-cert-verify: true"
-    fi
-    if [ -n "$o_type" ]; then
-        o_pw=$(_hysteria_obfs_get password)
-        line="${line}, obfs: ${o_type}, obfs-password: \"$(_yaml_dq "$o_pw")\""
-        o_min=$(_hysteria_obfs_get min)
-        o_max=$(_hysteria_obfs_get max)
-        [ -n "$o_min" ] && line="${line}, obfs-min-packet-size: ${o_min}"
-        [ -n "$o_max" ] && line="${line}, obfs-max-packet-size: ${o_max}"
-    fi
-    local server_up server_down
-    server_up=$(jq -r '.bandwidth.up // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    server_down=$(jq -r '.bandwidth.down // empty' "$HYSTERIA_CONFIG" 2>/dev/null)
-    [ -n "$server_up" ] && line="${line}, down: \"$(_yaml_dq "$server_up")\""
-    [ -n "$server_down" ] && line="${line}, up: \"$(_yaml_dq "$server_down")\""
-    case "$port_part" in
-        *-*) line="${line}, ports: \"${port_part}\"" ;;
-    esac
-    printf '%s}' "$line"
-}
-
-# 共享 clash.yaml 读改写必须持 config lock；避免 Xray/官方节点相互覆盖。
-_hysteria_sync_clash() {
-    _with_config_lock _hysteria_sync_clash_locked "$@"
-}
-
-_hysteria_sync_clash_locked() {
-    local meta="$1" old_name="${2:-}" line name
-    line=$(_hysteria_clash_line "$meta") || { _warn "clash 条目生成失败, 可手工编辑 ${CLASH_YAML}"; return 1; }
-    name=$(jq -r '.name // empty' "$meta")
-    [ -n "$name" ] || return 1
-    if [ -n "$old_name" ] && [ "$old_name" != "$name" ]; then
-        _remove_node_from_yaml_by_name "$old_name" 2>/dev/null || true
-    fi
-    if [ -f "$CLASH_YAML" ] && grep -qF "name: \"$(_yaml_dq "$name")\"" "$CLASH_YAML" 2>/dev/null; then
-        _replace_node_in_yaml "$line" "$name" \
-            || { _warn "clash 条目替换失败(clash 为可再生派生缓存, 节点本体不受影响), 可手工编辑 ${CLASH_YAML}"; return 1; }
-    else
-        _add_node_to_yaml "$line" "$name" \
-            || { _warn "clash 条目追加失败(clash 为可再生派生缓存, 节点本体不受影响), 可手工编辑 ${CLASH_YAML}"; return 1; }
-    fi
-    return 0
-}
-
-_hysteria_remove_clash_by_name() {
-    local name="$1"
-    [ -n "$name" ] || return 0
-    _remove_node_from_yaml_by_name "$name" 2>/dev/null \
-        || { _warn "clash 条目删除失败(clash 为可再生派生缓存, 节点本体不受影响), 可手工编辑 ${CLASH_YAML}"; return 1; }
-    return 0
-}
-
-# 按共享节点名称判断冲突；只排除当前官方节点。
+# 按 Manager 节点名称判断冲突；当前官方节点也参与判重。
 _hysteria_name_taken() {
     local name="$1" n f
     if [ -f "$HYSTERIA_NODE_META" ]; then
@@ -2301,9 +2201,6 @@ _hysteria_name_taken() {
         n=$(jq -r '.name // empty' "$f" 2>/dev/null) || n=""
         [ -n "$n" ] && [ "$n" = "$name" ] && return 0
     done
-    if [ -f "$CLASH_YAML" ] && grep -qF "name: \"$(_yaml_dq "$name")\"" "$CLASH_YAML" 2>/dev/null; then
-        return 0
-    fi
     return 1
 }
 
@@ -2476,7 +2373,7 @@ _hysteria_bootstrap_locked() {
     node_name=$(jq -r '.name // empty' <<< "$node_meta_json" 2>/dev/null) || node_name=""
     [ -n "$node_name" ] || { _error "初始化节点名称无效"; return 1; }
     if _hysteria_name_taken "$node_name"; then
-        _error "锁内复核发现名称已存在于共享 Clash 空间: $node_name"
+        _error "锁内复核发现节点名称已被占用: $node_name"
         return 1
     fi
     server_bak=$(_hysteria_snapshot_file "$HYSTERIA_SERVER_META") || return 1
@@ -2583,7 +2480,6 @@ _hysteria_bootstrap_locked() {
     if [ -n "$stage" ]; then _hysteria_tls_pair_finish yes "$stage" || return 1; fi
     [ -z "$server_bak" ] || rm -f "$server_bak" 2>/dev/null || _warn "初始化快照清理失败: $server_bak"
     [ -z "$node_bak" ] || rm -f "$node_bak" 2>/dev/null || _warn "初始化快照清理失败: $node_bak"
-    _hysteria_sync_clash "$HYSTERIA_NODE_META" || true
     return 0
 }
 
@@ -2829,7 +2725,7 @@ _hysteria_adopt_node_locked() {
     node_name=$(jq -r '.name // empty' <<< "$meta_json" 2>/dev/null) || node_name=""
     [ -n "$node_name" ] || { _error "节点名称无效"; return 1; }
     if _hysteria_name_taken "$node_name"; then
-        _error "锁内复核发现名称已占用共享 Clash 空间: $node_name"
+        _error "锁内复核发现节点名称已被占用: $node_name"
         return 1
     fi
     if [ "$addr_need_save" -eq 1 ] && [ -n "$(_hysteria_meta_get link_addr)" ]; then
@@ -2853,9 +2749,8 @@ _hysteria_adopt_node_locked() {
     fi
     if [ "$addr_need_save" -eq 1 ]; then
         _hysteria_meta_set link_addr "$addr" \
-            || _warn "连接地址未同步到 server_meta(节点已创建, 连接地址已保存在节点元数据中, 不影响链接与 clash 条目)"
+            || _warn "连接地址未同步到 server_meta(节点已创建, 连接地址已保存在节点元数据中, 不影响分享链接)"
     fi
-    _hysteria_sync_clash "$HYSTERIA_NODE_META" || _warn "clash 条目同步失败(可手工编辑 ${CLASH_YAML})"
 }
 
 _hysteria_add_node() {
@@ -2874,7 +2769,7 @@ _hysteria_add_node() {
     fi
     if _hysteria_node_broken; then
         _warn "节点元数据已损坏(无法解析或缺少必要字段): $HYSTERIA_NODE_META"
-        _tip "重建不会改动服务器认证密码, 只重写 Manager 侧的节点记录/链接/clash 条目"
+        _tip "重建不会改动服务器认证密码, 只重写 Manager 侧的节点记录与分享链接"
         local ans_repair
         read -rp "  删除损坏的节点元数据并重建? [y/N]: " ans_repair
         case "$ans_repair" in
@@ -2939,7 +2834,7 @@ _hysteria_view_nodes() {
     local gap; gap=$(_hysteria_obfs_uri_gap)
     if [ -n "$gap" ]; then
         _warn "分享链接不可生成: ${gap}"
-        echo -e "  ${YELLOW}clash/mihomo 配置可完整表达该尺寸; 手工客户端请自行设置相同分片尺寸${NC}"
+        echo -e "  ${YELLOW}请在客户端手工设置相同的 gecko 分片尺寸${NC}"
     fi
     echo
     if _hysteria_node_broken; then
@@ -2977,22 +2872,14 @@ _hysteria_view_nodes() {
     return 0
 }
 
-# 停服→删 config→删 node→清 unit/clash；删 config 失败须保留 unit 以恢复原状态。
+# 停服→删 config→删 node→清 unit；删 config 失败须保留 unit 以恢复原状态。
 _hysteria_delete_node_locked() {
-    local name="" was_running
+    local was_running
     _hysteria_gate || return 1
     if ! _hysteria_config_exists; then
         _error "锁内复核发现服务器配置已不存在, 不执行删除"
         return 1
     fi
-    if _hysteria_node_file_present; then
-        if _hysteria_node_exists; then
-            name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
-        else
-            _warn "节点元数据已损坏(无法解析或缺少必要字段), 读不到节点名"
-        fi
-    fi
-    [ -n "$name" ] || _warn "无法确定原节点名称, 未能自动清理 clash 派生条目(如需清理请手工编辑 ${CLASH_YAML})"
     was_running=$(_hysteria_runtime_state) || return 1
     if ! _hysteria_stop_and_verify; then
         _error "服务未能停止或 supervisor 状态未知(进程/证据未清除), 已中止(配置未删除)"
@@ -3012,7 +2899,6 @@ _hysteria_delete_node_locked() {
     fi
     _hysteria_cleanup_service_units \
         || _warn "service 定义清理失败(配置已删除, 服务已停止): 残留 unit 可能在下次开机尝试启动并失败, 请按上方提示人工清理"
-    [ -n "$name" ] && { _hysteria_remove_clash_by_name "$name" || true; }
     _success "服务器配置已删除, 服务已停止(核心 binary 保留)"
 }
 
@@ -3033,7 +2919,6 @@ _hysteria_delete_node() {
             _warn "节点元数据已损坏(无法解析或缺少必要字段), 读不到节点名"
         fi
     fi
-    [ -n "$name" ] || _warn "无法确定原节点名称, 未能自动清理 clash 派生条目(如需清理请手工编辑 ${CLASH_YAML})"
     echo -e "  服务器: $(_hysteria_listen_display)  TLS: $(_hysteria_tls_desc)  状态: $(_manage_hysteria status 2>/dev/null)"
     if [ -n "$name" ]; then
         echo -e "  节点: ${GREEN}${name}${NC}"
@@ -3286,7 +3171,7 @@ _hysteria_uninstall() {
 
 # service 清理失败保留文件；避免 enabled unit 指向已删 binary/config。
 _hysteria_uninstall_locked() {
-    local f name
+    local f
     _hysteria_installed || [ -f "/etc/systemd/system/${HYSTERIA_SVC}.service" ] || [ -f "/etc/init.d/${HYSTERIA_SVC}" ] \
         || { _warn "官方 Hysteria2 已被其他会话移除"; return 0; }
     _hysteria_stop_and_verify || { _error "hysteria 进程未退出, 已中止卸载以避免孤儿进程(文件未删除), 请手动停止后重试"; _press_any_key; return 1; }
@@ -3302,10 +3187,6 @@ _hysteria_uninstall_locked() {
         case "$part" in
             *-*) _warn "该配置启用了端口跳跃: 若服务曾被强制杀死, 请人工核查 nft/iptables 是否残留重定向规则" ;;
         esac
-    fi
-    if [ -f "$HYSTERIA_NODE_META" ]; then
-        name=$(jq -r '.name // empty' "$HYSTERIA_NODE_META" 2>/dev/null)
-        [ -n "$name" ] && _hysteria_remove_clash_by_name "$name"
     fi
     rm -f "$HYSTERIA_BIN" "$HYSTERIA_CONFIG" "$HYSTERIA_SERVER_META" "$HYSTERIA_NODE_META" "$HYSTERIA_LOG_FILE" "$(_hysteria_logrotate_conf)"
     rm -rf "$HYSTERIA_DATA_DIR" "$HYSTERIA_CERT_DIR"

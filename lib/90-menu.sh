@@ -670,8 +670,8 @@ _reset_journal_quarantine() {   # <journal> <原因>
 }
 
 # prepared 文件恢复只用事务私有快照；重置前无配置则恢复无配置，见 _reset_config_snapshot_restore。
-_reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_config>
-    local stage="$1" nodes_moved="$2" clash_moved="$3" had_config="$4" ok=0 f content=""
+_reset_config_snapshot_restore() {   # <stage> <nodes_moved> <had_config>
+    local stage="$1" nodes_moved="$2" had_config="$3" ok=0 f content=""
     if [ "$had_config" -eq 1 ]; then
         if [ -z "${JQ_MERGE_OBJECTS:-}" ]; then
             _error "缺少合并常量, 配置回滚已中止"
@@ -704,15 +704,6 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <clash_moved> <had_
         elif ! mv "$stage/nodes" "$NODES_DIR" 2>/dev/null; then
             ok=1
         elif ! _reset_fsync_rename "$stage/nodes" "$NODES_DIR"; then
-            ok=1
-        fi
-    fi
-    if [ "$clash_moved" -eq 1 ]; then
-        if ! rm -f "$CLASH_YAML" 2>/dev/null; then
-            ok=1
-        elif ! mv "$stage/clash.yaml" "$CLASH_YAML" 2>/dev/null; then
-            ok=1
-        elif ! _reset_fsync_rename "$stage/clash.yaml" "$CLASH_YAML"; then
             ok=1
         fi
     fi
@@ -755,7 +746,7 @@ _reset_config_replay_hop_specs_locked() {   # <journal>
 
 # 回滚 + 清 journal(仅回滚完整时才清账本); 不完整则保留 journal 与快照供启动期重试。
 # 顺序: 先回补 iptables(读取 journal), 再还原文件, 最后删账本。
-_reset_config_abort_locked() {   # <stage> <nodes_moved> <clash_moved> <had_config>
+_reset_config_abort_locked() {   # <stage> <nodes_moved> <had_config>
     local stage="$1" journal
     journal=$(_reset_journal_path)
     if ! _reset_config_replay_hop_specs_locked "$journal"; then
@@ -807,7 +798,7 @@ _reset_config_recover() {
 }
 
 _reset_config_recover_locked() {
-    local journal snapshot phase had_config nodes_moved=0 clash_moved=0
+    local journal snapshot phase had_config nodes_moved=0
     journal=$(_reset_journal_path)
     snapshot=$(_reset_snapshot_path)
     if _reset_journal_quarantine_exists "$journal"; then
@@ -884,8 +875,7 @@ _reset_config_recover_locked() {
     # 再还原文件；快照已消失不重复恢复，绝不猜 lastbak。
     if [ -d "$snapshot" ]; then
         [ -d "$snapshot/nodes" ] && nodes_moved=1
-        [ -f "$snapshot/clash.yaml" ] && clash_moved=1
-        if ! _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"; then
+        if ! _reset_config_snapshot_restore "$snapshot" "$nodes_moved" "$had_config"; then
             _warn "上次 reset 崩溃后的回滚不完整, 快照与 journal 保留供重试: $snapshot"
             return 1
         fi
@@ -899,7 +889,7 @@ _reset_config_recover_locked() {
 }
 
 _reset_config_locked() {
-    local had_config=0 nodes_moved=0 clash_moved=0 snapshot journal had_json
+    local had_config=0 nodes_moved=0 snapshot journal had_json
     snapshot=$(_reset_snapshot_path)
     journal=$(_reset_journal_path)
     # 先收敛上一次崩溃的 reset(同锁内); 收敛失败(损坏/schema 非法/回滚不完整)时拒绝开新事务。
@@ -983,78 +973,52 @@ _reset_config_locked() {
     # 先清 hop 再删 config/metadata；失败按 journal 幂等回补，见 _reset_config_abort_locked。
     if ! _hy2_cleanup_all_hops; then
         _error "端口跳跃规则清理失败, 正在回滚本次重置"
-        _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
+        _reset_config_abort_locked "$snapshot" 0 "$had_config"
         return 1
     fi
     if [ -d "$NODES_DIR" ]; then
         # mv 成功才置 nodes_moved，失败不可恢复不存在的副本。
         if ! mv "$NODES_DIR" "$snapshot/nodes" 2>/dev/null; then
             _error "无法准备节点 metadata 恢复快照, 已取消重置以保护现有数据"
-            _reset_config_abort_locked "$snapshot" 0 0 "$had_config"
+            _reset_config_abort_locked "$snapshot" 0 "$had_config"
             return 1
         fi
         nodes_moved=1
         if ! _reset_fsync_rename "$NODES_DIR" "$snapshot/nodes"; then
             _error "节点 metadata 快照移动未能持久化, 正在恢复重置前的快照"
-            _reset_config_abort_locked "$snapshot" 1 0 "$had_config"
+            _reset_config_abort_locked "$snapshot" 1 "$had_config"
             return 1
         fi
         if ! mkdir -p "$NODES_DIR" 2>/dev/null; then
             _error "无法重建节点 metadata 目录, 正在恢复重置前的快照"
-            _reset_config_abort_locked "$snapshot" 1 0 "$had_config"
+            _reset_config_abort_locked "$snapshot" 1 "$had_config"
             return 1
         fi
         if ! _reset_fsync_required "$NODES_DIR" || ! _reset_fsync_required "$(dirname "$NODES_DIR")"; then
             _error "新建节点 metadata 目录未能持久化, 正在恢复重置前的快照"
-            _reset_config_abort_locked "$snapshot" 1 0 "$had_config"
-            return 1
-        fi
-    fi
-    if [ -f "$CLASH_YAML" ]; then
-        if ! mv "$CLASH_YAML" "$snapshot/clash.yaml" 2>/dev/null; then
-            _error "无法准备 clash 恢复快照, 已取消重置以保护现有数据"
-            _reset_config_abort_locked "$snapshot" "$nodes_moved" 0 "$had_config"
-            return 1
-        fi
-        clash_moved=1
-        if ! _reset_fsync_rename "$CLASH_YAML" "$snapshot/clash.yaml"; then
-            _error "clash 恢复快照移动未能持久化, 正在恢复重置前的快照"
-            _reset_config_abort_locked "$snapshot" "$nodes_moved" 1 "$had_config"
+            _reset_config_abort_locked "$snapshot" 1 "$had_config"
             return 1
         fi
     fi
     # 清 confs 后重建；失败从事务快照回滚，不完整保留 journal。
     if ! rm -rf "$CONFIG_DIR" 2>/dev/null; then
         _error "无法删除旧配置目录, 已取消重置以保护现有数据"
-        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$had_config"
         return 1
     fi
     if ! _reset_fsync_required "$DEPLOY_DIR"; then
         _error "旧配置目录删除未能持久化, 正在恢复重置前的快照"
-        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$had_config"
         return 1
     fi
     if ! _init_config_if_empty; then
         _error "重建默认配置失败(只读/磁盘空间/jq 异常?), 正在回滚到重置前的配置"
-        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$had_config"
         return 1
     fi
     if ! _reset_fsync_required "$CONFIG_DIR" || ! _reset_fsync_required "$DEPLOY_DIR"; then
         _error "新配置未能持久化, 正在恢复重置前的快照"
-        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
-        return 1
-    fi
-    # 配置已确认重建成功; live metadata 目录已经是空目录, clash 重新落地也必须成功。
-    if [ "$clash_moved" -eq 1 ] && \
-       { ! printf 'proxies:\n' > "$CLASH_YAML" 2>/dev/null || [ ! -s "$CLASH_YAML" ]; }; then
-        _error "清空 clash 派生配置失败, 正在回滚重置"
-        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
-        return 1
-    fi
-    if [ "$clash_moved" -eq 1 ] && \
-       { ! _reset_fsync_required "$CLASH_YAML" || ! _reset_fsync_required "$(dirname "$CLASH_YAML")"; }; then
-        _error "空 clash 配置未能持久化, 正在恢复重置前的快照"
-        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$clash_moved" "$had_config"
+        _reset_config_abort_locked "$snapshot" "$nodes_moved" "$had_config"
         return 1
     fi
     # committed durable 后不回滚；恢复先收敛运行态，再进入清理。
@@ -1483,7 +1447,7 @@ _hy2_congestion_txn_locked() {
             ;;
         *) _error "未知 Hy2 拥塞事务: $operation"; return 1 ;;
     esac
-    _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+    _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
     return 0
 }
 
@@ -1694,7 +1658,7 @@ _hy2_obfs_txn_locked() {
                 --arg t "$otype" --arg p "$opw" --arg s "$osize"; then
                 _error "混淆元数据写入失败, 正在回滚实际配置快照"
             else
-                _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+                _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
                 return 0
             fi
             ;;
@@ -1702,7 +1666,7 @@ _hy2_obfs_txn_locked() {
             if ! _meta_update "$meta" 'del(.obfs_type) | del(.obfs_password) | del(.obfs_packet_size)'; then
                 _error "混淆元数据写入失败, 正在回滚实际配置快照"
             else
-                _hy2_sync_derived "$meta" || _warn "派生状态有未完成项(原因见上方告警), 请核对 ${meta} 与 ${CLASH_YAML}"
+                _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
                 return 0
             fi
             ;;
@@ -1785,7 +1749,7 @@ _hy2_obfs_menu() {
                 osize="${osize:-512-1200}"
                 local size_why; size_why=$(_hy2_obfs_size_invalid "$osize")
                 [ -n "$size_why" ] && { _error "packetSize 非法: ${size_why}"; _press_any_key; return; }
-                # 规范化(排序 + 去前导零)后回写, 使元数据/clash 与 Xray 看到同一区间
+                # 规范化(排序 + 去前导零)后回写, 使元数据与 Xray 看到同一区间
                 osize=$(_hy2_obfs_size_canon "$osize") || { _error "packetSize 规范化失败"; _press_any_key; return; }
             fi
             omask=$(_hy2_obfs_mask_block "$otype" "$opw" "$osize") || { _error "混淆参数构造失败"; _press_any_key; return; }
@@ -2071,12 +2035,6 @@ _reality_domain_menu() {
     result_mode=$(_reality_node_mode "$tag")
     newlink=$(jq -r '.share_link // empty' "$meta" 2>/dev/null)
     [ -n "$newlink" ] || _warn "未能读回新分享链接, 请用 [查看节点] 查看: $meta"
-    # clash 是派生缓存；同步失败告警，不回滚已一致权威态。
-    if ! _sync_node_clash "$meta"; then
-        _warn "clash 派生缓存同步失败, 订阅里的条目仍是旧伪装域名"
-        _tip "可重新执行一次本操作, 或删除后重建该节点以重建 clash 条目"
-    fi
-
     _success "Reality 域名已切换为: ${new_sni}"
     if [ "$result_mode" = "direct" ]; then
         actual_target=$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .streamSettings.realitySettings.target // empty' 2>/dev/null)

@@ -22,7 +22,6 @@ contains() { [[ "$1" == *"$2"* ]]; }
 lacks() { ! contains "$1" "$2"; }
 _info() { :; }; _tip() { :; }; _success() { :; }; _warn() { :; }; _error() { printf '%s\n' "$*" >> "$TMP/errors"; }
 _url_encode() { jq -rn --arg v "$1" '$v | @uri'; }
-_yaml_dq() { local v; v=$(jq -rn --arg v "$1" '$v | @json'); printf '%s' "${v:1:${#v}-2}"; }
 actual_config_jq=$(declare -f _config_jq)
 _config_jq() { printf call >> "$TMP/preflight"; return 1; }
 _ensure_unique_name() { return 0; }
@@ -47,7 +46,6 @@ multi_delete_routing() (
     printf '{"tag":"node-1","name":"n","protocol":"vless-tcp-reality-vision","tunnel_tag":"tun-a"}' > "$NODES_DIR/node-1.json"
     _hy2_hop_teardown_all() { return 0; }
     _hy2_filter_skipped() { _HY2_DEL_KEEP=("$@"); }
-    _remove_node_from_yaml_by_tag() { return 0; }
     _reality_tunnel_has_surviving_refs() { return 1; }
     local id; id=$(_node_identity node-1) || exit 1
     _delete_node_apply_multi node-1 "$id" >/dev/null 2>&1 || exit 1
@@ -85,19 +83,14 @@ check 'new auth survives real transaction' jq -e '.settings.clients[0].auth == "
 check 'server direction preserved in config' jq -e '.streamSettings.finalmask.quicParams | .brutalUp == "80 mbps" and .brutalDown == "20 mbps"' "$TMP/inbound.json"
 check 'server direction preserved in metadata' jq -e '.brutal_up == "80 mbps" and .brutal_down == "20 mbps"' "$TMP/committed.json"
 link=$(_rebuild_hy2_link "$TMP/committed.json")
-line=$(_hy2_clash_line "$TMP/committed.json")
 check 'URI client upload is server download' contains "$link" '&up=20%20mbps'
 check 'URI client download is server upload' contains "$link" '&down=80%20mbps'
-check 'Clash client upload is server download' contains "$line" 'up: "20 mbps"'
-check 'Clash client download is server upload' contains "$line" 'down: "80 mbps"'
 rc=0
 _commit_hy2_node_txn_locked hy2-test node server 443 0.0.0.0 secret sni false '' brutal '' '' '' '' '' /fixture/cert.pem /fixture/key.pem || rc=$?
 check 'ordinary brutal empty bandwidth remains accepted' eq "$rc" 0
 check 'ordinary brutal empty omits both fields' jq -e '.streamSettings.finalmask.quicParams | has("brutalUp") or has("brutalDown") | not' "$TMP/inbound.json"
 link=$(_rebuild_hy2_link "$TMP/committed.json")
-line=$(_hy2_clash_line "$TMP/committed.json")
 check 'ordinary brutal URI empty omits upload' lacks "$link" '&up='
-check 'ordinary brutal Clash empty omits upload' lacks "$line" ', up:'
 
 # Exercise both directions through creation, with an existing byte snapshot to protect.
 creation_fixture() {
@@ -145,13 +138,11 @@ done
 # Both CDN transports preserve existing Firefox and default absent fp to Chrome.
 for proto in vless-xhttp-cdn vless-ws-cdn; do
     jq -n --arg p "$proto" '{protocol:$p,name:"cdn",link_addr:"edge",port:443,uuid:"id",host:"site.example",path:"/path",fp:"firefox"}' > "$TMP/cdn.json"
-    link=$(_rebuild_cdn_link "$TMP/cdn.json"); line=$(_rebuild_clash_line "$TMP/cdn.json")
+    link=$(_rebuild_cdn_link "$TMP/cdn.json")
     check "$proto URI preserves Firefox" contains "$link" '&fp=firefox&'
-    check "$proto Clash preserves Firefox" contains "$line" '"client-fingerprint": "firefox"'
     jq 'del(.fp)' "$TMP/cdn.json" > "$TMP/default.json"
-    link=$(_rebuild_cdn_link "$TMP/default.json"); line=$(_rebuild_clash_line "$TMP/default.json")
+    link=$(_rebuild_cdn_link "$TMP/default.json")
     check "$proto URI defaults Chrome" contains "$link" '&fp=chrome&'
-    check "$proto Clash defaults Chrome" contains "$line" '"client-fingerprint": "chrome"'
 done
 
 # 缺必填字段时重建必须失败: 调用方据此保留旧 share_link, 不能写出连不通的链接。
@@ -196,7 +187,7 @@ _warn() { printf '%s\n' "$*" >> "$TMP/warnings"; }
 reality_fixture() {
     local dir="$1" shared="$2" addr_key="$3" peer_host="${4:-127.0.0.1}"
     DEPLOY_DIR="$TMP/$dir" CONFIG_DIR="$TMP/$dir/confs" NODES_DIR="$TMP/$dir/nodes"
-    BACKUP_DIR="$TMP/$dir/backup" CLASH_YAML="$TMP/$dir/clash.yaml"
+    BACKUP_DIR="$TMP/$dir/backup"
     mkdir -p "$CONFIG_DIR" "$NODES_DIR"
     jq -n --arg key "$addr_key" --arg peer "$peer_host:10443" --argjson shared "$shared" '
         {version:{min:"26.4.25",max:""},inbounds:([
@@ -264,34 +255,28 @@ for committed in false true; do
     check "shared recovery committed=$committed preserves tunnel" _config_jq -e '.inbounds[1].tag == "tunnel-site-10443-443" and .routing.rules[0].inboundTag == ["tunnel-site-10443-443"] and .inbounds[2].port == 9443'
 done
 
-# Missing congestion makes the real URI builder fail while the real Clash builder still succeeds.
-DEPLOY_DIR="$TMP/derived" CLASH_YAML="$TMP/derived/clash.yaml"
+# Missing congestion makes the real URI builder fail without writing a partial link.
+DEPLOY_DIR="$TMP/derived"
 mkdir -p "$DEPLOY_DIR"
 hy2_derived_fixture() {
     jq -n '{tag:"hy2-test",protocol:"hysteria2",name:"hy2-new",auth:"secret",link_addr:"edge.example",port:443,sni:"site.example",congestion:"bbr",share_link:"old-link"}' > "$DEPLOY_DIR/meta.json"
-    printf 'proxies:\n  - {name: "hy2-old", type: hysteria2, server: "old", port: 443}\n' > "$CLASH_YAML"
     : > "$TMP/warnings"
 }
 hy2_derived_fixture
 _meta_update "$DEPLOY_DIR/meta.json" 'del(.congestion)' || exit 1
-rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" hy2-old || rc=$?
-check 'Hy2 URI failure with Clash success returns nonzero' eq "$rc" 1
+rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?
+check 'Hy2 URI failure returns nonzero' eq "$rc" 1
 check 'Hy2 URI failure preserves old link' jq -e '.share_link == "old-link"' "$DEPLOY_DIR/meta.json"
-check 'Hy2 URI failure still updates Clash' grep -qF 'name: "hy2-new"' "$CLASH_YAML"
-check 'Hy2 URI failure removes old Clash name' lacks "$(cat "$CLASH_YAML")" 'name: "hy2-old"'
 check 'Hy2 URI failure reports link warning' grep -qF '分享链接重建失败' "$TMP/warnings"
 hy2_derived_fixture
 _meta_update "$DEPLOY_DIR/meta.json" '.obfs_type="salamander" | .obfs_password="obfs" | .obfs_packet_size="800-1000"' || exit 1
-rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" hy2-old || rc=$?
+rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?
 check 'Hy2 custom Gecko unexpressible succeeds' eq "$rc" 0
 check 'Hy2 custom Gecko clears old link' jq -e '.share_link == ""' "$DEPLOY_DIR/meta.json"
-check 'Hy2 custom Gecko still exports full Clash dimensions' contains "$(cat "$CLASH_YAML")" 'obfs: gecko, obfs-password: "obfs", obfs-min-packet-size: 800, obfs-max-packet-size: 1000'
 hy2_derived_fixture
-rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" hy2-old || rc=$?
+rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?
 check 'Hy2 normal derived sync succeeds' eq "$rc" 0
 check 'Hy2 normal derived sync rebuilds link' jq -e '.share_link | startswith("hy2://") and contains("@edge.example:443/")' "$DEPLOY_DIR/meta.json"
-check 'Hy2 normal derived sync updates Clash' grep -qF 'name: "hy2-new"' "$CLASH_YAML"
-check 'Hy2 normal derived sync removes old name' lacks "$(cat "$CLASH_YAML")" 'name: "hy2-old"'
 
 # Invoke the real PQ decision using deterministic local command output.
 XRAY_BIN="$TMP/xray"
@@ -599,12 +584,10 @@ metadata_unlink_failure_probe() (
     local d="$TMP/metadata-unlink-failure" tag=meta-fail
     mkdir -p "$d/nodes" || return 1
     NODES_DIR="$d/nodes"
-    CLASH_YAML="$d/clash.yaml"
     printf '%s\n' '{"tag":"meta-fail","protocol":"vless","name":"meta-fail"}' > "$NODES_DIR/$tag.json" || return 1
     _node_identity() { printf 'identity'; }
     _node_protocol_safe() { printf 'vless'; }
     _mutate_config() { return 0; }
-    _remove_node_from_yaml_by_tag() { return 0; }
     _hy2_purge_self_certs() { :; }
     _HY2_HOP_TD=()
     rm() {
