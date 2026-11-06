@@ -1262,11 +1262,12 @@ def parse_socks(link):
     username = ""
     password = ""
     if url["userinfo"]:
-        userinfo = percent_decode(url["userinfo"])
-        if ":" in userinfo:
-            username, password = userinfo.split(":", 1)
+        if ":" in url["userinfo"]:
+            raw_username, raw_password = url["userinfo"].split(":", 1)
+            username = percent_decode(raw_username)
+            password = percent_decode(raw_password)
         else:
-            decoded = base64_decode(userinfo)
+            decoded = base64_decode(url["userinfo"])
             if decoded is None:
                 fail("SOCKS 认证 Base64 无效")
             try:
