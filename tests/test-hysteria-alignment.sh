@@ -273,6 +273,34 @@ hysteria_restart_requires_readable_identity() (
 )
 check 'hysteria restart fails closed when identity is unreadable' hysteria_restart_requires_readable_identity
 
+hysteria_force_stop_probe() (
+    local marker="$1" allow="$2"
+    INIT_SYSTEM=systemd
+    HYSTERIA_BIN="$TMP/hysteria-bin"
+    : > "$marker"
+    sleep() { :; }
+    _manage_hysteria() { return 0; }
+    _hysteria_stopped_state() { return 1; }
+    _proc_exe_is_strict() {
+        printf 'strict\n' >> "$marker"
+        [ "$allow" = 1 ]
+    }
+    kill() { printf 'kill\n' >> "$marker"; return 0; }
+    _hysteria_stop_and_verify >/dev/null 2>&1
+)
+hysteria_force_stop_uses_strict_exe_ownership() {
+    local marker="$TMP/hy-force-stop"
+    hysteria_force_stop_probe "$marker" 1
+    awk '
+        /^strict$/ { strict = 1; next }
+        /^kill$/ { seen = 1; exit strict ? 0 : 1 }
+        END { if (!seen) exit 1 }
+    ' "$marker" || return 1
+    hysteria_force_stop_probe "$marker.deny" 0
+    grep -q '^strict$' "$marker.deny" && ! grep -q '^kill$' "$marker.deny"
+}
+check 'force stop confirms exe ownership before signalling' hysteria_force_stop_uses_strict_exe_ownership
+
 hysteria_password_eof_probe() (
     local meta="$TMP/eof-password-node.json"
     mkdir -p "$TMP/eof-password-data" || return 1
