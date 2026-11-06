@@ -1685,8 +1685,9 @@ _hysteria_listen_ranges() {
 }
 
 # 新跳跃区间覆盖其它 UDP 监听端口时同样会静默劫持。
-# Xray 入站按 config 事实枚举(与官方 Hysteria 的跳跃冲突检查同口径), 官方服务监听单独取;
-# 只信 metadata 会漏掉官方 Hysteria 与手改的入站配置。
+# 判据: Xray 入站按 config 事实枚举(与官方 Hysteria 的跳跃冲突检查同口径), 官方服务监听单独取;
+# 其它节点已启用的跳跃区间从 metadata 取(区间只存在于元数据, config 看不到)。
+# 只信 metadata 会漏掉官方 Hysteria 与手改的入站配置, 只看 config 会漏掉他人 hop 区间。
 # 用法:_range_hits_other_udp <start> <end> [exclude_tag]; 0=冲突。
 _range_hits_other_udp() {
     local s="$1" e="$2" exclude="${3:-}" self_port="" p_start p_end
@@ -1704,6 +1705,26 @@ _range_hits_other_udp() {
         [ -n "$p_start" ] && [ -n "$p_end" ] || continue
         [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] && return 0
     done < <(_hysteria_listen_ranges)
+    # 两条 PREROUTING DNAT 抢同一目的端口时先命中者生效, 他人已有区间必须拒绝。
+    local f tag ranges tok hs he
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        tag=$(basename "$f" .json)
+        [ "$tag" = "$exclude" ] && continue
+        ranges=$(_read_hop_ranges "$f" 2>/dev/null) || continue
+        [ -n "$ranges" ] || continue
+        # shellcheck disable=SC2086  # 空格分隔的 range 列表需要分词
+        for tok in $ranges; do
+            if [[ "$tok" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                hs="${BASH_REMATCH[1]}"; he="${BASH_REMATCH[2]}"
+            elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+                hs="$tok"; he="$tok"
+            else
+                continue
+            fi
+            [ "$hs" -le "$e" ] && [ "$he" -ge "$s" ] && return 0
+        done
+    done
     return 1
 }
 

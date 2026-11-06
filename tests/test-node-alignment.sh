@@ -98,6 +98,17 @@ udp_range_conflict_probe() (
     printf '{"listen":":9"}' > "$HYSTERIA_CONFIG"
     _hysteria_xray_udp_port_ranges() { printf '41000:41000\n'; }
     _range_hits_other_udp 40000 42000 xd-hy2-41000 && return 1
+    # 其它节点已启用的跳跃区间与本区间重叠也要拒绝(两条 DNAT 抢同一目的端口)。
+    printf '{"tag":"xd-hy2-20000","protocol":"hysteria2","port":20000,"hop_ranges":"20000-50000"}' \
+        > "$NODES_DIR/xd-hy2-20000.json"
+    _hysteria_xray_udp_port_ranges() { :; }
+    _range_hits_other_udp 45000 46000 xd-hy2-41000 || return 1
+    _range_hits_other_udp 51000 52000 xd-hy2-41000 && return 1
+    # 自身已有的跳跃区间不算冲突(改区间/重开跳跃时复用同一范围)。
+    rm -f "$NODES_DIR/xd-hy2-20000.json"
+    printf '{"tag":"xd-hy2-41000","protocol":"hysteria2","port":41000,"hop_ranges":"40000-42000"}' \
+        > "$NODES_DIR/xd-hy2-41000.json"
+    _range_hits_other_udp 40000 42000 xd-hy2-41000 && return 1
     return 0
 )
 check 'hop range conflict covers config UDP inbounds and official listen forms' udp_range_conflict_probe
