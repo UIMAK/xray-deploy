@@ -448,7 +448,6 @@ download_all() {
         fi
     done
 
-    echo "[信息] 下载 Python 解析器..."
     if dl "${REMOTE_BASE}/support/outbound_link.py" "$stage_support/outbound_link.py"; then
         ok=$((ok+1))
     else
