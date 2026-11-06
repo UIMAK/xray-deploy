@@ -180,5 +180,68 @@ geo_name_checks() {
 setup_case geo-names
 check 'custom geodata names require .dat and reject .gz sources' geo_name_checks
 
+# busybox 的 crontab -l 是没有 crontab 文件时输出 can't open ... ENOENT, 不是 no crontab;
+# 只有"确实没有"才算空态, 权限错误必须继续 fail-closed。
+crontab_empty_state() (
+    crontab() {
+        case "${1:-}" in
+            -l) printf "crontab: can't open 'root': No such file or directory\n" >&2; return 1 ;;
+            *) return 0 ;;
+        esac
+    }
+    local out
+    out=$(_crontab_read 2>/dev/null) || return 1
+    [ -z "$out" ] || return 1
+    # crontabs 目录缺失时 busybox 报 can't cd to, 同样属于"确实没有"。
+    crontab() {
+        printf "crontab: can't cd to /var/spool/cron/crontabs: No such file or directory\n" >&2
+        return 1
+    }
+    out=$(_crontab_read 2>/dev/null) || return 1
+    [ -z "$out" ]
+)
+check 'busybox missing crontab is treated as empty state' crontab_empty_state
+
+crontab_permission_still_fails() (
+    crontab() { printf "crontab: can't open 'root': Permission denied\n" >&2; return 1; }
+    ! _crontab_read >/dev/null 2>&1 || return 1
+    # busybox 在 crontabs 目录不可读时走 can't cd to, 同样不能当空态。
+    crontab() { printf "crontab: can't cd to /var/spool/cron/crontabs: Permission denied\n" >&2; return 1; }
+    ! _crontab_read >/dev/null 2>&1
+)
+check 'busybox permission denied still fails closed' crontab_permission_still_fails
+
+# 空 lastbak 必须在调用 jq 前判空: 无匹配 glob 会把 pattern 当片段送去校验, 报错也会指错文件。
+restore_empty_lastbak() (
+    rm -rf "$BACKUP_DIR/confs.lastbak"
+    mkdir -p "$BACKUP_DIR/confs.lastbak"
+    rm -f "$TMP/jq-called"
+    jq() { : > "$TMP/jq-called"; return 1; }
+    _restore_config >/dev/null 2>&1 && return 1
+    [ ! -e "$TMP/jq-called" ]
+)
+setup_case restore-empty
+check 'empty lastbak fails before invoking jq on stdin' restore_empty_lastbak
+
+# Xray 的 StringList 同时接受数组与逗号串; 标量 Geo 引用必须计入统计与精简范围。
+geo_scalar_reference() (
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        dns:{servers:[{address:"1.1.1.1",domains:"geosite:google"}]},
+        routing:{rules:[
+            {type:"field",domain:"geosite:cn",outboundTag:"block"},
+            {type:"field",ip:["geoip:private"],outboundTag:"block"},
+            {type:"field",domain:["example.com"],inboundTag:["node-a"],outboundTag:"direct"}
+        ]}}')" || return 1
+    local stats
+    stats=$(_route_rules_stats) || return 1
+    [ "$(printf '%s' "$stats" | cut -d' ' -f1)" = "3" ] || return 1
+    [ "$(printf '%s' "$stats" | cut -d' ' -f2)" = "2" ] || return 1
+    [ "$(printf '%s' "$stats" | cut -d' ' -f3)" = "1" ] || return 1
+    [ "$(_route_dns_geo_count)" = "1" ]
+)
+setup_case geo-scalar
+check 'scalar StringList Geo references are counted' geo_scalar_reference
+
 printf 'common regressions passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

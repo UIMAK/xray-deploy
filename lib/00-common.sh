@@ -752,9 +752,15 @@ _crontab_read() {
     if [ "$rc" -ne 0 ]; then
         local errtext; errtext=$(cat "$err" 2>/dev/null)
         rm -f "$err"
-        # 只认规范 no crontab 为空态; 权限/I/O/包装器损坏均 fail-closed, 不得清空用户任务。
+        # 只认"确实没有 crontab"为空态; 权限/I/O/包装器损坏均 fail-closed, 不得清空用户任务。
+        # busybox(busybox-suid) 的 crontab -l 是 bb_cat(用户名), 缺文件时报 can't open ... ENOENT,
+        # 缺 crontabs 目录时报 can't cd to; EACCES 等其它错误仍走失败分支。
         case "$errtext" in
             *"no crontab"*)
+                return 0 ;;
+            *"can't open"*"No such file or directory"*)
+                return 0 ;;
+            *"can't cd to"*"No such file or directory"*)
                 return 0 ;;
         esac
         _error "读取 crontab 失败, 已中止(避免覆盖并清空现有定时任务): ${errtext:-未知错误}"
@@ -836,22 +842,26 @@ _restore_config() {
     [ -d "$BACKUP_DIR/confs.lastbak" ] || return 1
     # 逐文件回写, 先确认所有恢复片段可用, 再触碰当前配置。
     local content f files=()
+    # 无匹配时 glob 会原样保留 pattern, 先按真实文件收集, 避免把 pattern 当成片段校验。
     for f in "$BACKUP_DIR/confs.lastbak"/*.json; do
+        [ -f "$f" ] || continue
+        files+=("$f")
+    done
+    if [ "${#files[@]}" -eq 0 ]; then
+        _error "配置备份目录中没有 JSON 片段: $BACKUP_DIR/confs.lastbak"
+        return 1
+    fi
+    for f in "${files[@]}"; do
         if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$f" >/dev/null 2>&1; then
             _error "备份片段为空或无法解析: $f"
             return 1
         fi
-        files+=("$f")
     done
     content=$(jq -s "$JQ_MERGE_OBJECTS" "${files[@]}") || {
         _error "读取备份失败($BACKUP_DIR/confs.lastbak)"
         return 1
     }
     [ -n "$content" ] || { _error "读取备份失败($BACKUP_DIR/confs.lastbak)"; return 1; }
-    if [ "${#files[@]}" -eq 0 ]; then
-        _error "配置备份目录中没有 JSON 片段: $BACKUP_DIR/confs.lastbak"
-        return 1
-    fi
     if ! _config_write_merged "$content"; then
         _error "配置回滚失败($CONFIG_DIR)"
         return 1

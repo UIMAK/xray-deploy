@@ -1516,11 +1516,11 @@ _hy2_toggle_brutal() {
     if [ "$new_cc" != "bbr" ]; then
         echo -e "  ${YELLOW}${new_cc} 格式: 100 mbps / 10m / 1g; 0/回车不限, 非零上下行至少 512 kbps (0.5 mbps)${NC}"
         if [ "$new_cc" = "force-brutal" ]; then
-            read -rp "  服务端上传带宽 (至少 512 kbps / 0.5 mbps): " brutal_up
+            read -rp "  服务端上传带宽 (至少 512 kbps / 0.5 mbps): " brutal_up || return
         else
-            read -rp "  服务端上传带宽 (回车不限): " brutal_up
+            read -rp "  服务端上传带宽 (回车不限): " brutal_up || return
         fi
-        read -rp "  下载带宽 (回车不限): " brutal_down
+        read -rp "  下载带宽 (回车不限): " brutal_down || return
         brutal_up=$(_normalize_bandwidth "$brutal_up")
         brutal_down=$(_normalize_bandwidth "$brutal_down")
     fi

@@ -201,6 +201,7 @@ def parse_hostport(value):
 class Query:
     def __init__(self, raw=""):
         self.items = []
+        self.keys = []
         seen = set()
         if not raw:
             return
@@ -210,13 +211,16 @@ class Query:
             if not part:
                 fail("查询字符串包含空参数")
             key, equals, value = part.partition("=")
-            key = percent_decode(key, True).lower()
+            # URI query 里的 '+' 是字面子分隔符, 只有 form 编码才映射成空格;
+            # 按 form 解码会把 base64(如 ECH)里的 '+' 改成空格并静默改错凭据。
+            key = percent_decode(key).lower()
             if not re.fullmatch(r"[a-z0-9_.-]+", key):
                 fail("查询参数名无效")
             if key in seen:
                 fail("查询参数重复: " + key)
             seen.add(key)
-            value = percent_decode(value, True)
+            self.keys.append(key)
+            value = percent_decode(value)
             if value:
                 self.items.append((key, value))
             if not separator:
@@ -227,6 +231,7 @@ class Query:
     def from_items(cls, items):
         query = cls()
         query.items = list(items)
+        query.keys = [key for key, _ in query.items]
         return query
 
     def get(self, name):
@@ -279,7 +284,8 @@ def int_get(query, label, minimum, maximum, names):
 
 def check_query(query, allowed):
     allowed = set(allowed)
-    for key, _ in query.items:
+    # 白名单按参数名校验: ?unknown= 这类空值参数不进入 items, 但同样必须拒绝。
+    for key in query.keys:
         if key not in allowed:
             fail("链接包含暂不支持的参数: " + key)
 
@@ -901,7 +907,8 @@ def parse_vmess_legacy(link):
     if aid is None:
         aid = 0
     aid_text = json_value_text(aid)
-    if aid_text != "0":
+    # 部分生成器把 aid 留空; 空值与缺省同义(AEAD 只要求 alterId 为 0)。
+    if aid_text not in ("0", ""):
         fail("VMess 只支持 AEAD，alterId 必须为 0")
     ps = json_field(data, "ps")
     cipher = json_field(data, "scy")
@@ -1148,6 +1155,9 @@ def parse_ss(link):
         query_raw = ""
     if not raw:
         fail("Shadowsocks 链接为空")
+    # SIP002 允许端口后跟可选路径 "/": ss://userinfo@host:port[/][?plugin][#tag]
+    if raw.endswith("/"):
+        raw = raw[:-1]
     if query_raw:
         query = Query(query_raw)
         if query.get("plugin") is not None or query.get("plugin-opts") is not None:
@@ -1385,12 +1395,10 @@ def parse_hysteria2(link):
         "obfs", "obfs-password", "obfs_password", "obfspassword", "minpacketsize",
         "maxpacketsize", "mport", "alpn", "up", "down", "upmbps", "downmbps",
         "pinsha256", "pcs", "pinnedpeercertsha256", "pin-sha256", "pin_sha256",
-        "vcn", "verifypeercertbyname", "ech", "udpidletimeout", "fp",
+        "vcn", "verifypeercertbyname", "ech", "udpidletimeout", "fp", "congestion",
     ))
     if query.get("fp") is not None:
         fail("Hysteria2 是 QUIC 传输，不支持 fp/uTLS 指纹")
-    if query.get("security") is not None:
-        fail("Hysteria2 不支持 security 参数")
     security_settings, sni = build_tls_settings("tls", server, query)
 
     masks = []
@@ -1436,20 +1444,30 @@ def parse_hysteria2(link):
 
     up = alias_get(query, "上行带宽", ("up", "upmbps"))
     down = alias_get(query, "下行带宽", ("down", "downmbps"))
+    # 拥塞控制由本工具导出的链接携带(hy2://...&congestion=...), 必须能原样导入。
+    congestion = query.get("congestion")
+    if congestion is not None:
+        congestion = congestion.lower()
+        if congestion not in ("reno", "bbr", "brutal", "force-brutal"):
+            fail("Hysteria2 congestion 只支持 reno/bbr/brutal/force-brutal")
     quic = None
-    if up is None and down is None:
-        pass
-    elif up is None or down is None:
-        fail("Hysteria2 的 up/down 必须同时提供")
-    else:
+    # 显式 congestion 优先保留: up=0&down=0 时也要带上拥塞控制语义。
+    if congestion is not None:
+        quic = {"congestion": congestion}
+    if up is not None and down is not None:
         up_value = bandwidth_value(up, "Hysteria2 up")
         down_value = bandwidth_value(down, "Hysteria2 down")
         if up_value or down_value:
-            quic = {"congestion": "brutal"}
-            if up_value:
-                quic["brutalUp"] = up_value
-            if down_value:
-                quic["brutalDown"] = down_value
+            if quic is None:
+                quic = {"congestion": "brutal"}
+            # brutal 系才有上下行限速; bbr/reno 下带宽字段没有意义。
+            if quic["congestion"] in ("brutal", "force-brutal"):
+                if up_value:
+                    quic["brutalUp"] = up_value
+                if down_value:
+                    quic["brutalDown"] = down_value
+    elif up is not None or down is not None:
+        fail("Hysteria2 的 up/down 必须同时提供")
 
     udp_idle = int_get(query, "Hysteria2 udpIdleTimeout", 0, 600, ("udpidletimeout",))
     if udp_idle == 1:

@@ -59,6 +59,86 @@ multi_delete_routing() (
 )
 check 'multi-delete removes tunnel routing rules by element' multi_delete_routing
 
+# 新节点 UDP 端口落进其它节点已启用的跳跃区间会被 PREROUTING DNAT 静默劫持, 必须重问;
+# 改端口时节点自身的跳跃区间不算冲突。
+hop_range_port_conflict() (
+    local dir="$TMP/hop-port" out
+    NODES_DIR="$dir/nodes"
+    rm -rf "$dir"; mkdir -p "$NODES_DIR"
+    printf '{"tag":"xd-hy2-40000","name":"hy2","protocol":"hysteria2","port":40000,"hop_ranges":"20000-50000"}' \
+        > "$NODES_DIR/xd-hy2-40000.json"
+    out=$(printf '25000\n61000\n' | _input_port udp 2>/dev/null)
+    [ "$out" = "61000" ] || return 1
+    out=$(printf '25000\n' | _input_port udp xd-hy2-40000 2>/dev/null)
+    [ "$out" = "25000" ] || return 1
+    # 他人元数据损坏 = 占用未知; 按冲突处理(fail-closed), 端口重问直至 EOF 取消。
+    printf '{broken' > "$NODES_DIR/bad.json"
+    out=$(printf '61000\n' | _input_port udp 2>/dev/null)
+    [ -z "$out" ]
+)
+check 'UDP port inside another node hop range is rejected' hop_range_port_conflict
+
+# 反向检查: config 里的 UDP 入站与官方 Hysteria listen(单端口/范围/多段)都要命中。
+udp_range_conflict_probe() (
+    local dir="$TMP/udp-range"
+    NODES_DIR="$dir/nodes"
+    HYSTERIA_CONFIG="$dir/hysteria.json"
+    rm -rf "$dir"; mkdir -p "$NODES_DIR"
+    printf '{"tag":"xd-hy2-41000","protocol":"hysteria2","port":41000}' > "$NODES_DIR/xd-hy2-41000.json"
+    _hysteria_xray_udp_port_ranges() { printf '40000:40000\n45000:45000\n'; }
+    _range_hits_other_udp 39900 40100 xd-hy2-41000 || return 1
+    _range_hits_other_udp 46000 47000 xd-hy2-41000 && return 1
+    printf '{"listen":"0.0.0.0:20808"}' > "$HYSTERIA_CONFIG"
+    _range_hits_other_udp 20700 20900 xd-hy2-41000 || return 1
+    _range_hits_other_udp 20500 20600 xd-hy2-41000 && return 1
+    # 启用官方跳跃后 listen 是端口范围, 必须按区间相交判断。
+    printf '{"listen":"0.0.0.0:20000-30000"}' > "$HYSTERIA_CONFIG"
+    _range_hits_other_udp 20500 20600 xd-hy2-41000 || return 1
+    # 多段 listen 逐段比对, 不能只看最后一段。
+    printf '{"listen":"0.0.0.0:20000-30000,[::]:5000"}' > "$HYSTERIA_CONFIG"
+    _range_hits_other_udp 4900 5100 xd-hy2-41000 || return 1
+    _range_hits_other_udp 20500 20600 xd-hy2-41000 || return 1
+    # 本节点自身的监听端口不算冲突。
+    printf '{"listen":":9"}' > "$HYSTERIA_CONFIG"
+    _hysteria_xray_udp_port_ranges() { printf '41000:41000\n'; }
+    _range_hits_other_udp 40000 42000 xd-hy2-41000 && return 1
+    # 其它节点已启用的跳跃区间与本区间重叠也要拒绝(两条 DNAT 抢同一目的端口)。
+    printf '{"tag":"xd-hy2-20000","protocol":"hysteria2","port":20000,"hop_ranges":"20000-50000"}' \
+        > "$NODES_DIR/xd-hy2-20000.json"
+    _hysteria_xray_udp_port_ranges() { :; }
+    _range_hits_other_udp 45000 46000 xd-hy2-41000 || return 1
+    _range_hits_other_udp 51000 52000 xd-hy2-41000 && return 1
+    # 自身已有的跳跃区间不算冲突(改区间/重开跳跃时复用同一范围)。
+    rm -f "$NODES_DIR/xd-hy2-20000.json"
+    printf '{"tag":"xd-hy2-41000","protocol":"hysteria2","port":41000,"hop_ranges":"40000-42000"}' \
+        > "$NODES_DIR/xd-hy2-41000.json"
+    _range_hits_other_udp 40000 42000 xd-hy2-41000 && return 1
+    # 他人元数据损坏 = 未知占用, 同样按冲突处理(fail-closed)。
+    printf '{broken' > "$NODES_DIR/bad.json"
+    _range_hits_other_udp 60000 61000 xd-hy2-41000 || return 1
+    return 0
+)
+check 'hop range conflict covers config UDP inbounds and official listen forms' udp_range_conflict_probe
+
+# SS 的 network 在 settings 下(模板), 兼容顶层写法; _modify_port 用它判定 UDP。
+inbound_network_probe() (
+    local dir="$TMP/net-probe"
+    CONFIG_DIR="$dir/confs" BACKUP_DIR="$dir/backup" STATE_DIR="$dir/state"
+    rm -rf "$dir"; mkdir -p "$CONFIG_DIR" "$BACKUP_DIR" "$STATE_DIR"
+    eval "$actual_config_jq"
+    _config_write_merged '{"inbounds":[
+        {"tag":"ss-tcp","protocol":"shadowsocks","port":1,"settings":{"network":"tcp"}},
+        {"tag":"ss-udp","protocol":"shadowsocks","port":2,"settings":{"network":"tcp,udp"}},
+        {"tag":"ss-none","protocol":"shadowsocks","port":3,"settings":{}},
+        {"tag":"ss-top","protocol":"shadowsocks","port":4,"network":"udp"}]}' >/dev/null || return 1
+    [ "$(_inbound_network ss-tcp)" = "tcp" ] || return 1
+    [ "$(_inbound_network ss-udp)" = "tcp,udp" ] || return 1
+    [ -z "$(_inbound_network ss-none)" ] || return 1
+    [ "$(_inbound_network ss-top)" = "udp" ] || return 1
+    [ -z "$(_inbound_network missing)" ]
+)
+check 'inbound network reads settings.network and top-level fallback' inbound_network_probe
+
 # Render and execute the real creation transaction; metadata retains server direction.
 R_LISTEN=0.0.0.0 R_PORT=443 R_TAG=hy2-test R_AUTH=secret
 R_CERT_FILE=/fixture/cert.pem R_KEY_FILE=/fixture/key.pem R_CONGESTION=bbr
@@ -85,6 +165,12 @@ check 'server direction preserved in metadata' jq -e '.brutal_up == "80 mbps" an
 link=$(_rebuild_hy2_link "$TMP/committed.json")
 check 'URI client upload is server download' contains "$link" '&up=20%20mbps'
 check 'URI client download is server upload' contains "$link" '&down=80%20mbps'
+rc=0
+_commit_hy2_node_txn_locked hy2-test node server 443 0.0.0.0 secret sni false '' force-brutal '80 mbps' '' '' '' '' /fixture/cert.pem /fixture/key.pem || rc=$?
+check 'one-sided force transaction succeeds' eq "$rc" 0
+link=$(_rebuild_hy2_link "$TMP/committed.json")
+check 'one-sided URI writes unlimited side as 0' contains "$link" '&up=0'
+check 'one-sided URI keeps configured side' contains "$link" '&down=80%20mbps'
 rc=0
 _commit_hy2_node_txn_locked hy2-test node server 443 0.0.0.0 secret sni false '' brutal '' '' '' '' '' /fixture/cert.pem /fixture/key.pem || rc=$?
 check 'ordinary brutal empty bandwidth remains accepted' eq "$rc" 0

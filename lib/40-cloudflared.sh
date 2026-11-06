@@ -1057,9 +1057,7 @@ _install_cloudflared() {
     local cmdline
     cmdline=$(_cf_build_cmdline "$token") || { _cf_update_timer_restore || _warn "更新 timer 状态还原失败"; _error "无法构造安全的 cloudflared 启动行"; return 1; }
     if ! _cf_write_service_line "$cmdline"; then
-        local ab_svc
-        ab_svc=$(_cf_unit_path)
-        rm -f "${ab_svc}.bak" 2>/dev/null
+        # _svc_restore 失败时 .bak 是唯一含 token 的恢复源, 这里不能删。
         _cf_update_timer_restore || _warn "更新 timer 状态还原失败"
         _error "service 配置写入失败, 安装中止"
         return 1
@@ -1241,7 +1239,8 @@ _cf_managed_line_only() {
         return
     fi
     if [ "$kind" != command_args ]; then
-        if [ "$first" = "$expected" ]; then
+        # 首词可能是软链写法(用户为多版本自建软链), 与 expected 的 readlink -f 结果比对。
+        if [ "$first" = "$expected" ] || [ "$(readlink -f "$first" 2>/dev/null)" = "$expected" ]; then
             i=1
         elif [ "$first" != tunnel ]; then
             return 1

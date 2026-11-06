@@ -142,7 +142,10 @@ _geo_auto_state() {
 # routing Geo 判据由统计与精简共用, 避免显示与删除范围漂移。
 # 覆盖 domain/domains、ip、sourceIP/source、localIP; 别名同样会加载 dat。
 # geosite:/geoip:/ext: 均计入, 先去 ! 因反选仍加载数据; ?/[] 容忍畸形字段。
-GEO_RULE_REF_JQ='([(.domain? // [])[]?, (.domains? // [])[]?, (.ip? // [])[]?, (.sourceIP? // [])[]?, (.source? // [])[]?, (.localIP? // [])[]?] | map(select(type=="string")) | map(ltrimstr("!")) | any(startswith("geosite:") or startswith("geoip:") or startswith("ext:")))'
+# Xray 的 StringList 同时接受数组与逗号串(官方文档与手写配置常见标量形式), 两种都要识别。
+GEO_RULE_REF_JQ='[ (.domain?, .domains?, .ip?, .sourceIP?, .source?, .localIP?)
+    | (if type == "string" then (split(",")[]) elif type == "array" then .[] else empty end) ]
+  | map(select(type == "string")) | map(ltrimstr("!")) | any(startswith("geosite:") or startswith("geoip:") or startswith("ext:"))'
 
 # cron 就绪才可记账为 on: systemd/OpenRC 要同时启动并启用, direct 只启动守护。
 _ensure_cron_running() {
@@ -337,7 +340,8 @@ _route_dns_geo_count() {
     local n
     n=$(_config_jq -r '
         [ (.dns?.servers[]? | select(type == "object")
-            | (.domains? // [])[]?, (.expectedIPs? // [])[]?, (.expectIPs? // [])[]?, (.unexpectedIPs? // [])[]?),
+            | (.domains?, .expectedIPs?, .expectIPs?, .unexpectedIPs?)
+            | (if type == "string" then (split(",")[]) elif type == "array" then .[] else empty end)),
            ((.dns?.hosts? // {}) | keys[]?) ]
         | map(select(type == "string")) | map(ltrimstr("!"))
         | map(select(startswith("geosite:") or startswith("geoip:") or startswith("ext:")))
