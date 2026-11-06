@@ -1088,7 +1088,13 @@ _hysteria_node_txn_locked() {
             return 1
         fi
     fi
-    _hysteria_config_apply_filter "$config_filter" "${@}" || return 1
+    if ! _hysteria_config_apply_filter "$config_filter" "${@}"; then
+        # config 未提交, 元数据未被改写; 备份里的密码副本不能留在数据目录。
+        if [ -n "$meta_bak" ] && ! rm -f "$meta_bak" 2>/dev/null; then
+            _warn "节点元数据备份清理失败, 请手动删除: $meta_bak"
+        fi
+        return 1
+    fi
     _hysteria_node_txn_meta_rollback() {
         local rc=0 mc
         if [ "$meta_had" -eq 1 ]; then
@@ -1865,16 +1871,23 @@ _hysteria_bandwidth_menu() {
         1)
             _hysteria_ask_value_reason "  up (如 100 mbps / 1g, 回车保持): " up 1 _hysteria_bandwidth_reason || return 0
             _hysteria_ask_value_reason "  down (如 100 mbps / 1g, 回车保持): " down 1 _hysteria_bandwidth_reason || return 0
-            up=$(_normalize_bandwidth "${up:-$cur_up}")
-            down=$(_normalize_bandwidth "${down:-$cur_down}")
+            # 只归一化本次输入的方向: 回车保持必须原样保留 config 里的值,
+            # 否则数字形态(核心按字节解释)会被补成 "<n> mbps" 而放大限速语义。
+            [ -n "$up" ] && up=$(_normalize_bandwidth "$up")
+            [ -n "$down" ] && down=$(_normalize_bandwidth "$down")
+            # 两个方向都空 = 未修改: 不写 config, 也不做多余的 verified restart。
+            if [ -z "$up" ] && [ -z "$down" ]; then
+                _info "带宽未修改"
+                _press_any_key
+                return 0
+            fi
             if ! _hysteria_config_txn --arg up "$up" --arg down "$down" \
-                 '(if $up != "" then .bandwidth.up = $up else del(.bandwidth.up) end)
-                    | (if $down != "" then .bandwidth.down = $down else del(.bandwidth.down) end)
-                    | if .bandwidth == {} then del(.bandwidth) else . end'; then
+                 '(if $up != "" then .bandwidth.up = $up else . end)
+                    | (if $down != "" then .bandwidth.down = $down else . end)'; then
                 _error "带宽设置失败"
             else
                 _hysteria_rebuild_all_links
-                _success "带宽已更新: up=${up:-不限} down=${down:-不限}"
+                _success "带宽已更新: up=${up:-${cur_up:-不限}} down=${down:-${cur_down:-不限}}"
             fi
             ;;
         2)

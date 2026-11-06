@@ -4,7 +4,7 @@
 # shellcheck disable=SC2329,SC2034
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/hysteria-alignment.XXXXXX")
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/hysteria-alignment.XXXXXX") || exit 1
 trap 'rm -rf "${TMP:?}"' EXIT
 PASS=0 FAIL=0
 pass() { PASS=$((PASS + 1)); printf 'ok - %s\n' "$1"; }
@@ -291,6 +291,25 @@ hysteria_password_eof_probe() (
     [ ! -e "$TMP/eof-password-txn" ]
 )
 check 'EOF while changing password cancels before transaction' hysteria_password_eof_probe
+
+# 带宽菜单回车保持不得改写数字形态值: 两个方向都空时直接返回, 不写 config、不重启。
+bandwidth_keep_untouched() (
+    _hysteria_gate() { return 0; }
+    clear() { :; }
+    _press_any_key() { :; }
+    _hysteria_config_get() {
+        case "$1" in
+            bandwidth.up) printf '1048576' ;;
+            bandwidth.down) printf '2097152' ;;
+        esac
+    }
+    _hysteria_config_txn() { : > "$TMP/bw-txn"; return 0; }
+    _hysteria_rebuild_all_links() { :; }
+    rm -f "$TMP/bw-txn"
+    printf '1\n\n\n' | _hysteria_bandwidth_menu >/dev/null 2>&1
+    [ ! -e "$TMP/bw-txn" ]
+)
+check 'bandwidth keep on enter does not rewrite config' bandwidth_keep_untouched
 
 printf 'RESULT: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

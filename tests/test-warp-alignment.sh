@@ -230,6 +230,12 @@ JSON
     check 'endpoint: bare host gains default port' eq 'engage.cloudflareclient.com:2408' "$(_warp_endpoint_norm 'engage.cloudflareclient.com')"
     check 'endpoint: bare IPv6 is bracketed and gains a port' eq '[2606:4700:110:8a36::1]:2408' "$(_warp_endpoint_norm '2606:4700:110:8a36::1')"
     check 'endpoint: host:port is preserved verbatim' eq '162.159.192.1:500' "$(_warp_endpoint_norm '162.159.192.1:500')"
+    endpoint_rejects() {
+        ! _warp_endpoint_norm '1.2.3.4:abc' >/dev/null 2>&1 &&
+            ! _warp_endpoint_norm '162.159.192.1:' >/dev/null 2>&1 &&
+            ! _warp_endpoint_norm 'a:b:c' >/dev/null 2>&1
+    }
+    check 'endpoint: non-IPv6 colon forms are rejected' endpoint_rejects
 
     printf '== A. normalize to build pipeline ==\n'
     build_ok() {   # <归一输出文件>

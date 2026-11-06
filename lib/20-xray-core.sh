@@ -2636,15 +2636,19 @@ _uninstall_xray_locked() {
             return 1
         fi
     fi
+    # service 定义删除失败会留下指向已删 ExecStart 的 unit, 不能报"已卸载干净"。
+    local svc_cleanup_rc=0
     case "$INIT_SYSTEM" in
         systemd)
             systemctl disable xray 2>/dev/null
-            rm -f /etc/systemd/system/xray.service
-            systemctl daemon-reload 2>/dev/null
+            rm -f /etc/systemd/system/xray.service || svc_cleanup_rc=1
+            [ ! -e /etc/systemd/system/xray.service ] || svc_cleanup_rc=1
+            systemctl daemon-reload 2>/dev/null || svc_cleanup_rc=1
             ;;
         openrc)
             rc-update del xray default 2>/dev/null
-            rm -f /etc/init.d/xray
+            rm -f /etc/init.d/xray || svc_cleanup_rc=1
+            [ ! -e /etc/init.d/xray ] || svc_cleanup_rc=1
             ;;
     esac
     if _crontab_replace "# xray-deploy-timed-restart" >/dev/null 2>&1; then
@@ -2667,6 +2671,7 @@ _uninstall_xray_locked() {
             return 1
         fi
         _success "Xray 核心与服务已卸载, 面板及全部数据已保留"
+        [ "$svc_cleanup_rc" -eq 0 ] || _warn "service 定义清理未完成, 请手动确认 xray.service"
         return 0
     fi
     _logrotate_cleanup
@@ -2677,7 +2682,12 @@ _uninstall_xray_locked() {
         _tip "请检查权限/只读文件系统后重试"
         return 1
     fi
-    _success "Xray 已卸载干净(/opt/xray-deploy、xd 命令、项目定时重启任务已清理)"
+    if [ "$svc_cleanup_rc" -ne 0 ]; then
+        _warn "service 定义清理未完成(可能残留 xray.service), 请手动确认"
+        _success "Xray 已卸载(/opt/xray-deploy、xd 命令、项目定时重启任务已清理)"
+    else
+        _success "Xray 已卸载干净(/opt/xray-deploy、xd 命令、项目定时重启任务已清理)"
+    fi
 }
 
 # ---------------------------------------------------------------------------

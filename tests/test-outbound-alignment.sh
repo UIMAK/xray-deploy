@@ -228,6 +228,9 @@ fi
     parse_fail 'unknown query rejected' \
         "vless://${UUID}@example.com:443?encryption=none&security=tls&sni=example.com&unknown=1" \
         '暂不支持'
+    parse_fail 'unknown empty query rejected' \
+        "vless://${UUID}@example.com:443?encryption=none&security=tls&sni=example.com&unknown=" \
+        '暂不支持'
     parse_fail 'XHTTP extra must be object' \
         "vless://${UUID}@example.com:443?encryption=none&security=tls&type=xhttp&sni=example.com&extra=%5B%5D" \
         'extra 必须是 JSON 对象'
@@ -247,6 +250,15 @@ fi
         and .[0].outbound.streamSettings.network == "websocket"
         and .[0].outbound.streamSettings.wsSettings.path == "/vm"
         and .[0].outbound.streamSettings.tlsSettings.alpn == ["h2","http/1.1"]
+    '
+    legacy_aid_empty=$(jq -cn \
+        --arg id "$UUID" \
+        '{v:"2",ps:"Legacy Empty AID",add:"vm.example.com",port:"443",id:$id,aid:"",
+          scy:"auto",net:"tcp",type:"none"}' |
+        base64 | tr -d '\n')
+    parse_ok 'VMess legacy empty aid treated as AEAD zero' "vmess://${legacy_aid_empty}" '
+        .[0].outbound.protocol == "vmess"
+        and .[0].outbound.settings.address == "vm.example.com"
     '
 
     legacy_tls_only=$(jq -cn \
@@ -358,6 +370,10 @@ fi
         and .[0].outbound.settings.method == "aes-128-gcm"
         and .[0].outbound.settings.password == "p@ss:word"
     '
+    parse_ok 'Shadowsocks SIP002 optional trailing slash' "ss://${ss_cred}@ss.example.com:8388/#SS-Slash" '
+        .[0].outbound.settings.port == 8388
+        and .[0].tag == "SS-Slash"
+    '
     ss_legacy=$(printf 'chacha20-poly1305:%s@legacy.example.com:8389' "$PASS_VALUE" | base64 | tr -d '=\n')
     parse_ok 'Shadowsocks legacy Base64' "ss://${ss_legacy}#SS-Legacy" '
         .[0].outbound.settings.method == "chacha20-poly1305"
@@ -415,6 +431,25 @@ fi
         .[0].outbound.streamSettings.finalmask.quicParams.congestion == "brutal"
         and .[0].outbound.streamSettings.finalmask.quicParams.brutalUp == "100 mbps"
         and (.[0].outbound.streamSettings.finalmask.quicParams | has("brutalDown") | not)
+    '
+    parse_ok 'Hysteria2 congestion from exported link' \
+        'hysteria2://pass@hy.example.com:443?sni=hy.example.com&congestion=bbr#Hy2-BBR' '
+        .[0].outbound.streamSettings.finalmask.quicParams == {congestion:"bbr"}
+    '
+    parse_ok 'Hysteria2 congestion and rates share quicParams' \
+        'hysteria2://pass@hy.example.com:443?sni=hy.example.com&congestion=force-brutal&up=100&down=200#Hy2-Force' '
+        .[0].outbound.streamSettings.finalmask.quicParams == {congestion:"force-brutal",brutalUp:"100 mbps",brutalDown:"200 mbps"}
+    '
+    parse_fail 'Hysteria2 unknown congestion rejected' \
+        'hysteria2://pass@hy.example.com:443?sni=hy.example.com&congestion=cubic' \
+        'congestion'
+    parse_ok 'Hysteria2 obfs password keeps literal plus' \
+        'hysteria2://pass@hy.example.com:443?sni=hy.example.com&obfs=salamander&obfs-password=a+b' '
+        .[0].outbound.streamSettings.finalmask.udp[0].settings.password == "a+b"
+    '
+    parse_ok 'Hysteria2 zero bandwidth keeps congestion' \
+        'hysteria2://pass@hy.example.com:443?sni=hy.example.com&congestion=brutal&up=0&down=0#Hy2-Zero' '
+        .[0].outbound.streamSettings.finalmask.quicParams == {congestion:"brutal"}
     '
     parse_fail 'Hysteria2 brutal below 512 kbps rejected' \
         'hysteria2://pass@hy.example.com:443?sni=hy.example.com&up=0.4&down=100' \

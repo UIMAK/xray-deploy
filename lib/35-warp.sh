@@ -95,8 +95,12 @@ _warp_endpoint_norm() {
         host="${BASH_REMATCH[1]}"
         port="${BASH_REMATCH[2]}"
     elif [[ "$ep" == *:* ]]; then
-        # 多个冒号且无端口后缀: 裸 IPv6
-        [[ "$ep" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+        # 多个冒号且无端口后缀: 裸 IPv6。不允许点分 IPv4 混入; 非压缩形式必须是 8 组。
+        [[ "$ep" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+        case "$ep" in
+            *::*) ;;
+            *) [ "${ep//[^:]/}" = ":::::::" ] || return 1 ;;
+        esac
         host="$ep"
     else
         host="$ep"

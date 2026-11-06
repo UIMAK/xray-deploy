@@ -61,6 +61,11 @@ _logrotate_ensure_package() {
         _warn "logrotate 安装失败, 日志轮换不可用"
         return 1
     }
+    # 装后复验: 包安装返回 0 不代表当前 PATH 能用到 logrotate。
+    if ! command -v logrotate >/dev/null 2>&1; then
+        _warn "logrotate 安装后仍不可用(检查 PATH 与包状态), 日志轮换不可用"
+        return 1
+    fi
     mkdir -p /etc/logrotate.d
     return 0
 }

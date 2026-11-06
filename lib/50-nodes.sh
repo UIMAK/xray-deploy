@@ -1575,6 +1575,7 @@ _gen_random_port() {
 
 _input_port() {
     local proto="${1:-}"  # optional: tcp, udp, or empty (both)
+    local exclude_tag="${2:-}"  # 改端口时排除自身已有的跳跃区间
     local port="" def
     def=$(_gen_random_port)
     while true; do
@@ -1590,6 +1591,11 @@ _input_port() {
         fi
         if _check_port_in_config "$port"; then
             _warn "端口 ${port} 已被其他节点使用,换一个"; def=$(_gen_random_port); continue
+        fi
+        # 只对 UDP 监听检查跳跃区间: TCP 不受 DNAT 影响。
+        if [ "$proto" != "tcp" ] && _port_in_hop_ranges "$port" "$exclude_tag"; then
+            _warn "端口 ${port} 在其它节点的端口跳跃区间内(UDP 会被 DNAT 劫持),换一个"
+            def=$(_gen_random_port); continue
         fi
         break
     done
@@ -1611,6 +1617,11 @@ _gen_free_tunnel_port() {
     return 0
 }
 
+# 取入站 network(模板把 network 放在 settings 下; 兼容顶层写法), 缺失时输出空。
+_inbound_network() {
+    _config_jq -r --arg t "$1" '.inbounds[]? | select(.tag == $t) | (.settings.network // .network // "")' 2>/dev/null
+}
+
 # 检查端口是否已存在于配置
 _check_port_in_config() {
     local port="$1"
@@ -1618,6 +1629,82 @@ _check_port_in_config() {
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
     _config_present || return 1
     _config_jq -e --argjson p "$port" '.inbounds[] | select(.port == $p)' >/dev/null 2>&1
+}
+
+# 端口落在其它节点已启用的端口跳跃区间的 UDP 段内会被 PREROUTING DNAT 静默劫持。
+# 用法:_port_in_hop_ranges <port> [exclude_tag]; 0=冲突。
+_port_in_hop_ranges() {
+    local port="$1" exclude="${2:-}" f tag ranges tok s e
+    [ -d "$NODES_DIR" ] || return 1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        tag=$(basename "$f" .json)
+        [ "$tag" = "$exclude" ] && continue
+        ranges=$(_read_hop_ranges "$f" 2>/dev/null) || continue
+        [ -n "$ranges" ] || continue
+        # shellcheck disable=SC2086  # 空格分隔的 range 列表需要分词
+        for tok in $ranges; do
+            if [[ "$tok" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                s="${BASH_REMATCH[1]}"; e="${BASH_REMATCH[2]}"
+            elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+                s="$tok"; e="$tok"
+            else
+                continue
+            fi
+            [ "$port" -ge "$s" ] && [ "$port" -le "$e" ] && return 0
+        done
+    done
+    return 1
+}
+
+# 官方 Hysteria listen 可能是单端口、端口范围或多段(0.0.0.0:20000-50000,[::]:5000);
+# 逐段输出 "start:end", 供跳跃冲突判断使用。
+_hysteria_listen_ranges() {
+    [ -n "${HYSTERIA_CONFIG:-}" ] && [ -f "$HYSTERIA_CONFIG" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    local listen seg port ls le
+    listen=$(jq -r '.listen // empty' "$HYSTERIA_CONFIG" 2>/dev/null) || return 0
+    [ -n "$listen" ] || return 0
+    local IFS=','
+    for seg in $listen; do
+        seg=${seg// /}
+        [ -n "$seg" ] || continue
+        port=${seg##*:}
+        case "$port" in
+            *-*)
+                ls=${port%%-*}; le=${port##*-}
+                [[ "$ls" =~ ^[0-9]+$ && "$le" =~ ^[0-9]+$ ]] || continue
+                printf '%s:%s\n' "$ls" "$le"
+                ;;
+            *)
+                [[ "$port" =~ ^[0-9]+$ ]] || continue
+                printf '%s:%s\n' "$port" "$port"
+                ;;
+        esac
+    done
+}
+
+# 新跳跃区间覆盖其它 UDP 监听端口时同样会静默劫持。
+# Xray 入站按 config 事实枚举(与官方 Hysteria 的跳跃冲突检查同口径), 官方服务监听单独取;
+# 只信 metadata 会漏掉官方 Hysteria 与手改的入站配置。
+# 用法:_range_hits_other_udp <start> <end> [exclude_tag]; 0=冲突。
+_range_hits_other_udp() {
+    local s="$1" e="$2" exclude="${3:-}" self_port="" p_start p_end
+    [ -n "$exclude" ] && self_port=$(jq -r '.port // empty' "$NODES_DIR/${exclude}.json" 2>/dev/null)
+    if declare -F _hysteria_xray_udp_port_ranges >/dev/null 2>&1; then
+        while IFS=: read -r p_start p_end; do
+            [ -n "$p_start" ] && [ -n "$p_end" ] || continue
+            [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] || continue
+            # 本节点自身的监听端口允许落在自己的跳跃范围内。
+            [ -n "$self_port" ] && [ "$p_start" = "$self_port" ] && [ "$p_end" = "$self_port" ] && continue
+            return 0
+        done < <(_hysteria_xray_udp_port_ranges)
+    fi
+    while IFS=: read -r p_start p_end; do
+        [ -n "$p_start" ] && [ -n "$p_end" ] || continue
+        [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] && return 0
+    done < <(_hysteria_listen_ranges)
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -3944,8 +4031,11 @@ _rebuild_hy2_link() {
     [ "$self_signed" = "true" ] && link="${link}&insecure=1&allowInsecure=1"
     link="${link}&congestion=${congestion}"
     # 服务端上行 = 客户端下行；metadata 保留服务端方向(finalmask.md: QuicParamsObject)。
-    [ -n "$brutal_down" ] && link="${link}&up=$(_url_encode "$brutal_down")"
-    [ -n "$brutal_up" ] && link="${link}&down=$(_url_encode "$brutal_up")"
+    # 两侧都写(缺的一侧 0=不限): 导入端要求 up/down 成对, 单侧限速也要能原样导入。
+    if [ -n "$brutal_down" ] || [ -n "$brutal_up" ]; then
+        link="${link}&up=$(_url_encode "${brutal_down:-0}")"
+        link="${link}&down=$(_url_encode "${brutal_up:-0}")"
+    fi
     if [ "$obfs_kind" != "none" ]; then
         # 自定义尺寸无法用 URI 表达 ⇒ 拒绝(默认 512-1200 可表达, 见 _hy2_link_unexpressible)
         [ "$obfs_kind" = "gecko" ] && ! _hy2_obfs_size_is_default "$meta" && return 1
@@ -4647,8 +4737,11 @@ _reality_port_txn_locked() {
         jq_filter="$jq_filter
 | (.inbounds[] | select(.tag == \$tg) | .tag) = \$new_tg
 | .routing.rules |= map(
-    if .inboundTag != null and (.inboundTag | type) == \"array\"
+    if .inboundTag == null then .
+    elif (.inboundTag | type) == \"array\"
     then .inboundTag |= map(if . == \$tg then \$new_tg else . end)
+    elif (.inboundTag | type) == \"string\"
+    then .inboundTag |= (split(\",\") | map(if . == \$tg then \$new_tg else . end) | join(\",\"))
     else . end)"
     fi
     if ! _mutate_config --arg t "$tag" --arg new_t "$new_tag" --argjson p "$newport" \
@@ -5041,12 +5134,18 @@ _modify_port() {
     local tag="${tags[$idx]:-}"
     [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
 
-    local newport; newport=$(_input_port) || return 1
-
     # 更新元数据 + 链接(端口出现在链接里)
     local meta="$NODES_DIR/${tag}.json"
     local oldport; oldport=$(jq -r '.port' "$meta")
     local proto; proto=$(jq -r '.protocol' "$meta" 2>/dev/null)
+    # 只有 UDP 监听会被端口跳跃 DNAT 劫持; 自身已有的跳跃区间不算冲突。
+    local port_proto="tcp"
+    case "$proto" in
+        hysteria2) port_proto="udp" ;;
+        shadowsocks)
+            case "$(_inbound_network "$tag")" in *udp*) port_proto="udp" ;; esac ;;
+    esac
+    local newport; newport=$(_input_port "$port_proto" "$tag") || return 1
 
     # 端口未变化时直接返回, 避免无意义重启; 也防止 Reality 分支对同名元数据文件 mv(同文件错误)
     [ "$newport" = "$oldport" ] && { _info "端口未变化"; _press_any_key; return; }
@@ -5358,6 +5457,15 @@ _hy2_toggle_hop() {
         # 解析并验证
         local parsed
         parsed=$(_parse_hop_ranges "$hop_input") || { _press_any_key; return; }
+        # 区间覆盖其它节点的 UDP 监听端口时, 对方流量会被本节点的 DNAT 劫持。
+        local chk_range chk_s chk_e
+        for chk_range in $parsed; do
+            chk_s=${chk_range%%:*}; chk_e=${chk_range##*:}
+            if _range_hits_other_udp "$chk_s" "$chk_e" "$tag"; then
+                _error "端口范围 ${chk_range} 覆盖其它节点的 UDP 端口, 会被 DNAT 劫持; 请先调整该节点端口或改用其它范围"
+                _press_any_key; return
+            fi
+        done
         # 规范化输入(用于存储和显示)
         local normalized=""
         local range
