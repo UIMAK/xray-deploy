@@ -70,7 +70,11 @@ hop_range_port_conflict() (
     out=$(printf '25000\n61000\n' | _input_port udp 2>/dev/null)
     [ "$out" = "61000" ] || return 1
     out=$(printf '25000\n' | _input_port udp xd-hy2-40000 2>/dev/null)
-    [ "$out" = "25000" ]
+    [ "$out" = "25000" ] || return 1
+    # 他人元数据损坏 = 占用未知; 按冲突处理(fail-closed), 端口重问直至 EOF 取消。
+    printf '{broken' > "$NODES_DIR/bad.json"
+    out=$(printf '61000\n' | _input_port udp 2>/dev/null)
+    [ -z "$out" ]
 )
 check 'UDP port inside another node hop range is rejected' hop_range_port_conflict
 
@@ -109,6 +113,9 @@ udp_range_conflict_probe() (
     printf '{"tag":"xd-hy2-41000","protocol":"hysteria2","port":41000,"hop_ranges":"40000-42000"}' \
         > "$NODES_DIR/xd-hy2-41000.json"
     _range_hits_other_udp 40000 42000 xd-hy2-41000 && return 1
+    # 他人元数据损坏 = 未知占用, 同样按冲突处理(fail-closed)。
+    printf '{broken' > "$NODES_DIR/bad.json"
+    _range_hits_other_udp 60000 61000 xd-hy2-41000 || return 1
     return 0
 )
 check 'hop range conflict covers config UDP inbounds and official listen forms' udp_range_conflict_probe

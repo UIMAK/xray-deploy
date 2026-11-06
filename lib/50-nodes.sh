@@ -1632,6 +1632,7 @@ _check_port_in_config() {
 }
 
 # 端口落在其它节点已启用的端口跳跃区间的 UDP 段内会被 PREROUTING DNAT 静默劫持。
+# 他人元数据读失败视为占用未知, 按冲突处理(未知归属拒绝破坏性操作)。
 # 用法:_port_in_hop_ranges <port> [exclude_tag]; 0=冲突。
 _port_in_hop_ranges() {
     local port="$1" exclude="${2:-}" f tag ranges tok s e
@@ -1640,7 +1641,10 @@ _port_in_hop_ranges() {
         [ -f "$f" ] || continue
         tag=$(basename "$f" .json)
         [ "$tag" = "$exclude" ] && continue
-        ranges=$(_read_hop_ranges "$f" 2>/dev/null) || continue
+        ranges=$(_read_hop_ranges "$f" 2>/dev/null) || {
+            _error "节点跳跃区间无法读取(元数据损坏), 无法确认端口是否被占用: $tag"
+            return 0
+        }
         [ -n "$ranges" ] || continue
         # shellcheck disable=SC2086  # 空格分隔的 range 列表需要分词
         for tok in $ranges; do
@@ -1686,7 +1690,7 @@ _hysteria_listen_ranges() {
 
 # 新跳跃区间覆盖其它 UDP 监听端口时同样会静默劫持。
 # 判据: Xray 入站按 config 事实枚举(与官方 Hysteria 的跳跃冲突检查同口径), 官方服务监听单独取;
-# 其它节点已启用的跳跃区间从 metadata 取(区间只存在于元数据, config 看不到)。
+# 其它节点已启用的跳跃区间从 metadata 取(区间只存在于元数据, config 看不到), 读失败按冲突处理。
 # 只信 metadata 会漏掉官方 Hysteria 与手改的入站配置, 只看 config 会漏掉他人 hop 区间。
 # 用法:_range_hits_other_udp <start> <end> [exclude_tag]; 0=冲突。
 _range_hits_other_udp() {
@@ -1711,7 +1715,10 @@ _range_hits_other_udp() {
         [ -f "$f" ] || continue
         tag=$(basename "$f" .json)
         [ "$tag" = "$exclude" ] && continue
-        ranges=$(_read_hop_ranges "$f" 2>/dev/null) || continue
+        ranges=$(_read_hop_ranges "$f" 2>/dev/null) || {
+            _error "节点跳跃区间无法读取(元数据损坏), 无法确认是否与本区间冲突: $tag"
+            return 0
+        }
         [ -n "$ranges" ] || continue
         # shellcheck disable=SC2086  # 空格分隔的 range 列表需要分词
         for tok in $ranges; do
