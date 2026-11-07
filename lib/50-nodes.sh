@@ -1309,10 +1309,21 @@ _read_hop_ranges_raw() {
 }
 
 # iptables 使用冒号段和空格分隔形式。
+# 字段非空但没有任何合法区间时按读取失败返回; 避免冲突判定静默跳过损坏元数据。
 _read_hop_ranges() {
-    local ranges
-    ranges=$(_read_hop_ranges_raw "$1") || return 1
-    printf '%s' "$ranges" | tr ',' ' ' | tr '-' ':'
+    local raw ranges tok valid=0
+    raw=$(_read_hop_ranges_raw "$1") || return 1
+    [ -n "$raw" ] || return 0
+    ranges=$(printf '%s' "$raw" | tr ',' ' ' | tr '-' ':')
+    # shellcheck disable=SC2086  # 空格分隔的 range 列表需要分词
+    for tok in $ranges; do
+        if [[ "$tok" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+            valid=1
+            break
+        fi
+    done
+    [ "$valid" -eq 1 ] || return 1
+    printf '%s' "$ranges"
 }
 
 # HY2 hop metadata 校验区分无hop与损坏；损坏时拒绝破坏性操作。

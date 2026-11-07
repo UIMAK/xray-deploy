@@ -120,6 +120,35 @@ udp_range_conflict_probe() (
 )
 check 'hop range conflict covers config UDP inbounds and official listen forms' udp_range_conflict_probe
 
+# hop_ranges 是合法 JSON 但值非法时, 必须按"元数据不可读"处理(与 _hy2_hop_meta_ok 同口径);
+# 否则冲突判定会静默跳过整段元数据, 放行可能与已有 DNAT 相交的区间。
+hop_ranges_invalid_value_fail_closed() (
+    local dir="$TMP/hop-badval" bad
+    NODES_DIR="$dir/nodes"
+    rm -rf "$dir"; mkdir -p "$NODES_DIR"
+    for bad in ',,' 'garbage' ' '; do
+        printf '{"tag":"xd-hy2-badval","protocol":"hysteria2","port":40000,"hop_ranges":"%s"}' "$bad" \
+            > "$NODES_DIR/xd-hy2-badval.json"
+        _port_in_hop_ranges 61000 2>/dev/null || return 1
+        _range_hits_other_udp 60000 61000 '' 2>/dev/null || return 1
+    done
+    # 阴性对照: 旧版 _read_hop_ranges 不校验值, 同样场景会放行; 证明上面断言能捕获回归。
+    (
+        _read_hop_ranges() {
+            local r
+            r=$(_read_hop_ranges_raw "$1") || return 1
+            printf '%s' "$r" | tr ',' ' ' | tr '-' ':'
+        }
+        printf '{"tag":"xd-hy2-badval","protocol":"hysteria2","port":40000,"hop_ranges":",,"}' \
+            > "$NODES_DIR/xd-hy2-badval.json"
+        _port_in_hop_ranges 61000 2>/dev/null && return 1
+        _range_hits_other_udp 60000 61000 '' 2>/dev/null && return 1
+        return 0
+    ) || return 1
+    return 0
+)
+check 'invalid hop_ranges value is treated as unreadable (fail-closed)' hop_ranges_invalid_value_fail_closed
+
 # SS 的 network 在 settings 下(模板), 兼容顶层写法; _modify_port 用它判定 UDP。
 inbound_network_probe() (
     local dir="$TMP/net-probe"
