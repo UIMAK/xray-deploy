@@ -413,6 +413,26 @@ fi
         .[0].outbound.settings.user == "user"
         and .[0].outbound.settings.pass == "pass"
     '
+    # dXNlcjpwYXM/ = base64("user:pas?"), 认证串含字面 "/"; 旧实现复用 split_url
+    # 按第一个 "/" 切 path, 会误判为路径并拒绝。与 parse_ss 同口径按 "@" 分离。
+    parse_ok 'SOCKS Base64 userinfo containing slash' \
+        'socks5://dXNlcjpwYXM/@socks.example.com:1080#SOCKS-B64-Slash' '
+            .[0].outbound.settings.user == "user"
+            and .[0].outbound.settings.pass == "pas?"
+        '
+    parse_ok 'SOCKS Base64 userinfo negative control' \
+        'socks5://dXNlcjpwYXM/@socks.example.com:1080#SOCKS-B64-Slash' '
+            (.[0].outbound.settings.user == "dXNlcjpwYXM/"
+             and .[0].outbound.settings.pass == "") | not
+        '
+    parse_ok 'SOCKS trailing slash still accepted' \
+        'socks5://user:pass@socks.example.com:1080/#SOCKS-Trailing' '
+            .[0].outbound.settings.user == "user"
+            and .[0].outbound.settings.pass == "pass"
+        '
+    parse_fail 'SOCKS real path still rejected' \
+        'socks5://user:pass@socks.example.com:1080/proxy#bad' \
+        'SOCKS 链接不能包含路径'
     parse_ok 'Trojan password and SNI' "trojan://${PASS_ENC}@trojan.example.com:443?sni=trojan.example.com#Trojan-Export" '
         .[0].outbound.protocol == "trojan"
         and .[0].outbound.settings.password == "p@ss:word"
