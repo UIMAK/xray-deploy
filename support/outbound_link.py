@@ -1267,16 +1267,23 @@ def parse_socks(link):
             username = percent_decode(raw_username)
             password = percent_decode(raw_password)
         else:
-            decoded = base64_decode(url["userinfo"])
-            if decoded is None:
-                fail("SOCKS 认证 Base64 无效")
-            try:
-                userinfo = decoded.decode("utf-8")
-            except UnicodeDecodeError:
-                fail("SOCKS 认证 Base64 无效")
-            if ":" not in userinfo:
-                fail("SOCKS 认证缺少密码")
-            username, password = userinfo.split(":", 1)
+            # 无原始冒号沿用旧实现顺序: 先整体 percent 解码再判断, 兼容 %3D
+            # 编码的 Base64 填充与 %3A 编码的 user:pass 分隔符; 解码后仍无
+            # 冒号才按 Base64 认证串处理
+            userinfo = percent_decode(url["userinfo"])
+            if ":" in userinfo:
+                username, password = userinfo.split(":", 1)
+            else:
+                decoded = base64_decode(userinfo)
+                if decoded is None:
+                    fail("SOCKS 认证 Base64 无效")
+                try:
+                    auth = decoded.decode("utf-8")
+                except UnicodeDecodeError:
+                    fail("SOCKS 认证 Base64 无效")
+                if ":" not in auth:
+                    fail("SOCKS 认证缺少密码")
+                username, password = auth.split(":", 1)
         if bool(username) != bool(password):
             fail("SOCKS 用户名和密码不能只填一个")
     settings = {"address": server, "port": port}
