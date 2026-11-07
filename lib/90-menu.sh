@@ -1886,11 +1886,12 @@ _reality_domain_txn_locked() {
                        | (if has("address") then .address = $dom else . end))
                   | .routing.rules |= map(
                       (if .inboundTag != null and (.inboundTag | type) == "array"
-                       then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                        then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                        elif .inboundTag != null and (.inboundTag | type) == "string"
+                        then .inboundTag |= (split(",") | map(if . == $tg then $new_tg else . end) | join(","))
                        else . end)
-                      | if .inboundTag != null and (.inboundTag | type) == "array"
-                           and (.inboundTag | index($new_tg)) != null
-                           and .domain != null
+                      | (.inboundTag | if type == "array" then . elif type == "string" then split(",") else [] end) as $tags
+                      | if ($tags | index($new_tg)) != null and .domain != null
                         then .domain = [$dom]
                         else . end)
                 else . end' || return 1
@@ -1909,10 +1910,11 @@ _reality_domain_txn_locked() {
                   | .routing.rules |= map(
                       (if .inboundTag != null and (.inboundTag | type) == "array"
                        then .inboundTag |= map(if . == $tg then $new_tg else . end)
+                        elif .inboundTag != null and (.inboundTag | type) == "string"
+                        then .inboundTag |= (split(",") | map(if . == $tg then $new_tg else . end) | join(","))
                        else . end)
-                      | if .inboundTag != null and (.inboundTag | type) == "array"
-                           and (.inboundTag | index($new_tg)) != null
-                           and .domain != null
+                      | (.inboundTag | if type == "array" then . elif type == "string" then split(",") else [] end) as $tags
+                      | if ($tags | index($new_tg)) != null and .domain != null
                         then .domain = [$dom]
                         else . end)
                 else . end' || return 1

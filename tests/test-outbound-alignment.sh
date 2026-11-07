@@ -388,6 +388,31 @@ fi
         and .[0].outbound.settings.user == "user"
         and .[0].outbound.settings.pass == "p@ss:word"
     '
+    parse_ok 'SOCKS encoded username colon' 'socks5://user%3Aname:pass@socks.example.com:1080#SOCKS-User-Colon' '
+        .[0].outbound.settings.user == "user:name"
+        and .[0].outbound.settings.pass == "pass"
+    '
+    parse_ok 'SOCKS encoded password colon' 'socks5://user:pa%3Ass@socks.example.com:1080#SOCKS-Pass-Colon' '
+        .[0].outbound.settings.user == "user"
+        and .[0].outbound.settings.pass == "pa:ss"
+    '
+    parse_ok 'SOCKS encoded username colon negative control' 'socks5://user%3Aname:pass@socks.example.com:1080#SOCKS-User-Colon' '
+        (.[0].outbound.settings.user == "user"
+         and .[0].outbound.settings.pass == "name:pass") | not
+    '
+    check 'negative control: SOCKS split-credential assertion rejects fixed parser output' \
+        jq -e '
+            (.[0].outbound.settings.user == "user"
+             and .[0].outbound.settings.pass == "name:pass") | not
+        ' <<< "$_OB_BATCH"
+    parse_ok 'SOCKS Base64 userinfo with percent-encoded padding' 'socks5://dXNlcjpwYXNz%3D@socks.example.com:1080#SOCKS-B64-EncPad' '
+        .[0].outbound.settings.user == "user"
+        and .[0].outbound.settings.pass == "pass"
+    '
+    parse_ok 'SOCKS percent-encoded credential separator' 'socks5://user%3Apass@socks.example.com:1080#SOCKS-EncSep' '
+        .[0].outbound.settings.user == "user"
+        and .[0].outbound.settings.pass == "pass"
+    '
     parse_ok 'Trojan password and SNI' "trojan://${PASS_ENC}@trojan.example.com:443?sni=trojan.example.com#Trojan-Export" '
         .[0].outbound.protocol == "trojan"
         and .[0].outbound.settings.password == "p@ss:word"

@@ -249,3 +249,97 @@ trap 'rm -rf "${TMP:?}"' EXIT
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
 )
+
+printf '== Reality domain switch routing tags ==\n'
+REALITY_DIR="$TMP/reality-domain"
+DEPLOY_DIR="$REALITY_DIR" CONFIG_DIR="$REALITY_DIR/confs" NODES_DIR="$REALITY_DIR/nodes"
+BACKUP_DIR="$REALITY_DIR/backups" STATE_DIR="$REALITY_DIR/state"
+mkdir -p "$CONFIG_DIR" "$NODES_DIR" "$BACKUP_DIR" "$STATE_DIR" || exit 1
+(
+    . "$ROOT/lib/00-common.sh"
+    . "$ROOT/lib/50-nodes.sh"
+    . "$ROOT/lib/90-menu.sh"
+
+    DEPLOY_DIR="$REALITY_DIR" CONFIG_DIR="$REALITY_DIR/confs" NODES_DIR="$REALITY_DIR/nodes"
+    BACKUP_DIR="$REALITY_DIR/backups" STATE_DIR="$REALITY_DIR/state"
+    PASS=0
+    FAIL=0
+    check() {
+        local label="$1"
+        shift
+        if "$@"; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); printf 'FAIL: %s\n' "$label"; fi
+    }
+    _info() { :; }
+    _warn() { :; }
+    _error() { :; }
+    _tip() { :; }
+    _mutate_config() {
+        local content
+        content=$(_config_jq "$@") || return 1
+        _config_write_merged "$content"
+    }
+    _meta_update() {
+        local meta="$1" filter="$2" content
+        shift 2
+        content=$(jq "$@" "$filter" "$meta") || return 1
+        printf '%s\n' "$content" > "$meta"
+    }
+    reality_domain_fixture() {
+        rm -f "$CONFIG_DIR"/*.json
+        _config_write_merged '{
+            "inbounds": [
+                {"tag":"xd-reality-443","protocol":"vless","streamSettings":{"realitySettings":{"serverNames":["old.example.com"]}}},
+                {"tag":"Tunnel-old.example.com-8443-443","protocol":"tunnel","settings":{"address":"old.example.com"}}
+            ],
+            "routing":{"rules":[
+                {"type":"field","inboundTag":["Tunnel-old.example.com-8443-443"],"domain":["old.example.com"],"outboundTag":"direct"},
+                {"type":"field","inboundTag":"Tunnel-old.example.com-8443-443","domain":["old.example.com"],"outboundTag":"block"},
+                {"type":"field","inboundTag":"other,Tunnel-old.example.com-8443-443","domain":["old.example.com"],"outboundTag":"direct"},
+                {"type":"field","inboundTag":"Tunnel-old.example.com-8443","domain":["old.example.com"],"outboundTag":"direct"}
+            ]}
+        }' >/dev/null 2>&1 || return 1
+        jq -n '{
+            "protocol":"vless-tcp-reality-vision","reality_mode":"tunnel",
+            "tunnel_tag":"Tunnel-old.example.com-8443-443","tunnel_port":8443,"port":443,
+            "sni":"old.example.com","share_link":"old-link"
+        }' > "$NODES_DIR/xd-reality-443.json" || return 1
+    }
+    reality_domain_probe() {
+        local pq_seed="${1:-}"
+        _reality_node_mode() { printf 'tunnel'; }
+        _gen_tunnel_tag() { printf 'Tunnel-new.example.com-8443-443'; }
+        _rebuild_reality_link() { printf 'new-link'; }
+        _reality_domain_txn_locked xd-reality-443 "$NODES_DIR/xd-reality-443.json" \
+            new.example.com "$pq_seed" '' 0 >/dev/null 2>&1
+    }
+    routing_tags_updated() {
+        jq -e '
+            .routing.rules[0].inboundTag == ["Tunnel-new.example.com-8443-443"]
+            and .routing.rules[1].inboundTag == "Tunnel-new.example.com-8443-443"
+            and .routing.rules[2].inboundTag == "other,Tunnel-new.example.com-8443-443"
+            and .routing.rules[3].inboundTag == "Tunnel-old.example.com-8443"
+        ' "$CONFIG_DIR/05_routing.json"
+    }
+    reality_domain_fixture
+    reality_domain_probe
+    check 'Reality domain switch updates array, scalar and comma-list routing tags' routing_tags_updated
+    check 'Reality domain switch updates only matching rule domains' jq -e '
+        .routing.rules[0].domain == ["new.example.com"]
+        and .routing.rules[1].domain == ["new.example.com"]
+        and .routing.rules[2].domain == ["new.example.com"]
+        and .routing.rules[3].domain == ["old.example.com"]
+    ' "$CONFIG_DIR/05_routing.json"
+    reality_domain_fixture
+    reality_domain_probe pq-seed
+    check 'Reality domain PQ switch updates array, scalar and comma-list routing tags' routing_tags_updated
+    reality_domain_fixture
+    check 'negative control: new routing tag assertions reject unchanged routing tags' jq -e '
+        ([.routing.rules[0].inboundTag == ["Tunnel-new.example.com-8443-443"],
+          .routing.rules[1].inboundTag == "Tunnel-new.example.com-8443-443",
+          .routing.rules[2].inboundTag == "other,Tunnel-new.example.com-8443-443"]
+         | all) | not
+    ' "$CONFIG_DIR/05_routing.json"
+
+    printf 'reality-domain-alignment: %s passed, %s failed\n' "$PASS" "$FAIL"
+    [ "$FAIL" -eq 0 ]
+)

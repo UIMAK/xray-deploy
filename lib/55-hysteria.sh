@@ -3100,19 +3100,14 @@ _hysteria_stop_and_verify() {
         _hysteria_stopped_state; return $?
     fi
     _manage_hysteria stop 2>/dev/null
-    local p exe
+    local p
     for _ in 1 2 3 4 5 6 7 8; do
         _hysteria_stopped_state && return 0
         sleep 1
     done
     _warn "服务停止后仍处于运行/过渡态, 按 exe 归属强制终止..."
     for p in /proc/[0-9]*; do
-        exe=$(readlink "${p}/exe" 2>/dev/null) || continue
-        case "$exe" in
-            "$HYSTERIA_BIN"|"$HYSTERIA_BIN (deleted)")
-                kill -9 "${p##*/}" 2>/dev/null
-                ;;
-        esac
+        _proc_exe_is_strict "${p##*/}" "$HYSTERIA_BIN" && kill -9 "${p##*/}" 2>/dev/null
     done
     sleep 1
     _manage_hysteria stop 2>/dev/null
