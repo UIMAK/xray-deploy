@@ -433,6 +433,15 @@ fi
     parse_fail 'SOCKS real path still rejected' \
         'socks5://user:pass@socks.example.com:1080/proxy#bad' \
         'SOCKS 链接不能包含路径'
+    # 字面斜杠只允许出现在 Base64 认证串; 普通认证串须用 %2F 编码, 保持旧实现的路径判定。
+    parse_fail 'SOCKS plain credential slash still rejected' \
+        'socks5://user:pa/ss@socks.example.com:1080#bad' \
+        'SOCKS 链接不能包含路径'
+    parse_ok 'SOCKS percent-encoded slash in plain credential' \
+        'socks5://user:pa%2Fss@socks.example.com:1080#SOCKS-EncSlash' '
+            .[0].outbound.settings.user == "user"
+            and .[0].outbound.settings.pass == "pa/ss"
+        '
     parse_ok 'Trojan password and SNI' "trojan://${PASS_ENC}@trojan.example.com:443?sni=trojan.example.com#Trojan-Export" '
         .[0].outbound.protocol == "trojan"
         and .[0].outbound.settings.password == "p@ss:word"
