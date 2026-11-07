@@ -1309,10 +1309,30 @@ _read_hop_ranges_raw() {
 }
 
 # iptables 使用冒号段和空格分隔形式。
+# 逐项校验所有区间, 与 _hy2_hop_meta_ok 同口径; 任一 token 非法即按读取失败返回,
+# 避免冲突判定跳过混合/越界/倒置的损坏元数据。
 _read_hop_ranges() {
-    local ranges
-    ranges=$(_read_hop_ranges_raw "$1") || return 1
-    printf '%s' "$ranges" | tr ',' ' ' | tr '-' ':'
+    local raw ranges tok s e ntok=0
+    raw=$(_read_hop_ranges_raw "$1") || return 1
+    [ -n "$raw" ] || return 0
+    ranges=$(printf '%s' "$raw" | tr ',' ' ' | tr '-' ':')
+    # shellcheck disable=SC2086  # 空格分隔的 range 列表需要分词
+    for tok in $ranges; do
+        ntok=$((ntok + 1))
+        if [[ "$tok" =~ ^[0-9]+$ ]]; then
+            if ! { [ "$tok" -ge 1 ] && [ "$tok" -le 65535 ]; }; then return 1; fi
+        elif [[ "$tok" =~ ^([0-9]+):([0-9]+)$ ]]; then
+            s="${BASH_REMATCH[1]}"; e="${BASH_REMATCH[2]}"
+            if ! { [ "$s" -ge 1 ] && [ "$s" -le 65535 ] &&
+                   [ "$e" -ge 1 ] && [ "$e" -le 65535 ] && [ "$s" -le "$e" ]; }; then
+                return 1
+            fi
+        else
+            return 1
+        fi
+    done
+    [ "$ntok" -gt 0 ] || return 1
+    printf '%s' "$ranges"
 }
 
 # HY2 hop metadata 校验区分无hop与损坏；损坏时拒绝破坏性操作。

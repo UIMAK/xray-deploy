@@ -1227,7 +1227,6 @@ def parse_ss(link):
 
 
 def parse_socks(link):
-    scheme = link.split("://", 1)[0]
     raw = link.split("://", 1)[1]
     if "#" in raw:
         raw, fragment = raw.split("#", 1)
@@ -1252,29 +1251,40 @@ def parse_socks(link):
             fail("SOCKS 整串 Base64 无效")
         if "@" not in raw:
             fail("SOCKS 整串 Base64 缺少用户信息")
-    url = split_url(scheme + "://" + raw)
-    if url["path"] not in ("", "/"):
+    # 不复用 split_url: Base64 认证串可能含字面 "/", 按第一个 "/" 切 path 会误判;
+    # 与 parse_ss 同口径, 用 rsplit("@", 1) 分离 userinfo 与 hostport。
+    if "@" in raw:
+        userinfo, hostport = raw.rsplit("@", 1)
+    else:
+        userinfo, hostport = "", raw
+    if not hostport:
+        fail("链接缺少服务器地址")
+    if hostport.endswith("/"):
+        hostport = hostport[:-1]
+    if "/" in hostport:
         fail("SOCKS 链接不能包含路径")
-    server, port_raw = parse_hostport(url["hostport"])
+    server, port_raw = parse_hostport(hostport)
     if not port_raw:
         fail("SOCKS 链接缺少端口")
     port = validate_port(port_raw)
     username = ""
     password = ""
-    if url["userinfo"]:
-        if ":" in url["userinfo"]:
-            raw_username, raw_password = url["userinfo"].split(":", 1)
+    b64_auth = False
+    if userinfo:
+        if ":" in userinfo:
+            raw_username, raw_password = userinfo.split(":", 1)
             username = percent_decode(raw_username)
             password = percent_decode(raw_password)
         else:
             # 无原始冒号沿用旧实现顺序: 先整体 percent 解码再判断, 兼容 %3D
             # 编码的 Base64 填充与 %3A 编码的 user:pass 分隔符; 解码后仍无
             # 冒号才按 Base64 认证串处理
-            userinfo = percent_decode(url["userinfo"])
-            if ":" in userinfo:
-                username, password = userinfo.split(":", 1)
+            decoded_userinfo = percent_decode(userinfo)
+            if ":" in decoded_userinfo:
+                username, password = decoded_userinfo.split(":", 1)
             else:
-                decoded = base64_decode(userinfo)
+                b64_auth = True
+                decoded = base64_decode(decoded_userinfo)
                 if decoded is None:
                     fail("SOCKS 认证 Base64 无效")
                 try:
@@ -1286,6 +1296,10 @@ def parse_socks(link):
                 username, password = auth.split(":", 1)
         if bool(username) != bool(password):
             fail("SOCKS 用户名和密码不能只填一个")
+        # 字面 / 只允许出现在 Base64 认证串; 普通认证串须用 %2F 编码,
+        # 保持旧实现按第一个 / 切 path 的拒绝行为。
+        if not b64_auth and "/" in userinfo:
+            fail("SOCKS 链接不能包含路径")
     settings = {"address": server, "port": port}
     if username:
         settings["user"] = username
