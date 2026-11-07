@@ -121,25 +121,32 @@ udp_range_conflict_probe() (
 check 'hop range conflict covers config UDP inbounds and official listen forms' udp_range_conflict_probe
 
 # hop_ranges 是合法 JSON 但值非法时, 必须按"元数据不可读"处理(与 _hy2_hop_meta_ok 同口径);
-# 否则冲突判定会静默跳过整段元数据, 放行可能与已有 DNAT 相交的区间。
+# 必须逐项校验所有 token, 否则混合合法/非法、越界、倒置区间会绕过冲突判定。
 hop_ranges_invalid_value_fail_closed() (
     local dir="$TMP/hop-badval" bad
     NODES_DIR="$dir/nodes"
     rm -rf "$dir"; mkdir -p "$NODES_DIR"
-    for bad in ',,' 'garbage' ' '; do
+    for bad in ',,' 'garbage' ' ' '40000-42000,garbage' '70000' '42000-40000'; do
         printf '{"tag":"xd-hy2-badval","protocol":"hysteria2","port":40000,"hop_ranges":"%s"}' "$bad" \
             > "$NODES_DIR/xd-hy2-badval.json"
         _port_in_hop_ranges 61000 2>/dev/null || return 1
         _range_hits_other_udp 60000 61000 '' 2>/dev/null || return 1
     done
-    # 阴性对照: 旧版 _read_hop_ranges 不校验值, 同样场景会放行; 证明上面断言能捕获回归。
+    # 阴性对照: 上一轮实现只校验首个合法 token 即 break, 混合值会放行;
+    # 证明本轮逐项校验的断言能捕获回归。
     (
         _read_hop_ranges() {
-            local r
-            r=$(_read_hop_ranges_raw "$1") || return 1
-            printf '%s' "$r" | tr ',' ' ' | tr '-' ':'
+            local raw ranges tok valid=0
+            raw=$(_read_hop_ranges_raw "$1") || return 1
+            [ -n "$raw" ] || return 0
+            ranges=$(printf '%s' "$raw" | tr ',' ' ' | tr '-' ':')
+            for tok in $ranges; do
+                if [[ "$tok" =~ ^[0-9]+(:[0-9]+)?$ ]]; then valid=1; break; fi
+            done
+            [ "$valid" -eq 1 ] || return 1
+            printf '%s' "$ranges"
         }
-        printf '{"tag":"xd-hy2-badval","protocol":"hysteria2","port":40000,"hop_ranges":",,"}' \
+        printf '{"tag":"xd-hy2-badval","protocol":"hysteria2","port":40000,"hop_ranges":"40000-42000,garbage"}' \
             > "$NODES_DIR/xd-hy2-badval.json"
         _port_in_hop_ranges 61000 2>/dev/null && return 1
         _range_hits_other_udp 60000 61000 '' 2>/dev/null && return 1
