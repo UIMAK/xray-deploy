@@ -1607,7 +1607,9 @@ def collect_links(text):
         if "://" not in text:
             fail("Base64 内容不是分享链接")
         depth += 1
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("，", "\n").replace("；", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # 中文逗号/分号只在其后紧跟协议前缀时才是分隔符，避免切断未转义的 tag
+    text = re.sub(r"[，；](?=\s*" + SCHEME_RE.pattern + r")", "\n", text, flags=re.IGNORECASE)
     for line in text.split("\n"):
         if line:
             links.extend(split_line_links(line))
