@@ -581,6 +581,13 @@ socks5://sep3.example.com:1080#Sep3,socks5://sep4.example.com:1080#Sep4;socks5:/
     else
         check 'unencoded Chinese punctuation inside tag preserved' false
     fi
+    if _outbound_parse_batch 'socks5://cn.example.com:1080#香港，家宽；' &&
+        [ "$_OB_COUNT" -eq 1 ] &&
+        jq -e '.[0].tag == "香港，家宽；"' <<< "$_OB_BATCH" >/dev/null 2>&1; then
+        check 'trailing Chinese punctuation inside tag preserved' true
+    else
+        check 'trailing Chinese punctuation inside tag preserved' false
+    fi
     batch_mixed="$l1"$'\n'"tuic://bad@example.com:443#Bad"$'\n'"$l2"
     if _outbound_parse_batch "$batch_mixed" &&
         [ "$_OB_COUNT" -eq 2 ] && [ "$_OB_SKIPPED" -eq 1 ] &&

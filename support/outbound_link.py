@@ -19,7 +19,8 @@ SCHEME_RE = re.compile(
     r"shadowtls|naive\+https|https?)://",
     re.IGNORECASE,
 )
-SEPARATORS = " \t\r\n,;，；"
+# 中文逗号/分号由 collect_links 按协议头前瞻切分，不在此剥离（避免切掉 tag 末尾标点）
+SEPARATORS = " \t\r\n,;"
 
 
 class ParseError(Exception):
