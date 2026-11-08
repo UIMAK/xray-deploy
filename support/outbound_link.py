@@ -715,7 +715,10 @@ def parse_vless(link):
     if flow:
         if flow not in ("xtls-rprx-vision", "xtls-rprx-vision-udp443"):
             fail("VLESS flow 只支持 xtls-rprx-vision(-udp443)")
-        if security not in ("tls", "reality"):
+        # VLESS 内置加密(encryption 非 none)经 CommonConn 可在 security=none 下跑 vision
+        if security not in ("tls", "reality") and not (
+            security == "none" and encryption != "none"
+        ):
             fail("VLESS flow 需要 TLS 或 Reality")
     kind = read_transport_kind(query)
     check_earlydata_header(kind, query)

@@ -141,6 +141,18 @@ fi
         check 'negative control: pqv assertion rejects omission' true
     fi
 
+    link="vless://${UUID}@example.com:443?encryption=mlkem768:seed123:verify456&security=none&type=tcp&flow=xtls-rprx-vision#ENC-Vision"
+    parse_ok 'ENC vision security=none roundtrip' "$link" '
+        .[0].outbound.settings.flow == "xtls-rprx-vision"
+        and .[0].outbound.settings.encryption == "mlkem768:seed123:verify456"
+        and .[0].outbound.streamSettings.security == "none"
+        and (.[0].outbound.streamSettings | has("tlsSettings") | not)
+        and (.[0].outbound.streamSettings | has("realitySettings") | not)
+    '
+    parse_fail 'vision without TLS or ENC rejected' \
+        "vless://${UUID}@example.com:443?encryption=none&security=none&type=tcp&flow=xtls-rprx-vision" \
+        'VLESS flow 需要 TLS 或 Reality'
+
     parse_fail 'Reality WebSocket rejected' \
         "vless://${UUID}@example.com:443?encryption=none&security=reality&type=ws&path=%2Fws&sni=www.example.com&pbk=${PBK}&sid=01#Reality-WS" \
         'Reality 只支持'
