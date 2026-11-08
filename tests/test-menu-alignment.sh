@@ -248,7 +248,7 @@ trap 'rm -rf "${TMP:?}"' EXIT
 
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
-)
+) || exit 1
 
 printf '== Reality domain switch routing tags ==\n'
 REALITY_DIR="$TMP/reality-domain"
