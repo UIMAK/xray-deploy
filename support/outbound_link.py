@@ -19,7 +19,8 @@ SCHEME_RE = re.compile(
     r"shadowtls|naive\+https|https?)://",
     re.IGNORECASE,
 )
-SEPARATORS = " \t\r\n,;，；"
+# 中文逗号/分号由 collect_links 按协议头前瞻切分，不在此剥离（避免切掉 tag 末尾标点）
+SEPARATORS = " \t\r\n,;"
 
 
 class ParseError(Exception):
@@ -715,7 +716,10 @@ def parse_vless(link):
     if flow:
         if flow not in ("xtls-rprx-vision", "xtls-rprx-vision-udp443"):
             fail("VLESS flow 只支持 xtls-rprx-vision(-udp443)")
-        if security not in ("tls", "reality"):
+        # VLESS 内置加密(encryption 非 none)经 CommonConn 可在 security=none 下跑 vision
+        if security not in ("tls", "reality") and not (
+            security == "none" and encryption != "none"
+        ):
             fail("VLESS flow 需要 TLS 或 Reality")
     kind = read_transport_kind(query)
     check_earlydata_header(kind, query)
@@ -1604,7 +1608,9 @@ def collect_links(text):
         if "://" not in text:
             fail("Base64 内容不是分享链接")
         depth += 1
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("，", "\n").replace("；", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # 中文逗号/分号只在其后紧跟协议前缀时才是分隔符，避免切断未转义的 tag
+    text = re.sub(r"[，；](?=\s*" + SCHEME_RE.pattern + r")", "\n", text, flags=re.IGNORECASE)
     for line in text.split("\n"):
         if line:
             links.extend(split_line_links(line))

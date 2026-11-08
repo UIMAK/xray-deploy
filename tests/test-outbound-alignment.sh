@@ -141,6 +141,18 @@ fi
         check 'negative control: pqv assertion rejects omission' true
     fi
 
+    link="vless://${UUID}@example.com:443?encryption=mlkem768:seed123:verify456&security=none&type=tcp&flow=xtls-rprx-vision#ENC-Vision"
+    parse_ok 'ENC vision security=none roundtrip' "$link" '
+        .[0].outbound.settings.flow == "xtls-rprx-vision"
+        and .[0].outbound.settings.encryption == "mlkem768:seed123:verify456"
+        and .[0].outbound.streamSettings.security == "none"
+        and (.[0].outbound.streamSettings | has("tlsSettings") | not)
+        and (.[0].outbound.streamSettings | has("realitySettings") | not)
+    '
+    parse_fail 'vision without TLS or ENC rejected' \
+        "vless://${UUID}@example.com:443?encryption=none&security=none&type=tcp&flow=xtls-rprx-vision" \
+        'VLESS flow 需要 TLS 或 Reality'
+
     parse_fail 'Reality WebSocket rejected' \
         "vless://${UUID}@example.com:443?encryption=none&security=reality&type=ws&path=%2Fws&sni=www.example.com&pbk=${PBK}&sid=01#Reality-WS" \
         'Reality 只支持'
@@ -561,6 +573,20 @@ socks5://sep3.example.com:1080#Sep3,socks5://sep4.example.com:1080#Sep4;socks5:/
         check 'space/newline/comma/semicolon/Chinese separators and concatenation' true
     else
         check 'space/newline/comma/semicolon/Chinese separators and concatenation' false
+    fi
+    if _outbound_parse_batch 'socks5://cn.example.com:1080#香港，家宽；测试' &&
+        [ "$_OB_COUNT" -eq 1 ] &&
+        jq -e '.[0].tag == "香港，家宽；测试"' <<< "$_OB_BATCH" >/dev/null 2>&1; then
+        check 'unencoded Chinese punctuation inside tag preserved' true
+    else
+        check 'unencoded Chinese punctuation inside tag preserved' false
+    fi
+    if _outbound_parse_batch 'socks5://cn.example.com:1080#香港，家宽；' &&
+        [ "$_OB_COUNT" -eq 1 ] &&
+        jq -e '.[0].tag == "香港，家宽；"' <<< "$_OB_BATCH" >/dev/null 2>&1; then
+        check 'trailing Chinese punctuation inside tag preserved' true
+    else
+        check 'trailing Chinese punctuation inside tag preserved' false
     fi
     batch_mixed="$l1"$'\n'"tuic://bad@example.com:443#Bad"$'\n'"$l2"
     if _outbound_parse_batch "$batch_mixed" &&
