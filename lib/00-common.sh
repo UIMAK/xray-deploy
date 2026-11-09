@@ -40,7 +40,6 @@ _deploy_lock_root() {
 }
 
 
-# 脚本自身
 export CMD_NAME="xd"                            # 快捷命令名(用户确认)
 
 # GitHub 资产
@@ -177,7 +176,7 @@ readonly XRAY_PRIVATE_BLOCK_RULE_JSON='{
 readonly XRAY_LOG_LEVELS="debug info warning error none"
 
 # ---------------------------------------------------------------------------
-# 颜色定义(借鉴 singbox-lite,统一配色)
+# 颜色定义(统一配色)
 # ---------------------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -187,7 +186,7 @@ SKYBLUE='\033[0;94m'
 NC='\033[0m'
 
 # ---------------------------------------------------------------------------
-# 日志打印函数(沿用 singbox-lite 命名,输出到 stderr 不污染管道)
+# 日志打印函数(输出到 stderr, 不污染管道)
 # ---------------------------------------------------------------------------
 _info()    { echo -e "${CYAN}[信息]${NC} $1" >&2; }
 _success() { echo -e "${GREEN}[成功]${NC} $1" >&2; }
@@ -236,7 +235,7 @@ _get_public_ip() {
         (( 10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255 && 10#${BASH_REMATCH[4]} <= 255 )) && \
         echo "$ip" && return 0
     done
-    # IPv6 兜底 —— **必须校验字面量**(#06): 只判非空会把错误页/代理提示写进分享链接。
+    # IPv6 兜底 —— **必须校验字面量**: 只判非空会把错误页/代理提示写进分享链接。
     for url in "https://api64.ipify.org" "https://6.ipw.cn" "https://ipv6.icanhazip.com"; do
         ip=$(curl -fsS6 --max-time 6 "$url" 2>/dev/null) && _is_ipv6_literal "$ip" && echo "$ip" && return 0
     done
@@ -612,6 +611,7 @@ _config_layout_valid() {
     return 0
 }
 
+# 合并视图(空 confs 输出 {}): 先校验片段布局, 重复顶层字段不进入合并。
 _config_merged() {
     _config_layout_valid || return 1
     local files=()
@@ -871,7 +871,7 @@ _restore_config() {
 }
 
 # ---------------------------------------------------------------------------
-# 随机生成(无需 Date.now/Math.random —— 用系统源)
+# 随机生成(用系统随机源)
 # ---------------------------------------------------------------------------
 _gen_uuid() {
     local u=""
@@ -919,7 +919,7 @@ _proc_ppid() {
     printf '%s' "$2"
 }
 
-# Read Linux process start time (proc stat field 22) to detect PID reuse across delayed signals.
+# 读取进程启动时间(/proc stat 第 22 字段), 用于识别延迟信号期间的 PID 复用。
 _proc_starttime() {
     local pid="${1:-}" line
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -931,7 +931,7 @@ _proc_starttime() {
     printf '%s' "${fields[19]}"
 }
 
-# True while <pid> still refers to the same process incarnation whose start time is <starttime>.
+# <pid> 仍是启动时间为 <starttime> 的同一进程化身时返回 0。
 _xd_pid_unchanged() {
     local pid="${1:-}" st="${2:-}" now
     [ -n "$st" ] || return 1
@@ -1013,6 +1013,7 @@ _xd_pidfile_write() {
     printf '%s %s %s\n' "$pid" "$starttime" "$comm" > "$file"
 }
 
+# PID、启动时间与 comm 三者都一致才承认 pidfile 归属。
 _xd_pidfile_identity_ok() {
     local record pid starttime comm
     record=$(_xd_pidfile_record "$1") || return 1
@@ -1268,8 +1269,8 @@ _rewrite_link_port() {
     local prefix="$host_part:$oldport" suffix
     [[ "$after_at" == "$prefix"* ]] || { printf ''; return 0; }
     suffix="${after_at#"$prefix"}"
-    # The port must end here or be followed by a URI delimiter. A prefix-only check lets oldport=443
-    # rewrite a real :4430 as :<newport>0, silently corrupting the share link.
+    # 端口后必须是结束或 URI 分隔符; 只做前缀匹配会让 oldport=443 把真实的 :4430
+    # 改写成 :<newport>0, 静默损坏分享链接。
     case "$suffix" in
         ""|/*|\?*|\#*) ;;
         *) printf ''; return 0 ;;

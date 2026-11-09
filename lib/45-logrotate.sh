@@ -4,8 +4,6 @@ export LOGROTATE_CONF="/etc/logrotate.d/xray-deploy"
 
 # 标记仅记录因 none 自动关闭的因果；手动接管清除，自动恢复成功才消费。
 LOGROTATE_AUTO_OFF_KEY="logrotate_off_by_loglevel"
-# 用户禁用意图标记放在 include 目录下(见 _logrotate_user_off_path), 不用 state 键:
-# 它要覆盖 state 存储不可写的场景, 写进同一存储会一起失败。
 
 _logrotate_auto_off_get() {
     _state_get "$LOGROTATE_AUTO_OFF_KEY" 2>/dev/null
@@ -22,7 +20,7 @@ _logrotate_auto_off_clear() {
 
 # 用户禁用意图标记: 记录"用户显式禁用, 但 enabled 状态写入失败"。
 # 不能放 STATE_DIR —— 该标记要覆盖的正是 state 存储不可写的场景, 写进同一存储会一起失败。
-# 改放 logrotate include 目录下被 logrotate 忽略的子目录(与配置同文件系统: 配置删除成功即可写),
+# 放在 logrotate include 目录下被 logrotate 忽略的子目录(与配置同文件系统: 配置删除成功即可写),
 # 保证 state 存储不可用时仍留下"用户已禁用"的事实, 避免 setup 复活轮换。
 _logrotate_user_off_path() {
     printf '%s/.xray-deploy.tmp.d/disabled' "$(dirname "$LOGROTATE_CONF")"

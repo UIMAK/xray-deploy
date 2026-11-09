@@ -1280,9 +1280,8 @@ def parse_socks(link):
             username = percent_decode(raw_username)
             password = percent_decode(raw_password)
         else:
-            # 无原始冒号沿用旧实现顺序: 先整体 percent 解码再判断, 兼容 %3D
-            # 编码的 Base64 填充与 %3A 编码的 user:pass 分隔符; 解码后仍无
-            # 冒号才按 Base64 认证串处理
+            # 无原始冒号: 先整体 percent 解码再判断, 兼容 %3D 编码的 Base64 填充
+            # 与 %3A 编码的 user:pass 分隔符; 解码后仍无冒号才按 Base64 认证串处理
             decoded_userinfo = percent_decode(userinfo)
             if ":" in decoded_userinfo:
                 username, password = decoded_userinfo.split(":", 1)
@@ -1300,8 +1299,8 @@ def parse_socks(link):
                 username, password = auth.split(":", 1)
         if bool(username) != bool(password):
             fail("SOCKS 用户名和密码不能只填一个")
-        # 字面 / 只允许出现在 Base64 认证串; 普通认证串须用 %2F 编码,
-        # 保持旧实现按第一个 / 切 path 的拒绝行为。
+        # 字面 / 只允许出现在 Base64 认证串; 普通认证串的字面 / 一律按"含路径"拒绝,
+        # 需要它时须写成 %2F。
         if not b64_auth and "/" in userinfo:
             fail("SOCKS 链接不能包含路径")
     settings = {"address": server, "port": port}

@@ -1,9 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # lib/20-xray-core.sh — Xray 核心管理
-# 双通道(稳定版 stable / 预览版 preview)安装与任意切换 + service 生成
-# Xray 核心安装、双通道切换与运行环境管理
-# 配置与节点在切换时保持不变。
+# 双通道(stable / preview)安装与切换、service 生成; 配置与节点保持不变。
 # ============================================================================
 
 # Xray 官方 release 资产命名(已核对 GitHub API):
@@ -41,8 +39,7 @@ _xray_newest_tag() {
 # ---------------------------------------------------------------------------
 # 通过 GitHub API 取指定通道最新 release 的 tag
 #   stable : releases/latest, 即最新正式版
-#   preview: 全部 release(含 prerelease)里版本号最高的那个 —— 最新稳定版更新时
-#            预览版就等于稳定版, 不会退回更旧的 prerelease
+#   preview: 全部 release(含 prerelease)里版本号最高的 tag(语义见 _xray_newest_tag)
 # jq 解析 release 对象; curl 失败再用 wget。
 # ---------------------------------------------------------------------------
 _xray_fetch_tag() {
@@ -115,6 +112,7 @@ _xray_version_at_least() {
     return 0
 }
 
+# 展示用版本: 优先 state 缓存, 缺失时回读 binary 并回填; 不作为安装/升级判据。
 _xray_cached_version() {
     local ver=""
     ver=$(_state_get version 2>/dev/null)
@@ -271,7 +269,7 @@ _xray_stage_release() {
     tmp_zip="${tmp_dir}/xray.zip"
 
     _info "下载 Xray-core ${tag} (${asset})"
-    # curl 优先 + 可移植 wget 兜底(原 wget --show-progress 在 busybox 上直接失败)
+    # 统一走 _http_download: curl 优先, wget 只用 busybox 也支持的选项
     if ! _http_download "$dl_url" "$tmp_zip" 120; then
         _error "下载失败: $dl_url"
         rm -rf "$tmp_dir"
@@ -302,7 +300,7 @@ _xray_stage_release() {
 #   1 = staging 不可用, 或 phase barrier 明确仍停在 snapshotted; 未 stop/未触碰生产文件
 #   3 = replacing 已 durable, mutation 可能部分发生; caller 必须运行 journal recovery
 # 从 replacing 到恢复完成前, journal 与 snapshots 均不得由调用方直接丢弃。
-_xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutation never started; 3=recovery required
+_xray_commit_staged() {  # <staging_dir>; 返回三态见上方契约
     local tmp_dir="$1" j binbak pre phase gd gsrc gtmp
     [ -d "$tmp_dir" ] && [ -f "${tmp_dir}/xray" ] || {
         _error "staging 目录不可用: ${tmp_dir:-（空）}"; return 1; }
@@ -364,7 +362,7 @@ _xray_commit_staged() {  # <staging_dir> -- 0=mutation batch complete; 1=mutatio
 # geo dat 的事务侧恢复: rollback 始终从 journal 指向的事务唯一快照重放;
 # 快照删除统一由 _xray_core_cleanup_sources 执行(删 journal 前检查全部残留)。
 # ---------------------------------------------------------------------------
-_xref_snapshot_geo_dats() {  # <journal> -- unique transaction paths are recorded in the journal
+_xref_snapshot_geo_dats() {  # <journal>; 事务唯一快照路径记录在 journal 里
     local j="$1" gd src bak pre
     for gd in geoip geosite; do
         src="$ASSET_DIR/${gd}.dat"
@@ -387,7 +385,7 @@ _xref_snapshot_geo_dats() {  # <journal> -- unique transaction paths are recorde
     return 0
 }
 
-_xref_restore_geo_dats() {  # <journal> -- retain snapshot sources until rolled_back phase is durable
+_xref_restore_geo_dats() {  # <journal>; 快照源保留到 rolled_back 落盘
     local j="$1" gd src bak pre failed=0
     for gd in geoip geosite; do
         src="$ASSET_DIR/${gd}.dat"
@@ -592,11 +590,11 @@ _with_deploy_install_lock() {
 
 # ---------------------------------------------------------------------------
 # journal 覆盖 SIGKILL/OOM/掉电后的恢复; 按盘上事实收敛, 不靠同步失败分支。
-# 单向 phase:
+# 单向 phase(cleanup 是 committed/rolled_back 之后的收尾动作, 不是 phase):
 #   core: prepared → snapshotted → replacing → binary_replaced → service_replaced
-#         → restart_verified → committed → cleanup → 删除 journal
-#   geo: prepared → snapshotted → replacing → geo_replaced → restart_verified → committed → cleanup
-#   rollback: replacing / mutation 后置 phase → rolled_back → cleanup
+#         → restart_verified → committed
+#   geo: prepared → snapshotted → replacing → geo_replaced → restart_verified → committed
+#   rollback: replacing 之后的 mutation phase → rolled_back
 # prepared/snapshotted: 生产态未触碰, 只清理; replacing: durable mutation barrier, 此后可能部分改动。
 # *_replaced/restart_verified: 未 committed 崩溃则回滚; committed/rolled_back 不可逆, 仅幂等 cleanup。
 # 终态须先落盘再删恢复源; disk_ok(binary/service/geo)与 run_ok(runtime/版本)均须收敛。
@@ -607,7 +605,8 @@ _xray_core_journal_path() { printf '%s' "$STATE_DIR/coretxn.json"; }
 _xray_core_blocked_path() { printf '%s' "$STATE_DIR/coretxn.blocked"; }
 _xray_core_path_present() { [ -e "$1" ] || [ -L "$1" ]; }
 
-_xray_core_fsync_file_dir() {  # best-effort durability for an artifact and its containing directory
+# 尽力把工件及其父目录刷入存储(失败只降级, 不影响事务结果)。
+_xray_core_fsync_file_dir() {  # <path>
     local p="$1"
     [ -n "$p" ] || return 0
     if _xray_core_path_present "$p"; then _fsync_path "$p" || :; fi
@@ -623,7 +622,7 @@ _xray_core_journal_fields() {  # <journal>; 7 行: binbak stage sprev gip gsp op
            (.operation), (.snapshot_scope // "full")' "$1" 2>/dev/null
 }
 
-_xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
+_xray_core_snapshots_fsync() {  # <journal>; 在 phase=snapshotted 之前调用
     local j="$1" binbak stage sprev gip gsp operation scope f
     local -a sources jf fields
     fields=$(_xray_core_journal_fields "$j") || return 1
@@ -649,7 +648,7 @@ _xray_core_snapshots_fsync() {  # <journal>; called before phase=snapshotted
     return 0
 }
 
-_xray_core_production_fsync() {  # <journal>; best effort before terminal phase/cleanup
+_xray_core_production_fsync() {  # <journal>; 终态/清理前的尽力刷盘
     local j="$1" operation bin unit
     operation=$(jq -r '.operation' "$j" 2>/dev/null) || return 1
     case "$operation" in
@@ -698,8 +697,8 @@ _xray_core_journal_write() {  # <old_version> <old_channel> <new_tag> <channel> 
     sprev=$(_xray_service_prev_path) || return 1
     unit=$(_xray_service_unit_path 2>/dev/null || printf '')
     if [ -n "$unit" ] && _xray_core_path_present "$unit"; then
-        # A masked unit is not a valid service snapshot source. The installer
-        # records it as an absent unit and removes the stale mask before writing.
+        # masked unit 不是合法的 service 快照源: 按"原本无 unit"记账,
+        # 由安装器移除陈旧 mask 后重建。
         if [ "${INIT_SYSTEM:-}" = systemd ] && _xray_service_is_masked "$unit"; then
             service_masked=true
         else
@@ -793,7 +792,7 @@ _xray_core_journal_phase() {
         _xray_core_snapshots_fsync "$j" || {
             _error "无法枚举 coretxn 恢复源, 不推进 snapshotted"; return 1; }
     elif [ "$next" = committed ] || [ "$next" = rolled_back ]; then
-        # Terminal phase means the changed production files are settled before recovery sources may be deleted.
+        # 终态: 先刷已改动的生产文件, 之后才允许删除恢复源。
         _xray_core_production_fsync "$j" || {
             _error "无法枚举 coretxn 生产路径, 不推进终态 phase=$next"; return 1; }
     fi
@@ -952,7 +951,7 @@ _xray_core_journal_ok() {
     fi
     return 0
 }
-# snapshot binary/geodata source for this journal. Called only before phase=snapshotted.
+# 本事务的 binary/geo 快照源; 只允许在 phase=snapshotted 之前调用。
 _xray_core_snapshot_binary() {  # <journal>
     local j="$1" bin bak pre
     bin=$(jq -r '.binary' "$j" 2>/dev/null) || return 1
@@ -1007,7 +1006,8 @@ _xray_core_cleanup_sources() {  # <journal>
     if [ "$scope" = full ]; then
         sources+=("$binbak" "$sprev" "${sprev}.absent" "${sprev}.enabled" "${sprev}.masked")
     fi
-    # Legacy Geo snapshots moved the mask despite owning only dat changes.
+    # full 作用域的 service 快照可能包含 mask: prepared/snapshotted 阶段生产态未改,
+    # 必须在清理快照前把 mask 还原; geo 事务只拥有 dat, 不触碰 mask。
     if [ "$scope" = full ] && [ "$service_masked" = true ] &&
        { [ "$phase" = prepared ] || [ "$phase" = snapshotted ]; }; then
         local unit; unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
@@ -1039,7 +1039,7 @@ _xray_core_cleanup_sources() {  # <journal>
 }
 _xray_core_cleanup_after_commit() {  # <journal>
     local j="$1"
-    # committed / rolled_back 都不可逆: 在删除恢复源前再刷一次生产态, 覆盖旧版本遗留的终态账本。
+    # committed / rolled_back 都不可逆: 删除恢复源前再刷一次生产态, 确保终态改动已落盘。
     _xray_core_production_fsync "$j" || return 1
     # 只清理 transaction-owned artifacts; 源/marker/journal 任一残留都返回失败,
     # 保留 terminal journal 让下次启动继续 cleanup。
@@ -1601,9 +1601,7 @@ _install_or_switch_xray_locked() {
 }
 
 # ---------------------------------------------------------------------------
-# 配置文件初始化(空 inbounds + freedom/blackhole + log)
-# confs/ 里没有任何非空 JSON 时写
-#
+# 配置文件初始化: confs/ 没有任何非空 JSON 时写入空 inbounds、freedom/blackhole 与 log。
 # 初始化是 read-decide-write; 普通入口取可重入 config lock, core-held 例外见函数内锁序说明。
 # ---------------------------------------------------------------------------
 _init_config_if_empty() {
@@ -1656,9 +1654,8 @@ _init_config_if_empty_locked() {
     }
   ]
 }'
-    # 注入默认 DNS 段与默认规则。jq 不可用/失败时不能落地"没有 routing 规则"的半份配置 ——
+    # 注入默认 DNS 段与默认规则; jq 失败时不能落地"没有 routing 规则"的半份配置 ——
     # 那会让首次安装的机器悄悄失去 BT/广告/私网拦截, 故显式失败由调用方处理。
-    # 两个默认常量都取自 00-common(唯一真相), DNS 菜单的 [恢复默认] 复用同一份。
     local content
     content=$(jq --argjson d "$XRAY_DEFAULT_DNS_JSON" --argjson r "$XRAY_DEFAULT_ROUTING_RULES_JSON" \
         '.dns = $d | .routing.rules = $r' <<< "$base") || {
@@ -1715,7 +1712,7 @@ _auto_ensure_config_env() {
 
 # ---------------------------------------------------------------------------
 # 读取当前日志级别(log.loglevel)
-# 真相源只有配置本身 —— 不另存 state 键(项目有 service/config/state 分裂的历史教训)。
+# 真相源只有配置本身, 不另存 state 键, 避免两处状态分裂。
 # 读不到时输出 "warning": 与核心行为一致(infra/conf/log.go 的 default 分支对未识别/缺失
 # 值一律按 warning 处理), 且下游 case 分支不会因空串落到"非法值"。
 # ---------------------------------------------------------------------------
@@ -1787,7 +1784,7 @@ _safe_nofile() {
 }
 
 # ---------------------------------------------------------------------------
-# unit 与 env 版本门控相关, 必须与 binary 同时快照/恢复。
+# unit 与 env 的启动参数必须与 binary 配套, 因此随 binary 一起快照/恢复。
 # 原有 unit 留内容与执行权限, 原无 unit 留 .absent 以撤销新文件。
 # 快照存 BACKUP_DIR, 不在 confs.lastbak 备份范围内; 具体源由 journal 的 txn_id 绑定。
 # ---------------------------------------------------------------------------
@@ -1800,8 +1797,7 @@ _xray_service_unit_path() {
     esac
 }
 
-# systemd mask is a stale, externally managed unit marker, not restorable service
-# content. It is handled as an absent unit during reinstall.
+# systemd mask 是外部管理的陈旧 unit 标记, 不是可恢复的 service 内容; 重装时按"原本无 unit"处理。
 _xray_service_is_masked() {
     local unit="$1" target=""
     [ -L "$unit" ] || return 1
@@ -1809,9 +1805,8 @@ _xray_service_is_masked() {
     [ "$target" = /dev/null ]
 }
 
-# Move the exact /dev/null symlink into the transaction-owned snapshot. A rename
-# avoids unlinking a concurrently replaced regular unit; verify the moved object
-# and fail closed if an external writer won the race.
+# 把精确的 /dev/null 符号链接移入事务私有快照: 用 rename 而非 unlink, 避免删掉并发替换成
+# 普通 unit 的文件; 移动后复核对象, 外部写入抢先则 fail-closed。
 _xray_service_take_mask_snapshot() {  # <unit> <snapshot symlink>
     local unit="$1" snapshot="$2" unit_dev snapshot_dev
     _xray_service_is_masked "$unit" || return 1
@@ -1838,9 +1833,8 @@ _xray_service_restore_mask() {  # <unit> <snapshot symlink>
     if _xray_core_path_present "$unit"; then
         _xray_service_is_masked "$unit" && return 0
         ! _xray_core_path_present "$displaced" || return 1
-        # Preserve the current file until the replacement mask is installed.
-        # A no-clobber symlink creation makes an external concurrent writer fail
-        # closed instead of being overwritten by mv/rm.
+        # 先保全现有文件再安装替换用的 mask; 不覆盖的符号链接创建让并发外部写入
+        # 失败保留, 而不是被 mv/rm 覆盖。
         mv -f "$unit" "$displaced" 2>/dev/null || return 1
     fi
     target=$(readlink "$snapshot" 2>/dev/null) || target=/dev/null
@@ -1881,9 +1875,8 @@ _xray_service_enable_state() {
                 enabled|disabled) printf '%s' "$st" ;;
                 ""|not-found)
                     unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
-                    # Some systemd versions print the missing-unit diagnostic on
-                    # stderr only, leaving stdout empty; an absent managed path
-                    # still has no enablement to preserve.
+                    # 部分 systemd 版本只把 missing-unit 诊断写到 stderr, stdout 为空;
+                    # 受管路径确实不存在时仍然没有 enable 状态需要保留。
                     if [ -n "$unit" ] && ! _xray_core_path_present "$unit"; then
                         printf 'disabled'
                     else
@@ -1893,8 +1886,8 @@ _xray_service_enable_state() {
                 masked)
                     unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
                     if [ -n "$unit" ] && _xray_service_is_masked "$unit"; then
-                        # A stale /dev/null mask has no enable link to preserve;
-                        # treat it as disabled until the installer replaces it.
+                        # 陈旧 /dev/null mask 没有 enable 链接需要保留; 按 disabled 处理,
+                        # 等安装器替换 unit。
                         printf 'disabled'
                     else
                         return 1
@@ -2080,9 +2073,9 @@ _xray_service_snapshot() {
 # ---------------------------------------------------------------------------
 # 生成 service 文件
 # XRAY_LOCATION_ASSET 走配置的 env 段(docs/config/env.md): 核心在构建模块前应用该段,
-# service 文件不再注入同名环境变量。
-# 官方 unit 的 User/Group 与 capability 字段依赖独立 xray 用户和对应目录 ownership；
-# 本项目部署树仍由 root 以 0700/0600 独占管理, 因此只同步不依赖权限迁移的安全字段。
+# service 文件不注入同名环境变量。
+# 官方 unit 的 User/Group/capability 依赖独立 xray 用户与目录 ownership; 本项目由 root
+# 以 0700/0600 独占管理, 故不写这些字段, 只保留 NoNewPrivileges 等不依赖权限迁移的加固项。
 # 注意: _install_or_switch_xray 先替换二进制再调本函数, 这里读到的是"新"核心版本。
 # ---------------------------------------------------------------------------
 _create_xray_systemd_service() {
@@ -2265,7 +2258,7 @@ _manage_xray() {
     local action="$1"
     # 所有 start/stop/restart 都与核心替换/Geo commit 共用 core.lock。锁持有标志由
     # _with_core_lock 的子 shell 继承, 所以事务内部的嵌套调用直接落到下方实现, 不会自锁。
-    # status 是只读观察, 不取锁。缺 flock 时由 _with_core_lock 使用拒绝接管的 mkdir 退路。
+    # status 是只读观察, 不取锁; 缺 flock 时 _with_core_lock 直接拒绝。
     case "$action" in
         start|stop|restart)
             # shellcheck disable=SC2031
@@ -2291,7 +2284,7 @@ _manage_xray() {
                 stop)    systemctl stop xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 restart) systemctl restart xray 2>/dev/null 9>&- {CORE_LOCK_FD}>&- {DEPLOY_INSTALL_LOCK_FD}>&- ;;
                 # 与 openrc/direct 一致地走 _xray_is_running(绑定到 unit MainPID 的
-                # 真实主进程), 不再用裸 is-active —— 后者在主进程已死、systemd 尚未把 unit
+                # 真实主进程), 不用裸 is-active —— 后者在主进程已死、systemd 尚未把 unit
                 # 迁出 active 的窗口内会报 running(详见 _xray_is_running 注释)。
                 status)  if _xray_is_running; then echo "running"; else echo "stopped"; fi ;;
             esac
@@ -2402,10 +2395,10 @@ _manage_xray() {
 }
 
 # ---------------------------------------------------------------------------
-# 重启 xray 并确认稳定运行(取代 _mutate_config 的预跑 xray -test)。
+# 重启 xray 并确认稳定运行(配置写入后统一走这里, 不预跑 xray -test)。
 # 低内存 VPS 上 xray -test 会与运行中的实例同时加载两份二进制+geo, 触发 OOM;
-# 改为重启后做存活确认: 启动前记录主进程身份, restart 后身份必须变化(证明旧进程已退出),
-# 再完整观察 8s, 期间任何一次不为 running 都立即判失败。8s > openrc respawn_delay=5,
+# 改为重启后做存活确认: 启动前记录主进程身份, restart 后先完整观察 8s(期间任何一次不为
+# running 都立即判失败), 再核对身份必须变化(证明旧进程已退出)。8s > openrc respawn_delay=5,
 # 至少覆盖一个崩溃-重生周期, 避免坏配置在启动后短暂 running、随后崩溃却被误判成功。
 # 坏配置/被 OOM 进不了持续 running 态 → 返回 1 触发上层回滚。
 # ---------------------------------------------------------------------------

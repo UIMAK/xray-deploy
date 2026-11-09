@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline official-Hysteria behavior; service and bootstrap publication are local stubs.
+# 离线官方 Hysteria 行为; service 与 bootstrap 发布均为本地桩。
 # 桩函数与 fixture 变量由 source 进来的生产模块间接消费。
 # shellcheck disable=SC2329,SC2034
 set -u
@@ -166,7 +166,7 @@ check 'failed install reports openssl unusable' grep -q 'openssl 安装后仍不
 check 'failed install discards staged key' test -z "$(ls -A "$HYSTERIA_CERT_DIR" 2>/dev/null | grep '\.tls-stage\.')"
 
 printf '== bootstrap zero bandwidth ==\n'
-# Exercise the complete input/JSON assembly path without publishing files or starting a service.
+# 走完整输入/JSON 组装路径, 不发布文件也不启动服务。
 (
     HYSTERIA_CONFIG="$TMP/not-yet-created.json"
     _hysteria_installed() { return 0; }

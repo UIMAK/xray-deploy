@@ -1,5 +1,5 @@
 #!/bin/bash
-# Offline node contracts; only temporary fixtures are changed, never host services.
+# 离线节点契约; 只改临时 fixture, 不触碰宿主服务。
 # 桩函数与渲染上下文 R_* 由 source 进来的生产模块间接消费。
 # shellcheck disable=SC2329,SC2034
 set -u
@@ -175,7 +175,7 @@ inbound_network_probe() (
 )
 check 'inbound network reads settings.network and top-level fallback' inbound_network_probe
 
-# Render and execute the real creation transaction; metadata retains server direction.
+# 渲染并执行真实创建事务; metadata 保留服务端方向。
 R_LISTEN=0.0.0.0 R_PORT=443 R_TAG=hy2-test R_AUTH=secret
 R_CERT_FILE=/fixture/cert.pem R_KEY_FILE=/fixture/key.pem R_CONGESTION=bbr
 _render_template "$ROOT/templates/hysteria2.server.jsonc" > "$TMP/rendered.json"
@@ -214,7 +214,7 @@ check 'ordinary brutal empty omits both fields' jq -e '.streamSettings.finalmask
 link=$(_rebuild_hy2_link "$TMP/committed.json")
 check 'ordinary brutal URI empty omits upload' lacks "$link" '&up='
 
-# Exercise both directions through creation, with an existing byte snapshot to protect.
+# 两个方向都走创建路径, 并带既有字节快照用于保护。
 creation_fixture() {
     printf '{"existing":"config"}\n' > "$TMP/inbound.json"
     printf '{"existing":"metadata"}\n' > "$TMP/committed.json"
@@ -257,7 +257,7 @@ for rate in 1kbps 524287bps not-a-rate; do
     check "shared rate rejects [$rate]" eq "$rc" 1
 done
 
-# Both CDN transports preserve existing Firefox and default absent fp to Chrome.
+# 两种 CDN 传输都保留既有 Firefox, 缺省 fp 回落 Chrome。
 for proto in vless-xhttp-cdn vless-ws-cdn; do
     jq -n --arg p "$proto" '{protocol:$p,name:"cdn",link_addr:"edge",port:443,uuid:"id",host:"site.example",path:"/path",fp:"firefox"}' > "$TMP/cdn.json"
     link=$(_rebuild_cdn_link "$TMP/cdn.json")
@@ -283,7 +283,7 @@ rc=0; out=$(_rebuild_vless_enc_link "$TMP/enc-no-key.json") || rc=$?
 check "enc rebuild rejects missing encryption" eq "$rc" 1
 check "enc rebuild prints nothing on failure" eq "$out" ""
 
-# Real port transactions and recovery run against confdir/metadata fixtures; no host locks/services.
+# 真实端口事务与恢复跑在 confdir/metadata fixture 上; 不取宿主锁、不碰服务。
 eval "$actual_config_jq"
 _with_config_lock() { "$@"; }
 _restart_xray_verified() { return 0; }
@@ -356,7 +356,7 @@ for addr_key in address rewriteAddress; do
     check "single $addr_key address/port untouched" _config_jq -e --arg key "$addr_key" '.inbounds[1] | .tag == "tunnel-site-10443-8443" and .port == 10443 and .settings[$key] == "site.example" and .settings.rewritePort == 443'
 done
 
-# Interrupt after metadata commit, and after config commit, using the actual journal writer.
+# 分别在 metadata 提交后与 config 提交后中断, 使用真实 journal 写入器。
 for committed in false true; do
     reality_fixture "recover-$committed" true rewriteAddress || exit 1
     orig=$(cat "$NODES_DIR/xd-reality-vision-443.json")
@@ -377,7 +377,7 @@ for committed in false true; do
     check "shared recovery committed=$committed preserves tunnel" _config_jq -e '.inbounds[1].tag == "tunnel-site-10443-443" and .routing.rules[0].inboundTag == ["tunnel-site-10443-443"] and .inbounds[2].port == 9443'
 done
 
-# Missing congestion makes the real URI builder fail without writing a partial link.
+# 缺 congestion 时真实 URI 构造器必须失败且不写半成品链接。
 DEPLOY_DIR="$TMP/derived"
 mkdir -p "$DEPLOY_DIR"
 hy2_derived_fixture() {
@@ -400,7 +400,7 @@ rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?
 check 'Hy2 normal derived sync succeeds' eq "$rc" 0
 check 'Hy2 normal derived sync rebuilds link' jq -e '.share_link | startswith("hy2://") and contains("@edge.example:443/")' "$DEPLOY_DIR/meta.json"
 
-# Invoke the real PQ decision using deterministic local command output.
+# 用确定性的本地命令输出驱动真实 PQ 判定。
 XRAY_BIN="$TMP/xray"
 printf '#!/bin/bash\nexit 99\n' > "$XRAY_BIN"
 chmod +x "$XRAY_BIN"

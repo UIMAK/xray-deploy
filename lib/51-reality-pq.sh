@@ -116,8 +116,8 @@ _detect_reality_pq() {
         _warn "$PQ_REASON"
         return 2
     fi
-    # Sampled Xray v25.9.11/v25.12.8/v26.3.27/v26.7.11/v26.9.9 emit RawURLEncoding: seed=32B, public key=1952B.
-    # 43/2603 即该编码的 32B/1952B 长度; 长度或字符集不符一律按未知(rc=2, 保留已有 PQ 配置)。
+    # 实测 Xray v25.9.11/v25.12.8/v26.3.27/v26.7.11/v26.9.9 输出 RawURLEncoding: seed 32B、公钥 1952B。
+    # 43/2603 即该编码下的字符数; 长度或字符集不符一律按未知(rc=2, 保留已有 PQ 配置)。
     local _rawurl_re='^[A-Za-z0-9_-]+$'
     if [ "${#pq_seed}" -ne 43 ] || [ "${#pq_verify}" -ne 2603 ] \
        || ! [[ "$pq_seed" =~ $_rawurl_re ]] || ! [[ "$pq_verify" =~ $_rawurl_re ]]; then

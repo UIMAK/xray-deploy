@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Config-directory split, restore and mutation regressions.
+# 配置目录拆分、恢复与变更回滚回归。
 # shellcheck disable=SC2329,SC2034
 set -u
 

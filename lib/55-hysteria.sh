@@ -384,7 +384,7 @@ _hysteria_pid_is_ours() {
 # OpenRC supervisor 需验证子进程 exe；pidfile 本身不证明核心运行。
 _hysteria_proc_tree_has_bin() {
     local anchor="$1" p c cur i
-    local depth=4   # 见上方契约说明: 实现假设, 超出即返回 1(fail-closed)
+    local depth=4   # 4 层足够覆盖 supervisor→业务进程; 超出按未找到处理(fail-closed)
     [[ "$anchor" =~ ^[0-9]+$ ]] || return 1
     [ "$anchor" != "0" ] || return 1
     if ! declare -F _proc_exe_is_strict >/dev/null 2>&1; then
@@ -584,7 +584,6 @@ _hysteria_kill_stale_supervisor() {
     return 0
 }
 
-# 重启后验证核心存活；官方无 check/validate 子命令。
 # 重启验证用: 当前后端主进程身份(PID:starttime)。未运行/无法确认时输出空。
 _hysteria_proc_identity() {
     local pid="" st=""
@@ -611,6 +610,7 @@ _hysteria_proc_identity() {
     printf '%s:%s' "$pid" "$st"
 }
 
+# 重启后验证核心存活(官方无 check/validate 子命令): 观察 8s 持续 running, 再核对身份已换。
 _hysteria_restart_verified() {
     # 运行中的服务必须先拿到身份, 否则无法证明旧进程已退出; 身份不可读直接拒绝。
     local before="" after="" was_running=0
@@ -816,7 +816,7 @@ _hysteria_backup_config() {
     fi
     chmod 600 "$last_tmp" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
     mv -f "$last_tmp" "${HYSTERIA_BACKUP_DIR}/hysteria.json.lastbak" 2>/dev/null || { rm -f "$tmp" "$last_tmp"; return 1; }
-    # 只喂 glob 给 ls, 不再用 ls | grep 过滤文件名(SC2010); 按 mtime 保留最新 10 份。
+    # 只把 glob 交给 ls(不用 ls | grep 过滤文件名); 按 mtime 保留最新 10 份。
     while IFS= read -r old; do
         [ -n "$old" ] || continue
         i=$((i+1))
@@ -1239,6 +1239,7 @@ _hysteria_auth_ok() {
     jq -e '(.auth.type == "password") and (.auth.password | type == "string") and ((.auth.password | length) > 0)' "$HYSTERIA_CONFIG" >/dev/null 2>&1
 }
 
+# server_initialized = 配置可解析且使用非空 password 认证; 不证明服务当前可运行。
 _hysteria_server_initialized() {
     _hysteria_auth_ok
 }
@@ -1266,12 +1267,14 @@ _hysteria_node_exists() {
     return 1
 }
 
+# 元数据文件存在但不可用(损坏): 与"没有节点"区分, 用于阻止覆盖而不是锁死入口。
 _hysteria_node_broken() {
     _hysteria_node_file_present || return 1
     _hysteria_node_exists && return 1
     return 0
 }
 
+# 菜单准入: 只在 server_initialized 时放行; 否则按配置事实给出可操作提示。
 _hysteria_gate() {
     _hysteria_server_initialized && return 0
     if _hysteria_config_exists; then

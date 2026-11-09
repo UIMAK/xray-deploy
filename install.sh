@@ -104,6 +104,7 @@ _install_file() { # <src> <dest>
     return 0
 }
 
+# 安装后逐项复核清单中的文件存在且非空。
 _verify_installed() {
     local m bad=""
     for m in $LIB_MODULES; do
@@ -170,7 +171,7 @@ _install_backup() {
     fi
     mkdir -p "$ROLLBACK_DIR" 2>/dev/null || return 1
     keep_tmp="$ROLLBACK_DIR/.KEEP.tmp.$$"
-    # 清单尾行只接受准确的 complete。
+    # .KEEP 头行是格式版本, 尾行必须是 complete; 读取端(_install_snapshot_read_entries)严格校验。
     printf '%s\n' 'xray-install-backup-v2' > "$keep_tmp" 2>/dev/null || return 1
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
@@ -212,6 +213,7 @@ _install_backup() {
 
 _install_txn_marker() { printf '%s/.INSTALLING' "$ROLLBACK_DIR"; }
 
+# 清单只接受发布清单内的相对路径, 拒绝其它路径(防路径穿越)。
 _install_snapshot_rel_ok() {
     local rel="$1" base
     case "$rel" in
@@ -230,6 +232,7 @@ _install_snapshot_rel_ok() {
     return 0
 }
 
+# 严格解析 .KEEP 恢复清单: 只接受合法相对路径、无重复项、完整头尾; 失败不产出条目。
 _install_snapshot_read_entries() {
     local d="$1" require_marker="${2:-1}" name suffix keep line marker
     local state rel extra count=0 seen='|' entries='' saw_entrypoint=0 saw_version=0 trailer=0
@@ -646,7 +649,7 @@ if ! _install_lock_acquire; then
     exit 1
 fi
 
-# Recover any prior publication interrupted after its complete rollback snapshot was created.
+# 恢复上次发布在快照完整落盘后中断的事务(.INSTALLING 标记仍在)。
 if ! _install_recover_interrupted; then
     exit 1
 fi
@@ -664,7 +667,7 @@ if [ "$IS_UPDATE" -eq 1 ]; then
         if [ ! -e /usr/local/bin/xray ] || [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$DEPLOY_DIR/bin/xray" ]; then
             ln -sf "$DEPLOY_DIR/bin/xray" /usr/local/bin/xray
         fi
-        # 顶层作用域不使用 local。
+        # 顶层作用域没有 local: 这里只能直接赋值。
         inst_ver=$(cat "$DEPLOY_DIR/VERSION" 2>/dev/null || echo "?")
         echo "[成功] 更新完成 (版本 ${inst_ver})"
     else

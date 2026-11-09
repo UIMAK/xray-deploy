@@ -2,7 +2,7 @@
 
 CF_GRACE_DEFAULT=30    # 官方 --grace-period 默认值
 CF_GRACE_MARGIN=5      # 余量: 不在宽限期到点的同一瞬间强杀
-CF_GRACE_MAX=300       # 上限: 防病态配置(cloudflared 自身只接受 <=3 分钟, 4h 只可能是手写错误)
+CF_GRACE_MAX=300       # 等待上界: 病态/手写的超长宽限期按 300s 计, 避免无限等待
 CF_STOP_REVERIFY=5     # 强杀后复验 systemd 停止终态的上界(进程已死, 只剩 unit 事务)
 
 _cf_arch_tag() {
@@ -656,7 +656,7 @@ _cf_systemd_grace_raw() {
     return 1
 }
 
-# systemd 有效配置优先，读不到才退回文本；宽限期不能按主 unit 猜测。
+# systemd 可判定时以它为准(明确没配就不回退文本); 只有无法判定才退回文本。
 _cf_grace_config() {
     local svcfile="$1" ln arr=() i w v efpath eff rc efval=""
     if [ "${INIT_SYSTEM:-}" = systemd ]; then
@@ -1095,7 +1095,7 @@ _uninstall_cloudflared() {
         rm -f /etc/cloudflared/token || cleanup_rc=1
     fi
     [ ! -e /etc/cloudflared/token ] && [ ! -L /etc/cloudflared/token ] || cleanup_rc=1
-    rmdir /etc/cloudflared 2>/dev/null || true  # Preserve any user-owned config.yml.
+    rmdir /etc/cloudflared 2>/dev/null || true  # 目录非空则保留用户自有的 config.yml
     if [ -x "$CF_BIN" ]; then
         _info "卸载 cloudflared..."
         "$CF_BIN" service uninstall 2>/dev/null || service_rc=$?

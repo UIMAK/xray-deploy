@@ -669,7 +669,7 @@ _reset_journal_quarantine() {   # <journal> <原因>
     return 1
 }
 
-# prepared 文件恢复只用事务私有快照；重置前无配置则恢复无配置，见 _reset_config_snapshot_restore。
+# prepared 文件恢复只用事务私有快照；重置前无配置则恢复为无配置。
 _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <had_config>
     local stage="$1" nodes_moved="$2" had_config="$3" ok=0 f content=""
     if [ "$had_config" -eq 1 ]; then
@@ -1188,7 +1188,7 @@ _hy2_masq_menu() {
     local tag
     tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
 
-    # 入站必须真实存在于 config(见文件头注释: 否则 jq 0 命中而菜单报成功)
+    # 入站必须真实存在于 config, 否则 jq 命中 0 条也会报成功。
     _config_jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' >/dev/null 2>&1 \
         || { _error "配置中找不到该节点的入站(${tag}); 请先同步/修复配置"; _press_any_key; return; }
 
@@ -1596,7 +1596,7 @@ _hy2_adjust_bandwidth() {
     new_down=$(_normalize_bandwidth "$new_down")
 
     local txn_rc=0
-    # Blank inputs and _hy2_sync_derived are resolved from current state inside the transaction lock.
+    # 空输入按当前值保持、_hy2_sync_derived 的派生都在事务锁内解析。
     _hy2_congestion_txn "$tag" bandwidth "" "$new_up" "$new_down" || txn_rc=$?
     case "$txn_rc" in
         0)
@@ -1760,7 +1760,8 @@ _hy2_obfs_menu() {
         *) _warn "无效选择"; _press_any_key; return ;;
     esac
     local txn_rc=0
-    # `_hy2_obfs_txn_locked` rechecks `_hy2_udp_has_foreign_salamander "$tag"` only for enable; if it refuses, it points users to the safe [3] close action.
+    # 启用时锁内的 _hy2_obfs_txn_locked 会复核外来 salamander 层; 拒绝时会引导用户
+    # 改用安全的 [3] 关闭操作。
     _hy2_obfs_txn "$tag" "$meta" "$obfs_choice" "$otype" "$opw" "$osize" "$omask" || txn_rc=$?
     case "$txn_rc" in
         0)

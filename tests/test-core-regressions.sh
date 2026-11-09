@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline scratch coverage of real core/Geo journals and direct service control.
+# 离线 scratch 覆盖真实 core/Geo 账本与 direct service 控制。
 # 桩函数与 fixture 变量由 source 进来的生产模块间接消费。
 # shellcheck disable=SC2329,SC2034
 set -u
@@ -22,7 +22,7 @@ trap cleanup EXIT
     [ -n "$maybe_drop_caches_definition" ] ||
         { printf 'SUMMARY pass=0 fail=1 (declare -f _maybe_drop_caches failed)\n'; exit 1; }
     _maybe_drop_caches() { :; }
-    # Map the allowlisted unit path to scratch while keeping real schema checks.
+    # 把白名单 unit 路径映射到 scratch, 仍保留真实 schema 校验。
     # 必须确认替换真的发生: 否则 eval 的是未修改函数, 会以真实系统路径运行却仍报 PASS。
     journal_ok_definition=$(declare -f _xray_core_journal_ok)
     [ -n "$journal_ok_definition" ] || { printf 'SUMMARY pass=0 fail=1 (declare -f failed)\n'; exit 1; }
@@ -287,7 +287,7 @@ trap cleanup EXIT
         INIT_SYSTEM=direct
         local pidfile="$DEPLOY_DIR/xray.pid"
         printf '4242 123' > "$pidfile"
-        # Map only the hardcoded pidfile/comm reads; no real process is signalled.
+        # 只映射写死的 pidfile/comm 读取; 不给任何真实进程发信号。
         # 替换必须命中, 否则 eval 未修改函数会 rm -f 宿主真实的 /run/xray.pid。
         _manage_xray_definition=$(declare -f _manage_xray)
         [ -n "$_manage_xray_definition" ] || return 1

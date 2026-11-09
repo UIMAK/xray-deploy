@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Focused offline regressions for shared configuration and state paths.
+# 共享配置与 state 路径的离线回归。
 # shellcheck disable=SC2329,SC2034
 set -u
 

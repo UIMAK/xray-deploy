@@ -1,5 +1,5 @@
 #!/bin/bash
-# Offline service transactions; mocks never call the host's init system.
+# 离线 service 事务; 桩不调用宿主 init 系统。
 # 桩函数与颜色/状态 fixture 由 source 进来的生产模块间接消费。
 # shellcheck disable=SC2329,SC2034
 set -u

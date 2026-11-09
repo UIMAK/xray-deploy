@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline share-link import contracts; only temporary config fixtures are changed.
+# 离线分享链接导入契约; 只改临时配置 fixture。
 # shellcheck disable=SC2329,SC2034
 set -u
 

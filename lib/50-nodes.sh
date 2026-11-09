@@ -15,11 +15,11 @@ PROTOCOLS=(
 )
 
 # ---------------------------------------------------------------------------
-# 带宽格式化: 纯数字自动补 mbps 单位
+# 带宽参数: 校验与格式化
 # ---------------------------------------------------------------------------
 # 发布核心按 1024 倍单位转为字节/秒；上下行非零时至少 65536，force 上行必须非零。
 # 不把微小正数截断为零当作不限速；只有输入数值零可免除最低速率。
-# Xray v26.9.30: infra/conf/transport_method.go Bandwidth.Bps / transport_internet.go Build。
+# 依据: infra/conf/transport_method.go Bandwidth.Bps 与 transport_internet.go Build。
 _hy2_brutal_rate_valid() {
     local v="${1,,}" required="${2:-false}" rate unit mul
     if [ -z "$v" ]; then
@@ -182,7 +182,7 @@ _hy2_obfs_mask_block() {
 }
 
 # masquerade 仅改 hysteriaSettings.masquerade，独立于 finalmask.udp；Xray 使用扁平字段。
-# unix socket 与 xForwarded 由协议支持(transport_method.go/hysteria/hub.go), 不再按版本探测。
+# unix socket 与 xForwarded 由协议支持(transport_method.go/hysteria/hub.go), 不按版本探测。
 
 # 完整已知字段按 Masquerade json tag 清理；保留未知字段以免覆盖外部配置。
 XD_MASQ_KNOWN_KEYS_JSON='["type","dir","url","rewriteHost","xForwarded","insecure","content","headers","statusCode"]'
@@ -241,7 +241,7 @@ _hy2_masq_url_invalid() {
     case "$u" in
         *[[:space:]]*) printf '%s' "URL 不能含空格/制表符(空格需写成 %20)"; return ;;
     esac
-    # URL 仅开放本机核心的 scheme；unix/空 scheme 要求 >=v26.9.8(hysteria/hub.go)。
+    # URL 只开放核心支持的 scheme: http/https、unix://、裸绝对路径(hysteria/hub.go)。
     scheme="${u%%://*}"
     case "$u" in
         http://*|https://*)
@@ -337,7 +337,9 @@ _hy2_masq_apply() {
     fi
 }
 
-# 端口跳跃操作只写本节点 DNAT；删除节点必须同时清理 runtime 与持久化状态。
+# ---------------------------------------------------------------------------
+# 端口跳跃 DNAT: 只写本节点规则; 删除节点必须同时清理 runtime 与持久化状态。
+# ---------------------------------------------------------------------------
 
 # 确保 iptables 已安装(Debian 同时装 iptables-persistent 做开机恢复)
 _ensure_iptables() {
@@ -463,8 +465,8 @@ _hy2_iptables_persist_files() {
         _hy2_conf_save_path "$conf_dir/iptables" IPTABLES_SAVE "$ipt_dir/rules-save"
         _hy2_conf_save_path "$conf_dir/ip6tables" IP6TABLES_SAVE "$ipt_dir/rules6-save"
     elif [ -x "$initd_dir/iptables" ] || [ -x "$initd_dir/ip6tables" ]; then
-        # A test/container may expose the OpenRC scripts without being classified Alpine;
-        # their default save paths are still part of the persistence surface.
+        # 测试/容器可能暴露 OpenRC 脚本却未被判定为 Alpine;
+        # 这些脚本的默认保存路径同样属于持久化范围。
         _hy2_conf_save_path "$conf_dir/iptables" IPTABLES_SAVE "$ipt_dir/rules-save"
         _hy2_conf_save_path "$conf_dir/ip6tables" IP6TABLES_SAVE "$ipt_dir/rules6-save"
     fi
@@ -953,8 +955,8 @@ _hy2_hop_apply() {
     return 0
 }
 
-# Remove only transaction-owned family-tagged records emitted by _hy2_add_hop_rules.
-# Records must carry v4:<range> or v6:<range>.
+# 只删除 _hy2_add_hop_rules 输出的、带 family 标记的事务自有记录。
+# 记录必须带 v4:<range> 或 v6:<range>; 缺标记一律拒绝清理。
 _hy2_remove_created_hop_rules() {
     local port="$1" rec family range cmd q specs line remain rc=0
     shift
@@ -1412,8 +1414,8 @@ _hy2_hop_cleanup_candidates() {
     command -v iptables >/dev/null 2>&1 || return 1
     local q q6="" v6ok=0
     q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
-    # 统一三态观察( 之前这里缺 /proc/net/ip6_tables_names 分支, 会只枚举 IPv4,
-    # 把可能存在却观察不到的 IPv6 规则漏出恢复源; 现在与另两个观察点完全同口径。
+    # IPv6 与另两个观察点同口径走 _hy2_ipv6_state 三态: 未知/无法观察都不得
+    # 漏出可能存在的 IPv6 规则, 否则恢复源不完整。
     case "$(_hy2_ipv6_state)" in
         ip6tables)
             # IPv6 与 IPv4 同为"会被删除的 runtime": 查不到就建不起恢复源 ⇒ 返回 1(fail-closed)。
@@ -1587,14 +1589,15 @@ _hy2_cleanup_all_hops() {
 _gen_random_port() {
     local lo hi range r
     lo=20000; hi=65000; range=$((hi-lo+1))
-    # /dev/urandom 取 2 字节做随机数(无 Math.random 限制)
+    # /dev/urandom 取 2 字节做随机数
     r=$(od -An -tu2 -N2 /dev/urandom 2>/dev/null | tr -d ' ')
     [ -z "$r" ] && r=${RANDOM:-$(( $$ % 45000 + 20000 ))}
     echo $(( lo + (r % range) ))
 }
 
+# 端口输入(回车随机): 逐项校验格式、占用、配置冲突与跳跃区间; EOF 取消。
 _input_port() {
-    local proto="${1:-}"  # optional: tcp, udp, or empty (both)
+    local proto="${1:-}"  # 可选: tcp / udp / 空(两者)
     local exclude_tag="${2:-}"  # 改端口时排除自身已有的跳跃区间
     local port="" def
     def=$(_gen_random_port)
@@ -2481,6 +2484,8 @@ _find_reality_for_tunnel_tag() {
 }
 
 # ---------------------------------------------------------------------------
+# tunnel_tag 是否仍被本次删除之外的 Reality 节点引用: 0=仍有, 1=无, 2=无法判定。
+# ---------------------------------------------------------------------------
 _reality_tunnel_has_surviving_refs() {
     local tunnel_tag="$1" refs rt removed found tunnel_count
     shift
@@ -3260,8 +3265,8 @@ _hy2_cert_key_match() {
     [ -n "$cpub" ] && [ "$cpub" = "$kpub" ]
 }
 
-# 删除证书备份文件。删不掉不算事务失败(残留 .bak 不影响运行态), 但必须如实报告 ——
-# 项目原则: 文件操作失败不得静默吞掉(logrotate 的 `|| true` 洗返回码就是 P1 教训)。
+# 删除证书备份文件。删不掉不算事务失败(残留 .bak 不影响运行态), 但必须如实报告:
+# 文件操作失败不得静默吞掉。
 _hy2_cert_bak_rm() {
     local f
     for f in "$@"; do
@@ -3321,7 +3326,7 @@ _hy2_cert_commit() {
     return 0
 }
 
-# 证书SNI取具体DNS SAN；通配符不能作为客户端具体serverName(tls.md)。
+# 自签证书用于 SNI 的域名: SAN 命中本次域名则用它, 否则取首个 DNS SAN, 再回退 CN(tls.md)。
 _hy2_cert_domain() {
     local cert="$1" preferred="${2:-}" d=""
     if [ -n "$preferred" ] && _hy2_cert_san_has "$cert" "$preferred"; then
@@ -3334,19 +3339,20 @@ _hy2_cert_domain() {
     printf '%s' "$d"
 }
 
-# 自签EC-256/10年优先openssl，缺失时 xray tls cert；全程校验后再提交。
-# --file 是前缀，输出 .crt/.key；不安装新工具，不依赖外部证书服务。
+# 既有证书可否复用: SAN 覆盖本次域名且 cert/key 属于同一密钥对。
 _hy2_cert_reusable() {
     local cert="$1" key="$2" domain="$3"
     [ -f "$cert" ] && [ -f "$key" ] || return 1
     command -v openssl >/dev/null 2>&1 || return 0   # 读不到 SAN/无法校验, 只能信任既有证书
-    # SAN 必须覆盖本次域名, 且 cert/key 必须同属一个密钥对 —— 后者让历史遗留的错配对
-    # (旧版本失败路径可能留下)在下一次调用时被判为不可复用, 从而被重新生成(自愈)。
+    # SAN 必须覆盖本次域名, 且 cert/key 同属一个密钥对; 错配对在下一次调用时判为不可复用,
+    # 从而被重新生成(自愈)。
     _hy2_cert_san_has "$cert" "$domain" || return 1
     _hy2_cert_key_match "$cert" "$key" || return 1
     return 0
 }
 
+# 自签 EC-256/10 年: 优先 openssl, 缺失时回退 xray tls cert; --file 是前缀, 输出 .crt/.key。
+# 全程校验后再提交; 不安装新工具, 不依赖外部证书服务。
 # 用法:_gen_hy2_cert <tag> [domain]  输出: CERT_FILE_PATH / KEY_FILE_PATH 全局变量
 _gen_hy2_cert() {
     local tag="$1" domain="${2:-$XD_HY2_DEFAULT_SNI}"
@@ -3396,7 +3402,7 @@ EOF
         [ -s "${xpre}.crt" ] && mv -f "${xpre}.crt" "$tmp_cert"
         [ -s "${xpre}.key" ] && mv -f "${xpre}.key" "$tmp_key"
         rm -f "${xpre}.crt" "${xpre}.key" 2>/dev/null
-        # 清理历史错误写法可能残留在父目录的 <tag>.crt/.key
+        # 清理可能残留在父目录的旧写法 <tag>.crt/.key
         rm -f "${CERT_DIR}/${tag}.crt" "${CERT_DIR}/${tag}.key" 2>/dev/null
     fi
     if [ -s "$tmp_cert" ] && [ -s "$tmp_key" ]; then
@@ -3565,7 +3571,7 @@ _hy2_cert_ref_abspaths() {
     return 0
 }
 
-# canonical解析不依赖cwd，优先realpath再readlink；未知返回失败不猜路径。
+# canonical 解析不依赖 cwd(在父目录内解析 basename), 用 readlink -f; 未知返回失败不猜路径。
 _hy2_realpath() {
     local p="$1" dir base out
     [ -n "$p" ] || return 1
@@ -4476,7 +4482,7 @@ _delete_node_apply_multi() {
             return 1
         fi
     done
-    # //同全删入口 —— teardown 在锁内, 逐项判定。
+    # 与全删入口同一判据: teardown 在锁内, 逐项判定。
     if ! _hy2_hop_teardown_all "${del_tags[@]}"; then
         _error "所选节点都无法安全清理端口跳跃规则, 已取消删除(节点未动)"
         return 1
@@ -5039,8 +5045,8 @@ _port_txn_recover_locked() {
         new_path=$(jq -r '.new_path' "$j" 2>/dev/null)
         ranges=$(jq -r '.ranges // ""' "$j" 2>/dev/null)
 
-        # (a) config is the recovery authority; unreadable, malformed, or non-canonical states
-        # cannot be guessed as "not committed" because that could overwrite newer metadata.
+        # (a) config 是恢复权威: 读不到/非法/非规范状态不能猜成"未提交",
+        #     否则可能覆盖更新的 metadata。
         local cfg_state
         if ! _config_jq -e 'type == "object" and (.inbounds | type == "array")' \
             >/dev/null 2>&1; then
@@ -5292,6 +5298,8 @@ _modify_port() {
     _press_any_key
 }
 
+# ---------------------------------------------------------------------------
+# 更新监听: 锁内复核身份后先改 config, 再写 metadata; metadata 失败回滚监听。
 # ---------------------------------------------------------------------------
 _update_listen_commit() {
     _with_config_lock _with_config_write_barrier _update_listen_commit_locked "$@"

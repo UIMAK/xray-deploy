@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Usage: XRAY_TEST_BIN=/path/to/xray bash tests/verify-configs.sh
-# Only parses isolated configs; never installs a core or starts a service.
+# 用法: XRAY_TEST_BIN=/path/to/xray bash tests/verify-configs.sh
+# 只解析隔离配置; 不安装核心, 不启动服务。
 # R_* 渲染上下文与 DEPLOY_* 等由 source 进来的生产模块消费, 单文件分析看不到引用。
 # shellcheck disable=SC2034
 set -euo pipefail
@@ -32,7 +32,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Source modules only: the main entry point must never run.
+# 只 source 模块: 主入口绝不能被执行。
 source "$repo/lib/00-common.sh"
 source "$repo/lib/20-xray-core.sh"
 source "$repo/lib/50-nodes.sh"
@@ -106,7 +106,7 @@ check_rendered() {
     fi
 }
 
-# Set the complete render context after sourcing; production defaults must stay unused.
+# source 之后设置完整渲染上下文; 不得落到生产默认值。
 R_LISTEN=127.0.0.1
 R_UUID=5783a3e7-e373-51cd-8642-c83782b807c5
 R_TARGET='config-test.invalid'
@@ -129,7 +129,7 @@ R_FLOW=''
 R_DECRYPTION=none
 R_NETWORK=tcp,udp
 
-# Real key material is required by REALITY and ENC (official reality/vless docs).
+# REALITY 与 ENC 需要真实密钥材料(官方 reality/vless 文档)。
 if keypair=$("$XRAY_BIN" x25519 2> "$scratch/x25519.log"); then
     R_PRIVATE_KEY=$(printf '%s\n' "$keypair" | awk -F': ' '/^Private/ {print $2; exit}')
 fi
@@ -271,7 +271,7 @@ for mode in plain salamander gecko brutal; do
     hy="$inbound"
 done
 
-# Core Bandwidth.Bps uses binary units; Build requires >=65536 bytes/s, not docs' 65535 bps.
+# 核心 Bandwidth.Bps 用二进制单位; Build 要求 >=65536 bytes/s, 不是文档里的 65535 bps。
 for rate in 1kbps 0.01mbps 10kbps 65534bps 65535bps 100kbps 524287bps 511.999kbps 0.499999mbps \
             524288bps 512kbps 0.5mbps '.5 MBPS' 524288 '512 kb'; do
     case "$rate" in

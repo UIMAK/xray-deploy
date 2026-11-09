@@ -141,6 +141,7 @@ _outbound_accept_tag() {
     fi
 }
 
+# 读取粘贴的多行链接: 含 :// 的算链接, 首个非链接行留给后续 tag 输入(prefetch)。
 _outbound_read_link_inputs() {   # <first line>
     local line
     _OB_INPUTS=("$1")
@@ -195,6 +196,7 @@ _outbound_prompt_tag() {
     done
 }
 
+# 原子追加出口; tag 重复/占用在实际写入时由 jq 复核, 不依赖上游检查。
 _outbound_commit() {
     local obs="$1"
     printf '%s' "$obs" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1 || {

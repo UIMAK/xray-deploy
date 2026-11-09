@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline state-changing menu behavior: transactions, cron and reset recovery.
+# 离线验证会改状态的菜单行为: 事务、cron 与 reset 恢复。
 # shellcheck disable=SC2329,SC2034
 set -u
 
