@@ -549,18 +549,32 @@ _route_read_tokens() {
     done
 }
 
-# 该 inboundTag 已有无其它匹配项的 block 兜底规则时(节点/Reality tunnel 会生成这种规则),
+# 该 inboundTag 已有 block 兜底规则时(节点/Reality tunnel 会生成这种规则),
 # 其后追加的 inboundTag 规则永远不会命中; 向导须拒绝, 不能制造无效规则。
+# outboundTag/balancerTag/ruleTag/webhook 是动作/标记/通知字段, 不限制匹配范围;
+# network 覆盖 tcp+udp 时等价于匹配全部流量。其它匹配字段出现即视为收窄范围。
 _route_inbound_has_block_fallback() {   # <tag>
     local tag="${1:-}"
     [ -n "$tag" ] || return 1
     _config_jq -e --arg t "$tag" '
+        def xd_meta_key:
+          . as $k | ["outboundTag", "balancerTag", "ruleTag", "webhook"] | index($k) != null;
+        def xd_network_all:
+          (if type == "string" then split(",") elif type == "array" then . else [] end)
+          | map(tostring | ascii_downcase)
+          | (index("tcp") != null and index("udp") != null);
+        def xd_catch_all:
+          . as $r
+          | ([$r | to_entries[] | select((.key | xd_meta_key) | not)
+              | select(.key == "inboundTag" or (.key == "network" and (.value | xd_network_all)))]
+             | length)
+            == ([$r | keys[] | select((xd_meta_key) | not)] | length);
         [.routing.rules[]?
          | select(type == "object")
          | select(.outboundTag? == "block")
          | select((.inboundTag? // null) != null)
          | select(((.inboundTag | if type == "string" then split(",") else . end) | index($t)) != null)
-         | select((keys - ["inboundTag", "outboundTag", "ruleTag", "balancerTag"] | length) == 0)
+         | select(xd_catch_all)
         ] | length > 0' >/dev/null 2>&1
 }
 

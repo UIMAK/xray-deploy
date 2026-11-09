@@ -304,6 +304,32 @@ route_inbound_shadow() (
 setup_case route-shadow
 check 'shadowed node inbound rejects inbound rules, open inbound still works' route_inbound_shadow
 
+# network 覆盖 tcp+udp、webhook 通知字段都不能让兜底规则漏判。
+route_inbound_shadow_variants() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"a-net"},{tag:"b-hook"},{tag:"c-open"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["a-net"],network:"tcp,udp",outboundTag:"block"},
+            {inboundTag:["b-hook"],outboundTag:"block",webhook:{url:"https://example.test/hook"}}
+        ]}}')" || return 1
+    local captured="$TMP/route-shadow-variants-args"
+    _mutate_config() { printf '%s\n' "$*" > "$captured"; return 0; }
+    rm -f "$captured"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n3\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["c-open"\]' "$captured"
+)
+setup_case route-shadow-variants
+check 'network tcp+udp and webhook do not hide block fallbacks' route_inbound_shadow_variants
+
 # 恢复默认保留节点规则; 带用户标记的 inboundTag 规则属于自定义规则, 必须一并丢弃。
 route_restore_defaults() (
     mkdir -p "$BIN_DIR"
