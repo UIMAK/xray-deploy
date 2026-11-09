@@ -79,7 +79,7 @@ _geo_source_label() {
                 printf '%s' "自定义链接(链接无效, 已回落默认)"
             fi
             ;;
-        *) printf '%s' "XTLS/Xray-rules-dat (默认, lite)" ;;
+        *) printf '%s' "XTLS/Xray-rules-dat" ;;
     esac
 }
 
@@ -274,7 +274,7 @@ _geo_set_auto_update() {
             fi
             gd=$(_geo_geodata_json) || return 1
             _mutate_config --argjson gd "$gd" '.geodata = $gd' || return 1
-            _success "Geo 自动更新已开启 (Xray 内置: $GEO_CRON_EXPR, 热重载)"
+            _success "Geo 自动更新已开启 (Xray 内置: $GEO_CRON_EXPR)"
             ;;
         off)
             _mutate_config 'del(.geodata)' || return 1
@@ -301,9 +301,9 @@ _geo_next_run_hint() {
     if [ -n "$c" ]; then
         # 只有值仍是默认常量时才描述具体时间, 手改 cron 后不虚构执行时刻。
         if [ "$c" = "$GEO_CRON_EXPR" ]; then
-            echo "Xray 内置定时: ${c} ($(_geo_cron_label), 热重载)"
+            echo "Xray 内置定时: ${c} ($(_geo_cron_label))"
         else
-            echo "Xray 内置定时: ${c} (热重载)"
+            echo "Xray 内置定时: ${c}"
         fi
         return
     fi
@@ -323,11 +323,11 @@ _route_preflight() {
     return 0
 }
 
-# 单次 jq 输出“总数 Geo数 节点数 私网标记数 混合数”, 减少整份配置读取。
-# 失败输出 0 0 0 0 0 并返回 1, 菜单必须区分不可读与确实无规则。
+# 单次 jq 输出“总数 Geo数 节点数 混合数”, 减少整份配置读取。
+# 失败输出 0 0 0 0 并返回 1, 菜单必须区分不可读与确实无规则。
 _route_rules_stats() {
     if ! _config_present || ! command -v jq >/dev/null 2>&1; then
-        printf '0 0 0 0 0'
+        printf '0 0 0 0'
         return 1
     fi
     local out
@@ -337,10 +337,9 @@ _route_rules_stats() {
             (\$r | length),
             ([\$r[] | select(${GEO_RULE_REF_JQ})] | length),
             ([\$r[] | select(.inboundTag? != null and (.ruleTag? // \"\") != \"${ROUTE_USER_RULE_TAG}\")] | length),
-            ([\$r[] | select((.ruleTag? // null) == \"${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}\")] | length),
             ([\$r[] | select(.inboundTag? != null and (.ruleTag? // \"\") != \"${ROUTE_USER_RULE_TAG}\" and (${GEO_RULE_REF_JQ}))] | length)
-          ] | @tsv" 2>/dev/null) || { printf '0 0 0 0 0'; return 1; }
-    [ -n "$out" ] || { printf '0 0 0 0 0'; return 1; }
+          ] | @tsv" 2>/dev/null) || { printf '0 0 0 0'; return 1; }
+    [ -n "$out" ] || { printf '0 0 0 0'; return 1; }
     # 转空格供菜单 read 拆分, 与上面的单行输出契约一致。
     printf '%s' "$out" | tr '\t' ' '
     return 0
@@ -774,7 +773,7 @@ _route_delete_rule_flow() {
     rule=$(_config_jq -c --argjson i "$idx" '.routing.rules[$i] // empty') && [ -n "$rule" ] \
         || { _error "读取待删规则失败"; return 1; }
     if [ -n "${XRAY_PRIVATE_BLOCK_RULE_TAG:-}" ] && [ "$rule_tag" = "$XRAY_PRIVATE_BLOCK_RULE_TAG" ]; then
-        _warn "这是精简规则注入的私网防护规则; 删除后客户端可经节点访问本机私网与云元数据"
+        _warn "这是精简规则注入的私网 block 规则; 删除后客户端可经节点访问本机私网与云元数据"
     fi
     read -rp "  确认删除第 $((idx + 1)) 条规则? [y/N]: " ans || return 0
     case "$ans" in
@@ -810,10 +809,10 @@ _route_restore_default_flow() {
 # 精简流程: 精简范围和顺序见 _route_slim_geo_rules。
 _route_slim_flow() {
     _route_preflight || return 1
-    local total=0 geo=0 node=0 mark=0 mixed=0 stats_ok=1 private_ok=0 stats="" ans="" dnsgeo=""
+    local total=0 geo=0 node=0 mixed=0 stats_ok=1 private_ok=0 stats="" ans="" dnsgeo=""
     stats=$(_route_rules_stats) || stats_ok=0
     # 失败时不 read 空结果, 避免把已初始化数字覆盖为空并触发算术诊断。
-    [ "$stats_ok" -eq 1 ] && read -r total geo node mark mixed <<< "$stats"
+    [ "$stats_ok" -eq 1 ] && read -r total geo node mixed <<< "$stats"
     _route_private_block_valid && private_ok=1
     # stats 读取失败时 geo/node/mixed 仍是初值 0: 既不能判"已是精简", 也不能拿 0 去确认删除。
     if [ "$stats_ok" -ne 1 ]; then
@@ -821,7 +820,7 @@ _route_slim_flow() {
         return 1
     fi
     if [ "$geo" -eq 0 ] && [ "$private_ok" -eq 1 ]; then
-        _info "已是精简状态(无 geo 引用 + 私网防护已注入), 无需重复操作"
+        _info "已是精简状态(无 geo 引用 + 精简私网规则已注入), 无需重复操作"
         return 0
     fi
     echo
@@ -946,7 +945,7 @@ _geo_data_menu() {
         if [ "$state" = "on" ]; then
             echo -e "  当前状态: ${GREEN}● 已开启${NC}"
             echo -e "  下次执行: $(_geo_next_run_hint)"
-            echo -e "  更新机制: ${GREEN}Xray 内置定时(热重载)${NC}"
+            echo -e "  更新机制: ${GREEN}Xray 内置定时${NC}"
         else
             echo -e "  当前状态: ${RED}○ 已关闭${NC}"
         fi
@@ -1377,7 +1376,7 @@ _geo_extra_delete() {
 # Geo 数据本身的更新与数据源切换在 [9] 子菜单, 避免主菜单堆十几项。
 _split_menu() {
     local choice="" state="" stats="" stats_ok=1
-    local total=0 geo=0 node=0 mark=0 mixed=0 private_ok=0
+    local total=0 geo=0 node=0
     while true; do
         clear
         echo
@@ -1392,17 +1391,8 @@ _split_menu() {
         stats_ok=1
         stats=$(_route_rules_stats) || stats_ok=0
         if [ "$stats_ok" -eq 1 ]; then
-            read -r total geo node mark mixed <<< "$stats"
+            read -r total geo node _ <<< "$stats"
             echo -e "  路由规则: ${CYAN}${total}${NC} 条 (引用 geo ${geo} 条, 节点规则 ${node} 条)"
-            private_ok=0
-            _route_private_block_valid && private_ok=1
-            if [ "$private_ok" -eq 1 ]; then
-                echo -e "  私网防护: ${GREEN}已注入字面量 CIDR${NC}"
-            elif [ "$mark" -gt 0 ]; then
-                echo -e "  私网防护: ${RED}规则标记存在但内容、唯一性或顺序无效${NC}"
-            else
-                echo -e "  私网防护: ${CYAN}未注入${NC}"
-            fi
         else
             echo -e "  路由规则: ${YELLOW}无法读取${NC} (Xray 未安装 / 配置缺失 / jq 不可用)"
         fi
