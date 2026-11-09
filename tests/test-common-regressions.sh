@@ -180,6 +180,287 @@ geo_name_checks() {
 setup_case geo-names
 check 'custom geodata names require .dat and reject .gz sources' geo_name_checks
 
+geo_source_defaults() {
+    [ "$GEO_CRON_EXPR" = "30 4 * * *" ] &&
+        case "$GEO_SRC_XTLS_GEOSITE" in
+            *"geosite.dat.gz") ;;
+            *) return 1 ;;
+        esac &&
+        case "$GEO_SRC_XTLS_GEOIP" in
+            *"geoip-lite.dat.gz") ;;
+            *) return 1 ;;
+        esac &&
+        _geo_url_gz 'https://example.com/geoip-lite.dat.gz' &&
+        _geo_url_gz 'https://example.com/geosite.dat.GZ?x=1' &&
+        ! _geo_url_gz 'https://example.com/geosite.dat'
+}
+check 'default Geo source is daily 04:30 with lite .gz assets' geo_source_defaults
+
+route_token_checks() {
+    _route_domain_token_valid example.com &&
+        _route_domain_token_valid geosite:cn &&
+        _route_domain_token_valid 'regexp:^ads\.example$' &&
+        _route_domain_token_valid ext:my.dat:cn &&
+        ! _route_domain_token_valid geoip:cn &&
+        ! _route_domain_token_valid 'https://example.com' &&
+        ! _route_domain_token_valid 'a b' &&
+        _route_ip_token_valid 10.0.0.0/8 &&
+        _route_ip_token_valid 2001:db8::/32 &&
+        _route_ip_token_valid geoip:private &&
+        _route_ip_token_valid '!geoip:cn' &&
+        _route_ip_token_valid '!10.0.0.0/8' &&
+        _route_ip_token_valid '!2001:db8::/32' &&
+        ! _route_ip_token_valid '!' &&
+        ! _route_ip_token_valid 10.0.0.0/33 &&
+        ! _route_ip_token_valid 10.0.0.0/ &&
+        ! _route_ip_token_valid 2001:db8::/ &&
+        ! _route_ip_token_valid 999.1.1.1 &&
+        _route_protocol_token_valid http &&
+        _route_protocol_token_valid tls &&
+        _route_protocol_token_valid quic &&
+        _route_protocol_token_valid bittorrent &&
+        ! _route_protocol_token_valid ssh &&
+        ! _route_protocol_token_valid unknown &&
+        ! _route_protocol_token_valid TLS &&
+        ! _route_protocol_token_valid 'a/b'
+}
+check 'route rule tokens reject malformed domain/IP/protocol values' route_token_checks
+
+route_rule_filters() (
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        routing:{rules:[
+            {inboundTag:["node-a"],outboundTag:"direct"},
+            {domain:["geosite:cn"],outboundTag:"block"}
+        ]}}')" || return 1
+    local out=""
+    out=$(jq --argjson rule '{"domain":["openai.com"],"outboundTag":"direct"}' --arg pos head "$ROUTE_ADD_RULE_JQ" \
+        "$CONFIG_DIR/05_routing.json") || return 1
+    [ "$(printf '%s' "$out" | jq -r '.routing.rules | length')" = "3" ] || return 1
+    [ "$(printf '%s' "$out" | jq -r '.routing.rules[0].inboundTag[0]')" = "node-a" ] || return 1
+    [ "$(printf '%s' "$out" | jq -r '.routing.rules[1].domain[0]')" = "openai.com" ] || return 1
+    out=$(jq --argjson rule '{"domain":["geosite:cn"],"outboundTag":"block"}' "$ROUTE_DELETE_RULE_JQ" \
+        "$CONFIG_DIR/05_routing.json") || return 1
+    [ "$(printf '%s' "$out" | jq -r '.routing.rules | length')" = "1" ] || return 1
+    ! jq --argjson rule '{"domain":["no-such-rule"],"outboundTag":"block"}' "$ROUTE_DELETE_RULE_JQ" \
+        "$CONFIG_DIR/05_routing.json" >/dev/null 2>&1
+)
+setup_case route-filters
+check 'route add inserts after node rules and delete matches by content' route_rule_filters
+
+route_inbound_ownership() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" --arg u "$ROUTE_USER_RULE_TAG" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"node-a"},{tag:"node-b"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["node-a"],outboundTag:"direct"},
+            {inboundTag:["node-a"],outboundTag:"block",ruleTag:$u}
+        ]}}')" || return 1
+    local out="$TMP/route-ownership-args"
+    _mutate_config() { printf '%s\n' "$*" > "$out"; return 0; }
+    # 未标记的节点规则继续拒绝删除。
+    rm -f "$out"
+    _route_delete_rule_flow >/dev/null 2>&1 <<< $'1\ny\n' && return 1
+    [ ! -e "$out" ] || return 1
+    # 带用户标记的 inboundTag 规则可删除。
+    _route_delete_rule_flow >/dev/null 2>&1 <<< $'2\ny\n' || return 1
+    grep -q '"ruleTag":"xd-user-rule"' "$out" || return 1
+    # 添加向导给 inboundTag 规则打上同一个用户标记; node-a 有兜底 block, 改用 node-b。
+    rm -f "$out"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["node-b"\]' "$out" &&
+        grep -q '"ruleTag":"xd-user-rule"' "$out"
+)
+setup_case route-ownership
+check 'user inbound rules are tagged and deletable, node rules stay protected' route_inbound_ownership
+
+# Reality tunnel 的兜底 block 规则会吞掉该 inbound 的后续规则; 向导必须拒绝,
+# 而没有兜底规则的入站仍可正常添加用户规则。
+route_inbound_shadow() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"a-tunnel"},{tag:"b-reality"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["a-tunnel"],domain:["example.com"],outboundTag:"direct"},
+            {inboundTag:["a-tunnel"],outboundTag:"block"}
+        ]}}')" || return 1
+    local captured="$TMP/route-shadow-args"
+    _mutate_config() { printf '%s\n' "$*" > "$captured"; return 0; }
+    rm -f "$captured"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["b-reality"\]' "$captured" &&
+        grep -q '"ruleTag":"xd-user-rule"' "$captured"
+)
+setup_case route-shadow
+check 'shadowed node inbound rejects inbound rules, open inbound still works' route_inbound_shadow
+
+# network 覆盖 tcp+udp、webhook 通知字段都不能让兜底规则漏判。
+route_inbound_shadow_variants() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"a-net"},{tag:"b-hook"},{tag:"c-open"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["a-net"],network:"tcp,udp",outboundTag:"block"},
+            {inboundTag:["b-hook"],outboundTag:"block",webhook:{url:"https://example.test/hook"}}
+        ]}}')" || return 1
+    local captured="$TMP/route-shadow-variants-args"
+    _mutate_config() { printf '%s\n' "$*" > "$captured"; return 0; }
+    rm -f "$captured"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n3\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["c-open"\]' "$captured"
+)
+setup_case route-shadow-variants
+check 'network tcp+udp and webhook do not hide block fallbacks' route_inbound_shadow_variants
+
+# port/sourcePort/localPort 覆盖 1-65535 同样是全量兜底; 只覆盖部分端口不算。
+route_inbound_shadow_ports() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"a-port"},{tag:"b-sport"},{tag:"c-lport"},{tag:"d-part"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["a-port"],port:"1-65535",outboundTag:"block"},
+            {inboundTag:["b-sport"],sourcePort:"1-65535",outboundTag:"block"},
+            {inboundTag:["c-lport"],localPort:"1-65535",outboundTag:"block"},
+            {inboundTag:["d-part"],port:"1-65534",outboundTag:"block"}
+        ]}}')" || return 1
+    local captured="$TMP/route-shadow-ports-args"
+    _mutate_config() { printf '%s\n' "$*" > "$captured"; return 0; }
+    rm -f "$captured"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n3\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n4\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["d-part"\]' "$captured"
+)
+setup_case route-shadow-ports
+check 'full port ranges hide block fallbacks, partial ranges do not' route_inbound_shadow_ports
+
+# sourceIP/source/localIP 双栈全范围同样是兜底; 仅 IPv4 全范围不算。
+route_inbound_shadow_ips() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"a-src"},{tag:"b-local"},{tag:"c-v4"},{tag:"d-alias"},{tag:"e-str"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["a-src"],sourceIP:["0.0.0.0/0","::/0"],outboundTag:"block"},
+            {inboundTag:["b-local"],localIP:["0.0.0.0/0","::/0"],outboundTag:"block"},
+            {inboundTag:["c-v4"],sourceIP:["0.0.0.0/0"],outboundTag:"block"},
+            {inboundTag:["d-alias"],source:["0.0.0.0/0","::/0"],outboundTag:"block"},
+            {inboundTag:["e-str"],sourceIP:"0.0.0.0/0,::/0",outboundTag:"block"}
+        ]}}')" || return 1
+    local captured="$TMP/route-shadow-ips-args"
+    _mutate_config() { printf '%s\n' "$*" > "$captured"; return 0; }
+    rm -f "$captured"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n4\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n5\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n3\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["c-v4"\]' "$captured"
+)
+setup_case route-shadow-ips
+check 'dual-stack sourceIP/localIP hide block fallbacks, IPv4-only does not' route_inbound_shadow_ips
+
+# 恢复默认保留节点规则; 带用户标记的 inboundTag 规则属于自定义规则, 必须一并丢弃。
+route_restore_defaults() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" --arg u "$ROUTE_USER_RULE_TAG" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"node-a"}],
+        routing:{domainStrategy:"AsIs",rules:[
+            {inboundTag:["node-a"],outboundTag:"direct"},
+            {inboundTag:["node-a"],outboundTag:"block",ruleTag:$u},
+            {domain:["custom.example"],outboundTag:"direct"}
+        ]}}')" || return 1
+    _with_config_lock() { "$@"; }
+    _txn_allow_config_write() { return 0; }
+    _backup_config() { return 0; }
+    _restart_xray_verified() { return 0; }
+    _route_restore_default_rules || return 1
+    _config_jq -e --arg u "$ROUTE_USER_RULE_TAG" --argjson n "$(printf '%s' "$XRAY_DEFAULT_ROUTING_RULES_JSON" | jq 'length')" '
+        (.routing.domainStrategy == "IPIfNonMatch")
+        and (([.routing.rules[] | select(.inboundTag? != null)] | length) == 1)
+        and (([.routing.rules[] | select((.ruleTag? // "") == $u)] | length) == 0)
+        and ((.routing.rules | length) == (1 + $n))' >/dev/null
+)
+setup_case route-restore
+check 'restore defaults drops user inbound rules and keeps node rules' route_restore_defaults
+
+# Xray 的 port/sourcePort 可为数字, network/protocol 可为标量; 列表与删除须能处理。
+route_scalar_fields() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        routing:{domainStrategy:"AsIs",rules:[
+            {network:"tcp",outboundTag:"direct"},
+            {port:443,outboundTag:"direct"},
+            {sourcePort:"1000-2000",outboundTag:"direct"},
+            {protocol:"tls",outboundTag:"direct"}
+        ]}}')" || return 1
+    local view="$TMP/route-scalar-view" captured="$TMP/route-scalar-delete"
+    _config_jq -r --arg ut "$ROUTE_USER_RULE_TAG" "$ROUTE_RULE_LIST_JQ" > "$view" || return 1
+    grep -q 'network=tcp' "$view" &&
+        grep -q 'port=443' "$view" &&
+        grep -q 'sourcePort=1000-2000' "$view" &&
+        grep -q 'protocol=tls' "$view" || return 1
+    _mutate_config() { printf '%s\n' "$*" > "$captured"; return 0; }
+    _route_delete_rule_flow >/dev/null 2>&1 <<< $'2\ny\n' || return 1
+    grep -q '"port":443' "$captured"
+)
+setup_case route-scalar
+check 'scalar network/port/sourcePort fields render and delete' route_scalar_fields
+
+geo_ext_reference_count() (
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        dns:{servers:[{address:"1.1.1.1",domains:"geosite:google"}],hosts:{"ext:my.dat:cn":"1.2.3.4"}},
+        routing:{rules:[
+            {domain:["ext:my.dat:cn","geosite:cn"],outboundTag:"block"},
+            {ip:"geoip:private",outboundTag:"block"}
+        ]}}')" || return 1
+    [ "$(_geo_ref_count "ext:my.dat:")" = "2" ] &&
+        [ "$(_geo_ref_count "geosite:")" = "2" ] &&
+        [ "$(_geo_ref_count "geoip:")" = "1" ]
+)
+setup_case geo-refs
+check 'Geo reference counts cover routing, DNS and hosts' geo_ext_reference_count
+
 # busybox 的 crontab -l 是没有 crontab 文件时输出 can't open ... ENOENT, 不是 no crontab;
 # 只有"确实没有"才算空态, 权限错误必须继续 fail-closed。
 crontab_empty_state() (

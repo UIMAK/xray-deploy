@@ -88,7 +88,7 @@ else
     fail 'top-level fields map to fixed fragment names'
 fi
 check_eq 'fragment keeps its top-level wrapper' routing "$(jq -r 'keys[0]' "$CONFIG_DIR/05_routing.json")"
-_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{},"geodata":{"cron":"0 3 */3 * *"}}' >/dev/null 2>&1
+_config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{},"geodata":{"cron":"30 4 * * *"}}' >/dev/null 2>&1
 [ -f "$CONFIG_DIR/14_geodata.json" ] || fail 'geodata fragment is created'
 _config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{}}' >/dev/null 2>&1
 if [ -e "$CONFIG_DIR/14_geodata.json" ]; then fail 'removed field deletes its fragment'; else pass 'removed field deletes its fragment'; fi
@@ -231,13 +231,13 @@ XH_PQ_MENU_OUT=$(
 check_eq 'PQ probe failure cancels the domain switch' canceled "$XH_PQ_MENU_OUT"
 
 printf '== Geo source state ==\n'
-GEO_U_XTLS_GEOSITE='https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat'
-GEO_U_XTLS_GEOIP='https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-full.dat'
+GEO_U_XTLS_GEOSITE='https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat.gz'
+GEO_U_XTLS_GEOIP='https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-lite.dat.gz'
 GEO_U_LOYAL_GEOSITE='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
 GEO_U_LOYAL_GEOIP='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
 rm -f "$STATE_DIR/geo_source" "$STATE_DIR/geo_geosite_url" "$STATE_DIR/geo_geoip_url"
 check_eq 'default Geo source is XTLS' xtls "$(_geo_source_name)"
-check_eq 'XTLS geoip uses geoip-full.dat' "$GEO_U_XTLS_GEOIP" "$(_geo_source_url geoip)"
+check_eq 'XTLS geoip uses the lite .gz source' "$GEO_U_XTLS_GEOIP" "$(_geo_source_url geoip)"
 _state_set geo_source loyal
 check_eq 'Loyalsoldier URLs are selected' "$GEO_U_LOYAL_GEOIP" "$(_geo_source_url geoip)"
 _state_set geo_source custom
@@ -275,6 +275,43 @@ if (
     _geo_apply_source custom 'https://a.test/gs.dat' 'ftp://a.test/gi.dat' >/dev/null 2>&1 && exit 1
     [ "$(_geo_source_name)" = loyal ] && [ ! -e "$STATE_DIR/geo_geosite_url" ]
 ); then pass 'invalid custom Geo source leaves state unchanged'; else fail 'invalid custom Geo source leaves state unchanged'; fi
+
+printf '== Geo gzip update ==\n'
+GEO_TEST_OK="$TMP/geo-update-ok"
+geo_gz_success() (
+    rm -f "$GEO_TEST_OK"
+    _geo_source_url() { printf 'https://a.test/%s.dat.gz' "$1"; }
+    _http_download() { head -c 4096 /dev/zero | tr '\0' x | gzip -c > "$2"; }
+    _with_config_lock() { "$@"; }
+    _with_core_lock() { "$@"; }
+    _xray_core_geo_update_locked() {
+        printf '%s' "$3" > "$GEO_TEST_OK"
+        [ "$3" = 1 ] || return 1
+        cp "$1/geosite.dat" "$1/geoip.dat" "$ASSET_DIR/"
+    }
+    _geo_update >/dev/null 2>&1 || return 1
+    [ "$(cat "$GEO_TEST_OK")" = 1 ] &&
+        [ "$(wc -c < "$ASSET_DIR/geosite.dat")" -eq 4096 ] &&
+        [ "$(wc -c < "$ASSET_DIR/geoip.dat")" -eq 4096 ] &&
+        [ "$(head -c 1 "$ASSET_DIR/geosite.dat")" = x ]
+)
+check 'gzip Geo update decompresses both sources' geo_gz_success
+
+geo_gz_corrupt() (
+    printf old-geosite > "$ASSET_DIR/geosite.dat"
+    printf old-geoip > "$ASSET_DIR/geoip.dat"
+    rm -f "$GEO_TEST_OK"
+    _geo_source_url() { printf 'https://a.test/%s.dat.gz' "$1"; }
+    _http_download() { printf 'not-gzip' > "$2"; }
+    _with_config_lock() { "$@"; }
+    _with_core_lock() { "$@"; }
+    _xray_core_geo_update_locked() { printf '%s' "$3" > "$GEO_TEST_OK"; return 1; }
+    _geo_update >/dev/null 2>&1 && return 1
+    [ "$(cat "$GEO_TEST_OK")" = 0 ] &&
+        [ "$(cat "$ASSET_DIR/geosite.dat")" = old-geosite ] &&
+        [ "$(cat "$ASSET_DIR/geoip.dat")" = old-geoip ]
+)
+check 'corrupt gzip aborts and keeps old dat files' geo_gz_corrupt
 
 printf '== custom geodata ==\n'
 GEO_EXTRA_PATH="$STATE_DIR/geo_extra_assets"
@@ -314,6 +351,29 @@ if (
 check 'custom geodata delete removes the file' test ! -e "$ASSET_DIR/my.dat"
 check_eq 'custom geodata delete removes the state line' '' "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
 check_eq 'custom geodata delete rewrites assets' 0 "$(jq -r '[.[] | select(.file=="my.dat")] | length' "$GEO_DELETE_ARGS" 2>/dev/null)"
+
+# 规则集仍被 ext: 引用时删除必须中止, 与 sing-box 删除规则集前的引用检查同义。
+printf 'my.dat\thttps://a.test/my.dat\n' > "$GEO_EXTRA_PATH"
+printf x > "$ASSET_DIR/my.dat"
+_config_write_merged '{"routing":{"rules":[{"domain":["ext:my.dat:cn"],"outboundTag":"block"}]}}' >/dev/null 2>&1
+if (
+    _geo_auto_mechanism() { printf off; }
+    _with_core_lock() { "$@"; }
+    echo 1 | _geo_extra_delete
+) >/dev/null 2>&1; then fail 'referenced ruleset delete aborts'; else pass 'referenced ruleset delete aborts'; fi
+check 'referenced ruleset delete keeps the file' test -e "$ASSET_DIR/my.dat"
+check_eq 'referenced ruleset delete keeps the state line' 'my.dat	https://a.test/my.dat' "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+# 配置损坏导致引用数无法统计时同样必须中止, 不能按 0 引用放行。
+printf '{"log": broken\n' > "$CONFIG_DIR/02_log.json"
+if (
+    _geo_auto_mechanism() { printf off; }
+    _with_core_lock() { "$@"; }
+    echo 1 | _geo_extra_delete
+) >/dev/null 2>&1; then fail 'unreadable config blocks ruleset delete'; else pass 'unreadable config blocks ruleset delete'; fi
+check 'unreadable config keeps the referenced file' test -e "$ASSET_DIR/my.dat"
+check_eq 'unreadable config keeps the state line' 'my.dat	https://a.test/my.dat' "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+rm -f "$CONFIG_DIR/02_log.json"
+rm -f "$ASSET_DIR/my.dat"
 
 printf 'zeta.dat\thttps://a.test/dl/zeta.dat\n../evil.dat\thttps://a.test/evil.dat\n' > "$GEO_EXTRA_PATH"
 printf keep > "$DEPLOY_DIR/evil.dat"
