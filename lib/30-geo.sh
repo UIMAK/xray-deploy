@@ -1,11 +1,12 @@
 #!/bin/bash
-# lib/30-geo.sh — Geo 更新、路由精简与 DNS 设置。
+# lib/30-geo.sh — 分流设置: 路由规则、规则集(geodata)、Geo 更新与 DNS 设置。
 # Geo 自动更新默认 OFF, 使用 Xray 内置 geodata。
-# 数据源默认 XTLS/Xray-rules-dat, 可切 Loyalsoldier 或自定义链接; 落点 $ASSET_DIR, 下载失败保留旧 dat。
+# 数据源默认 XTLS/Xray-rules-dat(geoip-lite + .gz), 可切 Loyalsoldier 或自定义链接;
+# 落点 $ASSET_DIR, 下载失败保留旧 dat。核心自下载 .gz 会解压, 管理器立即更新同样先解压再落地。
 # 内置 assets.file 必须预先存在, 否则核心拒绝启动; 见 _geo_set_auto_update。
 # DNS 写入走 _mutate_config 的重启与回滚; 见 _dns_apply。
 
-GEO_CRON_EXPR="0 3 */3 * *"
+GEO_CRON_EXPR="30 4 * * *"
 
 # 数据源只记预设名, 链接由常量给: 上游改名只改常量, 老机器不留死链。
 _geo_source_name() {
@@ -74,7 +75,7 @@ _geo_source_label() {
                 printf '%s' "自定义链接(链接无效, 已回落默认)"
             fi
             ;;
-        *) printf '%s' "XTLS/Xray-rules-dat (默认)" ;;
+        *) printf '%s' "XTLS/Xray-rules-dat (默认, lite)" ;;
     esac
 }
 
@@ -207,7 +208,7 @@ _geo_update() {
     _info "[$ts] 开始更新 Geo 数据 (数据源: $(_geo_source_label))..."
 
     # 两个 dat 成组提交; 任一下载失败由锁内 coretxn 拒绝整组, 保留旧数据。
-    # 远端文件名随源变化(geoip-full.dat 等), 落点恒为 $tmp/$f。
+    # 远端文件名随源变化(geoip-lite.dat.gz 等), 落点恒为 $tmp/$f。
     local ok=1 f url t sz
     for f in geosite.dat geoip.dat; do
         url=$(_geo_source_url "${f%%.dat}")
@@ -218,6 +219,21 @@ _geo_update() {
             ok=0
             rm -f "$t"
             continue
+        fi
+        # 默认源是 .gz: 核心自下载会解压, 管理器立即更新必须自行解压后再落到 .dat。
+        if _geo_url_gz "$url"; then
+            if ! command -v gzip >/dev/null 2>&1; then
+                _warn "$f 是 .gz 源, 但系统缺少 gzip, 保留旧文件"
+                ok=0
+                rm -f "$t"
+                continue
+            fi
+            if ! gzip -dc "$t" > "${t}.raw" 2>/dev/null || ! mv -f "${t}.raw" "$t"; then
+                _warn "$f 解压失败, 保留旧文件"
+                ok=0
+                rm -f "$t" "${t}.raw"
+                continue
+            fi
         fi
         # 至少 1KB, 避免空文件或错误页面覆盖可用 dat。
         sz=$(stat -c%s "$t" 2>/dev/null || stat -f%z "$t" 2>/dev/null || echo 0)
@@ -264,13 +280,27 @@ _geo_set_auto_update() {
     esac
 }
 
+# 默认 cron 的唯一人类可读描述; 非默认值原样显示。
+_geo_cron_label() {
+    if [ "$GEO_CRON_EXPR" = "30 4 * * *" ]; then
+        printf '每天 04:30'
+    else
+        printf '%s' "$GEO_CRON_EXPR"
+    fi
+}
+
 _geo_next_run_hint() {
     local c=""
     if _config_present && command -v jq >/dev/null 2>&1; then
         c=$(_config_jq -r '.geodata.cron // empty' 2>/dev/null)
     fi
     if [ -n "$c" ]; then
-        echo "Xray 内置定时: ${c} (每月 1/4/7/.../31 号 03:00, 热重载)"
+        # 只有值仍是默认常量时才描述具体时间, 手改 cron 后不虚构执行时刻。
+        if [ "$c" = "$GEO_CRON_EXPR" ]; then
+            echo "Xray 内置定时: ${c} ($(_geo_cron_label), 热重载)"
+        else
+            echo "Xray 内置定时: ${c} (热重载)"
+        fi
         return
     fi
     echo "未开启"
@@ -376,114 +406,497 @@ _route_restore_default_rules() {
     return 0
 }
 
-# _geo_menu [3] 的低内存子菜单; 精简范围和顺序见 _route_slim_geo_rules。
-_route_rules_menu() {
-    local choice
+# ---------------------------------------------------------------------------
+# 分流设置: 路由规则与规则集(geodata)。
+# Xray 没有 sing-box 的 route.rule_set: 这里的"规则集"就是 geodata 数据文件。
+# 内置两项(geosite.dat/geoip.dat)随数据源下载, 规则用 geosite:xx / geoip:xx 引用;
+# 自定义项落 $ASSET_DIR, 规则用 ext:文件名.dat:代码 引用。
+# ---------------------------------------------------------------------------
+
+# 路由规则摘要(查看/删除共用): 每条一行, 标出节点规则与 ruleTag。
+# 只输出 Xray routing.Rule 的已知匹配字段, 未知字段仍保留在 05_routing.json 中。
+ROUTE_RULE_LIST_JQ='
+def xd_values:
+  [ .[] | if type == "array" then .[] else tostring end ] | join(", ");
+def xd_rule($r):
+  [ ["domain", $r.domain?], ["ip", $r.ip?], ["port", $r.port?],
+    ["network", $r.network?], ["protocol", $r.protocol?],
+    ["inboundTag", $r.inboundTag?], ["sourceIP", $r.sourceIP?],
+    ["sourcePort", $r.sourcePort?], ["user", $r.user?] ]
+  | map(select(.[1] != null) | "\(.[0])=\([.[1]] | xd_values)")
+  | if length == 0 then "(无匹配字段)" else join(" ") end;
+(.routing.rules // []) as $rs
+| "  规则总数: \($rs | length)    排序: \(.routing.domainStrategy // "AsIs")",
+  (if ($rs | length) == 0 then "  (当前没有路由规则)"
+   else ($rs | to_entries[] | .key as $i | .value as $r
+     | "  [\($i + 1)]\(if $r.inboundTag? != null then " 节点规则" else "" end) → \($r.outboundTag? // $r.balancerTag? // "?")   \(xd_rule($r))\(if $r.ruleTag? then "   [ruleTag=\($r.ruleTag)]" else "" end)")
+   end)
+'
+
+# 末尾追加, 或插到第一条通用规则之前; 节点规则(inboundTag != null)始终留在最前。
+ROUTE_ADD_RULE_JQ='
+((.routing.rules // []) | if type == "array" then . else [] end) as $r
+| (if $pos == "head"
+   then ([range(0; ($r | length)) as $i | select($r[$i].inboundTag? == null) | $i] | first // ($r | length)) as $idx
+        | $r[0:$idx] + [$rule] + $r[$idx:]
+   else $r + [$rule]
+   end) as $new
+| .routing.rules = $new
+'
+
+# 按规则内容删除而不是按读取时的下标: 读取到提交之间配置可能被并发修改,
+# 下标会指向另一条规则; 内容在锁内找不到时直接失败, 不误删。
+ROUTE_DELETE_RULE_JQ='
+((.routing.rules // []) | if type == "array" then . else [] end) as $r
+| ($r | to_entries | map(select(.value == $rule)) | .[0].key) as $pos
+| if $pos == null then error("规则已不存在或已被修改")
+  else .routing.rules = ($r | to_entries | map(select(.key != $pos) | .value)) end
+'
+
+# 逗号/顿号/分号/空白分隔的输入拆成 ROUTE_TOKENS; 空项丢弃。
+_route_split_tokens() {
+    local raw="${1:-}" item
+    ROUTE_TOKENS=()
+    raw="${raw//，/ }"; raw="${raw//、/ }"; raw="${raw//,/ }"
+    raw="${raw//；/ }"; raw="${raw//;/ }"; raw="${raw//$'\t'/ }"
+    local -a parts
+    IFS=' ' read -r -a parts <<< "$raw"
+    for item in "${parts[@]}"; do
+        item="${item%$'\r'}"
+        [ -n "$item" ] && ROUTE_TOKENS+=("$item")
+    done
+    [ "${#ROUTE_TOKENS[@]}" -gt 0 ]
+}
+
+_route_geo_code_valid() { [[ "${1:-}" =~ ^[A-Za-z0-9_.@!-]+$ ]]; }
+_route_ext_ref_valid() { [[ "${1:-}" =~ ^ext:[A-Za-z0-9._-]+:[A-Za-z0-9_.@!-]+$ ]]; }
+
+# 域名列表项: 允许 geosite:/full:/domain:/keyword:/regexp:/ext: 前缀与普通域名。
+# 普通项按 Xray 默认 domain: 子串匹配; URL、空白和未知前缀拒绝。
+_route_domain_token_valid() {
+    local t="${1:-}"
+    [ -n "$t" ] || return 1
+    case "$t" in
+        *"://"*|*[[:space:]]*) return 1 ;;
+        geosite:*) _route_geo_code_valid "${t#geosite:}" ;;
+        geoip:*) return 1 ;;
+        ext:*) _route_ext_ref_valid "$t" ;;
+        full:*|domain:*|keyword:*|regexp:*) [ -n "${t#*:}" ] ;;
+        *:*) return 1 ;;
+        *) [[ "$t" =~ ^[A-Za-z0-9._-]+$ ]] ;;
+    esac
+}
+
+# IP 列表项: geoip:/ext: 代码, 或单个 IPv4/IPv6/CIDR; 前缀范围按地址族校验。
+_route_ip_token_valid() {
+    local t="${1:-}" addr="" prefix=""
+    [ -n "$t" ] || return 1
+    case "$t" in
+        *[[:space:]]*) return 1 ;;
+        geoip:*) _route_geo_code_valid "${t#geoip:}"; return ;;
+        ext:*) _route_ext_ref_valid "$t"; return ;;
+    esac
+    addr="$t"
+    case "$t" in
+        */*) addr="${t%%/*}"; prefix="${t#*/}" ;;
+    esac
+    _validate_listen "$addr" || return 1
+    [ -n "$prefix" ] || return 0
+    [[ "$prefix" =~ ^[0-9]{1,3}$ ]] || return 1
+    case "$addr" in
+        *:*) [ "$((10#$prefix))" -le 128 ] ;;
+        *) [ "$((10#$prefix))" -le 32 ] ;;
+    esac
+}
+
+_route_protocol_token_valid() { [[ "${1:-}" =~ ^[A-Za-z0-9_.-]+$ ]]; }
+
+_route_tokens_json() {
+    [ "$#" -gt 0 ] || return 1
+    jq -cn '$ARGS.positional' --args "$@"
+}
+
+# 读取并校验一组匹配值; 非法时整组重问; 只把 JSON 数组输出到 stdout。
+_route_read_tokens() {
+    local label="$1" kind="$2" raw="" token="" bad
+    while :; do
+        read -rp "  ${label}: " raw || return 1
+        if ! _route_split_tokens "$raw"; then
+            _warn "至少输入一项"
+            continue
+        fi
+        bad=0
+        for token in "${ROUTE_TOKENS[@]}"; do
+            case "$kind" in
+                domain) _route_domain_token_valid "$token" || { _warn "无效域名项: $token (可用 geosite:/full:/regexp:/ext: 前缀)"; bad=1; break; } ;;
+                ip) _route_ip_token_valid "$token" || { _warn "无效 IP 项: $token (可用 geoip:/ext: 前缀或 IPv4/IPv6/CIDR)"; bad=1; break; } ;;
+                protocol) _route_protocol_token_valid "$token" || { _warn "无效协议项: $token"; bad=1; break; } ;;
+            esac
+        done
+        [ "$bad" -eq 0 ] || continue
+        _route_tokens_json "${ROUTE_TOKENS[@]}" && return 0
+        _warn "生成规则值失败"
+    done
+}
+
+# 列出带 tag 的入站; 选中项输出到 stdout, 列表和提示走 stderr。
+_route_pick_inbound() {
+    local values="" count="" i="" tag="" choice="" idx=""
+    values=$(_config_jq -c '[.inbounds[]? | .tag | select(type == "string" and length > 0)] | unique') || return 1
+    count=$(printf '%s' "$values" | jq 'length') || return 1
+    if [ "$count" -eq 0 ]; then
+        _warn "当前没有带 tag 的入站, 无法按 inboundTag 匹配"
+        return 1
+    fi
+    for ((i = 0; i < count; i++)); do
+        tag=$(printf '%s' "$values" | jq -r --argjson i "$i" '.[$i]') || return 1
+        printf '    [%d] %s\n' "$((i + 1))" "$tag" >&2
+    done
+    read -rp "  选择入站(0 取消): " choice || return 1
+    case "$choice" in ''|0) return 1 ;; esac
+    idx=$(_xd_index_from_choice "$choice" "$count") || { _warn "无效编号"; return 1; }
+    printf '%s' "$values" | jq -r --argjson i "$idx" '.[$i]'
+}
+
+# 列出所有出站 tag; 选中项输出到 stdout。
+_route_pick_outbound() {
+    local values="" count="" i="" tag="" proto="" choice="" idx=""
+    values=$(_config_jq -c '[.outbounds[]? | select(.tag? != null) | {tag: .tag, protocol: (.protocol // "")}]') || return 1
+    count=$(printf '%s' "$values" | jq 'length') || return 1
+    if [ "$count" -eq 0 ]; then
+        _warn "当前没有可用的出站(outbounds)"
+        return 1
+    fi
+    for ((i = 0; i < count; i++)); do
+        tag=$(printf '%s' "$values" | jq -r --argjson i "$i" '.[$i].tag') || return 1
+        proto=$(printf '%s' "$values" | jq -r --argjson i "$i" '.[$i].protocol') || return 1
+        printf '    [%d] %s (%s)\n' "$((i + 1))" "$tag" "$proto" >&2
+    done
+    read -rp "  选择出口(0 取消): " choice || return 1
+    case "$choice" in ''|0) return 1 ;; esac
+    idx=$(_xd_index_from_choice "$choice" "$count") || { _warn "无效编号"; return 1; }
+    printf '%s' "$values" | jq -r --argjson i "$idx" '.[$i].tag'
+}
+
+_route_commit_add_rule() {
+    local rule="$1" pos="$2"
+    _mutate_config --argjson rule "$rule" --arg pos "$pos" "$ROUTE_ADD_RULE_JQ"
+}
+
+_route_commit_delete_rule() {
+    local rule="$1"
+    _mutate_config --argjson rule "$rule" "$ROUTE_DELETE_RULE_JQ"
+}
+
+_route_view_rules() {
+    # 只读查看不依赖 Xray 可执行文件, 与 DNS 查看同口径。
+    if ! _config_present; then
+        _warn "配置不存在"
+        return 0
+    fi
+    _require_jq "查看路由规则" || return 1
+    clear
+    echo
+    echo -e "  ${CYAN}【路由规则】${NC}"
+    echo -e "  文件: ${CONFIG_DIR}/05_routing.json"
+    echo
+    if ! _config_jq -r "$ROUTE_RULE_LIST_JQ"; then
+        _error "读取路由规则失败"
+        return 1
+    fi
+    echo
+    _tip "完整 JSON 可用 jq '.routing' ${CONFIG_DIR}/05_routing.json 查看"
+    return 0
+}
+
+# 向导: 匹配方式(域名/IP/inboundTag/协议) -> 出口 -> 插入位置 -> 确认提交。
+# Xray 规则是单字段 AND 语义, 不提供 sing-box 的 logical/or 组合, 一次只加一类匹配。
+_route_add_rule_flow() {
+    _config_edit_preflight "添加路由规则" || return 1
+    local kind="" field="" value_json="" outbound="" pos="end" rule="" ans=""
+    echo
+    echo -e "  ${CYAN}选择匹配方式${NC}"
+    echo -e "    ${GREEN}[1]${NC} 域名 (支持 geosite:xx / full: / regexp: / ext:文件名.dat:代码)"
+    echo -e "    ${GREEN}[2]${NC} IP (支持 geoip:xx / 单 IP / CIDR / ext:文件名.dat:代码)"
+    echo -e "    ${GREEN}[3]${NC} 入站 inboundTag"
+    echo -e "    ${GREEN}[4]${NC} 协议 protocol (如 bittorrent/http/tls/quic)"
+    echo -e "    ${GREEN}[0]${NC} 取消"
+    read -rp "  请选择: " kind || return 0
+    case "${kind:-0}" in
+        1) field="domain"; value_json=$(_route_read_tokens "域名(逗号或空格分隔)" domain) || return 0 ;;
+        2) field="ip"; value_json=$(_route_read_tokens "IP(逗号或空格分隔)" ip) || return 0 ;;
+        3)
+            local tag=""
+            tag=$(_route_pick_inbound) || return 0
+            value_json=$(_route_tokens_json "$tag") || { _error "生成规则值失败"; return 1; }
+            field="inboundTag"
+            ;;
+        4) field="protocol"; value_json=$(_route_read_tokens "协议(逗号或空格分隔)" protocol) || return 0 ;;
+        0) return 0 ;;
+        *) _warn "无效选择"; return 1 ;;
+    esac
+    echo
+    echo -e "  ${CYAN}选择出口 outboundTag${NC}"
+    outbound=$(_route_pick_outbound) || return 0
+    echo
+    echo -e "  ${CYAN}插入位置${NC}"
+    echo -e "    ${GREEN}[1]${NC} 追加到末尾(默认; 前面的规则先匹配)"
+    echo -e "    ${GREEN}[2]${NC} 插到默认规则之前(优先级更高; 节点规则仍保持最前)"
+    read -rp "  请选择 [1]: " ans || return 0
+    case "${ans:-1}" in
+        2) pos="head" ;;
+        *) pos="end" ;;
+    esac
+    rule=$(jq -cn --argjson v "$value_json" --arg f "$field" --arg o "$outbound" \
+        '{($f): $v, outboundTag: $o}') || { _error "生成规则失败"; return 1; }
+    echo
+    printf '  新规则: %s\n' "$rule"
+    if [ "$pos" = "head" ]; then
+        _info "将插入到第一条通用规则之前(节点规则仍保持最前)"
+    else
+        _info "将追加到 routing.rules 末尾; 同一流量以先匹配到的规则为准"
+    fi
+    read -rp "  确认添加? [y/N]: " ans || return 0
+    case "$ans" in
+        y|Y) ;;
+        *) _info "已取消"; return 0 ;;
+    esac
+    if _route_commit_add_rule "$rule" "$pos"; then
+        _success "路由规则已添加"
+    else
+        _error "添加失败(配置已回滚)"
+    fi
+}
+
+# 删除: 列出全部规则; 节点定向规则由节点/Reality 管理维护, 拒绝在此删除。
+_route_delete_rule_flow() {
+    _config_edit_preflight "删除路由规则" || return 1
+    local count="" sel="" idx="" ans="" rule_tag="" rule=""
+    count=$(_config_jq -r '((.routing.rules // []) | if type == "array" then length else 0 end)') \
+        || { _error "读取路由规则失败"; return 1; }
+    if [ "$count" -eq 0 ]; then
+        _info "当前没有路由规则"
+        return 0
+    fi
+    echo
+    if ! _config_jq -r "$ROUTE_RULE_LIST_JQ"; then
+        _error "读取路由规则失败"
+        return 1
+    fi
+    echo
+    read -rp "  选择要删除的规则编号(0 取消): " sel || return 0
+    case "$sel" in ''|0) return 0 ;; esac
+    idx=$(_xd_index_from_choice "$sel" "$count") || { _warn "无效编号"; return 1; }
+    if _config_jq -e --argjson i "$idx" '(.routing.rules[$i].inboundTag? // null) != null' >/dev/null 2>&1; then
+        _error "第 $((idx + 1)) 条是节点定向规则(inboundTag), 由节点/Reality 管理维护"
+        _tip "请通过删除节点或 Reality 域名管理调整, 避免破坏 tunnel 防偷跑规则"
+        return 1
+    fi
+    rule_tag=$(_config_jq -r --argjson i "$idx" '.routing.rules[$i].ruleTag? // empty') || rule_tag=""
+    # 取待删规则的完整 JSON, 提交时按内容匹配(见 ROUTE_DELETE_RULE_JQ)。
+    rule=$(_config_jq -c --argjson i "$idx" '.routing.rules[$i] // empty') && [ -n "$rule" ] \
+        || { _error "读取待删规则失败"; return 1; }
+    if [ -n "${XRAY_PRIVATE_BLOCK_RULE_TAG:-}" ] && [ "$rule_tag" = "$XRAY_PRIVATE_BLOCK_RULE_TAG" ]; then
+        _warn "这是精简规则注入的私网防护规则; 删除后客户端可经节点访问本机私网与云元数据"
+    fi
+    read -rp "  确认删除第 $((idx + 1)) 条规则? [y/N]: " ans || return 0
+    case "$ans" in
+        y|Y) ;;
+        *) _info "已取消"; return 0 ;;
+    esac
+    if _route_commit_delete_rule "$rule"; then
+        _success "路由规则已删除"
+    else
+        _error "删除失败(配置已回滚)"
+    fi
+}
+
+_route_restore_default_flow() {
+    _route_preflight || return 1
+    local ans=""
+    echo
+    echo -e "  ${YELLOW}恢复后将重新引用 geosite/geoip 数据, 小内存机器可能再次被 OOM${NC}"
+    echo -e "  ${YELLOW}注意: 手工添加的非节点自定义规则(含刚添加的规则)会被丢弃(节点规则保留; 配置已自动备份)${NC}"
+    read -rp "  确认恢复默认规则? [y/N]: " ans || return 0
+    case "$ans" in
+        y|Y) ;;
+        *) _info "已取消"; return 0 ;;
+    esac
+    if _route_restore_default_rules; then
+        _success "已恢复默认路由规则(bittorrent / 广告+私网域名 / 私网+CN IP / 域名白名单直连)"
+        _tip "请确认 assets 下 geosite.dat 与 geoip.dat 存在, 否则进入 [9] Geo 数据管理立即更新一次"
+    else
+        _error "恢复失败(配置已回滚)"
+    fi
+}
+
+# 精简流程: 精简范围和顺序见 _route_slim_geo_rules。
+_route_slim_flow() {
+    _route_preflight || return 1
+    local total=0 geo=0 node=0 mark=0 mixed=0 stats_ok=1 private_ok=0 stats="" ans="" dnsgeo=""
+    stats=$(_route_rules_stats) || stats_ok=0
+    # 失败时不 read 空结果, 避免把已初始化数字覆盖为空并触发算术诊断。
+    [ "$stats_ok" -eq 1 ] && read -r total geo node mark mixed <<< "$stats"
+    _route_private_block_valid && private_ok=1
+    # stats 读取失败时 geo/node/mixed 仍是初值 0: 既不能判"已是精简", 也不能拿 0 去确认删除。
+    if [ "$stats_ok" -ne 1 ]; then
+        _warn "无法读取当前路由规则, 无法判断精简范围, 已取消"
+        return 1
+    fi
+    if [ "$geo" -eq 0 ] && [ "$private_ok" -eq 1 ]; then
+        _info "已是精简状态(无 geo 引用 + 私网防护已注入), 无需重复操作"
+        return 0
+    fi
+    echo
+    echo -e "  将执行:"
+    echo -e "    ${CYAN}删除${NC} ${geo} 条引用 geo 数据的规则"
+    echo -e "    ${CYAN}注入${NC} 1 条字面量 CIDR 私网 block 规则(等价 geoip:private, 不加载 dat)"
+    echo -e "    ${CYAN}保留${NC} $((node - mixed)) 条不引用 Geo 的节点定向规则(仍在最前) + 其它非 Geo 规则"
+    [ "$mixed" -gt 0 ] && echo -e "    ${YELLOW}注意${NC} ${mixed} 条同时引用 Geo 的节点定向规则会删除"
+    dnsgeo=$(_route_dns_geo_count)
+    if [ "$dnsgeo" -gt 0 ]; then
+        _warn "dns 段还有 ${dnsgeo} 处 geo 引用, 精简路由规则不足以完全免除 dat 加载"
+        _tip "如需彻底省内存, 请手工编辑 ${CONFIG_DIR}/04_dns.json 去掉 geosite:/geoip:/ext: 引用"
+    fi
+    read -rp "  确认精简? [y/N]: " ans || return 0
+    case "$ans" in
+        y|Y) ;;
+        *) _info "已取消"; return 0 ;;
+    esac
+    if _route_slim_geo_rules; then
+        _success "路由规则已精简, xray 已用新配置重启"
+        _tip "geosite.dat / geoip.dat 不再被加载, 内存占用应明显下降"
+        if [ "$(_geo_auto_state 2>/dev/null)" = "on" ]; then
+            _tip "当前 Geo 自动更新仍为开启; 已无 geo 规则时它没有实际意义, 可在 [9] Geo 数据管理关闭"
+        fi
+    else
+        _error "精简失败(配置已回滚)"
+    fi
+}
+
+# 统计前缀(geosite: / geoip: / ext:文件.dat:)在 routing 与 dns 中的引用数。
+_geo_ref_count() {
+    local prefix="${1:-}" n=""
+    _config_present || { printf '0'; return 1; }
+    command -v jq >/dev/null 2>&1 || { printf '0'; return 1; }
+    n=$(_config_jq -r --arg p "$prefix" '
+        [ (.routing.rules[]?
+            | (.domain?, .domains?, .ip?, .sourceIP?, .source?, .localIP?)
+            | (if type == "string" then split(",")[] elif type == "array" then .[] else empty end)),
+          (.dns?.servers[]? | select(type == "object")
+            | (.domains?, .expectedIPs?, .expectIPs?, .unexpectedIPs?)
+            | (if type == "string" then split(",")[] elif type == "array" then .[] else empty end)),
+          ((.dns?.hosts? // {}) | keys[]?) ]
+        | map(select(type == "string")) | map(ltrimstr("!"))
+        | map(select(startswith($p))) | length' 2>/dev/null) || n=0
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    printf '%s' "$n"
+}
+
+_geo_size_human() {
+    local f="$1" sz=""
+    if [ ! -f "$f" ]; then
+        printf '缺失'
+        return 0
+    fi
+    sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "")
+    [[ "$sz" =~ ^[0-9]+$ ]] || { printf '?'; return 0; }
+    if [ "$sz" -ge 1048576 ]; then
+        printf '%d.%dMB' "$((sz / 1048576))" "$(((sz % 1048576) * 10 / 1048576))"
+    elif [ "$sz" -ge 1024 ]; then
+        printf '%d.%dKB' "$((sz / 1024))" "$(((sz % 1024) * 10 / 1024))"
+    else
+        printf '%dB' "$sz"
+    fi
+}
+
+# 查看规则集: 内置两项 + state 记录的自定义项, 附文件大小与引用计数。
+_geo_ruleset_view() {
+    _require_jq "查看规则集" || return 1
+    clear
+    echo
+    echo -e "  ${CYAN}【规则集(geodata 数据文件)】${NC}"
+    local state="" path="" name="" url="" refs=""
+    state=$(_geo_auto_state 2>/dev/null)
+    if [ "$state" = "on" ]; then
+        echo -e "  自动更新: ${GREEN}● 已开启${NC} ($(_geo_next_run_hint))"
+    else
+        echo -e "  自动更新: ${RED}○ 已关闭${NC}"
+    fi
+    echo -e "  引用方式: geosite:代码 / geoip:代码 引用内置; ext:文件名.dat:代码 引用自定义"
+    echo
+    echo -e "  ${CYAN}内置规则集${NC}"
+    refs=$(_geo_ref_count geosite:)
+    printf '    %-14s %8s  引用 %s 处\n' "geosite.dat" "$(_geo_size_human "$ASSET_DIR/geosite.dat")" "$refs"
+    printf '                   <- %s\n' "$(_geo_source_url geosite)"
+    refs=$(_geo_ref_count geoip:)
+    printf '    %-14s %8s  引用 %s 处\n' "geoip.dat" "$(_geo_size_human "$ASSET_DIR/geoip.dat")" "$refs"
+    printf '                   <- %s\n' "$(_geo_source_url geoip)"
+    echo
+    echo -e "  ${CYAN}自定义规则集${NC}"
+    path=$(_geo_extra_path)
+    if [ -s "$path" ]; then
+        while IFS=$'\t' read -r name url; do
+            [ -n "$name" ] || continue
+            refs=$(_geo_ref_count "ext:${name}:")
+            printf '    %-14s %8s  引用 %s 处  <- %s\n' "$name" \
+                "$(_geo_size_human "$ASSET_DIR/$name")" "$refs" "$url"
+        done < "$path"
+    else
+        printf '    (无; 可用 [5] 添加)\n'
+    fi
+    echo
+    if [ "$state" = "on" ]; then
+        echo -e "  ${CYAN}说明${NC}: 内置与自定义条目都写在 .geodata.assets, 由 Xray 内置定时下载"
+    else
+        echo -e "  ${YELLOW}说明${NC}: 自动更新关闭时, 自定义规则集只在添加时下载一次, 不会随定时更新"
+    fi
+    echo -e "  落点: $ASSET_DIR"
+    _tip "代码列表可用官方 Geo 数据查看器查询: https://xtls.github.io/tools/geofileviewer.html"
+    return 0
+}
+
+# Geo 数据子菜单: 立即更新 / 自动更新开关 / 切换数据源。
+_geo_data_menu() {
+    local choice="" state=""
     while true; do
         clear
         echo
-        echo -e "  ${CYAN}【路由规则(小内存优化)】${NC}"
-        echo
-        local total=0 geo=0 node=0 mark=0 mixed=0 stats_ok=1 private_ok=0
-        local stats; stats=$(_route_rules_stats) || stats_ok=0
-        # 失败时不 read 空结果, 避免把已初始化数字覆盖为空并触发算术诊断。
-        [ "$stats_ok" -eq 1 ] && read -r total geo node mark mixed <<< "$stats"
-        _route_private_block_valid && private_ok=1
-        if [ "$stats_ok" -ne 1 ]; then
-            _warn "无法读取当前路由规则(Xray 未安装 / 配置缺失 / jq 不可用)"
+        echo -e "  ${CYAN}【Geo 数据管理】${NC}"
+        state=$(_geo_auto_state)
+        if [ "$state" = "on" ]; then
+            echo -e "  当前状态: ${GREEN}● 已开启${NC}"
+            echo -e "  下次执行: $(_geo_next_run_hint)"
+            echo -e "  更新机制: ${GREEN}Xray 内置定时(热重载)${NC}"
         else
-            echo -e "  规则总数:   ${CYAN}${total}${NC}"
-            if [ "$geo" -gt 0 ]; then
-                echo -e "  引用 geo:   ${YELLOW}${geo}${NC} 条 (会加载 geosite.dat / geoip.dat)"
-            else
-                echo -e "  引用 geo:   ${GREEN}0${NC} 条 (不加载 dat)"
-            fi
-            echo -e "  节点规则:   ${CYAN}${node}${NC} 条 (tunnel 模式 Reality 的防偷跑规则)"
-            if [ "$mixed" -gt 0 ]; then
-                _warn "其中 ${mixed} 条节点定向规则也引用 Geo; 精简时会一并删除以停止 dat 加载"
-            fi
-            if [ "$private_ok" -eq 1 ]; then
-                echo -e "  私网防护:   ${GREEN}已注入字面量 CIDR${NC} (${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private})"
-            elif [ "$mark" -gt 0 ]; then
-                echo -e "  私网防护:   ${RED}规则标记存在但内容、唯一性或顺序无效${NC}"
-            else
-                echo -e "  私网防护:   ${CYAN}未注入${NC}"
-            fi
-            local dnsgeo; dnsgeo=$(_route_dns_geo_count)
-            if [ "$dnsgeo" -gt 0 ]; then
-                echo
-                _warn "dns 段还有 ${dnsgeo} 处 geo 引用, 精简路由规则不足以完全免除 dat 加载"
-                _tip "如需彻底省内存, 请手工编辑 ${CONFIG_DIR}/04_dns.json 去掉 geosite:/geoip:/ext: 引用"
-            fi
+            echo -e "  当前状态: ${RED}○ 已关闭${NC}"
         fi
+        echo -e "  数据源: $(_geo_source_label)"
+        echo -e "    geosite: $(_geo_source_url geosite)"
+        echo -e "    geoip:   $(_geo_source_url geoip)"
+        if _geo_builtin_source_drifted; then
+            echo -e "  ${YELLOW}注: 内置定时的下载链接仍是旧数据源, 进 [3] 重新应用一次即可同步(会重启核心)${NC}"
+        fi
+        echo -e "  落点: $ASSET_DIR (config env 的 XRAY_LOCATION_ASSET)"
         echo
-        echo -e "  ${YELLOW}小内存 VPS 上 geosite.dat + geoip.dat 各约 20MB+, 是 xray 被 OOM 杀掉的主因${NC}"
-        echo
-        echo -e "  ${GREEN}[1]${NC} 精简规则(去掉 geo 引用, 保留节点规则与私网防护)"
-        echo -e "  ${GREEN}[2]${NC} 恢复默认规则(重新引用 geo 数据)"
+        echo -e "  ${GREEN}[1]${NC} 立即更新一次"
+        if [ "$state" = "on" ]; then
+            echo -e "  ${GREEN}[2]${NC} 关闭自动更新"
+        else
+            echo -e "  ${GREEN}[2]${NC} 开启自动更新($(_geo_cron_label))"
+        fi
+        echo -e "  ${GREEN}[3]${NC} 切换数据源"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
         case "${choice:-0}" in
+            1) _geo_update ;;
+            2) if [ "$state" = "on" ]; then _geo_set_auto_update off; else _geo_set_auto_update on; fi ;;
+            3) _geo_set_source; return ;;
             0) return ;;
-            1)
-                _route_preflight || { _press_any_key; continue; }
-                # 完整防护有效才跳过重启, 单有 ruleTag 不够; 见 _route_private_block_valid。
-                # stats 读取失败时 geo/node/mixed 仍是初值 0: 既不能判"已是精简", 也不能拿 0 去确认删除。
-                if [ "$stats_ok" -ne 1 ]; then
-                    _warn "无法读取当前路由规则, 无法判断精简范围, 已取消"
-                    _press_any_key; continue
-                fi
-                if [ "$geo" -eq 0 ] && [ "$private_ok" -eq 1 ]; then
-                    _info "已是精简状态(无 geo 引用 + 私网防护已注入), 无需重复操作"
-                    _press_any_key; continue
-                fi
-                echo
-                echo -e "  将执行:"
-                echo -e "    ${CYAN}删除${NC} ${geo} 条引用 geo 数据的规则"
-                echo -e "    ${CYAN}注入${NC} 1 条字面量 CIDR 私网 block 规则(等价 geoip:private, 不加载 dat)"
-                echo -e "    ${CYAN}保留${NC} $((node - mixed)) 条不引用 Geo 的节点定向规则(仍在最前) + 其它非 Geo 规则"
-                [ "$mixed" -gt 0 ] && echo -e "    ${YELLOW}注意${NC} ${mixed} 条同时引用 Geo 的节点定向规则会删除"
-                read -rp "  确认精简? [y/N]: " ans
-                case "$ans" in
-                    y|Y) ;;
-                    *) _info "已取消"; _press_any_key; continue ;;
-                esac
-                if _route_slim_geo_rules; then
-                    _success "路由规则已精简, xray 已用新配置重启"
-                    _tip "geosite.dat / geoip.dat 不再被加载, 内存占用应明显下降"
-                    local gstate; gstate=$(_geo_auto_state 2>/dev/null)
-                    if [ "$gstate" = "on" ]; then
-                        _tip "当前 Geo 自动更新仍为开启; 已无 geo 规则时它没有实际意义, 可在上一级 [2] 关闭"
-                    fi
-                else
-                    _error "精简失败(配置已回滚)"
-                fi
-                _press_any_key
-                ;;
-            2)
-                _route_preflight || { _press_any_key; continue; }
-                echo
-                echo -e "  ${YELLOW}恢复后将重新引用 geosite/geoip 数据, 小内存机器可能再次被 OOM${NC}"
-                echo -e "  ${YELLOW}注意: 手工添加的非节点自定义规则会被丢弃(节点规则保留; 配置已自动备份)${NC}"
-                read -rp "  确认恢复默认规则? [y/N]: " ans
-                case "$ans" in
-                    y|Y) ;;
-                    *) _info "已取消"; _press_any_key; continue ;;
-                esac
-                if _route_restore_default_rules; then
-                    _success "已恢复默认路由规则(bittorrent / 广告+私网域名 / 私网+CN IP / 域名白名单直连)"
-                    _tip "请确认 assets 下 geosite.dat 与 geoip.dat 存在, 否则可在上一级 [1] 立即更新一次"
-                else
-                    _error "恢复失败(配置已回滚)"
-                fi
-                _press_any_key
-                ;;
-            *)
-                _warn "无效选择"
-                _press_any_key
-                ;;
+            *) _warn "无效" ;;
         esac
+        _press_any_key
     done
 }
 
@@ -692,12 +1105,17 @@ _geo_url_basename() {
     printf '%s' "${u##*/}"
 }
 
-# 核心只解压自身下载的 .gz; 本管理器按原样落地, 压缩内容会以 .dat 名存成坏数据, 故拒绝。
-_geo_extra_url_gz() {
+# 链接是否指向 .gz(忽略 ?query / #fragment): 内置源据此决定本地解压。
+_geo_url_gz() {
     case "$(_geo_url_basename "${1:-}")" in
         *.[gG][zZ]) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# 自定义条目按原样落地, 压缩内容会以 .dat 名存成坏数据, 故拒绝; 内置源由 _geo_update 解压。
+_geo_extra_url_gz() {
+    _geo_url_gz "${1:-}"
 }
 
 # 重写 state 去掉指定 file 的行; 任一步失败都保留原文件。
@@ -722,14 +1140,14 @@ _geo_extra_remove_line() {
 _geo_extra_add() {
     local url="" file="" default_name="" tmp="" sz=0 assets=""
     echo
-    url=$(_geo_prompt_url "geodata 链接") || return 0
+    url=$(_geo_prompt_url "规则集链接") || return 0
     if _geo_extra_url_gz "$url"; then
-        _error "不支持 .gz 链接: 请填未压缩的 .dat 链接(核心只解压自身下载的 .gz, 本管理器按原样落地)"
+        _error "不支持 .gz 链接: 自定义条目按原样落地, 请填未压缩的 .dat 链接"
         return 1
     fi
     default_name=$(_geo_url_basename "$url")
     while :; do
-        read -rp "  文件名(直接回车用 ${default_name:-链接末段}): " file || return 0
+        read -rp "  规则集文件名(直接回车用 ${default_name:-链接末段}): " file || return 0
         [ -n "$file" ] || file="$default_name"
         _geo_extra_file_valid "$file" && break
         if [ -z "$file" ]; then
@@ -739,7 +1157,7 @@ _geo_extra_add() {
         elif ! _geo_extra_name_has_dat "$file"; then
             _warn "文件名必须以 .dat 结尾(Xray >= v26.10.29 强制要求, 否则核心拒绝启动)"
         elif _geo_extra_exists "$file"; then
-            _warn "文件名已存在: $file (如需替换, 请先在 [2] 删除该条目)"
+            _warn "文件名已存在: $file (如需替换, 请先在 [6] 删除规则集)"
         else
             _warn "文件名只能包含字母/数字/./_/-, 且不能是 . 或含 / 或 .."
         fi
@@ -787,17 +1205,18 @@ _geo_extra_add() {
         _warn "文件已下载, 但 state 记录写入失败; 请手工补记或删除 $ASSET_DIR/$file"
         return 1
     fi
-    _success "已添加自定义 geodata: $file <- $url"
+    _success "已添加自定义规则集: $file <- $url"
+    _tip "在 [2] 添加路由规则时可用 ext:${file}:代码 引用(代码需存在于该 dat 中)"
     return 0
 }
 
 # 删除: builtin 机制下先重写 config(失败即中止, state 不动), 再删 state 行与本地文件。
 # state 记录的文件名是 . 或含 / 或 .. 时中止, 避免 rm 落到资源目录本身或之外。
 _geo_extra_delete() {
-    local path="" count=0 i=0 sel="" target="" name="" url="" assets="" mech=""
+    local path="" count=0 i=0 sel="" target="" name="" url="" assets="" mech="" refs=""
     path=$(_geo_extra_path)
     if [ ! -s "$path" ]; then
-        _warn "还没有自定义 geodata 条目"
+        _warn "还没有自定义规则集"
         return 0
     fi
     echo
@@ -806,6 +1225,8 @@ _geo_extra_delete() {
         count=$((count + 1))
         echo -e "    ${CYAN}[$count]${NC} $name <- $url"
     done < "$path"
+    echo
+    _tip "这里只列出自定义规则集; 内置 geosite.dat / geoip.dat 由数据源管理, 不能单独删除"
     echo
     read -rp "  请选择要删除的编号(0 取消): " sel || return 0
     case "$sel" in
@@ -831,6 +1252,13 @@ _geo_extra_delete() {
             return 1
             ;;
     esac
+    # 与 sing-box 删除规则集前的引用检查同义: 仍有 ext: 引用的 dat 不能先删。
+    refs=$(_geo_ref_count "ext:${target}:")
+    if [ "${refs:-0}" -gt 0 ]; then
+        _error "仍有 ${refs} 条路由/DNS 规则引用 ext:${target}:, 已取消删除"
+        _tip "请先在 [3] 删除对应路由规则, 或手工编辑 ${CONFIG_DIR}/05_routing.json"
+        return 1
+    fi
     mech=$(_geo_auto_mechanism)
     if [ "$mech" = "builtin" ]; then
         if ! assets=$(_geo_assets_json "$(_geo_source_name)"); then
@@ -857,96 +1285,71 @@ _geo_extra_delete() {
     if ! _with_core_lock rm -f "$ASSET_DIR/$target"; then
         _warn "本地文件删除失败: $ASSET_DIR/$target"
     fi
-    _success "已删除自定义 geodata: $target"
+    _success "已删除自定义规则集: $target"
     return 0
 }
 
-# 子菜单: 先列已有条目; 非内置定时机制要说明这些文件不随定时更新。
-_geo_extra_menu() {
-    local choice="" mech="" path="" n=0 name="" url=""
+# 分流设置主菜单: 路由规则与规则集(geodata)的查看/添加/删除/恢复/精简。
+# Geo 数据本身的更新与数据源切换在 [9] 子菜单, 避免主菜单堆十几项。
+_split_menu() {
+    local choice="" state="" stats="" stats_ok=1
+    local total=0 geo=0 node=0 mark=0 mixed=0 private_ok=0
     while true; do
         clear
         echo
-        echo -e "  ${CYAN}【自定义 geodata】${NC}"
-        mech=$(_geo_auto_mechanism)
-        path=$(_geo_extra_path)
-        n=0
-        if [ -s "$path" ]; then
-            echo -e "  已有条目:"
-            while IFS=$'\t' read -r name url; do
-                [ -n "$name" ] || continue
-                n=$((n + 1))
-                echo -e "    ${CYAN}[$n]${NC} $name <- $url"
-            done < "$path"
+        echo -e "  ${CYAN}【分流设置】${NC}"
+        state=$(_geo_auto_state 2>/dev/null)
+        if [ "$state" = "on" ]; then
+            echo -e "  Geo 自动更新: ${GREEN}● 已开启${NC} ($(_geo_next_run_hint))"
         else
-            echo -e "  已有条目: ${YELLOW}无${NC}"
+            echo -e "  Geo 自动更新: ${RED}○ 已关闭${NC}"
+        fi
+        echo -e "  数据源: $(_geo_source_label)"
+        stats_ok=1
+        stats=$(_route_rules_stats) || stats_ok=0
+        if [ "$stats_ok" -eq 1 ]; then
+            read -r total geo node mark mixed <<< "$stats"
+            echo -e "  路由规则: ${CYAN}${total}${NC} 条 (引用 geo ${geo} 条, 节点规则 ${node} 条)"
+            private_ok=0
+            _route_private_block_valid && private_ok=1
+            if [ "$private_ok" -eq 1 ]; then
+                echo -e "  私网防护: ${GREEN}已注入字面量 CIDR${NC}"
+            elif [ "$mark" -gt 0 ]; then
+                echo -e "  私网防护: ${RED}规则标记存在但内容、唯一性或顺序无效${NC}"
+            else
+                echo -e "  私网防护: ${CYAN}未注入${NC}"
+            fi
+        else
+            echo -e "  路由规则: ${YELLOW}无法读取${NC} (Xray 未安装 / 配置缺失 / jq 不可用)"
         fi
         echo
-        if [ "$mech" = "builtin" ]; then
-            echo -e "  这些文件写在 .geodata.assets, 由 Xray 内置定时下载"
-        else
-            echo -e "  ${YELLOW}内置 Geo 自动更新关闭时, 这些文件只在添加时下载一次, 不会随定时更新${NC}"
-        fi
-        echo -e "  落点: $ASSET_DIR"
-        echo
-        echo -e "  ${GREEN}[1]${NC} 添加"
-        echo -e "  ${GREEN}[2]${NC} 删除"
+        echo -e "  ${GREEN}[1]${NC} 查看路由规则"
+        echo -e "  ${GREEN}[2]${NC} 添加路由规则"
+        echo -e "  ${GREEN}[3]${NC} 删除路由规则"
+        echo -e "  ${GREEN}[4]${NC} 查看规则集(geodata)"
+        echo -e "  ${GREEN}[5]${NC} 添加规则集(自定义 .dat)"
+        echo -e "  ${GREEN}[6]${NC} 删除规则集"
+        echo -e "  ${GREEN}[7]${NC} 恢复默认路由规则"
+        echo -e "  ${GREEN}[8]${NC} 精简规则(小内存优化)"
+        echo -e "  ${GREEN}[9]${NC} Geo 数据管理(更新/自动更新/数据源)"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
         case "${choice:-0}" in
-            1) _geo_extra_add ;;
-            2) _geo_extra_delete ;;
+            1) _route_view_rules ;;
+            2) _route_add_rule_flow ;;
+            3) _route_delete_rule_flow ;;
+            4) _geo_ruleset_view ;;
+            5) _geo_extra_add ;;
+            6) _geo_extra_delete ;;
+            7) _route_restore_default_flow ;;
+            8) _route_slim_flow ;;
+            9) _geo_data_menu; continue ;;
             0) return ;;
-            *) _warn "无效选择" ;;
+            *) _warn "无效" ;;
         esac
         _press_any_key
     done
-}
-
-# Geo 菜单复用 _geo_auto_mechanism, 按当前 geodata 配置判断内置更新。
-_geo_menu() {
-    clear
-    echo
-    echo -e "  ${CYAN}【Geo 数据自动更新】${NC}"
-    local state; state=$(_geo_auto_state)
-    local choice=""
-    if [ "$state" = "on" ]; then
-        echo -e "  当前状态: ${GREEN}● 已开启${NC}"
-        echo -e "  下次执行: $(_geo_next_run_hint)"
-        echo -e "  更新机制: ${GREEN}Xray 内置定时(热重载)${NC}"
-    else
-        echo -e "  当前状态: ${RED}○ 已关闭${NC}"
-    fi
-    echo -e "  数据源: $(_geo_source_label)"
-    echo -e "    geosite: $(_geo_source_url geosite)"
-    echo -e "    geoip:   $(_geo_source_url geoip)"
-    if _geo_builtin_source_drifted; then
-        echo -e "  ${YELLOW}注: 内置定时的下载链接仍是旧数据源, 进 [4] 重新应用一次即可同步(会重启核心)${NC}"
-    fi
-    echo -e "  落点: $ASSET_DIR (config env 的 XRAY_LOCATION_ASSET)"
-    echo
-    echo -e "  ${GREEN}[1]${NC} 立即更新一次"
-    if [ "$state" = "on" ]; then
-        echo -e "  ${GREEN}[2]${NC} 关闭自动更新"
-    else
-        echo -e "  ${GREEN}[2]${NC} 开启自动更新(定期)"
-    fi
-    echo -e "  ${GREEN}[3]${NC} 路由规则(小内存优化: 精简 geo 引用)"
-    echo -e "  ${GREEN}[4]${NC} 切换数据源"
-    echo -e "  ${GREEN}[5]${NC} 自定义 geodata(添加/删除)"
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  请选择: " choice || return 0
-    case "${choice:-0}" in
-        1) _geo_update ;;
-        2) if [ "$state" = "on" ]; then _geo_set_auto_update off; else _geo_set_auto_update on; fi ;;
-        3) _route_rules_menu; return ;;
-        4) _geo_set_source; return ;;
-        5) _geo_extra_menu; return ;;
-        0) return ;;
-        *) _warn "无效" ;;
-    esac
-    _press_any_key
 }
 
 # DNS 设置仅修改 .dns; 写入走 _mutate_config 的重启与回滚。

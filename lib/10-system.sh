@@ -106,6 +106,8 @@ _ensure_base_deps() {
     command -v jq     >/dev/null 2>&1 || missing+=(jq)
     command -v unzip  >/dev/null 2>&1 || missing+=(unzip)
     command -v python3 >/dev/null 2>&1 || missing+=(python3)
+    # 默认 Geo 源是 .gz, 管理器立即更新时要本地解压; 核心自下载不依赖它。
+    command -v gzip    >/dev/null 2>&1 || missing+=(gzip)
     # tar/cron 通常自带,不强制
     if [ "${#missing[@]}" -gt 0 ]; then
         _pkg_install "${missing[@]}" || return 1

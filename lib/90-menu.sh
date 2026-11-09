@@ -244,7 +244,7 @@ _main_menu() {
         echo
         echo -e "  ${CYAN}【配置与更新】${NC}"
         _menu_row 18 "检查配置"     19 "DNS 设置"
-        _menu_row 20 "Geo 管理"     21 "检测脚本更新"
+        _menu_row 20 "分流设置"     21 "检测脚本更新"
         echo
         echo -e "  ${CYAN}【核心管理】${NC}"
         _menu_row 22 "Xray 核心管理" 23 "卸载"
@@ -275,7 +275,7 @@ _main_menu() {
             17) _timed_restart_menu ;;
             18) _check_config ;;
             19) _dns_menu ;;
-            20) _geo_menu ;;
+            20) _split_menu ;;
             21) _check_script_update ;;
             22) _xray_core_menu ;;
             23) _uninstall_menu ;;

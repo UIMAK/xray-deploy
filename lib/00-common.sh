@@ -44,9 +44,10 @@ export CMD_NAME="xd"                            # 快捷命令名(用户确认)
 
 # GitHub 资产
 export XRAY_REPO_API="https://api.github.com/repos/XTLS/Xray-core/releases"
-# Geo 数据源: 远端文件名各源不同(geoip-full.dat / geoip.dat ...), 本地落点恒为 geoip.dat。
-export GEO_SRC_XTLS_GEOSITE="https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat"
-export GEO_SRC_XTLS_GEOIP="https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-full.dat"
+# Geo 数据源: 远端文件名各源不同(geoip-lite.dat.gz / geoip.dat ...), 本地落点恒为 geoip.dat。
+# 默认用 XTLS 官方 .gz 压缩包(核心自下载时自动解压); 管理器立即更新时自行 gunzip, 见 30-geo。
+export GEO_SRC_XTLS_GEOSITE="https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat.gz"
+export GEO_SRC_XTLS_GEOIP="https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-lite.dat.gz"
 export GEO_SRC_LOYAL_GEOSITE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 export GEO_SRC_LOYAL_GEOIP="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
 export CF_DL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"

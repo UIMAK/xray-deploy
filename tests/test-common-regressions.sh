@@ -180,6 +180,77 @@ geo_name_checks() {
 setup_case geo-names
 check 'custom geodata names require .dat and reject .gz sources' geo_name_checks
 
+geo_source_defaults() {
+    [ "$GEO_CRON_EXPR" = "30 4 * * *" ] &&
+        case "$GEO_SRC_XTLS_GEOSITE" in
+            *"geosite.dat.gz") ;;
+            *) return 1 ;;
+        esac &&
+        case "$GEO_SRC_XTLS_GEOIP" in
+            *"geoip-lite.dat.gz") ;;
+            *) return 1 ;;
+        esac &&
+        _geo_url_gz 'https://example.com/geoip-lite.dat.gz' &&
+        _geo_url_gz 'https://example.com/geosite.dat.GZ?x=1' &&
+        ! _geo_url_gz 'https://example.com/geosite.dat'
+}
+check 'default Geo source is daily 04:30 with lite .gz assets' geo_source_defaults
+
+route_token_checks() {
+    _route_domain_token_valid example.com &&
+        _route_domain_token_valid geosite:cn &&
+        _route_domain_token_valid 'regexp:^ads\.example$' &&
+        _route_domain_token_valid ext:my.dat:cn &&
+        ! _route_domain_token_valid geoip:cn &&
+        ! _route_domain_token_valid 'https://example.com' &&
+        ! _route_domain_token_valid 'a b' &&
+        _route_ip_token_valid 10.0.0.0/8 &&
+        _route_ip_token_valid 2001:db8::/32 &&
+        _route_ip_token_valid geoip:private &&
+        ! _route_ip_token_valid 10.0.0.0/33 &&
+        ! _route_ip_token_valid 999.1.1.1 &&
+        _route_protocol_token_valid bittorrent &&
+        ! _route_protocol_token_valid 'a/b'
+}
+check 'route rule tokens reject malformed domain/IP/protocol values' route_token_checks
+
+route_rule_filters() (
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        routing:{rules:[
+            {inboundTag:["node-a"],outboundTag:"direct"},
+            {domain:["geosite:cn"],outboundTag:"block"}
+        ]}}')" || return 1
+    local out=""
+    out=$(jq --argjson rule '{"domain":["openai.com"],"outboundTag":"direct"}' --arg pos head "$ROUTE_ADD_RULE_JQ" \
+        "$CONFIG_DIR/05_routing.json") || return 1
+    [ "$(printf '%s' "$out" | jq -r '.routing.rules | length')" = "3" ] || return 1
+    [ "$(printf '%s' "$out" | jq -r '.routing.rules[0].inboundTag[0]')" = "node-a" ] || return 1
+    [ "$(printf '%s' "$out" | jq -r '.routing.rules[1].domain[0]')" = "openai.com" ] || return 1
+    out=$(jq --argjson rule '{"domain":["geosite:cn"],"outboundTag":"block"}' "$ROUTE_DELETE_RULE_JQ" \
+        "$CONFIG_DIR/05_routing.json") || return 1
+    [ "$(printf '%s' "$out" | jq -r '.routing.rules | length')" = "1" ] || return 1
+    ! jq --argjson rule '{"domain":["no-such-rule"],"outboundTag":"block"}' "$ROUTE_DELETE_RULE_JQ" \
+        "$CONFIG_DIR/05_routing.json" >/dev/null 2>&1
+)
+setup_case route-filters
+check 'route add inserts after node rules and delete matches by content' route_rule_filters
+
+geo_ext_reference_count() (
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        dns:{servers:[{address:"1.1.1.1",domains:"geosite:google"}],hosts:{"ext:my.dat:cn":"1.2.3.4"}},
+        routing:{rules:[
+            {domain:["ext:my.dat:cn","geosite:cn"],outboundTag:"block"},
+            {ip:"geoip:private",outboundTag:"block"}
+        ]}}')" || return 1
+    [ "$(_geo_ref_count "ext:my.dat:")" = "2" ] &&
+        [ "$(_geo_ref_count "geosite:")" = "2" ] &&
+        [ "$(_geo_ref_count "geoip:")" = "1" ]
+)
+setup_case geo-refs
+check 'Geo reference counts cover routing, DNS and hosts' geo_ext_reference_count
+
 # busybox 的 crontab -l 是没有 crontab 文件时输出 can't open ... ENOENT, 不是 no crontab;
 # 只有"确实没有"才算空态, 权限错误必须继续 fail-closed。
 crontab_empty_state() (
