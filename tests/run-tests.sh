@@ -326,6 +326,16 @@ if (
 ) >/dev/null 2>&1; then fail 'referenced ruleset delete aborts'; else pass 'referenced ruleset delete aborts'; fi
 check 'referenced ruleset delete keeps the file' test -e "$ASSET_DIR/my.dat"
 check_eq 'referenced ruleset delete keeps the state line' 'my.dat	https://a.test/my.dat' "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+# 配置损坏导致引用数无法统计时同样必须中止, 不能按 0 引用放行。
+printf '{"log": broken\n' > "$CONFIG_DIR/02_log.json"
+if (
+    _geo_auto_mechanism() { printf off; }
+    _with_core_lock() { "$@"; }
+    echo 1 | _geo_extra_delete
+) >/dev/null 2>&1; then fail 'unreadable config blocks ruleset delete'; else pass 'unreadable config blocks ruleset delete'; fi
+check 'unreadable config keeps the referenced file' test -e "$ASSET_DIR/my.dat"
+check_eq 'unreadable config keeps the state line' 'my.dat	https://a.test/my.dat' "$(cat "$GEO_EXTRA_PATH" 2>/dev/null)"
+rm -f "$CONFIG_DIR/02_log.json"
 rm -f "$ASSET_DIR/my.dat"
 
 printf 'zeta.dat\thttps://a.test/dl/zeta.dat\n../evil.dat\thttps://a.test/evil.dat\n' > "$GEO_EXTRA_PATH"

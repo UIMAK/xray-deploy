@@ -8,6 +8,10 @@
 
 GEO_CRON_EXPR="30 4 * * *"
 
+# 用户经 [2] 添加的 inboundTag 规则带此 ruleTag; 节点/Reality 生成的规则不带,
+# 删除菜单据此只放行用户规则, 继续保护节点防偷跑规则。
+ROUTE_USER_RULE_TAG="xd-user-rule"
+
 # 数据源只记预设名, 链接由常量给: 上游改名只改常量, 老机器不留死链。
 _geo_source_name() {
     local src=""
@@ -332,9 +336,9 @@ _route_rules_stats() {
         | [
             (\$r | length),
             ([\$r[] | select(${GEO_RULE_REF_JQ})] | length),
-            ([\$r[] | select(.inboundTag? != null)] | length),
+            ([\$r[] | select(.inboundTag? != null and (.ruleTag? // \"\") != \"${ROUTE_USER_RULE_TAG}\")] | length),
             ([\$r[] | select((.ruleTag? // null) == \"${XRAY_PRIVATE_BLOCK_RULE_TAG:-xd-block-private}\")] | length),
-            ([\$r[] | select(.inboundTag? != null and (${GEO_RULE_REF_JQ}))] | length)
+            ([\$r[] | select(.inboundTag? != null and (.ruleTag? // \"\") != \"${ROUTE_USER_RULE_TAG}\" and (${GEO_RULE_REF_JQ}))] | length)
           ] | @tsv" 2>/dev/null) || { printf '0 0 0 0 0'; return 1; }
     [ -n "$out" ] || { printf '0 0 0 0 0'; return 1; }
     # 转空格供菜单 read 拆分, 与上面的单行输出契约一致。
@@ -429,7 +433,7 @@ def xd_rule($r):
 | "  规则总数: \($rs | length)    排序: \(.routing.domainStrategy // "AsIs")",
   (if ($rs | length) == 0 then "  (当前没有路由规则)"
    else ($rs | to_entries[] | .key as $i | .value as $r
-     | "  [\($i + 1)]\(if $r.inboundTag? != null then " 节点规则" else "" end) → \($r.outboundTag? // $r.balancerTag? // "?")   \(xd_rule($r))\(if $r.ruleTag? then "   [ruleTag=\($r.ruleTag)]" else "" end)")
+     | "  [\($i + 1)]\(if $r.inboundTag? != null then (if ($r.ruleTag? // "") == $ut then " 用户规则" else " 节点规则" end) else "" end) → \($r.outboundTag? // $r.balancerTag? // "?")   \(xd_rule($r))\(if $r.ruleTag? then "   [ruleTag=\($r.ruleTag)]" else "" end)")
    end)
 '
 
@@ -498,7 +502,8 @@ _route_ip_token_valid() {
     esac
     addr="$t"
     case "$t" in
-        */*) addr="${t%%/*}"; prefix="${t#*/}" ;;
+        */*) addr="${t%%/*}"; prefix="${t#*/}"
+             [ -n "$prefix" ] || return 1 ;;
     esac
     _validate_listen "$addr" || return 1
     [ -n "$prefix" ] || return 0
@@ -600,7 +605,7 @@ _route_view_rules() {
     echo -e "  ${CYAN}【路由规则】${NC}"
     echo -e "  文件: ${CONFIG_DIR}/05_routing.json"
     echo
-    if ! _config_jq -r "$ROUTE_RULE_LIST_JQ"; then
+    if ! _config_jq -r --arg ut "$ROUTE_USER_RULE_TAG" "$ROUTE_RULE_LIST_JQ"; then
         _error "读取路由规则失败"
         return 1
     fi
@@ -617,7 +622,7 @@ _route_add_rule_flow() {
     echo
     echo -e "  ${CYAN}选择匹配方式${NC}"
     echo -e "    ${GREEN}[1]${NC} 域名 (支持 geosite:xx / full: / regexp: / ext:文件名.dat:代码)"
-    echo -e "    ${GREEN}[2]${NC} IP (支持 geoip:xx / 单 IP / CIDR / ext:文件名.dat:代码)"
+    echo -e "    ${GREEN}[2]${NC} IP (geoip:分类 / 单 IP / CIDR / ext:文件名.dat:代码; 默认 lite 仅含 cn/ru/ir 等)"
     echo -e "    ${GREEN}[3]${NC} 入站 inboundTag"
     echo -e "    ${GREEN}[4]${NC} 协议 protocol (如 bittorrent/http/tls/quic)"
     echo -e "    ${GREEN}[0]${NC} 取消"
@@ -647,8 +652,9 @@ _route_add_rule_flow() {
         2) pos="head" ;;
         *) pos="end" ;;
     esac
-    rule=$(jq -cn --argjson v "$value_json" --arg f "$field" --arg o "$outbound" \
-        '{($f): $v, outboundTag: $o}') || { _error "生成规则失败"; return 1; }
+    rule=$(jq -cn --argjson v "$value_json" --arg f "$field" --arg o "$outbound" --arg t "$ROUTE_USER_RULE_TAG" \
+        '{($f): $v, outboundTag: $o} + (if $f == "inboundTag" then {ruleTag: $t} else {} end)') \
+        || { _error "生成规则失败"; return 1; }
     echo
     printf '  新规则: %s\n' "$rule"
     if [ "$pos" = "head" ]; then
@@ -679,7 +685,7 @@ _route_delete_rule_flow() {
         return 0
     fi
     echo
-    if ! _config_jq -r "$ROUTE_RULE_LIST_JQ"; then
+    if ! _config_jq -r --arg ut "$ROUTE_USER_RULE_TAG" "$ROUTE_RULE_LIST_JQ"; then
         _error "读取路由规则失败"
         return 1
     fi
@@ -687,12 +693,13 @@ _route_delete_rule_flow() {
     read -rp "  选择要删除的规则编号(0 取消): " sel || return 0
     case "$sel" in ''|0) return 0 ;; esac
     idx=$(_xd_index_from_choice "$sel" "$count") || { _warn "无效编号"; return 1; }
-    if _config_jq -e --argjson i "$idx" '(.routing.rules[$i].inboundTag? // null) != null' >/dev/null 2>&1; then
+    rule_tag=$(_config_jq -r --argjson i "$idx" '.routing.rules[$i].ruleTag? // empty') || rule_tag=""
+    if _config_jq -e --argjson i "$idx" '(.routing.rules[$i].inboundTag? // null) != null' >/dev/null 2>&1 \
+       && [ "$rule_tag" != "$ROUTE_USER_RULE_TAG" ]; then
         _error "第 $((idx + 1)) 条是节点定向规则(inboundTag), 由节点/Reality 管理维护"
         _tip "请通过删除节点或 Reality 域名管理调整, 避免破坏 tunnel 防偷跑规则"
         return 1
     fi
-    rule_tag=$(_config_jq -r --argjson i "$idx" '.routing.rules[$i].ruleTag? // empty') || rule_tag=""
     # 取待删规则的完整 JSON, 提交时按内容匹配(见 ROUTE_DELETE_RULE_JQ)。
     rule=$(_config_jq -c --argjson i "$idx" '.routing.rules[$i] // empty') && [ -n "$rule" ] \
         || { _error "读取待删规则失败"; return 1; }
@@ -777,7 +784,9 @@ _route_slim_flow() {
 # 统计前缀(geosite: / geoip: / ext:文件.dat:)在 routing 与 dns 中的引用数。
 _geo_ref_count() {
     local prefix="${1:-}" n=""
-    _config_present || { printf '0'; return 1; }
+    # 配置不存在时不可能有引用, 输出 0 且 rc 0; 配置存在但无法统计时 rc 1,
+    # 调用方(如删除前守卫)必须区分“0 引用”与“无法统计”并 fail-closed。
+    _config_present || { printf '0'; return 0; }
     command -v jq >/dev/null 2>&1 || { printf '0'; return 1; }
     n=$(_config_jq -r --arg p "$prefix" '
         [ (.routing.rules[]?
@@ -788,8 +797,8 @@ _geo_ref_count() {
             | (if type == "string" then split(",")[] elif type == "array" then .[] else empty end)),
           ((.dns?.hosts? // {}) | keys[]?) ]
         | map(select(type == "string")) | map(ltrimstr("!"))
-        | map(select(startswith($p))) | length' 2>/dev/null) || n=0
-    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+        | map(select(startswith($p))) | length' 2>/dev/null) || { printf '0'; return 1; }
+    [[ "$n" =~ ^[0-9]+$ ]] || { printf '0'; return 1; }
     printf '%s' "$n"
 }
 
@@ -1253,8 +1262,13 @@ _geo_extra_delete() {
             ;;
     esac
     # 与 sing-box 删除规则集前的引用检查同义: 仍有 ext: 引用的 dat 不能先删。
-    refs=$(_geo_ref_count "ext:${target}:")
-    if [ "${refs:-0}" -gt 0 ]; then
+    # 统计失败(配置不可读/缺 jq)时不能当作 0 引用, 否则会删掉仍有引用的文件。
+    if ! refs=$(_geo_ref_count "ext:${target}:"); then
+        _error "无法读取配置, 无法检查 ext:${target}: 引用, 已取消删除"
+        _tip "请先修复配置后重试"
+        return 1
+    fi
+    if [ "$refs" -gt 0 ]; then
         _error "仍有 ${refs} 条路由/DNS 规则引用 ext:${target}:, 已取消删除"
         _tip "请先在 [3] 删除对应路由规则, 或手工编辑 ${CONFIG_DIR}/05_routing.json"
         return 1

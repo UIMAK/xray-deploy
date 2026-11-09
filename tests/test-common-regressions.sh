@@ -208,6 +208,8 @@ route_token_checks() {
         _route_ip_token_valid 2001:db8::/32 &&
         _route_ip_token_valid geoip:private &&
         ! _route_ip_token_valid 10.0.0.0/33 &&
+        ! _route_ip_token_valid 10.0.0.0/ &&
+        ! _route_ip_token_valid 2001:db8::/ &&
         ! _route_ip_token_valid 999.1.1.1 &&
         _route_protocol_token_valid bittorrent &&
         ! _route_protocol_token_valid 'a/b'
@@ -235,6 +237,36 @@ route_rule_filters() (
 )
 setup_case route-filters
 check 'route add inserts after node rules and delete matches by content' route_rule_filters
+
+route_inbound_ownership() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" --arg u "$ROUTE_USER_RULE_TAG" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"node-a"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["node-a"],outboundTag:"direct"},
+            {inboundTag:["node-a"],outboundTag:"block",ruleTag:$u}
+        ]}}')" || return 1
+    local out="$TMP/route-ownership-args"
+    _mutate_config() { printf '%s\n' "$*" > "$out"; return 0; }
+    # 未标记的节点规则继续拒绝删除。
+    rm -f "$out"
+    _route_delete_rule_flow >/dev/null 2>&1 <<< $'1\ny\n' && return 1
+    [ ! -e "$out" ] || return 1
+    # 带用户标记的 inboundTag 规则可删除。
+    _route_delete_rule_flow >/dev/null 2>&1 <<< $'2\ny\n' || return 1
+    grep -q '"ruleTag":"xd-user-rule"' "$out" || return 1
+    # 添加向导给 inboundTag 规则打上同一个用户标记。
+    rm -f "$out"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["node-a"\]' "$out" &&
+        grep -q '"ruleTag":"xd-user-rule"' "$out"
+)
+setup_case route-ownership
+check 'user inbound rules are tagged and deletable, node rules stay protected' route_inbound_ownership
 
 geo_ext_reference_count() (
     _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
