@@ -400,13 +400,14 @@ _route_slim_geo_rules() {
     return 0
 }
 
-# 保留节点规则并接共享默认规则; 其余自定义规则会丢弃, 菜单须在确认前明示。
+# 保留节点规则并接共享默认规则; 用户经菜单添加的 inboundTag 规则带用户标记,
+# 属于自定义规则, 与其它手工规则一并丢弃, 保持菜单确认提示一致。
 # 恢复 IPIfNonMatch 让 geoip:cn 对域名目标生效; inboundTag? 容忍非对象元素。
 _route_restore_default_rules() {
     _route_preflight || return 1
-    _mutate_config --argjson defs "$XRAY_DEFAULT_ROUTING_RULES_JSON" \
+    _mutate_config --arg ut "$ROUTE_USER_RULE_TAG" --argjson defs "$XRAY_DEFAULT_ROUTING_RULES_JSON" \
         '.routing.domainStrategy = "IPIfNonMatch"
-         | .routing.rules = ([.routing.rules[]? | select(.inboundTag? != null)] + $defs)' || return 1
+         | .routing.rules = ([.routing.rules[]? | select(.inboundTag? != null and (.ruleTag? // "") != $ut)] + $defs)' || return 1
     return 0
 }
 
@@ -514,7 +515,8 @@ _route_ip_token_valid() {
     esac
 }
 
-_route_protocol_token_valid() { [[ "${1:-}" =~ ^[A-Za-z0-9_.-]+$ ]]; }
+# Xray routing 的 protocol 仅支持这四种(官方 routing.md), 其它值不会被核心命中, 提前拒绝。
+_route_protocol_token_valid() { [[ "${1:-}" =~ ^(http|tls|quic|bittorrent)$ ]]; }
 
 _route_tokens_json() {
     [ "$#" -gt 0 ] || return 1
@@ -535,7 +537,7 @@ _route_read_tokens() {
             case "$kind" in
                 domain) _route_domain_token_valid "$token" || { _warn "无效域名项: $token (可用 geosite:/full:/regexp:/ext: 前缀)"; bad=1; break; } ;;
                 ip) _route_ip_token_valid "$token" || { _warn "无效 IP 项: $token (可用 geoip:/ext: 前缀或 IPv4/IPv6/CIDR)"; bad=1; break; } ;;
-                protocol) _route_protocol_token_valid "$token" || { _warn "无效协议项: $token"; bad=1; break; } ;;
+                protocol) _route_protocol_token_valid "$token" || { _warn "无效协议项: $token (支持 http/tls/quic/bittorrent)"; bad=1; break; } ;;
             esac
         done
         [ "$bad" -eq 0 ] || continue
