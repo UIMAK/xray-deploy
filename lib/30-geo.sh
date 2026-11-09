@@ -552,7 +552,8 @@ _route_read_tokens() {
 # 该 inboundTag 已有 block 兜底规则时(节点/Reality tunnel 会生成这种规则),
 # 其后追加的 inboundTag 规则永远不会命中; 向导须拒绝, 不能制造无效规则。
 # outboundTag/balancerTag/ruleTag/webhook 是动作/标记/通知字段, 不限制匹配范围;
-# network 覆盖 tcp+udp 时等价于匹配全部流量。其它匹配字段出现即视为收窄范围。
+# network 覆盖 tcp+udp、port/sourcePort/localPort 覆盖 1-65535 时等价于匹配全部流量
+# (vlessRoute 的 0 表示非 VLESS, 不视为全量)。其它匹配字段出现即视为收窄范围。
 _route_inbound_has_block_fallback() {   # <tag>
     local tag="${1:-}"
     [ -n "$tag" ] || return 1
@@ -563,10 +564,32 @@ _route_inbound_has_block_fallback() {   # <tag>
           (if type == "string" then split(",") elif type == "array" then . else [] end)
           | map(tostring | ascii_downcase)
           | (index("tcp") != null and index("udp") != null);
+        def xd_port_all:
+          (if type == "number" then [.] elif type == "string" then split(",") else [] end)
+          | map(
+              if type == "number" then {f: ., t: .}
+              elif type == "string" then
+                (gsub("^\\s+|\\s+$"; "")) as $s
+                | if ($s | test("^[0-9]+-[0-9]+$")) then
+                    ($s | split("-")) as $p | {f: ($p[0] | tonumber), t: ($p[1] | tonumber)}
+                  elif ($s | test("^[0-9]+$")) then
+                    ($s | tonumber) as $n | {f: $n, t: $n}
+                  else null end
+              else null end)
+          | map(select(. != null and .f <= .t))
+          | sort_by(.f)
+          | reduce .[] as $r ({covered: 0, ok: true};
+              if $r.f > (.covered + 1) then .ok = false
+              else .covered = ([.covered, $r.t] | max)
+              end)
+          | (.ok and .covered >= 65535);
         def xd_catch_all:
           . as $r
           | ([$r | to_entries[] | select((.key | xd_meta_key) | not)
-              | select(.key == "inboundTag" or (.key == "network" and (.value | xd_network_all)))]
+              | select(.key == "inboundTag"
+                  or (.key == "network" and (.value | xd_network_all))
+                  or ((.key == "port" or .key == "sourcePort" or .key == "localPort")
+                      and (.value | xd_port_all)))]
              | length)
             == ([$r | keys[] | select((xd_meta_key) | not)] | length);
         [.routing.rules[]?
