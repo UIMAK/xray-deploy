@@ -553,7 +553,9 @@ _route_read_tokens() {
 # 其后追加的 inboundTag 规则永远不会命中; 向导须拒绝, 不能制造无效规则。
 # outboundTag/balancerTag/ruleTag/webhook 是动作/标记/通知字段, 不限制匹配范围;
 # network 覆盖 tcp+udp、port/sourcePort/localPort 覆盖 1-65535 时等价于匹配全部流量
-# (vlessRoute 的 0 表示非 VLESS, 不视为全量)。其它匹配字段出现即视为收窄范围。
+# (vlessRoute 的 0 表示非 VLESS, 不视为全量); sourceIP/source/localIP 同时含
+# 0.0.0.0/0 与 ::/0 时覆盖全部地址(目标 ip 不按全量处理: 域名目标在 AsIs 下可能无 IP)。
+# 其它匹配字段出现即视为收窄范围。
 _route_inbound_has_block_fallback() {   # <tag>
     local tag="${1:-}"
     [ -n "$tag" ] || return 1
@@ -583,13 +585,19 @@ _route_inbound_has_block_fallback() {   # <tag>
               else .covered = ([.covered, $r.t] | max)
               end)
           | (.ok and .covered >= 65535);
+        def xd_ip_all:
+          (if type == "string" then split(",") elif type == "array" then . else [] end)
+          | map(select(type == "string"))
+          | (index("0.0.0.0/0") != null and index("::/0") != null);
         def xd_catch_all:
           . as $r
           | ([$r | to_entries[] | select((.key | xd_meta_key) | not)
               | select(.key == "inboundTag"
                   or (.key == "network" and (.value | xd_network_all))
                   or ((.key == "port" or .key == "sourcePort" or .key == "localPort")
-                      and (.value | xd_port_all)))]
+                      and (.value | xd_port_all))
+                  or ((.key == "sourceIP" or .key == "source" or .key == "localIP")
+                      and (.value | xd_ip_all)))]
              | length)
             == ([$r | keys[] | select((xd_meta_key) | not)] | length);
         [.routing.rules[]?

@@ -360,6 +360,39 @@ route_inbound_shadow_ports() (
 setup_case route-shadow-ports
 check 'full port ranges hide block fallbacks, partial ranges do not' route_inbound_shadow_ports
 
+# sourceIP/source/localIP 双栈全范围同样是兜底; 仅 IPv4 全范围不算。
+route_inbound_shadow_ips() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"a-src"},{tag:"b-local"},{tag:"c-v4"},{tag:"d-alias"},{tag:"e-str"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["a-src"],sourceIP:["0.0.0.0/0","::/0"],outboundTag:"block"},
+            {inboundTag:["b-local"],localIP:["0.0.0.0/0","::/0"],outboundTag:"block"},
+            {inboundTag:["c-v4"],sourceIP:["0.0.0.0/0"],outboundTag:"block"},
+            {inboundTag:["d-alias"],source:["0.0.0.0/0","::/0"],outboundTag:"block"},
+            {inboundTag:["e-str"],sourceIP:"0.0.0.0/0,::/0",outboundTag:"block"}
+        ]}}')" || return 1
+    local captured="$TMP/route-shadow-ips-args"
+    _mutate_config() { printf '%s\n' "$*" > "$captured"; return 0; }
+    rm -f "$captured"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n4\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n5\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n3\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["c-v4"\]' "$captured"
+)
+setup_case route-shadow-ips
+check 'dual-stack sourceIP/localIP hide block fallbacks, IPv4-only does not' route_inbound_shadow_ips
+
 # 恢复默认保留节点规则; 带用户标记的 inboundTag 规则属于自定义规则, 必须一并丢弃。
 route_restore_defaults() (
     mkdir -p "$BIN_DIR"
