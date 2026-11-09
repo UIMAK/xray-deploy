@@ -276,6 +276,43 @@ if (
     [ "$(_geo_source_name)" = loyal ] && [ ! -e "$STATE_DIR/geo_geosite_url" ]
 ); then pass 'invalid custom Geo source leaves state unchanged'; else fail 'invalid custom Geo source leaves state unchanged'; fi
 
+printf '== Geo gzip update ==\n'
+GEO_TEST_OK="$TMP/geo-update-ok"
+geo_gz_success() (
+    rm -f "$GEO_TEST_OK"
+    _geo_source_url() { printf 'https://a.test/%s.dat.gz' "$1"; }
+    _http_download() { head -c 4096 /dev/zero | tr '\0' x | gzip -c > "$2"; }
+    _with_config_lock() { "$@"; }
+    _with_core_lock() { "$@"; }
+    _xray_core_geo_update_locked() {
+        printf '%s' "$3" > "$GEO_TEST_OK"
+        [ "$3" = 1 ] || return 1
+        cp "$1/geosite.dat" "$1/geoip.dat" "$ASSET_DIR/"
+    }
+    _geo_update >/dev/null 2>&1 || return 1
+    [ "$(cat "$GEO_TEST_OK")" = 1 ] &&
+        [ "$(wc -c < "$ASSET_DIR/geosite.dat")" -eq 4096 ] &&
+        [ "$(wc -c < "$ASSET_DIR/geoip.dat")" -eq 4096 ] &&
+        [ "$(head -c 1 "$ASSET_DIR/geosite.dat")" = x ]
+)
+check 'gzip Geo update decompresses both sources' geo_gz_success
+
+geo_gz_corrupt() (
+    printf old-geosite > "$ASSET_DIR/geosite.dat"
+    printf old-geoip > "$ASSET_DIR/geoip.dat"
+    rm -f "$GEO_TEST_OK"
+    _geo_source_url() { printf 'https://a.test/%s.dat.gz' "$1"; }
+    _http_download() { printf 'not-gzip' > "$2"; }
+    _with_config_lock() { "$@"; }
+    _with_core_lock() { "$@"; }
+    _xray_core_geo_update_locked() { printf '%s' "$3" > "$GEO_TEST_OK"; return 1; }
+    _geo_update >/dev/null 2>&1 && return 1
+    [ "$(cat "$GEO_TEST_OK")" = 0 ] &&
+        [ "$(cat "$ASSET_DIR/geosite.dat")" = old-geosite ] &&
+        [ "$(cat "$ASSET_DIR/geoip.dat")" = old-geoip ]
+)
+check 'corrupt gzip aborts and keeps old dat files' geo_gz_corrupt
+
 printf '== custom geodata ==\n'
 GEO_EXTRA_PATH="$STATE_DIR/geo_extra_assets"
 GEO_EXTRA_BIG="$TMP/geo-extra-big.dat"

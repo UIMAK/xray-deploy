@@ -207,6 +207,10 @@ route_token_checks() {
         _route_ip_token_valid 10.0.0.0/8 &&
         _route_ip_token_valid 2001:db8::/32 &&
         _route_ip_token_valid geoip:private &&
+        _route_ip_token_valid '!geoip:cn' &&
+        _route_ip_token_valid '!10.0.0.0/8' &&
+        _route_ip_token_valid '!2001:db8::/32' &&
+        ! _route_ip_token_valid '!' &&
         ! _route_ip_token_valid 10.0.0.0/33 &&
         ! _route_ip_token_valid 10.0.0.0/ &&
         ! _route_ip_token_valid 2001:db8::/ &&
@@ -250,7 +254,7 @@ route_inbound_ownership() (
     chmod +x "$XRAY_BIN"
     _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" --arg u "$ROUTE_USER_RULE_TAG" '{
         version:{min:$v,max:""},
-        inbounds:[{tag:"node-a"}],
+        inbounds:[{tag:"node-a"},{tag:"node-b"}],
         outbounds:[{tag:"proxy",protocol:"vless"}],
         routing:{rules:[
             {inboundTag:["node-a"],outboundTag:"direct"},
@@ -265,14 +269,40 @@ route_inbound_ownership() (
     # 带用户标记的 inboundTag 规则可删除。
     _route_delete_rule_flow >/dev/null 2>&1 <<< $'2\ny\n' || return 1
     grep -q '"ruleTag":"xd-user-rule"' "$out" || return 1
-    # 添加向导给 inboundTag 规则打上同一个用户标记。
+    # 添加向导给 inboundTag 规则打上同一个用户标记; node-a 有兜底 block, 改用 node-b。
     rm -f "$out"
-    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' || return 1
-    grep -q '"inboundTag":\["node-a"\]' "$out" &&
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["node-b"\]' "$out" &&
         grep -q '"ruleTag":"xd-user-rule"' "$out"
 )
 setup_case route-ownership
 check 'user inbound rules are tagged and deletable, node rules stay protected' route_inbound_ownership
+
+# Reality tunnel 的兜底 block 规则会吞掉该 inbound 的后续规则; 向导必须拒绝,
+# 而没有兜底规则的入站仍可正常添加用户规则。
+route_inbound_shadow() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"a-tunnel"},{tag:"b-reality"}],
+        outbounds:[{tag:"proxy",protocol:"vless"}],
+        routing:{rules:[
+            {inboundTag:["a-tunnel"],domain:["example.com"],outboundTag:"direct"},
+            {inboundTag:["a-tunnel"],outboundTag:"block"}
+        ]}}')" || return 1
+    local captured="$TMP/route-shadow-args"
+    _mutate_config() { printf '%s\n' "$*" > "$captured"; return 0; }
+    rm -f "$captured"
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n1\n1\n1\ny\n' && return 1
+    [ ! -e "$captured" ] || return 1
+    _route_add_rule_flow >/dev/null 2>&1 <<< $'3\n2\n1\n1\ny\n' || return 1
+    grep -q '"inboundTag":\["b-reality"\]' "$captured" &&
+        grep -q '"ruleTag":"xd-user-rule"' "$captured"
+)
+setup_case route-shadow
+check 'shadowed node inbound rejects inbound rules, open inbound still works' route_inbound_shadow
 
 # 恢复默认保留节点规则; 带用户标记的 inboundTag 规则属于自定义规则, 必须一并丢弃。
 route_restore_defaults() (

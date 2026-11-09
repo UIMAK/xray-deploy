@@ -492,10 +492,13 @@ _route_domain_token_valid() {
     esac
 }
 
-# IP 列表项: geoip:/ext: 代码, 或单个 IPv4/IPv6/CIDR; 前缀范围按地址族校验。
+# IP 列表项: 可带 ! 反选前缀, geoip:/ext: 代码, 或单个 IPv4/IPv6/CIDR; 前缀范围按地址族校验。
 _route_ip_token_valid() {
     local t="${1:-}" addr="" prefix=""
     [ -n "$t" ] || return 1
+    case "$t" in
+        '!'*) t="${t#!}"; [ -n "$t" ] || return 1 ;;
+    esac
     case "$t" in
         *[[:space:]]*) return 1 ;;
         geoip:*) _route_geo_code_valid "${t#geoip:}"; return ;;
@@ -536,7 +539,7 @@ _route_read_tokens() {
         for token in "${ROUTE_TOKENS[@]}"; do
             case "$kind" in
                 domain) _route_domain_token_valid "$token" || { _warn "无效域名项: $token (可用 geosite:/full:/regexp:/ext: 前缀)"; bad=1; break; } ;;
-                ip) _route_ip_token_valid "$token" || { _warn "无效 IP 项: $token (可用 geoip:/ext: 前缀或 IPv4/IPv6/CIDR)"; bad=1; break; } ;;
+                ip) _route_ip_token_valid "$token" || { _warn "无效 IP 项: $token (可用 ! 反选、geoip:/ext: 前缀或 IPv4/IPv6/CIDR)"; bad=1; break; } ;;
                 protocol) _route_protocol_token_valid "$token" || { _warn "无效协议项: $token (支持 http/tls/quic/bittorrent)"; bad=1; break; } ;;
             esac
         done
@@ -544,6 +547,21 @@ _route_read_tokens() {
         _route_tokens_json "${ROUTE_TOKENS[@]}" && return 0
         _warn "生成规则值失败"
     done
+}
+
+# 该 inboundTag 已有无其它匹配项的 block 兜底规则时(节点/Reality tunnel 会生成这种规则),
+# 其后追加的 inboundTag 规则永远不会命中; 向导须拒绝, 不能制造无效规则。
+_route_inbound_has_block_fallback() {   # <tag>
+    local tag="${1:-}"
+    [ -n "$tag" ] || return 1
+    _config_jq -e --arg t "$tag" '
+        [.routing.rules[]?
+         | select(type == "object")
+         | select(.outboundTag? == "block")
+         | select((.inboundTag? // null) != null)
+         | select(((.inboundTag | if type == "string" then split(",") else . end) | index($t)) != null)
+         | select((keys - ["inboundTag", "outboundTag", "ruleTag", "balancerTag"] | length) == 0)
+        ] | length > 0' >/dev/null 2>&1
 }
 
 # 列出带 tag 的入站; 选中项输出到 stdout, 列表和提示走 stderr。
@@ -624,7 +642,7 @@ _route_add_rule_flow() {
     echo
     echo -e "  ${CYAN}选择匹配方式${NC}"
     echo -e "    ${GREEN}[1]${NC} 域名 (支持 geosite:xx / full: / regexp: / ext:文件名.dat:代码)"
-    echo -e "    ${GREEN}[2]${NC} IP (geoip:分类 / 单 IP / CIDR / ext:文件名.dat:代码; 默认 lite 仅含 cn/ru/ir 等)"
+    echo -e "    ${GREEN}[2]${NC} IP (geoip:分类 / 单 IP / CIDR / ext:文件名.dat:代码; 前缀 ! 反选; 默认 lite 仅含 cn/ru/ir 等)"
     echo -e "    ${GREEN}[3]${NC} 入站 inboundTag"
     echo -e "    ${GREEN}[4]${NC} 协议 protocol (如 bittorrent/http/tls/quic)"
     echo -e "    ${GREEN}[0]${NC} 取消"
@@ -635,6 +653,11 @@ _route_add_rule_flow() {
         3)
             local tag=""
             tag=$(_route_pick_inbound) || return 0
+            if _route_inbound_has_block_fallback "$tag"; then
+                _error "入站 $tag 已有 block 兜底规则(inboundTag → block), 其后添加的规则不会生效"
+                _tip "请改用域名/IP/协议匹配; 如需调整兜底规则, 请通过节点/Reality 管理或 [3] 删除用户规则"
+                return 1
+            fi
             value_json=$(_route_tokens_json "$tag") || { _error "生成规则值失败"; return 1; }
             field="inboundTag"
             ;;
