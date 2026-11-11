@@ -400,6 +400,112 @@ rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?
 check 'Hy2 normal derived sync succeeds' eq "$rc" 0
 check 'Hy2 normal derived sync rebuilds link' jq -e '.share_link | startswith("hy2://") and contains("@edge.example:443/")' "$DEPLOY_DIR/meta.json"
 
+hy2_pin_fixture() {
+    local tag="$1"
+    jq -n --arg t "$tag" '{tag:$t,protocol:"hysteria2",name:"hy2-pin",auth:"secret",link_addr:"edge.example",port:443,sni:"site.example",congestion:"bbr",self_signed:true,share_link:"old-link"}' > "$DEPLOY_DIR/meta.json"
+    : > "$TMP/warnings"
+    : > "$TMP/errors"
+}
+hy2_pin_value() {
+    local pin='' i
+    for i in $(seq 1 31); do pin="${pin}AB:"; done
+    printf '%sAB' "$pin"
+}
+hy2_pin_stub() {
+    mkdir -p "$TMP/pin-bin"
+    cat > "$TMP/pin-bin/openssl" <<EOF
+#!/bin/sh
+printf 'sha256 Fingerprint=%s\n' '$1'
+EOF
+    chmod +x "$TMP/pin-bin/openssl"
+}
+hy2_pin_probe() (
+    local pin link encoded old_path="$PATH"
+    pin=$(hy2_pin_value)
+    hy2_pin_fixture hy2-pin
+    mkdir -p "$CERT_DIR/hy2-pin"
+    printf cert > "$CERT_DIR/hy2-pin/cert.pem"
+    hy2_pin_stub "$pin"
+    PATH="$TMP/pin-bin:$old_path"
+    link=$(_rebuild_hy2_link "$DEPLOY_DIR/meta.json") || return 1
+    PATH="$old_path"
+    encoded=$(_url_encode "$pin")
+    contains "$link" "insecure=1&pinSHA256=$encoded" && lacks "$link" 'allowInsecure'
+)
+check 'Hy2 self-signed link pins certificate without allowInsecure' hy2_pin_probe
+
+hy2_pin_legacy_cert_probe() (
+    local pin link encoded old_path="$PATH"
+    pin=$(hy2_pin_value)
+    hy2_pin_fixture hy2-legacy
+    printf cert > "$CERT_DIR/hy2-legacy.crt"
+    hy2_pin_stub "$pin"
+    PATH="$TMP/pin-bin:$old_path"
+    link=$(_rebuild_hy2_link "$DEPLOY_DIR/meta.json") || return 1
+    PATH="$old_path"
+    encoded=$(_url_encode "$pin")
+    contains "$link" "pinSHA256=$encoded"
+)
+check 'Hy2 self-signed link supports legacy cert layout' hy2_pin_legacy_cert_probe
+
+hy2_pin_missing_cert_probe() (
+    local rc=0
+    hy2_pin_fixture hy2-pin-missing
+    _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?
+    eq "$rc" 1 &&
+        jq -e '.share_link == ""' "$DEPLOY_DIR/meta.json" &&
+        grep -qF '已清空分享链接' "$TMP/warnings"
+)
+check 'Hy2 self-signed missing cert clears unsafe link' hy2_pin_missing_cert_probe
+
+hy2_pin_no_openssl_probe() (
+    local rc=0 out
+    hy2_pin_fixture hy2-pin-no-openssl
+    mkdir -p "$CERT_DIR/hy2-pin-no-openssl"
+    printf cert > "$CERT_DIR/hy2-pin-no-openssl/cert.pem"
+    command -v openssl >/dev/null 2>&1 || return 1
+    # shellcheck disable=SC2123
+    PATH=/nonexistent
+    command -v openssl >/dev/null 2>&1 && return 1
+    out=$(_hy2_cert_pin "$CERT_DIR/hy2-pin-no-openssl/cert.pem") || rc=$?
+    eq "$rc" 1 && [ -z "$out" ]
+)
+check 'Hy2 self-signed pin fails closed without openssl' hy2_pin_no_openssl_probe
+
+hy2_pin_bad_field_probe() (
+    local rc=0
+    hy2_pin_fixture hy2-pin-bad
+    _meta_update "$DEPLOY_DIR/meta.json" 'del(.congestion)' || return 1
+    _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?
+    eq "$rc" 1 &&
+        jq -e '.share_link == ""' "$DEPLOY_DIR/meta.json" &&
+        grep -qF '已清空原链接' "$TMP/warnings"
+)
+check 'Hy2 self-signed general rebuild failure clears unsafe link' hy2_pin_bad_field_probe
+
+hy2_pin_port_probe() (
+    local rc=0 newmeta
+    hy2_pin_fixture hy2-pin-port
+    newmeta=$(_hy2_gen_newmeta "$DEPLOY_DIR/meta.json" '' 8443) || rc=$?
+    [ "$rc" -eq 0 ] && jq -e '.port == 8443 and .share_link == ""' <<< "$newmeta" >/dev/null
+)
+check 'Hy2 self-signed missing pin clears link during port rebuild' hy2_pin_port_probe
+
+hy2_listen_sync_probe() (
+    local tag=hy2-listen meta
+    NODES_DIR="$TMP/listen-nodes"
+    mkdir -p "$NODES_DIR"
+    meta="$NODES_DIR/$tag.json"
+    jq -n '{tag:"hy2-listen",protocol:"hysteria2",name:"hy2-listen",auth:"secret",link_addr:"old.example",port:443,sni:"site.example",congestion:"bbr",self_signed:true,share_link:"hy2://secret@old.example:443/?insecure=1&allowInsecure=1#hy2-listen"}' > "$meta"
+    _node_identity() { printf same; }
+    _config_jq() { printf '[{"tag":"hy2-listen","listen":"0.0.0.0"}]'; }
+    _mutate_config() { return 0; }
+    _hy2_sync_derived() { printf '%s' "$1" > "$TMP/sync-called"; return 0; }
+    _update_listen_commit_locked "$tag" same 127.0.0.1 edge.example 'hy2://secret@old.example:443/?insecure=1&allowInsecure=1#hy2-listen' || return 1
+    [ "$(cat "$TMP/sync-called")" = "$meta" ]
+)
+check 'Hy2 listen update rebuilds derived link' hy2_listen_sync_probe
+
 # 用确定性的本地命令输出驱动真实 PQ 判定。
 XRAY_BIN="$TMP/xray"
 printf '#!/bin/bash\nexit 99\n' > "$XRAY_BIN"

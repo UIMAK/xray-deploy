@@ -151,6 +151,15 @@ _hy2_link_unexpressible() {
     return 0
 }
 
+# 自签链接无法安全重建时清除派生值；失败只报告，不覆盖权威字段。
+_hy2_clear_share_link() {
+    local meta="$1"
+    _meta_update "$meta" '.share_link=""' || {
+        _error "不安全分享链接清空失败(节点元数据不可写?): $meta"
+        return 1
+    }
+}
+
 # 只替换 settings.xd_managed=true 的自有层，关闭用 XD_UDP_JQ_UPSERT 的 $new=null；外来同类层保留。
 # XD_UDP_OUR_TYPE/XD_UDP_OUR_MARKER 为匹配键；udp 是多层数组(finalmask.md)。
 XD_UDP_OUR_TYPE="salamander"
@@ -1187,7 +1196,10 @@ _hy2_gen_newmeta() {
     newlink=$(_rebuild_hy2_link "$tmp_meta"); rc=$?
     # 两种失败必须区分: 不可表达(gecko 自定义尺寸) ⇒ 链接留空是正常结果;
     # 元数据缺字段 ⇒ 无法安全重建, 拒绝(不写坏链接)。
-    if [ "$rc" != 0 ] && ! _hy2_link_unexpressible "$tmp_meta"; then
+    if [ "$rc" -eq 2 ]; then
+        newlink=""
+        _warn "自签证书 pin 无法推导, 分享链接已清空"
+    elif [ "$rc" != 0 ] && ! _hy2_link_unexpressible "$tmp_meta"; then
         rm -f "$tmp_meta"
         # 无链接身份的(测试/采纳)元数据没有可丢的链接, 只更新端口与名称。
         if [ -z "$newport" ] || [ "$(jq -r 'has("share_link") or has("uuid")' "$meta" 2>/dev/null)" != false ]; then
@@ -3339,6 +3351,20 @@ _hy2_cert_domain() {
     printf '%s' "$d"
 }
 
+# 自签证书 pin 固定 X.509 DER 的 SHA-256；证书、openssl 或输出异常时拒绝生成链接。
+_hy2_cert_pin() {
+    local cert="$1" pin
+    [ -f "$cert" ] || { _error "自签证书不存在, 无法生成 pin: $cert"; return 1; }
+    command -v openssl >/dev/null 2>&1 || { _error "缺少 openssl, 无法生成自签证书 pin"; return 1; }
+    pin=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null) || pin=""
+    pin="${pin#*=}"
+    if [[ ! "$pin" =~ ^([[:xdigit:]]{64}|([[:xdigit:]]{2}:){31}[[:xdigit:]]{2})$ ]]; then
+        _error "自签证书 SHA256 pin 无效: $cert"
+        return 1
+    fi
+    printf '%s' "$pin"
+}
+
 # 既有证书可否复用: SAN 覆盖本次域名且 cert/key 属于同一密钥对。
 _hy2_cert_reusable() {
     local cert="$1" key="$2" domain="$3"
@@ -4034,7 +4060,7 @@ _add_hysteria2() {
 
     _success "节点 [${name}] 创建成功"
     if [ "$self_signed" = "true" ]; then
-        _tip "自签证书, 客户端须手动信任证书 (insecure=1)"
+        _tip "自签证书, 分享链接使用 pinSHA256 固定证书; 不要关闭校验"
     else
         _tip "使用自定义证书, SNI: ${sni}"
     fi
@@ -4060,7 +4086,7 @@ _add_hysteria2() {
 # Hy2分享链接从metadata重建；自定义gecko尺寸不可表达时返回失败不编造URI。
 _rebuild_hy2_link() {
     local meta="$1"
-    local auth host port sni congestion brutal_up brutal_down name self_signed
+    local auth host port sni congestion brutal_up brutal_down name self_signed tag cert pin
     auth=$(jq -r '.auth // empty' "$meta")
     host=$(jq -r '.link_addr // empty' "$meta")
     port=$(jq -r '.port // empty' "$meta")
@@ -4082,7 +4108,15 @@ _rebuild_hy2_link() {
     local link_ip; link_ip=$(_link_host "$host")
     local link
     link="hy2://$(_url_encode "$auth")@${link_ip}:${port}/?sni=$(_url_encode "$sni")"
-    [ "$self_signed" = "true" ] && link="${link}&insecure=1&allowInsecure=1"
+    if [ "$self_signed" = "true" ]; then
+        tag=$(jq -r '.tag // empty' "$meta")
+        [ -n "$tag" ] || { _error "节点元数据缺少 tag, 无法定位自签证书: $meta"; return 2; }
+        cert="$CERT_DIR/$tag/cert.pem"
+        [ -f "$cert" ] || cert="$CERT_DIR/$tag.crt"
+        _hy2_cert_path_inside "$cert" || { _error "自签证书路径不在证书目录内: $cert"; return 2; }
+        pin=$(_hy2_cert_pin "$cert") || return 2
+        link="${link}&insecure=1&pinSHA256=$(_url_encode "$pin")"
+    fi
     link="${link}&congestion=${congestion}"
     # 服务端上行 = 客户端下行；metadata 保留服务端方向(finalmask.md: QuicParamsObject)。
     # 两侧都写(缺的一侧 0=不限): 导入端要求 up/down 成对, 单侧限速也要能原样导入。
@@ -4103,7 +4137,7 @@ _rebuild_hy2_link() {
     echo "$link"
 }
 
-# _hy2_sync_derived 只同步分享链接；不可表达时清空链接。
+# _hy2_sync_derived 只同步分享链接；不可表达或自签重建失败时清空链接。
 # config/metadata 是权威，派生失败只告警且如实返回，不回滚权威状态。
 _hy2_sync_derived() {
     local meta="$1" link="" lrc=0
@@ -4114,6 +4148,12 @@ _hy2_sync_derived() {
             lrc=1
             _error "分享链接写入失败(节点元数据不可写?): $meta"
         }
+    elif [ "$lrc" -eq 2 ]; then
+        lrc=1
+        if _hy2_clear_share_link "$meta"; then
+            _warn "自签证书 pin 无法推导, 已清空分享链接"
+            _tip "请恢复证书或安装 openssl 后重新修改节点"
+        fi
     elif _hy2_link_unexpressible "$meta"; then
         lrc=0
         _meta_update "$meta" '.share_link=""' || {
@@ -4123,6 +4163,11 @@ _hy2_sync_derived() {
         _warn "当前混淆(gecko 带自定义分片尺寸)无法用官方 hy2 链接表达, 已清空分享链接"
         _tip "官方 URI 的 obfs 只表达类型(salamander/gecko), 没有尺寸参数; 只有默认 512-1200 可表达"
         _tip "请在客户端手工填写相同的 gecko 分片尺寸"
+    elif [ "$(jq -r '.self_signed // false' "$meta" 2>/dev/null)" = "true" ]; then
+        lrc=1
+        if _hy2_clear_share_link "$meta"; then
+            _warn "自签证书分享链接重建失败, 已清空原链接"
+        fi
     else
         lrc=1
         _warn "分享链接重建失败(元数据缺少必要字段), 已保留原链接"
@@ -5330,12 +5375,18 @@ _update_listen_commit_locked() {
             | (if has("preferred_addr") then .preferred_addr=$a else . end)
             | .share_link=$link' \
             --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink"; then
+            if [ "$(jq -r '.protocol // empty' "$meta" 2>/dev/null)" = "hysteria2" ]; then
+                _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
+            fi
             return 0
         fi
     else
         if _meta_update "$meta" '.listen=$l | .link_addr=$a
             | (if has("preferred_addr") then .preferred_addr=$a else . end)' \
             --arg l "$newlisten" --arg a "$newaddr"; then
+            if [ "$(jq -r '.protocol // empty' "$meta" 2>/dev/null)" = "hysteria2" ]; then
+                _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
+            fi
             return 0
         fi
     fi
