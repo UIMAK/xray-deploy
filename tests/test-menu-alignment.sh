@@ -246,6 +246,39 @@ trap 'rm -rf "${TMP:?}"' EXIT
         bash -c 'test "$1" = 0 && test "$(cat "$2")" = stop && test "$(cat "$3")" = 已停止 && test ! -s "$4" && test "$(cat "$5")" = press' _ \
         "$RC" "$TMP/service-calls" "$TMP/success" "$TMP/messages" "$TMP/press-calls"
 
+    invoke_protocol_menu() {
+        local choice="$1"
+        : > "$TMP/menu-rows"
+        : > "$TMP/protocol-calls"
+        RC=0
+        (
+            PROTOCOL_CHOICE="$choice"
+            clear() { :; }
+            _menu_require_tty() { return 0; }
+            _print_logo() { :; }
+            _print_status_bar() { :; }
+            _menu_row() { printf '%s|%s|%s|%s\n' "$1" "$2" "${3:-}" "${4:-}" >> "$TMP/menu-rows"; }
+            _reset_config_recover() { return 0; }
+            _xray_core_txn_recover() { return 0; }
+            _port_txn_recover() { return 0; }
+            _auto_tag_tagless_inbounds() { return 0; }
+            _auto_adopt_orphans() { return 0; }
+            _auto_ensure_config_env() { return 0; }
+            _cloudflared_menu() { printf 'cloudflared\n' >> "$TMP/protocol-calls"; }
+            _hysteria_menu() { printf 'hysteria\n' >> "$TMP/protocol-calls"; }
+            _main_menu <<< "$PROTOCOL_CHOICE"$'\n0'
+        ) > "$TMP/output" 2>&1 || RC=$?
+    }
+    invoke_protocol_menu 9
+    check 'protocol menu shows and dispatches cloudflared at 9' \
+        bash -c 'grep -qxF "8|Xray Hy2 管理|9|cloudflared 管理" "$1" &&
+                 grep -qxF "10|Hysteria2 管理|11|WARP 管理" "$1" &&
+                 test "$(cat "$2")" = cloudflared' _ \
+        "$TMP/menu-rows" "$TMP/protocol-calls"
+    invoke_protocol_menu 10
+    check 'protocol menu dispatches Hysteria2 at 10' \
+        test "$(cat "$TMP/protocol-calls")" = hysteria
+
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]
 ) || exit 1

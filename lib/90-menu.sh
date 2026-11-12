@@ -234,8 +234,8 @@ _main_menu() {
         _menu_row 7 "添加出口"
         echo
         echo -e "  ${CYAN}【协议管理】${NC}"
-        _menu_row 8 "Xray Hy2 管理" 9 "Hysteria2 管理"
-        _menu_row 10 "cloudflared 管理" 11 "WARP 管理"
+        _menu_row 8 "Xray Hy2 管理" 9 "cloudflared 管理"
+        _menu_row 10 "Hysteria2 管理" 11 "WARP 管理"
         echo
         echo -e "  ${CYAN}【服务控制】${NC}"
         _menu_row 12 "重启 Xray"    13 "停止 Xray"
@@ -262,8 +262,8 @@ _main_menu() {
             6) _reality_domain_menu; continue ;;
             7) _outbound_add_prompt; _press_any_key; continue ;;
             8) _hy2_manage_menu; continue ;;
-            9) _hysteria_menu; continue ;;
-            10) _cloudflared_menu; continue ;;
+            9) _cloudflared_menu; continue ;;
+            10) _hysteria_menu; continue ;;
             11) _warp_menu; continue ;;
             12) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
                 _press_any_key ;;
