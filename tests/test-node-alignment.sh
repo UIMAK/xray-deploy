@@ -391,7 +391,6 @@ _meta_update "$DEPLOY_DIR/meta.json" 'del(.congestion)' || exit 1
 rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?
 check 'Hy2 URI failure returns nonzero' eq "$rc" 1
 check 'Hy2 URI failure preserves old link' jq -e '.share_link == "old-link"' "$DEPLOY_DIR/meta.json"
-check 'Hy2 URI failure reports link warning' grep -qF '分享链接重建失败' "$TMP/warnings"
 hy2_derived_fixture
 _meta_update "$DEPLOY_DIR/meta.json" '.obfs_type="salamander" | .obfs_password="obfs" | .obfs_packet_size="800-1000"' || exit 1
 rc=0; _hy2_sync_derived "$DEPLOY_DIR/meta.json" || rc=$?

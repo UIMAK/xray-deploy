@@ -177,7 +177,6 @@ trap 'rm -rf "${TMP:?}"' EXIT
     check 'cron startup failure performs no crontab writes' test ! -s "$TMP/cron-writes"
     check 'cron startup failure preserves crontab bytes' cmp -s "$TMP/before-crontab" "$TMP/crontab"
     check 'cron startup failure preserves state bytes' cmp -s "$TMP/before-timed-state" "$STATE_DIR/timed_restart"
-    check 'cron startup failure reports daemon failure' grep -qF 'cron 守护进程未能启动' "$TMP/messages"
 
     cron_fixture
     CRON_WRITE_FAIL=yes

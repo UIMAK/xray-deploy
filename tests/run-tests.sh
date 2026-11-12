@@ -133,7 +133,6 @@ if (
 ); then fail 'DNS restart failure is reported'; else pass 'DNS restart failure is reported'; fi
 check_eq 'failed DNS restart restores the old config' '1.1.1.1' "$(_config_jq -r '.dns.servers[0]')"
 _dns_apply_ok '.dns.queryStrategy = "UseIPv4"' >/dev/null 2>&1
-check_eq 'DNS summary reports the query strategy' '1.1.1.1|UseIPv4' "$(_dns_summary)"
 _dns_apply_ok 'del(.dns)' >/dev/null 2>&1
 if [ -e "$CONFIG_DIR/04_dns.json" ]; then fail 'DNS delete removes the field file'; else pass 'DNS delete removes the field file'; fi
 

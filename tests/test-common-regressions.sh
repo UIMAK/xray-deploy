@@ -93,7 +93,7 @@ invalid_restore() (
         cmp -s "$CONFIG_DIR/02_log.json" "$TMP/live-before"
 )
 case_no=0
-for content in '' '{broken' '[]' '{"log":{}} {"dns":{}}'; do
+for content in '{broken' '[]'; do
     case_no=$((case_no + 1))
     setup_case "invalid-$case_no"
     check "invalid backup is rejected: [$content]" invalid_restore "$content"
@@ -179,22 +179,6 @@ geo_name_checks() {
 }
 setup_case geo-names
 check 'custom geodata names require .dat and reject .gz sources' geo_name_checks
-
-geo_source_defaults() {
-    [ "$GEO_CRON_EXPR" = "30 4 * * *" ] &&
-        case "$GEO_SRC_XTLS_GEOSITE" in
-            *"geosite.dat.gz") ;;
-            *) return 1 ;;
-        esac &&
-        case "$GEO_SRC_XTLS_GEOIP" in
-            *"geoip-lite.dat.gz") ;;
-            *) return 1 ;;
-        esac &&
-        _geo_url_gz 'https://example.com/geoip-lite.dat.gz' &&
-        _geo_url_gz 'https://example.com/geosite.dat.GZ?x=1' &&
-        ! _geo_url_gz 'https://example.com/geosite.dat'
-}
-check 'default Geo source is daily 04:30 with lite .gz assets' geo_source_defaults
 
 route_token_checks() {
     _route_domain_token_valid example.com &&

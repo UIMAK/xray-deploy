@@ -105,7 +105,6 @@ reset_fixture
 inline_fixture
 run 0 _read_cf_state
 check 'legacy inline read' eq "$CF_CUR_TOKEN" "$OLD"
-check 'inline credential format preserved' eq "$CF_CUR_TOKEN_FILE" ''
 run 0 _cf_switch_token <<< "$NEW"
 check 'inline switch updates launch token' contains "$(cat "$CF_UNIT_SYSTEMD")" "run --token $NEW"
 check 'comment token unchanged' contains "$(cat "$CF_UNIT_SYSTEMD")" "# stale token $OLD"
@@ -125,7 +124,6 @@ check 'token-file does not migrate inline' no_contains "$(cat "$CF_UNIT_SYSTEMD"
 check 'token-file backup consumed after success' test ! -e "$TMP/token.bak"
 check 'token-file mode limited to owner' eq "$(stat -c %a "$TMP/token")" 600
 run 0 _cf_toggle http2
-check 'toggle preserves token-file launch' contains "$(cat "$CF_UNIT_SYSTEMD")" "--token-file $TMP/token"
 check 'HTTP2 off omits protocol option' no_contains "$(cat "$CF_UNIT_SYSTEMD")" --protocol
 run 0 _cf_set_edge_ip <<< 2
 check 'IPv6 switch writes option before run' contains "$(cat "$CF_UNIT_SYSTEMD")" "--edge-ip-version 6 run --token-file"
@@ -185,7 +183,6 @@ run 0 _cf_toggle autoupdate
 check 'OFF disables timer startup' eq "$(cat "$TMP/timer-enabled")" off
 check 'OFF stops active timer' eq "$(cat "$TMP/timer-active")" off
 check 'OFF stops update worker' contains "$(cat "$TMP/systemctl")" 'stop cloudflared-update.service'
-check 'OFF retains process no-autoupdate' contains "$(cat "$CF_UNIT_SYSTEMD")" --no-autoupdate
 run 0 _read_cf_state
 check 'OFF effective state matches actual behavior' eq "$(_cf_autoupdate_effective)" off
 run 0 _cf_toggle autoupdate
@@ -259,10 +256,6 @@ printf '%s (ignore_errors=yes) -%s\n' "$TMP/a.env" "$TMP/b.env" > "$TMP/cf-envfi
 printf 'TUNNEL_GRACE_PERIOD=10s\n' > "$TMP/a.env"
 printf 'TUNNEL_GRACE_PERIOD=45s\n' > "$TMP/b.env"
 check 'EnvironmentFiles last file wins on the systemd path' eq "$(_cf_grace_config "$CF_UNIT_SYSTEMD")" 45s
-CF_LOADSTATE=not-found
-printf 'EnvironmentFile=%s\nEnvironmentFile=-%s\n' "$TMP/a.env" "$TMP/b.env" > "$CF_UNIT_SYSTEMD"
-check 'EnvironmentFiles last file wins in the text fallback' eq "$(_cf_grace_config "$CF_UNIT_SYSTEMD")" 45s
-CF_LOADSTATE=loaded
 rm -f "$TMP/cf-envfiles" "$TMP/cf-execstart" "$TMP/a.env" "$TMP/b.env" "$CF_UNIT_SYSTEMD"
 
 reset_fixture

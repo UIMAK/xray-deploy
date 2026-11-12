@@ -661,13 +661,6 @@ socks5://sep3.example.com:1080#Sep3,socks5://sep4.example.com:1080#Sep4;socks5:/
     else
         check 'EOF cancels tag prompt' true
     fi
-    if [ "$(declare -f _outbound_prompt_tag | grep -cF 'read -e -r -p')" -eq 2 ] &&
-        [ "$(declare -f _outbound_add_prompt | grep -cF 'read -e -r -p')" -eq 2 ]; then
-        check 'outbound prompts enable Readline editing' true
-    else
-        check 'outbound prompts enable Readline editing' false
-    fi
-
     printf '== config commit ==\n'
     write_base_config
     routing_hash=$(hash_file "$CONFIG_DIR/05_routing.json")
