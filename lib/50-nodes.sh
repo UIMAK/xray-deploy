@@ -800,11 +800,15 @@ _hy2_persist_v4_rules() {
     return "$ok"
 }
 
-# v6 规则 best-effort 持久化; 无 ip6tables-save 时跳过, 失败只告警。
+# v6 规则 best-effort 持久化, 失败只告警; 完全无 IPv6 时静默跳过。
 # ensure_dir=1 时自行创建目录(alpine 缺 init.d ip6tables 的回退路径)。
 _hy2_persist_v6_rules() {
     local ipt_dir="$1" ensure_dir="${2:-0}" tmp
-    command -v ip6tables-save >/dev/null 2>&1 || return 0
+    if ! command -v ip6tables-save >/dev/null 2>&1; then
+        # 有 ip6tables 但缺 save 才是异常(规则写不进持久化), 需点名便于排查卸载阻塞
+        command -v ip6tables >/dev/null 2>&1 && _warn "ip6tables-save 不可用, IPv6 跳跃规则未持久化(重启后会丢失)"
+        return 0
+    fi
     if [ "$ensure_dir" = 1 ]; then
         mkdir -p "$ipt_dir" 2>/dev/null || _warn "无法创建 $ipt_dir, IPv6 规则持久化失败(best-effort)"
     fi
@@ -1587,14 +1591,17 @@ _hy2_cleanup_all_hops() {
     if ! declare -F _hy2_no_hop_rules_in_runtime >/dev/null 2>&1 || ! _hy2_no_hop_rules_in_runtime; then
         _error "无法证明端口跳跃规则已清空, 或仍存在孤儿规则; 已保留现场, 请手动检查 iptables -t nat -S PREROUTING"
         residual=1
-    elif ! _hy2_no_hop_rules_persisted; then
+    elif [ "$residual" -eq 0 ] && ! _hy2_no_hop_rules_persisted; then
         # runtime 已证明干净: 持久化文件里的残留只会在重启后复活旧规则(常见于旧安装或手工测试遗留),
         # 按当前 runtime 重写即可收敛; 不能因为没有 hop metadata(不会调用上面的持久化)就永久挡住卸载。
-        if _hy2_persist_iptables && _hy2_no_hop_rules_persisted; then
-            _info "持久化文件中残留的端口跳跃规则已按当前运行时重写清除"
-        else
+        if ! _hy2_persist_iptables; then
+            _error "持久化文件仍含端口跳跃规则, 但按当前运行时重写失败; 请检查 iptables 持久化工具后重试"
+            residual=1
+        elif ! _hy2_no_hop_rules_persisted; then
             _error "持久化文件仍含端口跳跃规则, 重启后会恢复旧规则; 请手动检查: $( _hy2_iptables_persist_files | tr '\n' ' ' )"
             residual=1
+        else
+            _info "持久化文件中残留的端口跳跃规则已按当前运行时重写清除"
         fi
     fi
     if [ "$residual" -ne 0 ]; then

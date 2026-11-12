@@ -24,7 +24,7 @@ _info() { :; }; _tip() { :; }; _success() { :; }; _warn() { :; }; _error() { pri
 _url_encode() { jq -rn --arg v "$1" '$v | @uri'; }
 actual_config_jq=$(declare -f _config_jq)
 # 后面的用例会在模块作用域内定义 _hy2_persist_iptables 桩, 先留一份真实实现给需要真实持久化的用例。
-actual_persist_iptables=$(declare -f _hy2_persist_iptables)
+actual_persist_iptables=$(declare -f _hy2_persist_iptables) || { printf 'missing _hy2_persist_iptables\n' >&2; exit 1; }
 _config_jq() { printf call >> "$TMP/preflight"; return 1; }
 _ensure_unique_name() { return 0; }
 _tpl_path() { printf '%s/templates/%s.server.jsonc' "$ROOT" "$1"; }
@@ -682,6 +682,30 @@ hop_persist_stale_probe() (
     return 0
 )
 check 'hop cleanup: stale persist file rewritten from clean runtime, rewrite failure stays fail-closed' hop_persist_stale_probe
+
+# runtime 仍含活跃 hop 规则: 必须阻塞卸载并保留现场, 不能被持久化重写掩盖。
+hop_runtime_dirty_probe() (
+    local bin="$TMP/hopdirty-bin" ipt="$TMP/hopdirty-ipt" clean="$TMP/hopdirty-nodes" rc=0
+    mkdir -p "$bin" "$ipt" "$clean" "$TMP/hopdirty-initd" "$TMP/hopdirty-conf" || return 1
+    printf '#!/bin/sh\ncase "$*" in *"-S PREROUTING"*) printf -- "-A PREROUTING -p udp -m udp --dport 44300:44310 -m comment --comment xray-deploy-hy2-hop -j DNAT --to-destination :443\\n" ;; esac\nexit 0\n' > "$bin/iptables" || return 1
+    printf '#!/bin/sh\ncase "$*" in *"-S PREROUTING"*) printf -- "-P PREROUTING ACCEPT\\n" ;; esac\nexit 0\n' > "$bin/ip6tables" || return 1
+    printf '#!/bin/sh\nprintf "*filter\\nCOMMIT\\n"\nexit 0\n' > "$bin/iptables-save" || return 1
+    cp "$bin/iptables-save" "$bin/ip6tables-save" || return 1
+    chmod +x "$bin"/* || return 1
+    printf -- '-A PREROUTING -p udp -m udp --dport 44300:44310 -m comment --comment xray-deploy-hy2-hop -j DNAT --to-destination :443\n' > "$ipt/rules.v4" || return 1
+    # shellcheck disable=SC2030,SC2031  # 探针整体在子 shell 内运行, 不跨用例
+    NODES_DIR="$clean" HY2_IPTABLES_DIR="$ipt" HY2_INITD_DIR="$TMP/hopdirty-initd" HY2_CONF_DIR="$TMP/hopdirty-conf"
+    _detect_os_family() { printf 'debian\n'; }
+    eval "$actual_persist_iptables"
+    # shellcheck disable=SC2030,SC2031
+    export PATH="$bin:$PATH"
+    _hy2_cleanup_all_hops || rc=$?
+    [ "$rc" -eq 1 ] || return 1
+    # runtime 脏时不得重写持久化: 文件仍保留 marker 证明未拿脏 runtime 去覆盖
+    grep -q "xray-deploy-hy2-hop" "$ipt/rules.v4" || return 1
+    return 0
+)
+check 'hop cleanup: live hop rule in runtime still blocks and keeps persist untouched' hop_runtime_dirty_probe
 
 # 无 iptables 的 nft 主机: 跳跃规则判定必须实测 nft 规则集, 不能凭"检测到 nft"直接判 UNKNOWN。
 # shellcheck disable=SC2031  # 上一用例在子 shell 内改过 NODES_DIR/PATH(有意隔离)
