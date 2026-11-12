@@ -510,9 +510,9 @@ _hy2_ipv6_state() {
     printf 'absent\n'; return 0
 }
 
-# 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
-_hy2_no_hop_rules_at_all() {
-    local q f p4 p6 runtime_clean=0 persist_files persist_rc
+# 返回: 0 = 有证据表明 runtime 无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
+_hy2_no_hop_rules_in_runtime() {
+    local q p4 p6 runtime_clean=0
     if command -v iptables >/dev/null 2>&1; then
         q=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
         printf '%s\n' "$q" | grep -q "xray-deploy-hy2-hop" && return 1
@@ -574,7 +574,12 @@ _hy2_no_hop_rules_at_all() {
         runtime_clean=1
     fi
     [ "$runtime_clean" -eq 1 ] || return 1
-    # runtime 已确认无规则; 持久化文件会在重启时重新加载, 同样必须干净
+}
+
+# 持久化文件会在重启时重新加载, 同样必须干净; 但残留可由 runtime 重写收敛, 不等于清理失败。
+# 返回: 0 = 持久化文件均无 hop 规则(文件缺失视为干净); 1 = 仍含残留或读不到
+_hy2_no_hop_rules_persisted() {
+    local f persist_files persist_rc
     persist_files=$(_hy2_iptables_persist_files) || return 1
     while IFS= read -r f; do
         [ -f "$f" ] || continue
@@ -584,6 +589,12 @@ _hy2_no_hop_rules_at_all() {
         esac
     done <<< "$persist_files"
     return 0
+}
+
+# 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
+_hy2_no_hop_rules_at_all() {
+    _hy2_no_hop_rules_in_runtime || return 1
+    _hy2_no_hop_rules_persisted
 }
 
 # DNAT 添加幂等且拒绝跨节点冲突；查询失败中止，失败回滚本次已加规则。
@@ -1573,9 +1584,18 @@ _hy2_cleanup_all_hops() {
         residual=1
     fi
     # 无 metadata 也要观察实际DNAT；不能以无节点文件代替清理结果。
-    if ! declare -F _hy2_no_hop_rules_at_all >/dev/null 2>&1 || ! _hy2_no_hop_rules_at_all; then
+    if ! declare -F _hy2_no_hop_rules_in_runtime >/dev/null 2>&1 || ! _hy2_no_hop_rules_in_runtime; then
         _error "无法证明端口跳跃规则已清空, 或仍存在孤儿规则; 已保留现场, 请手动检查 iptables -t nat -S PREROUTING"
         residual=1
+    elif ! _hy2_no_hop_rules_persisted; then
+        # runtime 已证明干净: 持久化文件里的残留只会在重启后复活旧规则(常见于旧安装或手工测试遗留),
+        # 按当前 runtime 重写即可收敛; 不能因为没有 hop metadata(不会调用上面的持久化)就永久挡住卸载。
+        if _hy2_persist_iptables && _hy2_no_hop_rules_persisted; then
+            _info "持久化文件中残留的端口跳跃规则已按当前运行时重写清除"
+        else
+            _error "持久化文件仍含端口跳跃规则, 重启后会恢复旧规则; 请手动检查: $( _hy2_iptables_persist_files | tr '\n' ' ' )"
+            residual=1
+        fi
     fi
     if [ "$residual" -ne 0 ]; then
         if [ "${#saved[@]}" -gt 0 ]; then
