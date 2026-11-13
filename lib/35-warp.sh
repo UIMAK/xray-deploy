@@ -386,6 +386,7 @@ _warp_delete() {
 # 首个匹配生效: 已被更靠前规则命中的目标不会走到 WARP, 添加后会提示这一点。
 _warp_add_rule() {   # <domain|ip> <逗号分隔值>
     local kind="${1:-}" csv="${2:-}" v vals_json new
+    csv="${csv//，/,}"   # 值列表允许全角/半角逗号混用
     local -a vals=()
     case "$kind" in domain|ip) ;; *) return 1 ;; esac
     [ -n "$csv" ] || return 1

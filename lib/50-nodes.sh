@@ -377,8 +377,9 @@ _ensure_iptables() {
 }
 
 # 解析端口范围字符串 → "start:end start:end ..."
+# 逗号列表输入允许全角/半角混用, 归一后按半角切词。
 _parse_hop_ranges() {
-    local input="$1"
+    local input="${1//，/,}"
     local result=""
     local entries
     IFS=',' read -ra entries <<< "$input"
@@ -4449,6 +4450,7 @@ _delete_node() {
     echo -e "  ${RED}[a]${NC} ${RED}全部删除${NC} | 多选: 逗号分隔(如1,3)"
     echo -e "  ${GREEN}[0]${NC} 返回"
     read -rp "  选择: " choice
+    choice="${choice//，/,}"   # 多选编号允许全角/半角逗号混用
     [ "$choice" = "0" ] && return
 
     # 全部删除(y/N 确认)

@@ -402,6 +402,7 @@ _timed_restart_menu() {
         3) cron_expr="0 */12 * * *" ;;
         4)
             read -rp "  输入 cron 表达式 (如 30 3 * * *): " cron_expr
+            cron_expr="${cron_expr//，/,}"   # 字段内逗号列表允许全角/半角混用
             [ -z "$cron_expr" ] && { _warn "表达式为空, 取消"; _press_any_key; return; }
             # cron 只验五字段结构和字符集，范围由 cron 解析。
             local -a _ce

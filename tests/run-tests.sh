@@ -110,6 +110,9 @@ else
 fi
 
 printf '== DNS writes ==\n'
+# DNS 上游列表输入允许全角/半角逗号混用。
+_dns_split_servers 'https://a.example，https://b.example'
+check_eq 'dns split accepts mixed full/half-width commas' 'https://a.example|https://b.example' "$(IFS='|'; printf '%s' "${DNS_SERVER_VALUES[*]:-}")"
 _config_write_merged '{"version":{"min":"26.4.25","max":""},"log":{"loglevel":"warning"},"routing":{"rules":[]}}' >/dev/null 2>&1
 _dns_apply_ok() {
     local rc=0

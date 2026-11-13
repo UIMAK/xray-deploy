@@ -116,6 +116,8 @@ eq 'single range accepted' '' "$(_hysteria_hop_reason '20000-30000')"
 reason=$(_hysteria_hop_reason '20000-30000,40000-50000')
 check 'multi-range warning identifies manager limitation' contains '本管理器' "$reason"
 check 'multi-range warning acknowledges official support' contains '官方 listen 支持多段' "$reason"
+reason=$(_hysteria_hop_reason '20000-30000，40000-50000')
+check 'full-width comma multi-range gets the same rejection' contains '不接受逗号分隔的多段' "$reason"
 reject 'manager listen parser refuses multi-range' _hysteria_listen_port_part ':20000-30000,40000-50000'
 
 printf '== self-signed TLS installs missing openssl ==\n'
