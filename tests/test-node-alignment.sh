@@ -459,6 +459,25 @@ hy2_pin_missing_cert_probe() (
 )
 check 'Hy2 self-signed missing cert clears unsafe link' hy2_pin_missing_cert_probe
 
+hy2_pin_autoinstall_probe() (
+    local rc=0 out
+    hy2_pin_fixture hy2-pin-autoinstall
+    mkdir -p "$CERT_DIR/hy2-pin-autoinstall"
+    printf cert > "$CERT_DIR/hy2-pin-autoinstall/cert.pem"
+    : > "$TMP/openssl.absent"
+    command() {
+        if [ "${1:-}" = -v ] && [ "${2:-}" = openssl ]; then
+            [ -f "$TMP/openssl.absent" ] && return 1 || return 0
+        fi
+        builtin command "$@"
+    }
+    _pkg_install() { rm -f "$TMP/openssl.absent"; }
+    openssl() { printf 'sha256 Fingerprint=%s\n' "$(hy2_pin_value)"; }
+    out=$(_hy2_cert_pin "$CERT_DIR/hy2-pin-autoinstall/cert.pem") || rc=$?
+    eq "$rc" 0 && [ "$out" = "$(hy2_pin_value)" ] && [ ! -f "$TMP/openssl.absent" ]
+)
+check 'Hy2 self-signed pin auto-installs openssl before deriving' hy2_pin_autoinstall_probe
+
 hy2_pin_no_openssl_probe() (
     local rc=0 out
     hy2_pin_fixture hy2-pin-no-openssl

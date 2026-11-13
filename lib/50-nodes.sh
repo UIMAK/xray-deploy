@@ -3382,7 +3382,16 @@ _hy2_cert_domain() {
 _hy2_cert_pin() {
     local cert="$1" pin
     [ -f "$cert" ] || { _error "自签证书不存在, 无法生成 pin: $cert"; return 1; }
-    command -v openssl >/dev/null 2>&1 || { _error "缺少 openssl, 无法生成自签证书 pin"; return 1; }
+    # pin 只能由 openssl 推导, 而基础依赖不含它; 缺失时就地补装(同 _ensure_iptables), 装后仍缺才放弃。
+    if ! command -v openssl >/dev/null 2>&1; then
+        _info "openssl 未安装, 正在安装..."
+        _pkg_install openssl
+        if ! command -v openssl >/dev/null 2>&1; then
+            _error "openssl 安装后仍不可用, 无法生成自签证书 pin"
+            return 1
+        fi
+        _success "openssl 已安装"
+    fi
     pin=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null) || pin=""
     pin="${pin#*=}"
     if [[ ! "$pin" =~ ^([[:xdigit:]]{64}|([[:xdigit:]]{2}:){31}[[:xdigit:]]{2})$ ]]; then
