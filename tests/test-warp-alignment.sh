@@ -352,6 +352,12 @@ JSON
         and (.routing.rules[1].ip == ["geoip:cn"])
         and (.routing.rules[2].domain == ["example.org"])'
 
+    # 6) 全角/半角逗号混用: 值列表在函数入口归一, 两个值按序写入同一规则。
+    base_cfg | cfg_reset || exit 1
+    check 'add rule accepts mixed full/half-width commas' _warp_add_rule domain 'example.com，example.net'
+    check 'add rule mixed commas writes both values in order' qe '
+        [.routing.rules[]? | select((.outboundTag? // "") == "warp" and (.domain? == ["example.com","example.net"]))] | length == 1'
+
     # -----------------------------------------------------------------------
     # D. 出站生命周期
     # -----------------------------------------------------------------------

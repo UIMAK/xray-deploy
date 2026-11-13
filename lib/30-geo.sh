@@ -1434,6 +1434,7 @@ _split_menu() {
 # 将用户输入拆成独立上游; 空白项丢弃, 其它内容原样保留。
 _dns_split_servers() {
     local input="$1" item
+    input="${input//，/,}"   # 上游列表允许全角/半角逗号混用
     DNS_SERVER_VALUES=()
     local -a parts=()
     IFS=',' read -r -a parts <<< "$input"

@@ -80,6 +80,9 @@ hop_range_port_conflict() (
 )
 check 'UDP port inside another node hop range is rejected' hop_range_port_conflict
 
+# 跳跃范围输入允许全角/半角逗号混用: 解析入口归一, 切词仍按半角逗号。
+check 'hop ranges parse mixed full/half-width commas' eq "$(_parse_hop_ranges '11，13，15-17')" "$(_parse_hop_ranges '11,13,15-17')"
+
 # 反向检查: config 里的 UDP 入站与官方 Hysteria listen(单端口/范围/多段)都要命中。
 udp_range_conflict_probe() (
     local dir="$TMP/udp-range"

@@ -1502,6 +1502,7 @@ _hysteria_prompt_tls() {
         3)
             while true; do
                 read -rp "  ACME 域名(多个用逗号分隔): " acme_domains || return 1
+                acme_domains="${acme_domains//，/,}"   # 域名列表允许全角/半角逗号混用
                 arr="["; first=1; acme_bad=""; acme_first=""
                 IFS=',' read -ra doms <<< "$acme_domains"
                 for d in "${doms[@]}"; do
@@ -1716,7 +1717,7 @@ _hysteria_port_menu() {
             2)
                 read -rp "  跳跃范围 (如 20000-50000, 回车取消): " part
                 [ -z "$part" ] && { _press_any_key; continue; }
-                [[ "$part" == *","* ]] && { _warn "本管理器仅支持单段连续范围(官方 listen 支持多段)"; _press_any_key; continue; }
+                [[ "$part" == *","* || "$part" == *，* ]] && { _warn "本管理器仅支持单段连续范围(官方 listen 支持多段)"; _press_any_key; continue; }
                 local parsed
                 parsed=$(_parse_hop_ranges "$part") || { _press_any_key; continue; }
                 lo="${parsed%%:*}"; hi="${parsed##*:}"
@@ -2266,12 +2267,12 @@ _hysteria_hop_reason() {
     local hop="$1" parsed lo hi st en
     [ -n "$hop" ] || { printf '%s' ""; return; }
     case "$hop" in
-        *","*) printf '%s' "本管理器仅支持单段连续范围(官方 listen 支持多段)(如 20000-50000), 不接受逗号分隔的多段"; return ;;
+        *","*|*，*) printf '%s' "本管理器仅支持单段连续范围(官方 listen 支持多段)(如 20000-50000), 不接受逗号分隔的多段"; return ;;
     esac
     hop=$(printf '%s' "$hop" | tr -d ' ')
     [ -n "$hop" ] || { printf '%s' ""; return; }
     case "$hop" in
-        *","*) printf '%s' "本管理器仅支持单段连续范围(官方 listen 支持多段)(如 20000-50000), 不接受逗号分隔的多段"; return ;;
+        *","*|*，*) printf '%s' "本管理器仅支持单段连续范围(官方 listen 支持多段)(如 20000-50000), 不接受逗号分隔的多段"; return ;;
     esac
     st="${hop%%-*}"; en="${hop##*-}"
     if [ "$st" = "$hop" ]; then
