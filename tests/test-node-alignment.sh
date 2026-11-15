@@ -663,26 +663,28 @@ consts_probe() {
 check 'literal constants: sni default, hop field removal, inbound tag removal' consts_probe
 
 # 运行时干净但持久化文件残留 hop(旧安装/手工测试遗留): metadata 为空时清理循环不会调用持久化,
-# 只有按 runtime 重写才能收敛, 否则卸载被永久阻塞。
+# 只有删掉 hop 条目才能收敛; 用户自有规则不得被 runtime 整表覆盖。
 hop_persist_stale_probe() (
-    local bin="$TMP/hopbin" failbin="$TMP/hopbin-fail" ipt="$TMP/hop-ipt" clean="$TMP/hop-nodes" rc=0
+    local bin="$TMP/hopbin" failbin="$TMP/hopbin-fail" ipt="$TMP/hop-ipt" clean="$TMP/hop-nodes" rc=0 realmv state
     mkdir -p "$bin" "$failbin" "$ipt" "$clean" "$TMP/hop-initd" "$TMP/hop-conf" || return 1
     printf '#!/bin/sh\ncase "$*" in *"-S PREROUTING"*) printf -- "-P PREROUTING ACCEPT\\n" ;; esac\nexit 0\n' > "$bin/iptables" || return 1
     cp "$bin/iptables" "$bin/ip6tables" || return 1
-    printf '#!/bin/sh\nprintf "*filter\\nCOMMIT\\n"\nexit 0\n' > "$bin/iptables-save" || return 1
-    cp "$bin/iptables-save" "$bin/ip6tables-save" || return 1
-    # 阴性对照只让 v4 持久化写入失败, 其余观察能力与正向用例一致
+    # 阴性对照让 v4 替换成功后 v6 失败, 验证已清理的 v4 也会按快照回滚。
+    realmv=$(command -v mv) || return 1
+    state="$TMP/hop-mv-count"
     cp "$bin/iptables" "$failbin/iptables" || return 1
     cp "$bin/ip6tables" "$failbin/ip6tables" || return 1
-    printf '#!/bin/sh\nexit 1\n' > "$failbin/iptables-save" || return 1
-    cp "$bin/ip6tables-save" "$failbin/ip6tables-save" || return 1
+    printf '#!/bin/sh\nn=$(cat "%s" 2>/dev/null || echo 0)\nn=$((n+1))\nprintf "%%s\\n" "$n" > "%s"\n[ "$n" -ge 2 ] && exit 1\nexec "%s" "$@"\n' \
+        "$state" "$state" "$realmv" > "$failbin/mv" || return 1
     chmod +x "$bin"/* "$failbin"/* || return 1
+    user4='-A PREROUTING -p tcp -m tcp --dport 8443 -j ACCEPT'
+    user6='-A PREROUTING -p tcp -m tcp --dport 8443 -j ACCEPT'
     stale='-A PREROUTING -p udp -m udp --dport 44300:44310 -m comment --comment xray-deploy-hy2-hop -j DNAT --to-destination :443'
-    printf '%s\n' "$stale" > "$ipt/rules.v4" || return 1
-    printf '%s\n' "$stale" > "$ipt/rules.v6" || return 1
+    printf '%s\n%s\n' "$user4" "$stale" > "$ipt/rules.v4" || return 1
+    printf '%s\n%s\n' "$user6" "$stale" > "$ipt/rules.v6" || return 1
     # shellcheck disable=SC2030,SC2031  # 探针整体在子 shell 内运行, 不跨用例
     NODES_DIR="$clean" HY2_IPTABLES_DIR="$ipt" HY2_INITD_DIR="$TMP/hop-initd" HY2_CONF_DIR="$TMP/hop-conf"
-    # 本套件不加载平台模块; 目标平台是 Debian, 按 debian 分支验证 v4+v6 两面都重写。
+    # 本套件不加载平台模块; 目标平台是 Debian, 按 debian 分支验证 v4+v6 两面都只删 hop 条目。
     _detect_os_family() { printf 'debian\n'; }
     eval "$actual_persist_iptables"
     # shellcheck disable=SC2030,SC2031
@@ -691,18 +693,25 @@ hop_persist_stale_probe() (
     [ "$rc" -eq 0 ] || return 1
     grep -q "xray-deploy-hy2-hop" "$ipt/rules.v4" && return 1
     grep -q "xray-deploy-hy2-hop" "$ipt/rules.v6" && return 1
-    # 持久化重写失败时不得放行: 残留仍在, 必须继续 fail-closed
-    printf '%s\n' "$stale" > "$ipt/rules.v4" || return 1
-    printf '%s\n' "$stale" > "$ipt/rules.v6" || return 1
+    grep -qxF -e "$user4" "$ipt/rules.v4" || return 1
+    grep -qxF -e "$user6" "$ipt/rules.v6" || return 1
+    # 删除失败时不得放行: 残留仍在, 必须继续 fail-closed, 用户规则保持原样
+    printf '%s\n%s\n' "$user4" "$stale" > "$ipt/rules.v4" || return 1
+    printf '%s\n%s\n' "$user6" "$stale" > "$ipt/rules.v6" || return 1
+    rm -f "$state"
     # shellcheck disable=SC2031
     PATH="$failbin:$PATH"
     rc=0
     _hy2_cleanup_all_hops || rc=$?
     [ "$rc" -eq 1 ] || return 1
+    [ "$(cat "$state" 2>/dev/null || echo 0)" -eq 2 ] || return 1
     grep -q "xray-deploy-hy2-hop" "$ipt/rules.v4" || return 1
+    grep -q "xray-deploy-hy2-hop" "$ipt/rules.v6" || return 1
+    grep -qxF -e "$user4" "$ipt/rules.v4" || return 1
+    grep -qxF -e "$user6" "$ipt/rules.v6" || return 1
     return 0
 )
-check 'hop cleanup: stale persist file rewritten from clean runtime, rewrite failure stays fail-closed' hop_persist_stale_probe
+check 'hop cleanup: stale persist file removes hop lines only, write failure stays fail-closed' hop_persist_stale_probe
 
 # runtime 仍含活跃 hop 规则: 必须阻塞卸载并保留现场, 不能被持久化重写掩盖。
 hop_runtime_dirty_probe() (
