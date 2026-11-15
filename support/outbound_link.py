@@ -1558,6 +1558,9 @@ def parse_link(link):
 
 def append_link(links, value):
     value = value.strip(SEPARATORS)
+    # 无 fragment 时尾随的全角逗号/分号是粘贴分隔符；有 fragment 时可能是 tag 内容，保留。
+    if "#" not in value:
+        value = value.strip("，；")
     if value:
         links.append(value)
 

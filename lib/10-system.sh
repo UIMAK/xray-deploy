@@ -108,6 +108,8 @@ _ensure_base_deps() {
     command -v python3 >/dev/null 2>&1 || missing+=(python3)
     # 默认 Geo 源是 .gz, 管理器立即更新时要本地解压; 核心自下载不依赖它。
     command -v gzip    >/dev/null 2>&1 || missing+=(gzip)
+    # 自签 Hysteria2 分享链接的 pin 由 openssl 推导; 启动阶段补齐, 避免落入 config 锁内安装。
+    command -v openssl >/dev/null 2>&1 || missing+=(openssl)
     # tar/cron 通常自带,不强制
     if [ "${#missing[@]}" -gt 0 ]; then
         _pkg_install "${missing[@]}" || return 1

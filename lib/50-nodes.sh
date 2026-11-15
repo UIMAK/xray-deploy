@@ -592,6 +592,26 @@ _hy2_no_hop_rules_persisted() {
     return 0
 }
 
+# 只删持久化文件里的 hop 条目, 不按 runtime 整表覆盖; 读不到或写入失败返回 1。
+_hy2_purge_persisted_hop_rules() {
+    local f tmp persist_files grc rc=0
+    persist_files=$(_hy2_iptables_persist_files) || return 1
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        grep -q "xray-deploy-hy2-hop" "$f" 2>/dev/null; grc=$?
+        [ "$grc" -eq 1 ] && continue
+        [ "$grc" -eq 0 ] || { rc=1; continue; }
+        tmp="${f}.tmp.$$"
+        grep -v "xray-deploy-hy2-hop" "$f" > "$tmp" 2>/dev/null; grc=$?
+        if [ "$grc" -le 1 ] && mv -f "$tmp" "$f" 2>/dev/null; then
+            continue
+        fi
+        rm -f "$tmp"
+        rc=1
+    done <<< "$persist_files"
+    return "$rc"
+}
+
 # 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
 _hy2_no_hop_rules_at_all() {
     _hy2_no_hop_rules_in_runtime || return 1
@@ -1584,8 +1604,8 @@ _hy2_cleanup_all_hops() {
             fi
         done
     fi
-    if [ "$found" -eq 1 ] && ! _hy2_persist_iptables; then
-        _error "iptables 规则持久化失败, 端口跳跃清理未完成"
+    if [ "$found" -eq 1 ] && ! _hy2_purge_persisted_hop_rules; then
+        _error "iptables 持久化文件中的端口跳跃规则删除失败, 清理未完成"
         residual=1
     fi
     # 无 metadata 也要观察实际DNAT；不能以无节点文件代替清理结果。
@@ -1594,15 +1614,15 @@ _hy2_cleanup_all_hops() {
         residual=1
     elif [ "$residual" -eq 0 ] && ! _hy2_no_hop_rules_persisted; then
         # runtime 已证明干净: 持久化文件里的残留只会在重启后复活旧规则(常见于旧安装或手工测试遗留),
-        # 按当前 runtime 重写即可收敛; 不能因为没有 hop metadata(不会调用上面的持久化)就永久挡住卸载。
-        if ! _hy2_persist_iptables; then
-            _error "持久化文件仍含端口跳跃规则, 但按当前运行时重写失败; 请检查 iptables 持久化工具后重试"
+        # 只删 hop 条目即可收敛, 不按 runtime 整表覆盖, 避免丢失用户已持久化但当前未加载的规则。
+        if ! _hy2_purge_persisted_hop_rules; then
+            _error "持久化文件仍含端口跳跃规则, 但删除残留条目失败; 请检查 iptables 持久化文件后重试"
             residual=1
         elif ! _hy2_no_hop_rules_persisted; then
             _error "持久化文件仍含端口跳跃规则, 重启后会恢复旧规则; 请手动检查: $( _hy2_iptables_persist_files | tr '\n' ' ' )"
             residual=1
         else
-            _info "持久化文件中残留的端口跳跃规则已按当前运行时重写清除"
+            _info "持久化文件中残留的端口跳跃规则已删除"
         fi
     fi
     if [ "$residual" -ne 0 ]; then
@@ -3383,7 +3403,7 @@ _hy2_cert_domain() {
 _hy2_cert_pin() {
     local cert="$1" pin
     [ -f "$cert" ] || { _error "自签证书不存在, 无法生成 pin: $cert"; return 1; }
-    # pin 只能由 openssl 推导, 而基础依赖不含它; 缺失时就地补装(同 _ensure_iptables), 装后仍缺才放弃。
+    # pin 只能由 openssl 推导; 启动依赖已含它, 这里兜底运行中缺失的情况, 装后仍缺才放弃。
     if ! command -v openssl >/dev/null 2>&1; then
         _info "openssl 未安装, 正在安装..."
         _pkg_install openssl
