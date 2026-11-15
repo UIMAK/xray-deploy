@@ -612,6 +612,37 @@ _hy2_purge_persisted_hop_rules() {
     return "$rc"
 }
 
+# 快照 iptables 持久化文件; 无文件时不输出。失败返回 1。
+_hy2_snapshot_persist_files() {
+    local f files dir any=0 n=0
+    files=$(_hy2_iptables_persist_files) || return 1
+    while IFS= read -r f; do
+        [ -f "$f" ] && any=1
+    done <<< "$files"
+    [ "$any" -eq 1 ] || return 0
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/xray-hy2-persist.XXXXXX") || return 1
+    : > "$dir/manifest" || { rm -rf "$dir"; return 1; }
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        n=$((n + 1))
+        cp -p "$f" "$dir/$n" 2>/dev/null || { rm -rf "$dir"; return 1; }
+        printf '%s\n' "$f" >> "$dir/manifest" || { rm -rf "$dir"; return 1; }
+    done <<< "$files"
+    printf '%s\n' "$dir"
+}
+
+# 按快照恢复持久化文件; 任一文件失败返回 1, 快照保留供重试。
+_hy2_restore_persist_files() {
+    local dir="$1" f rc=0 n=0
+    [ -n "$dir" ] && [ -d "$dir" ] && [ -f "$dir/manifest" ] || return 1
+    while IFS= read -r f; do
+        n=$((n + 1))
+        [ -f "$dir/$n" ] || { rc=1; continue; }
+        cp -p "$dir/$n" "$f" 2>/dev/null || rc=1
+    done < "$dir/manifest"
+    return "$rc"
+}
+
 # 返回: 0 = 有证据表明无 hop 规则; 1 = 有规则, 或无观察能力(UNKNOWN)
 _hy2_no_hop_rules_at_all() {
     _hy2_no_hop_rules_in_runtime || return 1
@@ -1537,13 +1568,25 @@ _hy2_restore_hop_rules() {
 }
 
 # 回滚并刷新持久化均成功才返回0；否则返回1且保留现场。
+# --snapshot <dir>: 持久化文件按快照恢复, 不按 runtime 整表覆盖。
 _hy2_restore_hop_rules_checked() {
-    [ "$#" -gt 0 ] || return 0
-    if ! _hy2_restore_hop_rules "$@"; then
+    local snapshot=""
+    if [ "${1:-}" = "--snapshot" ]; then
+        [ "$#" -ge 2 ] || return 1
+        snapshot="$2"
+        shift 2
+    fi
+    [ "$#" -gt 0 ] || [ -n "$snapshot" ] || return 0
+    if [ "$#" -gt 0 ] && ! _hy2_restore_hop_rules "$@"; then
         _error "回滚未能恢复全部端口跳跃规则, metadata 与 runtime 可能分裂, 请手动检查: iptables -t nat -S PREROUTING"
         return 1
     fi
-    if ! _hy2_persist_iptables; then
+    if [ -n "$snapshot" ]; then
+        if ! _hy2_restore_persist_files "$snapshot"; then
+            _error "端口跳跃规则已恢复到 runtime, 但持久化文件按快照恢复失败: 现场已保留待重试"
+            return 1
+        fi
+    elif ! _hy2_persist_iptables; then
         _error "端口跳跃规则已恢复到 runtime, 但持久化刷新失败: 重启后状态可能不一致, 现场已保留待重试"
         return 1
     fi
@@ -1554,7 +1597,7 @@ _hy2_restore_hop_rules_checked() {
 _hy2_cleanup_all_hops() {
     local found=0 residual=0 metadata_hop=0
     local saved=()
-    local meta
+    local meta persist_snapshot="" restore_ok=0
     for meta in "$NODES_DIR"/*.json; do
         [ -f "$meta" ] || continue
         local tag="${meta##*/}"
@@ -1580,11 +1623,18 @@ _hy2_cleanup_all_hops() {
             return 1
         fi
     fi
+    # 先快照持久化文件; 失败时不改动任何 iptables 状态。清理失败按原内容恢复,
+    # 避免回滚时拿 runtime 快照整表覆盖, 丢掉用户已持久化但当前未加载的规则。
+    if ! persist_snapshot=$(_hy2_snapshot_persist_files); then
+        _error "无法备份 iptables 持久化文件, 已中止端口跳跃清理"
+        return 1
+    fi
     if command -v iptables >/dev/null 2>&1 && [ -d "$NODES_DIR" ]; then
         local _cand_all _cand
         # 恢复源建不起来就绝不动 runtime(否则失败后无法回补, 直接造成 metadata/runtime 分裂)。
         if ! _cand_all=$(_hy2_hop_cleanup_candidates 2>/dev/null); then
             _error "无法枚举待清理的端口跳跃规则(恢复源获取失败), 已中止清理以避免 metadata/runtime 分裂"
+            [ -n "$persist_snapshot" ] && rm -rf "$persist_snapshot"
             return 1
         fi
         while IFS= read -r _cand; do
@@ -1596,7 +1646,10 @@ _hy2_cleanup_all_hops() {
             [ "$proto" = "hysteria2" ] || continue
             local port ranges
             port=$(jq -r '.port' "$f" 2>/dev/null)
-            ranges=$(_read_hop_ranges "$f") || return 1
+            if ! ranges=$(_read_hop_ranges "$f"); then
+                [ -n "$persist_snapshot" ] && rm -rf "$persist_snapshot"
+                return 1
+            fi
             if [ -n "$ranges" ] && [ -n "$port" ]; then
                 # shellcheck disable=SC2086
                 _hy2_remove_hop_rules "$port" $ranges || residual=1
@@ -1626,17 +1679,31 @@ _hy2_cleanup_all_hops() {
         fi
     fi
     if [ "$residual" -ne 0 ]; then
-        if [ "${#saved[@]}" -gt 0 ]; then
-            _error "端口跳跃清理未完成, 正在回滚本次已删除的规则, 使 metadata 与 runtime 保持一致..."
-            if _hy2_restore_hop_rules_checked "${saved[@]}"; then
+        if [ "${#saved[@]}" -gt 0 ] || [ -n "$persist_snapshot" ]; then
+            if [ "${#saved[@]}" -gt 0 ]; then
+                _error "端口跳跃清理未完成, 正在回滚本次已删除的规则, 使 metadata 与 runtime 保持一致..."
+            else
+                _error "端口跳跃清理未完成, 正在按快照恢复持久化文件..."
+            fi
+            if [ -n "$persist_snapshot" ]; then
+                _hy2_restore_hop_rules_checked --snapshot "$persist_snapshot" "${saved[@]}" || restore_ok=1
+            else
+                _hy2_restore_hop_rules_checked "${saved[@]}" || restore_ok=1
+            fi
+            if [ "$restore_ok" -eq 0 ]; then
+                [ -n "$persist_snapshot" ] && rm -rf "$persist_snapshot"
                 _error "已回滚到清理前状态; 节点数据保留, 请处理后重试"
             else
                 _error "回滚未完整收敛(见上), 请手动检查 iptables 与持久化文件后重试"
+                [ -n "$persist_snapshot" ] && _error "持久化文件快照保留: $persist_snapshot"
             fi
         else
             _error "端口跳跃规则清理未完成, 请手动检查 iptables -t nat -S PREROUTING"
         fi
         return 1
+    fi
+    if [ -n "$persist_snapshot" ]; then
+        rm -rf "$persist_snapshot" 2>/dev/null || _warn "无法删除持久化文件快照: $persist_snapshot"
     fi
     return 0
 }

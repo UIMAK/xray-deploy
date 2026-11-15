@@ -665,14 +665,17 @@ check 'literal constants: sni default, hop field removal, inbound tag removal' c
 # 运行时干净但持久化文件残留 hop(旧安装/手工测试遗留): metadata 为空时清理循环不会调用持久化,
 # 只有删掉 hop 条目才能收敛; 用户自有规则不得被 runtime 整表覆盖。
 hop_persist_stale_probe() (
-    local bin="$TMP/hopbin" failbin="$TMP/hopbin-fail" ipt="$TMP/hop-ipt" clean="$TMP/hop-nodes" rc=0
+    local bin="$TMP/hopbin" failbin="$TMP/hopbin-fail" ipt="$TMP/hop-ipt" clean="$TMP/hop-nodes" rc=0 realmv state
     mkdir -p "$bin" "$failbin" "$ipt" "$clean" "$TMP/hop-initd" "$TMP/hop-conf" || return 1
     printf '#!/bin/sh\ncase "$*" in *"-S PREROUTING"*) printf -- "-P PREROUTING ACCEPT\\n" ;; esac\nexit 0\n' > "$bin/iptables" || return 1
     cp "$bin/iptables" "$bin/ip6tables" || return 1
-    # 阴性对照只让持久化文件替换失败, 其余观察能力与正向用例一致
+    # 阴性对照让 v4 替换成功后 v6 失败, 验证已清理的 v4 也会按快照回滚。
+    realmv=$(command -v mv) || return 1
+    state="$TMP/hop-mv-count"
     cp "$bin/iptables" "$failbin/iptables" || return 1
     cp "$bin/ip6tables" "$failbin/ip6tables" || return 1
-    printf '#!/bin/sh\nexit 1\n' > "$failbin/mv" || return 1
+    printf '#!/bin/sh\nn=$(cat "%s" 2>/dev/null || echo 0)\nn=$((n+1))\nprintf "%%s\\n" "$n" > "%s"\n[ "$n" -ge 2 ] && exit 1\nexec "%s" "$@"\n' \
+        "$state" "$state" "$realmv" > "$failbin/mv" || return 1
     chmod +x "$bin"/* "$failbin"/* || return 1
     user4='-A PREROUTING -p tcp -m tcp --dport 8443 -j ACCEPT'
     user6='-A PREROUTING -p tcp -m tcp --dport 8443 -j ACCEPT'
@@ -695,13 +698,17 @@ hop_persist_stale_probe() (
     # 删除失败时不得放行: 残留仍在, 必须继续 fail-closed, 用户规则保持原样
     printf '%s\n%s\n' "$user4" "$stale" > "$ipt/rules.v4" || return 1
     printf '%s\n%s\n' "$user6" "$stale" > "$ipt/rules.v6" || return 1
+    rm -f "$state"
     # shellcheck disable=SC2031
     PATH="$failbin:$PATH"
     rc=0
     _hy2_cleanup_all_hops || rc=$?
     [ "$rc" -eq 1 ] || return 1
+    [ "$(cat "$state" 2>/dev/null || echo 0)" -eq 2 ] || return 1
     grep -q "xray-deploy-hy2-hop" "$ipt/rules.v4" || return 1
+    grep -q "xray-deploy-hy2-hop" "$ipt/rules.v6" || return 1
     grep -qxF -e "$user4" "$ipt/rules.v4" || return 1
+    grep -qxF -e "$user6" "$ipt/rules.v6" || return 1
     return 0
 )
 check 'hop cleanup: stale persist file removes hop lines only, write failure stays fail-closed' hop_persist_stale_probe

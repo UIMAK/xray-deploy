@@ -591,7 +591,13 @@ socks5://sep3.example.com:1080#Sep3,socks5://sep4.example.com:1080#Sep4;socks5:/
     parse_ok 'trailing Chinese comma on single bare link' \
         'socks5://tail.example.com:1080，' \
         '.[0].server == "tail.example.com"'
-    if _outbound_parse_batch $'socks5://tail1.example.com:1080，\nsocks5://tail2.example.com:1080；' &&
+    parse_ok 'space before trailing Chinese punctuation on bare link' \
+        'socks5://tail.example.com:1080 ，' \
+        '.[0].server == "tail.example.com"'
+    parse_ok 'space before trailing Chinese semicolon on bare link' \
+        'socks5://tail.example.com:1080 ；' \
+        '.[0].server == "tail.example.com"'
+    if _outbound_parse_batch $'socks5://tail1.example.com:1080 ，\nsocks5://tail2.example.com:1080 ；' &&
         [ "$_OB_COUNT" -eq 2 ] &&
         jq -e '[.[].server] == ["tail1.example.com","tail2.example.com"]' <<< "$_OB_BATCH" >/dev/null 2>&1; then
         check 'trailing Chinese punctuation on bare links is ignored' true
