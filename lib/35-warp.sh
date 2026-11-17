@@ -1,20 +1,27 @@
 #!/bin/bash
 # lib/35-warp.sh — WARP 自动注册、Xray WireGuard 出站与分流规则。
-# 注册来源按 warp-reg.sh → wgcf-cli → 注册 API 回退, 全部失败不写配置、不动已有出站。
+# 注册来源按 warp-reg.sh → wgcf-cli → 注册 API 回退, wgcf-cli 缺失时取 GitHub release 临时副本。
 # 配置唯一事实来源是 confs 里的 Xray 片段: 注册结果与 endpoint 覆盖都保存在 tag=warp 出站里。
 # 写入一律走 _mutate_config(定义在 50 模块, 调用时才解析); 见 _warp_apply / _warp_delete。
 
 WARP_TAG="warp"
 WARP_DEFAULT_PORT="2408"
-WARP_REG_SCRIPT_URL="https://warp-reg.vercel.app"
+WARP_REG_SCRIPT_URL="https://raw.githubusercontent.com/chise0713/warp-reg.sh/master/warp-reg.sh"
+WARP_WGCF_URL="https://github.com/ArchiveNetwork/wgcf-cli/releases/download/v0.3.6"
 WARP_API_URL="https://warp.cloudflare.now.cc/?run=register&format=xray"
+_WARP_REASON=""
+_WARP_HTTP_CODE=""
 
 # 归一/生成共用的 jq 定义: 内部表示字段名与类型固定, 缺必填字段或非法 reserved 一律 error 退出。
 # reserved 按官方文档是可选项(默认全 0), 省略时补 [0,0,0]; mtu 缺省取 1280 是 Cloudflare WARP 的
 # 推荐值(也是 wgcf 的输出值), Xray WireGuard 出站的通用默认是 1420。
 # (error 让 jq 非零退出且不产生输出, 满足"失败时 stdout 为空")。
+# 注册端点无论上游只返回 v4、只返回 v6 还是双栈, 都统一使用 engage.cloudflareclient.com,
+# 由 Xray 内置 DNS 选择; Xray WireGuard 出站的 endpoint 支持域名。
 _WARP_NORM_JQ='
 def fld($k): if (type == "object") then (.[$k] // null) else null end;
+def hasstr($k): ((fld($k) | type) == "string") and ((fld($k) // "") != "");
+def warpdomain: "engage.cloudflareclient.com";
 def arr($v): if ($v | type) == "array" then $v
              elif (($v | type) == "string") and $v != "" then [$v]
              else [] end;
@@ -52,7 +59,8 @@ def reg2norm:
       reserved: (($r | fld("reserved_dec")) | if type == "null" then [0, 0, 0]
                   elif type == "array" then . else error("reserved_dec 必须是数组") end),
       endpoint: (($r | fld("endpoint"))
-                 | if type == "object" then (fld("v4") // fld("v6") // "")
+                 | if type == "object" then
+                     (if (hasstr("v4") or hasstr("v6")) then warpdomain else "" end)
                    elif type == "string" then .
                    else "" end),
       publicKey: (($r | fld("public_key")) | if type == "string" then . else "" end),
@@ -60,6 +68,7 @@ def reg2norm:
       mtu: 1280
     }
   | wgcheck;
+# Xray 出站形态的 endpoint 已是单值, 保持上游返回值, 不套用注册端点域名规则。
 def out2norm:
   wgs as $s
   | if ($s | type) != "object" then error("不是 Xray WireGuard 出站结构") else . end
@@ -134,60 +143,212 @@ _warp_finalize() {   # <候选内部表示 JSON>
 # ---------------------------------------------------------------------------
 # 获取: 原始响应只写入 <outfile>, 不写 stdout。成功返回 0, 失败返回 1。
 # ---------------------------------------------------------------------------
-# warp-reg.sh: 本机有命令就直接跑; 否则按官方 bash -c "$(curl -L ...)" 的方式限时取回脚本再执行。
-_warp_fetch_warp_reg() {
-    local out="${1:-}" script rc=0
-    [ -n "$out" ] || return 1
-    if command -v warp-reg >/dev/null 2>&1; then
-        warp-reg >"$out" 2>/dev/null || rc=1
-    elif command -v warp-reg.sh >/dev/null 2>&1; then
-        warp-reg.sh >"$out" 2>/dev/null || rc=1
+# WARP 专用 HTTPS 下载: 保留 HTTP 状态码和响应体, 失败时用于说明原因。
+_warp_http_get() {   # <url> <dest> [timeout_sec]
+    local url="${1:-}" dest="${2:-}" timeout_s="${3:-25}" code=""
+    _WARP_HTTP_CODE=""
+    case "$url" in https://*) ;; *) return 1 ;; esac
+    [ -n "$dest" ] || return 1
+    : > "$dest" || return 1
+    if command -v curl >/dev/null 2>&1; then
+        code=$(curl -sSL --proto '=https' --proto-redir '=https' --max-redirs 5 \
+            --connect-timeout 8 --max-time "$timeout_s" -o "$dest" -w '%{http_code}' "$url" 2>/dev/null) || {
+            _WARP_HTTP_CODE="$code"
+            return 1
+        }
+        _WARP_HTTP_CODE="$code"
+        case "$code" in 2*) ;; *) return 1 ;; esac
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T "$timeout_s" -O "$dest" "$url" 2>/dev/null || {
+            _WARP_HTTP_CODE="000"
+            return 1
+        }
+        _WARP_HTTP_CODE="000"
     else
-        script=$(mktemp) || return 1
-        if _http_download "$WARP_REG_SCRIPT_URL" "$script" 20; then
-            bash "$script" >"$out" 2>/dev/null || rc=1
-        else
-            rc=1
-        fi
-        rm -f "$script"
+        return 1
     fi
-    [ "$rc" -eq 0 ] && [ -s "$out" ] && return 0
-    return 1
+    [ -s "$dest" ]
+}
+
+_warp_http_reason() {   # <dest>
+    local out="${1:-}" msg=""
+    [ -s "$out" ] || return 1
+    if command -v jq >/dev/null 2>&1; then
+        msg=$(jq -r '(.error // .message // empty) | if type == "string" then . else tostring end' "$out" 2>/dev/null) || msg=""
+    fi
+    if [ -z "$msg" ]; then
+        msg=$(head -c 200 "$out" 2>/dev/null | tr '\n' ' ')
+        msg="${msg#"${msg%%[![:space:]]*}"}"
+        msg="${msg%"${msg##*[![:space:]]}"}"
+    fi
+    [ -n "$msg" ] || return 1
+    if [ -n "${_WARP_HTTP_CODE:-}" ] && [ "$_WARP_HTTP_CODE" != "000" ]; then
+        printf 'HTTP %s: %s' "$_WARP_HTTP_CODE" "$msg"
+    else
+        printf '%s' "$msg"
+    fi
+}
+
+# 外部注册工具可能因网络半开阻塞; timeout 可用时统一限时, 不可用时保持原行为。
+_warp_run() {   # <timeout_sec> <cmd...>
+    local timeout_s="${1:-30}" kind=""
+    shift
+    [ "$#" -gt 0 ] || return 1
+    kind=$(type -t "$1" 2>/dev/null) || kind=""
+    case "$kind" in
+        function|builtin)
+            "$@" </dev/null
+            return $?
+            ;;
+    esac
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_s" "$@" </dev/null
+    else
+        "$@" </dev/null
+    fi
+}
+
+# warp-reg.sh 在缺 xxd/python3 时会先向 stdout 打印安装提示; 从首个 JSON 起点开始保留。
+_warp_trim_reg_output() {   # <outfile>
+    local out="${1:-}" tmp
+    [ -n "$out" ] && [ -f "$out" ] || return 1
+    tmp="$out.trim"
+    awk 'seen || /^[[:space:]]*\{/ { seen=1; print }' "$out" > "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+    mv "$tmp" "$out" || {
+        rm -f "$tmp"
+        return 1
+    }
+}
+
+# warp-reg.sh: 优先本机命令; 本机失败或不存在时取 GitHub 脚本再执行。
+_warp_fetch_warp_reg() {
+    local out="${1:-}" script rc=0 local_failed=0
+    [ -n "$out" ] || { _WARP_REASON="未指定输出文件"; return 1; }
+    _WARP_REASON=""
+    if command -v warp-reg >/dev/null 2>&1; then
+        _warp_run 30 warp-reg >"$out" 2>/dev/null || { rc=1; local_failed=1; }
+    elif command -v warp-reg.sh >/dev/null 2>&1; then
+        _warp_run 30 warp-reg.sh >"$out" 2>/dev/null || { rc=1; local_failed=1; }
+    fi
+    if [ "$rc" -eq 0 ] && [ -s "$out" ]; then
+        _warp_trim_reg_output "$out" || { _WARP_REASON="warp-reg 输出无法读取"; return 1; }
+        [ -s "$out" ] && return 0
+        _WARP_REASON="warp-reg 未返回注册结果"
+    elif [ "$local_failed" -eq 1 ]; then
+        _WARP_REASON="本机 warp-reg 执行失败"
+    fi
+
+    if command -v apk >/dev/null 2>&1; then
+        _WARP_REASON="远程 warp-reg.sh 不支持 Alpine apk"
+        return 1
+    fi
+    _WARP_REASON=""
+    rc=0
+    script=$(mktemp) || { _WARP_REASON="无法创建临时文件"; return 1; }
+    if _warp_http_get "$WARP_REG_SCRIPT_URL" "$script" 20; then
+        _warp_run 30 bash "$script" >"$out" 2>/dev/null || rc=1
+    else
+        rc=1
+        _WARP_REASON=$(_warp_http_reason "$script") || _WARP_REASON="下载 warp-reg 脚本失败"
+    fi
+    rm -f "$script"
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$_WARP_REASON" ] || _WARP_REASON="warp-reg 脚本执行失败"
+        [ "$local_failed" -eq 0 ] || _WARP_REASON="本机 warp-reg 执行失败, $_WARP_REASON"
+        return 1
+    fi
+    [ -s "$out" ] || { _WARP_REASON="warp-reg 未返回注册结果"; return 1; }
+    _warp_trim_reg_output "$out" || { _WARP_REASON="warp-reg 输出无法读取"; return 1; }
+    [ -s "$out" ] || { _WARP_REASON="warp-reg 未返回注册结果"; return 1; }
+    return 0
+}
+
+# wgcf-cli release 只有 tar.zstd; 缺少 zstd 时按需安装, 解压用 zstd + tar 兼容 busybox tar。
+_warp_install_wgcf_cli() {   # <tempdir>
+    local dir="${1:-}" machine archive tarfile url
+    _WARP_WGCF_TOOL=""
+    _WARP_REASON=""
+    [ -n "$dir" ] && [ -d "$dir" ] || { _WARP_REASON="wgcf-cli 临时目录不可用"; return 1; }
+    case "$(uname -m)" in
+        x86_64|amd64) machine="64" ;;
+        i386|i686) machine="32" ;;
+        aarch64|arm64) machine="arm64-v8a" ;;
+        armv7l|armv7) machine="arm32-v7a" ;;
+        *) _WARP_REASON="当前架构没有可用的 wgcf-cli"; return 1 ;;
+    esac
+    if ! command -v zstd >/dev/null 2>&1; then
+        command -v _pkg_install >/dev/null 2>&1 || { _WARP_REASON="缺少 zstd, 无法解压 wgcf-cli"; return 1; }
+        _pkg_install zstd || { _WARP_REASON="安装 zstd 失败"; return 1; }
+    fi
+    archive="$dir/wgcf-cli.tar.zstd"
+    tarfile="$dir/wgcf-cli.tar"
+    url="$WARP_WGCF_URL/wgcf-cli-linux-$machine.tar.zstd"
+    _warp_http_get "$url" "$archive" 30 || {
+        _WARP_REASON=$(_warp_http_reason "$archive") || _WARP_REASON="下载 wgcf-cli 失败"
+        return 1
+    }
+    zstd -d -q -f "$archive" -o "$tarfile" >/dev/null 2>&1 || { _WARP_REASON="解压 wgcf-cli 失败"; return 1; }
+    tar -xf "$tarfile" -C "$dir" >/dev/null 2>&1 || { _WARP_REASON="解压 wgcf-cli 失败"; return 1; }
+    [ -f "$dir/wgcf-cli" ] || { _WARP_REASON="wgcf-cli 包内缺少可执行文件"; return 1; }
+    chmod +x "$dir/wgcf-cli" || { _WARP_REASON="wgcf-cli 无法执行"; return 1; }
+    _WARP_WGCF_TOOL="$dir/wgcf-cli"
 }
 
 # wgcf-cli: 在同一临时目录内先取注册 JSON, 再退回 generate --xray 的产物。
 # register 把含 WARP 私钥的 wgcf.json 写在当前目录, 所以 register 与 generate 都只在 mktemp 目录内运行,
 # 目录随后整体删除: 调用者当前目录不留账号文件, generate 也能读到 register 生成的账号。
-# 本机没有该命令直接失败(不自行安装)。
+# 本机没有该命令时取 GitHub release 临时副本, 不写入系统 PATH。
 _warp_fetch_wgcf_cli() {
-    local out="${1:-}" dir f
-    [ -n "$out" ] || return 1
-    command -v wgcf-cli >/dev/null 2>&1 || return 1
-    dir=$(mktemp -d) || return 1
-    ( cd "$dir" && wgcf-cli register >"$dir/reg.json" 2>/dev/null ) || :
+    local out="${1:-}" dir f tool have_reg=0
+    [ -n "$out" ] || { _WARP_REASON="未指定输出文件"; return 1; }
+    _WARP_REASON=""
+    dir=$(mktemp -d) || { _WARP_REASON="无法创建临时目录"; return 1; }
+    tool=$(command -v wgcf-cli 2>/dev/null) || tool=""
+    if [ -z "$tool" ]; then
+        _info "wgcf-cli 未安装, 下载 GitHub 临时副本"
+        _warp_install_wgcf_cli "$dir" || { rm -rf "$dir"; return 1; }
+        tool="$_WARP_WGCF_TOOL"
+    fi
+    [ -n "$tool" ] || { _WARP_REASON="wgcf-cli 不可用"; rm -rf "$dir"; return 1; }
+    ( cd "$dir" && _warp_run 60 "$tool" register >"$dir/reg.json" 2>/dev/null ) || :
     if [ -s "$dir/reg.json" ] && jq -e . "$dir/reg.json" >/dev/null 2>&1; then
         cp "$dir/reg.json" "$out" 2>/dev/null || :
-    else
-        # register 失败或输出不是 JSON 时退回 generate; 账号文件就在同一个 $dir 里。
-        ( cd "$dir" && wgcf-cli generate --xray >/dev/null 2>&1 ) || :
+        [ -s "$out" ] && have_reg=1
+    elif [ -s "$dir/wgcf.json" ] && jq -e . "$dir/wgcf.json" >/dev/null 2>&1; then
+        cp "$dir/wgcf.json" "$out" 2>/dev/null || :
+        [ -s "$out" ] && have_reg=1
     fi
-    for f in "$dir/wgcf.xray.json" "$dir"/*.xray.json; do
-        if [ -f "$f" ] && [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
-            cp "$f" "$out" 2>/dev/null || :
-            break
-        fi
-    done
+    if [ "$have_reg" -eq 0 ]; then
+        # register 失败或输出不是 JSON 时退回 generate; 同时接住写文件和写 stdout 两种版本。
+        ( cd "$dir" && _warp_run 60 "$tool" generate --xray >"$dir/generate.log" 2>/dev/null ) || :
+        for f in "$dir/wgcf.xray.json" "$dir/wgcf.json" "$dir"/*.xray.json "$dir/generate.log"; do
+            if [ -f "$f" ] && [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
+                cp "$f" "$out" 2>/dev/null || :
+                break
+            fi
+        done
+    fi
     rm -rf "$dir"
-    [ -s "$out" ] && jq -e . "$out" >/dev/null 2>&1 && return 0
+    if [ -s "$out" ] && jq -e . "$out" >/dev/null 2>&1; then
+        return 0
+    fi
+    _WARP_REASON="wgcf-cli 未返回可用配置"
     return 1
 }
 
 # 注册 API 直接返回 Xray WireGuard 出站结构。
 _warp_fetch_api() {
     local out="${1:-}"
-    [ -n "$out" ] || return 1
-    _http_download "$WARP_API_URL" "$out" 25 || return 1
-    [ -s "$out" ] || return 1
+    [ -n "$out" ] || { _WARP_REASON="未指定输出文件"; return 1; }
+    _WARP_REASON=""
+    if ! _warp_http_get "$WARP_API_URL" "$out" 25; then
+        _WARP_REASON=$(_warp_http_reason "$out") || _WARP_REASON="未取得注册 API 响应"
+        return 1
+    fi
+    [ -s "$out" ] || { _WARP_REASON="注册 API 返回空响应"; return 1; }
     return 0
 }
 
@@ -216,16 +377,30 @@ _warp_normalize_api() { _warp_normalize_jq "${1:-}" ' (if (wgs) != null then out
 # 生成: 从 stdin 读内部表示, 向 stdout 输出单个 Xray outbound。
 # noKernelTun 由调用方决定, 缺省 true: LXC/容器里自动探测 TUN 不可靠, 稳定优先。
 # ---------------------------------------------------------------------------
+# WARP 端点域名同时有 A/AAAA; Xray 默认在解析结果中随机选一个。
+# 有 IPv4 默认路由时固定 UseIPv4, 只有 IPv6 默认路由时才用 UseIPv6。
+_warp_domain_strategy() {
+    if command -v ip >/dev/null 2>&1 &&
+        [ -z "$(ip route show default 2>/dev/null)" ] &&
+        [ -n "$(ip -6 route show default 2>/dev/null)" ]; then
+        printf 'UseIPv6'
+    else
+        printf 'UseIPv4'
+    fi
+}
+
 _warp_build_outbound() {   # [true|false, 缺省 true]
-    local nk="${1:-true}" norm
+    local nk="${1:-true}" norm ds
     case "$nk" in true|false) ;; *) return 1 ;; esac
     norm=$(cat) || return 1
     [ -n "$norm" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
-    printf '%s' "$norm" | jq -c --argjson nk "$nk" "$_WARP_NORM_JQ"'
+    ds=$(_warp_domain_strategy)
+    printf '%s' "$norm" | jq -c --argjson nk "$nk" --arg ds "$ds" "$_WARP_NORM_JQ"'
         wgcheck
         | { protocol: "wireguard",
             tag: "warp",
+            streamSettings: { sockopt: { domainStrategy: $ds } },
             settings: {
               secretKey: .secretKey,
               address: .address,
@@ -253,8 +428,9 @@ _warp_obtain() {
         raw=$(mktemp) || { _error "无法创建临时文件"; return 1; }
         norm=""
         reason=""
+        _WARP_REASON=""
         if ! "$fetch_fn" "$raw"; then
-            reason="未取得注册响应"
+            reason="${_WARP_REASON:-未取得注册响应}"
         elif ! norm=$("$norm_fn" "$raw"); then
             reason="响应无法解析"
         fi
