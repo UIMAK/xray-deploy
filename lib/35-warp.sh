@@ -189,6 +189,25 @@ _warp_http_reason() {   # <dest>
     fi
 }
 
+# 外部注册工具可能因网络半开阻塞; timeout 可用时统一限时, 不可用时保持原行为。
+_warp_run() {   # <timeout_sec> <cmd...>
+    local timeout_s="${1:-30}" kind=""
+    shift
+    [ "$#" -gt 0 ] || return 1
+    kind=$(type -t "$1" 2>/dev/null) || kind=""
+    case "$kind" in
+        function|builtin)
+            "$@" </dev/null
+            return $?
+            ;;
+    esac
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_s" "$@" </dev/null
+    else
+        "$@" </dev/null
+    fi
+}
+
 # warp-reg.sh 在缺 xxd/python3 时会先向 stdout 打印安装提示; 从首个 JSON 起点开始保留。
 _warp_trim_reg_output() {   # <outfile>
     local out="${1:-}" tmp
@@ -210,9 +229,9 @@ _warp_fetch_warp_reg() {
     [ -n "$out" ] || { _WARP_REASON="未指定输出文件"; return 1; }
     _WARP_REASON=""
     if command -v warp-reg >/dev/null 2>&1; then
-        warp-reg </dev/null >"$out" 2>/dev/null || { rc=1; local_failed=1; }
+        _warp_run 30 warp-reg >"$out" 2>/dev/null || { rc=1; local_failed=1; }
     elif command -v warp-reg.sh >/dev/null 2>&1; then
-        warp-reg.sh </dev/null >"$out" 2>/dev/null || { rc=1; local_failed=1; }
+        _warp_run 30 warp-reg.sh >"$out" 2>/dev/null || { rc=1; local_failed=1; }
     fi
     if [ "$rc" -eq 0 ] && [ -s "$out" ]; then
         _warp_trim_reg_output "$out" || { _WARP_REASON="warp-reg 输出无法读取"; return 1; }
@@ -222,11 +241,15 @@ _warp_fetch_warp_reg() {
         _WARP_REASON="本机 warp-reg 执行失败"
     fi
 
+    if command -v apk >/dev/null 2>&1; then
+        _WARP_REASON="远程 warp-reg.sh 不支持 Alpine apk"
+        return 1
+    fi
     _WARP_REASON=""
     rc=0
     script=$(mktemp) || { _WARP_REASON="无法创建临时文件"; return 1; }
     if _warp_http_get "$WARP_REG_SCRIPT_URL" "$script" 20; then
-        bash "$script" </dev/null >"$out" 2>/dev/null || rc=1
+        _warp_run 30 bash "$script" >"$out" 2>/dev/null || rc=1
     else
         rc=1
         _WARP_REASON=$(_warp_http_reason "$script") || _WARP_REASON="下载 warp-reg 脚本失败"
@@ -290,7 +313,7 @@ _warp_fetch_wgcf_cli() {
         tool="$_WARP_WGCF_TOOL"
     fi
     [ -n "$tool" ] || { _WARP_REASON="wgcf-cli 不可用"; rm -rf "$dir"; return 1; }
-    ( cd "$dir" && "$tool" register </dev/null >"$dir/reg.json" 2>/dev/null ) || :
+    ( cd "$dir" && _warp_run 60 "$tool" register >"$dir/reg.json" 2>/dev/null ) || :
     if [ -s "$dir/reg.json" ] && jq -e . "$dir/reg.json" >/dev/null 2>&1; then
         cp "$dir/reg.json" "$out" 2>/dev/null || :
         [ -s "$out" ] && have_reg=1
@@ -300,7 +323,7 @@ _warp_fetch_wgcf_cli() {
     fi
     if [ "$have_reg" -eq 0 ]; then
         # register 失败或输出不是 JSON 时退回 generate; 同时接住写文件和写 stdout 两种版本。
-        ( cd "$dir" && "$tool" generate --xray </dev/null >"$dir/generate.log" 2>/dev/null ) || :
+        ( cd "$dir" && _warp_run 60 "$tool" generate --xray >"$dir/generate.log" 2>/dev/null ) || :
         for f in "$dir/wgcf.xray.json" "$dir/wgcf.json" "$dir"/*.xray.json "$dir/generate.log"; do
             if [ -f "$f" ] && [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
                 cp "$f" "$out" 2>/dev/null || :
@@ -354,16 +377,30 @@ _warp_normalize_api() { _warp_normalize_jq "${1:-}" ' (if (wgs) != null then out
 # 生成: 从 stdin 读内部表示, 向 stdout 输出单个 Xray outbound。
 # noKernelTun 由调用方决定, 缺省 true: LXC/容器里自动探测 TUN 不可靠, 稳定优先。
 # ---------------------------------------------------------------------------
+# WARP 端点域名同时有 A/AAAA; Xray 默认在解析结果中随机选一个。
+# 有 IPv4 默认路由时固定 UseIPv4, 只有 IPv6 默认路由时才用 UseIPv6。
+_warp_domain_strategy() {
+    if command -v ip >/dev/null 2>&1 &&
+        [ -z "$(ip route show default 2>/dev/null)" ] &&
+        [ -n "$(ip -6 route show default 2>/dev/null)" ]; then
+        printf 'UseIPv6'
+    else
+        printf 'UseIPv4'
+    fi
+}
+
 _warp_build_outbound() {   # [true|false, 缺省 true]
-    local nk="${1:-true}" norm
+    local nk="${1:-true}" norm ds
     case "$nk" in true|false) ;; *) return 1 ;; esac
     norm=$(cat) || return 1
     [ -n "$norm" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
-    printf '%s' "$norm" | jq -c --argjson nk "$nk" "$_WARP_NORM_JQ"'
+    ds=$(_warp_domain_strategy)
+    printf '%s' "$norm" | jq -c --argjson nk "$nk" --arg ds "$ds" "$_WARP_NORM_JQ"'
         wgcheck
         | { protocol: "wireguard",
             tag: "warp",
+            streamSettings: { sockopt: { domainStrategy: $ds } },
             settings: {
               secretKey: .secretKey,
               address: .address,

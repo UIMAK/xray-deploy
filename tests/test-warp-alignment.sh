@@ -250,10 +250,141 @@ JSON
     check 'build: peers keep publicKey/endpoint/allowedIPs from normalize' eq 'cHVibGljLWFwaQ==|162.159.192.6:2408|0.0.0.0/0,::/0' "$(jq -r '.settings.peers[0] | [.publicKey, .endpoint, (.allowedIPs | join(","))] | join("|")' "$TMP/outbound.json")"
     check 'build: default mtu 1280 is carried into settings' eq '1280' "$(jq -r '.settings.mtu' "$TMP/outbound.json")"
 
+    build_domain_strategy() (
+        _warp_domain_strategy() { printf 'UseIPv6'; }
+        cat "$TMP/n-api.json" | _warp_build_outbound > "$TMP/outbound-ds.json" 2>/dev/null || return 1
+        jq -e '.streamSettings.sockopt.domainStrategy == "UseIPv6"' "$TMP/outbound-ds.json" >/dev/null 2>&1
+    )
+    check 'build: WARP outbound carries endpoint domain strategy' build_domain_strategy
+
+    domain_strategy_ipv6_only() (
+        command() {
+            case "${1:-} ${2:-}" in
+                "-v ip") return 0 ;;
+            esac
+            builtin command "$@"
+        }
+        ip() {
+            case "$*" in
+                "route show default") return 0 ;;
+                "-6 route show default") printf 'default via fe80::1 dev eth0\n' ;;
+            esac
+        }
+        [ "$(_warp_domain_strategy)" = "UseIPv6" ]
+    )
+    check 'domain strategy: IPv6-only host uses UseIPv6' domain_strategy_ipv6_only
+
+    domain_strategy_dual_stack() (
+        command() {
+            case "${1:-} ${2:-}" in
+                "-v ip") return 0 ;;
+            esac
+            builtin command "$@"
+        }
+        ip() {
+            case "$*" in
+                "route show default") printf 'default via 192.0.2.1 dev eth0\n' ;;
+                "-6 route show default") printf 'default via fe80::1 dev eth0\n' ;;
+            esac
+        }
+        [ "$(_warp_domain_strategy)" = "UseIPv4" ]
+    )
+    check 'domain strategy: dual-stack host uses UseIPv4' domain_strategy_dual_stack
+
     # -----------------------------------------------------------------------
     # B. 获取失败不污染输出
     # -----------------------------------------------------------------------
     printf '== B. fetch failure does not write output ==\n'
+    mkdir -p "$TMP/fakebin" || exit 1
+    cat > "$TMP/fakebin/curl" <<'SH'
+#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -w) shift 2 ;;
+        --*) shift ;;
+        *) shift ;;
+    esac
+done
+[ -n "$out" ] && printf '%s' "${FAKE_BODY:-}" > "$out"
+printf '%s' "${FAKE_CODE:-200}"
+exit "${FAKE_RC:-0}"
+SH
+    chmod +x "$TMP/fakebin/curl" || exit 1
+
+    http_curl_2xx() (
+        PATH="$TMP/fakebin:$PATH"
+        export FAKE_BODY='{"ok":true}' FAKE_CODE=200 FAKE_RC=0
+        _warp_http_get 'https://example.test/x' "$TMP/http-200.out" 5 || return 1
+        [ "$_WARP_HTTP_CODE" = 200 ] && [ "$(cat "$TMP/http-200.out")" = '{"ok":true}' ]
+    )
+    check 'http: curl 2xx writes body and status' http_curl_2xx
+
+    http_curl_403() (
+        PATH="$TMP/fakebin:$PATH"
+        export FAKE_BODY='{"error":"denied"}' FAKE_CODE=403 FAKE_RC=0
+        ! _warp_http_get 'https://example.test/x' "$TMP/http-403.out" 5 || return 1
+        [ "$_WARP_HTTP_CODE" = 403 ] || return 1
+        [ "$(_warp_http_reason "$TMP/http-403.out")" = 'HTTP 403: denied' ]
+    )
+    check 'http: curl 4xx keeps status and reason' http_curl_403
+
+    http_curl_empty() (
+        PATH="$TMP/fakebin:$PATH"
+        export FAKE_BODY='' FAKE_CODE=200 FAKE_RC=0
+        ! _warp_http_get 'https://example.test/x' "$TMP/http-empty.out" 5
+    )
+    check 'http: empty 2xx body is rejected' http_curl_empty
+
+    http_curl_fail() (
+        PATH="$TMP/fakebin:$PATH"
+        export FAKE_BODY='' FAKE_CODE=000 FAKE_RC=1
+        ! _warp_http_get 'https://example.test/x' "$TMP/http-fail.out" 5 || return 1
+        [ "$_WARP_HTTP_CODE" = 000 ]
+    )
+    check 'http: curl failure keeps 000 status' http_curl_fail
+
+    http_wget_ok() (
+        command() {
+            case "${1:-} ${2:-}" in
+                "-v curl") return 1 ;;
+                "-v wget") return 0 ;;
+            esac
+            builtin command "$@"
+        }
+        wget() {
+            local out=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    -O) out="$2"; shift 2 ;;
+                    *) shift ;;
+                esac
+            done
+            printf '%s' '{"ok":true}' > "$out"
+        }
+        _warp_http_get 'https://example.test/x' "$TMP/http-wget.out" 5 || return 1
+        [ "$_WARP_HTTP_CODE" = 000 ] && [ "$(cat "$TMP/http-wget.out")" = '{"ok":true}' ]
+    )
+    check 'http: wget fallback writes body' http_wget_ok
+
+    run_timeout_external() (
+        command() {
+            case "${1:-} ${2:-}" in
+                "-v timeout") return 0 ;;
+            esac
+            builtin command "$@"
+        }
+        timeout() {
+            printf '%s|%s\n' "$1" "$2" > "$TMP/timeout.args"
+            shift
+            "$@"
+        }
+        _warp_run 30 sh -c 'exit 0' || return 1
+        [ "$(cat "$TMP/timeout.args")" = "30|sh" ]
+    )
+    check 'run: external command is wrapped by timeout' run_timeout_external
+
     fetch_all_fail() (
         # 隐藏主机上可能存在的 warp-reg / wgcf-cli, 让三种来源都落到"取不到"的分支。
         command() {
@@ -292,6 +423,12 @@ JSON
     check 'fetch: first source succeeding makes _warp_obtain rc=0 with a buildable outfile' fetch_first_source_ok
 
     fetch_local_fail_remote_ok() (
+        command() {
+            case "${1:-} ${2:-}" in
+                "-v apk") return 1 ;;
+            esac
+            builtin command "$@"
+        }
         warp-reg() { return 1; }
         _warp_http_get() {
             printf '%s\n' "$1" > "$TMP/warp-reg-url"
@@ -305,6 +442,23 @@ JSON
         jq -e '.endpoint.v4 == "162.159.192.1:0"' "$TMP/warp-reg.out" >/dev/null 2>&1
     )
     check 'fetch: local warp-reg failure falls back to GitHub script' fetch_local_fail_remote_ok
+
+    fetch_alpine_skips_remote() (
+        command() {
+            case "${1:-} ${2:-}" in
+                "-v warp-reg"|"-v warp-reg.sh") return 1 ;;
+                "-v apk") return 0 ;;
+            esac
+            builtin command "$@"
+        }
+        _warp_http_get() { return 99; }
+        rm -f "$TMP/alpine.out"
+        _warp_fetch_warp_reg "$TMP/alpine.out" 2>/dev/null
+        [ "$?" -eq 1 ] || return 1
+        [ ! -s "$TMP/alpine.out" ] || return 1
+        [ "$_WARP_REASON" = "远程 warp-reg.sh 不支持 Alpine apk" ]
+    )
+    check 'fetch: Alpine skips remote warp-reg.sh without downloading' fetch_alpine_skips_remote
 
     fetch_wgcf_auto_install() (
         command() {
