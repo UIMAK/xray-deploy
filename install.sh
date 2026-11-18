@@ -3,7 +3,7 @@
 
 set -u
 
-# 上游 base 只定义一次，镜像/fork 用 XRAY_DEPLOY_RAW 覆盖。
+# 上游 base 只定义一次，镜像/fork 用 XRAY_DEPLOY_RAW 覆盖（必须 HTTPS）。
 REMOTE_BASE_DEFAULT="https://raw.githubusercontent.com/UIMAK/xray-deploy/main"
 REMOTE_BASE="${XRAY_DEPLOY_RAW:-$REMOTE_BASE_DEFAULT}"
 
@@ -61,18 +61,23 @@ if [ "${#need[@]}" -gt 0 ]; then
     done
 fi
 
-# 下载：curl 优先，wget 兜底并重试。
+# 下载：入口 URL 必须是 HTTPS；curl 优先，仅在 curl 缺失时用 wget 兜底，
+# 避免 curl 的协议/重定向约束被兜底路径绕过（wget 无等价的通用选项）。
 dl() {
     local url="$1" dest="$2"
+    case "$url" in
+        https://*) ;;
+        *) echo "[错误] 下载地址必须使用 HTTPS: $url"; return 1 ;;
+    esac
     mkdir -p "$(dirname "$dest")"
     # curl 优先
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL --retry 2 --max-time 30 "$url" -o "$dest" 2>/dev/null; then
+        if curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 \
+            --retry 2 --max-time 30 "$url" -o "$dest" 2>/dev/null; then
             [ -s "$dest" ] && return 0
         fi
-    fi
-    # wget 兜底(只用 busybox/GNU 都支持的 -q -T -O; --tries/--timeout 等 GNU 长选项在老版本 busybox 上不保证)
-    if command -v wget >/dev/null 2>&1; then
+    # 无 curl 时用 wget(只用 busybox/GNU 都支持的 -q -T -O; --tries/--timeout 等 GNU 长选项在老版本 busybox 上不保证)
+    elif command -v wget >/dev/null 2>&1; then
         if wget -q -T 30 -O "$dest" "$url" 2>/dev/null; then
             [ -s "$dest" ] && return 0
         fi
@@ -120,6 +125,61 @@ _verify_installed() {
         echo "       请按上面列出的路径逐个检查修复; 不要整体删除 $DEPLOY_DIR (会连带删除 confs/ 与 nodes/)"
         return 1
     fi
+    return 0
+}
+
+# 安装源落盘前复核: 版本格式、入口/模块/模板/解析器非空, Bash 与 Python 语法。
+_validate_stage() {   # <source_dir>
+    local src="${1:-}" m ver
+    [ -n "$src" ] && [ -d "$src" ] || {
+        echo "[错误] 安装源目录不存在: ${src:-<空>}"
+        return 1
+    }
+    [ -s "$src/VERSION" ] || {
+        echo "[错误] 安装源缺少 VERSION(或为空)"
+        return 1
+    }
+    ver=$(cat "$src/VERSION" 2>/dev/null) || {
+        echo "[错误] 读取 VERSION 失败"
+        return 1
+    }
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        echo "[错误] VERSION 必须是三段数字: $ver"
+        return 1
+    }
+    [ -s "$src/xray-deploy.sh" ] || {
+        echo "[错误] 安装源缺少 xray-deploy.sh"
+        return 1
+    }
+    bash -n "$src/xray-deploy.sh" 2>/dev/null || {
+        echo "[错误] xray-deploy.sh 语法检查失败"
+        return 1
+    }
+    for m in $LIB_MODULES; do
+        [ -s "$src/lib/${m}.sh" ] || {
+            echo "[错误] 安装源缺少 lib/${m}.sh"
+            return 1
+        }
+        bash -n "$src/lib/${m}.sh" 2>/dev/null || {
+            echo "[错误] lib/${m}.sh 语法检查失败"
+            return 1
+        }
+    done
+    for m in $TPL_NAMES; do
+        [ -s "$src/templates/${m}.server.jsonc" ] || {
+            echo "[错误] 安装源缺少 templates/${m}.server.jsonc"
+            return 1
+        }
+    done
+    [ -s "$src/support/outbound_link.py" ] || {
+        echo "[错误] 安装源缺少 support/outbound_link.py"
+        return 1
+    }
+    python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' \
+        "$src/support/outbound_link.py" 2>/dev/null || {
+        echo "[错误] support/outbound_link.py 语法检查失败"
+        return 1
+    }
     return 0
 }
 
@@ -464,6 +524,11 @@ download_all() {
         echo "[错误] 部分文件下载失败, 已取消更新(现有文件未变动)"
         return 1
     fi
+    if ! _validate_stage "$stage"; then
+        rm -rf "$stage"
+        echo "[错误] 暂存文件校验失败, 已取消更新(现有文件未变动)"
+        return 1
+    fi
 
     # 全量取件后执行整版本事务，见 _install_backup。
     mkdir -p "$DEPLOY_DIR" "$INSTALL_LIB_DIR" "$INSTALL_TPL_DIR" "$INSTALL_SUPPORT_DIR"
@@ -671,7 +736,7 @@ if [ "$IS_UPDATE" -eq 1 ]; then
         inst_ver=$(cat "$DEPLOY_DIR/VERSION" 2>/dev/null || echo "?")
         echo "[成功] 更新完成 (版本 ${inst_ver})"
     else
-        echo "[警告] 部分文件下载失败, 请检查网络后重试"
+        echo "[警告] 更新未完成, 请查看上方错误"
         exit 1
     fi
     exit 0
@@ -689,24 +754,8 @@ LOCAL_TRUSTED=0
 [ -e "${LOCAL_DIR}/.git" ] && LOCAL_TRUSTED=1
 if [ -f "${LOCAL_DIR}/xray-deploy.sh" ] && [ "$LOCAL_TRUSTED" -eq 1 ]; then
     echo "[信息] 检测到本地源, 从本地拷贝"
-    # 本地也走整版本事务；templates 与 VERSION 在备份前预检，lib/ 缺失在落地阶段失败并回滚。
-    tpl_missing=""
-    for t in $TPL_NAMES; do
-        [ -f "${LOCAL_DIR}/templates/${t}.server.jsonc" ] || tpl_missing="${tpl_missing} ${t}.server.jsonc"
-    done
-    if [ -n "$tpl_missing" ]; then
-        echo "[错误] 本地源 templates/ 缺少:${tpl_missing}"; exit 1
-    fi
-    if [ ! -s "${LOCAL_DIR}/support/outbound_link.py" ]; then
-        echo "[错误] 本地源缺少 support/outbound_link.py(或为空), 安装中止"
-        exit 1
-    fi
-    # VERSION 必须非空，且在备份前拒绝缺失，避免版本号残留。
-    if [ ! -s "${LOCAL_DIR}/VERSION" ]; then
-        echo "[错误] 本地源缺少 VERSION(或为空), 安装中止"
-        echo "       更新检查以它为本地真相源, 缺失会导致更新检查使用错误的版本号"
-        exit 1
-    fi
+    # 本地源也在备份前完成整版本复核，避免坏脚本或残缺模块进入落地事务。
+    _validate_stage "$LOCAL_DIR" || exit 1
 
     # .KEEP 占用由 _install_backup 判定；不在调用前删恢复源。
     _bk_rc=0
