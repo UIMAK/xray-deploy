@@ -388,7 +388,8 @@ check 'rejected delete keeps the outside file' test -f "$DEPLOY_DIR/evil.dat"
 
 printf '== child suites ==\n'
 for suite in test-node-alignment.sh test-outbound-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh \
-    test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh; do
+    test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh \
+    test-installer-alignment.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then
         tail -n 1 "$TMP/$suite.log"
         pass "suite $suite"

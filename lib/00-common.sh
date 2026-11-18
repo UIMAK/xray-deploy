@@ -244,20 +244,25 @@ _get_public_ip() {
 }
 
 # ---------------------------------------------------------------------------
-# 通用 HTTP 下载: curl 优先, wget 兜底。wget 只用 busybox/GNU 都支持的 -q -T -O
-# (GNU 专有选项会让 busybox wget unrecognized option 中止)。成功且文件非空才返回 0。
+# 通用 HTTPS 下载: 仅接受 HTTPS; curl 优先, 仅在 curl 缺失时用 wget 兜底。
+# wget 只用 busybox/GNU 都支持的 -q -T -O; curl 失败不回退, 避免绕过协议/重定向约束。
+# 成功且文件非空才返回 0。
 # 用法: _http_download <url> <dest> [timeout_sec]
 # ---------------------------------------------------------------------------
 _http_download() {
     local url="$1" dest="$2" timeout_s="${3:-60}"
+    case "$url" in
+        https://*) ;;
+        *) _error "下载地址必须使用 HTTPS: $url"; return 1 ;;
+    esac
     local dir; dir=$(dirname "$dest")
     [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL --retry 2 --max-time "$timeout_s" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
+        if curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 8 \
+            --retry 2 --max-time "$timeout_s" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
             return 0
         fi
-    fi
-    if command -v wget >/dev/null 2>&1; then
+    elif command -v wget >/dev/null 2>&1; then
         if wget -q -T "$timeout_s" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
             return 0
         fi
