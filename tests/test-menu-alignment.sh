@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 离线验证会改状态的菜单行为: 事务、cron 与 reset 恢复。
-# shellcheck disable=SC2329,SC2034
+# shellcheck disable=SC2329,SC2034,SC2030,SC2031
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
@@ -277,6 +277,38 @@ trap 'rm -rf "${TMP:?}"' EXIT
     invoke_protocol_menu 10
     check 'protocol menu dispatches Hysteria2 at 10' \
         test "$(cat "$TMP/protocol-calls")" = hysteria
+
+    printf '== update check download path ==\n'
+    update_check_fixture() {
+        printf '1.0.0\n' > "$DEPLOY_DIR/VERSION"
+        printf '1.0.0\n' > "$TMP/remote-version"
+        : > "$TMP/http-calls"
+        : > "$TMP/direct-calls"
+        : > "$TMP/press-calls"
+    }
+    invoke_update_check() {
+        RC=0
+        (
+            clear() { :; }
+            _press_any_key() { printf 'press\n' >> "$TMP/press-calls"; }
+            _http_download() {
+                printf '%s|%s\n' "$1" "$3" >> "$TMP/http-calls"
+                cp "$TMP/remote-version" "$2"
+            }
+            curl() { printf 'curl\n' >> "$TMP/direct-calls"; return 1; }
+            wget() { printf 'wget\n' >> "$TMP/direct-calls"; return 1; }
+            _check_script_update
+        ) > "$TMP/output" 2>&1 || RC=$?
+    }
+    update_check_fixture
+    invoke_update_check
+    check 'update check reads VERSION through _http_download' \
+        bash -c 'test "$1" = 0 && test "$(wc -l < "$2")" -eq 1 && grep -qxF "$3|10" "$2"' _ \
+        "$RC" "$TMP/http-calls" "$SCRIPT_VERSION_URL"
+    check 'update check bypasses direct curl/wget' test ! -s "$TMP/direct-calls"
+    check 'update check consumes downloaded VERSION and reports latest' \
+        bash -c 'grep -qF "已是最新版本" "$1" && test "$(cat "$2")" = press' _ \
+        "$TMP/output" "$TMP/press-calls"
 
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]

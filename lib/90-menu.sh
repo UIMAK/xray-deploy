@@ -1044,6 +1044,7 @@ _reset_config_locked() {
 }
 
 # 更新检查读取本地/远端 VERSION；XRAY_DEPLOY_RAW 为用户指定受信源。
+# 远端 VERSION 与 install.sh 统一走 _http_download 的 HTTPS 约束。
 # 非空/bash -n 只验证内容/语法，不证明来源；不引入下载哈希/签名机制。
 SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
 
@@ -1064,13 +1065,18 @@ _check_script_update() {
     [ -z "$local_ver" ] && local_ver="(未知)"
     echo -e "  当前版本: ${CYAN}${local_ver}${NC}"
     _info "正在检查远程版本..."
-    local remote
-    remote=$(curl -fsSL --max-time 10 "$SCRIPT_VERSION_URL" 2>/dev/null) || \
-    remote=$(wget -q -T 10 -O- "$SCRIPT_VERSION_URL" 2>/dev/null) || remote=""
-    if [ -z "$remote" ]; then
+    local remote ver_tmp
+    ver_tmp=$(mktemp) || {
+        _warn "无法创建远程版本临时文件"
+        _press_any_key; return
+    }
+    if ! _http_download "$SCRIPT_VERSION_URL" "$ver_tmp" 10 || [ ! -s "$ver_tmp" ]; then
+        rm -f "$ver_tmp"
         _warn "无法获取远程版本(网络受限或仓库未发布),请手动检查"
         _press_any_key; return
     fi
+    remote=$(cat "$ver_tmp" 2>/dev/null)
+    rm -f "$ver_tmp"
     remote=$(echo "$remote" | tr -d '[:space:]')
     # 外部版本必须整体合法，不能剥字符后误判最新版；见 _sanitize_token。
     if ! remote=$(_sanitize_token "$remote"); then
