@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 离线 scratch 覆盖真实 core/Geo 账本与 direct service 控制。
 # 桩函数与 fixture 变量由 source 进来的生产模块间接消费。
-# shellcheck disable=SC2329,SC2034
+# shellcheck disable=SC2329,SC2034,SC2030,SC2031
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
 command -v jq >/dev/null 2>&1 || { printf 'SUMMARY pass=0 fail=1 (jq required)\n'; exit 1; }
@@ -619,8 +619,37 @@ trap cleanup EXIT
         local def check_line rm_line
         def=$(declare -f _uninstall_xray_locked)
         check_line=$(printf '%s\n' "$def" | grep -n '_logrotate_cleanup' | head -n 1 | cut -d: -f1)
-        rm_line=$(printf '%s\n' "$def" | grep -n 'rm -f /usr/local/bin' | head -n 1 | cut -d: -f1)
+        rm_line=$(printf '%s\n' "$def" | grep -n 'rm -rf "\$DEPLOY_DIR"' | head -n 1 | cut -d: -f1)
         [ -n "$check_line" ] && [ -n "$rm_line" ] && [ "$check_line" -lt "$rm_line" ]
+    }
+
+    # 全量卸载先删部署目录、成功后才删 xd；目录删除失败必须保留可重试入口。
+    uninstall_retry_entrypoint_contract() {
+        local root="$TMP/uninstall-retry" def remove_line entry_line
+        def=$(declare -f _uninstall_xray_locked)
+        remove_line=$(printf '%s\n' "$def" | grep -n 'rm -rf "\$DEPLOY_DIR"' | head -n 1 | cut -d: -f1)
+        entry_line=$(printf '%s\n' "$def" | grep -n 'rm -f /usr/local/bin/"\$CMD_NAME"' | head -n 1 | cut -d: -f1)
+        [ -n "$remove_line" ] && [ -n "$entry_line" ] && [ "$remove_line" -lt "$entry_line" ] || return 1
+        mkdir -p "$root/deploy/bin" "$root/deploy/state" || return 1
+        (
+            DEPLOY_DIR="$root/deploy" XRAY_BIN="$root/deploy/bin/xray" CMD_NAME=xd INIT_SYSTEM=direct
+            STATE_DIR="$DEPLOY_DIR/state"
+            : > "$XRAY_BIN"
+            _xray_stop_and_verify() { return 0; }
+            _crontab_replace() { return 0; }
+            _logrotate_cleanup() { :; }
+            _success() { :; }
+            _error() { :; }
+            _warn() { :; }
+            rm() {
+                case "$*" in
+                    *"-rf $DEPLOY_DIR"*) return 1 ;;
+                esac
+                command rm "$@"
+            }
+            _uninstall_xray_locked all >/dev/null 2>&1 && return 1
+            [ -d "$DEPLOY_DIR" ]
+        )
     }
 
     uninstall_keep_panel_contract() (
@@ -856,6 +885,7 @@ trap cleanup EXIT
     check 'verified restart rejects unchanged old process identity' restart_verified_rejects_unchanged_identity
     check 'verified restart fails closed when identity is unreadable' restart_verified_requires_readable_identity
     check 'uninstall checks logrotate helper before deleting entrypoints' uninstall_cleanup_contract
+    check 'full uninstall keeps xd retryable until the deploy tree is gone' uninstall_retry_entrypoint_contract
     check 'Xray-only uninstall preserves manager and data' uninstall_keep_panel_contract
     printf 'SUMMARY pass=%s fail=%s\n' "$PASS" "$FAIL"
     [ "$FAIL" -eq 0 ]

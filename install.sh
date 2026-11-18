@@ -589,12 +589,19 @@ download_all() {
 }
 
 # 创建 xd 快捷链接；目标若是目录, ln 会把链接写进目录内部, 必须先拒绝。
+# 只接管本部署生成的链接或失效链接, 同名外部命令拒绝覆盖。
 _install_xd_link() {
     local bin_dir
     bin_dir=$(dirname "$INSTALL_BIN")
     mkdir -p "$bin_dir" || { echo "[错误] 无法创建命令目录: $bin_dir"; return 1; }
     if [ -d "$INSTALL_BIN" ] && [ ! -L "$INSTALL_BIN" ]; then
         echo "[错误] 命令目标是目录, 拒绝创建嵌套链接: $INSTALL_BIN"
+        return 1
+    fi
+    if { [ -e "$INSTALL_BIN" ] || [ -L "$INSTALL_BIN" ]; } &&
+       { [ ! -L "$INSTALL_BIN" ] || [ "$(readlink -- "$INSTALL_BIN" 2>/dev/null)" != "$DEPLOY_DIR/xray-deploy.sh" ]; }; then
+        echo "[错误] 已有命令不属于本部署, 拒绝覆盖: $INSTALL_BIN"
+        echo "       请移除该命令或改名后重试"
         return 1
     fi
     ln -sfn "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN" || {
