@@ -24,6 +24,7 @@ check() {
 # install.sh 顶层会做 root 检查并进入安装流程，这里只抽取待测函数。
 eval "$(sed -n '/^dl() {/,/^}$/p' "$ROOT/install.sh")"
 eval "$(sed -n '/^_validate_stage() {/,/^}$/p' "$ROOT/install.sh")"
+eval "$(sed -n '/^_install_xd_link() {/,/^}$/p' "$ROOT/install.sh")"
 
 LIB_MODULES="00-common 10-system"
 TPL_NAMES="tpl"
@@ -182,6 +183,27 @@ stage_validation_precedes_backup() {
     ' "$ROOT/install.sh"
 }
 
+xd_link_rejects_foreign_command() (
+    DEPLOY_DIR="$TMP/xd-deploy"
+    INSTALL_BIN="$TMP/xd-bin/xd"
+    mkdir -p "$DEPLOY_DIR" "$TMP/xd-bin" || return 1
+    : > "$DEPLOY_DIR/xray-deploy.sh"
+    printf '#!/bin/sh\n' > "$INSTALL_BIN"
+    ! _install_xd_link >/dev/null 2>&1 && [ -f "$INSTALL_BIN" ] || return 1
+    printf '#!/bin/sh\n' > "$TMP/xd-foreign"
+    ln -sfn "$TMP/xd-foreign" "$INSTALL_BIN"
+    ! _install_xd_link >/dev/null 2>&1 && [ "$(readlink -- "$INSTALL_BIN")" = "$TMP/xd-foreign" ]
+)
+
+xd_link_replaces_own_command() (
+    DEPLOY_DIR="$TMP/xd-own-deploy"
+    INSTALL_BIN="$TMP/xd-own-bin/xd"
+    mkdir -p "$DEPLOY_DIR" "$TMP/xd-own-bin" || return 1
+    : > "$DEPLOY_DIR/xray-deploy.sh"
+    ln -sfn "$DEPLOY_DIR/xray-deploy.sh" "$INSTALL_BIN"
+    _install_xd_link >/dev/null 2>&1 && [ "$(readlink -- "$INSTALL_BIN")" = "$DEPLOY_DIR/xray-deploy.sh" ]
+)
+
 check 'dl rejects non-HTTPS URL before downloader' dl_rejects_http
 check 'dl applies curl HTTPS protocol constraints' dl_applies_https_flags
 check 'dl does not fall back to wget when curl fails' dl_does_not_fallback_when_curl_fails
@@ -197,6 +219,8 @@ check 'staging rejects shell syntax error' stage_rejects_bad_shell
 check 'staging rejects Python syntax error' stage_rejects_bad_python
 check 'staging rejects missing module' stage_rejects_missing_lib
 check 'staging validation precedes backup in remote and local installs' stage_validation_precedes_backup
+check 'xd link refuses a foreign command' xd_link_rejects_foreign_command
+check 'xd link replaces its own command' xd_link_replaces_own_command
 
 printf 'installer alignment passed %s, failed %s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -2651,10 +2651,8 @@ _uninstall_xray_locked() {
     else
         _warn "未能移除定时重启任务, 请手动检查 crontab"
     fi
-    # 整站卸载才移除管理入口; 单独卸载核心时保留 xd 和面板数据, 以便后续重新安装/管理。
-    if [ "$mode" = all ]; then
-        rm -f /usr/local/bin/"$CMD_NAME"
-    fi
+    # 管理入口留到部署目录删除成功后再移除; 删除失败时仍可用 xd 重试,
+    # 单独卸载核心时则保留 xd 和面板数据以便重新安装/管理。
     if [ "$(readlink -f /usr/local/bin/xray 2>/dev/null)" = "$XRAY_BIN" ]; then
         rm -f /usr/local/bin/xray
     fi
@@ -2674,6 +2672,16 @@ _uninstall_xray_locked() {
         _error "部署目录删除失败, 卸载未完成: $DEPLOY_DIR"
         _tip "请检查权限/只读文件系统后重试"
         return 1
+    fi
+    if [ "$mode" = all ]; then
+        rm -f /usr/local/bin/"$CMD_NAME" || {
+            _error "管理命令删除失败, 请手动移除: /usr/local/bin/$CMD_NAME"
+            return 1
+        }
+        [ ! -e /usr/local/bin/"$CMD_NAME" ] && [ ! -L /usr/local/bin/"$CMD_NAME" ] || {
+            _error "管理命令仍存在, 卸载未完成: /usr/local/bin/$CMD_NAME"
+            return 1
+        }
     fi
     if [ "$svc_cleanup_rc" -ne 0 ]; then
         _warn "service 定义清理未完成(可能残留 xray.service), 请手动确认"
