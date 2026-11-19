@@ -6,7 +6,7 @@
     "settings": {
         "clients": [
             {
-                "id": "{{UUID}}"
+                "id": "{{UUID}}"{{FLOW_BLOCK}}
             }
         ],
         "decryption": "{{DECRYPTION}}"

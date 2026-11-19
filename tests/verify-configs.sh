@@ -148,6 +148,13 @@ for template in vless-tcp-reality-vision-direct vless-tcp-reality-vision-tunnel 
        && assert_field "$inbound" '.streamSettings.realitySettings.serverNames[0]' "$R_SERVER_NAME" \
        && assert_field "$inbound" '.streamSettings.realitySettings.shortIds[0]' "$R_SHORT_ID"; then
         check_rendered "$template" "$inbound"
+        case "$template" in
+            vless-xhttp-*)
+                printf '%s' "$inbound" | jq -e '.settings.clients[0] | has("flow") | not' >/dev/null \
+                    && record PASS "$template omits empty flow" \
+                    || record FAIL "$template (empty flow injected)"
+                ;;
+        esac
     else
         record FAIL "$template (real key generation, render or REALITY fields differ)"
     fi
@@ -155,10 +162,12 @@ done
 
 R_PORT=18451
 R_TAG='config-test-enc'
+ENC_TEST_DECRYPTION=""
 if ! _xray_version_at_least "$core_version" 25.8.31; then
     record SKIP 'vless-enc (requires core >=25.8.31; encryption must not silently fall back to none)'
 elif _generate_vless_enc_keys x25519 > "$scratch/vlessenc.log" 2>&1; then
     R_DECRYPTION="$VLESS_ENC_DECRYPTION"
+    ENC_TEST_DECRYPTION="$VLESS_ENC_DECRYPTION"
     if inbound=$(_render_template "$repo/templates/vless-enc.server.jsonc") \
        && assert_field "$inbound" '.settings.decryption' "$R_DECRYPTION" \
        && [ "$R_DECRYPTION" != none ]; then
@@ -179,6 +188,21 @@ if inbound=$(_render_template "$repo/templates/vless-xhttp-cdn.server.jsonc") \
     check_rendered xhttp-cdn-path-ampersand "$inbound"
 else
     record FAIL 'xhttp-cdn-path-ampersand (rendered path/mode differs or render failed)'
+fi
+
+# XHTTP+VLESS Encryption 自动 Vision: 模板必须只在 R_FLOW 非空时注入 clients[0].flow。
+if [ -n "$ENC_TEST_DECRYPTION" ]; then
+    R_FLOW=xtls-rprx-vision R_DECRYPTION="$ENC_TEST_DECRYPTION" R_PORT=18453 R_TAG='config-test-xhttp-flow'
+    if inbound=$(_render_template "$repo/templates/vless-xhttp-cdn.server.jsonc") \
+       && assert_field "$inbound" '.settings.clients[0].flow' xtls-rprx-vision \
+       && assert_field "$inbound" '.settings.decryption' "$ENC_TEST_DECRYPTION"; then
+        check_rendered xhttp-cdn-enc-vision "$inbound"
+    else
+        record FAIL 'xhttp-cdn-enc-vision (flow block or encryption differs)'
+    fi
+    R_FLOW='' R_DECRYPTION=none
+else
+    record SKIP 'xhttp-cdn-enc-vision (requires core vlessenc)'
 fi
 
 R_PORT="$R_TUNNEL_PORT"

@@ -152,6 +152,15 @@ fi
     parse_fail 'vision without TLS or ENC rejected' \
         "vless://${UUID}@example.com:443?encryption=none&security=none&type=tcp&flow=xtls-rprx-vision" \
         'VLESS flow 需要 TLS 或 Reality'
+    link="vless://${UUID}@example.com:443?encryption=mlkem768:seed123:verify456&security=none&type=xhttp&mode=auto&path=%2Fapi&flow=xtls-rprx-vision#XHTTP-ENC-Vision"
+    parse_ok 'XHTTP ENC vision roundtrip' "$link" '
+        .[0].outbound.settings.flow == "xtls-rprx-vision"
+        and .[0].outbound.settings.encryption == "mlkem768:seed123:verify456"
+        and .[0].outbound.streamSettings.network == "xhttp"
+    '
+    parse_fail 'XHTTP vision without ENC rejected' \
+        "vless://${UUID}@example.com:443?encryption=none&security=reality&type=xhttp&mode=auto&path=%2Fapi&sni=www.example.com&pbk=${PBK}&sid=01&flow=xtls-rprx-vision" \
+        'VLESS flow 只支持 RAW/TCP 传输'
 
     parse_fail 'Reality WebSocket rejected' \
         "vless://${UUID}@example.com:443?encryption=none&security=reality&type=ws&path=%2Fws&sni=www.example.com&pbk=${PBK}&sid=01#Reality-WS" \
