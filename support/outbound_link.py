@@ -723,7 +723,8 @@ def parse_vless(link):
             fail("VLESS flow 需要 TLS 或 Reality")
     kind = read_transport_kind(query)
     check_earlydata_header(kind, query)
-    if flow and kind != "raw":
+    # 无 VLESS Encryption 时 Vision 仅限 RAW/TCP; 启用后无底层传输限制。
+    if flow and kind != "raw" and encryption == "none":
         fail("VLESS flow 只支持 RAW/TCP 传输")
     header = query.get("headertype")
     if header is not None and header.lower() not in ("", "none"):

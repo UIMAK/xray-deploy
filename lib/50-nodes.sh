@@ -1962,6 +1962,14 @@ _render_template() {
     else
         content="${content//$p/}"
     fi
+    # 客户端 flow 块(可选: XHTTP+VLESS Encryption 自动 Vision; 未启用时省略)
+    p="{{FLOW_BLOCK}}"
+    if [ -n "$R_FLOW" ]; then
+        content="${content//$p/,
+                \"flow\": \"$R_FLOW\"}"
+    else
+        content="${content//$p/}"
+    fi
 
     # jq 合法化 + 美化(每字段单独行, 2 空格缩进)
     echo "$content" | jq . 2>/dev/null || {
@@ -2874,6 +2882,14 @@ _enc_param() {   # 输出 none 或 url-encoded 加密参数(ENC_ENABLED/ENC_ENCR
     fi
 }
 
+# XHTTP 节点启用 VLESS Encryption 时自动使用 Vision；未启用加密则保持空 flow。
+_xhttp_enc_flow() {
+    if [ "${ENC_ENABLED:-0}" -eq 1 ]; then
+        printf 'xtls-rprx-vision'
+    fi
+    return 0
+}
+
 _enc_meta_json() {   # <meta_json>; 未启用加密时原样返回
     if [ "$ENC_ENABLED" -eq 1 ]; then
         printf '%s' "$1" | jq \
@@ -2970,6 +2986,12 @@ _add_reality_node() {   # <tcp|xhttp>
 
     _enc_opts_prompt || return 1
 
+    # XHTTP 启用 VLESS Encryption 时自动带 Vision; TCP 模板固定 Vision, 不依赖该项。
+    local flow=""
+    if [ "$wire" = "xhttp" ]; then
+        flow=$(_xhttp_enc_flow)
+    fi
+
     local tag="${tag_prefix}-${port}"
     local tunnel_tag=""
     local listen="::"
@@ -2987,6 +3009,7 @@ _add_reality_node() {   # <tcp|xhttp>
         R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
         R_SERVER_NAME="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
         R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_TUNNEL_PORT="$tunnel_port" R_MLDSA65_SEED="$pq_seed"
+        R_FLOW="$flow"
         reality_json=$(_render_template "$(_tpl_path "${tpl_prefix}-tunnel")") || return 1
 
     else
@@ -2994,6 +3017,7 @@ _add_reality_node() {   # <tcp|xhttp>
         R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid"
         R_SERVER_NAME="$sni" R_TARGET="$sni" R_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
         R_SHORT_ID="$REALITY_SHORT_ID" R_PATH="$path" R_MLDSA65_SEED="$pq_seed"
+        R_FLOW="$flow"
         reality_json=$(_render_template "$(_tpl_path "${tpl_prefix}-direct")") || return 1
     fi
 
@@ -3008,6 +3032,7 @@ _add_reality_node() {   # <tcp|xhttp>
     link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=${wire}"
     if [ "$wire" = "xhttp" ]; then
         link="${link}&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}&path=$(_url_encode "$path")"
+        [ -n "$flow" ] && link="${link}&flow=${flow}"
     else
         link="${link}&flow=xtls-rprx-vision&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&sid=${REALITY_SHORT_ID}"
     fi
@@ -3017,7 +3042,7 @@ _add_reality_node() {   # <tcp|xhttp>
     # reality_mode 是模式的权威标记(见 _reality_node_mode); 直连节点不写 tunnel_tag/tunnel_port
     local meta_json meta_filter
     if [ "$wire" = "xhttp" ]; then
-        meta_filter='{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,mldsa65_verify:$pqv,share_link:$link}'
+        meta_filter='{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,path:$path,flow:$flow,mldsa65_verify:$pqv,share_link:$link}'
     else
         meta_filter='{tag:$tag,name:$name,protocol:$proto,reality_mode:$mode,port:$port,listen:$listen,link_addr:$addr,uuid:$uuid,sni:$sni,public_key:$pk,short_id:$sid,mldsa65_verify:$pqv,share_link:$link}'
     fi
@@ -3026,7 +3051,7 @@ _add_reality_node() {   # <tcp|xhttp>
         --arg mode "$mode" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg uuid "$uuid" --arg sni "$sni" --arg pk "$REALITY_PUBLIC_KEY" \
-        --arg sid "$REALITY_SHORT_ID" --arg path "$path" --arg pqv "$pq_verify" --arg link "$link" \
+        --arg sid "$REALITY_SHORT_ID" --arg path "$path" --arg flow "$flow" --arg pqv "$pq_verify" --arg link "$link" \
         "$meta_filter")
     if [ "$mode" = "tunnel" ]; then
         meta_json=$(echo "$meta_json" | jq \
@@ -3241,9 +3266,15 @@ _add_cdn_node() {   # <xhttp|ws>
 
     _enc_opts_prompt || return 1
 
+    # XHTTP 启用 VLESS Encryption 时自动带 Vision; WS 保持无 flow。
+    local flow=""
+    if [ "$wire" = "xhttp" ]; then
+        flow=$(_xhttp_enc_flow)
+    fi
+
     local tag="${tag_prefix}-${port}"
     local listen="::"
-    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path"
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" R_UUID="$uuid" R_PATH="$path" R_FLOW="$flow"
     local inbound
     inbound=$(_render_template "$(_tpl_path "$tpl_prefix")") || return 1
 
@@ -3256,6 +3287,7 @@ _add_cdn_node() {   # <xhttp|ws>
     link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$host")&fp=chrome"
     if [ "$wire" = "xhttp" ]; then
         link="${link}&alpn=h2&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")"
+        [ -n "$flow" ] && link="${link}&flow=${flow}"
     else
         link="${link}&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")"
     fi
@@ -3269,9 +3301,9 @@ _add_cdn_node() {   # <xhttp|ws>
             --argjson port "$port" --arg listen "$listen" \
             --arg uuid "$uuid" --arg host "$host" --arg path "$path" \
             --arg preferred_addr "$preferred_addr" --argjson preferred_port "$preferred_port" \
-            --arg sni "$host" --arg fp "chrome" --arg alpn "h2" \
+            --arg sni "$host" --arg fp "chrome" --arg alpn "h2" --arg flow "$flow" \
             --arg link "$link" \
-            '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,share_link:$link}')
+            '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$preferred_addr,uuid:$uuid,host:$host,path:$path,preferred_addr:$preferred_addr,preferred_port:$preferred_port,sni:$sni,fp:$fp,alpn:$alpn,flow:$flow,share_link:$link}')
     else
         meta_json=$(jq -n \
             --arg tag "$tag" --arg name "$name" --arg proto "$tpl_prefix" \
@@ -4302,7 +4334,7 @@ _hy2_sync_derived() {
 # Reality分享链接从metadata重建；pqv取客户端verify，不泄露seed。
 _rebuild_reality_link() {
     local meta="$1" new_sni="${2:-}"
-    local uuid host port proto sni pk sid pqv name path
+    local uuid host port proto sni pk sid pqv name path flow
     uuid=$(jq -r '.uuid // empty' "$meta")
     host=$(jq -r '.link_addr // empty' "$meta")
     port=$(jq -r '.port // empty' "$meta")
@@ -4312,6 +4344,7 @@ _rebuild_reality_link() {
     pk=$(jq -r '.public_key // empty' "$meta")
     sid=$(jq -r '.short_id // empty' "$meta")
     pqv=$(jq -r '.mldsa65_verify // empty' "$meta")
+    flow=$(jq -r '.flow // empty' "$meta")
     name=$(jq -r '.name // empty' "$meta")
     path=$(jq -r '.path // empty' "$meta")
     if [ -z "$uuid" ] || [ -z "$host" ] || [ -z "$port" ] || [ -z "$sni" ] \
@@ -4338,6 +4371,7 @@ _rebuild_reality_link() {
             ;;
         vless-xhttp-reality)
             link="vless://${uuid}@${link_ip}:${port}?encryption=${enc_param}&security=reality&type=xhttp&mode=auto&sni=$(_url_encode "$sni")&fp=chrome&pbk=$(_url_encode "$pk")&sid=${sid}&path=$(_url_encode "$path")"
+            [ -n "$flow" ] && link="${link}&flow=${flow}"
             ;;
         *) echo ""; return 1 ;;
     esac
@@ -4374,7 +4408,7 @@ _rebuild_vless_enc_link() {
 # 用法:_rebuild_cdn_link <meta_file>
 _rebuild_cdn_link() {
     local meta="$1"
-    local uuid host path name proto preferred_addr preferred_port sni fp alpn
+    local uuid host path name proto preferred_addr preferred_port sni fp alpn flow
     uuid=$(jq -r '.uuid // empty' "$meta")
     host=$(jq -r '.host // empty' "$meta")
     path=$(jq -r '.path // empty' "$meta")
@@ -4390,6 +4424,7 @@ _rebuild_cdn_link() {
     # 已选指纹原样导出；Firefox 仍受支持，缺失时默认 Chrome(transport.md: fingerprint)。
     fp=$(jq -r '.fp // "chrome"' "$meta")
     alpn=$(jq -r '.alpn // "h2"' "$meta")
+    flow=$(jq -r '.flow // empty' "$meta")
     local enc; enc=$(jq -r '.encryption // "none"' "$meta")
     local enc_param
     if [ "$enc" != "none" ] && [ -n "$enc" ]; then
@@ -4402,6 +4437,7 @@ _rebuild_cdn_link() {
     case "$proto" in
         vless-xhttp-cdn)
             link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$sni")&fp=${fp}&alpn=${alpn}&type=xhttp&mode=auto&host=$(_url_encode "$host")&path=$(_url_encode "$path")"
+            [ -n "$flow" ] && link="${link}&flow=${flow}"
             ;;
         vless-ws-cdn)
             link="vless://${uuid}@${link_ip}:${preferred_port}?encryption=${enc_param}&security=tls&sni=$(_url_encode "$sni")&fp=${fp}&type=ws&host=$(_url_encode "$host")&path=$(_url_encode "${path}?ed=2560")"

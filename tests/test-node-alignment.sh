@@ -272,6 +272,25 @@ for proto in vless-xhttp-cdn vless-ws-cdn; do
     check "$proto URI defaults Chrome" contains "$link" '&fp=chrome&'
 done
 
+# XHTTP+VLESS Encryption 自动 Vision: 只有 xhttp 链接携带 flow, WS 与无 flow 元数据保持原样。
+ENC_ENABLED=0
+check 'xhttp flow stays empty without ENC' eq '' "$(_xhttp_enc_flow)"
+ENC_ENABLED=1
+check 'xhttp flow auto-enables Vision with ENC' eq 'xtls-rprx-vision' "$(_xhttp_enc_flow)"
+ENC_ENABLED=0
+jq -n '{protocol:"vless-xhttp-cdn",name:"cdn",link_addr:"edge",port:443,uuid:"id",host:"site.example",path:"/path",flow:"xtls-rprx-vision"}' > "$TMP/cdn-flow.json"
+link=$(_rebuild_cdn_link "$TMP/cdn-flow.json")
+check 'xhttp cdn rebuild keeps flow' contains "$link" '&flow=xtls-rprx-vision'
+jq -n '{protocol:"vless-ws-cdn",name:"cdn",link_addr:"edge",port:443,uuid:"id",host:"site.example",path:"/path",flow:"xtls-rprx-vision"}' > "$TMP/ws-flow.json"
+link=$(_rebuild_cdn_link "$TMP/ws-flow.json")
+check 'ws cdn rebuild ignores flow' lacks "$link" 'flow='
+jq -n '{protocol:"vless-xhttp-reality",name:"rx",link_addr:"edge",port:443,uuid:"id",sni:"site.example",public_key:"pk",short_id:"sid",path:"/p",flow:"xtls-rprx-vision"}' > "$TMP/reality-flow.json"
+link=$(_rebuild_reality_link "$TMP/reality-flow.json") || link=""
+check 'xhttp reality rebuild keeps flow' contains "$link" '&flow=xtls-rprx-vision'
+jq 'del(.flow)' "$TMP/reality-flow.json" > "$TMP/reality-no-flow.json"
+link=$(_rebuild_reality_link "$TMP/reality-no-flow.json") || link=""
+check 'xhttp reality rebuild omits empty flow' lacks "$link" 'flow='
+
 # 缺必填字段时重建必须失败: 调用方据此保留旧 share_link, 不能写出连不通的链接。
 jq -n '{protocol:"vless-ws-cdn",name:"cdn",link_addr:"edge.example",port:80,uuid:"id",host:"site.example",path:"/p"}' > "$TMP/cdn-full.json"
 link=$(_rebuild_cdn_link "$TMP/cdn-full.json") || link=""
