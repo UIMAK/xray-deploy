@@ -1931,10 +1931,21 @@ _xray_service_snapshot_enable() {  # <标志文件路径> [已知状态]
     return 0
 }
 
+# 统一执行 enable/disable 动作; 状态读取与回读校验由调用方负责。
+_xray_service_apply_enable() {  # enabled|disabled
+    case "${INIT_SYSTEM:-}:$1" in
+        systemd:enabled)  systemctl enable xray >/dev/null 2>&1 ;;
+        systemd:disabled) systemctl disable xray >/dev/null 2>&1 ;;
+        openrc:enabled)   rc-update add xray default >/dev/null 2>&1 ;;
+        openrc:disabled)  rc-update del xray default >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 恢复 enable 状态。只在快照存在时动手(见上: 无快照 = 该维未快照, 不猜)。
 # 返回 1 = 自启策略未恢复; 同步 rollback 与 crash recovery 只告警, 不阻塞核心事务收敛。
 _xray_service_restore_enable() {  # <标志文件路径> [keep_snapshot]
-    local flag="$1" keep="${2:-}" want current action_rc=0
+    local flag="$1" keep="${2:-}" want current
     [ -f "$flag" ] || return 0
     want=$(cat "$flag" 2>/dev/null) || {
         _error "读取 service 自启快照失败: $flag"
@@ -1952,29 +1963,84 @@ _xray_service_restore_enable() {  # <标志文件路径> [keep_snapshot]
         return 1
     }
     if [ "$current" != "$want" ]; then
-        case "${INIT_SYSTEM:-}:${want}" in
-            systemd:enabled)
-                systemctl enable xray >/dev/null 2>&1 || action_rc=$? ;;
-            systemd:disabled)
-                systemctl disable xray >/dev/null 2>&1 || action_rc=$? ;;
-            openrc:enabled)
-                rc-update add xray default >/dev/null 2>&1 || action_rc=$? ;;
-            openrc:disabled)
-                rc-update del xray default >/dev/null 2>&1 || action_rc=$? ;;
-            *)
-                _error "无法在 ${INIT_SYSTEM:-未知} backend 恢复 service 自启状态"
-                [ "$keep" = keep ] || rm -f "$flag" 2>/dev/null
-                return 1
-                ;;
-        esac
-    fi
-    if [ "$action_rc" -ne 0 ]; then
-        _error "恢复 service 自启状态失败(action_rc=${action_rc}), 快照保留: $flag"
-        return 1
+        if ! _xray_service_apply_enable "$want"; then
+            _error "恢复 service 自启状态失败, 快照保留: $flag"
+            return 1
+        fi
     fi
     [ "$keep" = keep ] || rm -f "$flag" 2>/dev/null
     _warn "已执行 service 开机自启状态恢复(${want})"
     return 0
+}
+
+# 菜单开关: 只改持久化 enable 状态, 不启动/停止当前服务。
+# 与核心事务共用 core lock, 并拒绝在未收敛事务上写入; 否则 rollback 可能用旧快照
+# 覆盖用户刚设置的自启状态。
+_xray_service_set_enable_locked() {  # enabled|disabled
+    local want="$1" unit current
+    case "${INIT_SYSTEM:-}" in
+        systemd|openrc) ;;
+        direct)
+            _error "当前为 direct 模式, 无 service, 无法设置开机自启"
+            return 1
+            ;;
+        *)
+            _error "未知 init 系统后端, 无法设置开机自启: ${INIT_SYSTEM:-<空>}"
+            return 1
+            ;;
+    esac
+    unit=$(_xray_service_unit_path 2>/dev/null) || unit=""
+    if [ -z "$unit" ] || ! _xray_core_path_present "$unit"; then
+        _error "xray service 不存在, 请先安装或修复核心"
+        return 1
+    fi
+    if _xray_core_txn_pending; then
+        _error "核心事务尚未收敛, 已拒绝修改开机自启; 请先重启脚本完成恢复"
+        return 1
+    fi
+    current=$(_xray_service_enable_state) || {
+        _error "无法读取当前 xray 开机自启状态"
+        return 1
+    }
+    if [ "$current" = "$want" ]; then
+        case "$want" in
+            enabled) _info "Xray 开机自启已是启用状态" ;;
+            disabled) _info "Xray 开机自启已是关闭状态" ;;
+        esac
+        return 0
+    fi
+    if ! _xray_service_apply_enable "$want"; then
+        _error "设置 Xray 开机自启失败: ${want}"
+        return 1
+    fi
+    current=$(_xray_service_enable_state) || current=""
+    if [ "$current" != "$want" ]; then
+        _error "设置后回读开机自启状态不一致(期望 ${want}, 实际 ${current:-未知})"
+        return 1
+    fi
+    case "$want" in
+        enabled) _success "已启用 Xray 开机自启" ;;
+        disabled) _success "已关闭 Xray 开机自启" ;;
+    esac
+    _tip "仅影响下次开机, 当前运行状态未改变"
+    return 0
+}
+
+_xray_service_set_enable() {  # enabled|disabled
+    local want="$1"
+    case "$want" in
+        enabled|disabled) ;;
+        *) _error "无效的开机自启状态: ${want:-<空>}"; return 1 ;;
+    esac
+    if [ "${XRAY_DEPLOY_CORE_LOCK_HELD:-0}" = 1 ]; then
+        _xray_service_set_enable_locked "$want"
+        return $?
+    fi
+    if ! declare -F _with_core_lock >/dev/null 2>&1; then
+        _error "缺少核心锁助手, 已拒绝修改开机自启(fail-closed)"
+        return 1
+    fi
+    _with_core_lock _xray_service_set_enable_locked "$want"
 }
 
 # ---------------------------------------------------------------------------
@@ -2684,28 +2750,39 @@ _uninstall_xray_locked() {
 }
 
 # ---------------------------------------------------------------------------
-# 核心管理菜单入口(安装/更新或切换)
+# 核心管理菜单入口(安装/更新或切换、开机自启开关)
 # ---------------------------------------------------------------------------
 _xray_core_menu() {
     clear
-    local cur="" cur_channel=""
+    local cur="" autostart="" autostart_label=""
     cur=$(_xray_cached_version 2>/dev/null)
-    cur_channel=$(_state_get channel 2>/dev/null)
-    [ -z "$cur_channel" ] && cur_channel="未设置"
 
     echo
     echo -e "  ${CYAN}【Xray 核心管理】${NC}"
     if [ -x "$XRAY_BIN" ] && [ -n "$cur" ]; then
-        echo -e "  当前版本: ${GREEN}v${cur}${NC}  通道: ${CYAN}${cur_channel}${NC}"
-        echo -e "  ${YELLOW}已安装 → 切换通道最新版或指定版本(配置与节点不变)${NC}"
+        case "${INIT_SYSTEM:-}" in
+            systemd|openrc)
+                autostart=$(_xray_service_enable_state 2>/dev/null) || autostart=""
+                case "$autostart" in
+                    enabled) autostart_label="${GREEN}● 已启用${NC}" ;;
+                    disabled) autostart_label="${YELLOW}○ 已关闭${NC}" ;;
+                    *) autostart_label="${RED}未知${NC}" ;;
+                esac
+                echo -e "  开机自启: ${autostart_label}"
+                ;;
+            direct) echo -e "  开机自启: ${YELLOW}不支持(direct 模式)${NC}" ;;
+            *) echo -e "  开机自启: ${RED}未知${NC}" ;;
+        esac
+        echo -e "  ${YELLOW}切换通道最新版或指定版本(配置与节点不变)${NC}"
     else
-        echo -e "  当前版本: ${RED}未安装${NC}"
         echo -e "  ${YELLOW}选择通道或指定版本将安装核心${NC}"
     fi
     echo
     echo -e "  ${GREEN}[1]${NC} 稳定版(stable)"
     echo -e "  ${GREEN}[2]${NC} 预览版(preview, 取最新版含预发布)"
     echo -e "  ${GREEN}[3]${NC} 安装指定版本 (X.Y.Z)"
+    echo -e "  ${GREEN}[4]${NC} 启用自启"
+    echo -e "  ${GREEN}[5]${NC} 关闭自启"
     echo -e "  ${GREEN}[0]${NC} 返回"
     echo
     local choice
@@ -2727,6 +2804,8 @@ _xray_core_menu() {
             fi
             _install_or_switch_xray custom "$vtag"
             ;;
+        4) _xray_service_set_enable enabled ;;
+        5) _xray_service_set_enable disabled ;;
         0) return ;;
         *) _warn "无效选择" ;;
     esac

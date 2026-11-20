@@ -735,6 +735,71 @@ trap cleanup EXIT
         _xray_service_snapshot >/dev/null 2>&1 && return 1
         [ ! -e "$BACKUP_DIR/xray-service.snapshot-test.prev" ]
     )
+    service_autostart_probe() (
+        fixture autostart
+        rm -f "$UNIT"
+        printf 'unit' > "$UNIT"
+        local mode=disabled
+        systemctl() {
+            case "$1" in
+                is-enabled)
+                    printf '%s\n' "$mode"
+                    [ "$mode" = enabled ]
+                    ;;
+                enable)  mode=enabled; return 0 ;;
+                disable) mode=disabled; return 0 ;;
+                *) return 99 ;;
+            esac
+        }
+        _xray_service_set_enable enabled >/dev/null 2>&1 || return 1
+        [ "$mode" = enabled ] || return 1
+        _xray_service_set_enable disabled >/dev/null 2>&1 || return 1
+        [ "$mode" = disabled ] || return 1
+
+        INIT_SYSTEM=openrc
+        mode=disabled
+        rc-update() {
+            case "$1" in
+                show)
+                    [ "$mode" = enabled ] && printf '          xray | default\n'
+                    return 0
+                    ;;
+                add) [ "$2" = xray ] && mode=enabled; return 0 ;;
+                del) [ "$2" = xray ] && mode=disabled; return 0 ;;
+                *) return 99 ;;
+            esac
+        }
+        _xray_service_set_enable enabled >/dev/null 2>&1 || return 1
+        [ "$mode" = enabled ] || return 1
+        _xray_service_set_enable disabled >/dev/null 2>&1 || return 1
+        [ "$mode" = disabled ] || return 1
+
+        printf '{"phase":"prepared"}\n' > "$STATE_DIR/coretxn.json"
+        _xray_service_set_enable enabled >/dev/null 2>&1 && return 1
+        rm -f "$STATE_DIR/coretxn.json"
+
+        INIT_SYSTEM=direct
+        _xray_service_set_enable enabled >/dev/null 2>&1 && return 1
+        return 0
+    )
+    core_menu_autostart_wiring_probe() (
+        fixture core-menu
+        chmod +x "$XRAY_BIN"
+        _xray_cached_version() { printf '26.9.8'; }
+        _xray_service_enable_state() { printf 'disabled'; }
+        _xray_service_set_enable() { printf '%s' "$1" > "$TMP/core-menu-choice"; }
+        clear() { :; }
+        _press_any_key() { :; }
+        printf '4\n' | _xray_core_menu > "$TMP/core-menu-out" 2>&1 || return 1
+        [ "$(cat "$TMP/core-menu-choice")" = enabled ] || return 1
+        grep -q '【Xray 核心管理】' "$TMP/core-menu-out" || return 1
+        ! grep -q 'cloudflared:' "$TMP/core-menu-out" || return 1
+        grep -q '开机自启' "$TMP/core-menu-out" || return 1
+        grep -q '开机自启:.*○ 已关闭' "$TMP/core-menu-out" || return 1
+        grep -q '启用自启' "$TMP/core-menu-out" || return 1
+        printf '5\n' | _xray_core_menu >/dev/null 2>&1 || return 1
+        [ "$(cat "$TMP/core-menu-choice")" = disabled ]
+    )
     memory_limits_probe() {
         [ "$(_xray_mem_limit_from_mb 128)" = 40 ] || return 1
         [ "$(_xray_mem_limit_from_mb 512)" = 332 ] || return 1
@@ -872,6 +937,8 @@ trap cleanup EXIT
     check 'preview fetch goes through the newest-release picker' preview_fetch_probe
     check 'Geo snapshot rejects content that differs from the source' geo_snapshot_cmp_probe
     check 'service snapshot rejects content that differs from the unit' service_snapshot_cmp_probe
+    check 'service autostart toggle applies and verifies enable state' service_autostart_probe
+    check 'core menu wires enable/disable autostart choices' core_menu_autostart_wiring_probe
     check 'GOMEMLIMIT ratio and cgroup v1/v2 limits are bounded' memory_limits_probe
     check 'release staging marks owner before download and cleans failure' stage_marker_probe
     check 'core install bootstraps missing geo dat from the release' core_geo_missing_probe
