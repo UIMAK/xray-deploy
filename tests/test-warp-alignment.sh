@@ -173,8 +173,10 @@ JSON
     cat > "$FX/masque-reg.json" <<'JSON'
 {"id": "123e4567-e89b-12d3-a456-426614174000", "token": "masque-token"}
 JSON
+    # Cloudflare 免费设备登记 MASQUE 后 warp_enabled 仍为 false, 真实响应以 PATCH 成功
+    # 和 config 为准; 这里保留真实字段, 防止再次把它误判成注册失败。
     cat > "$FX/masque-enroll.json" <<'JSON'
-{"warp_enabled": true,
+{"warp_enabled": false, "tunnel_type": "masque",
  "config": {
    "peers": [{"public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n"}],
    "interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700:110:8a36::2"}}
@@ -184,10 +186,10 @@ JSON
         privateKey: $privateKey,
         response: $response[0]
     }' > "$FX/masque-raw.json"
-    jq -n --arg privateKey 'cHJpdmF0ZS1tYXNxdWU=' --slurpfile response "$FX/masque-enroll.json" '{
+    jq -n --arg privateKey 'cHJpdmF0ZS1tYXNxdWU=' '{
         privateKey: $privateKey,
-        response: ($response[0] | .warp_enabled = false)
-    }' > "$FX/masque-disabled.json"
+        response: {warp_enabled: false, tunnel_type: "masque", config: {interface: {addresses: {}}}}
+    }' > "$FX/masque-incomplete.json"
     # 每种来源保留一个格式错误代表: 非法 JSON、缺字段。
     printf '{"private_key": ' > "$FX/reg-bad-json.json"
     printf '{"outbounds": [{"settings": {"secretKey": "k"}}]}\n' > "$FX/out-bad-missing.json"
@@ -251,7 +253,7 @@ JSON
             and (.address == ["172.16.0.2/32", "2606:4700:110:8a36::2/128"])
             and (.server == "162.159.198.2")
             and (.port == 443)
-            and (.serverName == "consumer-masque.cloudflareclient.com")
+            and (.serverName == "zt-masque.cloudflareclient.com")
             and (.alpn == ["h2"])
         ' "$TMP/n-masque.json" >/dev/null 2>&1
     }
@@ -297,7 +299,7 @@ JSON
             and (.settings.port == 443)
             and (.streamSettings.network == "masque")
             and (.streamSettings.security == "tls")
-            and (.streamSettings.tlsSettings.serverName == "consumer-masque.cloudflareclient.com")
+            and (.streamSettings.tlsSettings.serverName == "zt-masque.cloudflareclient.com")
             and (.streamSettings.tlsSettings.alpn == ["h2"])
             and (.streamSettings.masqueSettings.warp.privateKey == "cHJpdmF0ZS1tYXNxdWU=")
             and (.streamSettings.masqueSettings.warp.publicKey | startswith("-----BEGIN PUBLIC KEY-----"))
@@ -497,7 +499,8 @@ SH
         _warp_fetch_masque "$TMP/masque-fetch.json" >/dev/null 2>&1 || return 1
         jq -e '
             (.privateKey | length) > 0
-            and (.response.warp_enabled == true)
+            and (.response.warp_enabled == false)
+            and (.response.tunnel_type == "masque")
             and (.response.config.peers[0].public_key | startswith("-----BEGIN PUBLIC KEY-----"))
         ' "$TMP/masque-fetch.json" >/dev/null 2>&1
         jq -e '
@@ -511,21 +514,21 @@ SH
             and (.tunnel_type == "masque")
         ' "$TMP/masque-patch-body.json" >/dev/null 2>&1
     )
-    check 'fetch masque: POST + PATCH result carries private key and enrolled account' fetch_masque_ok
+    check 'fetch masque: free account with warp_enabled=false still succeeds' fetch_masque_ok
 
-    fetch_masque_disabled() (
+    fetch_masque_incomplete() (
         _warp_http_json() {
             case "${1:-}" in
                 POST) cp "$FX/masque-reg.json" "${4:-}" ;;
-                PATCH) cp "$FX/masque-disabled.json" "${4:-}" ;;
+                PATCH) cp "$FX/masque-incomplete.json" "${4:-}" ;;
                 *) return 1 ;;
             esac
         }
-        rm -f "$TMP/masque-disabled-out.json"
-        _warp_fetch_masque "$TMP/masque-disabled-out.json" >/dev/null 2>&1
-        [ "$?" -eq 1 ] && [ ! -e "$TMP/masque-disabled-out.json" ]
+        rm -f "$TMP/masque-incomplete-out.json"
+        _warp_fetch_masque "$TMP/masque-incomplete-out.json" >/dev/null 2>&1
+        [ "$?" -eq 1 ] && [ ! -e "$TMP/masque-incomplete-out.json" ]
     )
-    check 'fetch masque: account without warp_enabled is rejected without output' fetch_masque_disabled
+    check 'fetch masque: response without endpoint data is rejected without output' fetch_masque_incomplete
 
     obtain_masque_ok() (
         _warp_fetch_masque() { cp "$FX/masque-raw.json" "$1"; }
