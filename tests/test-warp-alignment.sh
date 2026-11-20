@@ -169,6 +169,25 @@ JSON
   "secretKey": "c2VjcmV0LW5vcnN2", "address": ["172.16.0.8/32"],
   "peers": [{"publicKey": "cHVibGljLW5vcnN2", "endpoint": "162.159.192.8:2408"}]}}]}
 JSON
+    # usque 的 MASQUE 注册结果: POST 给账户/token, PATCH 返回 P-256 端点与隧道地址。
+    cat > "$FX/masque-reg.json" <<'JSON'
+{"id": "123e4567-e89b-12d3-a456-426614174000", "token": "masque-token"}
+JSON
+    cat > "$FX/masque-enroll.json" <<'JSON'
+{"warp_enabled": true,
+ "config": {
+   "peers": [{"public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n"}],
+   "interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700:110:8a36::2"}}
+ }}
+JSON
+    jq -n --arg privateKey $'cHJpdmF0ZS1tYXNxdWU=\n' --slurpfile response "$FX/masque-enroll.json" '{
+        privateKey: $privateKey,
+        response: $response[0]
+    }' > "$FX/masque-raw.json"
+    jq -n --arg privateKey 'cHJpdmF0ZS1tYXNxdWU=' --slurpfile response "$FX/masque-enroll.json" '{
+        privateKey: $privateKey,
+        response: ($response[0] | .warp_enabled = false)
+    }' > "$FX/masque-disabled.json"
     # 每种来源保留一个格式错误代表: 非法 JSON、缺字段。
     printf '{"private_key": ' > "$FX/reg-bad-json.json"
     printf '{"outbounds": [{"settings": {"secretKey": "k"}}]}\n' > "$FX/out-bad-missing.json"
@@ -221,12 +240,31 @@ JSON
     check 'normalize reg: single-stack v6 fixture yields 7 masked fields' norm_ok _warp_normalize_reg "$FX/reg-v6-only.json" "$TMP/n-reg-v6.json"
     check 'normalize reg: single-stack v6 endpoint uses Cloudflare domain' eq 'engage.cloudflareclient.com:2408' "$(jq -r .endpoint "$TMP/n-reg-v6.json")"
 
+    masque_norm_ok() {
+        _warp_normalize_masque "$FX/masque-raw.json" > "$TMP/n-masque.json" 2>/dev/null || return 1
+        jq -e '
+            (length == 8)
+            and (keys == ["address", "alpn", "kind", "port", "privateKey", "publicKey", "server", "serverName"])
+            and (.kind == "masque")
+            and (.privateKey == "cHJpdmF0ZS1tYXNxdWU=")
+            and (.publicKey | startswith("-----BEGIN PUBLIC KEY-----"))
+            and (.address == ["172.16.0.2/32", "2606:4700:110:8a36::2/128"])
+            and (.server == "162.159.198.2")
+            and (.port == 443)
+            and (.serverName == "consumer-masque.cloudflareclient.com")
+            and (.alpn == ["h2"])
+        ' "$TMP/n-masque.json" >/dev/null 2>&1
+    }
+    check 'normalize masque: P-256 key, address and WARP H2 endpoint are extracted' masque_norm_ok
+    check 'normalize masque: private key whitespace is stripped' eq 'cHJpdmF0ZS1tYXNxdWU=' "$(jq -r .privateKey "$TMP/n-masque.json")"
+
     check 'normalize reg rejects malformed JSON with rc=1 and empty stdout' norm_bad _warp_normalize_reg "$FX/reg-bad-json.json"
     check 'normalize api rejects missing fields with rc=1 and empty stdout' norm_bad _warp_normalize_api "$FX/out-bad-missing.json"
     check 'normalize wgcf rejects invalid outbound with rc=1 and empty stdout' norm_bad _warp_normalize_wgcf "$FX/out-bad-missing.json"
 
     printf '== A. endpoint normalization ==\n'
     check 'endpoint: bare host gains default port' eq 'engage.cloudflareclient.com:2408' "$(_warp_endpoint_norm 'engage.cloudflareclient.com')"
+    check 'endpoint: masque default port is 443' eq '162.159.198.2:443' "$(_warp_endpoint_norm '162.159.198.2' 443)"
     check 'endpoint: bare IPv6 is bracketed and gains a port' eq '[2606:4700:110:8a36::1]:2408' "$(_warp_endpoint_norm '2606:4700:110:8a36::1')"
     check 'endpoint: host:port is preserved verbatim' eq '162.159.192.1:500' "$(_warp_endpoint_norm '162.159.192.1:500')"
     endpoint_rejects() {
@@ -249,6 +287,25 @@ JSON
     check 'build: api normalize output becomes a single warp wireguard outbound' build_ok "$TMP/n-api.json"
     check 'build: peers keep publicKey/endpoint/allowedIPs from normalize' eq 'cHVibGljLWFwaQ==|162.159.192.6:2408|0.0.0.0/0,::/0' "$(jq -r '.settings.peers[0] | [.publicKey, .endpoint, (.allowedIPs | join(","))] | join("|")' "$TMP/outbound.json")"
     check 'build: default mtu 1280 is carried into settings' eq '1280' "$(jq -r '.settings.mtu' "$TMP/outbound.json")"
+
+    build_masque_ok() {
+        cat "$TMP/n-masque.json" | _warp_build_outbound > "$TMP/outbound-masque.json" 2>/dev/null || return 1
+        jq -e '
+            (.tag == "warp")
+            and (.protocol == "masque")
+            and (.settings.address == "162.159.198.2")
+            and (.settings.port == 443)
+            and (.streamSettings.network == "masque")
+            and (.streamSettings.security == "tls")
+            and (.streamSettings.tlsSettings.serverName == "consumer-masque.cloudflareclient.com")
+            and (.streamSettings.tlsSettings.alpn == ["h2"])
+            and (.streamSettings.masqueSettings.warp.privateKey == "cHJpdmF0ZS1tYXNxdWU=")
+            and (.streamSettings.masqueSettings.warp.publicKey | startswith("-----BEGIN PUBLIC KEY-----"))
+            and (.streamSettings.masqueSettings.warp.address == ["172.16.0.2/32", "2606:4700:110:8a36::2/128"])
+            and (.settings.noKernelTun == null)
+        ' "$TMP/outbound-masque.json" >/dev/null 2>&1
+    }
+    check 'build: masque normalize output becomes a warp masque outbound' build_masque_ok
 
     build_domain_strategy() (
         _warp_domain_strategy() { printf 'UseIPv6'; }
@@ -421,6 +478,66 @@ SH
             "$TMP/obtain-ok.outbound" >/dev/null 2>&1
     )
     check 'fetch: first source succeeding makes _warp_obtain rc=0 with a buildable outfile' fetch_first_source_ok
+
+    fetch_masque_ok() (
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    cp "${3:-}" "$TMP/masque-post-body.json"
+                    cp "$FX/masque-reg.json" "${4:-}"
+                    ;;
+                PATCH)
+                    cp "${3:-}" "$TMP/masque-patch-body.json"
+                    cp "$FX/masque-enroll.json" "${4:-}"
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/masque-fetch.json"
+        _warp_fetch_masque "$TMP/masque-fetch.json" >/dev/null 2>&1 || return 1
+        jq -e '
+            (.privateKey | length) > 0
+            and (.response.warp_enabled == true)
+            and (.response.config.peers[0].public_key | startswith("-----BEGIN PUBLIC KEY-----"))
+        ' "$TMP/masque-fetch.json" >/dev/null 2>&1
+        jq -e '
+            (.key | length) == 44
+            and (.key_type == "curve25519")
+            and (.tunnel_type == "wireguard")
+        ' "$TMP/masque-post-body.json" >/dev/null 2>&1 || return 1
+        jq -e '
+            (.key | length) > 100
+            and (.key_type == "secp256r1")
+            and (.tunnel_type == "masque")
+        ' "$TMP/masque-patch-body.json" >/dev/null 2>&1
+    )
+    check 'fetch masque: POST + PATCH result carries private key and enrolled account' fetch_masque_ok
+
+    fetch_masque_disabled() (
+        _warp_http_json() {
+            case "${1:-}" in
+                POST) cp "$FX/masque-reg.json" "${4:-}" ;;
+                PATCH) cp "$FX/masque-disabled.json" "${4:-}" ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/masque-disabled-out.json"
+        _warp_fetch_masque "$TMP/masque-disabled-out.json" >/dev/null 2>&1
+        [ "$?" -eq 1 ] && [ ! -e "$TMP/masque-disabled-out.json" ]
+    )
+    check 'fetch masque: account without warp_enabled is rejected without output' fetch_masque_disabled
+
+    obtain_masque_ok() (
+        _warp_fetch_masque() { cp "$FX/masque-raw.json" "$1"; }
+        rm -f "$TMP/masque-obtain.json"
+        _warp_obtain "$TMP/masque-obtain.json" masque >/dev/null 2>&1 || return 1
+        jq -e '
+            .kind == "masque"
+            and .privateKey == "cHJpdmF0ZS1tYXNxdWU="
+            and .address == ["172.16.0.2/32", "2606:4700:110:8a36::2/128"]
+        ' "$TMP/masque-obtain.json" >/dev/null 2>&1
+    )
+    check 'obtain masque: selected provider normalizes into an internal masque object' obtain_masque_ok
 
     fetch_local_fail_remote_ok() (
         command() {
@@ -697,6 +814,57 @@ JSON
         [ "$?" -eq 1 ]
     )
     check 'set endpoint: an invalid endpoint is rejected with rc=1' endpoint_rejects
+
+    masque_lifecycle() (
+        base_cfg | cfg_reset || return 1
+        local norm
+        norm=$(_warp_normalize_masque "$FX/masque-raw.json") || return 1
+        _warp_apply "$norm" >/dev/null 2>&1 || return 1
+        _config_jq -e '
+            (.outbounds[] | select(.tag == "warp") | .protocol == "masque")
+            and ((.outbounds[] | select(.tag == "warp") | .settings.noKernelTun) == null)
+        ' >/dev/null 2>&1 || return 1
+        _warp_add_rule domain 'masque.example' >/dev/null 2>&1 || return 1
+        _warp_set_endpoint '162.159.198.10' >/dev/null 2>&1 || return 1
+        _config_jq -e '
+            (.outbounds[] | select(.tag == "warp")
+                | .settings.address == "162.159.198.10" and .settings.port == 443)
+        ' >/dev/null 2>&1 || return 1
+        _warp_apply "$(norm_a)" >/dev/null 2>&1 || return 1
+        _config_jq -e '
+            (.outbounds[] | select(.tag == "warp")
+                | .protocol == "wireguard" and .settings.noKernelTun == true)
+            and ([.routing.rules[]? | select(.outboundTag == "warp" and .domain == ["masque.example"])] | length == 1)
+        ' >/dev/null 2>&1
+    )
+    check 'masque lifecycle: replace wireguard, update endpoint, preserve rules, switch back' masque_lifecycle
+
+    masque_state_summary() (
+        base_cfg | cfg_reset || return 1
+        local norm out kind endpoint addresses mtu rules
+        norm=$(_warp_normalize_masque "$FX/masque-raw.json") || return 1
+        _warp_apply "$norm" >/dev/null 2>&1 || return 1
+        out=$(_warp_state_summary) || return 1
+        IFS=$'\t' read -r present kind endpoint addresses mtu rules <<< "$out"
+        [ "$present" = 1 ] || return 1
+        [ "$kind" = masque ] || return 1
+        [ "$endpoint" = '162.159.198.2:443' ] || return 1
+        [ "$addresses" = '172.16.0.2/32,2606:4700:110:8a36::2/128' ] || return 1
+        [ "$mtu" = '-' ] || return 1
+        [ "$rules" = 0 ] || return 1
+        case "$out" in *cHJpdmF0ZS1tYXNxdWU=*|*privateKey*) return 1 ;; esac
+    )
+    check 'masque state summary: reports method/endpoint/address without secrets' masque_state_summary
+
+    masque_tun_rejected() (
+        base_cfg | cfg_reset || return 1
+        local norm
+        norm=$(_warp_normalize_masque "$FX/masque-raw.json") || return 1
+        _warp_apply "$norm" >/dev/null 2>&1 || return 1
+        _warp_set_tun auto >/dev/null 2>&1
+        [ "$?" -eq 1 ] && _config_jq -e '.outbounds[] | select(.tag == "warp") | .protocol == "masque"' >/dev/null 2>&1
+    )
+    check 'masque: kernel TUN switch is rejected without changing the outbound' masque_tun_rejected
 
     cfg_reset <<'JSON' || exit 1
 {

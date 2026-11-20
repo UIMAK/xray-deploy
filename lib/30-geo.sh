@@ -766,7 +766,7 @@ _route_delete_rule_flow() {
     if _config_jq -e --argjson i "$idx" '(.routing.rules[$i].inboundTag? // null) != null' >/dev/null 2>&1 \
        && [ "$rule_tag" != "$ROUTE_USER_RULE_TAG" ]; then
         _error "第 $((idx + 1)) 条是节点定向规则(inboundTag), 由节点/Reality 管理维护"
-        _tip "请通过删除节点或 Reality 域名管理调整, 避免破坏 tunnel 防偷跑规则"
+        _tip "请通过主菜单 [修改节点] 的 Reality 域名项调整, 避免破坏 tunnel 防偷跑规则"
         return 1
     fi
     # 取待删规则的完整 JSON, 提交时按内容匹配(见 ROUTE_DELETE_RULE_JQ)。

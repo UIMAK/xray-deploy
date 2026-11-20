@@ -87,19 +87,6 @@ _print_status_bar() {
         fi
     fi
 
-    # 官方 Hysteria2(独立于 Xray Hy2; 未安装时不显示, 不占状态栏空间)
-    local hyline=""
-    if [ -x "$HYSTERIA_BIN" ]; then
-        local hver hst=""
-        hver=$(_hysteria_cached_version 2>/dev/null)
-        if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
-            hst="${GREEN}● 运行中${NC}"
-        else
-            hst="${RED}○ 已停止${NC}"
-        fi
-        hyline="  Hysteria2 v${hver#v}: ${hst}"
-    fi
-
     # Geo(真相源: confs/14_geodata.json 的 geodata.cron)
     local geostate; geostate=$(_geo_auto_state 2>/dev/null); [ -z "$geostate" ] && geostate="off"
     local geostr
@@ -108,7 +95,6 @@ _print_status_bar() {
     echo -e "  系统: ${CYAN}${os_info}${NC}  |  init: ${CYAN}${INIT_SYSTEM}${NC}"
     echo -e "  Xray${CYAN}${xver}${NC} [${xchannel}]: ${xstatus}  |  节点: ${CYAN}${ncount}${NC}"
     echo -e "  cloudflared: ${cfstatus}  |  Geo: ${geostr}"
-    [ -n "$hyline" ] && echo -e "$hyline"
     echo
 }
 
@@ -229,25 +215,23 @@ _main_menu() {
 
         echo -e "  ${CYAN}【节点管理】${NC}"
         _menu_row 1 "添加节点"      2 "查看节点"
-        _menu_row 3 "删除节点"      4 "修改端口"
-        _menu_row 5 "更新监听"      6 "Reality 域名管理"
-        _menu_row 7 "添加出口"
+        _menu_row 3 "修改节点"      4 "删除节点"
+        _menu_row 5 "添加出口"
         echo
         echo -e "  ${CYAN}【协议管理】${NC}"
-        _menu_row 8 "Xray Hy2 管理" 9 "cloudflared 管理"
-        _menu_row 10 "Hysteria2 管理" 11 "WARP 管理"
+        _menu_row 6 "cloudflared 管理" 7 "WARP 管理"
         echo
         echo -e "  ${CYAN}【服务控制】${NC}"
-        _menu_row 12 "重启 Xray"    13 "停止 Xray"
-        _menu_row 14 "查看状态"     15 "查看日志"
-        _menu_row 16 "日志轮换"     17 "定时重启"
+        _menu_row 8 "重启 Xray"     9 "停止 Xray"
+        _menu_row 10 "查看状态"     11 "查看日志"
+        _menu_row 12 "日志轮换"     13 "定时重启"
         echo
         echo -e "  ${CYAN}【配置与更新】${NC}"
-        _menu_row 18 "检查配置"     19 "DNS 设置"
-        _menu_row 20 "分流设置"     21 "检测脚本更新"
+        _menu_row 14 "检查配置"     15 "DNS 设置"
+        _menu_row 16 "分流设置"     17 "检测脚本更新"
         echo
         echo -e "  ${CYAN}【核心管理】${NC}"
-        _menu_row 22 "Xray 核心管理" 23 "卸载"
+        _menu_row 18 "Xray 核心管理" 19 "卸载"
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
@@ -256,29 +240,25 @@ _main_menu() {
         case "$choice" in
             1) _add_node; continue ;;
             2) _view_nodes; continue ;;
-            3) _delete_node; continue ;;
-            4) _modify_port; continue ;;
-            5) _update_listen; continue ;;
-            6) _reality_domain_menu; continue ;;
-            7) _outbound_add_prompt; _press_any_key; continue ;;
-            8) _hy2_manage_menu; continue ;;
-            9) _cloudflared_menu; continue ;;
-            10) _hysteria_menu; continue ;;
-            11) _warp_menu; continue ;;
-            12) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
+            3) _modify_node; continue ;;
+            4) _delete_node; continue ;;
+            5) _outbound_add_prompt; _press_any_key; continue ;;
+            6) _cloudflared_menu; continue ;;
+            7) _warp_menu; continue ;;
+            8) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
                 _press_any_key ;;
-            13) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
+            9) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
                 _press_any_key ;;
-            14) _view_status ;;
-            15) _view_log ;;
-            16) _logrotate_menu ;;
-            17) _timed_restart_menu ;;
-            18) _check_config ;;
-            19) _dns_menu ;;
-            20) _split_menu ;;
-            21) _check_script_update ;;
-            22) _xray_core_menu ;;
-            23) _uninstall_menu ;;
+            10) _view_status ;;
+            11) _view_log ;;
+            12) _logrotate_menu ;;
+            13) _timed_restart_menu ;;
+            14) _check_config ;;
+            15) _dns_menu ;;
+            16) _split_menu ;;
+            17) _check_script_update ;;
+            18) _xray_core_menu ;;
+            19) _uninstall_menu ;;
             0) echo -e "${CYAN}再见${NC}"; exit 0 ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
@@ -1121,36 +1101,140 @@ _check_script_update() {
     _press_any_key
 }
 
-# Hysteria2 管理子菜单
-_hy2_manage_menu() {
+# 修改节点: 先选节点, 再按协议展示该节点可改的字段。
+_modify_node() {
+    clear
+    local count; count=$(_node_count)
+    [ "$count" -eq 0 ] && { _warn "暂无节点"; _press_any_key; return; }
+    echo; echo -e "  ${CYAN}【修改节点】${NC}"
+    printf "  %-3s %-20s %-30s %-6s %s\n" "#" "名称" "协议" "端口" "监听"
+    echo "  -------------------------------------------------------------------------------"
+    local f tags=() i=1
+    for f in "$NODES_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        local tag name proto port listen
+        tag=$(basename "$f" .json)
+        name=$(jq -r '.name // .tag // empty' "$f" 2>/dev/null)
+        proto=$(jq -r '.protocol // empty' "$f" 2>/dev/null)
+        port=$(jq -r '.port // "-"' "$f" 2>/dev/null)
+        listen=$(jq -r '.listen // "::"' "$f" 2>/dev/null)
+        tags+=("$tag")
+        printf "  ${GREEN}[%d]${NC} %s %-30s %-6s %s\n" \
+            "$i" "$(_menu_name_pad "${name:-$tag}")" "${proto:-?}" "${port:-?}" "${listen:-::}"
+        i=$((i+1))
+    done
+    echo -e "  ${GREEN}[0]${NC} 返回"
     local choice
+    read -rp "  选择节点: " choice || return 0
+    [ "$choice" = "0" ] && return
+    local idx
+    idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    local tag="${tags[$idx]:-}"
+    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+    _modify_node_actions "$tag"
+}
+
+_modify_node_actions() {
+    local tag="$1" meta choice
+    meta="$NODES_DIR/${tag}.json"
+    [ -f "$meta" ] || { _error "节点不存在: $tag"; _press_any_key; return 1; }
     while true; do
         clear
+        local name proto port listen sni rmode cc hop
+        name=$(jq -r '.name // .tag // empty' "$meta" 2>/dev/null)
+        proto=$(jq -r '.protocol // empty' "$meta" 2>/dev/null)
+        port=$(jq -r '.port // empty' "$meta" 2>/dev/null)
+        listen=$(jq -r '.listen // "::"' "$meta" 2>/dev/null)
+        [ -n "$name" ] || name="$tag"
+        echo; echo -e "  ${CYAN}【修改节点 — ${name}】${NC}"
+        echo -e "  协议: ${proto:-?}  端口: ${port:-?}  监听: ${listen:-?}"
+        case "$proto" in
+            *reality*)
+                sni=$(jq -r '.sni // empty' "$meta" 2>/dev/null)
+                rmode="隧道"
+                [ "$(_reality_node_mode "$tag" 2>/dev/null)" = "direct" ] && rmode="直连"
+                echo -e "  Reality 域名: ${CYAN}${sni:-?}${NC} (${rmode})"
+                ;;
+            hysteria2)
+                cc=$(jq -r '.congestion // "bbr"' "$meta" 2>/dev/null)
+                hop=$(jq -r '.hop_ranges // empty' "$meta" 2>/dev/null)
+                echo -e "  拥塞控制: ${cc:-bbr}  端口跳跃: ${hop:-未启用}"
+                ;;
+        esac
         echo
-        echo -e "  ${CYAN}【Xray Hy2 管理 (Xray-core 实现)】${NC}"
-        # 无节点先提示并返回，不进入编辑。
-        if ! _has_hy2_nodes; then
-            echo -e "  ${YELLOW}暂无 Xray Hy2 节点${NC}"
-        fi
-        echo
-        echo -e "  ${GREEN}[1]${NC} 切换拥塞控制 (bbr/brutal/force-brutal)"
-        echo -e "  ${GREEN}[2]${NC} 调整 brutal 带宽"
-        echo -e "  ${GREEN}[3]${NC} 端口跳跃 (iptables)"
-        echo -e "  ${GREEN}[4]${NC} 查看端口跳跃状态"
-        echo -e "  ${GREEN}[5]${NC} 混淆 salamander / gecko (FinalMask.udp)"
-        # 标签区分 HTTP masquerade 与链路 FinalMask，二者独立。
-        echo -e "  ${GREEN}[6]${NC} HTTP/3 伪装 masquerade (非 Hysteria 请求的 HTTP 页面)"
+        echo -e "  ${GREEN}[1]${NC} 修改端口"
+        echo -e "  ${GREEN}[2]${NC} 更新监听"
+        case "$proto" in
+            *reality*)
+                echo -e "  ${GREEN}[3]${NC} 修改 Reality 伪装域名"
+                ;;
+            hysteria2)
+                echo -e "  ${GREEN}[3]${NC} 切换拥塞控制 (bbr/brutal/force-brutal)"
+                echo -e "  ${GREEN}[4]${NC} 调整 brutal 带宽"
+                echo -e "  ${GREEN}[5]${NC} 端口跳跃 (iptables)"
+                echo -e "  ${GREEN}[6]${NC} 查看端口跳跃状态"
+                echo -e "  ${GREEN}[7]${NC} 混淆 salamander / gecko (FinalMask.udp)"
+                echo -e "  ${GREEN}[8]${NC} HTTP/3 页面伪装 masquerade"
+                ;;
+        esac
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
-        case "$choice" in
-            1) _hy2_toggle_brutal ;;
-            2) _hy2_adjust_bandwidth ;;
-            3) _hy2_toggle_hop ;;
-            4) _hy2_view_hop ;;
-            5) _hy2_obfs_menu ;;
-            6) _hy2_masq_menu ;;
-            0) return ;;
+        case "${choice:-0}" in
+            0) return 0 ;;
+            1)
+                local new_tag
+                XD_NODE_EDIT_TAG="$tag"
+                _modify_port "$tag" || true
+                new_tag="${XD_NODE_EDIT_TAG:-$tag}"
+                if [ "$new_tag" != "$tag" ] && [ -f "$NODES_DIR/${new_tag}.json" ]; then
+                    tag="$new_tag"
+                    meta="$NODES_DIR/${tag}.json"
+                fi
+                ;;
+            2) _update_listen "$tag" || true ;;
+            3)
+                case "$proto" in
+                    *reality*) _reality_domain_menu "$tag" || true ;;
+                    hysteria2) _hy2_toggle_brutal "$tag" || true ;;
+                    *) _warn "该协议暂无此项"; _press_any_key ;;
+                esac
+                ;;
+            4)
+                if [ "$proto" = "hysteria2" ]; then
+                    _hy2_adjust_bandwidth "$tag" || true
+                else
+                    _warn "该协议暂无此项"; _press_any_key
+                fi
+                ;;
+            5)
+                if [ "$proto" = "hysteria2" ]; then
+                    _hy2_toggle_hop "$tag" || true
+                else
+                    _warn "该协议暂无此项"; _press_any_key
+                fi
+                ;;
+            6)
+                if [ "$proto" = "hysteria2" ]; then
+                    _hy2_view_hop "$tag" || true
+                else
+                    _warn "该协议暂无此项"; _press_any_key
+                fi
+                ;;
+            7)
+                if [ "$proto" = "hysteria2" ]; then
+                    _hy2_obfs_menu "$tag" || true
+                else
+                    _warn "该协议暂无此项"; _press_any_key
+                fi
+                ;;
+            8)
+                if [ "$proto" = "hysteria2" ]; then
+                    _hy2_masq_menu "$tag" || true
+                else
+                    _warn "该协议暂无此项"; _press_any_key
+                fi
+                ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
     done
@@ -1169,31 +1253,39 @@ _hy2_select_node() {   # <choice> <tag1> [<tag2> ...]
 }
 
 _hy2_masq_menu() {
-    local choice
+    local preset_tag="${1:-}" choice
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【HTTP/3 页面伪装 masquerade】${NC}"
     echo -e "  ${YELLOW}作用: 非 Hysteria 客户端(普通浏览器/扫描器)连上本端口时返回什么 HTTP 页面${NC}"
-    echo -e "  ${YELLOW}与 [5] 混淆(FinalMask.udp)是两个独立机制 —— 混淆改链路上的 QUIC 字节, 本项改 HTTP 页面${NC}"
-    local f tags=() i=1
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        [ "$proto" = "hysteria2" ] || continue
-        local tag name desc
-        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
-        desc=$(_hy2_masq_desc "$tag")
-        tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %s 当前: %s\n" "$i" "$(_menu_name_pad "$name")" "${desc:-默认 404 页面}"
-        i=$((i+1))
-    done
-    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice || return 1
-    [ "$choice" = "0" ] && return
-    # 编号经 _hy2_select_node 限长/范围校验后再索引。
+    echo -e "  ${YELLOW}与混淆(FinalMask.udp)是两个独立机制 —— 混淆改链路上的 QUIC 字节, 本项改 HTTP 页面${NC}"
     local tag
-    tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    if [ -n "$preset_tag" ]; then
+        tag="$preset_tag"
+        local preset_meta="$NODES_DIR/${tag}.json"
+        [ -f "$preset_meta" ] || { _error "节点不存在: $tag"; _press_any_key; return 1; }
+        [ "$(jq -r '.protocol // empty' "$preset_meta" 2>/dev/null)" = "hysteria2" ] \
+            || { _error "不是 Xray Hy2 节点: $tag"; _press_any_key; return 1; }
+    else
+        local f tags=() i=1
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            [ "$proto" = "hysteria2" ] || continue
+            local name desc
+            tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
+            desc=$(_hy2_masq_desc "$tag")
+            tags+=("$tag")
+            printf "  ${GREEN}[%d]${NC} %s 当前: %s\n" "$i" "$(_menu_name_pad "$name")" "${desc:-默认 404 页面}"
+            i=$((i+1))
+        done
+        [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  选择节点: " choice || return 1
+        [ "$choice" = "0" ] && return
+        # 编号经 _hy2_select_node 限长/范围校验后再索引。
+        tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    fi
 
     # 入站必须真实存在于 config, 否则 jq 命中 0 条也会报成功。
     _config_jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' >/dev/null 2>&1 \
@@ -1255,7 +1347,7 @@ _hy2_masq_set_file() {
     return 0
 }
 
-# proxy 为扁平 url/rewriteHost/insecure 模型，不照抄官方 Hysteria 嵌套形状。
+# proxy 为扁平 url/rewriteHost/insecure 模型，不使用嵌套配置形状。
 _hy2_masq_set_proxy() {
     local tag="$1" url why ans rh="true" ins="false" xf="false" payload
     echo
@@ -1479,27 +1571,36 @@ _hy2_congestion_rollback() {
 }
 
 _hy2_toggle_brutal() {
+    local preset_tag="${1:-}" choice cc_choice
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【切换 brutal / bbr】${NC}"
-    local f tags=() i=1
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        [ "$proto" = "hysteria2" ] || continue
-        local tag name cc
-        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); cc=$(jq -r '.congestion' "$f")
-        tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %s 当前: %s\n" "$i" "$(_menu_name_pad "$name")" "$cc"
-        i=$((i+1))
-    done
-    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice
-    [ "$choice" = "0" ] && return
-    # 编号经 _hy2_select_node 限长/范围校验后再索引。
     local tag
-    tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    if [ -n "$preset_tag" ]; then
+        tag="$preset_tag"
+        local preset_meta="$NODES_DIR/${tag}.json"
+        [ -f "$preset_meta" ] || { _error "节点不存在: $tag"; _press_any_key; return 1; }
+        [ "$(jq -r '.protocol // empty' "$preset_meta" 2>/dev/null)" = "hysteria2" ] \
+            || { _error "不是 Xray Hy2 节点: $tag"; _press_any_key; return 1; }
+    else
+        local f tags=() i=1
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            [ "$proto" = "hysteria2" ] || continue
+            local name cc
+            tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); cc=$(jq -r '.congestion' "$f")
+            tags+=("$tag")
+            printf "  ${GREEN}[%d]${NC} %s 当前: %s\n" "$i" "$(_menu_name_pad "$name")" "$cc"
+            i=$((i+1))
+        done
+        [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  选择节点: " choice
+        [ "$choice" = "0" ] && return
+        # 编号经 _hy2_select_node 限长/范围校验后再索引。
+        tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    fi
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
@@ -1561,29 +1662,37 @@ _hy2_toggle_brutal() {
 
 # Hysteria2: 调整 brutal 带宽(仅 brutal 模式)
 _hy2_adjust_bandwidth() {
-    local choice
+    local preset_tag="${1:-}" choice
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【调整 brutal 带宽】${NC}"
-    local f tags=() i=1
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        [ "$proto" = "hysteria2" ] || continue
-        local tag name cc up down
-        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
-        cc=$(jq -r '.congestion' "$f"); up=$(jq -r '.brutal_up // empty' "$f"); down=$(jq -r '.brutal_down // empty' "$f")
-        tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %s cc=%-6s up=%-12s down=%s\n" "$i" "$(_menu_name_pad "$name")" "$cc" "${up:--}" "${down:--}"
-        i=$((i+1))
-    done
-    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice
-    [ "$choice" = "0" ] && return
-    # 编号经 _hy2_select_node 限长/范围校验后再索引。
     local tag
-    tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    if [ -n "$preset_tag" ]; then
+        tag="$preset_tag"
+        local preset_meta="$NODES_DIR/${tag}.json"
+        [ -f "$preset_meta" ] || { _error "节点不存在: $tag"; _press_any_key; return 1; }
+        [ "$(jq -r '.protocol // empty' "$preset_meta" 2>/dev/null)" = "hysteria2" ] \
+            || { _error "不是 Xray Hy2 节点: $tag"; _press_any_key; return 1; }
+    else
+        local f tags=() i=1
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            [ "$proto" = "hysteria2" ] || continue
+            local name cc up down
+            tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
+            cc=$(jq -r '.congestion' "$f"); up=$(jq -r '.brutal_up // empty' "$f"); down=$(jq -r '.brutal_down // empty' "$f")
+            tags+=("$tag")
+            printf "  ${GREEN}[%d]${NC} %s cc=%-6s up=%-12s down=%s\n" "$i" "$(_menu_name_pad "$name")" "$cc" "${up:--}" "${down:--}"
+            i=$((i+1))
+        done
+        [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  选择节点: " choice
+        [ "$choice" = "0" ] && return
+        # 编号经 _hy2_select_node 限长/范围校验后再索引。
+        tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    fi
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_cc; cur_cc=$(jq -r '.congestion' "$meta")
@@ -1697,30 +1806,38 @@ _hy2_obfs_txn_locked() {
 }
 
 _hy2_obfs_menu() {
-    local choice
+    local preset_tag="${1:-}" choice
     clear
     _has_hy2_nodes || { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【混淆 salamander / gecko (FinalMask.udp)】${NC}"
-    local f tags=() i=1
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        [ "$proto" = "hysteria2" ] || continue
-        local tag name otype osize
-        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
-        otype=$(jq -r '.obfs_type // empty' "$f")
-        osize=$(_hy2_obfs_size_get "$f")
-        tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %s 当前: %s%s\n" "$i" "$(_menu_name_pad "$name")" "${otype:-未启用}" "${osize:+ (packetSize=${osize})}"
-        i=$((i+1))
-    done
-    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice
-    [ "$choice" = "0" ] && return
-    # 编号经 _hy2_select_node 限长/范围校验后再索引。
     local tag
-    tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    if [ -n "$preset_tag" ]; then
+        tag="$preset_tag"
+        local preset_meta="$NODES_DIR/${tag}.json"
+        [ -f "$preset_meta" ] || { _error "节点不存在: $tag"; _press_any_key; return 1; }
+        [ "$(jq -r '.protocol // empty' "$preset_meta" 2>/dev/null)" = "hysteria2" ] \
+            || { _error "不是 Xray Hy2 节点: $tag"; _press_any_key; return 1; }
+    else
+        local f tags=() i=1
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            [ "$proto" = "hysteria2" ] || continue
+            local name otype osize
+            tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
+            otype=$(jq -r '.obfs_type // empty' "$f")
+            osize=$(_hy2_obfs_size_get "$f")
+            tags+=("$tag")
+            printf "  ${GREEN}[%d]${NC} %s 当前: %s%s\n" "$i" "$(_menu_name_pad "$name")" "${otype:-未启用}" "${osize:+ (packetSize=${osize})}"
+            i=$((i+1))
+        done
+        [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Xray Hy2 节点"; _press_any_key; return; }
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  选择节点: " choice
+        [ "$choice" = "0" ] && return
+        # 编号经 _hy2_select_node 限长/范围校验后再索引。
+        tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+    fi
 
     local meta="$NODES_DIR/${tag}.json"
     local cur_type cur_size
@@ -1953,43 +2070,20 @@ _reality_domain_txn_locked() {
     return 0
 }
 
-_reality_domain_menu() {
-    local choice
-    _has_reality_nodes || { _warn "暂无 Reality 节点"; _press_any_key; return; }
-    while true; do
-        clear
-        echo; echo -e "  ${CYAN}【Reality 域名管理】${NC}"
-    local f tags=() i=1
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        case "$proto" in *reality*) ;; *) continue ;; esac
-        local tag name sni
-        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); sni=$(jq -r '.sni' "$f")
-        tags+=("$tag")
-        # 显示实际拓扑；域名切换按 direct/tunnel 分别更新目标。
-        local mlabel="隧道"
-        [ "$(_reality_node_mode "$tag")" = "direct" ] && mlabel="直连"
-        printf "  ${GREEN}[%d]${NC} %-24s [%s] 当前域名: %s\n" "$i" "$name" "$mlabel" "$sni"
-        i=$((i+1))
-    done
-    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Reality 节点"; _press_any_key; return; }
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice || return 0
-    [ "$choice" = "0" ] && return
-    local tag
-    tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; continue; }
-
-    local meta="$NODES_DIR/${tag}.json"
-    local cur_sni; cur_sni=$(jq -r '.sni' "$meta")
+_reality_domain_switch() {
+    local tag="${1:-}" meta cur_sni new_sni
+    meta="$NODES_DIR/${tag}.json"
+    [ -f "$meta" ] || { _error "节点不存在: $tag"; return 1; }
+    local proto; proto=$(jq -r '.protocol // empty' "$meta" 2>/dev/null)
+    case "$proto" in *reality*) ;; *) _error "不是 Reality 节点: $tag"; return 1 ;; esac
+    cur_sni=$(jq -r '.sni' "$meta")
     echo -e "  当前域名: ${CYAN}${cur_sni}${NC}"
-    local new_sni
-    read -rp "  新伪装域名 (回车取消): " new_sni
-    [ -z "$new_sni" ] && { _info "已取消"; _press_any_key; continue; }
+    read -rp "  新伪装域名 (回车取消): " new_sni || return 1
+    [ -z "$new_sni" ] && { _info "已取消"; _press_any_key; return 0; }
     # SNI 同时组成 tunnel tag，先校验域名避免关联失效。
     if ! _validate_domain "$new_sni"; then
         _error "伪装域名格式非法(仅字母/数字/连字符, 点分段): $new_sni"
-        _press_any_key; continue
+        _press_any_key; return 1
     fi
 
     local new_target="${new_sni}:443"
@@ -2015,12 +2109,12 @@ _reality_domain_menu() {
             _error "后量子兼容性探测失败, 无法判断新域名是否支持 PQ(原因见上方告警)"
             _tip "本次域名切换未执行, 节点配置保持不变; 请确认网络可达后重试"
             _press_any_key
-            continue
+            return 1
             ;;
     esac
 
     # 仅为决定是否需要用户确认而在锁外读取拓扑; 切换事务会在锁内重新读取并校验所有状态。
-    local preflight_mode allow_missing_tunnel=0 preflight_tunnel_tag=""
+    local preflight_mode allow_missing_tunnel=0 preflight_tunnel_tag="" ans
     preflight_mode=$(_reality_node_mode "$tag")
     if [ "$preflight_mode" != "direct" ]; then
         preflight_tunnel_tag=$(jq -r '.tunnel_tag // empty' "$meta" 2>/dev/null)
@@ -2028,7 +2122,7 @@ _reality_domain_menu() {
             _warn "该节点缺少 tunnel_tag 元数据"
             _warn "域名切换将仅更新 Reality inbound, 不会更新 tunnel inbound 和路由规则"
             read -rp "  继续? [y/N]: " ans
-            case "$ans" in y|Y) allow_missing_tunnel=1 ;; *) _info "已取消"; _press_any_key; continue ;; esac
+            case "$ans" in y|Y) allow_missing_tunnel=1 ;; *) _info "已取消"; _press_any_key; return 0 ;; esac
         fi
     fi
 
@@ -2038,7 +2132,7 @@ _reality_domain_menu() {
     if [ "$txn_rc" -ne 0 ]; then
         # rc 1/2/3 的具体恢复状态由事务体报告，契约见 _reality_domain_txn_locked。
         [ "$txn_rc" -eq 2 ] && _tip "本次改动未完成, 请按上方提示人工核对后重试"
-        _press_any_key; continue
+        _press_any_key; return 1
     fi
     # 成功路径: 分享链接即 metadata 里刚原子提交的那一份
     local newlink="" result_mode actual_target
@@ -2055,5 +2149,39 @@ _reality_domain_menu() {
     [ -z "$pq_verify" ] && _warn "新域名不支持后量子, 已移除 pqv 参数"
     echo -e "  ${CYAN}新分享链接:${NC} ${newlink}"
     _press_any_key
+    return 0
+}
+
+_reality_domain_menu() {
+    local preset_tag="${1:-}" choice
+    _has_reality_nodes || { _warn "暂无 Reality 节点"; _press_any_key; return; }
+    if [ -n "$preset_tag" ]; then
+        _reality_domain_switch "$preset_tag"
+        return
+    fi
+    while true; do
+        clear
+        echo; echo -e "  ${CYAN}【Reality 域名管理】${NC}"
+        local f tags=() i=1
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            case "$proto" in *reality*) ;; *) continue ;; esac
+            local tag name sni
+            tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); sni=$(jq -r '.sni' "$f")
+            tags+=("$tag")
+            # 显示实际拓扑；域名切换按 direct/tunnel 分别更新目标。
+            local mlabel="隧道"
+            [ "$(_reality_node_mode "$tag")" = "direct" ] && mlabel="直连"
+            printf "  ${GREEN}[%d]${NC} %-24s [%s] 当前域名: %s\n" "$i" "$name" "$mlabel" "$sni"
+            i=$((i+1))
+        done
+        [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Reality 节点"; _press_any_key; return; }
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  选择节点: " choice || return 0
+        [ "$choice" = "0" ] && return
+        local tag
+        tag=$(_hy2_select_node "$choice" "${tags[@]}") || { _warn "无效选择"; _press_any_key; continue; }
+        _reality_domain_switch "$tag"
     done
 }

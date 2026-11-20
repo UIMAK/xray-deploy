@@ -1811,54 +1811,48 @@ _port_in_hop_ranges() {
     return 1
 }
 
-# 官方 Hysteria listen 可能是单端口、端口范围或多段(0.0.0.0:20000-50000,[::]:5000);
-# 逐段输出 "start:end", 供跳跃冲突判断使用。
-_hysteria_listen_ranges() {
-    [ -n "${HYSTERIA_CONFIG:-}" ] && [ -f "$HYSTERIA_CONFIG" ] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
-    local listen seg port ls le
-    listen=$(jq -r '.listen // empty' "$HYSTERIA_CONFIG" 2>/dev/null) || return 0
-    [ -n "$listen" ] || return 0
-    local IFS=','
-    for seg in $listen; do
-        seg=${seg// /}
-        [ -n "$seg" ] || continue
-        port=${seg##*:}
-        case "$port" in
-            *-*)
-                ls=${port%%-*}; le=${port##*-}
-                [[ "$ls" =~ ^[0-9]+$ && "$le" =~ ^[0-9]+$ ]] || continue
-                printf '%s:%s\n' "$ls" "$le"
-                ;;
-            *)
-                [[ "$port" =~ ^[0-9]+$ ]] || continue
-                printf '%s:%s\n' "$port" "$port"
-                ;;
-        esac
-    done
+# 覆盖所有 UDP 入站能力并兼容旧字段; 跳跃 DNAT 会劫持范围内所有 UDP。
+_xray_udp_port_ranges() {
+    _config_present && command -v jq >/dev/null 2>&1 || return 0
+    local s e
+    while IFS=: read -r s e; do
+        [[ "$s" =~ ^[0-9]+$ && "$e" =~ ^[0-9]+$ ]] || continue
+        printf '%s:%s\n' "$s" "$e"
+    done < <(_config_jq -r '
+        .inbounds[]? | select(.port != null)
+        | select(
+            (.protocol // "") == "hysteria"
+            or ((.protocol // "") == "wireguard")
+            or ((.streamSettings.network // "") == "mkcp")
+            or ((.streamSettings.network // "") == "quic")
+            or ((.protocol // "") == "socks" and ((.settings.udp // false) == true))
+            or (((.protocol // "") == "dokodemo-door" or (.protocol // "") == "tunnel")
+                and (((.settings.allowedNetwork // .settings.network // "tcp") | tostring) | test("udp")))
+            or ((.protocol // "") == "shadowsocks"
+                and (((.settings.network // "tcp") | tostring) | test("udp")))
+          )
+        | (.port | tostring) | split(",")[]
+        | if test("^[0-9]+-[0-9]+$") then sub("-"; ":")
+          elif test("^[0-9]+$") then "\(.):\(.)"
+          else empty end
+    ' 2>/dev/null)
 }
 
 # 新跳跃区间覆盖其它 UDP 监听端口时同样会静默劫持。
-# 判据: Xray 入站按 config 事实枚举(与官方 Hysteria 的跳跃冲突检查同口径), 官方服务监听单独取;
-# 其它节点已启用的跳跃区间从 metadata 取(区间只存在于元数据, config 看不到), 读失败按冲突处理。
-# 只信 metadata 会漏掉官方 Hysteria 与手改的入站配置, 只看 config 会漏掉他人 hop 区间。
+# 判据: Xray 入站按 config 事实枚举; 其它节点已启用的跳跃区间从 metadata 取
+# (区间只存在于元数据, config 看不到), 读失败按冲突处理。
+# 只看 config 会漏掉他人 hop 区间。
 # 用法:_range_hits_other_udp <start> <end> [exclude_tag]; 0=冲突。
 _range_hits_other_udp() {
     local s="$1" e="$2" exclude="${3:-}" self_port="" p_start p_end
     [ -n "$exclude" ] && self_port=$(jq -r '.port // empty' "$NODES_DIR/${exclude}.json" 2>/dev/null)
-    if declare -F _hysteria_xray_udp_port_ranges >/dev/null 2>&1; then
-        while IFS=: read -r p_start p_end; do
-            [ -n "$p_start" ] && [ -n "$p_end" ] || continue
-            [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] || continue
-            # 本节点自身的监听端口允许落在自己的跳跃范围内。
-            [ -n "$self_port" ] && [ "$p_start" = "$self_port" ] && [ "$p_end" = "$self_port" ] && continue
-            return 0
-        done < <(_hysteria_xray_udp_port_ranges)
-    fi
     while IFS=: read -r p_start p_end; do
         [ -n "$p_start" ] && [ -n "$p_end" ] || continue
-        [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] && return 0
-    done < <(_hysteria_listen_ranges)
+        [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] || continue
+        # 本节点自身的监听端口允许落在自己的跳跃范围内。
+        [ -n "$self_port" ] && [ "$p_start" = "$self_port" ] && [ "$p_end" = "$self_port" ] && continue
+        return 0
+    done < <(_xray_udp_port_ranges)
     # 两条 PREROUTING DNAT 抢同一目的端口时先命中者生效, 他人已有区间必须拒绝。
     local f tag ranges tok hs he
     for f in "$NODES_DIR"/*.json; do
@@ -5373,26 +5367,37 @@ _port_txn_recover_locked() {
 # 修改端口(沿用思路, 适配新元数据)
 # ---------------------------------------------------------------------------
 _modify_port() {
+    local preset_tag="${1:-}" choice
     clear
-    local count; count=$(_node_count)
-    [ "$count" -eq 0 ] && { _warn "暂无节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【修改端口】${NC}"
-    local tags=() i=1
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local tag name port
-        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %-20s 当前端口 %s\n" "$i" "$name" "$port"
-        i=$((i+1))
-    done
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择: " choice
-    [ "$choice" = "0" ] && return
-    local idx
-    idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
-    local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+    local tag
+    if [ -n "$preset_tag" ]; then
+        tag="$preset_tag"
+        [ -f "$NODES_DIR/${tag}.json" ] || { _error "节点不存在: $tag"; _press_any_key; return 1; }
+    else
+        local count; count=$(_node_count)
+        [ "$count" -eq 0 ] && { _warn "暂无节点"; _press_any_key; return; }
+        local tags=() i=1
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local name port
+            tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
+            tags+=("$tag")
+            printf "  ${GREEN}[%d]${NC} %-20s 当前端口 %s\n" "$i" "$name" "$port"
+            i=$((i+1))
+        done
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  选择: " choice
+        [ "$choice" = "0" ] && return
+        local idx
+        idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+        tag="${tags[$idx]:-}"
+        [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+    fi
+
+    # Reality 改端口会同步重命名 metadata/tag; 供调用方刷新当前节点标识。
+    # shellcheck disable=SC2034  # 由 90-menu.sh 的修改节点动作菜单读取
+    XD_NODE_EDIT_TAG="$tag"
 
     # 更新元数据 + 链接(端口出现在链接里)
     local meta="$NODES_DIR/${tag}.json"
@@ -5442,6 +5447,8 @@ _modify_port() {
         if ! _reality_port_txn "$tag" "$meta" "$oldport" "$newport"; then
             _press_any_key; return 1
         fi
+        # shellcheck disable=SC2034  # 由 90-menu.sh 的修改节点动作菜单读取
+        XD_NODE_EDIT_TAG="${tag%-*}-${newport}"
         _press_any_key
         return
     fi
@@ -5563,28 +5570,35 @@ _update_listen_commit_locked() {
 # 更新监听(单节点 )
 # ---------------------------------------------------------------------------
 _update_listen() {
+    local preset_tag="${1:-}" choice
     clear
-    local count; count=$(_node_count)
-    [ "$count" -eq 0 ] && { _warn "暂无节点"; _press_any_key; return; }
     echo; echo -e "  ${CYAN}【更新监听 — 单节点】${NC}"
     echo -e "  ${YELLOW}仅修改所选节点的 listen, 其他节点不变${NC}"
-    local tags=() i=1
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local tag name port listen
-        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
-        port=$(jq -r '.port' "$f"); listen=$(jq -r '.listen' "$f")
-        tags+=("$tag")
-        printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 当前监听 %s\n" "$i" "$name" "$port" "$listen"
-        i=$((i+1))
-    done
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择: " choice
-    [ "$choice" = "0" ] && return
-    local idx
-    idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
-    local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+    local tag
+    if [ -n "$preset_tag" ]; then
+        tag="$preset_tag"
+        [ -f "$NODES_DIR/${tag}.json" ] || { _error "节点不存在: $tag"; _press_any_key; return 1; }
+    else
+        local count; count=$(_node_count)
+        [ "$count" -eq 0 ] && { _warn "暂无节点"; _press_any_key; return; }
+        local tags=() i=1
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local name port listen
+            tag=$(basename "$f" .json); name=$(jq -r '.name' "$f")
+            port=$(jq -r '.port' "$f"); listen=$(jq -r '.listen' "$f")
+            tags+=("$tag")
+            printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 当前监听 %s\n" "$i" "$name" "$port" "$listen"
+            i=$((i+1))
+        done
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  选择: " choice
+        [ "$choice" = "0" ] && return
+        local idx
+        idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+        tag="${tags[$idx]:-}"
+        [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+    fi
 
     local meta="$NODES_DIR/${tag}.json"
     local listen_identity
@@ -5649,6 +5663,7 @@ _update_listen() {
 
 # 启用/禁用端口跳跃 (iptables DNAT + 分享链接 mport)
 _hy2_toggle_hop() {
+    local preset_tag="${1:-}" choice
     clear
     _has_hy2_nodes || { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
     _ensure_iptables || { _press_any_key; return; }
@@ -5657,30 +5672,39 @@ _hy2_toggle_hop() {
     echo -e "  ${YELLOW}iptables DNAT 将 UDP 端口范围转发到 Hysteria2 监听端口${NC}"
     echo -e "  ${YELLOW}客户端可连接范围内任意端口, 提高抗封锁能力${NC}"
     echo
-    local tags=() i=1
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        [ "$proto" = "hysteria2" ] || continue
-        local tag name port ranges_display
-        tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        ranges_display=$(_read_hop_ranges_raw "$f") || return 1
-        tags+=("$tag")
-        if [ -n "$ranges_display" ]; then
-            printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${GREEN}%s${NC}\n" "$i" "$name" "$port" "$ranges_display"
-        else
-            printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${RED}未启用${NC}\n" "$i" "$name" "$port"
-        fi
-        i=$((i+1))
-    done
-    [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
-    echo -e "  ${GREEN}[0]${NC} 返回"
-    read -rp "  选择节点: " choice
-    [ "$choice" = "0" ] && return
-    local idx
-    idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
-    local tag="${tags[$idx]:-}"
-    [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+    local tag
+    if [ -n "$preset_tag" ]; then
+        tag="$preset_tag"
+        local preset_meta="$NODES_DIR/${tag}.json"
+        [ -f "$preset_meta" ] || { _error "节点不存在: $tag"; _press_any_key; return 1; }
+        [ "$(jq -r '.protocol // empty' "$preset_meta" 2>/dev/null)" = "hysteria2" ] \
+            || { _error "不是 Xray Hy2 节点: $tag"; _press_any_key; return 1; }
+    else
+        local tags=() i=1
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            [ "$proto" = "hysteria2" ] || continue
+            local name port ranges_display
+            tag=$(basename "$f" .json); name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
+            ranges_display=$(_read_hop_ranges_raw "$f") || return 1
+            tags+=("$tag")
+            if [ -n "$ranges_display" ]; then
+                printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${GREEN}%s${NC}\n" "$i" "$name" "$port" "$ranges_display"
+            else
+                printf "  ${GREEN}[%d]${NC} %-20s 端口 %-7s 跳跃: ${RED}未启用${NC}\n" "$i" "$name" "$port"
+            fi
+            i=$((i+1))
+        done
+        [ ${#tags[@]} -eq 0 ] && { _warn "暂无 Hysteria2 节点"; _press_any_key; return; }
+        echo -e "  ${GREEN}[0]${NC} 返回"
+        read -rp "  选择节点: " choice
+        [ "$choice" = "0" ] && return
+        local idx
+        idx=$(_xd_index_from_choice "$choice" "${#tags[@]}") || { _warn "无效选择"; _press_any_key; return; }
+        tag="${tags[$idx]:-}"
+        [ -z "$tag" ] && { _warn "无效选择"; _press_any_key; return; }
+    fi
 
     local meta="$NODES_DIR/${tag}.json"
     local port; port=$(jq -r '.port' "$meta")
@@ -5769,29 +5793,52 @@ _hy2_toggle_hop() {
 
 # 查看端口跳跃状态
 _hy2_view_hop() {
+    local preset_tag="${1:-}" filter_port=""
     clear
     echo; echo -e "  ${CYAN}【端口跳跃状态】${NC}"
     echo
     local found=0
-    for f in "$NODES_DIR"/*.json; do
-        [ -f "$f" ] || continue
-        local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
-        [ "$proto" = "hysteria2" ] || continue
+    if [ -n "$preset_tag" ]; then
+        local meta="$NODES_DIR/${preset_tag}.json"
+        [ -f "$meta" ] || { _error "节点不存在: $preset_tag"; _press_any_key; return 1; }
+        [ "$(jq -r '.protocol // empty' "$meta" 2>/dev/null)" = "hysteria2" ] \
+            || { _error "不是 Xray Hy2 节点: $preset_tag"; _press_any_key; return 1; }
         local name port ranges_display
-        name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
-        ranges_display=$(_read_hop_ranges_raw "$f") || return 1
+        name=$(jq -r '.name' "$meta"); port=$(jq -r '.port' "$meta")
+        ranges_display=$(_read_hop_ranges_raw "$meta") || return 1
+        filter_port="$port"
         if [ -n "$ranges_display" ]; then
             echo -e "  ${GREEN}●${NC} ${name}: ${CYAN}${ranges_display}${NC} → ${port} (UDP)"
             found=1
         fi
-    done
+    else
+        for f in "$NODES_DIR"/*.json; do
+            [ -f "$f" ] || continue
+            local proto; proto=$(jq -r '.protocol' "$f" 2>/dev/null)
+            [ "$proto" = "hysteria2" ] || continue
+            local name port ranges_display
+            name=$(jq -r '.name' "$f"); port=$(jq -r '.port' "$f")
+            ranges_display=$(_read_hop_ranges_raw "$f") || return 1
+            if [ -n "$ranges_display" ]; then
+                echo -e "  ${GREEN}●${NC} ${name}: ${CYAN}${ranges_display}${NC} → ${port} (UDP)"
+                found=1
+            fi
+        done
+    fi
     if [ "$found" -eq 0 ]; then
-        echo -e "  ${YELLOW}暂无启用端口跳跃的节点${NC}"
+        if [ -n "$preset_tag" ]; then
+            echo -e "  ${YELLOW}该节点未启用端口跳跃${NC}"
+        else
+            echo -e "  ${YELLOW}暂无启用端口跳跃的节点${NC}"
+        fi
     fi
     echo
     if command -v iptables >/dev/null 2>&1; then
         local rules
         rules=$(_hy2_list_all_hop_rules)
+        if [ -n "$filter_port" ] && [ -n "$rules" ]; then
+            rules=$(printf '%s\n' "$rules" | grep -E -- ":${filter_port}( |\$)" || true)
+        fi
         if [ -n "$rules" ]; then
             echo -e "  ${CYAN}iptables nat 规则:${NC}"
             echo "$rules" | while read -r line; do

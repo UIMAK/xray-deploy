@@ -83,34 +83,22 @@ check 'UDP port inside another node hop range is rejected' hop_range_port_confli
 # 跳跃范围输入允许全角/半角逗号混用: 解析入口归一, 切词仍按半角逗号。
 check 'hop ranges parse mixed full/half-width commas' eq "$(_parse_hop_ranges '11，13，15-17')" "$(_parse_hop_ranges '11,13,15-17')"
 
-# 反向检查: config 里的 UDP 入站与官方 Hysteria listen(单端口/范围/多段)都要命中。
+# 反向检查: 新跳跃区间覆盖 config 里的 UDP 入站时要命中。
 udp_range_conflict_probe() (
     local dir="$TMP/udp-range"
     NODES_DIR="$dir/nodes"
-    HYSTERIA_CONFIG="$dir/hysteria.json"
     rm -rf "$dir"; mkdir -p "$NODES_DIR"
     printf '{"tag":"xd-hy2-41000","protocol":"hysteria2","port":41000}' > "$NODES_DIR/xd-hy2-41000.json"
-    _hysteria_xray_udp_port_ranges() { printf '40000:40000\n45000:45000\n'; }
+    _xray_udp_port_ranges() { printf '40000:40000\n45000:45000\n'; }
     _range_hits_other_udp 39900 40100 xd-hy2-41000 || return 1
     _range_hits_other_udp 46000 47000 xd-hy2-41000 && return 1
-    printf '{"listen":"0.0.0.0:20808"}' > "$HYSTERIA_CONFIG"
-    _range_hits_other_udp 20700 20900 xd-hy2-41000 || return 1
-    _range_hits_other_udp 20500 20600 xd-hy2-41000 && return 1
-    # 启用官方跳跃后 listen 是端口范围, 必须按区间相交判断。
-    printf '{"listen":"0.0.0.0:20000-30000"}' > "$HYSTERIA_CONFIG"
-    _range_hits_other_udp 20500 20600 xd-hy2-41000 || return 1
-    # 多段 listen 逐段比对, 不能只看最后一段。
-    printf '{"listen":"0.0.0.0:20000-30000,[::]:5000"}' > "$HYSTERIA_CONFIG"
-    _range_hits_other_udp 4900 5100 xd-hy2-41000 || return 1
-    _range_hits_other_udp 20500 20600 xd-hy2-41000 || return 1
     # 本节点自身的监听端口不算冲突。
-    printf '{"listen":":9"}' > "$HYSTERIA_CONFIG"
-    _hysteria_xray_udp_port_ranges() { printf '41000:41000\n'; }
+    _xray_udp_port_ranges() { printf '41000:41000\n'; }
     _range_hits_other_udp 40000 42000 xd-hy2-41000 && return 1
     # 其它节点已启用的跳跃区间与本区间重叠也要拒绝(两条 DNAT 抢同一目的端口)。
     printf '{"tag":"xd-hy2-20000","protocol":"hysteria2","port":20000,"hop_ranges":"20000-50000"}' \
         > "$NODES_DIR/xd-hy2-20000.json"
-    _hysteria_xray_udp_port_ranges() { :; }
+    _xray_udp_port_ranges() { :; }
     _range_hits_other_udp 45000 46000 xd-hy2-41000 || return 1
     _range_hits_other_udp 51000 52000 xd-hy2-41000 && return 1
     # 自身已有的跳跃区间不算冲突(改区间/重开跳跃时复用同一范围)。
@@ -123,7 +111,7 @@ udp_range_conflict_probe() (
     _range_hits_other_udp 60000 61000 xd-hy2-41000 || return 1
     return 0
 )
-check 'hop range conflict covers config UDP inbounds and official listen forms' udp_range_conflict_probe
+check 'hop range conflict covers Xray UDP inbounds and other hop ranges' udp_range_conflict_probe
 
 # hop_ranges 是合法 JSON 但值非法时, 必须按"元数据不可读"处理(与 _hy2_hop_meta_ok 同口径);
 # 必须逐项校验所有 token, 否则混合合法/非法、越界、倒置区间会绕过冲突判定。
@@ -179,6 +167,29 @@ inbound_network_probe() (
     [ -z "$(_inbound_network missing)" ]
 )
 check 'inbound network reads settings.network and top-level fallback' inbound_network_probe
+
+# 跳跃冲突用的 UDP 入站枚举必须覆盖真实 config 能力, 端口范围也要展开。
+udp_port_ranges_probe() (
+    local dir="$TMP/udp-ranges" out
+    CONFIG_DIR="$dir/confs" BACKUP_DIR="$dir/backup" STATE_DIR="$dir/state"
+    rm -rf "$dir"; mkdir -p "$CONFIG_DIR" "$BACKUP_DIR" "$STATE_DIR"
+    eval "$actual_config_jq"
+    _config_write_merged '{"inbounds":[
+        {"tag":"hy2","protocol":"hysteria","port":443},
+        {"tag":"ss-udp","protocol":"shadowsocks","port":8443,"settings":{"network":"tcp,udp"}},
+        {"tag":"ss-tcp","protocol":"shadowsocks","port":9443,"settings":{"network":"tcp"}},
+        {"tag":"wg","protocol":"wireguard","port":"51820-51821"},
+        {"tag":"socks","protocol":"socks","port":1080,"settings":{"udp":true}},
+        {"tag":"vless","protocol":"vless","port":12345}]}' >/dev/null || return 1
+    out=$(_xray_udp_port_ranges) || return 1
+    contains "$out" '443:443' || return 1
+    contains "$out" '8443:8443' || return 1
+    contains "$out" '51820:51821' || return 1
+    contains "$out" '1080:1080' || return 1
+    ! contains "$out" '9443:9443' || return 1
+    ! contains "$out" '12345:12345'
+)
+check 'UDP port range enumerator matches Xray inbound capabilities' udp_port_ranges_probe
 
 # 渲染并执行真实创建事务; metadata 保留服务端方向。
 R_LISTEN=0.0.0.0 R_PORT=443 R_TAG=hy2-test R_AUTH=secret

@@ -66,8 +66,8 @@ _xray_fetch_tag() {
 
 # ---------------------------------------------------------------------------
 # 版本号规范化的唯一入口: 接受 v26.3.27 / 26.3.27, 输出 tag "v26.3.27"; 非法输入返回 1。
-# Xray release tag 恒为 vMAJOR.MINOR.PATCH, 只认三段数字, 不猜别名/前缀/范围
-# (与 _hysteria_canon_version 同口径)。只裁首尾空白, 内部空格如实拒绝。
+# Xray release tag 恒为 vMAJOR.MINOR.PATCH, 只认三段数字, 不猜别名/前缀/范围。
+# 只裁首尾空白, 内部空格如实拒绝。
 # ---------------------------------------------------------------------------
 _xray_canon_tag() {
     local v="${1:-}"
@@ -2476,7 +2476,7 @@ _restart_xray_verified() {
 }
 
 # ---------------------------------------------------------------------------
-# 卸载先 stop 再轮询正向停止证据, 确认成功才返回 0(同 _hysteria_stop_and_verify)。
+# 卸载先 stop 再轮询正向停止证据, 确认成功才返回 0。
 # 查询失败/未知不等于停止; 缺 _xray_is_running 时拒绝破坏性操作。
 # 日常 status 仍走 _xray_is_running, 破坏性路径用下方更严格 stopped 判据。
 # ---------------------------------------------------------------------------
@@ -2602,10 +2602,6 @@ _uninstall_xray_locked() {
             _error "缺少端口跳跃清理助手, 已中止卸载(未做任何删除)"
             return 1
         fi
-        if ! declare -F _hysteria_cleanup_before_uninstall >/dev/null 2>&1; then
-            _error "缺少官方 Hysteria2 清理助手, 已中止卸载(未做任何删除)"
-            return 1
-        fi
     fi
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
         _error "缺少 crontab 清理助手, 已中止卸载(未做任何删除)"
@@ -2619,13 +2615,9 @@ _uninstall_xray_locked() {
         return 1
     fi
     if [ "$mode" = all ]; then
-        # 整站卸载时先清跳跃规则与独立 Hysteria2, 失败则保留管理入口。
+        # 整站卸载时先清跳跃规则, 失败则保留管理入口。
         if ! _hy2_cleanup_all_hops; then
             _error "端口跳跃规则清理失败, 已中止卸载(部署目录与节点元数据保留), 请处理后重试"
-            return 1
-        fi
-        if ! _hysteria_cleanup_before_uninstall; then
-            _error "官方 Hysteria2 清理未完成, 已中止 Xray 卸载(部署数据与 Xray 管理入口保留), 请处理后重试"
             return 1
         fi
     fi
@@ -2723,7 +2715,7 @@ _xray_core_menu() {
         2) _install_or_switch_xray preview ;;
         3)
             # 规范化的唯一入口是 _xray_canon_tag: 只接受 vX.Y.Z / X.Y.Z, 其余一律拒绝。
-            # 版本存在与否不在菜单预检 —— 与 hy 官方核心管理菜单同口径, 由下载阶段判定;
+            # 版本存在与否不在菜单预检, 由下载阶段判定;
             # 不存在的 tag 会在取件阶段失败, 不触碰任何生产文件。
             local vraw vtag
             read -rp "  输入版本号 (如 26.3.27 或 v26.3.27): " vraw || return 0
