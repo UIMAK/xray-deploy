@@ -3228,11 +3228,11 @@ _hysteria_menu() {
         if [ -n "$cur" ]; then
             st=$(_manage_hysteria status 2>/dev/null)
             if [ "$st" = "running" ]; then
-                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${GREEN}● 运行中${NC}  (Xray Hy2 在主菜单 [Xray Hy2 管理], 两者独立)"
+                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${GREEN}● 运行中${NC}  (Xray Hy2 在主菜单 [修改节点] 内管理, 两者独立)"
             elif [ "$st" = "unknown" ]; then
-                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${YELLOW}? 未知(保留服务证据)${NC}  (Xray Hy2 在主菜单 [Xray Hy2 管理], 两者独立)"
+                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${YELLOW}? 未知(保留服务证据)${NC}  (Xray Hy2 在主菜单 [修改节点] 内管理, 两者独立)"
             else
-                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${RED}○ 已停止${NC}  (Xray Hy2 在主菜单 [Xray Hy2 管理], 两者独立)"
+                echo -e "  核心: ${GREEN}${cur}${NC}  状态: ${RED}○ 已停止${NC}  (Xray Hy2 在主菜单 [修改节点] 内管理, 两者独立)"
             fi
         else
             echo -e "  核心: ${RED}未安装${NC}"
