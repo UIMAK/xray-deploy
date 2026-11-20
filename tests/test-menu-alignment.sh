@@ -273,13 +273,14 @@ trap 'rm -rf "${TMP:?}"' EXIT
         bash -c 'grep -qxF "1|添加节点|2|查看节点" "$1" &&
                  grep -qxF "3|修改节点|4|删除节点" "$1" &&
                  grep -qxF "5|添加出口||" "$1" &&
-                 grep -qxF "6|cloudflared 管理|7|WARP 管理" "$1" &&
+                 grep -qxF "6|WARP 管理|7|cloudflared 管理" "$1" &&
                  grep -qxF "8|重启 Xray|9|停止 Xray" "$1" &&
-                 test "$(cat "$2")" = cloudflared' _ \
+                 grep -qxF "16|分流设置|17|脚本更新" "$1" &&
+                 test "$(cat "$2")" = warp' _ \
         "$TMP/menu-rows" "$TMP/protocol-calls"
     invoke_protocol_menu 7
-    check 'protocol menu dispatches WARP at 7' \
-        test "$(cat "$TMP/protocol-calls")" = warp
+    check 'protocol menu dispatches cloudflared at 7' \
+        test "$(cat "$TMP/protocol-calls")" = cloudflared
 
     printf '== modify node action dispatch ==\n'
     MODIFY_NODES="$TMP/modify-nodes"
