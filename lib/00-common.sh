@@ -82,7 +82,7 @@ readonly JQ_MERGE_OBJECTS='reduce .[] as $o ({}; reduce ($o | to_entries[]) as $
 # ---------------------------------------------------------------------------
 # 默认 routing 规则集(唯一真相): _init_config_if_empty(20-xray-core) 与
 # _route_restore_default_rules(30-geo) 共用, **绝不允许任一侧另写一份**。
-# 4 条中只有第 2、3 条会让 Xray 加载 geosite.dat/geoip.dat(各 ~20MB+), 这正是
+# 3 条中只有第 2、3 条会让 Xray 加载 geosite.dat/geoip.dat(各 ~20MB+), 这正是
 # Geo 自动更新 → [路由规则] 精简 要摘掉的两条(见 XRAY_PRIVATE_BLOCK_RULE_JSON)。
 # regexp 内 \\d / \\. 是 JSON 转义后的单个反斜杠(单引号防 bash 再吃一层)。
 # ---------------------------------------------------------------------------
@@ -107,30 +107,6 @@ readonly XRAY_DEFAULT_ROUTING_RULES_JSON='[
       "geoip:cn"
     ],
     "outboundTag": "block"
-  },
-  {
-    "domain": [
-      "pypi.org",
-      "unpkg.com",
-      "debian.org",
-      "github.com",
-      "nodejs.org",
-      "ubuntu.com",
-      "kali.download",
-      "pypi.python.org",
-      "ssl.gstatic.com",
-      "www.gstatic.com",
-      "cp.cloudflare.com",
-      "dockerstatic.com",
-      "fonts.gstatic.com",
-      "registry.npmjs.org",
-      "cdnjs.cloudflare.com",
-      "githubusercontent.com",
-      "www.msftconnecttest.com",
-      "regexp:^(mt|khm)\\d?\\.google\\.com$",
-      "regexp:(gstatic|fonts|dl|ajax)\\.google(apis)?\\.com$"
-    ],
-    "outboundTag": "direct"
   }
 ]'
 
