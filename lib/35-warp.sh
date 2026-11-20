@@ -13,7 +13,8 @@ WARP_API_URL="https://warp.cloudflare.now.cc/?run=register&format=xray"
 WARP_MASQUE_API="https://api.cloudflareclient.com/v0a4471"
 WARP_MASQUE_ENDPOINT="162.159.198.2"
 WARP_MASQUE_PORT="443"
-WARP_MASQUE_SERVER_NAME="consumer-masque.cloudflareclient.com"
+# usque README 推荐使用 zt-masque; consumer-masque 虽可用但在部分网络会被重置。
+WARP_MASQUE_SERVER_NAME="zt-masque.cloudflareclient.com"
 _WARP_REASON=""
 _WARP_HTTP_CODE=""
 
@@ -533,11 +534,8 @@ _warp_fetch_masque() {   # <outfile>
         rm -rf -- "$dir"
         return 1
     fi
-    if ! jq -e '.warp_enabled == true' "$dir/enroll.json" >/dev/null 2>&1; then
-        _WARP_REASON="Cloudflare 账户未开启 WARP(MASQUE)"
-        rm -rf -- "$dir"
-        return 1
-    fi
+    # warp_enabled 只反映 WireGuard WARP 开关: 匿名免费设备登记 MASQUE 后仍为 false,
+    # usque 也不检查该字段。以 PATCH 成功且端点公钥、隧道地址完整为准。
     if ! jq -e '
             ((.config.peers[0].public_key // "") != "")
             and (((.config.interface.addresses.v4 // "") != "")
