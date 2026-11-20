@@ -1,6 +1,6 @@
 #!/bin/bash
-# lib/35-warp.sh — WARP 自动注册、Xray WireGuard 出站与分流规则。
-# 注册来源按 warp-reg.sh → wgcf-cli → 注册 API 回退, wgcf-cli 缺失时取 GitHub release 临时副本。
+# lib/35-warp.sh — WARP 自动注册、Xray WireGuard/MASQUE 出站与分流规则。
+# WireGuard 来源按 warp-reg.sh → wgcf-cli → 注册 API 回退; MASQUE 直接走 Cloudflare 设备注册 API。
 # 配置唯一事实来源是 confs 里的 Xray 片段: 注册结果与 endpoint 覆盖都保存在 tag=warp 出站里。
 # 写入一律走 _mutate_config(定义在 50 模块, 调用时才解析); 见 _warp_apply / _warp_delete。
 
@@ -9,6 +9,11 @@ WARP_DEFAULT_PORT="2408"
 WARP_REG_SCRIPT_URL="https://raw.githubusercontent.com/chise0713/warp-reg.sh/master/warp-reg.sh"
 WARP_WGCF_URL="https://github.com/ArchiveNetwork/wgcf-cli/releases/download/v0.3.6"
 WARP_API_URL="https://warp.cloudflare.now.cc/?run=register&format=xray"
+# Cloudflare 设备管理 API 与 usque v4.2.1 对齐; MASQUE H2 使用免费 WARP 的 anycast 段。
+WARP_MASQUE_API="https://api.cloudflareclient.com/v0a4471"
+WARP_MASQUE_ENDPOINT="162.159.198.2"
+WARP_MASQUE_PORT="443"
+WARP_MASQUE_SERVER_NAME="consumer-masque.cloudflareclient.com"
 _WARP_REASON=""
 _WARP_HTTP_CODE=""
 
@@ -49,6 +54,21 @@ def wgcheck:
     then . else error("reserved 必须是 3 个 0-255 整数") end
   | if (($o.mtu | type) == "number") and ($o.mtu > 0) and ($o.mtu <= 65535) and (($o.mtu | floor) == $o.mtu)
     then . else error("mtu 非法") end;
+def masquecheck:
+  if (type == "object") then . else error("MASQUE 归一对象必须是 object") end
+  | . as $o
+  | if hasstr("privateKey") then . else error("缺少 privateKey") end
+  | if hasstr("publicKey") then . else error("缺少 publicKey") end
+  | if (($o.address | type) == "array") and (($o.address | length) > 0)
+       and (([$o.address[] | select((type == "string") and (. != ""))] | length) == ($o.address | length))
+    then . else error("MASQUE address 非法") end
+  | if hasstr("server") then . else error("缺少 server") end
+  | if (($o.port | type) == "number") and ($o.port >= 1) and ($o.port <= 65535)
+       and (($o.port | floor) == $o.port)
+    then . else error("MASQUE port 非法") end
+  | if hasstr("serverName") then . else error("缺少 serverName") end
+  | if (($o.alpn | type) == "array") and (($o.alpn | length) > 0)
+    then . else error("MASQUE alpn 非法") end;
 def reg2norm:
   . as $r
   | {
@@ -84,14 +104,30 @@ def out2norm:
       mtu: (if ($s.mtu | type) == "number" then $s.mtu else 1280 end)
     }
   | wgcheck;
+def masque2norm:
+  . as $r
+  | ($r.response // {}) as $a
+  | ($a.config.interface.addresses // {}) as $i
+  | ($a.config.peers[0] // {}) as $p
+  | {
+      kind: "masque",
+      privateKey: (($r.privateKey // "") | if type == "string" then gsub("[[:space:]]"; "") else "" end),
+      publicKey: ($p.public_key // ""),
+      address: ([$i.v4, $i.v6] | map(select((type == "string") and (. != ""))) | map(addrmask)),
+      server: $server,
+      port: $port,
+      serverName: $sni,
+      alpn: ["h2"]
+    }
+  | masquecheck;
 '
 
 # ---------------------------------------------------------------------------
-# endpoint 规范化: v6 必须带方括号, 裸 IP 补默认 2408 端口, 端口 0 视为未指定。
-# 用法: ep=$(_warp_endpoint_norm "<来源 endpoint>")   —— 非法返回 1 且无输出
+# endpoint 规范化: v6 必须带方括号, 裸 IP 补默认端口(WireGuard 2408 / MASQUE 443),
+# 端口 0 视为未指定。用法: ep=$(_warp_endpoint_norm "<来源 endpoint>" [默认端口])
 # ---------------------------------------------------------------------------
 _warp_endpoint_norm() {
-    local ep="${1:-}" host="" port="" p
+    local ep="${1:-}" default_port="${2:-$WARP_DEFAULT_PORT}" host="" port="" p
     ep="${ep#"${ep%%[![:space:]]*}"}"
     ep="${ep%"${ep##*[![:space:]]}"}"
     [ -n "$ep" ] || return 1
@@ -117,7 +153,7 @@ _warp_endpoint_norm() {
     [ -n "$host" ] || return 1
     [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
     if [ -z "$port" ] || [ "$port" = "0" ]; then
-        port="$WARP_DEFAULT_PORT"
+        port="$default_port"
     fi
     [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
     p=$((10#$port))
@@ -131,8 +167,13 @@ _warp_endpoint_norm() {
 
 # 归一收尾: endpoint 交给 bash 规范化后回写, 其余字段原样保留。失败不输出任何内容。
 _warp_finalize() {   # <候选内部表示 JSON>
-    local obj="${1:-}" ep out
+    local obj="${1:-}" kind ep out
     [ -n "$obj" ] || return 1
+    kind=$(printf '%s' "$obj" | jq -r '.kind // ""' 2>/dev/null) || return 1
+    if [ "$kind" = "masque" ]; then
+        printf '%s\n' "$obj"
+        return 0
+    fi
     ep=$(printf '%s' "$obj" | jq -r '.endpoint // ""' 2>/dev/null) || return 1
     ep=$(_warp_endpoint_norm "$ep") || return 1
     out=$(printf '%s' "$obj" | jq -c --arg ep "$ep" '.endpoint = $ep' 2>/dev/null) || return 1
@@ -352,6 +393,177 @@ _warp_fetch_api() {
     return 0
 }
 
+_warp_http_json() {   # <method> <url> <bodyfile> <dest> [authfile]
+    local method="${1:-}" url="${2:-}" body="${3:-}" dest="${4:-}" auth="${5:-}" code rc
+    local -a args
+    [ -n "$method" ] && [ -n "$url" ] && [ -f "$body" ] && [ -n "$dest" ] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    _WARP_HTTP_CODE=""
+    args=(
+        -sS
+        -o "$dest"
+        -w '%{http_code}'
+        --proto '=https'
+        --proto-redir '=https'
+        --connect-timeout 8
+        --max-time 30
+        -X "$method"
+        -H 'User-Agent: WARP for Android'
+        -H 'CF-Client-Version: a-6.35-4471'
+        -H 'Content-Type: application/json; charset=UTF-8'
+        -H 'Connection: Keep-Alive'
+    )
+    [ -n "$auth" ] && args+=(-K "$auth")
+    code=$(curl "${args[@]}" --data-binary @"$body" "$url" 2>"$dest.err")
+    rc=$?
+    _WARP_HTTP_CODE="${code:-000}"
+    [ "$rc" -eq 0 ] || return 1
+    case "$_WARP_HTTP_CODE" in
+        2??) ;;
+        *) return 1 ;;
+    esac
+    [ -s "$dest" ] || return 1
+    return 0
+}
+
+# MASQUE 注册沿用 usque 的做法: 先注册一个临时 WireGuard 公钥取得账户与 token,
+# 再把账户设备密钥替换为 P-256(secp256r1) 并切换到 masque。临时 WireGuard 私钥不保存。
+# 输出为 {privateKey, response}; response 是 Cloudflare 的 PATCH /reg/<id> 响应。
+_warp_fetch_masque() {   # <outfile>
+    local out="${1:-}" dir="" wg_pub tos serial id token
+    _WARP_REASON=""
+    [ -n "$out" ] || { _WARP_REASON="未指定输出文件"; return 1; }
+    command -v openssl >/dev/null 2>&1 || { _WARP_REASON="openssl 不可用"; return 1; }
+    command -v base64 >/dev/null 2>&1 || { _WARP_REASON="base64 不可用"; return 1; }
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/warp-masque.XXXXXX") || {
+        _WARP_REASON="无法创建 MASQUE 临时目录"
+        return 1
+    }
+    chmod 700 "$dir" 2>/dev/null || {
+        _WARP_REASON="无法保护 MASQUE 临时目录"
+        rm -rf -- "$dir"
+        return 1
+    }
+
+    if ! openssl genpkey -algorithm X25519 -out "$dir/wg.pem" >/dev/null 2>&1; then
+        _WARP_REASON="无法生成 MASQUE 注册用 WireGuard 密钥"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    wg_pub=$(openssl pkey -in "$dir/wg.pem" -pubout -outform DER 2>/dev/null |
+        tail -c 32 | base64 | tr -d '\n')
+    [ -n "$wg_pub" ] || {
+        _WARP_REASON="无法导出 MASQUE 注册用 WireGuard 公钥"
+        rm -rf -- "$dir"
+        return 1
+    }
+    tos=$(date -u +"%Y-%m-%dT%H:%M:%S.000+00:00") || {
+        _WARP_REASON="无法生成注册时间"
+        rm -rf -- "$dir"
+        return 1
+    }
+    serial=$(openssl rand -hex 8 2>/dev/null)
+    [ -n "$serial" ] || {
+        _WARP_REASON="无法生成设备序列号"
+        rm -rf -- "$dir"
+        return 1
+    }
+
+    if ! jq -n --arg key "$wg_pub" --arg tos "$tos" --arg serial "$serial" '{
+            key: $key,
+            install_id: "",
+            fcm_token: "",
+            tos: $tos,
+            model: "PC",
+            serial_number: $serial,
+            os_version: "",
+            key_type: "curve25519",
+            tunnel_type: "wireguard",
+            locale: "en_US"
+        }' > "$dir/reg.body"; then
+        _WARP_REASON="无法生成 MASQUE 注册请求"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! _warp_http_json POST "$WARP_MASQUE_API/reg" "$dir/reg.body" "$dir/reg.json"; then
+        _WARP_REASON=$(_warp_http_reason "$dir/reg.json" 2>/dev/null) ||
+            _WARP_REASON="Cloudflare MASQUE 注册请求失败"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    id=$(jq -r '.id // empty' "$dir/reg.json" 2>/dev/null)
+    token=$(jq -r '.token // empty' "$dir/reg.json" 2>/dev/null)
+    if ! [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || [ -z "$token" ]; then
+        _WARP_REASON="Cloudflare MASQUE 注册响应缺少有效账户信息"
+        rm -rf -- "$dir"
+        return 1
+    fi
+
+    if ! openssl ecparam -name prime256v1 -genkey -noout -out "$dir/ec.pem" >/dev/null 2>&1 ||
+        ! openssl ec -in "$dir/ec.pem" -outform DER -out "$dir/ec.der" >/dev/null 2>&1 ||
+        ! openssl ec -in "$dir/ec.pem" -pubout -outform DER -out "$dir/ec.pub.der" >/dev/null 2>&1; then
+        _WARP_REASON="无法生成 MASQUE P-256 设备密钥"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    base64 < "$dir/ec.der" | tr -d '\n' > "$dir/ec.priv.b64"
+    base64 < "$dir/ec.pub.der" | tr -d '\n' > "$dir/ec.pub.b64"
+    if [ ! -s "$dir/ec.priv.b64" ] || [ ! -s "$dir/ec.pub.b64" ]; then
+        _WARP_REASON="无法编码 MASQUE P-256 设备密钥"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! jq -n --rawfile key "$dir/ec.pub.b64" '{
+            key: $key,
+            key_type: "secp256r1",
+            tunnel_type: "masque"
+        }' > "$dir/enroll.body"; then
+        _WARP_REASON="无法生成 MASQUE 设备登记请求"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$dir/auth.conf" || {
+        _WARP_REASON="无法生成 MASQUE 授权配置"
+        rm -rf -- "$dir"
+        return 1
+    }
+    if ! _warp_http_json PATCH "$WARP_MASQUE_API/reg/$id" "$dir/enroll.body" "$dir/enroll.json" "$dir/auth.conf"; then
+        _WARP_REASON=$(_warp_http_reason "$dir/enroll.json" 2>/dev/null) ||
+            _WARP_REASON="Cloudflare MASQUE 设备登记失败"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! jq -e '.warp_enabled == true' "$dir/enroll.json" >/dev/null 2>&1; then
+        _WARP_REASON="Cloudflare 账户未开启 WARP(MASQUE)"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! jq -e '
+            ((.config.peers[0].public_key // "") != "")
+            and (((.config.interface.addresses.v4 // "") != "")
+                 or ((.config.interface.addresses.v6 // "") != ""))
+        ' "$dir/enroll.json" >/dev/null 2>&1; then
+        _WARP_REASON="Cloudflare MASQUE 登记响应缺少端点或隧道地址"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! jq -n --rawfile privateKey "$dir/ec.priv.b64" --slurpfile response "$dir/enroll.json" '{
+            privateKey: $privateKey,
+            response: $response[0]
+        }' > "$dir/result.json"; then
+        _WARP_REASON="无法生成 MASQUE 注册结果"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! cp "$dir/result.json" "$out" || ! chmod 600 "$out" 2>/dev/null; then
+        _WARP_REASON="无法写入 MASQUE 注册结果"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    rm -rf -- "$dir"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # 归一: 读 <rawfile>, 成功向 stdout 输出内部表示, 失败返回 1 且 stdout 为空。
 # ---------------------------------------------------------------------------
@@ -360,7 +572,9 @@ _warp_normalize_jq() {   # <rawfile> <jq程序后缀>
     local raw="${1:-}" prog="${2:-}" obj
     [ -n "$raw" ] && [ -f "$raw" ] && [ -s "$raw" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
-    obj=$(jq -c "$_WARP_NORM_JQ$prog" "$raw" 2>/dev/null) || return 1
+    obj=$(jq -c --arg server "$WARP_MASQUE_ENDPOINT" --arg sni "$WARP_MASQUE_SERVER_NAME" \
+        --argjson port "$WARP_MASQUE_PORT" \
+        "$_WARP_NORM_JQ$prog" "$raw" 2>/dev/null) || return 1
     [ -n "$obj" ] || return 1
     _warp_finalize "$obj"
 }
@@ -369,6 +583,8 @@ _warp_normalize_reg() { _warp_normalize_jq "${1:-}" ' reg2norm'; }
 
 # wgcf-cli 既可能给注册 JSON, 也可能给 generate --xray 的出站: 有出站字段就按出站解析。
 _warp_normalize_wgcf() { _warp_normalize_jq "${1:-}" ' (if (wgs) != null then out2norm else reg2norm end)'; }
+
+_warp_normalize_masque() { _warp_normalize_jq "${1:-}" ' masque2norm'; }
 
 # API 给的是出站结构; 即使缺 allowedIPs/mtu 也必须重新映射成内部字段, 不拼接来源 JSON。
 _warp_normalize_api() { _warp_normalize_jq "${1:-}" ' (if (wgs) != null then out2norm else error("不是 Xray WireGuard 出站结构") end)'; }
@@ -397,18 +613,44 @@ _warp_build_outbound() {   # [true|false, 缺省 true]
     command -v jq >/dev/null 2>&1 || return 1
     ds=$(_warp_domain_strategy)
     printf '%s' "$norm" | jq -c --argjson nk "$nk" --arg ds "$ds" "$_WARP_NORM_JQ"'
-        wgcheck
-        | { protocol: "wireguard",
-            tag: "warp",
-            streamSettings: { sockopt: { domainStrategy: $ds } },
-            settings: {
-              secretKey: .secretKey,
-              address: .address,
-              reserved: .reserved,
-              peers: [{ publicKey: .publicKey, endpoint: .endpoint, allowedIPs: .allowedIPs }],
-              mtu: .mtu,
-              noKernelTun: $nk
-            } }' 2>/dev/null
+        if .kind == "masque" then
+            masquecheck
+            | { protocol: "masque",
+                tag: "warp",
+                settings: {
+                  address: .server,
+                  port: .port
+                },
+                streamSettings: {
+                  network: "masque",
+                  security: "tls",
+                  tlsSettings: {
+                    serverName: .serverName,
+                    alpn: .alpn
+                  },
+                  masqueSettings: {
+                    warp: {
+                      privateKey: .privateKey,
+                      publicKey: .publicKey,
+                      address: .address
+                    }
+                  },
+                  sockopt: { domainStrategy: $ds }
+                } }
+        else
+            wgcheck
+            | { protocol: "wireguard",
+                tag: "warp",
+                streamSettings: { sockopt: { domainStrategy: $ds } },
+                settings: {
+                  secretKey: .secretKey,
+                  address: .address,
+                  reserved: .reserved,
+                  peers: [{ publicKey: .publicKey, endpoint: .endpoint, allowedIPs: .allowedIPs }],
+                  mtu: .mtu,
+                  noKernelTun: $nk
+                } }
+        end' 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -416,9 +658,37 @@ _warp_build_outbound() {   # [true|false, 缺省 true]
 # 全部失败只在 stderr 说明原因, 不碰配置。
 # ---------------------------------------------------------------------------
 _warp_obtain() {
-    local out="${1:-}" mode label fetch_fn norm_fn raw norm reason
+    local out="${1:-}" kind="${2:-wireguard}" mode label fetch_fn norm_fn raw norm reason
     [ -n "$out" ] || return 1
     command -v jq >/dev/null 2>&1 || { _error "jq 不可用, 无法解析 WARP 注册结果"; return 1; }
+    case "$kind" in
+        wireguard) ;;
+        masque)
+            raw=$(mktemp) || { _error "无法创建临时文件"; return 1; }
+            norm=""
+            reason=""
+            _WARP_REASON=""
+            if ! _warp_fetch_masque "$raw"; then
+                reason="${_WARP_REASON:-未取得 Cloudflare MASQUE 注册响应}"
+            elif ! norm=$(_warp_normalize_masque "$raw"); then
+                reason="Cloudflare MASQUE 响应无法解析"
+            fi
+            rm -f "$raw"
+            if [ -n "$norm" ]; then
+                if printf '%s' "$norm" > "$out"; then
+                    return 0
+                fi
+                _error "无法写入注册结果: $out"
+                return 1
+            fi
+            _error "MASQUE 注册失败: ${reason:-未取得注册响应}"
+            return 1
+            ;;
+        *)
+            _error "未知 WARP 注册方式: $kind"
+            return 1
+            ;;
+    esac
     for mode in reg wgcf api; do
         case "$mode" in
             reg)  label="warp-reg.sh"; fetch_fn=_warp_fetch_warp_reg; norm_fn=_warp_normalize_reg ;;
@@ -476,7 +746,13 @@ _warp_outbound_json() {
     printf '%s' "$ob"
 }
 
-# 单行: present<TAB>endpoint<TAB>addresses<TAB>mtu<TAB>ruleCount
+_warp_outbound_kind() {
+    local ob
+    ob=$(_warp_outbound_json) || return 1
+    printf '%s' "$ob" | jq -r '.protocol // ""' 2>/dev/null
+}
+
+# 单行: present<TAB>kind<TAB>endpoint<TAB>addresses<TAB>mtu<TAB>ruleCount
 _warp_state_summary() {
     _config_present || return 1
     command -v jq >/dev/null 2>&1 || return 1
@@ -485,11 +761,20 @@ _warp_state_summary() {
         . as $root
         | ([$root.outbounds[]? | select((.tag? // "") == "warp")] | first) as $w
         | ([$root.routing.rules[]? | select(iswrule)] | length) as $n
-        | if $w == null then ["0", "", "", "", ""]
-          else ["1",
-                ($w.settings.peers[0].endpoint // ""),
-                ([$w.settings.address[]? | tostring] | join(",")),
-                (($w.settings.mtu // "") | tostring),
+        | if $w == null then ["0", "-", "-", "-", "-", "0"]
+          else ($w.protocol // "wireguard") as $p
+          | ["1",
+                $p,
+                (if $p == "masque" then
+                    ($w.settings.address // "") as $h
+                    | ($w.settings.port // 443) as $port
+                    | ((if ($h | test(":")) and (($h | startswith("[")) | not)
+                          then "[" + $h + "]" else $h end) + ":" + ($port | tostring))
+                 else ($w.settings.peers[0].endpoint // "") end),
+                (if $p == "masque" then
+                    ([$w.streamSettings.masqueSettings.warp.address[]? | tostring] | join(","))
+                 else ([$w.settings.address[]? | tostring] | join(",")) end),
+                (if $p == "masque" then "-" else (($w.settings.mtu // "") | tostring) end),
                 ($n | tostring)]
           end
         | @tsv' 2>/dev/null) || return 1
@@ -498,13 +783,15 @@ _warp_state_summary() {
 }
 
 # 替换或追加 tag=warp 出站; 已有同 tag 出站原位替换, 其它出站原样保留。
-# 重新注册沿用现有出站的 noKernelTun 选择, 不让重新注册悄悄重置 TUN 模式。
-# 全新注册用推荐值 true; 已有出站只在明确 true 时保持, 其余(含缺字段)按 Xray 默认的 false 处理。
+# 重新注册 WireGuard 时沿用现有出站的 noKernelTun 选择, 不让重新注册悄悄重置 TUN 模式。
+# 全新注册或从 MASQUE 切回 WireGuard 时用推荐值 true; 已有 WireGuard 只在明确 true 时保持。
 _warp_apply() {
     local norm="${1:-}" ob nk=true existing
     [ -n "$norm" ] || return 1
     if existing=$(_warp_outbound_json 2>/dev/null); then
-        [ "$(printf '%s' "$existing" | jq -r '.settings.noKernelTun // false' 2>/dev/null)" = "true" ] || nk=false
+        if [ "$(printf '%s' "$existing" | jq -r '.protocol // ""' 2>/dev/null)" = "wireguard" ]; then
+            [ "$(printf '%s' "$existing" | jq -r '.settings.noKernelTun // false' 2>/dev/null)" = "true" ] || nk=false
+        fi
     fi
     ob=$(printf '%s' "$norm" | _warp_build_outbound "$nk") || return 1
     [ -n "$ob" ] || return 1
@@ -522,24 +809,54 @@ _warp_apply() {
     return 0
 }
 
-# 只改 peers[0].endpoint, 其它字段(含分流规则)不动。
+# WireGuard 改 peers[0].endpoint; MASQUE 改 settings.address / settings.port。
+# 其它字段(含分流规则)不动。
 _warp_set_endpoint() {
-    local ep
-    ep=$(_warp_endpoint_norm "${1:-}") || return 1
-    _config_edit_preflight "管理 WARP" || return 1
-    _warp_outbound_json | jq -e '.settings.peers[0].publicKey' >/dev/null 2>&1 || {
-        _error "WARP 出站不存在或缺少 peer, 无法修改 endpoint"
+    local ep kind host port
+    kind=$(_warp_outbound_kind 2>/dev/null) || {
+        _error "WARP 出站不存在, 无法修改 endpoint"
         return 1
     }
-    _mutate_config --arg ep "$ep" '
-        . as $root
-        | .outbounds = ([$root.outbounds[]?
-            | if (.tag? // "") == "warp"
-              then (if ((.settings.peers // []) | length) > 0
-                    then .settings.peers[0].endpoint = $ep
-                    else . end)
-              else . end])
-    ' || return 1
+    case "$kind" in
+        masque) ep=$(_warp_endpoint_norm "${1:-}" "$WARP_MASQUE_PORT") || return 1 ;;
+        wireguard) ep=$(_warp_endpoint_norm "${1:-}" "$WARP_DEFAULT_PORT") || return 1 ;;
+        *)
+            _error "未知 WARP 出站协议: $kind"
+            return 1
+            ;;
+    esac
+    _config_edit_preflight "管理 WARP" || return 1
+    if [ "$kind" = "masque" ]; then
+        if [[ "$ep" == \[*\]*:* ]]; then
+            host="${ep#\[}"
+            host="${host%%\]*}"
+            port="${ep##*:}"
+        else
+            host="${ep%:*}"
+            port="${ep##*:}"
+        fi
+        _mutate_config --arg host "$host" --argjson port "$port" '
+            . as $root
+            | .outbounds = ([$root.outbounds[]?
+                | if (.tag? // "") == "warp"
+                  then (.settings.address = $host | .settings.port = $port)
+                  else . end])
+        ' || return 1
+    else
+        _warp_outbound_json | jq -e '.settings.peers[0].publicKey' >/dev/null 2>&1 || {
+            _error "WARP 出站缺少 peer, 无法修改 endpoint"
+            return 1
+        }
+        _mutate_config --arg ep "$ep" '
+            . as $root
+            | .outbounds = ([$root.outbounds[]?
+                | if (.tag? // "") == "warp"
+                  then (if ((.settings.peers // []) | length) > 0
+                        then .settings.peers[0].endpoint = $ep
+                        else . end)
+                  else . end])
+        ' || return 1
+    fi
     return 0
 }
 
@@ -733,11 +1050,27 @@ _warp_delete_rule() {
 # ---------------------------------------------------------------------------
 # 子菜单: 不调用 _menu_require_tty(只有主菜单调用)。菜单只显示是否存在/endpoint/地址/MTU/规则数。
 # ---------------------------------------------------------------------------
-_warp_register() {
-    local tmp norm
+_warp_register() {   # [wireguard|masque]
+    local kind="${1:-}" ans tmp norm
+    if [ -z "$kind" ]; then
+        echo
+        echo -e "  ${CYAN}选择 WARP 连接方式${NC}"
+        echo -e "  ${GREEN}[1]${NC} WireGuard (UDP，兼容性好)"
+        echo -e "  ${GREEN}[2]${NC} MASQUE (HTTP/2 over TLS，TCP 443)"
+        read -rp "  请选择 [1]: " ans || return 1
+        case "${ans:-1}" in
+            1) kind="wireguard" ;;
+            2) kind="masque" ;;
+            *) _info "已取消"; return 0 ;;
+        esac
+    fi
+    case "$kind" in
+        wireguard|masque) ;;
+        *) _error "未知 WARP 连接方式: $kind"; return 1 ;;
+    esac
     _config_edit_preflight "管理 WARP" || return 1
     tmp=$(mktemp) || { _error "无法创建临时文件"; return 1; }
-    if ! _warp_obtain "$tmp"; then
+    if ! _warp_obtain "$tmp" "$kind"; then
         rm -f "$tmp"
         _error "WARP 注册失败, 配置未修改"
         return 1
@@ -749,7 +1082,11 @@ _warp_register() {
         _error "WARP 出站写入失败(配置已回滚)"
         return 1
     fi
-    _success "WARP 出站已写入(tag=warp), xray 已用新配置重启"
+    if [ "$kind" = "masque" ]; then
+        _success "WARP MASQUE 出站已写入(tag=warp), xray 已用新配置重启"
+    else
+        _success "WARP WireGuard 出站已写入(tag=warp), xray 已用新配置重启"
+    fi
     _tip "注册/重新注册不会自动添加分流规则; 需要分流请在 [4] 添加"
     return 0
 }
@@ -789,13 +1126,24 @@ _warp_add_rule_prompt() {
 }
 
 _warp_set_endpoint_prompt() {
-    local ep
-    _warp_outbound_json >/dev/null || { _error "WARP 出站不存在"; return 1; }
+    local ep kind default_port example
+    kind=$(_warp_outbound_kind 2>/dev/null) || { _error "WARP 出站不存在"; return 1; }
+    case "$kind" in
+        masque)
+            default_port="$WARP_MASQUE_PORT"
+            example="$WARP_MASQUE_ENDPOINT"
+            _tip "MASQUE 换端点时必须保证端点证书公钥与 warp.publicKey 一致, 只建议使用 WARP MASQUE 段"
+            ;;
+        *)
+            default_port="$WARP_DEFAULT_PORT"
+            example="162.159.192.1"
+            ;;
+    esac
     while true; do
         read -rp "  新 endpoint (回车取消): " ep || return 1
         [ -n "$ep" ] || { _info "已取消"; return 0; }
-        _warp_endpoint_norm "$ep" >/dev/null && break
-        _warn "endpoint 非法(例: 162.159.192.1:2408 或 [2606:4700::1]:2408), 请重新输入"
+        _warp_endpoint_norm "$ep" "$default_port" >/dev/null && break
+        _warn "endpoint 非法(例: ${example}:${default_port} 或 [2606:4700::1]:${default_port}), 请重新输入"
     done
     if _warp_set_endpoint "$ep"; then
         _success "endpoint 已更新, xray 已用新配置重启"
@@ -848,8 +1196,10 @@ _warp_delete_prompt() {
 # 内核 TUN 模式: on=强制关闭(noKernelTun=true, 始终 gVisor), auto=让 Xray 自动检测。
 # 官方文档: TUN 性能更高, 只有 LXC/Docker 里 TUN 起不来时才需要强制关闭。
 _warp_tun_mode() {
-    local ob
+    local ob kind
     ob=$(_warp_outbound_json) || return 1
+    kind=$(printf '%s' "$ob" | jq -r '.protocol // ""' 2>/dev/null) || return 1
+    [ "$kind" = "wireguard" ] || return 1
     if printf '%s' "$ob" | jq -e '.settings.noKernelTun == true' >/dev/null 2>&1; then
         printf 'on'
     else
@@ -858,10 +1208,14 @@ _warp_tun_mode() {
 }
 
 _warp_set_tun() {   # <on|auto>
-    local mode="${1:-}" nk
+    local mode="${1:-}" nk kind
     case "$mode" in on|auto) ;; *) return 1 ;; esac
     _config_edit_preflight "管理 WARP" || return 1
-    _warp_outbound_json >/dev/null || { _error "WARP 出站不存在, 无法修改 TUN 模式"; return 1; }
+    kind=$(_warp_outbound_kind 2>/dev/null) || { _error "WARP 出站不存在, 无法修改 TUN 模式"; return 1; }
+    [ "$kind" = "wireguard" ] || {
+        _error "MASQUE 出站不支持内核 TUN 模式"
+        return 1
+    }
     nk=false
     [ "$mode" = on ] && nk=true
     _mutate_config --argjson nk "$nk" '
@@ -874,8 +1228,19 @@ _warp_set_tun() {   # <on|auto>
 }
 
 _warp_set_tun_prompt() {
-    local cur choice
-    cur=$(_warp_tun_mode) || { _error "WARP 出站不存在"; return 1; }
+    local cur choice kind
+    if ! cur=$(_warp_tun_mode); then
+        kind=$(_warp_outbound_kind 2>/dev/null) || {
+            _error "WARP 出站不存在"
+            return 1
+        }
+        if [ "$kind" = "masque" ]; then
+            _error "MASQUE 出站不支持内核 TUN 模式"
+        else
+            _error "无法读取 WARP 出站的 TUN 模式"
+        fi
+        return 1
+    fi
     if [ "$cur" = on ]; then
         echo -e "  当前: ${CYAN}强制关闭内核 TUN${NC} (noKernelTun=true, 始终使用 gVisor 用户态网络栈)"
     else
@@ -907,29 +1272,42 @@ _warp_set_tun_prompt() {
 }
 
 _warp_menu() {
-    local choice st present endpoint addresses mtu rules
+    local choice st present kind endpoint addresses mtu rules method
     while true; do
         clear
         echo
-        echo -e "  ${CYAN}【WARP (Cloudflare WireGuard 出站)】${NC}"
+        echo -e "  ${CYAN}【WARP (Cloudflare WireGuard / MASQUE 出站)】${NC}"
         echo
         present=0
+        kind=""
         endpoint=""
         addresses=""
         mtu=""
         rules=""
         if st=$(_warp_state_summary); then
-            IFS=$'\t' read -r present endpoint addresses mtu rules <<< "$st"
+            IFS=$'\t' read -r present kind endpoint addresses mtu rules <<< "$st"
             if [ "$present" = "1" ]; then
+                if [ "$kind" = "masque" ]; then
+                    method="MASQUE (HTTP/2)"
+                else
+                    method="WireGuard"
+                fi
                 echo -e "  出站:      ${GREEN}已存在${NC} (tag=$WARP_TAG)"
+                echo -e "  方式:      ${CYAN}${method}${NC}"
                 echo -e "  endpoint:  ${CYAN}${endpoint:-未知}${NC}"
                 echo -e "  地址:      ${CYAN}${addresses:-未知}${NC}"
-                echo -e "  MTU:       ${CYAN}${mtu:-未知}${NC}"
+                if [ "$kind" != "masque" ]; then
+                    echo -e "  MTU:       ${CYAN}${mtu:-未知}${NC}"
+                fi
                 echo -e "  分流规则:  ${CYAN}${rules:-0}${NC} 条"
-                case "$(_warp_tun_mode 2>/dev/null)" in
-                    on) echo -e "  内核 TUN:  ${CYAN}强制关闭${NC} (始终使用 gVisor)" ;;
-                    auto) echo -e "  内核 TUN:  ${CYAN}自动检测${NC} (有权限时走内核 TUN)" ;;
-                esac
+                if [ "$kind" = "masque" ]; then
+                    echo -e "  传输:      ${CYAN}MASQUE CONNECT-IP / HTTP2 over TLS${NC}"
+                else
+                    case "$(_warp_tun_mode 2>/dev/null)" in
+                        on) echo -e "  内核 TUN:  ${CYAN}强制关闭${NC} (始终使用 gVisor)" ;;
+                        auto) echo -e "  内核 TUN:  ${CYAN}自动检测${NC} (有权限时走内核 TUN)" ;;
+                    esac
+                fi
             else
                 echo -e "  出站:      ${YELLOW}未配置${NC}"
             fi
@@ -937,9 +1315,9 @@ _warp_menu() {
             _warn "无法读取当前配置(Xray 未安装 / 配置缺失 / jq 不可用)"
         fi
         echo
-        echo -e "  ${GREEN}[1]${NC} 注册 / 重新注册 WARP"
+        echo -e "  ${GREEN}[1]${NC} 注册 / 重新注册 WARP (WireGuard / MASQUE)"
         echo -e "  ${GREEN}[2]${NC} 修改 endpoint"
-        echo -e "  ${GREEN}[3]${NC} 内核 TUN 模式 (强制关闭 / 自动检测)"
+        echo -e "  ${GREEN}[3]${NC} 内核 TUN 模式 (仅 WireGuard)"
         echo -e "  ${GREEN}[4]${NC} 添加分流规则 (domain / ip)"
         echo -e "  ${GREEN}[5]${NC} 查看分流规则"
         echo -e "  ${GREEN}[6]${NC} 删除分流规则"
