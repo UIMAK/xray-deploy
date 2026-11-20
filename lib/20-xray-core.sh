@@ -2765,7 +2765,7 @@ _xray_core_menu() {
                 autostart=$(_xray_service_enable_state 2>/dev/null) || autostart=""
                 case "$autostart" in
                     enabled) autostart_label="${GREEN}● 已启用${NC}" ;;
-                    disabled) autostart_label="${YELLOW}○ 已关闭${NC}" ;;
+                    disabled) autostart_label="${RED}○ 已关闭${NC}" ;;
                     *) autostart_label="${RED}未知${NC}" ;;
                 esac
                 echo -e "  开机自启: ${autostart_label}"
