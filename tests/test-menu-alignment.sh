@@ -233,7 +233,7 @@ trap 'rm -rf "${TMP:?}"' EXIT
             _auto_adopt_orphans() { return 0; }
             _auto_ensure_config_env() { return 0; }
             _manage_xray() { printf '%s\n' "$*" >> "$TMP/service-calls"; return "$STOP_RC"; }
-            _main_menu <<< $'12\n0'
+            _main_menu <<< $'9\n0'
         ) > "$TMP/output" 2>&1 || RC=$?
     }
     invoke_stop_menu 1
@@ -268,15 +268,136 @@ trap 'rm -rf "${TMP:?}"' EXIT
             _main_menu <<< "$PROTOCOL_CHOICE"$'\n0'
         ) > "$TMP/output" 2>&1 || RC=$?
     }
-    invoke_protocol_menu 9
-    check 'protocol menu shows and dispatches cloudflared at 9' \
-        bash -c 'grep -qxF "8|Xray Hy2 管理|9|cloudflared 管理" "$1" &&
-                 grep -qxF "10|WARP 管理||" "$1" &&
+    invoke_protocol_menu 6
+    check 'node menu exposes modify at 3 and protocol menus at 6-7' \
+        bash -c 'grep -qxF "1|添加节点|2|查看节点" "$1" &&
+                 grep -qxF "3|修改节点|4|删除节点" "$1" &&
+                 grep -qxF "5|添加出口||" "$1" &&
+                 grep -qxF "6|cloudflared 管理|7|WARP 管理" "$1" &&
+                 grep -qxF "8|重启 Xray|9|停止 Xray" "$1" &&
                  test "$(cat "$2")" = cloudflared' _ \
         "$TMP/menu-rows" "$TMP/protocol-calls"
-    invoke_protocol_menu 10
-    check 'protocol menu dispatches WARP at 10' \
+    invoke_protocol_menu 7
+    check 'protocol menu dispatches WARP at 7' \
         test "$(cat "$TMP/protocol-calls")" = warp
+
+    printf '== modify node action dispatch ==\n'
+    MODIFY_NODES="$TMP/modify-nodes"
+    mkdir -p "$MODIFY_NODES"
+    jq -n '{tag:"a-reality", protocol:"vless-tcp-reality-vision", name:"reality",
+            port:443, listen:"::", sni:"example.test"}' > "$MODIFY_NODES/a-reality.json"
+    jq -n '{tag:"b-hy2", protocol:"hysteria2", name:"hy2",
+            port:8443, listen:"::", congestion:"bbr"}' > "$MODIFY_NODES/b-hy2.json"
+    invoke_modify_node() {
+        local input="$1"
+        : > "$TMP/modify-calls"
+        (
+            NODES_DIR="$MODIFY_NODES"
+            clear() { :; }
+            _menu_name_pad() { printf '%s' "$1"; }
+            _press_any_key() { :; }
+            _reality_node_mode() { printf 'direct\n'; }
+            _modify_port() { printf 'port:%s\n' "$1" >> "$TMP/modify-calls"; }
+            _update_listen() { printf 'listen:%s\n' "$1" >> "$TMP/modify-calls"; }
+            _reality_domain_menu() { printf 'reality:%s\n' "$1" >> "$TMP/modify-calls"; }
+            _hy2_toggle_brutal() { printf 'brutal:%s\n' "$1" >> "$TMP/modify-calls"; }
+            _modify_node <<< "$input"
+        ) > "$TMP/output" 2>&1
+    }
+    invoke_modify_node $'1\n1\n0\n'
+    check 'modify node routes port edit to selected node' \
+        test "$(cat "$TMP/modify-calls")" = "port:a-reality"
+    invoke_modify_node $'1\n2\n0\n'
+    check 'modify node routes listen edit to selected node' \
+        test "$(cat "$TMP/modify-calls")" = "listen:a-reality"
+    invoke_modify_node $'1\n3\n0\n'
+    check 'modify node routes Reality domain edit to selected node' \
+        test "$(cat "$TMP/modify-calls")" = "reality:a-reality"
+    invoke_modify_node $'2\n3\n0\n'
+    check 'modify node routes Hy2 congestion edit to selected node' \
+        test "$(cat "$TMP/modify-calls")" = "brutal:b-hy2"
+
+    MODIFY_RENAME_NODES="$TMP/modify-nodes-rename"
+    mkdir -p "$MODIFY_RENAME_NODES"
+    : > "$TMP/modify-calls"
+    jq -n '{tag:"r1", protocol:"vless-tcp-reality-vision", name:"rename-me",
+            port:443, listen:"::", sni:"example.test"}' > "$MODIFY_RENAME_NODES/r1.json"
+    (
+        NODES_DIR="$MODIFY_RENAME_NODES"
+        clear() { :; }
+        _menu_name_pad() { printf '%s' "$1"; }
+        _press_any_key() { :; }
+        _reality_node_mode() { printf 'direct\n'; }
+        _modify_port() {
+            printf 'port:%s\n' "$1" >> "$TMP/modify-calls"
+            jq '.tag="r2"' "$NODES_DIR/r1.json" > "$NODES_DIR/r2.json"
+            rm -f "$NODES_DIR/r1.json"
+            XD_NODE_EDIT_TAG="r2"
+        }
+        _reality_domain_menu() { printf 'reality:%s\n' "$1" >> "$TMP/modify-calls"; }
+        _modify_node <<< $'1\n1\n3\n0\n'
+    ) > "$TMP/output" 2>&1
+    check 'modify node refreshes tag after Reality port rename' \
+        test "$(cat "$TMP/modify-calls")" = $'port:r1\nreality:r2'
+
+    PORT_TAG_NODES="$TMP/port-tag-nodes"
+    mkdir -p "$PORT_TAG_NODES"
+    jq -n '{tag:"xd-reality-443", protocol:"vless-tcp-reality-vision",
+            name:"port-tag", port:443, listen:"::", sni:"example.test"}' \
+        > "$PORT_TAG_NODES/xd-reality-443.json"
+    (
+        NODES_DIR="$PORT_TAG_NODES"
+        clear() { :; }
+        _press_any_key() { :; }
+        _input_port() { printf '8443'; }
+        _reality_port_txn() { return 0; }
+        XD_NODE_EDIT_TAG=""
+        _modify_port xd-reality-443 >/dev/null 2>&1
+        printf '%s\n' "$XD_NODE_EDIT_TAG" > "$TMP/port-tag"
+    )
+    check 'real modify port publishes renamed Reality tag' \
+        test "$(cat "$TMP/port-tag")" = "xd-reality-8443"
+
+    printf '== Hy2 preset tag paths ==\n'
+    PRESET_NODES="$TMP/hy2-preset-nodes"
+    mkdir -p "$PRESET_NODES"
+    jq -n '{tag:"p-hy2", protocol:"hysteria2", name:"preset",
+            port:8443, listen:"::", congestion:"brutal"}' \
+        > "$PRESET_NODES/p-hy2.json"
+    : > "$TMP/preset-calls"
+    (
+        NODES_DIR="$PRESET_NODES"
+        clear() { :; }
+        _press_any_key() { :; }
+        _has_hy2_nodes() { return 0; }
+        _ensure_iptables() { return 0; }
+        _hy2_select_node() { printf 'SELECTED:%s\n' "$*" >> "$TMP/preset-calls"; return 1; }
+        _normalize_bandwidth() { printf '%s' "$1"; }
+        _hy2_congestion_txn() { printf 'bw:%s\n' "$1" >> "$TMP/preset-calls"; return 3; }
+        _read_hop_ranges() { printf ''; }
+        _read_hop_ranges_raw() { printf ''; }
+        _config_jq() { return 0; }
+        _hy2_masq_desc() { printf ''; }
+        _hy2_list_all_hop_rules() { printf ''; }
+        _hy2_adjust_bandwidth p-hy2 <<< $'\n\n'
+        _hy2_toggle_hop p-hy2 <<< $'\n'
+        _hy2_obfs_menu p-hy2 <<< $'0\n'
+        _hy2_masq_menu p-hy2 <<< $'0\n'
+        _hy2_view_hop p-hy2
+    ) > "$TMP/preset-output" 2>&1
+    check 'Hy2 preset actions never reselect a node' \
+        bash -c '! grep -q "^SELECTED:" "$1" && test "$(cat "$1")" = "bw:p-hy2"' _ \
+        "$TMP/preset-calls"
+    check 'Hy2 preset actions reached every action path' \
+        bash -c 'grep -q "调整 brutal 带宽" "$1" &&
+                 grep -q "端口跳跃 — 启用/禁用" "$1" &&
+                 grep -q "混淆 salamander / gecko" "$1" &&
+                 grep -q "HTTP/3 页面伪装 masquerade" "$1"' _ \
+        "$TMP/preset-output"
+    check 'per-node hop view reports node-specific empty state' \
+        bash -c 'grep -q "该节点未启用端口跳跃" "$1" &&
+                 ! grep -q "暂无启用端口跳跃的节点" "$1"' _ \
+        "$TMP/preset-output"
 
     printf '== update check download path ==\n'
     update_check_fixture() {
