@@ -1,7 +1,7 @@
 #!/bin/bash
-# lib/35-warp.sh — WARP 自动注册、Xray WireGuard/MASQUE 出站与分流规则。
+# lib/35-warp.sh — WARP 自动注册与 Xray WireGuard/MASQUE 出站。
 # WireGuard 来源按 warp-reg.sh → wgcf-cli → 注册 API 回退; MASQUE 直接走 Cloudflare 设备注册 API。
-# 配置唯一事实来源是 confs 里的 Xray 片段: 注册结果与 endpoint 覆盖都保存在 tag=warp 出站里。
+# 配置唯一事实来源是 confs 里的 Xray 片段: 注册结果保存在 tag=warp 出站里。
 # 写入一律走 _mutate_config(定义在 50 模块, 调用时才解析); 见 _warp_apply / _warp_delete。
 
 WARP_TAG="warp"
@@ -632,8 +632,7 @@ _warp_build_outbound() {   # [true|false, 缺省 true]
                       publicKey: .publicKey,
                       address: .address
                     }
-                  },
-                  sockopt: { domainStrategy: $ds }
+                  }
                 } }
         else
             wgcheck
@@ -716,22 +715,6 @@ _warp_obtain() {
     return 1
 }
 
-# 分流规则判据: 只有 outboundTag=warp 且带 domain 或 ip 的规则才算本模块管理的 WARP 规则。
-# 列表、删除与菜单计数共用这一个判据, 避免编号与可删除条目错位。
-# 去重只统计 WARP 规则内的值; 其它出站的同名值不参与去重, 否则「让 geoip:cn 或
-# 已在直连白名单里的域名走 warp」这类合法覆盖会被静默丢弃。
-_WARP_RULE_JQ='
-def iswrule: ((.outboundTag? // "") == "warp")
-  and (((.["domain"]? // null) != null) or ((.["ip"]? // null) != null));
-def wvals($k): [ .[]? | select((.outboundTag? // "") == "warp") | (.[$k]? // null)
-                 | (if type == "array" then .[] else . end) | select(type == "string") ];
-def newvals($k; $v):
-  . as $rules
-  | ($rules | wvals($k)) as $have
-  | ($v | reduce .[] as $x ([];
-      if (($have | index($x)) == null) and (index($x) == null) then . + [$x] else . end));
-'
-
 # ---------------------------------------------------------------------------
 # 配置操作: 读取走 _config_jq, 写入走 _mutate_config(备份/提交/verified restart/回滚)。
 # ---------------------------------------------------------------------------
@@ -750,16 +733,15 @@ _warp_outbound_kind() {
     printf '%s' "$ob" | jq -r '.protocol // ""' 2>/dev/null
 }
 
-# 单行: present<TAB>kind<TAB>endpoint<TAB>addresses<TAB>mtu<TAB>ruleCount
+# 单行: present<TAB>kind<TAB>endpoint<TAB>addresses<TAB>mtu
 _warp_state_summary() {
     _config_present || return 1
     command -v jq >/dev/null 2>&1 || return 1
     local line
-    line=$(_config_jq -r "$_WARP_RULE_JQ"'
+    line=$(_config_jq -r '
         . as $root
         | ([$root.outbounds[]? | select((.tag? // "") == "warp")] | first) as $w
-        | ([$root.routing.rules[]? | select(iswrule)] | length) as $n
-        | if $w == null then ["0", "-", "-", "-", "-", "0"]
+        | if $w == null then ["0", "-", "-", "-", "-"]
           else ($w.protocol // "wireguard") as $p
           | ["1",
                 $p,
@@ -772,8 +754,7 @@ _warp_state_summary() {
                 (if $p == "masque" then
                     ([$w.streamSettings.masqueSettings.warp.address[]? | tostring] | join(","))
                  else ([$w.settings.address[]? | tostring] | join(",")) end),
-                (if $p == "masque" then "-" else (($w.settings.mtu // "") | tostring) end),
-                ($n | tostring)]
+                (if $p == "masque" then "-" else (($w.settings.mtu // "") | tostring) end)]
           end
         | @tsv' 2>/dev/null) || return 1
     [ -n "$line" ] || return 1
@@ -807,57 +788,6 @@ _warp_apply() {
     return 0
 }
 
-# WireGuard 改 peers[0].endpoint; MASQUE 改 settings.address / settings.port。
-# 其它字段(含分流规则)不动。
-_warp_set_endpoint() {
-    local ep kind host port
-    kind=$(_warp_outbound_kind 2>/dev/null) || {
-        _error "WARP 出站不存在, 无法修改 endpoint"
-        return 1
-    }
-    case "$kind" in
-        masque) ep=$(_warp_endpoint_norm "${1:-}" "$WARP_MASQUE_PORT") || return 1 ;;
-        wireguard) ep=$(_warp_endpoint_norm "${1:-}" "$WARP_DEFAULT_PORT") || return 1 ;;
-        *)
-            _error "未知 WARP 出站协议: $kind"
-            return 1
-            ;;
-    esac
-    _config_edit_preflight "管理 WARP" || return 1
-    if [ "$kind" = "masque" ]; then
-        if [[ "$ep" == \[*\]*:* ]]; then
-            host="${ep#\[}"
-            host="${host%%\]*}"
-            port="${ep##*:}"
-        else
-            host="${ep%:*}"
-            port="${ep##*:}"
-        fi
-        _mutate_config --arg host "$host" --argjson port "$port" '
-            . as $root
-            | .outbounds = ([$root.outbounds[]?
-                | if (.tag? // "") == "warp"
-                  then (.settings.address = $host | .settings.port = $port)
-                  else . end])
-        ' || return 1
-    else
-        _warp_outbound_json | jq -e '.settings.peers[0].publicKey' >/dev/null 2>&1 || {
-            _error "WARP 出站缺少 peer, 无法修改 endpoint"
-            return 1
-        }
-        _mutate_config --arg ep "$ep" '
-            . as $root
-            | .outbounds = ([$root.outbounds[]?
-                | if (.tag? // "") == "warp"
-                  then (if ((.settings.peers // []) | length) > 0
-                        then .settings.peers[0].endpoint = $ep
-                        else . end)
-                  else . end])
-        ' || return 1
-    fi
-    return 0
-}
-
 # 出站与引用它的分流规则必须在同一次 jq 变更里一起删除, 否则会留下悬空 outboundTag。
 _warp_delete() {
     _config_edit_preflight "管理 WARP" || return 1
@@ -873,180 +803,8 @@ _warp_delete() {
     return 0
 }
 
-# 新规则追加到 routing.rules 末尾, 不改动既有规则的顺序与语义。
-# 首个匹配生效: 已被更靠前规则命中的目标不会走到 WARP, 添加后会提示这一点。
-_warp_add_rule() {   # <domain|ip> <逗号分隔值>
-    local kind="${1:-}" csv="${2:-}" v vals_json new
-    csv="${csv//，/,}"   # 值列表允许全角/半角逗号混用
-    local -a vals=()
-    case "$kind" in domain|ip) ;; *) return 1 ;; esac
-    [ -n "$csv" ] || return 1
-    local IFS=','
-    # 只按逗号切词, 关闭路径名展开: 值里的 * ? [ 不会被当前目录的同名文件替换。
-    set -f
-    for v in $csv; do
-        v="${v#"${v%%[![:space:]]*}"}"
-        v="${v%"${v##*[![:space:]]}"}"
-        [ -n "$v" ] || continue
-        vals+=("$v")
-    done
-    set +f
-    [ "${#vals[@]}" -gt 0 ] || return 1
-    vals_json=$(jq -n -c --args '$ARGS.positional' -- "${vals[@]}") || return 1
-    [ -n "$vals_json" ] || return 1
-    _config_edit_preflight "管理 WARP" || return 1
-    # 先只读算出真正要写入的值: 全部已存在就不写配置, 避免无意义重启。
-    new=$(_config_jq -c --arg k "$kind" --argjson v "$vals_json" "$_WARP_RULE_JQ"' (.routing.rules // []) | newvals($k; $v)' 2>/dev/null) || return 1
-    [ -n "$new" ] || return 1
-    if [ "$new" = "[]" ]; then
-        _info "这些值已存在于 WARP 分流规则中, 未重复写入"
-        return 0
-    fi
-    _mutate_config --arg k "$kind" --argjson v "$new" "$_WARP_RULE_JQ"'
-        . as $root
-        | ($root.routing.rules // []) as $rules
-        | ($rules | newvals($k; $v)) as $new
-        | if ($new | length) == 0 then $root
-          else $root | .routing.rules = ($rules + [{($k): $new, outboundTag: "warp"}])
-          end' || return 1
-    return 0
-}
-
-# 每行: 序号<TAB>类型<TAB>值; 无 WARP 规则时返回 0 且无输出。
-_warp_rules_list() {
-    _config_present || return 1
-    command -v jq >/dev/null 2>&1 || return 1
-    local out
-    out=$(_config_jq -r "$_WARP_RULE_JQ"'
-        . as $root
-        | [$root.routing.rules[]? | select(iswrule)]
-        | to_entries[]
-        | .key as $i
-        | .value as $r
-        | [("domain", "ip") as $t | select(($r[$t]? // null) != null) | $t] as $types
-        | [("domain", "ip") as $t | select(($r[$t]? // null) != null)
-             | ($r[$t] | if type == "array" then map(tostring) | join(",") else tostring end)] as $vals
-        | [ ($i + 1 | tostring), ($types | join("+")), ($vals | join(",")) ]
-        | @tsv' 2>/dev/null) || return 1
-    [ -n "$out" ] || return 0
-    printf '%s\n' "$out"
-}
-
-# 终端可见列数; 非交互(测试/管道)退回 COLUMNS, 再退回 80。
-_warp_term_width() {
-    local w=""
-    [ -t 1 ] && w=$(tput cols 2>/dev/null)
-    [[ "${w:-}" =~ ^[0-9]+$ ]] || w="${COLUMNS:-80}"
-    [[ "${w:-}" =~ ^[0-9]+$ ]] || w=80
-    [ "${w:-80}" -ge 40 ] || w=80
-    printf '%s\n' "$w"
-}
-
-# 显示宽度: 按 UTF-8 字节数计。ASCII 精确等于列宽, CJK/全角算得更宽(保守),
-# 因此折行只会更早, 不会撑破终端。
-_warp_text_width() {
-    local LC_ALL=C
-    printf '%s' "${#1}"
-}
-
-# 渲染分流规则供 [5] 查看 / [6] 删除: 序号、类型、值数量成列, 值按终端宽度折行,
-# 续行缩进到类型列。序号与 _warp_rules_list 一致, 行数仍以 TSV 为准。
-# 可选参数 1: 调用方已读出的 _warp_rules_list 结果, 传入可免去重复读取配置。
-_warp_rules_show() {
-    local list="" given=0 total=0 numw kindw cntw indent width cols num kind joined v k last
-    local cur="" curw=0 count=0 vw
-    local -a vals=() chunks=()
-    if [ "$#" -gt 0 ]; then
-        list="$1"
-        given=1
-    fi
-    if [ "$given" -eq 0 ]; then
-        list=$(_warp_rules_list) || return 1
-    fi
-    [ -n "$list" ] || { _info "暂无 WARP 分流规则"; return 0; }
-
-    kindw=6
-    cntw=1
-    while IFS=$'\t' read -r num kind joined; do
-        total=$((total + 1))
-        [ "${#kind}" -gt "$kindw" ] && kindw=${#kind}
-        count=0
-        if [ -n "$joined" ]; then
-            IFS=',' read -r -a vals <<< "$joined"
-            count=${#vals[@]}
-        fi
-        [ "${#count}" -gt "$cntw" ] && cntw=${#count}
-    done <<< "$list"
-    numw=${#total}
-
-    indent=$((2 + numw + 2))
-    cols=$(_warp_term_width)
-    width=$((cols - indent))
-    [ "$width" -ge 24 ] || width=24
-
-    # %b 解释颜色变量的字面转义(\033); %s 会把它们原样打出来。
-    printf '  %bWARP 分流规则 %s 条%b (序号用于删除)\n\n' "$CYAN" "$total" "$NC"
-    while IFS=$'\t' read -r num kind joined; do
-        vals=()
-        chunks=()
-        if [ -n "$joined" ]; then
-            IFS=',' read -r -a vals <<< "$joined"
-        fi
-        count=${#vals[@]}
-        printf '  %*s) %b%-*s%b %*s 项\n' "$numw" "$num" "$CYAN" "$kindw" "$kind" "$NC" "$cntw" "$count"
-        # 无值的手工规则: 只留表头行; 空数组在旧 bash 的 set -u 下展开会报错。
-        [ "$count" -eq 0 ] && continue
-        # 贪心填充; 单个值超过可用宽度时独占一行并溢出, 不再拆分(拆开的值无法还原)。
-        cur=""
-        curw=0
-        for v in "${vals[@]}"; do
-            v=${v#"${v%%[![:space:]]*}"}
-            v=${v%"${v##*[![:space:]]}"}
-            [ -n "$v" ] || continue
-            vw=$(_warp_text_width "$v")
-            if [ -z "$cur" ]; then
-                cur=$v
-                curw=$vw
-            elif [ $((curw + 2 + vw)) -le "$width" ]; then
-                cur="$cur, $v"
-                curw=$((curw + 2 + vw))
-            else
-                chunks+=("$cur")
-                cur=$v
-                curw=$vw
-            fi
-        done
-        [ -n "$cur" ] && chunks+=("$cur")
-        [ "${#chunks[@]}" -eq 0 ] && continue
-        last=$((${#chunks[@]} - 1))
-        for k in "${!chunks[@]}"; do
-            if [ "$k" -lt "$last" ]; then
-                printf '%*s%s,\n' "$indent" '' "${chunks[$k]}"
-            else
-                printf '%*s%s\n' "$indent" '' "${chunks[$k]}"
-            fi
-        done
-    done <<< "$list"
-}
-
-# 序号与 _warp_rules_list 一致(按 outboundTag=warp 规则的出现顺序从 1 开始)。
-_warp_delete_rule() {
-    local n="${1:-}" total idx
-    _config_edit_preflight "管理 WARP" || return 1
-    total=$(_config_jq -r "$_WARP_RULE_JQ"' [.routing.rules[]? | select(iswrule)] | length' 2>/dev/null) || return 1
-    [[ "$total" =~ ^[0-9]+$ ]] || return 1
-    idx=$(_xd_index_from_choice "$n" "$total") || return 1
-    _mutate_config --argjson i "$idx" "$_WARP_RULE_JQ"'
-        . as $root
-        | ($root.routing.rules // []) as $rules
-        | ([range(0; ($rules | length)) | select($rules[.] | iswrule)] | .[$i]) as $pos
-        | if $pos == null then . else del(.routing.rules[$pos]) end
-    ' || return 1
-    return 0
-}
-
 # ---------------------------------------------------------------------------
-# 子菜单: 不调用 _menu_require_tty(只有主菜单调用)。菜单只显示是否存在/endpoint/地址/MTU/规则数。
+# 子菜单: 不调用 _menu_require_tty(只有主菜单调用)。菜单只显示是否存在/endpoint/地址/MTU。
 # ---------------------------------------------------------------------------
 _warp_register() {   # [wireguard|masque]
     local kind="${1:-}" ans tmp norm
@@ -1085,92 +843,7 @@ _warp_register() {   # [wireguard|masque]
     else
         _success "WARP WireGuard 出站已写入(tag=warp), xray 已用新配置重启"
     fi
-    _tip "注册/重新注册不会自动添加分流规则; 需要分流请在 [4] 添加"
     return 0
-}
-
-_warp_add_rule_prompt() {
-    local kind="" csv
-    while true; do
-        read -rp "  规则类型 [1=域名(domain) 2=IP(ip)]: " kind || return 1
-        case "$kind" in
-            1|domain) kind=domain; break ;;
-            2|ip)     kind=ip; break ;;
-            *) _warn "请输入 1 或 2" ;;
-        esac
-    done
-    echo -e "  多个值用英文逗号分隔, 同类规则里已有的值不会重复写入"
-    if [ "$kind" = "domain" ]; then
-        echo -e "  例: example.com,geosite:netflix,regexp:^ad\\."
-    else
-        echo -e "  例: 1.1.1.1,8.8.8.0/24,geoip:cn"
-    fi
-    while true; do
-        read -rp "  请输入: " csv || return 1
-        [ -n "$csv" ] || { _warn "输入为空, 请重新输入"; continue; }
-        break
-    done
-    if _warp_add_rule "$kind" "$csv"; then
-        _success "已写入 ${kind} 分流规则(追加到路由末尾), xray 已用新配置重启"
-        _tip "首个匹配生效: 若该目标已被更靠前的规则命中, 本条不会触发"
-        # Geo 精简会删掉所有引用 geo 数据的规则, 包括刚写入的这条。
-        case "$csv" in
-            *geoip:*|*geosite:*|*ext:*) _tip "该规则引用 geo 数据; 执行 Geo 自动更新里的 [精简规则] 时会被一并删除" ;;
-        esac
-        return 0
-    fi
-    _error "分流规则写入失败(配置已回滚或值非法)"
-    return 1
-}
-
-_warp_set_endpoint_prompt() {
-    local ep kind default_port example
-    kind=$(_warp_outbound_kind 2>/dev/null) || { _error "WARP 出站不存在"; return 1; }
-    case "$kind" in
-        masque)
-            default_port="$WARP_MASQUE_PORT"
-            example="$WARP_MASQUE_ENDPOINT"
-            _tip "MASQUE 换端点时必须保证端点证书公钥与 warp.publicKey 一致, 只建议使用 WARP MASQUE 段"
-            ;;
-        *)
-            default_port="$WARP_DEFAULT_PORT"
-            example="162.159.192.1"
-            ;;
-    esac
-    while true; do
-        read -rp "  新 endpoint (回车取消): " ep || return 1
-        [ -n "$ep" ] || { _info "已取消"; return 0; }
-        _warp_endpoint_norm "$ep" "$default_port" >/dev/null && break
-        _warn "endpoint 非法(例: ${example}:${default_port} 或 [2606:4700::1]:${default_port}), 请重新输入"
-    done
-    if _warp_set_endpoint "$ep"; then
-        _success "endpoint 已更新, xray 已用新配置重启"
-        return 0
-    fi
-    _error "endpoint 更新失败(配置已回滚)"
-    return 1
-}
-
-_warp_delete_rule_prompt() {
-    local list total=0 n line
-    list=$(_warp_rules_list) || { _error "无法读取分流规则"; return 1; }
-    [ -n "$list" ] || { _info "暂无 WARP 分流规则"; return 0; }
-    _warp_rules_show "$list" || { _error "无法显示分流规则"; return 1; }
-    while IFS= read -r line; do
-        [ -n "$line" ] && total=$((total + 1))
-    done <<< "$list"
-    while true; do
-        read -rp "  请输入要删除的序号(0 取消): " n || return 1
-        [ "$n" = "0" ] && { _info "已取消"; return 0; }
-        _xd_index_from_choice "$n" "$total" >/dev/null && break
-        _warn "序号无效, 请重新输入"
-    done
-    if _warp_delete_rule "$n"; then
-        _success "已删除该条 WARP 分流规则, xray 已用新配置重启"
-        return 0
-    fi
-    _error "删除失败(配置已回滚)"
-    return 1
 }
 
 _warp_delete_prompt() {
@@ -1270,7 +943,7 @@ _warp_set_tun_prompt() {
 }
 
 _warp_menu() {
-    local choice st present kind endpoint addresses mtu rules method
+    local choice st present kind endpoint addresses mtu method
     while true; do
         clear
         echo
@@ -1281,9 +954,8 @@ _warp_menu() {
         endpoint=""
         addresses=""
         mtu=""
-        rules=""
         if st=$(_warp_state_summary); then
-            IFS=$'\t' read -r present kind endpoint addresses mtu rules <<< "$st"
+            IFS=$'\t' read -r present kind endpoint addresses mtu <<< "$st"
             if [ "$present" = "1" ]; then
                 if [ "$kind" = "masque" ]; then
                     method="MASQUE (HTTP/2)"
@@ -1297,7 +969,6 @@ _warp_menu() {
                 if [ "$kind" != "masque" ]; then
                     echo -e "  MTU:       ${CYAN}${mtu:-未知}${NC}"
                 fi
-                echo -e "  分流规则:  ${CYAN}${rules:-0}${NC} 条"
                 if [ "$kind" = "masque" ]; then
                     echo -e "  传输:      ${CYAN}MASQUE CONNECT-IP / HTTP2 over TLS${NC}"
                 else
@@ -1314,24 +985,16 @@ _warp_menu() {
         fi
         echo
         echo -e "  ${GREEN}[1]${NC} 注册 / 重新注册 WARP (WireGuard / MASQUE)"
-        echo -e "  ${GREEN}[2]${NC} 修改 endpoint"
-        echo -e "  ${GREEN}[3]${NC} 内核 TUN 模式 (仅 WireGuard)"
-        echo -e "  ${GREEN}[4]${NC} 添加分流规则 (domain / ip)"
-        echo -e "  ${GREEN}[5]${NC} 查看分流规则"
-        echo -e "  ${GREEN}[6]${NC} 删除分流规则"
-        echo -e "  ${GREEN}[7]${NC} 删除 WARP 出站与全部分流规则"
+        echo -e "  ${GREEN}[2]${NC} 内核 TUN 模式 (仅 WireGuard)"
+        echo -e "  ${GREEN}[3]${NC} 删除 WARP 出站"
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
         case "${choice:-0}" in
             0) return ;;
             1) _warp_register; _press_any_key ;;
-            2) _warp_set_endpoint_prompt; _press_any_key ;;
-            3) _warp_set_tun_prompt; _press_any_key ;;
-            4) _warp_add_rule_prompt; _press_any_key ;;
-            5) _warp_rules_show || _error "无法读取分流规则"; _press_any_key ;;
-            6) _warp_delete_rule_prompt; _press_any_key ;;
-            7) _warp_delete_prompt; _press_any_key ;;
+            2) _warp_set_tun_prompt; _press_any_key ;;
+            3) _warp_delete_prompt; _press_any_key ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
     done

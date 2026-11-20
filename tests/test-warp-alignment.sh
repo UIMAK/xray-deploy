@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib/35-warp.sh 的离线回归: 归一/生成、获取失败不落盘、分流规则与出站生命周期。
+# lib/35-warp.sh 的离线回归: 归一/生成、获取失败不落盘与出站生命周期。
 # 全部断言不联网、不启服务: 配置只写进 mktemp 目录, 写入统一由真实 jq 落盘的 _mutate_config 桩完成。
 # shellcheck disable=SC2329,SC2034,SC2030,SC2031
 set -u
@@ -304,6 +304,7 @@ JSON
             and (.streamSettings.masqueSettings.warp.privateKey == "cHJpdmF0ZS1tYXNxdWU=")
             and (.streamSettings.masqueSettings.warp.publicKey | startswith("-----BEGIN PUBLIC KEY-----"))
             and (.streamSettings.masqueSettings.warp.address == ["172.16.0.2/32", "2606:4700:110:8a36::2/128"])
+            and (.streamSettings.sockopt == null)
             and (.settings.noKernelTun == null)
         ' "$TMP/outbound-masque.json" >/dev/null 2>&1
     }
@@ -708,84 +709,9 @@ SH
     check 'fetch: local and remote warp-reg failures share one reason' fetch_reg_local_remote_fail
 
     # -----------------------------------------------------------------------
-    # C. 分流规则(本次修复的回归重点)
+    # C. 出站生命周期
     # -----------------------------------------------------------------------
-    printf '== C. routing rules ==\n'
-
-    # 1) 默认规则里已有 ip=geoip:cn(block); WARP 规则仍必须真的写进去(旧实现静默返回 0 且不写)。
-    base_cfg | cfg_reset || exit 1
-    check 'add rule ip geoip:cn returns 0 although geoip:cn is already a block rule' _warp_add_rule ip 'geoip:cn'
-    check 'add rule ip geoip:cn actually writes {ip:[geoip:cn],outboundTag:warp}' qe '
-        [.routing.rules[]? | select((.outboundTag? // "") == "warp" and (.ip? == ["geoip:cn"]))] | length == 1'
-    check 'add rule ip geoip:cn keeps the original block rule untouched' qe '
-        [.routing.rules[]? | select((.outboundTag? // "") == "block" and ((.ip? // []) | index("geoip:cn")) != null)] | length == 1'
-
-    # 2) 默认规则里 github.com 已在直连白名单, WARP 规则同样必须新增。
-    base_cfg | cfg_reset || exit 1
-    check 'add rule domain github.com returns 0 although github.com is already a direct rule' _warp_add_rule domain 'github.com'
-    check 'add rule domain github.com actually writes {domain:[github.com],outboundTag:warp}' qe '
-        [.routing.rules[]? | select((.outboundTag? // "") == "warp" and (.domain? == ["github.com"]))] | length == 1'
-
-    # 3) 同一值第二次必须 rc=0 且完全不写配置(WARP 规则内部仍要去重)。
-    base_cfg | cfg_reset || exit 1
-    _warp_add_rule domain 'example.com' >/dev/null 2>&1
-    cfg_snapshot "$TMP/c3-before.cfg"
-    check 'add rule: duplicate value still returns 0' _warp_add_rule domain 'example.com'
-    cfg_snapshot "$TMP/c3-after.cfg"
-    check 'add rule: duplicate value leaves config bytes untouched (cmp)' cmp -s "$TMP/c3-before.cfg" "$TMP/c3-after.cfg"
-    check 'add rule: duplicate value does not add a second rule' qe '
-        [.routing.rules[]? | select((.outboundTag? // "") == "warp" and (.domain? == ["example.com"]))] | length == 1'
-
-    # 4) 追加位置: 新规则一律加到 routing.rules 末尾, 既有规则顺序与语义不变; 连续新增仍相邻。
-    cfg_reset <<'JSON' || exit 1
-{
-  "inbounds": [{"tag": "xd-vless-443", "protocol": "vless", "port": 443}],
-  "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
-  "routing": {"rules": [
-    {"inboundTag": ["xd-vless-443"], "outboundTag": "direct"},
-    {"ip": ["geoip:private"], "outboundTag": "block", "ruleTag": "xd-block-private"},
-    {"domain": ["example.org"], "outboundTag": "block"}
-  ]}
-}
-JSON
-    _warp_add_rule ip 'geoip:cn' >/dev/null 2>&1
-    check 'append: existing rules keep their order' eq 'direct|block|block|warp' "$(_config_jq -r '.routing.rules | map(.outboundTag) | join("|")')"
-    check 'append: the warp rule lands at the end' eq 'warp' "$(_config_jq -r '.routing.rules[-1].outboundTag')"
-    _warp_add_rule domain 'example.net' >/dev/null 2>&1
-    check 'append: consecutive warp rules stay adjacent at the end' eq 'block|warp|warp' "$(_config_jq -r '[.routing.rules[2], .routing.rules[3], .routing.rules[4]] | map(.outboundTag) | join("|")')"
-
-    # 5) 列表序号与删除序号同口径: 只有 outboundTag=warp、没有 domain/ip 的裸规则不计入。
-    cfg_reset <<'JSON' || exit 1
-{
-  "inbounds": [{"tag": "xd-vless-443", "protocol": "vless", "port": 443}],
-  "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
-  "routing": {"rules": [
-    {"outboundTag": "warp"},
-    {"domain": ["example.com"], "outboundTag": "warp"},
-    {"ip": ["geoip:cn"], "outboundTag": "warp"},
-    {"domain": ["example.org"], "outboundTag": "block"}
-  ]}
-}
-JSON
-    check 'list: a bare outboundTag=warp rule without domain/ip is not listed' eq 2 "$(_warp_rules_list | wc -l | tr -d ' ')"
-    check 'list: first listed rule is the first rule carrying domain/ip' eq '1|domain|example.com' "$(_warp_rules_list | sed -n '1p' | tr '\t' '|')"
-    check 'delete rule 1: returns 0' _warp_delete_rule 1
-    check 'delete rule 1: deletes the first listed rule, not the bare warp rule' qe '
-        (.routing.rules | length) == 3
-        and (.routing.rules[0] == {"outboundTag": "warp"})
-        and (.routing.rules[1].ip == ["geoip:cn"])
-        and (.routing.rules[2].domain == ["example.org"])'
-
-    # 6) 全角/半角逗号混用: 值列表在函数入口归一, 两个值按序写入同一规则。
-    base_cfg | cfg_reset || exit 1
-    check 'add rule accepts mixed full/half-width commas' _warp_add_rule domain 'example.com，example.net'
-    check 'add rule mixed commas writes both values in order' qe '
-        [.routing.rules[]? | select((.outboundTag? // "") == "warp" and (.domain? == ["example.com","example.net"]))] | length == 1'
-
-    # -----------------------------------------------------------------------
-    # D. 出站生命周期
-    # -----------------------------------------------------------------------
-    printf '== D. outbound lifecycle ==\n'
+    printf '== C. outbound lifecycle ==\n'
     base_cfg | cfg_reset || exit 1
     check 'apply: writes the warp outbound after the existing ones' _warp_apply "$(norm_a)"
     check 'apply: outbound order is direct, block, warp' eq 'direct|block|warp' "$(_config_jq -r '.outbounds | map(.tag) | join("|")')"
@@ -809,15 +735,6 @@ JSON
     check 'tun: on writes noKernelTun=true' qe '.outbounds[] | select(.tag == "warp") | .settings.noKernelTun == true'
     check 'apply: re-apply writes the new secret at the same position' eq 'c2VjcmV0LWI=' "$(_config_jq -r '.outbounds[2].settings.secretKey')"
 
-    check 'set endpoint: returns 0' _warp_set_endpoint '162.159.192.9:2408'
-    check 'set endpoint: peers[0].endpoint is replaced' eq '162.159.192.9:2408' "$(_config_jq -r '.outbounds[2].settings.peers[0].endpoint')"
-    check 'set endpoint: publicKey and allowedIPs are untouched' eq 'cHVibGljLWtleS1i|0.0.0.0/0,::/0' "$(_config_jq -r '.outbounds[2].settings.peers[0] | [.publicKey, (.allowedIPs | join(","))] | join("|")')"
-    endpoint_rejects() (
-        _warp_set_endpoint 'not a valid endpoint!' >/dev/null 2>&1
-        [ "$?" -eq 1 ]
-    )
-    check 'set endpoint: an invalid endpoint is rejected with rc=1' endpoint_rejects
-
     masque_lifecycle() (
         base_cfg | cfg_reset || return 1
         local norm
@@ -827,37 +744,39 @@ JSON
             (.outbounds[] | select(.tag == "warp") | .protocol == "masque")
             and ((.outbounds[] | select(.tag == "warp") | .settings.noKernelTun) == null)
         ' >/dev/null 2>&1 || return 1
-        _warp_add_rule domain 'masque.example' >/dev/null 2>&1 || return 1
-        _warp_set_endpoint '162.159.198.10' >/dev/null 2>&1 || return 1
-        _config_jq -e '
-            (.outbounds[] | select(.tag == "warp")
-                | .settings.address == "162.159.198.10" and .settings.port == 443)
-        ' >/dev/null 2>&1 || return 1
         _warp_apply "$(norm_a)" >/dev/null 2>&1 || return 1
         _config_jq -e '
             (.outbounds[] | select(.tag == "warp")
                 | .protocol == "wireguard" and .settings.noKernelTun == true)
-            and ([.routing.rules[]? | select(.outboundTag == "warp" and .domain == ["masque.example"])] | length == 1)
         ' >/dev/null 2>&1
     )
-    check 'masque lifecycle: replace wireguard, update endpoint, preserve rules, switch back' masque_lifecycle
+    check 'masque lifecycle: replace wireguard and switch back' masque_lifecycle
 
     masque_state_summary() (
         base_cfg | cfg_reset || return 1
-        local norm out kind endpoint addresses mtu rules
+        local norm out kind endpoint addresses mtu
         norm=$(_warp_normalize_masque "$FX/masque-raw.json") || return 1
         _warp_apply "$norm" >/dev/null 2>&1 || return 1
         out=$(_warp_state_summary) || return 1
-        IFS=$'\t' read -r present kind endpoint addresses mtu rules <<< "$out"
+        IFS=$'\t' read -r present kind endpoint addresses mtu <<< "$out"
         [ "$present" = 1 ] || return 1
         [ "$kind" = masque ] || return 1
         [ "$endpoint" = '162.159.198.2:443' ] || return 1
         [ "$addresses" = '172.16.0.2/32,2606:4700:110:8a36::2/128' ] || return 1
         [ "$mtu" = '-' ] || return 1
-        [ "$rules" = 0 ] || return 1
         case "$out" in *cHJpdmF0ZS1tYXNxdWU=*|*privateKey*) return 1 ;; esac
     )
     check 'masque state summary: reports method/endpoint/address without secrets' masque_state_summary
+
+    warp_menu_surface() (
+        _warp_state_summary() { printf '1\tmasque\t162.159.198.2:443\t172.16.0.2/32\t-\n'; }
+        printf '0\n' | _warp_menu > "$TMP/warp-menu.out" 2>&1 || return 1
+        grep -q '\[1\].*注册' "$TMP/warp-menu.out" &&
+            grep -q '\[2\].*内核 TUN' "$TMP/warp-menu.out" &&
+            grep -q '\[3\].*删除 WARP 出站' "$TMP/warp-menu.out" &&
+            ! grep -q '修改 endpoint\|分流规则\|\[4\]\|\[5\]\|\[6\]\|\[7\]' "$TMP/warp-menu.out"
+    )
+    check 'masque menu: register/TUN/delete only, no endpoint edit or WARP rules' warp_menu_surface
 
     masque_tun_rejected() (
         base_cfg | cfg_reset || return 1
