@@ -1029,7 +1029,7 @@ _xd_pidfile_identity_ok() {
 }
 
 # kill 专用 exe 判定: 身份读不到即拒绝; 判活 _proc_exe_is 为防重复启动而 fail-open。
-# 凡凭 exe 归属决定是否 kill 都必须用本函数(含 55-hysteria supervisor 清理)。
+# 凡凭 exe 归属决定是否 kill 都必须用本函数。
 # ---------------------------------------------------------------------------
 _proc_exe_is_strict() {
     local pid="${1:-}" want="${2:-}" got rw

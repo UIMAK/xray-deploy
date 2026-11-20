@@ -679,7 +679,6 @@ trap cleanup EXIT
             return 0
         }
         _hy2_cleanup_all_hops() { printf 'hop-cleanup\n' >> "$root/actions"; return 99; }
-        _hysteria_cleanup_before_uninstall() { printf 'hysteria-cleanup\n' >> "$root/actions"; return 99; }
         _logrotate_cleanup() { printf 'logrotate-cleanup\n' >> "$root/actions"; return 99; }
         _uninstall_xray_locked keep-panel || return 1
         [ ! -e "$XRAY_BIN" ] && [ -f "$DEPLOY_DIR/xray-deploy.sh" ] \
