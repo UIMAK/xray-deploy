@@ -301,7 +301,7 @@ _geo_next_run_hint() {
     if [ -n "$c" ]; then
         # 只有值仍是默认常量时才描述具体时间, 手改 cron 后不虚构执行时刻。
         if [ "$c" = "$GEO_CRON_EXPR" ]; then
-            echo "Xray 内置定时: ${c} ($(_geo_cron_label))"
+            echo "$(_geo_cron_label) 更新"
         else
             echo "Xray 内置定时: ${c}"
         fi
@@ -317,7 +317,7 @@ _route_preflight() {
     if [ -z "${XRAY_DEFAULT_ROUTING_RULES_JSON:-}" ] || [ -z "${XRAY_PRIVATE_BLOCK_RULE_JSON:-}" ] \
        || [ -z "${XRAY_PRIVATE_BLOCK_RULE_TAG:-}" ]; then
         _error "缺少默认规则常量, 无法修改路由规则"
-        _tip "请在主菜单执行 [检测脚本更新] 完整更新一次后重试"
+        _tip "请在主菜单执行 [脚本更新] 完整更新一次后重试"
         return 1
     fi
     return 0
@@ -888,7 +888,7 @@ _geo_size_human() {
     fi
 }
 
-# 查看规则集: 内置两项 + state 记录的自定义项, 附文件大小与引用计数。
+# 查看规则集: 内置两项只列数据源; state 记录的自定义项附文件大小与引用计数。
 _geo_ruleset_view() {
     _require_jq "查看规则集" || return 1
     clear
@@ -904,12 +904,8 @@ _geo_ruleset_view() {
     echo -e "  引用方式: geosite:代码 / geoip:代码 引用内置; ext:文件名.dat:代码 引用自定义"
     echo
     echo -e "  ${CYAN}内置规则集${NC}"
-    refs=$(_geo_ref_count geosite:)
-    printf '    %-14s %8s  引用 %s 处\n' "geosite.dat" "$(_geo_size_human "$ASSET_DIR/geosite.dat")" "$refs"
-    printf '                   <- %s\n' "$(_geo_source_url geosite)"
-    refs=$(_geo_ref_count geoip:)
-    printf '    %-14s %8s  引用 %s 处\n' "geoip.dat" "$(_geo_size_human "$ASSET_DIR/geoip.dat")" "$refs"
-    printf '                   <- %s\n' "$(_geo_source_url geoip)"
+    printf '    %-14s <- %s\n' "geosite.dat" "$(_geo_source_url geosite)"
+    printf '    %-14s <- %s\n' "geoip.dat" "$(_geo_source_url geoip)"
     echo
     echo -e "  ${CYAN}自定义规则集${NC}"
     path=$(_geo_extra_path)
@@ -1600,7 +1596,7 @@ _dns_restore_default() {
     _config_edit_preflight "修改 DNS 配置" || return 1
     if [ -z "${XRAY_DEFAULT_DNS_JSON:-}" ]; then
         _error "缺少默认 DNS 常量, 无法恢复默认"
-        _tip "请先在主菜单执行 [检测脚本更新] 完整更新一次后重试"
+        _tip "请先在主菜单执行 [脚本更新] 完整更新一次后重试"
         return 1
     fi
     local ans

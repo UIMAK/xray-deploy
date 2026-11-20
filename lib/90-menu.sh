@@ -219,7 +219,7 @@ _main_menu() {
         _menu_row 5 "添加出口"
         echo
         echo -e "  ${CYAN}【协议管理】${NC}"
-        _menu_row 6 "cloudflared 管理" 7 "WARP 管理"
+        _menu_row 6 "WARP 管理" 7 "cloudflared 管理"
         echo
         echo -e "  ${CYAN}【服务控制】${NC}"
         _menu_row 8 "重启 Xray"     9 "停止 Xray"
@@ -228,7 +228,7 @@ _main_menu() {
         echo
         echo -e "  ${CYAN}【配置与更新】${NC}"
         _menu_row 14 "检查配置"     15 "DNS 设置"
-        _menu_row 16 "分流设置"     17 "检测脚本更新"
+        _menu_row 16 "分流设置"     17 "脚本更新"
         echo
         echo -e "  ${CYAN}【核心管理】${NC}"
         _menu_row 18 "Xray 核心管理" 19 "卸载"
@@ -243,8 +243,8 @@ _main_menu() {
             3) _modify_node; continue ;;
             4) _delete_node; continue ;;
             5) _outbound_add_prompt; _press_any_key; continue ;;
-            6) _cloudflared_menu; continue ;;
-            7) _warp_menu; continue ;;
+            6) _warp_menu; continue ;;
+            7) _cloudflared_menu; continue ;;
             8) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
                 _press_any_key ;;
             9) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
@@ -415,7 +415,7 @@ _timed_restart_menu() {
     # 缺 _crontab_replace 拒绝写入，裸管道会将读失败变成清空。
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
         _error "缺少 crontab 助手 _crontab_replace, 无法写入 crontab"
-        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+        _tip "请执行 [脚本更新] 更新全部 lib 后重试"
         _press_any_key; return
     fi
     # 先确认 cron 能运行，再写任务。
@@ -464,7 +464,7 @@ _timed_restart_disable() {
     local marker="# xray-deploy-timed-restart"
     if ! declare -F _crontab_replace >/dev/null 2>&1; then
         _error "缺少 crontab 助手 _crontab_replace, 无法清理 crontab"
-        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+        _tip "请执行 [脚本更新] 更新全部 lib 后重试"
         return 1
     fi
     # _crontab_has_marker 区分存在/缺失/读失败，不能将读失败记为 off。
@@ -474,7 +474,7 @@ _timed_restart_disable() {
     else
         # 缺三态判据拒绝，不猜 off 或退回裸管道。
         _error "缺少 crontab 助手 _crontab_has_marker, 无法确认定时任务状态"
-        _tip "请执行 [检测脚本更新] 更新全部 lib 后重试"
+        _tip "请执行 [脚本更新] 更新全部 lib 后重试"
         return 1
     fi
     case "$has_rc" in
@@ -656,7 +656,7 @@ _reset_config_snapshot_restore() {   # <stage> <nodes_moved> <had_config>
     if [ "$had_config" -eq 1 ]; then
         if [ -z "${JQ_MERGE_OBJECTS:-}" ]; then
             _error "缺少合并常量, 配置回滚已中止"
-            _tip "请在主菜单执行 [检测脚本更新] 完整更新一次后重试"
+            _tip "请在主菜单执行 [脚本更新] 完整更新一次后重试"
             return 1
         fi
         if ls -1 "$stage/confs"/*.json >/dev/null 2>&1; then
@@ -1039,7 +1039,7 @@ _sanitize_token() {
 _check_script_update() {
     clear
     echo
-    echo -e "  ${CYAN}【检测脚本更新】${NC}"
+    echo -e "  ${CYAN}【脚本更新】${NC}"
     local local_ver ans
     local_ver=$(cat "$DEPLOY_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')
     [ -z "$local_ver" ] && local_ver="(未知)"
