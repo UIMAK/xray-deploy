@@ -32,7 +32,7 @@ LIB_DIR="$SCRIPT_DIR/lib"
 [ -d "$LIB_DIR" ] || LIB_DIR="/opt/xray-deploy/lib"
 
 # LIB_MODULES 与安装器一致；source 失败即拒绝不完整安装。
-LIB_MODULES="00-common 10-system 20-xray-core 30-geo 35-warp 40-cloudflared 45-logrotate 50-nodes 51-reality-pq 52-outbounds 55-hysteria 90-menu"
+LIB_MODULES="00-common 10-system 20-xray-core 30-geo 35-warp 40-cloudflared 45-logrotate 50-nodes 51-reality-pq 52-outbounds 90-menu"
 
 # source 前持安装读锁，避免混用不同发布代的文件。
 _BOOTSTRAP_LOCK_ROOT="/var/lock/xray-deploy"
@@ -131,7 +131,7 @@ unset _bootstrap_locked _bootstrap_i
 # 公共初始化: init 系统探测 + 目录确保; 失败即退出。
 # root 已由入口 main 统一校验(本函数仅经 main → _init_runtime/_cron_init 调用)。
 _base_init() {
-    # INIT_SYSTEM 供 20-xray-core/40-cloudflared/55-hysteria 等服务后端分支消费。
+    # INIT_SYSTEM 供 20-xray-core/40-cloudflared 等服务后端分支消费。
     # shellcheck disable=SC2034
     INIT_SYSTEM=$(_detect_init_system)
     _ensure_dirs || { _error "初始化失败: 无法确保安全目录/权限"; exit 1; }

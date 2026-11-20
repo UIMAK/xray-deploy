@@ -233,7 +233,7 @@ trap 'rm -rf "${TMP:?}"' EXIT
             _auto_adopt_orphans() { return 0; }
             _auto_ensure_config_env() { return 0; }
             _manage_xray() { printf '%s\n' "$*" >> "$TMP/service-calls"; return "$STOP_RC"; }
-            _main_menu <<< $'13\n0'
+            _main_menu <<< $'12\n0'
         ) > "$TMP/output" 2>&1 || RC=$?
     }
     invoke_stop_menu 1
@@ -264,19 +264,19 @@ trap 'rm -rf "${TMP:?}"' EXIT
             _auto_adopt_orphans() { return 0; }
             _auto_ensure_config_env() { return 0; }
             _cloudflared_menu() { printf 'cloudflared\n' >> "$TMP/protocol-calls"; }
-            _hysteria_menu() { printf 'hysteria\n' >> "$TMP/protocol-calls"; }
+            _warp_menu() { printf 'warp\n' >> "$TMP/protocol-calls"; }
             _main_menu <<< "$PROTOCOL_CHOICE"$'\n0'
         ) > "$TMP/output" 2>&1 || RC=$?
     }
     invoke_protocol_menu 9
     check 'protocol menu shows and dispatches cloudflared at 9' \
         bash -c 'grep -qxF "8|Xray Hy2 管理|9|cloudflared 管理" "$1" &&
-                 grep -qxF "10|Hysteria2 管理|11|WARP 管理" "$1" &&
+                 grep -qxF "10|WARP 管理||" "$1" &&
                  test "$(cat "$2")" = cloudflared' _ \
         "$TMP/menu-rows" "$TMP/protocol-calls"
     invoke_protocol_menu 10
-    check 'protocol menu dispatches Hysteria2 at 10' \
-        test "$(cat "$TMP/protocol-calls")" = hysteria
+    check 'protocol menu dispatches WARP at 10' \
+        test "$(cat "$TMP/protocol-calls")" = warp
 
     printf '== update check download path ==\n'
     update_check_fixture() {

@@ -1811,54 +1811,48 @@ _port_in_hop_ranges() {
     return 1
 }
 
-# 官方 Hysteria listen 可能是单端口、端口范围或多段(0.0.0.0:20000-50000,[::]:5000);
-# 逐段输出 "start:end", 供跳跃冲突判断使用。
-_hysteria_listen_ranges() {
-    [ -n "${HYSTERIA_CONFIG:-}" ] && [ -f "$HYSTERIA_CONFIG" ] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
-    local listen seg port ls le
-    listen=$(jq -r '.listen // empty' "$HYSTERIA_CONFIG" 2>/dev/null) || return 0
-    [ -n "$listen" ] || return 0
-    local IFS=','
-    for seg in $listen; do
-        seg=${seg// /}
-        [ -n "$seg" ] || continue
-        port=${seg##*:}
-        case "$port" in
-            *-*)
-                ls=${port%%-*}; le=${port##*-}
-                [[ "$ls" =~ ^[0-9]+$ && "$le" =~ ^[0-9]+$ ]] || continue
-                printf '%s:%s\n' "$ls" "$le"
-                ;;
-            *)
-                [[ "$port" =~ ^[0-9]+$ ]] || continue
-                printf '%s:%s\n' "$port" "$port"
-                ;;
-        esac
-    done
+# 覆盖所有 UDP 入站能力并兼容旧字段; 跳跃 DNAT 会劫持范围内所有 UDP。
+_xray_udp_port_ranges() {
+    _config_present && command -v jq >/dev/null 2>&1 || return 0
+    local s e
+    while IFS=: read -r s e; do
+        [[ "$s" =~ ^[0-9]+$ && "$e" =~ ^[0-9]+$ ]] || continue
+        printf '%s:%s\n' "$s" "$e"
+    done < <(_config_jq -r '
+        .inbounds[]? | select(.port != null)
+        | select(
+            (.protocol // "") == "hysteria"
+            or ((.protocol // "") == "wireguard")
+            or ((.streamSettings.network // "") == "mkcp")
+            or ((.streamSettings.network // "") == "quic")
+            or ((.protocol // "") == "socks" and ((.settings.udp // false) == true))
+            or (((.protocol // "") == "dokodemo-door" or (.protocol // "") == "tunnel")
+                and (((.settings.allowedNetwork // .settings.network // "tcp") | tostring) | test("udp")))
+            or ((.protocol // "") == "shadowsocks"
+                and (((.settings.network // "tcp") | tostring) | test("udp")))
+          )
+        | (.port | tostring) | split(",")[]
+        | if test("^[0-9]+-[0-9]+$") then sub("-"; ":")
+          elif test("^[0-9]+$") then "\(.):\(.)"
+          else empty end
+    ' 2>/dev/null)
 }
 
 # 新跳跃区间覆盖其它 UDP 监听端口时同样会静默劫持。
-# 判据: Xray 入站按 config 事实枚举(与官方 Hysteria 的跳跃冲突检查同口径), 官方服务监听单独取;
-# 其它节点已启用的跳跃区间从 metadata 取(区间只存在于元数据, config 看不到), 读失败按冲突处理。
-# 只信 metadata 会漏掉官方 Hysteria 与手改的入站配置, 只看 config 会漏掉他人 hop 区间。
+# 判据: Xray 入站按 config 事实枚举; 其它节点已启用的跳跃区间从 metadata 取
+# (区间只存在于元数据, config 看不到), 读失败按冲突处理。
+# 只看 config 会漏掉他人 hop 区间。
 # 用法:_range_hits_other_udp <start> <end> [exclude_tag]; 0=冲突。
 _range_hits_other_udp() {
     local s="$1" e="$2" exclude="${3:-}" self_port="" p_start p_end
     [ -n "$exclude" ] && self_port=$(jq -r '.port // empty' "$NODES_DIR/${exclude}.json" 2>/dev/null)
-    if declare -F _hysteria_xray_udp_port_ranges >/dev/null 2>&1; then
-        while IFS=: read -r p_start p_end; do
-            [ -n "$p_start" ] && [ -n "$p_end" ] || continue
-            [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] || continue
-            # 本节点自身的监听端口允许落在自己的跳跃范围内。
-            [ -n "$self_port" ] && [ "$p_start" = "$self_port" ] && [ "$p_end" = "$self_port" ] && continue
-            return 0
-        done < <(_hysteria_xray_udp_port_ranges)
-    fi
     while IFS=: read -r p_start p_end; do
         [ -n "$p_start" ] && [ -n "$p_end" ] || continue
-        [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] && return 0
-    done < <(_hysteria_listen_ranges)
+        [ "$p_start" -le "$e" ] && [ "$p_end" -ge "$s" ] || continue
+        # 本节点自身的监听端口允许落在自己的跳跃范围内。
+        [ -n "$self_port" ] && [ "$p_start" = "$self_port" ] && [ "$p_end" = "$self_port" ] && continue
+        return 0
+    done < <(_xray_udp_port_ranges)
     # 两条 PREROUTING DNAT 抢同一目的端口时先命中者生效, 他人已有区间必须拒绝。
     local f tag ranges tok hs he
     for f in "$NODES_DIR"/*.json; do

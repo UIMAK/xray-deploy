@@ -87,19 +87,6 @@ _print_status_bar() {
         fi
     fi
 
-    # 官方 Hysteria2(独立于 Xray Hy2; 未安装时不显示, 不占状态栏空间)
-    local hyline=""
-    if [ -x "$HYSTERIA_BIN" ]; then
-        local hver hst=""
-        hver=$(_hysteria_cached_version 2>/dev/null)
-        if [ "$(_manage_hysteria status 2>/dev/null)" = "running" ]; then
-            hst="${GREEN}● 运行中${NC}"
-        else
-            hst="${RED}○ 已停止${NC}"
-        fi
-        hyline="  Hysteria2 v${hver#v}: ${hst}"
-    fi
-
     # Geo(真相源: confs/14_geodata.json 的 geodata.cron)
     local geostate; geostate=$(_geo_auto_state 2>/dev/null); [ -z "$geostate" ] && geostate="off"
     local geostr
@@ -108,7 +95,6 @@ _print_status_bar() {
     echo -e "  系统: ${CYAN}${os_info}${NC}  |  init: ${CYAN}${INIT_SYSTEM}${NC}"
     echo -e "  Xray${CYAN}${xver}${NC} [${xchannel}]: ${xstatus}  |  节点: ${CYAN}${ncount}${NC}"
     echo -e "  cloudflared: ${cfstatus}  |  Geo: ${geostr}"
-    [ -n "$hyline" ] && echo -e "$hyline"
     echo
 }
 
@@ -235,19 +221,19 @@ _main_menu() {
         echo
         echo -e "  ${CYAN}【协议管理】${NC}"
         _menu_row 8 "Xray Hy2 管理" 9 "cloudflared 管理"
-        _menu_row 10 "Hysteria2 管理" 11 "WARP 管理"
+        _menu_row 10 "WARP 管理"
         echo
         echo -e "  ${CYAN}【服务控制】${NC}"
-        _menu_row 12 "重启 Xray"    13 "停止 Xray"
-        _menu_row 14 "查看状态"     15 "查看日志"
-        _menu_row 16 "日志轮换"     17 "定时重启"
+        _menu_row 11 "重启 Xray"    12 "停止 Xray"
+        _menu_row 13 "查看状态"     14 "查看日志"
+        _menu_row 15 "日志轮换"     16 "定时重启"
         echo
         echo -e "  ${CYAN}【配置与更新】${NC}"
-        _menu_row 18 "检查配置"     19 "DNS 设置"
-        _menu_row 20 "分流设置"     21 "检测脚本更新"
+        _menu_row 17 "检查配置"     18 "DNS 设置"
+        _menu_row 19 "分流设置"     20 "检测脚本更新"
         echo
         echo -e "  ${CYAN}【核心管理】${NC}"
-        _menu_row 22 "Xray 核心管理" 23 "卸载"
+        _menu_row 21 "Xray 核心管理" 22 "卸载"
         echo
         echo -e "  ${GREEN}[0]${NC} 退出"
         echo
@@ -263,22 +249,21 @@ _main_menu() {
             7) _outbound_add_prompt; _press_any_key; continue ;;
             8) _hy2_manage_menu; continue ;;
             9) _cloudflared_menu; continue ;;
-            10) _hysteria_menu; continue ;;
-            11) _warp_menu; continue ;;
-            12) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
+            10) _warp_menu; continue ;;
+            11) if _restart_xray_verified; then _success "已重启并稳定运行"; else _error "重启后 xray 未稳定运行, 请查看日志"; fi
                 _press_any_key ;;
-            13) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
+            12) if _manage_xray stop; then _success "已停止"; else _error "停止 Xray 失败, 请查看日志"; fi
                 _press_any_key ;;
-            14) _view_status ;;
-            15) _view_log ;;
-            16) _logrotate_menu ;;
-            17) _timed_restart_menu ;;
-            18) _check_config ;;
-            19) _dns_menu ;;
-            20) _split_menu ;;
-            21) _check_script_update ;;
-            22) _xray_core_menu ;;
-            23) _uninstall_menu ;;
+            13) _view_status ;;
+            14) _view_log ;;
+            15) _logrotate_menu ;;
+            16) _timed_restart_menu ;;
+            17) _check_config ;;
+            18) _dns_menu ;;
+            19) _split_menu ;;
+            20) _check_script_update ;;
+            21) _xray_core_menu ;;
+            22) _uninstall_menu ;;
             0) echo -e "${CYAN}再见${NC}"; exit 0 ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
@@ -1121,7 +1106,7 @@ _check_script_update() {
     _press_any_key
 }
 
-# Hysteria2 管理子菜单
+# Xray Hy2 管理子菜单
 _hy2_manage_menu() {
     local choice
     while true; do
@@ -1255,7 +1240,7 @@ _hy2_masq_set_file() {
     return 0
 }
 
-# proxy 为扁平 url/rewriteHost/insecure 模型，不照抄官方 Hysteria 嵌套形状。
+# proxy 为扁平 url/rewriteHost/insecure 模型，不使用嵌套配置形状。
 _hy2_masq_set_proxy() {
     local tag="$1" url why ans rh="true" ins="false" xf="false" payload
     echo

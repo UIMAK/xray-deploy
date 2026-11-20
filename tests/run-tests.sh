@@ -35,7 +35,6 @@ contains() { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 . "$ROOT/lib/50-nodes.sh"
 . "$ROOT/lib/51-reality-pq.sh"
 . "$ROOT/lib/52-outbounds.sh"
-. "$ROOT/lib/55-hysteria.sh"
 . "$ROOT/lib/90-menu.sh"
 
 DEPLOY_DIR="$TMP/deploy"
@@ -50,18 +49,9 @@ LOG_DIR="$DEPLOY_DIR/log"
 GEO_LOG="$LOG_DIR/geo-update.log"
 XRAY_BIN="$BIN_DIR/xray"
 CF_BIN="$TMP/cloudflared"
-HYSTERIA_DATA_DIR="$DEPLOY_DIR/hysteria"
-HYSTERIA_BACKUP_DIR="$DEPLOY_DIR/hysteria-backups"
-HYSTERIA_CERT_DIR="$DEPLOY_DIR/hysteria-certs"
-HYSTERIA_CONFIG="$HYSTERIA_DATA_DIR/hysteria.json"
-HYSTERIA_SERVER_META="$HYSTERIA_DATA_DIR/server_meta.json"
-HYSTERIA_NODE_META="$HYSTERIA_DATA_DIR/node.json"
-HYSTERIA_PID_FILE="$TMP/hysteria.pid"
-HYSTERIA_SVC="hysteria"
 INIT_SYSTEM=direct
 mkdir -p "$DEPLOY_DIR" "$CONFIG_DIR" "$BACKUP_DIR" "$STATE_DIR" "$ASSET_DIR" \
-    "$NODES_DIR" "$CERT_DIR" "$BIN_DIR" "$LOG_DIR" \
-    "$HYSTERIA_DATA_DIR" "$HYSTERIA_BACKUP_DIR" "$HYSTERIA_CERT_DIR"
+    "$NODES_DIR" "$CERT_DIR" "$BIN_DIR" "$LOG_DIR"
 _deploy_lock_root() { printf '%s' "$TMP/locks"; }
 mkdir -p "$TMP/locks"
 _restart_xray_verified() { return 0; }
@@ -387,7 +377,7 @@ if (
 check 'rejected delete keeps the outside file' test -f "$DEPLOY_DIR/evil.dat"
 
 printf '== child suites ==\n'
-for suite in test-node-alignment.sh test-outbound-alignment.sh test-cloudflared-alignment.sh test-hysteria-alignment.sh \
+for suite in test-node-alignment.sh test-outbound-alignment.sh test-cloudflared-alignment.sh \
     test-menu-alignment.sh test-warp-alignment.sh test-common-regressions.sh test-core-regressions.sh \
     test-installer-alignment.sh; do
     if bash "$ROOT/tests/$suite" > "$TMP/$suite.log" 2>&1; then
