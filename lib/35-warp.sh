@@ -1307,7 +1307,7 @@ _warp_menu() {
                     esac
                 fi
             else
-                echo -e "  出站:      ${YELLOW}未配置${NC}"
+                echo -e "  出站: ${YELLOW}未配置${NC}"
             fi
         else
             _warn "无法读取当前配置(Xray 未安装 / 配置缺失 / jq 不可用)"
