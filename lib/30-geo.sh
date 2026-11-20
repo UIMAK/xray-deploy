@@ -799,7 +799,7 @@ _route_restore_default_flow() {
         *) _info "已取消"; return 0 ;;
     esac
     if _route_restore_default_rules; then
-        _success "已恢复默认路由规则(bittorrent / 广告+私网域名 / 私网+CN IP / 域名白名单直连)"
+        _success "已恢复默认路由规则(bittorrent / 广告+私网域名 / 私网+CN IP)"
         _tip "请确认 assets 下 geosite.dat 与 geoip.dat 存在, 否则进入 [9] Geo 数据管理立即更新一次"
     else
         _error "恢复失败(配置已回滚)"

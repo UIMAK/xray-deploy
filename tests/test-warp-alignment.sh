@@ -88,7 +88,7 @@ fi
         _config_write_merged "$content"
     }
 
-    # 默认路由规则(含 block 的 geoip:cn 与 direct 白名单里的 github.com)。
+    # 默认路由规则(含 block 的 geoip:cn)。
     base_cfg() {
         jq -n -c --argjson rules "$XRAY_DEFAULT_ROUTING_RULES_JSON" '{
             log: {loglevel: "warning"},
