@@ -5,13 +5,13 @@
 # 协议清单
 # ---------------------------------------------------------------------------
 PROTOCOLS=(
-    "vless-tcp-reality-vision|VLESS+TCP+Reality+Vision|reality|direct|可选直连/Tunnel(防偷跑)"
-    "vless-xhttp-reality|VLESS+XHTTP+Reality|reality|direct|可选直连/Tunnel(防偷跑)"
-    "vless-enc|VLESS+ENC|enc|direct|内置加密·类似SS·轻量无TLS"
-    "vless-xhttp-cdn|VLESS+XHTTP(无TLS)|none|cdn|必须套CDN·禁止直连"
-    "vless-ws-cdn|VLESS+WS(无TLS)|none|cdn|必须套CDN·禁止直连"
-    "shadowsocks|Shadowsocks|none|direct|"
-    "hysteria2|Hysteria2|tls|direct|必须套TLS证书·QUIC"
+    "vless-tcp-reality-vision|VLESS+TCP+Reality+Vision|reality|direct"
+    "vless-xhttp-reality|VLESS+XHTTP+Reality|reality|direct"
+    "vless-enc|VLESS+ENC|enc|direct"
+    "vless-xhttp-cdn|VLESS+XHTTP(无TLS)|none|cdn"
+    "vless-ws-cdn|VLESS+WS(无TLS)|none|cdn"
+    "shadowsocks|Shadowsocks|none|direct"
+    "hysteria2|Hysteria2|tls|direct"
 )
 
 # ---------------------------------------------------------------------------
@@ -2810,7 +2810,7 @@ _detect_inbound_protocol() {
 
 # ---------------------------------------------------------------------------
 # 添加节点:协议分发
-# PROTOCOLS 的 name 字段已含对齐空格, 直接打印
+# PROTOCOLS 直接打印协议名
 # ---------------------------------------------------------------------------
 _add_node() {
     clear
@@ -2819,17 +2819,12 @@ _add_node() {
     _ensure_dirs || return 1
     echo
     echo -e "  ${CYAN}【添加节点 — 选择协议】${NC}"
-    echo -e "  ${YELLOW}提示: 标记「必须套CDN」的协议不能直连, 需经 CDN 回源${NC}"
     echo
     local i=1
     for p in "${PROTOCOLS[@]}"; do
-        local name desc
-        IFS='|' read -r _ name _ _ desc <<< "$p"
-        if [ -n "$desc" ]; then
-            printf "  ${GREEN}[%d]${NC} %s   %s\n" "$i" "$name" "$desc"
-        else
-            printf "  ${GREEN}[%d]${NC} %s\n" "$i" "$name"
-        fi
+        local name
+        IFS='|' read -r _ name _ <<< "$p"
+        printf "  ${GREEN}[%d]${NC} %s\n" "$i" "$name"
         i=$((i+1))
     done
     echo -e "  ${GREEN}[0]${NC} 返回"
