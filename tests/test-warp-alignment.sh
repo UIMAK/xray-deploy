@@ -190,6 +190,17 @@ JSON
         privateKey: $privateKey,
         response: {warp_enabled: false, tunnel_type: "masque", config: {interface: {addresses: {}}}}
     }' > "$FX/masque-incomplete.json"
+    # WARP+ / Zero Trust 的 WireGuard 注册响应: client_id 前 3 字节就是 reserved。
+    cat > "$FX/wg-account-reg.json" <<'JSON'
+{"id": "wg-account-id", "token": "wg-account-token",
+ "config": {
+   "client_id": "AQIDBA==",
+   "peers": [{"public_key": "cGVlci1wdWJsaWMta2V5",
+              "endpoint": {"v4": "162.159.193.1:0", "v6": "[2606:4700:100::1]:0",
+                           "host": "engage.cloudflareclient.com"}}],
+   "interface": {"addresses": {"v4": "172.16.0.9", "v6": "2606:4700:110:8a36::9"}}
+ }}
+JSON
     # 每种来源保留一个格式错误代表: 非法 JSON、缺字段。
     printf '{"private_key": ' > "$FX/reg-bad-json.json"
     printf '{"outbounds": [{"settings": {"secretKey": "k"}}]}\n' > "$FX/out-bad-missing.json"
@@ -531,6 +542,155 @@ SH
     )
     check 'fetch masque: response without endpoint data is rejected without output' fetch_masque_incomplete
 
+    account_prompt() (
+        local jwt='eyJhbGciOiJSUzI1NiJ9.eyJ0ZWFtIjoidGVzdCJ9.c2ln'
+        _warp_ask_account <<< '1' >/dev/null 2>&1 || return 1
+        [ "$_WARP_ACCOUNT" = free ] && [ -z "$_WARP_SECRET" ] || return 1
+        _warp_ask_account <<< $'2\nABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
+        [ "$_WARP_ACCOUNT" = plus ] &&
+            [ "$_WARP_SECRET" = ABCDEFGH-ABCDEFGH-ABCDEFGH ] || return 1
+        _warp_ask_account <<< "3"$'\n'"$jwt" >/dev/null 2>&1 || return 1
+        [ "$_WARP_ACCOUNT" = team ] && [ "$_WARP_SECRET" = "$jwt" ] || return 1
+        _warp_ask_account <<< '0' >/dev/null 2>&1
+        [ "$?" -eq 1 ] &&
+            ! _warp_valid_license 'bad' &&
+            _warp_valid_license 'ABCDEFGH-ABCDEFGH-ABCDEFGH' &&
+            ! _warp_valid_team_token 'has space' &&
+            _warp_valid_team_token "$jwt"
+    )
+    check 'account prompt: free/plus/team selection, cancel and input validation' account_prompt
+
+    register_default_enter() (
+        _config_edit_preflight() { return 0; }
+        _warp_obtain() {
+            printf '%s\t%s\t%s\n' "${2:-}" "${3:-}" "${4:-}" > "$TMP/register-default.args"
+            printf '{"kind":"masque"}\n' > "$1"
+        }
+        _warp_apply() { return 0; }
+        printf '\n\n' | _warp_register >/dev/null 2>&1 || return 1
+        [ "$(cut -f1 "$TMP/register-default.args")" = masque ] &&
+            [ "$(cut -f2 "$TMP/register-default.args")" = free ] &&
+            [ -z "$(cut -f3 "$TMP/register-default.args")" ]
+    )
+    check 'register prompt: bare Enter twice selects free MASQUE' register_default_enter
+
+    fetch_masque_plus() (
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    [ -z "${5:-}" ] || return 1
+                    cp "$FX/masque-reg.json" "${4:-}"
+                    ;;
+                PUT)
+                    printf '%s\n' "${2:-}" > "$TMP/masque-plus-put.url"
+                    cp "${3:-}" "$TMP/masque-plus-put.body"
+                    grep -q 'Authorization: Bearer masque-token' "${5:-}" || return 1
+                    printf '{"license":"ABCDEFGH-ABCDEFGH-ABCDEFGH"}\n' > "${4:-}"
+                    ;;
+                PATCH) cp "$FX/masque-enroll.json" "${4:-}" ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/masque-plus.json"
+        _warp_fetch_masque "$TMP/masque-plus.json" plus \
+            'ABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
+        [ -s "$TMP/masque-plus.json" ] || return 1
+        grep -q '/reg/123e4567-e89b-12d3-a456-426614174000/account$' \
+            "$TMP/masque-plus-put.url" || return 1
+        jq -e '.license == "ABCDEFGH-ABCDEFGH-ABCDEFGH"' \
+            "$TMP/masque-plus-put.body" >/dev/null 2>&1
+    )
+    check 'fetch masque: WARP+ license is bound before MASQUE enrollment' fetch_masque_plus
+
+    fetch_masque_team() (
+        local jwt='eyJhbGciOiJSUzI1NiJ9.eyJ0ZWFtIjoidGVzdCJ9.c2ln'
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    grep -Fq "CF-Access-Jwt-Assertion: $jwt" "${5:-}" || return 1
+                    cp "$FX/masque-reg.json" "${4:-}"
+                    ;;
+                PATCH) cp "$FX/masque-enroll.json" "${4:-}" ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/masque-team.json"
+        _warp_fetch_masque "$TMP/masque-team.json" team "$jwt" >/dev/null 2>&1 || return 1
+        [ -s "$TMP/masque-team.json" ]
+    )
+    check 'fetch masque: Zero Trust team token is sent as JWT without license binding' fetch_masque_team
+
+    masque_account_endpoints() {
+        [ "$(_warp_normalize_masque "$FX/masque-raw.json" plus | jq -r .server)" = "162.159.199.2" ] &&
+            [ "$(_warp_normalize_masque "$FX/masque-raw.json" team | jq -r .server)" = "162.159.197.2" ] &&
+            [ "$(_warp_normalize_masque "$FX/masque-raw.json" | jq -r .server)" = "162.159.198.2" ]
+    }
+    check 'normalize masque: free/WARP+/Zero Trust use their own endpoints' masque_account_endpoints
+
+    obtain_masque_plus() (
+        _warp_fetch_masque() { cp "$FX/masque-raw.json" "$1"; }
+        rm -f "$TMP/masque-plus-obtain.json"
+        _warp_obtain "$TMP/masque-plus-obtain.json" masque plus \
+            'ABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
+        jq -e '.kind == "masque" and .server == "162.159.199.2"' \
+            "$TMP/masque-plus-obtain.json" >/dev/null 2>&1
+    )
+    check 'obtain masque: WARP+ account selects the WARP+ endpoint' obtain_masque_plus
+
+    fetch_wg_account() (
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    [ -z "${5:-}" ] || return 1
+                    cp "$FX/wg-account-reg.json" "${4:-}"
+                    ;;
+                PUT)
+                    grep -q 'Authorization: Bearer wg-account-token' "${5:-}" || return 1
+                    printf '{"license":"ABCDEFGH-ABCDEFGH-ABCDEFGH"}\n' > "${4:-}"
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/wg-account.json" "$TMP/wg-account.norm.json"
+        _warp_fetch_wg_account "$TMP/wg-account.json" plus \
+            'ABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
+        jq -e '
+            (.privateKey | length) == 44
+            and .reserved == [1, 2, 3]
+            and .response.id == "wg-account-id"
+        ' "$TMP/wg-account.json" >/dev/null 2>&1 || return 1
+        _warp_normalize_wg_account "$TMP/wg-account.json" > "$TMP/wg-account.norm.json" || return 1
+        jq -e '
+            (.secretKey | length) == 44
+            and .address == ["172.16.0.9/32", "2606:4700:110:8a36::9/128"]
+            and .reserved == [1, 2, 3]
+            and .endpoint == "162.159.193.1:2408"
+            and .publicKey == "cGVlci1wdWJsaWMta2V5"
+            and .mtu == 1280
+        ' "$TMP/wg-account.norm.json" >/dev/null 2>&1
+    )
+    check 'fetch wireguard: WARP+ registration binds license, derives reserved and endpoint' fetch_wg_account
+
+    obtain_wg_team() (
+        local jwt='eyJhbGciOiJSUzI1NiJ9.eyJ0ZWFtIjoidGVzdCJ9.c2ln'
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    grep -Fq "CF-Access-Jwt-Assertion: $jwt" "${5:-}" || return 1
+                    cp "$FX/wg-account-reg.json" "${4:-}"
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/wg-team.out"
+        _warp_obtain "$TMP/wg-team.out" wireguard team "$jwt" >/dev/null 2>&1 || return 1
+        jq -e '
+            .reserved == [1, 2, 3]
+            and .endpoint == "162.159.193.1:2408"
+        ' "$TMP/wg-team.out" >/dev/null 2>&1
+    )
+    check 'obtain wireguard: Zero Trust JWT registration skips license binding' obtain_wg_team
+
     obtain_masque_ok() (
         _warp_fetch_masque() { cp "$FX/masque-raw.json" "$1"; }
         rm -f "$TMP/masque-obtain.json"
@@ -709,9 +869,136 @@ SH
     check 'fetch: local and remote warp-reg failures share one reason' fetch_reg_local_remote_fail
 
     # -----------------------------------------------------------------------
+    # B2. Cloudflare 设备生命周期: 记录/释放/提交/回滚
+    # -----------------------------------------------------------------------
+    device_record_roundtrip() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" DEV1 TOKEN1 plus || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_PENDING_KEY")" = "$(printf 'DEV1\tTOKEN1')" ] || return 1
+        [ "$(stat -c %a "$STATE_DIR/$WARP_DEVICE_PENDING_KEY")" = 600 ] || return 1
+        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+    )
+    check 'device: record roundtrip keeps id/token with 600 perms' device_record_roundtrip
+
+    device_release_uses_delete() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY"
+        : > "$TMP/device-curl.log"
+        curl() {
+            local prev="" a
+            for a in "$@"; do
+                [ "$prev" = "-K" ] && _warp_test_auth="$a"
+                prev="$a"
+            done
+            printf '%s\n' "$*" >> "$TMP/device-curl.log"
+            [ -n "${_warp_test_auth:-}" ] && cat "$_warp_test_auth" >> "$TMP/device-curl.log"
+            printf '%s' "${_warp_test_code:-204}"
+        }
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" DEV2 TOKEN2 plus || return 1
+        _warp_device_release "$WARP_DEVICE_STATE_KEY" || return 1
+        grep -q -- '-X DELETE' "$TMP/device-curl.log" || return 1
+        grep -q '/reg/DEV2' "$TMP/device-curl.log" || return 1
+        grep -q 'Authorization: Bearer TOKEN2' "$TMP/device-curl.log" || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_STATE_KEY" ]
+    )
+    check 'device: release deletes the device and clears the record' device_release_uses_delete
+
+    device_release_failure_keeps_state() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY"
+        curl() { printf '%s' "${_warp_test_code:-204}"; }
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" DEV3 TOKEN3 plus || return 1
+        _warp_test_code=500
+        _warp_device_release "$WARP_DEVICE_STATE_KEY" && return 1
+        _warp_device_fields "$WARP_DEVICE_STATE_KEY" >/dev/null 2>&1 || return 1
+        _warp_test_code=404
+        _warp_device_release "$WARP_DEVICE_STATE_KEY" || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_STATE_KEY" ]
+    )
+    check 'device: release keeps the record on failure and treats 404 as gone' device_release_failure_keeps_state
+
+    device_commit_releases_old() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        : > "$TMP/device-curl.log"
+        curl() {
+            printf '%s\n' "$*" >> "$TMP/device-curl.log"
+            printf '%s' 204
+        }
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" OLDDEV OLDTOK plus || return 1
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" NEWDEV NEWTOK plus || return 1
+        _warp_device_commit || return 1
+        grep -q '/reg/OLDDEV' "$TMP/device-curl.log" || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY" | cut -f1)" = NEWDEV ] || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" ]
+    )
+    check 'device: commit releases the old device and promotes the new one' device_commit_releases_old
+
+    license_bind_errors_preserve_current_device() (
+        local dir
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" OLDDEV OLDTOK plus || return 1
+        _warp_device_release_fields() {
+            : > "$TMP/license-bind-released"
+            return 0
+        }
+        _warp_http_json() {
+            case "${1:-}" in
+                POST) cp "$FX/wg-account-reg.json" "${4:-}" ;;
+                PUT)
+                    printf '%s\n' "${WARP_TEST_LICENSE_ERROR:-}" > "${4:-}"
+                    _WARP_HTTP_CODE="${WARP_TEST_LICENSE_CODE:-400}"
+                    return 1
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        WARP_TEST_LICENSE_CODE=429
+        WARP_TEST_LICENSE_ERROR='{"error":"Too many requests"}'
+        dir=$(mktemp -d "$TMP/license-bind.XXXXXX") || return 1
+        _warp_api_register_wg "$dir" plus 'ABCDEFGH-ABCDEFGH-ABCDEFGH' && return 1
+        [ "$_WARP_REASON" = 'HTTP 429: Too many requests' ] || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY")" = "$(printf 'OLDDEV\tOLDTOK')" ] || return 1
+        [ ! -e "$TMP/license-bind-released" ] || return 1
+        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+
+        WARP_TEST_LICENSE_CODE=400
+        WARP_TEST_LICENSE_ERROR='{"error":"Too many devices registered"}'
+        dir=$(mktemp -d "$TMP/license-bind.XXXXXX") || return 1
+        _warp_api_register_wg "$dir" plus 'ABCDEFGH-ABCDEFGH-ABCDEFGH' && return 1
+        case "$_WARP_REASON" in
+            'HTTP 400: Too many devices registered'*'请先删除'*) ;;
+            *) return 1 ;;
+        esac
+        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY")" = "$(printf 'OLDDEV\tOLDTOK')" ] || return 1
+        [ ! -e "$TMP/license-bind-released" ] || return 1
+        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+        _warp_device_drop "$WARP_DEVICE_STATE_KEY"
+    )
+    check 'license bind: rate limit and device quota failures keep the current device' license_bind_errors_preserve_current_device
+
+    register_failure_releases_pending() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        base_cfg | cfg_reset || return 1
+        : > "$TMP/device-curl.log"
+        curl() {
+            printf '%s\n' "$*" >> "$TMP/device-curl.log"
+            printf '%s' 204
+        }
+        _warp_ask_account() { _WARP_ACCOUNT="plus"; _WARP_SECRET="ABCDEFGH-ABCDEFGH-ABCDEFGH"; return 0; }
+        _warp_obtain() {
+            _warp_device_record "$WARP_DEVICE_PENDING_KEY" PENDDEV PENDTOK plus || return 1
+            printf '%s\n' '{"kind":"masque"}' > "$1"
+        }
+        _warp_apply() { return 1; }
+        _warp_register masque >/dev/null 2>&1 || true
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" ] || return 1
+        grep -q '/reg/PENDDEV' "$TMP/device-curl.log"
+    )
+    check 'register: failed apply releases the pending device' register_failure_releases_pending
+
+    # -----------------------------------------------------------------------
     # C. 出站生命周期
     # -----------------------------------------------------------------------
     printf '== C. outbound lifecycle ==\n'
+    rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
     base_cfg | cfg_reset || exit 1
     check 'apply: writes the warp outbound after the existing ones' _warp_apply "$(norm_a)"
     check 'apply: outbound order is direct, block, warp' eq 'direct|block|warp' "$(_config_jq -r '.outbounds | map(.tag) | join("|")')"

@@ -1460,6 +1460,20 @@ _dns_summary() {
     printf '%s' "$out" | tr '\t' '|'
 }
 
+# 并行查询状态用圆点标记, 与核心管理菜单的开机自启同一写法。
+_dns_parallel_label() {
+    local enabled
+    enabled=$(_config_jq -r '(.dns | if type == "object" then . else {} end) | .enableParallelQuery // false' 2>/dev/null) || {
+        printf '%s' "${RED}未知${NC}"
+        return 0
+    }
+    case "$enabled" in
+        true) printf '%s' "${GREEN}● 已启用${NC}" ;;
+        false) printf '%s' "${RED}○ 已关闭${NC}" ;;
+        *) printf '%s' "${RED}未知${NC}" ;;
+    esac
+}
+
 # 参数同 _config_jq(filter 最后)。
 _dns_apply() {
     [ "$#" -ge 1 ] || return 1
@@ -1548,9 +1562,8 @@ _dns_set_parallel() {
     _config_edit_preflight "修改 DNS 配置" || return 1
     echo
     echo -e "  ${CYAN}设置并行查询 enableParallelQuery${NC}"
-    local current c value
-    current=$(_config_jq -r '.dns.enableParallelQuery // false' 2>/dev/null) || current=false
-    echo -e "  当前状态: $current"
+    local c value
+    echo -e "  当前状态: $(_dns_parallel_label)"
     echo -e "  ${GREEN}[1]${NC} 开启"
     echo -e "  ${GREEN}[2]${NC} 关闭"
     echo -e "  ${GREEN}[0]${NC} 取消"
@@ -1638,6 +1651,7 @@ _dns_menu() {
         fi
         echo -e "  当前上游: ${servers:-未设置}"
         echo -e "  解析策略: ${strategy:-未设置}"
+        echo -e "  并行查询: $(_dns_parallel_label)"
         echo
         echo -e "  ${GREEN}[1]${NC} 设置上游 DNS 服务器"
         echo -e "  ${GREEN}[2]${NC} 设置解析策略"

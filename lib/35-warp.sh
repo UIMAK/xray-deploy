@@ -1,6 +1,7 @@
 #!/bin/bash
 # lib/35-warp.sh — WARP 自动注册与 Xray WireGuard/MASQUE 出站。
-# WireGuard 来源按 warp-reg.sh → wgcf-cli → 注册 API 回退; MASQUE 直接走 Cloudflare 设备注册 API。
+# 账号类型: 免费 WARP / WARP+ license / Zero Trust team token。
+# WireGuard 免费账号按 warp-reg.sh → wgcf-cli → 注册 API 回退; WARP+、Zero Trust 与 MASQUE 直接走 Cloudflare 设备注册 API。
 # 配置唯一事实来源是 confs 里的 Xray 片段: 注册结果保存在 tag=warp 出站里。
 # 写入一律走 _mutate_config(定义在 50 模块, 调用时才解析); 见 _warp_apply / _warp_delete。
 
@@ -9,14 +10,19 @@ WARP_DEFAULT_PORT="2408"
 WARP_REG_SCRIPT_URL="https://raw.githubusercontent.com/chise0713/warp-reg.sh/master/warp-reg.sh"
 WARP_WGCF_URL="https://github.com/ArchiveNetwork/wgcf-cli/releases/download/v0.3.6"
 WARP_API_URL="https://warp.cloudflare.now.cc/?run=register&format=xray"
-# Cloudflare 设备管理 API 与 usque v4.2.1 对齐; MASQUE H2 使用免费 WARP 的 anycast 段。
-WARP_MASQUE_API="https://api.cloudflareclient.com/v0a4471"
+# Cloudflare 设备管理 API 与 usque v4.2.1 对齐; MASQUE H2 按账号类型选择 anycast 段。
+WARP_API_BASE="https://api.cloudflareclient.com/v0a4471"
 WARP_MASQUE_ENDPOINT="162.159.198.2"
+WARP_MASQUE_ENDPOINT_PLUS="162.159.199.2"
+WARP_MASQUE_ENDPOINT_TEAM="162.159.197.2"
 WARP_MASQUE_PORT="443"
 # usque README 推荐使用 zt-masque; consumer-masque 虽可用但在部分网络会被重置。
 WARP_MASQUE_SERVER_NAME="zt-masque.cloudflareclient.com"
 _WARP_REASON=""
 _WARP_HTTP_CODE=""
+# Cloudflare 设备记录: 重新注册/删除 WARP 时据此释放旧设备, 否则 WARP+ 5 台额度会被占满。
+WARP_DEVICE_STATE_KEY="warp_device"
+WARP_DEVICE_PENDING_KEY="warp_device_pending"
 
 # 归一/生成共用的 jq 定义: 内部表示字段名与类型固定, 缺必填字段或非法 reserved 一律 error 退出。
 # reserved 按官方文档是可选项(默认全 0), 省略时补 [0,0,0]; mtu 缺省取 1280 是 Cloudflare WARP 的
@@ -85,6 +91,26 @@ def reg2norm:
                    elif type == "string" then .
                    else "" end),
       publicKey: (($r | fld("public_key")) | if type == "string" then . else "" end),
+      allowedIPs: ["0.0.0.0/0", "::/0"],
+      mtu: 1280
+    }
+  | wgcheck;
+# 账号注册 (WARP+ / Zero Trust) 的原始响应; 私钥与 reserved 由注册流程另行生成。
+def wgacct2norm:
+  . as $r
+  | (($r.response // {}) | .config // {}) as $c
+  | (($c.peers // [])[0] // {}) as $p
+  | (($c.interface // {}).addresses // {}) as $a
+  | {
+      secretKey: (($r.privateKey // "") | if type == "string" then . else "" end),
+      address: ([$a.v4, $a.v6] | map(select((type == "string") and (. != ""))) | map(addrmask)),
+      reserved: ($r.reserved // []),
+      endpoint: (if ($p.endpoint | type) == "string" then $p.endpoint
+                 elif (($p.endpoint.v4 // "") != "") then $p.endpoint.v4
+                 elif (($p.endpoint.v6 // "") != "") then $p.endpoint.v6
+                 elif (($p.endpoint.host // "") != "") then $p.endpoint.host
+                 else "" end),
+      publicKey: (($p.public_key // "") | if type == "string" then . else "" end),
       allowedIPs: ["0.0.0.0/0", "::/0"],
       mtu: 1280
     }
@@ -164,6 +190,36 @@ _warp_endpoint_norm() {
     else
         printf '%s:%d' "$host" "$p"
     fi
+}
+
+# 账号类型对应的 MASQUE 端点; WireGuard 使用注册响应里的 endpoint。
+_warp_masque_endpoint() {   # [free|plus|team]
+    case "${1:-free}" in
+        plus) printf '%s' "$WARP_MASQUE_ENDPOINT_PLUS" ;;
+        team) printf '%s' "$WARP_MASQUE_ENDPOINT_TEAM" ;;
+        *) printf '%s' "$WARP_MASQUE_ENDPOINT" ;;
+    esac
+}
+
+_warp_account_label() {   # [free|plus|team]
+    case "${1:-free}" in
+        plus) printf 'WARP+' ;;
+        team) printf 'Zero Trust' ;;
+        *) printf '免费 WARP' ;;
+    esac
+}
+
+_warp_valid_license() {
+    [[ "${1:-}" =~ ^[0-9A-Za-z]{8}-[0-9A-Za-z]{8}-[0-9A-Za-z]{8}$ ]]
+}
+
+_warp_valid_team_token() {
+    local token="${1:-}"
+    [ -n "$token" ] || return 1
+    case "$token" in
+        *[[:space:]\"\\]*) return 1 ;;
+    esac
+    [[ "$token" =~ ^[A-Za-z0-9._~+/=-]+$ ]]
 }
 
 # 归一收尾: endpoint 交给 bash 规范化后回写, 其余字段原样保留。失败不输出任何内容。
@@ -427,46 +483,152 @@ _warp_http_json() {   # <method> <url> <bodyfile> <dest> [authfile]
     return 0
 }
 
-# MASQUE 注册沿用 usque 的做法: 先注册一个临时 WireGuard 公钥取得账户与 token,
-# 再把账户设备密钥替换为 P-256(secp256r1) 并切换到 masque。临时 WireGuard 私钥不保存。
-# 输出为 {privateKey, response}; response 是 Cloudflare 的 PATCH /reg/<id> 响应。
-_warp_fetch_masque() {   # <outfile>
-    local out="${1:-}" dir="" wg_pub tos serial id token
-    _WARP_REASON=""
-    [ -n "$out" ] || { _WARP_REASON="未指定输出文件"; return 1; }
+# 删除 Cloudflare 设备(释放 WARP+ 设备额度): 204/404 视为成功。
+_warp_http_delete() {   # <url> <authfile>
+    local url="${1:-}" auth="${2:-}" code rc
+    [ -n "$url" ] && [ -f "$auth" ] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        --proto '=https' --proto-redir '=https' \
+        --connect-timeout 8 --max-time 20 \
+        -X DELETE \
+        -H 'User-Agent: WARP for Android' \
+        -H 'CF-Client-Version: a-6.35-4471' \
+        -K "$auth" "$url" 2>/dev/null)
+    rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    case "$code" in
+        2??|404) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 设备记录 {"id","token","account"}: 写入 state, 由 _state_set 保证 600。
+# token 是 Bearer 凭据, 只经文件传给 jq, 不进 argv。
+_warp_device_record() {   # <key> <id> <token> <account>
+    local key="${1:-}" id="${2:-}" token="${3:-}" account="${4:-}" tmp json
+    [ -n "$key" ] && [ -n "$id" ] && [ -n "$token" ] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    tmp=$(mktemp) || return 1
+    if ! printf '%s' "$token" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    json=$(jq -cn --arg id "$id" --arg account "$account" --rawfile token "$tmp" \
+        '{id: $id, token: $token, account: $account}' 2>/dev/null) || json=""
+    rm -f "$tmp"
+    [ -n "$json" ] || return 1
+    _state_set "$key" "$json"
+}
+
+_warp_device_fields() {   # <key> -> "id<TAB>token"
+    local key="${1:-}" json id token
+    json=$(_state_get "$key" 2>/dev/null) || return 1
+    [ -n "$json" ] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    id=$(printf '%s' "$json" | jq -r '.id // empty' 2>/dev/null) || return 1
+    token=$(printf '%s' "$json" | jq -r '.token // empty' 2>/dev/null) || return 1
+    [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    [ -n "$token" ] || return 1
+    printf '%s\t%s\n' "$id" "$token"
+}
+
+_warp_device_drop() {   # <key>
+    local key="${1:-}"
+    [ -n "$key" ] || return 1
+    rm -f -- "$STATE_DIR/$key" 2>/dev/null
+}
+
+_warp_device_release_fields() {   # <id> <token>
+    local id="${1:-}" token="${2:-}" dir rc=1
+    [ -n "$id" ] && [ -n "$token" ] || return 1
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/warp-release.XXXXXX") || return 1
+    chmod 700 "$dir" 2>/dev/null
+    if printf 'header = "Authorization: Bearer %s"\n' "$token" > "$dir/auth.conf"; then
+        chmod 600 "$dir/auth.conf" 2>/dev/null
+        _warp_http_delete "$WARP_API_BASE/reg/$id" "$dir/auth.conf" && rc=0
+    fi
+    rm -rf -- "$dir"
+    [ "$rc" -eq 0 ]
+}
+
+# 删除 state 里记录的设备; 成功才清掉记录, 失败保留供下次再试。
+_warp_device_release() {   # <key>
+    local key="${1:-}" fields id token
+    fields=$(_warp_device_fields "$key") || return 1
+    IFS=$'\t' read -r id token <<< "$fields"
+    _warp_device_release_fields "$id" "$token" || return 1
+    _warp_device_drop "$key"
+}
+
+# 新设备已生效: 待确认记录提升为当前设备, 再释放上一台设备(释放 WARP+ 额度)。
+_warp_device_commit() {
+    local pending old old_id old_token
+    pending=$(_state_get "$WARP_DEVICE_PENDING_KEY" 2>/dev/null) || pending=""
+    [ -n "$pending" ] || return 0
+    old=$(_warp_device_fields "$WARP_DEVICE_STATE_KEY" 2>/dev/null) || old=""
+    if ! _state_set "$WARP_DEVICE_STATE_KEY" "$pending"; then
+        # 记录失败时清掉 pending, 避免之后误删仍在使用的设备。
+        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+        _warn "WARP 设备记录写入失败, 之后无法自动释放设备额度"
+        return 1
+    fi
+    _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+    if [ -n "$old" ]; then
+        IFS=$'\t' read -r old_id old_token <<< "$old"
+        if ! _warp_device_release_fields "$old_id" "$old_token"; then
+            _warn "旧 WARP 设备解绑失败, WARP+ 设备额度可能仍被占用"
+        fi
+    fi
+    return 0
+}
+
+# 注册整体失败时释放刚创建但未生效的设备。
+_warp_device_rollback() {
+    _warp_device_fields "$WARP_DEVICE_PENDING_KEY" >/dev/null 2>&1 || return 0
+    if ! _warp_device_release "$WARP_DEVICE_PENDING_KEY"; then
+        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+        _warn "失败注册产生的 WARP 设备未能解绑, 额度可能被占用"
+    fi
+    return 0
+}
+
+# 注册一个临时 WireGuard 设备并通过指定账号类型取得账户:
+# free 匿名注册; plus 注册后把 license 绑定到该设备; team 注册请求带 team token (JWT)。
+# 输出 <dir>/reg.json、wg.priv.b64、wg.pub.b64 和 Bearer auth.conf。
+_warp_api_register_wg() {   # <dir> [free|plus|team] [license|team token]
+    local dir="${1:-}" account="${2:-free}" secret="${3:-}" tos serial wg_pub auth_post="" id token
+    [ -n "$dir" ] && [ -d "$dir" ] || { _WARP_REASON="注册临时目录不可用"; return 1; }
+    case "$account" in
+        free|plus|team) ;;
+        *) _WARP_REASON="未知 WARP 账号类型: $account"; return 1 ;;
+    esac
+    case "$account" in
+        plus) _warp_valid_license "$secret" || { _WARP_REASON="WARP+ license 格式无效"; return 1; } ;;
+        team) _warp_valid_team_token "$secret" || { _WARP_REASON="Zero Trust team token 无效"; return 1; } ;;
+    esac
     command -v openssl >/dev/null 2>&1 || { _WARP_REASON="openssl 不可用"; return 1; }
     command -v base64 >/dev/null 2>&1 || { _WARP_REASON="base64 不可用"; return 1; }
-    dir=$(mktemp -d "${TMPDIR:-/tmp}/warp-masque.XXXXXX") || {
-        _WARP_REASON="无法创建 MASQUE 临时目录"
-        return 1
-    }
-    chmod 700 "$dir" 2>/dev/null || {
-        _WARP_REASON="无法保护 MASQUE 临时目录"
-        rm -rf -- "$dir"
-        return 1
-    }
 
     if ! openssl genpkey -algorithm X25519 -out "$dir/wg.pem" >/dev/null 2>&1; then
-        _WARP_REASON="无法生成 MASQUE 注册用 WireGuard 密钥"
-        rm -rf -- "$dir"
+        _WARP_REASON="无法生成 WARP 注册用 WireGuard 密钥"
         return 1
     fi
     wg_pub=$(openssl pkey -in "$dir/wg.pem" -pubout -outform DER 2>/dev/null |
         tail -c 32 | base64 | tr -d '\n')
-    [ -n "$wg_pub" ] || {
-        _WARP_REASON="无法导出 MASQUE 注册用 WireGuard 公钥"
-        rm -rf -- "$dir"
+    openssl pkey -in "$dir/wg.pem" -outform DER 2>/dev/null |
+        tail -c 32 | base64 | tr -d '\n' > "$dir/wg.priv.b64"
+    if [ -z "$wg_pub" ] || [ ! -s "$dir/wg.priv.b64" ]; then
+        _WARP_REASON="无法导出 WARP 注册用 WireGuard 密钥"
         return 1
-    }
+    fi
     tos=$(date -u +"%Y-%m-%dT%H:%M:%S.000+00:00") || {
         _WARP_REASON="无法生成注册时间"
-        rm -rf -- "$dir"
         return 1
     }
     serial=$(openssl rand -hex 8 2>/dev/null)
     [ -n "$serial" ] || {
         _WARP_REASON="无法生成设备序列号"
-        rm -rf -- "$dir"
         return 1
     }
 
@@ -482,23 +644,82 @@ _warp_fetch_masque() {   # <outfile>
             tunnel_type: "wireguard",
             locale: "en_US"
         }' > "$dir/reg.body"; then
-        _WARP_REASON="无法生成 MASQUE 注册请求"
-        rm -rf -- "$dir"
+        _WARP_REASON="无法生成 WARP 注册请求"
         return 1
     fi
-    if ! _warp_http_json POST "$WARP_MASQUE_API/reg" "$dir/reg.body" "$dir/reg.json"; then
+    if [ "$account" = "team" ]; then
+        printf 'header = "CF-Access-Jwt-Assertion: %s"\n' "$secret" > "$dir/jwt.conf" || {
+            _WARP_REASON="无法生成 Zero Trust 授权配置"
+            return 1
+        }
+        chmod 600 "$dir/jwt.conf" 2>/dev/null
+        auth_post="$dir/jwt.conf"
+    fi
+    if ! _warp_http_json POST "$WARP_API_BASE/reg" "$dir/reg.body" "$dir/reg.json" "$auth_post"; then
         _WARP_REASON=$(_warp_http_reason "$dir/reg.json" 2>/dev/null) ||
-            _WARP_REASON="Cloudflare MASQUE 注册请求失败"
-        rm -rf -- "$dir"
+            _WARP_REASON="Cloudflare WARP 注册请求失败"
         return 1
     fi
     id=$(jq -r '.id // empty' "$dir/reg.json" 2>/dev/null)
     token=$(jq -r '.token // empty' "$dir/reg.json" 2>/dev/null)
     if ! [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || [ -z "$token" ]; then
-        _WARP_REASON="Cloudflare MASQUE 注册响应缺少有效账户信息"
+        _WARP_REASON="Cloudflare WARP 注册响应缺少有效账户信息"
+        return 1
+    fi
+    # 先记录设备: 之后任何一步失败都可按 id/token 释放, 避免占用 WARP+ 设备额度。
+    _warp_device_record "$WARP_DEVICE_PENDING_KEY" "$id" "$token" "$account" ||
+        _warn "无法记录 WARP 设备信息, 注册失败后可能无法自动释放设备额度"
+    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$dir/auth.conf" || {
+        _WARP_REASON="无法生成 WARP 授权配置"
+        return 1
+    }
+    chmod 600 "$dir/auth.conf" 2>/dev/null
+    if [ "$account" = "plus" ]; then
+        # license 是长期凭据, 经 600 文件传给 jq, 不进 argv。
+        if ! printf '%s' "$secret" > "$dir/license.txt" ||
+            ! jq -n --rawfile license "$dir/license.txt" '{license: $license}' > "$dir/license.body"; then
+            rm -f "$dir/license.txt"
+            _WARP_REASON="无法生成 WARP+ license 请求"
+            return 1
+        fi
+        chmod 600 "$dir/license.txt" 2>/dev/null
+        rm -f "$dir/license.txt"
+        if ! _warp_http_json PUT "$WARP_API_BASE/reg/$id/account" \
+            "$dir/license.body" "$dir/license.json" "$dir/auth.conf"; then
+            # 绑定前不能销毁现用设备: 一旦后续失败, 本地配置仍引用它。
+            _WARP_REASON=$(_warp_http_reason "$dir/license.json" 2>/dev/null) ||
+                _WARP_REASON="WARP+ license 绑定失败"
+            if grep -Eqi 'too many devices|device (limit|quota)|maximum (number of )?devices' \
+                "$dir/license.json" 2>/dev/null; then
+                _WARP_REASON="${_WARP_REASON}；请先删除不再使用的 WARP 设备后重试"
+            fi
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# MASQUE 注册沿用 usque 的做法: 先注册一个临时 WireGuard 公钥取得账户与 token,
+# 再把账户设备密钥替换为 P-256(secp256r1) 并切换到 masque。临时 WireGuard 私钥不保存。
+# 输出为 {privateKey, response}; response 是 Cloudflare 的 PATCH /reg/<id> 响应。
+_warp_fetch_masque() {   # <outfile> [free|plus|team] [license|team token]
+    local out="${1:-}" account="${2:-free}" secret="${3:-}" dir="" id
+    _WARP_REASON=""
+    [ -n "$out" ] || { _WARP_REASON="未指定输出文件"; return 1; }
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/warp-masque.XXXXXX") || {
+        _WARP_REASON="无法创建 MASQUE 临时目录"
+        return 1
+    }
+    chmod 700 "$dir" 2>/dev/null || {
+        _WARP_REASON="无法保护 MASQUE 临时目录"
+        rm -rf -- "$dir"
+        return 1
+    }
+    if ! _warp_api_register_wg "$dir" "$account" "$secret"; then
         rm -rf -- "$dir"
         return 1
     fi
+    id=$(jq -r '.id // empty' "$dir/reg.json" 2>/dev/null)
 
     if ! openssl ecparam -name prime256v1 -genkey -noout -out "$dir/ec.pem" >/dev/null 2>&1 ||
         ! openssl ec -in "$dir/ec.pem" -outform DER -out "$dir/ec.der" >/dev/null 2>&1 ||
@@ -523,12 +744,7 @@ _warp_fetch_masque() {   # <outfile>
         rm -rf -- "$dir"
         return 1
     fi
-    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$dir/auth.conf" || {
-        _WARP_REASON="无法生成 MASQUE 授权配置"
-        rm -rf -- "$dir"
-        return 1
-    }
-    if ! _warp_http_json PATCH "$WARP_MASQUE_API/reg/$id" "$dir/enroll.body" "$dir/enroll.json" "$dir/auth.conf"; then
+    if ! _warp_http_json PATCH "$WARP_API_BASE/reg/$id" "$dir/enroll.body" "$dir/enroll.json" "$dir/auth.conf"; then
         _WARP_REASON=$(_warp_http_reason "$dir/enroll.json" 2>/dev/null) ||
             _WARP_REASON="Cloudflare MASQUE 设备登记失败"
         rm -rf -- "$dir"
@@ -562,15 +778,69 @@ _warp_fetch_masque() {   # <outfile>
     return 0
 }
 
+# WARP+ / Zero Trust 的 WireGuard 注册; reserved 取 Cloudflare client_id 解码后的前 3 字节。
+_warp_fetch_wg_account() {   # <outfile> [plus|team] [license|team token]
+    local out="${1:-}" account="${2:-plus}" secret="${3:-}" dir="" client_b64 reserved
+    _WARP_REASON=""
+    [ -n "$out" ] || { _WARP_REASON="未指定输出文件"; return 1; }
+    case "$account" in
+        plus|team) ;;
+        *) _WARP_REASON="WireGuard 账号注册不支持: $account"; return 1 ;;
+    esac
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/warp-account.XXXXXX") || {
+        _WARP_REASON="无法创建 WARP 账号临时目录"
+        return 1
+    }
+    chmod 700 "$dir" 2>/dev/null || {
+        _WARP_REASON="无法保护 WARP 账号临时目录"
+        rm -rf -- "$dir"
+        return 1
+    }
+    if ! _warp_api_register_wg "$dir" "$account" "$secret"; then
+        rm -rf -- "$dir"
+        return 1
+    fi
+    client_b64=$(jq -r '.config.client_id // empty' "$dir/reg.json" 2>/dev/null)
+    if [ ! -s "$dir/wg.priv.b64" ] || [ -z "$client_b64" ]; then
+        _WARP_REASON="Cloudflare WARP 注册响应缺少 WireGuard 密钥信息"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    reserved=$(printf '%s' "$client_b64" | base64 -d 2>/dev/null | od -An -tu1 -N3 2>/dev/null |
+        awk '{ for (i = 1; i <= NF; i++) b[++n] = $i } END { if (n != 3) exit 1; printf "%d,%d,%d", b[1], b[2], b[3] }') || {
+        _WARP_REASON="无法从 client_id 解析 WireGuard reserved"
+        rm -rf -- "$dir"
+        return 1
+    }
+    # 私钥经 600 临时文件传给 jq, 不进 argv。
+    if ! jq -n --rawfile privateKey "$dir/wg.priv.b64" --arg reserved "$reserved" \
+        --slurpfile response "$dir/reg.json" '{
+            privateKey: $privateKey,
+            reserved: ($reserved | split(",") | map(tonumber)),
+            response: $response[0]
+        }' > "$dir/result.json"; then
+        _WARP_REASON="无法生成 WARP 账号注册结果"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! cp "$dir/result.json" "$out" || ! chmod 600 "$out" 2>/dev/null; then
+        _WARP_REASON="无法写入 WARP 账号注册结果"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    rm -rf -- "$dir"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # 归一: 读 <rawfile>, 成功向 stdout 输出内部表示, 失败返回 1 且 stdout 为空。
 # ---------------------------------------------------------------------------
-# 归一骨架: <rawfile> <jq程序后缀>; 三个入口只差中间的 jq 分支表达式。
-_warp_normalize_jq() {   # <rawfile> <jq程序后缀>
-    local raw="${1:-}" prog="${2:-}" obj
+# 归一骨架: <rawfile> <jq程序后缀> [MASQUE 端点]; 各入口只差中间的 jq 分支表达式。
+_warp_normalize_jq() {   # <rawfile> <jq程序后缀> [masque_server]
+    local raw="${1:-}" prog="${2:-}" server="${3:-$WARP_MASQUE_ENDPOINT}" obj
     [ -n "$raw" ] && [ -f "$raw" ] && [ -s "$raw" ] || return 1
     command -v jq >/dev/null 2>&1 || return 1
-    obj=$(jq -c --arg server "$WARP_MASQUE_ENDPOINT" --arg sni "$WARP_MASQUE_SERVER_NAME" \
+    obj=$(jq -c --arg server "$server" --arg sni "$WARP_MASQUE_SERVER_NAME" \
         --argjson port "$WARP_MASQUE_PORT" \
         "$_WARP_NORM_JQ$prog" "$raw" 2>/dev/null) || return 1
     [ -n "$obj" ] || return 1
@@ -582,10 +852,14 @@ _warp_normalize_reg() { _warp_normalize_jq "${1:-}" ' reg2norm'; }
 # wgcf-cli 既可能给注册 JSON, 也可能给 generate --xray 的出站: 有出站字段就按出站解析。
 _warp_normalize_wgcf() { _warp_normalize_jq "${1:-}" ' (if (wgs) != null then out2norm else reg2norm end)'; }
 
-_warp_normalize_masque() { _warp_normalize_jq "${1:-}" ' masque2norm'; }
+_warp_normalize_masque() {   # <rawfile> [free|plus|team]
+    _warp_normalize_jq "${1:-}" ' masque2norm' "$(_warp_masque_endpoint "${2:-free}")"
+}
 
 # API 给的是出站结构; 即使缺 allowedIPs/mtu 也必须重新映射成内部字段, 不拼接来源 JSON。
 _warp_normalize_api() { _warp_normalize_jq "${1:-}" ' (if (wgs) != null then out2norm else error("不是 Xray WireGuard 出站结构") end)'; }
+
+_warp_normalize_wg_account() { _warp_normalize_jq "${1:-}" ' wgacct2norm'; }
 
 # ---------------------------------------------------------------------------
 # 生成: 从 stdin 读内部表示, 向 stdout 输出单个 Xray outbound。
@@ -651,23 +925,53 @@ _warp_build_outbound() {   # [true|false, 缺省 true]
 }
 
 # ---------------------------------------------------------------------------
-# 编排: 三种来源按序尝试, 第一个成功即写 <outfile> 并返回 0。
+# 编排: 免费 WireGuard 三种来源按序尝试; WARP+/Zero Trust 直接走账号注册 API。
 # 全部失败只在 stderr 说明原因, 不碰配置。
 # ---------------------------------------------------------------------------
 _warp_obtain() {
-    local out="${1:-}" kind="${2:-wireguard}" mode label fetch_fn norm_fn raw norm reason
+    local out="${1:-}" kind="${2:-wireguard}" account="${3:-free}" secret="${4:-}"
+    local mode label fetch_fn norm_fn raw norm reason
     [ -n "$out" ] || return 1
     command -v jq >/dev/null 2>&1 || { _error "jq 不可用, 无法解析 WARP 注册结果"; return 1; }
+    case "$account" in
+        free|plus|team) ;;
+        *) _error "未知 WARP 账号类型: $account"; return 1 ;;
+    esac
+    label=$(_warp_account_label "$account")
     case "$kind" in
-        wireguard) ;;
+        wireguard)
+            if [ "$account" != "free" ]; then
+                raw=$(mktemp) || { _error "无法创建临时文件"; return 1; }
+                norm=""
+                reason=""
+                _WARP_REASON=""
+                if ! _warp_fetch_wg_account "$raw" "$account" "$secret"; then
+                    reason="${_WARP_REASON:-未取得 Cloudflare WARP 注册响应}"
+                elif ! norm=$(_warp_normalize_wg_account "$raw"); then
+                    reason="Cloudflare WARP 响应无法解析"
+                fi
+                rm -f "$raw"
+                if [ -n "$norm" ]; then
+                    if printf '%s' "$norm" > "$out"; then
+                        return 0
+                    fi
+                    _warp_device_rollback
+                    _error "无法写入注册结果: $out"
+                    return 1
+                fi
+                _warp_device_rollback
+                _error "WireGuard 注册失败 (${label}): ${reason:-未取得注册响应}"
+                return 1
+            fi
+            ;;
         masque)
             raw=$(mktemp) || { _error "无法创建临时文件"; return 1; }
             norm=""
             reason=""
             _WARP_REASON=""
-            if ! _warp_fetch_masque "$raw"; then
+            if ! _warp_fetch_masque "$raw" "$account" "$secret"; then
                 reason="${_WARP_REASON:-未取得 Cloudflare MASQUE 注册响应}"
-            elif ! norm=$(_warp_normalize_masque "$raw"); then
+            elif ! norm=$(_warp_normalize_masque "$raw" "$account"); then
                 reason="Cloudflare MASQUE 响应无法解析"
             fi
             rm -f "$raw"
@@ -675,10 +979,12 @@ _warp_obtain() {
                 if printf '%s' "$norm" > "$out"; then
                     return 0
                 fi
+                _warp_device_rollback
                 _error "无法写入注册结果: $out"
                 return 1
             fi
-            _error "MASQUE 注册失败: ${reason:-未取得注册响应}"
+            _warp_device_rollback
+            _error "MASQUE 注册失败 (${label}): ${reason:-未取得注册响应}"
             return 1
             ;;
         *)
@@ -800,23 +1106,73 @@ _warp_delete() {
            then .routing.rules = ([$root.routing.rules[]? | select((.outboundTag? // "") != "warp")])
            else . end)
     ' || return 1
+    # 本地删除后再释放 Cloudflare 设备(解绑 WARP+ 额度); 失败只提示, 不影响本地清理。
+    if _warp_device_fields "$WARP_DEVICE_STATE_KEY" >/dev/null 2>&1; then
+        _warp_device_release "$WARP_DEVICE_STATE_KEY" ||
+            _warn "WARP 设备解绑失败, WARP+ 设备额度需手动释放"
+    fi
     return 0
 }
 
 # ---------------------------------------------------------------------------
 # 子菜单: 不调用 _menu_require_tty(只有主菜单调用)。菜单只显示是否存在/endpoint/地址/MTU。
 # ---------------------------------------------------------------------------
+_warp_ask_account() {   # sets _WARP_ACCOUNT / _WARP_SECRET; 0=ok 1=cancel
+    local ans secret
+    _WARP_ACCOUNT="free"
+    _WARP_SECRET=""
+    echo
+    echo -e "  ${CYAN}选择 WARP 账号类型${NC}"
+    echo -e "  ${GREEN}[1]${NC} 免费 WARP"
+    echo -e "  ${GREEN}[2]${NC} WARP+ (license key)"
+    echo -e "  ${GREEN}[3]${NC} Zero Trust (team token)"
+    echo -e "  ${GREEN}[0]${NC} 返回"
+    while true; do
+        read -rp "  请选择 [1]: " ans || return 1
+        case "${ans:-1}" in
+            0) return 1 ;;
+            1)
+                _WARP_ACCOUNT="free"
+                _WARP_SECRET=""
+                return 0
+                ;;
+            2)
+                read -rp "  请输入 WARP+ license: " secret || return 1
+                secret=$(printf '%s' "$secret" | tr -d '[:space:]')
+                if _warp_valid_license "$secret"; then
+                    _WARP_ACCOUNT="plus"
+                    _WARP_SECRET="$secret"
+                    return 0
+                fi
+                _warn "license 格式应为 xxxxxxxx-xxxxxxxx-xxxxxxxx"
+                ;;
+            3)
+                echo -e "  team token 从 ${CYAN}https://<团队名>.cloudflareaccess.com/warp${NC} 获取 (有效期约 1 分钟)"
+                read -rp "  请输入 Zero Trust team token: " secret || return 1
+                secret=$(printf '%s' "$secret" | tr -d '[:space:]')
+                if _warp_valid_team_token "$secret"; then
+                    _WARP_ACCOUNT="team"
+                    _WARP_SECRET="$secret"
+                    return 0
+                fi
+                _warn "team token 不能为空, 且不能包含空白、引号或反斜杠"
+                ;;
+            *) _warn "无效选择" ;;
+        esac
+    done
+}
+
 _warp_register() {   # [wireguard|masque]
-    local kind="${1:-}" ans tmp norm
+    local kind="${1:-}" ans tmp norm account secret label
     if [ -z "$kind" ]; then
         echo
         echo -e "  ${CYAN}选择 WARP 连接方式${NC}"
-        echo -e "  ${GREEN}[1]${NC} WireGuard (UDP，兼容性好)"
-        echo -e "  ${GREEN}[2]${NC} MASQUE (HTTP/2 over TLS，TCP 443)"
+        echo -e "  ${GREEN}[1]${NC} MASQUE (HTTP/2 over TLS，TCP 443)"
+        echo -e "  ${GREEN}[2]${NC} WireGuard (UDP，兼容性好)"
         read -rp "  请选择 [1]: " ans || return 1
         case "${ans:-1}" in
-            1) kind="wireguard" ;;
-            2) kind="masque" ;;
+            1) kind="masque" ;;
+            2) kind="wireguard" ;;
             *) _info "已取消"; return 0 ;;
         esac
     fi
@@ -824,24 +1180,33 @@ _warp_register() {   # [wireguard|masque]
         wireguard|masque) ;;
         *) _error "未知 WARP 连接方式: $kind"; return 1 ;;
     esac
+    if ! _warp_ask_account; then
+        _info "已取消"
+        return 0
+    fi
+    account="$_WARP_ACCOUNT"
+    secret="$_WARP_SECRET"
+    label=$(_warp_account_label "$account")
     _config_edit_preflight "管理 WARP" || return 1
     tmp=$(mktemp) || { _error "无法创建临时文件"; return 1; }
-    if ! _warp_obtain "$tmp" "$kind"; then
+    if ! _warp_obtain "$tmp" "$kind" "$account" "$secret"; then
         rm -f "$tmp"
         _error "WARP 注册失败, 配置未修改"
         return 1
     fi
     norm=$(cat "$tmp")
     rm -f "$tmp"
-    [ -n "$norm" ] || { _error "注册结果为空, 配置未修改"; return 1; }
+    [ -n "$norm" ] || { _warp_device_rollback; _error "注册结果为空, 配置未修改"; return 1; }
     if ! _warp_apply "$norm"; then
+        _warp_device_rollback
         _error "WARP 出站写入失败(配置已回滚)"
         return 1
     fi
+    _warp_device_commit || true
     if [ "$kind" = "masque" ]; then
-        _success "WARP MASQUE 出站已写入(tag=warp), xray 已用新配置重启"
+        _success "WARP MASQUE 出站已写入(tag=warp, 账号: $label), xray 已用新配置重启"
     else
-        _success "WARP WireGuard 出站已写入(tag=warp), xray 已用新配置重启"
+        _success "WARP WireGuard 出站已写入(tag=warp, 账号: $label), xray 已用新配置重启"
     fi
     return 0
 }
