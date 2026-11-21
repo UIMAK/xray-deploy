@@ -190,6 +190,17 @@ JSON
         privateKey: $privateKey,
         response: {warp_enabled: false, tunnel_type: "masque", config: {interface: {addresses: {}}}}
     }' > "$FX/masque-incomplete.json"
+    # WARP+ / Zero Trust 的 WireGuard 注册响应: client_id 前 3 字节就是 reserved。
+    cat > "$FX/wg-account-reg.json" <<'JSON'
+{"id": "wg-account-id", "token": "wg-account-token",
+ "config": {
+   "client_id": "AQIDBA==",
+   "peers": [{"public_key": "cGVlci1wdWJsaWMta2V5",
+              "endpoint": {"v4": "162.159.193.1:0", "v6": "[2606:4700:100::1]:0",
+                           "host": "engage.cloudflareclient.com"}}],
+   "interface": {"addresses": {"v4": "172.16.0.9", "v6": "2606:4700:110:8a36::9"}}
+ }}
+JSON
     # 每种来源保留一个格式错误代表: 非法 JSON、缺字段。
     printf '{"private_key": ' > "$FX/reg-bad-json.json"
     printf '{"outbounds": [{"settings": {"secretKey": "k"}}]}\n' > "$FX/out-bad-missing.json"
@@ -530,6 +541,155 @@ SH
         [ "$?" -eq 1 ] && [ ! -e "$TMP/masque-incomplete-out.json" ]
     )
     check 'fetch masque: response without endpoint data is rejected without output' fetch_masque_incomplete
+
+    account_prompt() (
+        local jwt='eyJhbGciOiJSUzI1NiJ9.eyJ0ZWFtIjoidGVzdCJ9.c2ln'
+        _warp_ask_account <<< '1' >/dev/null 2>&1 || return 1
+        [ "$_WARP_ACCOUNT" = free ] && [ -z "$_WARP_SECRET" ] || return 1
+        _warp_ask_account <<< $'2\nABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
+        [ "$_WARP_ACCOUNT" = plus ] &&
+            [ "$_WARP_SECRET" = ABCDEFGH-ABCDEFGH-ABCDEFGH ] || return 1
+        _warp_ask_account <<< "3"$'\n'"$jwt" >/dev/null 2>&1 || return 1
+        [ "$_WARP_ACCOUNT" = team ] && [ "$_WARP_SECRET" = "$jwt" ] || return 1
+        _warp_ask_account <<< '0' >/dev/null 2>&1
+        [ "$?" -eq 1 ] &&
+            ! _warp_valid_license 'bad' &&
+            _warp_valid_license 'ABCDEFGH-ABCDEFGH-ABCDEFGH' &&
+            ! _warp_valid_team_token 'has space' &&
+            _warp_valid_team_token "$jwt"
+    )
+    check 'account prompt: free/plus/team selection, cancel and input validation' account_prompt
+
+    register_default_enter() (
+        _config_edit_preflight() { return 0; }
+        _warp_obtain() {
+            printf '%s\t%s\t%s\n' "${2:-}" "${3:-}" "${4:-}" > "$TMP/register-default.args"
+            printf '{"kind":"masque"}\n' > "$1"
+        }
+        _warp_apply() { return 0; }
+        printf '\n\n' | _warp_register >/dev/null 2>&1 || return 1
+        [ "$(cut -f1 "$TMP/register-default.args")" = masque ] &&
+            [ "$(cut -f2 "$TMP/register-default.args")" = free ] &&
+            [ -z "$(cut -f3 "$TMP/register-default.args")" ]
+    )
+    check 'register prompt: bare Enter twice selects free MASQUE' register_default_enter
+
+    fetch_masque_plus() (
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    [ -z "${5:-}" ] || return 1
+                    cp "$FX/masque-reg.json" "${4:-}"
+                    ;;
+                PUT)
+                    printf '%s\n' "${2:-}" > "$TMP/masque-plus-put.url"
+                    cp "${3:-}" "$TMP/masque-plus-put.body"
+                    grep -q 'Authorization: Bearer masque-token' "${5:-}" || return 1
+                    printf '{"license":"ABCDEFGH-ABCDEFGH-ABCDEFGH"}\n' > "${4:-}"
+                    ;;
+                PATCH) cp "$FX/masque-enroll.json" "${4:-}" ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/masque-plus.json"
+        _warp_fetch_masque "$TMP/masque-plus.json" plus \
+            'ABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
+        [ -s "$TMP/masque-plus.json" ] || return 1
+        grep -q '/reg/123e4567-e89b-12d3-a456-426614174000/account$' \
+            "$TMP/masque-plus-put.url" || return 1
+        jq -e '.license == "ABCDEFGH-ABCDEFGH-ABCDEFGH"' \
+            "$TMP/masque-plus-put.body" >/dev/null 2>&1
+    )
+    check 'fetch masque: WARP+ license is bound before MASQUE enrollment' fetch_masque_plus
+
+    fetch_masque_team() (
+        local jwt='eyJhbGciOiJSUzI1NiJ9.eyJ0ZWFtIjoidGVzdCJ9.c2ln'
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    grep -Fq "CF-Access-Jwt-Assertion: $jwt" "${5:-}" || return 1
+                    cp "$FX/masque-reg.json" "${4:-}"
+                    ;;
+                PATCH) cp "$FX/masque-enroll.json" "${4:-}" ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/masque-team.json"
+        _warp_fetch_masque "$TMP/masque-team.json" team "$jwt" >/dev/null 2>&1 || return 1
+        [ -s "$TMP/masque-team.json" ]
+    )
+    check 'fetch masque: Zero Trust team token is sent as JWT without license binding' fetch_masque_team
+
+    masque_account_endpoints() {
+        [ "$(_warp_normalize_masque "$FX/masque-raw.json" plus | jq -r .server)" = "162.159.199.2" ] &&
+            [ "$(_warp_normalize_masque "$FX/masque-raw.json" team | jq -r .server)" = "162.159.197.2" ] &&
+            [ "$(_warp_normalize_masque "$FX/masque-raw.json" | jq -r .server)" = "162.159.198.2" ]
+    }
+    check 'normalize masque: free/WARP+/Zero Trust use their own endpoints' masque_account_endpoints
+
+    obtain_masque_plus() (
+        _warp_fetch_masque() { cp "$FX/masque-raw.json" "$1"; }
+        rm -f "$TMP/masque-plus-obtain.json"
+        _warp_obtain "$TMP/masque-plus-obtain.json" masque plus \
+            'ABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
+        jq -e '.kind == "masque" and .server == "162.159.199.2"' \
+            "$TMP/masque-plus-obtain.json" >/dev/null 2>&1
+    )
+    check 'obtain masque: WARP+ account selects the WARP+ endpoint' obtain_masque_plus
+
+    fetch_wg_account() (
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    [ -z "${5:-}" ] || return 1
+                    cp "$FX/wg-account-reg.json" "${4:-}"
+                    ;;
+                PUT)
+                    grep -q 'Authorization: Bearer wg-account-token' "${5:-}" || return 1
+                    printf '{"license":"ABCDEFGH-ABCDEFGH-ABCDEFGH"}\n' > "${4:-}"
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/wg-account.json" "$TMP/wg-account.norm.json"
+        _warp_fetch_wg_account "$TMP/wg-account.json" plus \
+            'ABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
+        jq -e '
+            (.privateKey | length) == 44
+            and .reserved == [1, 2, 3]
+            and .response.id == "wg-account-id"
+        ' "$TMP/wg-account.json" >/dev/null 2>&1 || return 1
+        _warp_normalize_wg_account "$TMP/wg-account.json" > "$TMP/wg-account.norm.json" || return 1
+        jq -e '
+            (.secretKey | length) == 44
+            and .address == ["172.16.0.9/32", "2606:4700:110:8a36::9/128"]
+            and .reserved == [1, 2, 3]
+            and .endpoint == "162.159.193.1:2408"
+            and .publicKey == "cGVlci1wdWJsaWMta2V5"
+            and .mtu == 1280
+        ' "$TMP/wg-account.norm.json" >/dev/null 2>&1
+    )
+    check 'fetch wireguard: WARP+ registration binds license, derives reserved and endpoint' fetch_wg_account
+
+    obtain_wg_team() (
+        local jwt='eyJhbGciOiJSUzI1NiJ9.eyJ0ZWFtIjoidGVzdCJ9.c2ln'
+        _warp_http_json() {
+            case "${1:-}" in
+                POST)
+                    grep -Fq "CF-Access-Jwt-Assertion: $jwt" "${5:-}" || return 1
+                    cp "$FX/wg-account-reg.json" "${4:-}"
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        rm -f "$TMP/wg-team.out"
+        _warp_obtain "$TMP/wg-team.out" wireguard team "$jwt" >/dev/null 2>&1 || return 1
+        jq -e '
+            .reserved == [1, 2, 3]
+            and .endpoint == "162.159.193.1:2408"
+        ' "$TMP/wg-team.out" >/dev/null 2>&1
+    )
+    check 'obtain wireguard: Zero Trust JWT registration skips license binding' obtain_wg_team
 
     obtain_masque_ok() (
         _warp_fetch_masque() { cp "$FX/masque-raw.json" "$1"; }
