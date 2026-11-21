@@ -1026,7 +1026,7 @@ _reset_config_locked() {
 # 更新检查读取本地/远端 VERSION；XRAY_DEPLOY_RAW 为用户指定受信源。
 # 远端 VERSION 与 install.sh 统一走 _http_download 的 HTTPS 约束。
 # 非空/bash -n 只验证内容/语法，不证明来源；不引入下载哈希/签名机制。
-SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/UIMAK/xray-deploy/main}/VERSION"
+SCRIPT_VERSION_URL="${XRAY_DEPLOY_RAW:-https://raw.githubusercontent.com/YOUIMARK/xray-deploy/main}/VERSION"
 
 # 外部版本/通道仅接受 [0-9A-Za-z._-]，避免 echo -e 解释转义；非法 rc 1，不剥字符伪造合法值。
 _sanitize_token() {

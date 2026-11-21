@@ -3,8 +3,8 @@
 
 set -u
 
-# 上游 base 只定义一次，镜像/fork 用 XRAY_DEPLOY_RAW 覆盖（必须 HTTPS）。
-REMOTE_BASE_DEFAULT="https://raw.githubusercontent.com/UIMAK/xray-deploy/main"
+# 默认源只定义一次，镜像用 XRAY_DEPLOY_RAW 覆盖（必须 HTTPS）。
+REMOTE_BASE_DEFAULT="https://raw.githubusercontent.com/YOUIMARK/xray-deploy/main"
 REMOTE_BASE="${XRAY_DEPLOY_RAW:-$REMOTE_BASE_DEFAULT}"
 
 CMD_NAME="xd"
