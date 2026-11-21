@@ -869,9 +869,93 @@ SH
     check 'fetch: local and remote warp-reg failures share one reason' fetch_reg_local_remote_fail
 
     # -----------------------------------------------------------------------
+    # B2. Cloudflare 设备生命周期: 记录/释放/提交/回滚
+    # -----------------------------------------------------------------------
+    device_record_roundtrip() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" DEV1 TOKEN1 plus || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_PENDING_KEY")" = "$(printf 'DEV1\tTOKEN1')" ] || return 1
+        [ "$(stat -c %a "$STATE_DIR/$WARP_DEVICE_PENDING_KEY")" = 600 ] || return 1
+        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+    )
+    check 'device: record roundtrip keeps id/token with 600 perms' device_record_roundtrip
+
+    device_release_uses_delete() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY"
+        : > "$TMP/device-curl.log"
+        curl() {
+            local prev="" a
+            for a in "$@"; do
+                [ "$prev" = "-K" ] && _warp_test_auth="$a"
+                prev="$a"
+            done
+            printf '%s\n' "$*" >> "$TMP/device-curl.log"
+            [ -n "${_warp_test_auth:-}" ] && cat "$_warp_test_auth" >> "$TMP/device-curl.log"
+            printf '%s' "${_warp_test_code:-204}"
+        }
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" DEV2 TOKEN2 plus || return 1
+        _warp_device_release "$WARP_DEVICE_STATE_KEY" || return 1
+        grep -q -- '-X DELETE' "$TMP/device-curl.log" || return 1
+        grep -q '/reg/DEV2' "$TMP/device-curl.log" || return 1
+        grep -q 'Authorization: Bearer TOKEN2' "$TMP/device-curl.log" || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_STATE_KEY" ]
+    )
+    check 'device: release deletes the device and clears the record' device_release_uses_delete
+
+    device_release_failure_keeps_state() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY"
+        curl() { printf '%s' "${_warp_test_code:-204}"; }
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" DEV3 TOKEN3 plus || return 1
+        _warp_test_code=500
+        _warp_device_release "$WARP_DEVICE_STATE_KEY" && return 1
+        _warp_device_fields "$WARP_DEVICE_STATE_KEY" >/dev/null 2>&1 || return 1
+        _warp_test_code=404
+        _warp_device_release "$WARP_DEVICE_STATE_KEY" || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_STATE_KEY" ]
+    )
+    check 'device: release keeps the record on failure and treats 404 as gone' device_release_failure_keeps_state
+
+    device_commit_releases_old() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        : > "$TMP/device-curl.log"
+        curl() {
+            printf '%s\n' "$*" >> "$TMP/device-curl.log"
+            printf '%s' 204
+        }
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" OLDDEV OLDTOK plus || return 1
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" NEWDEV NEWTOK plus || return 1
+        _warp_device_commit || return 1
+        grep -q '/reg/OLDDEV' "$TMP/device-curl.log" || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY" | cut -f1)" = NEWDEV ] || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" ]
+    )
+    check 'device: commit releases the old device and promotes the new one' device_commit_releases_old
+
+    register_failure_releases_pending() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        base_cfg | cfg_reset || return 1
+        : > "$TMP/device-curl.log"
+        curl() {
+            printf '%s\n' "$*" >> "$TMP/device-curl.log"
+            printf '%s' 204
+        }
+        _warp_ask_account() { _WARP_ACCOUNT="plus"; _WARP_SECRET="ABCDEFGH-ABCDEFGH-ABCDEFGH"; return 0; }
+        _warp_obtain() {
+            _warp_device_record "$WARP_DEVICE_PENDING_KEY" PENDDEV PENDTOK plus || return 1
+            printf '%s\n' '{"kind":"masque"}' > "$1"
+        }
+        _warp_apply() { return 1; }
+        _warp_register masque >/dev/null 2>&1 || true
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" ] || return 1
+        grep -q '/reg/PENDDEV' "$TMP/device-curl.log"
+    )
+    check 'register: failed apply releases the pending device' register_failure_releases_pending
+
+    # -----------------------------------------------------------------------
     # C. 出站生命周期
     # -----------------------------------------------------------------------
     printf '== C. outbound lifecycle ==\n'
+    rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
     base_cfg | cfg_reset || exit 1
     check 'apply: writes the warp outbound after the existing ones' _warp_apply "$(norm_a)"
     check 'apply: outbound order is direct, block, warp' eq 'direct|block|warp' "$(_config_jq -r '.outbounds | map(.tag) | join("|")')"
