@@ -597,7 +597,7 @@ _warp_device_rollback() {
 # free 匿名注册; plus 注册后把 license 绑定到该设备; team 注册请求带 team token (JWT)。
 # 输出 <dir>/reg.json、wg.priv.b64、wg.pub.b64 和 Bearer auth.conf。
 _warp_api_register_wg() {   # <dir> [free|plus|team] [license|team token]
-    local dir="${1:-}" account="${2:-free}" secret="${3:-}" tos serial wg_pub auth_post="" id token bound
+    local dir="${1:-}" account="${2:-free}" secret="${3:-}" tos serial wg_pub auth_post="" id token
     [ -n "$dir" ] && [ -d "$dir" ] || { _WARP_REASON="注册临时目录不可用"; return 1; }
     case "$account" in
         free|plus|team) ;;
@@ -686,18 +686,14 @@ _warp_api_register_wg() {   # <dir> [free|plus|team] [license|team token]
         rm -f "$dir/license.txt"
         if ! _warp_http_json PUT "$WARP_API_BASE/reg/$id/account" \
             "$dir/license.body" "$dir/license.json" "$dir/auth.conf"; then
-            # 额度可能已被上一台设备占满: 释放记录的旧设备后重试一次。
-            bound=1
-            if grep -qi 'too many' "$dir/license.json" 2>/dev/null &&
-                _warp_device_release "$WARP_DEVICE_STATE_KEY"; then
-                _warp_http_json PUT "$WARP_API_BASE/reg/$id/account" \
-                    "$dir/license.body" "$dir/license.json" "$dir/auth.conf" && bound=0
+            # 绑定前不能销毁现用设备: 一旦后续失败, 本地配置仍引用它。
+            _WARP_REASON=$(_warp_http_reason "$dir/license.json" 2>/dev/null) ||
+                _WARP_REASON="WARP+ license 绑定失败"
+            if grep -Eqi 'too many devices|device (limit|quota)|maximum (number of )?devices' \
+                "$dir/license.json" 2>/dev/null; then
+                _WARP_REASON="${_WARP_REASON}；请先删除不再使用的 WARP 设备后重试"
             fi
-            if [ "$bound" -ne 0 ]; then
-                _WARP_REASON=$(_warp_http_reason "$dir/license.json" 2>/dev/null) ||
-                    _WARP_REASON="WARP+ license 绑定失败"
-                return 1
-            fi
+            return 1
         fi
     fi
     return 0

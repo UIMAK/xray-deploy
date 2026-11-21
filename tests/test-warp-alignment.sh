@@ -931,6 +931,49 @@ SH
     )
     check 'device: commit releases the old device and promotes the new one' device_commit_releases_old
 
+    license_bind_errors_preserve_current_device() (
+        local dir
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" OLDDEV OLDTOK plus || return 1
+        _warp_device_release_fields() {
+            : > "$TMP/license-bind-released"
+            return 0
+        }
+        _warp_http_json() {
+            case "${1:-}" in
+                POST) cp "$FX/wg-account-reg.json" "${4:-}" ;;
+                PUT)
+                    printf '%s\n' "${WARP_TEST_LICENSE_ERROR:-}" > "${4:-}"
+                    _WARP_HTTP_CODE="${WARP_TEST_LICENSE_CODE:-400}"
+                    return 1
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        WARP_TEST_LICENSE_CODE=429
+        WARP_TEST_LICENSE_ERROR='{"error":"Too many requests"}'
+        dir=$(mktemp -d "$TMP/license-bind.XXXXXX") || return 1
+        _warp_api_register_wg "$dir" plus 'ABCDEFGH-ABCDEFGH-ABCDEFGH' && return 1
+        [ "$_WARP_REASON" = 'HTTP 429: Too many requests' ] || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY")" = "$(printf 'OLDDEV\tOLDTOK')" ] || return 1
+        [ ! -e "$TMP/license-bind-released" ] || return 1
+        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+
+        WARP_TEST_LICENSE_CODE=400
+        WARP_TEST_LICENSE_ERROR='{"error":"Too many devices registered"}'
+        dir=$(mktemp -d "$TMP/license-bind.XXXXXX") || return 1
+        _warp_api_register_wg "$dir" plus 'ABCDEFGH-ABCDEFGH-ABCDEFGH' && return 1
+        case "$_WARP_REASON" in
+            'HTTP 400: Too many devices registered'*'请先删除'*) ;;
+            *) return 1 ;;
+        esac
+        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY")" = "$(printf 'OLDDEV\tOLDTOK')" ] || return 1
+        [ ! -e "$TMP/license-bind-released" ] || return 1
+        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+        _warp_device_drop "$WARP_DEVICE_STATE_KEY"
+    )
+    check 'license bind: rate limit and device quota failures keep the current device' license_bind_errors_preserve_current_device
+
     register_failure_releases_pending() (
         rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
         base_cfg | cfg_reset || return 1
