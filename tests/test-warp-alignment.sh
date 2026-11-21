@@ -201,6 +201,13 @@ JSON
    "interface": {"addresses": {"v4": "172.16.0.9", "v6": "2606:4700:110:8a36::9"}}
  }}
 JSON
+    # Zero Trust 注册响应包在 result 下, 设备 ID 带 t. 前缀。
+    jq '{result: (. + {id: "t.wg-account-id"}), success: true, errors: [], messages: []}' \
+        "$FX/wg-account-reg.json" > "$FX/wg-team-reg.json"
+    jq '{result: (. + {id: "t.123e4567-e89b-12d3-a456-426614174000"}), success: true, errors: [], messages: []}' \
+        "$FX/masque-reg.json" > "$FX/masque-team-reg.json"
+    jq '{result: ., success: true, errors: [], messages: []}' \
+        "$FX/masque-enroll.json" > "$FX/masque-team-enroll.json"
     # 每种来源保留一个格式错误代表: 非法 JSON、缺字段。
     printf '{"private_key": ' > "$FX/reg-bad-json.json"
     printf '{"outbounds": [{"settings": {"secretKey": "k"}}]}\n' > "$FX/out-bad-missing.json"
@@ -544,6 +551,7 @@ SH
 
     account_prompt() (
         local jwt='eyJhbGciOiJSUzI1NiJ9.eyJ0ZWFtIjoidGVzdCJ9.c2ln'
+        local deep="com.cloudflare.warp://youimark.cloudflareaccess.com/auth?token=$jwt"
         _warp_ask_account <<< '1' >/dev/null 2>&1 || return 1
         [ "$_WARP_ACCOUNT" = free ] && [ -z "$_WARP_SECRET" ] || return 1
         _warp_ask_account <<< $'2\nABCDEFGH-ABCDEFGH-ABCDEFGH' >/dev/null 2>&1 || return 1
@@ -551,14 +559,19 @@ SH
             [ "$_WARP_SECRET" = ABCDEFGH-ABCDEFGH-ABCDEFGH ] || return 1
         _warp_ask_account <<< "3"$'\n'"$jwt" >/dev/null 2>&1 || return 1
         [ "$_WARP_ACCOUNT" = team ] && [ "$_WARP_SECRET" = "$jwt" ] || return 1
+        _warp_ask_account <<< "3"$'\n'"$deep" >/dev/null 2>&1 || return 1
+        [ "$_WARP_ACCOUNT" = team ] && [ "$_WARP_SECRET" = "$jwt" ] || return 1
+        [ "$(_warp_team_token_value "youimark.cloudflareaccess.com/auth?token=$jwt")" = "$jwt" ] || return 1
         _warp_ask_account <<< '0' >/dev/null 2>&1
         [ "$?" -eq 1 ] &&
             ! _warp_valid_license 'bad' &&
             _warp_valid_license 'ABCDEFGH-ABCDEFGH-ABCDEFGH' &&
             ! _warp_valid_team_token 'has space' &&
+            ! _warp_valid_team_token 'eyxxx' &&
+            _warp_valid_team_token "$deep" &&
             _warp_valid_team_token "$jwt"
     )
-    check 'account prompt: free/plus/team selection, cancel and input validation' account_prompt
+    check 'account prompt: deep link extracts JWT, cancel and input validation' account_prompt
 
     register_default_enter() (
         _config_edit_preflight() { return 0; }
@@ -608,17 +621,23 @@ SH
             case "${1:-}" in
                 POST)
                     grep -Fq "CF-Access-Jwt-Assertion: $jwt" "${5:-}" || return 1
-                    cp "$FX/masque-reg.json" "${4:-}"
+                    cp "$FX/masque-team-reg.json" "${4:-}"
                     ;;
-                PATCH) cp "$FX/masque-enroll.json" "${4:-}" ;;
+                PATCH)
+                    grep -q 'Authorization: Bearer masque-token' "${5:-}" || return 1
+                    cp "$FX/masque-team-enroll.json" "${4:-}"
+                    ;;
                 *) return 1 ;;
             esac
         }
         rm -f "$TMP/masque-team.json"
         _warp_fetch_masque "$TMP/masque-team.json" team "$jwt" >/dev/null 2>&1 || return 1
-        [ -s "$TMP/masque-team.json" ]
+        jq -e '
+            .response.config.interface.addresses.v4 == "172.16.0.2"
+            and .response.config.peers[0].public_key != ""
+        ' "$TMP/masque-team.json" >/dev/null 2>&1
     )
-    check 'fetch masque: Zero Trust team token is sent as JWT without license binding' fetch_masque_team
+    check 'fetch masque: Zero Trust unwraps result and sends JWT without license binding' fetch_masque_team
 
     masque_account_endpoints() {
         [ "$(_warp_normalize_masque "$FX/masque-raw.json" plus | jq -r .server)" = "162.159.199.2" ] &&
@@ -677,7 +696,7 @@ SH
             case "${1:-}" in
                 POST)
                     grep -Fq "CF-Access-Jwt-Assertion: $jwt" "${5:-}" || return 1
-                    cp "$FX/wg-account-reg.json" "${4:-}"
+                    cp "$FX/wg-team-reg.json" "${4:-}"
                     ;;
                 *) return 1 ;;
             esac
@@ -689,7 +708,7 @@ SH
             and .endpoint == "162.159.193.1:2408"
         ' "$TMP/wg-team.out" >/dev/null 2>&1
     )
-    check 'obtain wireguard: Zero Trust JWT registration skips license binding' obtain_wg_team
+    check 'obtain wireguard: Zero Trust t. device ID and wrapped result are accepted' obtain_wg_team
 
     obtain_masque_ok() (
         _warp_fetch_masque() { cp "$FX/masque-raw.json" "$1"; }
@@ -873,12 +892,12 @@ SH
     # -----------------------------------------------------------------------
     device_record_roundtrip() (
         rm -f -- "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
-        _warp_device_record "$WARP_DEVICE_PENDING_KEY" DEV1 TOKEN1 plus || return 1
-        [ "$(_warp_device_fields "$WARP_DEVICE_PENDING_KEY")" = "$(printf 'DEV1\tTOKEN1')" ] || return 1
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" t.a849f2f4-61dd-11ed-8b7d-3acbb31d7d51 TOKEN1 team || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_PENDING_KEY")" = "$(printf 't.a849f2f4-61dd-11ed-8b7d-3acbb31d7d51\tTOKEN1')" ] || return 1
         [ "$(stat -c %a "$STATE_DIR/$WARP_DEVICE_PENDING_KEY")" = 600 ] || return 1
         _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
     )
-    check 'device: record roundtrip keeps id/token with 600 perms' device_record_roundtrip
+    check 'device: team id roundtrip keeps id/token with 600 perms' device_record_roundtrip
 
     device_release_uses_delete() (
         rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY"
@@ -893,14 +912,14 @@ SH
             [ -n "${_warp_test_auth:-}" ] && cat "$_warp_test_auth" >> "$TMP/device-curl.log"
             printf '%s' "${_warp_test_code:-204}"
         }
-        _warp_device_record "$WARP_DEVICE_STATE_KEY" DEV2 TOKEN2 plus || return 1
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" t.release-device TOKEN2 team || return 1
         _warp_device_release "$WARP_DEVICE_STATE_KEY" || return 1
         grep -q -- '-X DELETE' "$TMP/device-curl.log" || return 1
-        grep -q '/reg/DEV2' "$TMP/device-curl.log" || return 1
+        grep -q '/reg/t.release-device' "$TMP/device-curl.log" || return 1
         grep -q 'Authorization: Bearer TOKEN2' "$TMP/device-curl.log" || return 1
         [ ! -e "$STATE_DIR/$WARP_DEVICE_STATE_KEY" ]
     )
-    check 'device: release deletes the device and clears the record' device_release_uses_delete
+    check 'device: team id release deletes the device and clears the record' device_release_uses_delete
 
     device_release_failure_keeps_state() (
         rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY"
@@ -915,6 +934,20 @@ SH
     )
     check 'device: release keeps the record on failure and treats 404 as gone' device_release_failure_keeps_state
 
+    device_rollback_releases_team_pending() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        : > "$TMP/device-curl.log"
+        curl() {
+            printf '%s\n' "$*" >> "$TMP/device-curl.log"
+            printf '%s' 204
+        }
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" t.rollback-device ROLLTOK team || return 1
+        _warp_device_rollback || return 1
+        grep -q '/reg/t.rollback-device' "$TMP/device-curl.log" || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" ]
+    )
+    check 'device: rollback releases team-style pending device' device_rollback_releases_team_pending
+
     device_commit_releases_old() (
         rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
         : > "$TMP/device-curl.log"
@@ -922,14 +955,14 @@ SH
             printf '%s\n' "$*" >> "$TMP/device-curl.log"
             printf '%s' 204
         }
-        _warp_device_record "$WARP_DEVICE_STATE_KEY" OLDDEV OLDTOK plus || return 1
-        _warp_device_record "$WARP_DEVICE_PENDING_KEY" NEWDEV NEWTOK plus || return 1
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" t.old-device OLDTOK team || return 1
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" t.new-device NEWTOK team || return 1
         _warp_device_commit || return 1
-        grep -q '/reg/OLDDEV' "$TMP/device-curl.log" || return 1
-        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY" | cut -f1)" = NEWDEV ] || return 1
+        grep -q '/reg/t.old-device' "$TMP/device-curl.log" || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY" | cut -f1)" = t.new-device ] || return 1
         [ ! -e "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" ]
     )
-    check 'device: commit releases the old device and promotes the new one' device_commit_releases_old
+    check 'device: commit releases the old team device and promotes the new one' device_commit_releases_old
 
     license_bind_errors_preserve_current_device() (
         local dir

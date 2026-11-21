@@ -213,13 +213,29 @@ _warp_valid_license() {
     [[ "${1:-}" =~ ^[0-9A-Za-z]{8}-[0-9A-Za-z]{8}-[0-9A-Za-z]{8}$ ]]
 }
 
-_warp_valid_team_token() {
+# team token 是 JWT; Cloudflare 页面复制到的通常是带 token= 的跳转链接。
+_warp_team_token_value() {
     local token="${1:-}"
+    token="${token#"${token%%[![:space:]]*}"}"
+    token="${token%"${token##*[![:space:]]}"}"
+    case "$token" in
+        *'?token='*) token="${token#*'?token='}" ;;
+        *'&token='*) token="${token#*'&token='}" ;;
+        token=*) token="${token#token=}" ;;
+    esac
+    token="${token%%&*}"
+    token="${token%%#*}"
+    printf '%s' "$token"
+}
+
+_warp_valid_team_token() {
+    local token
+    token=$(_warp_team_token_value "${1:-}")
     [ -n "$token" ] || return 1
     case "$token" in
         *[[:space:]\"\\]*) return 1 ;;
     esac
-    [[ "$token" =~ ^[A-Za-z0-9._~+/=-]+$ ]]
+    [[ "$token" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]
 }
 
 # 归一收尾: endpoint 交给 bash 规范化后回写, 其余字段原样保留。失败不输出任何内容。
@@ -272,7 +288,7 @@ _warp_http_reason() {   # <dest>
     local out="${1:-}" msg=""
     [ -s "$out" ] || return 1
     if command -v jq >/dev/null 2>&1; then
-        msg=$(jq -r '(.error // .message // empty) | if type == "string" then . else tostring end' "$out" 2>/dev/null) || msg=""
+        msg=$(jq -r '(.error // .message // .errors[0].message // empty) | if type == "string" then . else tostring end' "$out" 2>/dev/null) || msg=""
     fi
     if [ -z "$msg" ]; then
         msg=$(head -c 200 "$out" 2>/dev/null | tr '\n' ' ')
@@ -483,6 +499,21 @@ _warp_http_json() {   # <method> <url> <bodyfile> <dest> [authfile]
     return 0
 }
 
+# Zero Trust 注册/登记响应是 {"result": {...}, "success": true}; 免费账号直接返回顶层对象。
+_warp_unwrap_result() {   # <file>
+    local file="${1:-}" tmp
+    [ -n "$file" ] && [ -s "$file" ] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    jq -e 'type == "object"' "$file" >/dev/null 2>&1 || return 1
+    jq -e '(.result | type) == "object"' "$file" >/dev/null 2>&1 || return 0
+    tmp="$file.unwrap"
+    if ! jq -c '.result' "$file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
 # 删除 Cloudflare 设备(释放 WARP+ 设备额度): 204/404 视为成功。
 _warp_http_delete() {   # <url> <authfile>
     local url="${1:-}" auth="${2:-}" code rc
@@ -528,7 +559,7 @@ _warp_device_fields() {   # <key> -> "id<TAB>token"
     command -v jq >/dev/null 2>&1 || return 1
     id=$(printf '%s' "$json" | jq -r '.id // empty' 2>/dev/null) || return 1
     token=$(printf '%s' "$json" | jq -r '.token // empty' 2>/dev/null) || return 1
-    [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    [[ "$id" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
     [ -n "$token" ] || return 1
     printf '%s\t%s\n' "$id" "$token"
 }
@@ -605,7 +636,10 @@ _warp_api_register_wg() {   # <dir> [free|plus|team] [license|team token]
     esac
     case "$account" in
         plus) _warp_valid_license "$secret" || { _WARP_REASON="WARP+ license 格式无效"; return 1; } ;;
-        team) _warp_valid_team_token "$secret" || { _WARP_REASON="Zero Trust team token 无效"; return 1; } ;;
+        team)
+            secret=$(_warp_team_token_value "$secret")
+            _warp_valid_team_token "$secret" || { _WARP_REASON="Zero Trust team token 无效"; return 1; }
+            ;;
     esac
     command -v openssl >/dev/null 2>&1 || { _WARP_REASON="openssl 不可用"; return 1; }
     command -v base64 >/dev/null 2>&1 || { _WARP_REASON="base64 不可用"; return 1; }
@@ -660,10 +694,14 @@ _warp_api_register_wg() {   # <dir> [free|plus|team] [license|team token]
             _WARP_REASON="Cloudflare WARP 注册请求失败"
         return 1
     fi
+    if ! _warp_unwrap_result "$dir/reg.json"; then
+        _WARP_REASON="Cloudflare WARP 注册响应无法解析"
+        return 1
+    fi
     id=$(jq -r '.id // empty' "$dir/reg.json" 2>/dev/null)
     token=$(jq -r '.token // empty' "$dir/reg.json" 2>/dev/null)
-    if ! [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || [ -z "$token" ]; then
-        _WARP_REASON="Cloudflare WARP 注册响应缺少有效账户信息"
+    if ! [[ "$id" =~ ^[A-Za-z0-9_.-]+$ ]] || [ -z "$token" ]; then
+        _WARP_REASON="Cloudflare WARP 注册响应缺少有效账户信息 (HTTP ${_WARP_HTTP_CODE:-?})"
         return 1
     fi
     # 先记录设备: 之后任何一步失败都可按 id/token 释放, 避免占用 WARP+ 设备额度。
@@ -747,6 +785,11 @@ _warp_fetch_masque() {   # <outfile> [free|plus|team] [license|team token]
     if ! _warp_http_json PATCH "$WARP_API_BASE/reg/$id" "$dir/enroll.body" "$dir/enroll.json" "$dir/auth.conf"; then
         _WARP_REASON=$(_warp_http_reason "$dir/enroll.json" 2>/dev/null) ||
             _WARP_REASON="Cloudflare MASQUE 设备登记失败"
+        rm -rf -- "$dir"
+        return 1
+    fi
+    if ! _warp_unwrap_result "$dir/enroll.json"; then
+        _WARP_REASON="Cloudflare MASQUE 登记响应无法解析"
         rm -rf -- "$dir"
         return 1
     fi
@@ -1147,15 +1190,15 @@ _warp_ask_account() {   # sets _WARP_ACCOUNT / _WARP_SECRET; 0=ok 1=cancel
                 _warn "license 格式应为 xxxxxxxx-xxxxxxxx-xxxxxxxx"
                 ;;
             3)
-                echo -e "  team token 从 ${CYAN}https://<团队名>.cloudflareaccess.com/warp${NC} 获取 (有效期约 1 分钟)"
-                read -rp "  请输入 Zero Trust team token: " secret || return 1
-                secret=$(printf '%s' "$secret" | tr -d '[:space:]')
+                echo -e "  team token 从 ${CYAN}https://<团队名>.cloudflareaccess.com/warp${NC} 获取 (有效期约 1 分钟; 可直接粘贴带 token= 的跳转链接)"
+                read -rp "  请输入 Zero Trust team token 或链接: " secret || return 1
+                secret=$(_warp_team_token_value "$secret")
                 if _warp_valid_team_token "$secret"; then
                     _WARP_ACCOUNT="team"
                     _WARP_SECRET="$secret"
                     return 0
                 fi
-                _warn "team token 不能为空, 且不能包含空白、引号或反斜杠"
+                _warn "team token 应为 eyJ... 开头的 JWT; 可直接粘贴 com.cloudflare.warp://...?token=... 链接"
                 ;;
             *) _warn "无效选择" ;;
         esac
