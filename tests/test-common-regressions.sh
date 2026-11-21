@@ -170,6 +170,22 @@ version_preserved_by_mutations() (
 setup_case mutations
 check 'DNS, routing, Geo and node mutations preserve the version fragment' version_preserved_by_mutations
 
+# DNS 设置页与并行查询子页共用圆点状态文案。
+dns_menu_parallel_state() (
+    clear() { :; }
+    local out
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" \
+        '{version:{min:$v,max:""},dns:{servers:["1.1.1.1"],queryStrategy:"UseIP",enableParallelQuery:true}}')" || return 1
+    out=$(printf '0\n' | _dns_menu 2>&1) || return 1
+    printf '%s' "$out" | grep -q '并行查询:.*● 已启用' || return 1
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" \
+        '{version:{min:$v,max:""},dns:{servers:["1.1.1.1"],queryStrategy:"UseIP",enableParallelQuery:false}}')" || return 1
+    out=$(printf '0\n' | _dns_menu 2>&1) || return 1
+    printf '%s' "$out" | grep -q '并行查询:.*○ 已关闭'
+)
+setup_case dns-menu-parallel
+check 'DNS menu shows parallel query with dot state' dns_menu_parallel_state
+
 geo_name_checks() {
     _geo_extra_name_has_dat geoip-full.dat &&
         _geo_extra_name_has_dat GEOIP.DAT &&
